@@ -155,3 +155,57 @@ Raw result data is also queryable via a public API.
 - Schema design (next step)
 - API design
 - Dashboard scope per job type
+
+---
+
+## Possible Future Improvements (from fishtest)
+
+The following features are drawn from fishtest, the distributed testing framework for Stockfish. They are candidates for inclusion in a later phase.
+
+### Worker Integrity and Anomaly Detection
+
+- **Chi-square testing per worker** — statistical test that flags workers submitting results that deviate significantly from the population. Detects buggy or malicious clients without needing to trust any individual submission.
+- **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks.
+- **Redundant task execution** — send the same task to multiple workers and cross-validate results. Could be implemented as an explicit "send to N workers, require M matching" model.
+
+### Heartbeats and Active Lease Tracking
+
+- **Heartbeat endpoint** — workers ping the server periodically to prove they are still alive on a claimed task. Distinguishes "worker died" from "worker is slow," which lazy timeout reclamation alone cannot do.
+
+### Statistical Result Evaluation
+
+- **SPRT (Sequential Probability Ratio Test)** — for game-pair jobs, stop as soon as statistical significance is reached rather than running a fixed number of pairs. Saves compute by terminating early when the outcome is clear.
+- **ELO / rating accumulation** — aggregate game results across many runs into a persistent strength rating for each bot or configuration being tested.
+- **Completion time forecasting** — estimate hours remaining until a job reaches statistical significance based on current throughput and SPRT progress.
+
+### Worker Client Features
+
+- **Self-updating worker binary** — worker checks a version endpoint on startup, downloads a newer version if available (with hash verification), and restarts itself. Reduces manual update burden on contributors.
+- **Fleet mode** — a flag that makes the worker exit cleanly on error or empty queue, enabling orchestrators (systemd, Docker, CI) to manage its lifecycle.
+- **Global artifact cache** — multiple workers on the same machine or network share downloaded dictionaries and bot binaries rather than each fetching independently.
+- **Hardware-aware binary selection** — workers report CPU capabilities and download or compile the appropriate binary variant for their architecture.
+
+### Contributor Tracking and Transparency
+
+- **Per-worker contribution stats** — games completed, uptime, error rate, etc., surfaced on a machines dashboard page.
+- **Audit log** — every significant action (task claimed, result submitted, job created, user banned) written to an append-only log table for debugging and accountability.
+
+### Job Lifecycle Controls
+
+- **Approval workflow** — users submit job requests that admins must approve before workers are assigned tasks. Adds a pending-requests queue layer on top of the current admin-only model.
+- **Stop / pause / purge controls** — admins can stop an active job mid-run, purge its accumulated results and restart, or delete it entirely.
+- **Job priority field** — a priority field separate from allocation weight; high-priority jobs jump the queue even if their allocation percentage is modest.
+
+### Security
+
+- **CSRF protection** — CSRF tokens tied to the session on all state-mutating endpoints.
+- **Password strength enforcement** — reject weak passwords at account creation time (e.g., via zxcvbn) before hashing.
+
+### Data Access
+
+- **Streaming result download** — an endpoint that streams raw result data for a completed job for offline analysis.
+- **Paginated public API for finished jobs** — the existing public API plan should include pagination with filtering by username, success status, and time control.
+
+### Scaling
+
+- **Primary/secondary server split** — one instance owns task scheduling and mutations; read-only instances serve the dashboard. Eliminates concurrent scheduling conflicts under high worker load.
