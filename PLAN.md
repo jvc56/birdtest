@@ -12,15 +12,15 @@ birdtest is a crowdsourced word game analysis platform, modeled after Fishnet (w
 
 Jobs are long-running research goals defined and managed by admins. The following job types are supported:
 
-- Analyze all possible opening racks
-- Run simulated games
-- Run simulated game pairs
-- Run static games
-- Run static game pairs
-- Analyze a single preendgame
-- Leave generation
+- **Analyze all possible opening racks**
+- **Run simulated games** — Monte Carlo simulation across candidate moves to estimate win percentage.
+- **Run simulated game pairs** — Monte Carlo simulation across candidate moves to estimate win percentage, run as matched pairs (same seed, players swapped) to reduce variance.
+- **Run static games** — move selection based on highest static equity (score + leave value; no simulation or lookahead).
+- **Run static game pairs** — same as static games but run as matched pairs.
+- **Analyze a single preendgame**
+- **Leave generation**
 
-Each job has a **priority** and a **percentage allocation**. Priority takes precedence: workers are only assigned tasks from lower-priority jobs when no tasks are available at any higher priority level. Allocation percentages govern how work is distributed among jobs at the same priority level; allocations must sum to 100% within each priority tier. Jobs, their priorities, and their allocations are managed by admins only.
+Each job has a **priority** and a **percentage allocation**. Priority takes precedence: workers are only assigned tasks from lower-priority jobs when no tasks remain at any higher-priority level. **A lower integer value means higher priority** — priority `0` outranks priority `1`. Allocation percentages govern how work is distributed among jobs at the same priority level; active jobs within a tier must have allocations summing to 100% (enforced at the application layer, not via a DB constraint). Jobs, their priorities, and their allocations are managed by admins only.
 
 #### Job Lifecycle Controls
 
@@ -52,14 +52,16 @@ Tasks move through an explicit state machine:
 ```
 available → claimed → completed
                ↑          
-         (heartbeat timeout: reclaimed to available)
+         (heartbeat timeout on a claim: one slot reopens; task returns to available if it had been at capacity)
 ```
 
-- **available**: Ready to be assigned to a worker.
-- **claimed**: Assigned to a worker. A claim token, claim timestamp, and heartbeat timestamp are recorded.
-- **completed**: The task response has been accepted and the task record stored.
+State is determined by denormalized counters (`accepted_count`, `active_claim_count`) relative to the job's `redundancy` value X:
 
-While a task is claimed, the worker sends periodic heartbeats that update `last_heartbeat_at`. If `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the timeout window, the task is considered abandoned and reclaimed to **available**. Reclamation is lazy — it runs at the moment the next task is requested, not via a background process.
+- **available**: `accepted_count + active_claim_count < redundancy` — open capacity remains; workers can claim a new slot.
+- **claimed**: `accepted_count + active_claim_count = redundancy` but `accepted_count < redundancy` — all slots are filled with in-flight claims; waiting on results.
+- **completed**: `accepted_count = redundancy` — all X results have been submitted and accepted.
+
+Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested, not via a background process.
 
 #### Task Generation
 
@@ -74,12 +76,12 @@ Task generation is job-type-dependent:
 ### Workflow
 
 1. The worker sends a **task claim** to the server — a minimal message identifying itself and signaling it is ready for work.
-2. The system selects a job by priority tier (highest first), then by weighted random draw among jobs in that tier based on allocation percentages, falling through if no tasks are available.
-3. Expired claimed tasks for the selected job are lazily reclaimed and returned to available.
-4. The system acquires the next task (pre-populated or on-demand, depending on the job type), records a claim timestamp, and issues a claim token (UUID) to the worker.
+2. The system selects a job by priority tier (lowest integer value = highest priority, descending). Within the top available tier, a job is chosen by weighted random draw renormalized proportionally across only the currently **active** jobs in that tier; inactive and completed jobs are excluded and their configured allocation percentages do not count against active jobs' weights at selection time.
+3. Expired claims for the selected job are lazily reclaimed: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`.
+4. The system acquires the next task (pre-populated or on-demand, depending on the job type), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
 6. The worker performs the task and submits a **task response** along with the claim token.
-7. If the claim token matches the current record, the task response is accepted, a **task record** is stored, and the task is marked completed. If the token is stale (the task timed out and was reclaimed), the submission is silently ignored.
+7. If the claim token matches a `task_claims` row that is not abandoned, the task response is accepted, a **task record** is stored keyed to the `task_claim_id`, `accepted_count` is incremented, and `active_claim_count` is decremented. When `accepted_count = redundancy` the task is marked **completed**. If the token is stale (the claim was abandoned due to timeout), the submission is silently ignored.
 
 ---
 
@@ -94,7 +96,7 @@ Workers are the clients that perform tasks and submit results. Two types are sup
 
 - **Chi-square testing per worker** — statistical test that flags workers submitting results that deviate significantly from the population. Detects buggy or malicious clients without needing to trust any individual submission.
 - **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID.
-- **Redundant task execution** — send the same task to multiple workers and cross-validate results. Can be implemented as an explicit "send to N workers, require M matching" model.
+- **Redundant task execution** — each job specifies a redundancy value X; X independent workers must each complete the task. All X results are stored independently. No consensus or agreement check is performed at submission time — reconciliation is a downstream analysis question deferred past v1. The only active integrity mechanism at submission time is chi-square anomaly detection per worker.
 
 ---
 
@@ -123,6 +125,8 @@ Users can create an account to track their contributions. Account creation requi
 A confirmation code is sent to the email address on registration. Users can generate one or more API keys from their account, which are used to authenticate task submissions.
 
 API keys are stored as hashes (never raw values) in the database. The raw key is shown to the user exactly once at generation time.
+
+**v1 account scope**: The sole v1 purpose of a user account is to generate an API token, which attributes task submissions to that account instead of an anonymous UUID. No other feature is gated behind registration. Anonymous workers can complete tasks fully, with no account or API token required.
 
 ---
 
@@ -205,7 +209,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
 
 1. **Auth and verification**: The server reads the worker identity from request headers (`Authorization: Bearer <api-key>` for authenticated workers, `X-Worker-UUID` for anonymous workers). It verifies the worker is not banned and upserts the worker record (`users` or `anonymous_workers`).
 
-2. **Job selection**: The server filters to active jobs (excluding inactive and completed), then selects by priority tier — highest priority first. Within the top available tier, a job is chosen by weighted random draw based on allocation percentages.
+2. **Job selection**: The server filters to active jobs (excluding inactive and completed), then selects by priority tier — lowest integer value first (priority `0` outranks priority `1`). Within the top available tier, a job is chosen by weighted random draw renormalized proportionally across the active jobs in that tier; allocation percentages of inactive/completed jobs do not factor in.
 
 3. **Lazy reclamation**: Before acquiring a task, any claimed tasks for the selected job whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`.
 
@@ -235,12 +239,12 @@ Each job type defines:
 |---|---|
 | **Task request** | Serialized and sent to the worker when it claims a task. Contains everything the worker needs to perform the work. |
 | **Task response** | Deserialized from the worker's submission. The raw output of the work, validated on receipt. |
-| **Task record** | The normalized form stored in `task_results.result` (JSONB). Derived from the response; may omit fields, recompute derived values, or canonicalize formats. |
+| **Task record** | The normalized form stored in a typed record table (one table per record type). Derived from the response; may omit fields, recompute derived values, or canonicalize formats. |
 | **Creation strategy** | How tasks for this job type are generated: **pre-populated** or **on-demand** (see below). |
 
 ### Task Request Types
 
-A task request is serialized into the `request` JSONB column of the `tasks` table at task creation time. For pre-populated jobs all requests are written at job creation; for on-demand jobs the request is written at claim time.
+A task request is inserted into a typed request table at task creation time (in the same transaction as the `tasks` row). For pre-populated jobs all requests are written at job creation; for on-demand jobs the request is written at claim time.
 
 Some request types are shared across job types:
 
@@ -264,7 +268,7 @@ A task response is what the worker submits after completing a task. It is valida
 
 ### Task Record Types
 
-A task record is the normalized form stored in the database after a response is accepted. It may omit raw fields, recompute derived values, or canonicalize formats. Task record types may be shared when the stored shape is the same regardless of how the task was generated.
+A task record is the normalized form stored in a typed table after a response is accepted. It may omit raw fields, recompute derived values, or canonicalize formats. Task record types may be shared when the stored shape is the same regardless of how the task was generated.
 
 | Type | Used by |
 |---|---|
@@ -285,13 +289,15 @@ Each job type is a struct implementing the `JobHandler` trait:
 
 ```rust
 pub trait JobHandler {
-    type Request: Serialize;
+    type Request;   // maps to a typed request table row
     type Response: DeserializeOwned;
-    type Record: Serialize;
+    type Record;    // maps to a typed record table row
 
     fn creation_strategy() -> CreationStrategy;
-    fn make_request(task: &Task) -> Self::Request;
-    fn process_response(task: &Task, response: Self::Response) -> Result<Self::Record>;
+    async fn insert_request(pool: &PgPool, task_id: Uuid, req: &Self::Request) -> Result<()>;
+    fn make_request(task_id: Uuid) -> Self::Request;
+    fn process_response(task_id: Uuid, response: Self::Response) -> Result<Self::Record>;
+    async fn insert_record(pool: &PgPool, record: &Self::Record) -> Result<()>;
 }
 
 pub enum CreationStrategy {
@@ -307,7 +313,7 @@ A top-level `JobType` enum dispatches to each concrete handler. The compiler enf
 1. Add a variant to the `JobType` enum and to the `job_type` Postgres enum (migration).
 2. Create a handler struct and implement `JobHandler` with its three associated types.
 3. Add the variant to `JobType`'s match arms — the compiler will reject a build that omits it.
-4. No other changes required. Request, response, and record types serialize to/from the JSONB columns in `tasks` and `task_results`.
+4. Add a migration inserting/selecting from the new typed request and record tables. No other changes required — the compiler enforces all match arms are handled.
 
 ---
 
@@ -326,12 +332,13 @@ Contributors run a client program that polls for tasks, executes them, and submi
 
 ### Language
 
-The client language is undecided — see Action Items. Key considerations:
+**Python.** Chosen for ease of setup across contributor machines — no compilation step required. The client is lightweight and shells out to the word game engine for all computation, so raw client performance is not a concern.
 
-- **Python** — no compilation step, easy for contributors to run on any platform, large ecosystem for scripting. Downside: requires a Python install; slower for CPU-heavy work (though the heavy lifting is done by a subprocess).
-- **Rust** — single compiled binary, no runtime dependency, shares type definitions with the server. Downside: contributors must compile or download a pre-built binary; adds build complexity.
+### Engine Dependency (MAGPIE)
 
-In both cases the client itself is lightweight — it shells out to the word game engine for the actual computation, so raw client performance matters little.
+The worker client shells out to **MAGPIE** ([github.com/jvc56/MAGPIE](https://github.com/jvc56/MAGPIE)) for the actual word game computation. For v1, the contributor or admin supplies a path to a local MAGPIE directory containing an already-compiled MAGPIE executable. The worker client does **not** build, install, fetch, or manage MAGPIE — it only invokes the binary at the given path.
+
+The MAGPIE directory path is a required configuration value for the worker client, provided via a config file or CLI flag (e.g. `--magpie-dir /path/to/MAGPIE`).
 
 ---
 
@@ -369,6 +376,8 @@ All endpoints return JSON. State-mutating endpoints require a valid CSRF token. 
 
 ### Admin API
 
+All Admin API endpoints require the requesting user to have `is_admin = TRUE`. Requests from non-admin authenticated users or anonymous workers are rejected with `403 Forbidden`.
+
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/api/admin/jobs` | Create a new job. Becomes active immediately. |
@@ -404,6 +413,7 @@ CREATE TABLE users (
     email                TEXT NOT NULL UNIQUE,
     password_hash        TEXT NOT NULL,
     email_confirmed_at   TIMESTAMPTZ,
+    is_admin             BOOLEAN NOT NULL DEFAULT FALSE,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -475,8 +485,11 @@ CREATE TYPE job_status AS ENUM (
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_type   job_type NOT NULL,
+    -- Lower value = higher priority. Priority 0 outranks priority 1.
     priority   INT NOT NULL DEFAULT 0,
     allocation INT NOT NULL CHECK (allocation BETWEEN 0 AND 100),
+    -- Number of independent workers that must complete each task. Default 1 = single-claim behavior.
+    redundancy INT NOT NULL DEFAULT 1 CHECK (redundancy >= 1),
     status     job_status NOT NULL DEFAULT 'active',
     config     JSONB NOT NULL DEFAULT '{}',
     created_by      UUID NOT NULL REFERENCES users(id),
@@ -493,26 +506,131 @@ CREATE TABLE tasks (
     job_id               UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     natural_key          TEXT NOT NULL UNIQUE,
     state                task_state NOT NULL DEFAULT 'available',
-    request              JSONB NOT NULL,
-    claim_token          UUID,
-    claimed_at           TIMESTAMPTZ,
-    last_heartbeat_at    TIMESTAMPTZ,
-    claimed_by_user_id   UUID REFERENCES users(id),
-    claimed_by_anon_uuid UUID REFERENCES anonymous_workers(uuid),
-    completed_at         TIMESTAMPTZ,
-    CONSTRAINT claim_has_single_owner CHECK (
-        (claimed_by_user_id IS NOT NULL)::int + (claimed_by_anon_uuid IS NOT NULL)::int <= 1
-    )
+    -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate join/aggregate.
+    accepted_count       INT NOT NULL DEFAULT 0,
+    active_claim_count   INT NOT NULL DEFAULT 0,
+    completed_at         TIMESTAMPTZ
 );
 
 -- Partial indexes to support efficient SKIP LOCKED task selection and timeout reclamation.
 CREATE INDEX tasks_queue_idx   ON tasks (job_id, state) WHERE state = 'available';
-CREATE INDEX tasks_claimed_idx ON tasks (state, claimed_at) WHERE state = 'claimed';
+CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
-CREATE TABLE task_results (
-    task_id      UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-    result       JSONB NOT NULL,
-    submitted_at TIMESTAMPTZ NOT NULL DEFAULT now()
+-- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
+
+CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned');
+
+CREATE TABLE task_claims (
+    id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id              UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    claim_token          UUID NOT NULL,
+    state                claim_state NOT NULL DEFAULT 'claimed',
+    claimed_by_user_id   UUID REFERENCES users(id),
+    claimed_by_anon_uuid UUID REFERENCES anonymous_workers(uuid),
+    claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_heartbeat_at    TIMESTAMPTZ,
+    completed_at         TIMESTAMPTZ,
+    CONSTRAINT claim_has_single_owner CHECK (
+        (claimed_by_user_id IS NOT NULL)::int + (claimed_by_anon_uuid IS NOT NULL)::int = 1
+    )
+);
+
+-- Prevent a single identity from filling more than one non-abandoned slot on the same task.
+CREATE UNIQUE INDEX task_claims_user_unique_idx
+    ON task_claims (task_id, claimed_by_user_id)
+    WHERE state != 'abandoned';
+CREATE UNIQUE INDEX task_claims_anon_unique_idx
+    ON task_claims (task_id, claimed_by_anon_uuid)
+    WHERE state != 'abandoned';
+
+-- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
+
+CREATE TABLE position_requests (
+    task_id     UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    lexicon     TEXT NOT NULL,
+    variant     TEXT NOT NULL,
+    position    TEXT NOT NULL   -- encoded board + rack (e.g. GCG format)
+);
+
+CREATE TABLE seed_requests (
+    task_id         UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    lexicon         TEXT NOT NULL,
+    variant         TEXT NOT NULL,
+    seed            BIGINT NOT NULL,
+    num_games       INT NOT NULL DEFAULT 1,
+    player1_type    TEXT NOT NULL,
+    player2_type    TEXT NOT NULL
+);
+
+CREATE TABLE static_game_requests (
+    task_id         UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    lexicon         TEXT NOT NULL,
+    variant         TEXT NOT NULL,
+    game_gcg        TEXT NOT NULL,  -- full game record in GCG format
+    player1_type    TEXT NOT NULL,
+    player2_type    TEXT NOT NULL
+);
+
+CREATE TABLE leave_requests (
+    task_id     UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    lexicon     TEXT NOT NULL,
+    variant     TEXT NOT NULL,
+    iteration   INT NOT NULL
+);
+
+-- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
+-- task_id is denormalized here for efficient job-results queries without joining through task_claims.
+
+CREATE TABLE position_analysis_records (
+    task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    best_move       TEXT NOT NULL,
+    best_score      INT NOT NULL,
+    best_equity     DOUBLE PRECISION NOT NULL,
+    num_moves       INT NOT NULL,
+    artifact_key    TEXT,           -- S3 key for full ranked move list
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Top moves stored relationally for querying; full list is in S3 via artifact_key.
+CREATE TABLE position_analysis_moves (
+    id              BIGSERIAL PRIMARY KEY,
+    task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    rank            SMALLINT NOT NULL,
+    move            TEXT NOT NULL,
+    score           INT NOT NULL,
+    equity          DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX position_analysis_moves_task_idx ON position_analysis_moves (task_id);
+
+CREATE TABLE game_records (
+    task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    score1          INT NOT NULL,
+    score2          INT NOT NULL,
+    winner          SMALLINT NOT NULL CHECK (winner IN (0, 1, 2)),  -- 0 = draw
+    num_turns       INT NOT NULL,
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE game_pair_records (
+    task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    score1_game1    INT NOT NULL,
+    score2_game1    INT NOT NULL,
+    score1_game2    INT NOT NULL,
+    score2_game2    INT NOT NULL,
+    winner          SMALLINT NOT NULL CHECK (winner IN (0, 1, 2)),  -- 0 = tie
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Full leave tables are large binary data; store in S3 and reference by key.
+CREATE TABLE leave_records (
+    task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    artifact_key    TEXT NOT NULL,
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- ELO ratings
@@ -547,8 +665,12 @@ CREATE TABLE audit_log (
 
 - Define the preendgame task subdivision algorithm.
 - Define the dashboard scope for each job type.
-- Decide the worker client language: Python (easy to run, no compilation) vs Rust (single binary, shares server types) vs other.
-- Decide whether the task request, task response, and task record should all be stored in a single `tasks` row or split across tables.
+- Define exact `natural_key` composition per task type (must guarantee global uniqueness without collisions across jobs).
+- Clarify whether CSRF protection is scoped to session-cookie endpoints only (excluding the bearer-token/anon-UUID worker API).
+- Define rate limiting / abuse prevention for public unauthenticated endpoints (registration, anonymous worker claim/result).
+- Decide deployment mechanics: single container vs. sidecar containers for Axum + SvelteKit on ECS; migration tooling; observability (logging/metrics/tracing).
+- Define exact `config` JSONB shape per job type, and SPRT/ELO parameters (alpha, beta, ELO bounds, K-factor) and where they are configured.
+- Define what triggers automatic job completion for SPRT-driven job types (who evaluates SPRT significance, and when).
 
 ---
 
@@ -560,6 +682,10 @@ CREATE TABLE audit_log (
 - **Fleet mode** — a flag that makes the worker exit cleanly on error or empty queue, enabling orchestrators (systemd, Docker, CI) to manage its lifecycle.
 - **Global artifact cache** — multiple workers on the same machine or network share downloaded dictionaries and bot binaries rather than each fetching independently.
 - **Hardware-aware binary selection** — workers report CPU capabilities and download or compile the appropriate binary variant for their architecture.
+
+### Configuration
+
+- **Per-job-type (or per-job) heartbeat timeout** — the heartbeat timeout window is a single global constant for v1. A future improvement could make it configurable per job type or per individual job.
 
 ### Scaling
 
