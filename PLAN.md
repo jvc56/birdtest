@@ -857,8 +857,10 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 
 ```
 birdtest/
+├── docker-compose.yml               # local Postgres + MinIO (S3 stub) for development — see Development
 ├── backend/                        # Axum web server (Rust)
 │   ├── Cargo.toml
+│   ├── .env.example                # DATABASE_URL, SESSION_SIGNING_KEY, MAIL_BACKEND=console, etc. for local dev
 │   ├── migrations/                 # sqlx migration files
 │   │   └── 0001_initial.sql
 │   └── src/
@@ -1388,6 +1390,114 @@ CREATE TABLE audit_log (
 ### Scaling
 
 - **Primary/secondary server split** — one instance owns task scheduling and mutations; read-only instances serve the dashboard. Eliminates concurrent scheduling conflicts under high worker load.
+
+---
+
+## Development
+
+Everything needed to run birdtest locally — backend, frontend, and a worker doing real work against it — runs on a laptop with no AWS access. AWS services (SES, SSM, S3) are stubbed or swapped for local equivalents in dev; only the deployed environment touches real AWS.
+
+### Prerequisites
+
+| Tool | Used for |
+|---|---|
+| Rust (stable, via `rustup`) + `sqlx-cli` (`cargo install sqlx-cli`) | Backend build and migrations |
+| Node.js (LTS) + `npm` | Frontend |
+| Docker / Docker Compose | Local Postgres |
+| Python 3.11+ | Worker client |
+| A compiled MAGPIE binary (see [Engine Dependency (MAGPIE)](#engine-dependency-magpie)) | Worker client's actual computation — clone and build [MAGPIE](https://github.com/jvc56/MAGPIE) separately per its own README; birdtest does not vendor or build it |
+
+### 1. Database
+
+A `docker-compose.yml` at the repo root brings up Postgres on the standard port with a fixed local user/password/db name (`birdtest`/`birdtest`/`birdtest`), so `DATABASE_URL` is the same for every contributor:
+
+```yaml
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: birdtest
+      POSTGRES_PASSWORD: birdtest
+      POSTGRES_DB: birdtest
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+volumes:
+  pgdata:
+```
+
+```bash
+docker compose up -d postgres
+```
+
+### 2. Backend
+
+```bash
+cd backend
+cp .env.example .env        # DATABASE_URL, session signing key, etc. — see below
+sqlx migrate run            # applies backend/migrations/ against the local DB
+cargo run                   # serves on http://localhost:8080 by default
+```
+
+`config.rs` reads from environment variables in dev instead of AWS SSM Parameter Store (SSM is only consulted when an `AWS_REGION`/task-role environment indicates it's actually running in ECS). `.env.example` documents every variable the backend needs locally:
+
+| Variable | Local default | Notes |
+|---|---|---|
+| `DATABASE_URL` | `postgres://birdtest:birdtest@localhost:5432/birdtest` | Matches the Compose service above |
+| `SESSION_SIGNING_KEY` | a fixed dev-only key committed in `.env.example` | Never the real key; rotated per environment in SSM for staging/prod |
+| `MAIL_BACKEND` | `console` | In `console` mode, confirmation codes and password-reset links are logged to stdout instead of sent via SES — there is no local SES equivalent, and standing up a real mail sink isn't worth it for dev. `MAIL_BACKEND=ses` (with real AWS credentials) is available for testing the SES path specifically. |
+| `DATA_PATH` | `../data` | Points at the mirrored `data/letterdistributions/` used for opening-rack enumeration |
+| `RUST_LOG` | `birdtest=debug,tower_http=debug` | Standard `tracing` env filter |
+
+S3 (artifact storage for full move lists, leave files, rack-equity CSVs) is stubbed with [MinIO](https://min.io/) in dev — add a `minio` service to the same `docker-compose.yml`, exposed S3-API-compatible on `localhost:9000`, and point the backend's `S3_ENDPOINT` env var at it. The AWS SDK works unmodified against MinIO; no separate code path is needed.
+
+### 3. Frontend
+
+```bash
+cd frontend
+npm install
+npm run dev                 # serves on http://localhost:5173, proxying /api/* to :8080 (see vite.config.ts)
+```
+
+`vite.config.ts`'s dev server proxy means the frontend never needs its own copy of API base-URL configuration in dev — it talks to whatever `npm run dev`'s proxy target points at, defaulting to the backend's `localhost:8080`.
+
+### 4. Worker client
+
+```bash
+cd worker
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .
+python worker.py --server-url http://localhost:8080 --magpie-dir /path/to/MAGPIE
+```
+
+The worker needs an actual admin-created, activated job to have anything to claim (see step 5) — with no active job, `_claim_task` just gets 204s and the worker sleeps in its retry loop, which is expected and not an error.
+
+### 5. Seeding a local admin and a first job
+
+There's no seed script needed for the minimum path — the first registered user isn't automatically an admin (avoids a footgun where every dev DB has an implicit admin), so promotion is a one-line manual step against the local DB:
+
+```bash
+# 1. Register normally through the frontend (or POST /api/auth/register), then confirm
+#    the email — MAIL_BACKEND=console means the confirmation code is in the backend's
+#    stdout log rather than an inbox.
+# 2. Promote that user to admin directly in Postgres (no API for this by design —
+#    is_admin is not settable through any endpoint):
+psql "$DATABASE_URL" -c "UPDATE users SET is_admin = true WHERE username = 'you';"
+```
+
+From there, use the now-admin account's session to create a player config and a job through `/admin/player-configs/new` and `/admin/jobs/new` (or the equivalent `POST /api/admin/...` calls directly), then activate the job with an allocation via `/api/admin/jobs/:id/activate`. Once a job is active, the worker client from step 4 will start claiming and completing real tasks against it, and the dashboard at `http://localhost:5173/jobs/:id` updates live via SSE — this is the fastest way to confirm a full change (backend, frontend, and worker together) actually works end to end.
+
+### Running the automated suites
+
+See [Testing](#testing) for what each suite covers; day-to-day, from each component's directory:
+
+```bash
+cd backend && cargo test                 # unit + Postgres-backed integration tests (needs docker compose up -d postgres)
+cd worker   && pytest                    # unit tests against a mocked MAGPIE/HTTP layer, no real MAGPIE binary needed
+cd frontend && npm run test              # Vitest component tests
+cd frontend && npm run test:e2e          # Playwright, needs the backend and a seeded DB running (see script in package.json)
+```
 
 ---
 
