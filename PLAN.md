@@ -21,7 +21,7 @@ Each job has a **priority** and a **percentage allocation**. Priority takes prec
 
 #### Job Lifecycle Controls
 
-Jobs are created by admins and become active immediately. The following states are supported:
+Jobs are created by admins in the **inactive** state and only start receiving work once explicitly activated. The following states are supported:
 
 - **active** — workers are assigned tasks from this job normally.
 - **inactive** — the job exists and retains all its tasks and results, but workers are not assigned tasks from it. Admins can reactivate it at any time.
@@ -29,7 +29,7 @@ Jobs are created by admins and become active immediately. The following states a
 
 Jobs are created in the **inactive** state. Allocation is not set at creation time — it is supplied by the admin when they activate the job. This keeps the allocation budget coherent: an admin reviews the full set of active jobs, decides the new job's share, and activates it with a specific percentage in a single action.
 
-Admins can deactivate, reactivate, purge (clear all results and return tasks to unclaimed), force-complete, or delete a job at any time.
+Admins can deactivate, reactivate, purge (clear all results and return tasks to `available`), force-complete, or delete a job at any time.
 
 ---
 
@@ -74,7 +74,7 @@ Task generation is job-type-dependent:
 ### Workflow
 
 1. The worker sends a **task claim** to the server — a minimal message identifying itself and signaling it is ready for work.
-2. The system selects a job by priority tier (lowest integer value = highest priority, descending). Within the top available tier, the job chosen is the one **most behind its configured allocation share** — specifically, the active job with the lowest ratio of `tasks_dispatched / allocation`, where `tasks_dispatched` is the total non-abandoned claims ever issued for that job. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
+2. The system selects a job by priority tier (lowest integer value = highest priority, descending). Within the top available tier, the job chosen is the one **most behind its configured allocation share** — specifically, the active job with the lowest ratio of `tasks_dispatched / allocation`, where `tasks_dispatched` is the total count of claims ever issued for that job, **including abandoned ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so this count only ever goes up (a claim row, once inserted, is never deleted, only re-stated). Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 3. Expired claims for the selected job are lazily reclaimed: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`.
 4. The system acquires the next task (pre-populated or on-demand, depending on the job type), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
@@ -301,7 +301,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
 
 1. **Auth and verification**: The server reads the worker identity from request headers (`Authorization: Bearer <api-key>` for authenticated workers, `X-Worker-UUID` for anonymous workers). It verifies the worker is not banned and upserts the worker record (`users` or `anonymous_workers`).
 
-2. **Job selection**: The server filters to active jobs (excluding inactive and completed), then selects by priority tier — lowest integer value first (priority `0` outranks priority `1`). Within the top available tier, the server selects the job with the lowest ratio of `tasks_dispatched / allocation` — the job most behind its configured share. `tasks_dispatched` is the total number of non-abandoned claims ever issued for the job (a count that only goes up). Ties break on `created_at ASC`. This is implemented as a single SQL `ORDER BY` query; no randomness is involved.
+2. **Job selection**: The server filters to active jobs (excluding inactive and completed), then selects by priority tier — lowest integer value first (priority `0` outranks priority `1`). `$min_priority` is computed by a preceding `SELECT MIN(priority) FROM jobs WHERE status = 'active'` (a job with no active jobs at all returns no work). Within the top available tier, the server selects the job with the lowest ratio of `tasks_dispatched / allocation` — the job most behind its configured share. `tasks_dispatched` is the total count of claims ever issued for the job, **including abandoned ones** — every claim row consumed dispatch capacity at the moment it was inserted, so counting all of them (rather than filtering by state) is what keeps this monotonic; excluding abandoned claims would let it shrink as timeouts accrue and would unfairly favor jobs with flaky workers. Ties break on `created_at ASC`. This is implemented as a single SQL `ORDER BY` query; no randomness is involved.
 
    ```sql
    SELECT j.id
@@ -310,7 +310,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
    ORDER BY
      (SELECT COUNT(*) FROM task_claims tc
       JOIN tasks t ON t.id = tc.task_id
-      WHERE t.job_id = j.id AND tc.state != 'abandoned')::float
+      WHERE t.job_id = j.id)::float
      / NULLIF(j.allocation, 0) ASC,
      j.created_at ASC
    LIMIT 1
@@ -591,12 +591,18 @@ def _get_magpie_version(cfg: Config) -> str:
     )
     return result.stdout.strip()
 
+def _parse_semver(version: str) -> tuple[int, ...]:
+    """Parses a "X.Y.Z" string into a tuple of ints for correct numeric comparison —
+    plain string comparison is wrong here ("1.10.0" < "1.9.0" as strings)."""
+    return tuple(int(part) for part in version.split("."))
+
 def _claim_task(cfg: Config) -> Optional[dict]:
     """POST /api/worker/task. Returns parsed body, or None on 204 (no work available)."""
     ...
 
-def _send_heartbeat(cfg: Config, claim_token: str, progress: Optional[dict] = None) -> None:
-    """POST /api/worker/heartbeat. `progress` carries leave-gen rack data when set."""
+def _send_heartbeat(cfg: Config, claim_token: str) -> None:
+    """POST /api/worker/heartbeat. Pure liveness ping — no payload; leave-gen progress
+    is derived server-side from accepted task results, not from heartbeats."""
     ...
 
 def _submit_result(cfg: Config, claim_token: str, result: dict) -> None:
@@ -640,11 +646,10 @@ def _heartbeat_loop(
     cfg: Config,
     claim_token: str,
     stop: threading.Event,
-    progress_fn,  # () -> Optional[dict]; leave-gen supplies live rack data, others return None
 ) -> None:
     while not stop.wait(timeout=cfg.heartbeat_interval):
         try:
-            _send_heartbeat(cfg, claim_token, progress=progress_fn())
+            _send_heartbeat(cfg, claim_token)
         except Exception:
             logger.warning("Heartbeat failed", exc_info=True)
 
@@ -665,7 +670,9 @@ def _worker_loop(cfg: Config, magpie_version: str) -> None:
         min_ver = response.get("min_magpie_version")
 
         # 2. Version gate — skip task if MAGPIE is too old; claim expires server-side
-        if min_ver and magpie_version < min_ver:
+        # Compared as a tuple of ints (_parse_semver), not string order: "1.10.0" < "1.9.0"
+        # as strings, which is backwards.
+        if min_ver and _parse_semver(magpie_version) < _parse_semver(min_ver):
             logger.error(
                 "MAGPIE %s < required %s for this job; skipping task", magpie_version, min_ver
             )
@@ -677,7 +684,7 @@ def _worker_loop(cfg: Config, magpie_version: str) -> None:
         stop = threading.Event()
         hb = threading.Thread(
             target=_heartbeat_loop,
-            args=(cfg, claim_token, stop, lambda: None),
+            args=(cfg, claim_token, stop),
             daemon=True,
         )
         hb.start()
@@ -729,7 +736,7 @@ if __name__ == "__main__":
 
 ## API
 
-All endpoints return JSON. State-mutating endpoints require a valid CSRF token. Worker endpoints accept either an `Authorization: Bearer <api-key>` header (authenticated workers) or no auth header plus an `X-Worker-UUID` header (anonymous workers).
+All endpoints return JSON. State-mutating, session-cookie-backed endpoints (Auth, Account, Admin APIs) require a valid CSRF token; Worker API endpoints are exempt despite also being state-mutating, since they authenticate via bearer token or `X-Worker-UUID` rather than a cookie a browser would send automatically — see [Security](#security) for the full rationale. Worker endpoints accept either an `Authorization: Bearer <api-key>` header (authenticated workers) or no auth header plus an `X-Worker-UUID` header (anonymous workers).
 
 ### Worker API
 
@@ -771,11 +778,11 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `POST` | `/api/admin/player-configs` | Create a new player configuration. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job references it. |
-| `POST` | `/api/admin/jobs` | Create a new job. Becomes active immediately. |
+| `POST` | `/api/admin/jobs` | Create a new job. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. |
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. |
-| `POST` | `/api/admin/jobs/:id/purge` | Purge all results for a job and return tasks to unclaimed. |
+| `POST` | `/api/admin/jobs/:id/purge` | Purge all results for a job and return tasks to `available`. |
 | `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account and all their task claims and records. |
 | `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. |
@@ -1194,10 +1201,6 @@ CREATE TABLE task_claims (
     claimed_by_anon_uuid UUID REFERENCES anonymous_workers(uuid),
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_heartbeat_at    TIMESTAMPTZ,
-    -- For leave generation: the worker reports the bottleneck rack and its occurrence count
-    -- with each heartbeat so the dashboard can show generation progress.
-    progress_rack        TEXT,
-    progress_occurrences INT,
     completed_at         TIMESTAMPTZ,
     CONSTRAINT claim_has_single_owner CHECK (
         (claimed_by_user_id IS NOT NULL)::int + (claimed_by_anon_uuid IS NOT NULL)::int = 1
