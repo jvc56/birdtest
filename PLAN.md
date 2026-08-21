@@ -212,7 +212,7 @@ Shows all jobs with: job type, status, priority, allocation, and a completion co
 **Leave generation**
 
 - Current generation number and the configured per-generation minimum rack target (e.g., "Generation 3 — target: 500 occurrences per rack").
-- The rack with the fewest occurrences in the current generation and its current count — shows how far the generation is from completing.
+- The rack with the fewest occurrences *within the in-progress generation* and its current count, live-updated on every accepted task result via SSE — sourced from `leave_rack_progress`, not from a single worker's heartbeat (see [Leave Generation — On-demand, partitioned generations](#leave-generation--on-demand-partitioned-generations)).
 
 ---
 
@@ -424,25 +424,27 @@ Same as games, except the batch size is `pairs_per_batch` from the job config. E
 
 ---
 
-#### Leave Generation — On-demand, sequential generations
+#### Leave Generation — On-demand, partitioned generations
 
-Leave generation has sequential phases: generation N must complete before generation N+1 begins. Within a generation, work is done by a single worker running the full generation (multiple parallel workers per generation is not supported in v1). Each task represents one generation.
+Leave generation has sequential phases: generation N must complete before generation N+1 begins. Within a generation, work is **partitioned across many parallel workers**: each task forces a different subset of the racks that still need occurrences for the current generation (MAGPIE's `-forceracksfile`) and plays a bounded batch of games. A generation is not "one worker, one task" — it's many small tasks that collectively drive every rack up to the configured per-generation occurrence target.
 
-**State**: The job tracks which generation is currently in progress via the completed task count. The output of each generation (a leave file) is stored in S3 and referenced by `leave_records.artifact_key`. The next generation's task receives the previous generation's artifact key as input.
+**State**: Per-rack occurrence progress *within* the current generation is tracked directly in Postgres, in `leave_rack_progress (job_id, generation, rack, occurrence_count, equity_sum)`, updated transactionally as each task result is accepted (see below) — this is what makes live, sub-generation dashboard progress possible without needing anything from MAGPIE beyond what already exists. The output of a *completed* generation (a combined KLV, built server-side once every rack has reached target — see Aggregation below) is stored in S3 and referenced by `leave_generation_artifacts.artifact_key`; the next generation's tasks receive that artifact key as input.
 
 At claim time:
-1. Count completed `leave_generation` tasks for this job → `completed_generations`.
-2. If `completed_generations == configured_generation_count` → no work; the job should already be marked complete.
-3. If any `task_claims` row for this job has `state = 'claimed'` → a generation is already in progress; return "no work" (only one task in-flight at a time).
-4. Determine `next_generation = completed_generations + 1` and find `previous_artifact_key` from the most recent `leave_records` row (NULL for generation 1 — worker uses the lexicon's default leaves).
-5. `INSERT INTO tasks (job_id, seed=NULL, state='claimed', active_claim_count=1) RETURNING id`.
-6. `INSERT INTO leave_requests (task_id, lexicon, variant, iteration=$next_generation)`.
-7. `INSERT INTO task_claims (...)`.
-8. Return the request, including `previous_artifact_key` so the worker knows which leave file to seed from.
+1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and `configured_generation_count` generations are already done, return "no work."
+2. Query `leave_rack_progress` for `(job_id, current_generation)`, ordered by `occurrence_count ASC`, and pick up to `racks_per_task` racks below `target_rack_count` (racks with no row yet count as 0). If none are below target *and* no `task_claims` row for this generation is still `claimed`, the generation is complete — run generation transition (below) instead of dispatching a task.
+3. `INSERT INTO tasks (job_id, seed=NULL, state='claimed', active_claim_count=1) RETURNING id`.
+4. `INSERT INTO leave_requests (task_id, lexicon, variant, generation, forced_racks)` — `forced_racks` is the chosen rack subset (see Schema); `previous_artifact_key` (the prior generation's combined KLV, NULL for generation 1) is included in the response.
+5. `INSERT INTO task_claims (...)`.
+6. Return the request and claim token.
 
-**Worker behaviour**: The worker downloads the previous generation's leave file from S3 (or uses the built-in default for generation 1), invokes MAGPIE's `autoplay` command with leave-generation parameters for the configured number of games, then uploads the resulting leave file to S3 and submits the key as the result.
+**Worker behaviour**: The worker downloads the previous generation's combined leave file from S3 (or uses the lexicon's default leaves for generation 1), writes the forced-rack subset to a local file, invokes `autoplay` with `-forceracksfile <file> -writerackequitycsv true` for the configured batch of games, then uploads the resulting `<rack>,<count>,<mean>` CSV to S3 and submits the key **plus an inline `{rack, count, mean}` summary for just its forced racks** as the `LeaveResponse` — small and bounded, so the server can update `leave_rack_progress` synchronously on result submission without a round trip to S3.
 
-**Dashboard progress**: The rack-with-fewest-occurrences display requires the worker to report intermediate progress. Workers include a `progress` payload with their heartbeat (`POST /api/worker/heartbeat`) containing the current minimum rack occurrence count and the rack string. The server stores this on the in-progress `task_claims` row for display.
+**On result acceptance**: within the same transaction that accepts the task result, for each `{rack, count, mean}` in the response, upsert into `leave_rack_progress`: `occurrence_count += count`, `equity_sum += count * mean`. This is what drives the live dashboard figure — no heartbeat involved.
+
+**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into a `rack,value` CSV (`value = equity_sum / occurrence_count` per rack — this is the format `magpie convert csv2klv` expects, distinct from the `rack,count,mean` format workers upload) and runs `magpie convert csv2klv` to produce the generation's combined KLV, uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete. This conversion is a small, synchronous, server-side operation — the recommended approach is linking `libmagpie` into the Rust backend via FFI over the `cmd_api.c` C API rather than dispatching it as a worker task, since it needs no game simulation, just a deterministic file conversion. This does mean the backend container needs `libmagpie` and lexicon data available at runtime, alongside the existing `data/letterdistributions/` dependency — call out in Tech Stack / ECS if adopted.
+
+**Dashboard progress**: because progress is now driven by many small task completions across possibly many workers rather than one long-running worker, the rack-with-fewest-occurrences figure ([Leave generation](#leave-generation) job detail bullet) is live and derived directly from `leave_rack_progress`, updating on every accepted task result via the existing per-job SSE stream — no heartbeat payload is needed.
 
 ### Rust Implementation
 
@@ -618,7 +620,9 @@ def _handle_game_pair(request: dict, cfg: Config) -> dict:
     ...
 
 def _handle_leave_gen(request: dict, cfg: Config) -> dict:
-    """Download previous-gen leaves from S3, run autoplay, upload result, return S3 key."""
+    """Download previous-gen leaves from S3, write the forced-rack subset to a local
+    file, run autoplay with -forceracksfile, upload the resulting rack-equity CSV,
+    and return its S3 key plus the inline {rack, count, mean} summary."""
     ...
 
 _HANDLERS = {
@@ -1231,10 +1235,25 @@ CREATE TABLE game_requests (
 );
 
 CREATE TABLE leave_requests (
-    task_id     UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-    lexicon     TEXT NOT NULL,
-    variant     TEXT NOT NULL,
-    iteration   INT NOT NULL
+    task_id             UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    lexicon             TEXT NOT NULL,
+    variant             TEXT NOT NULL,
+    generation          INT NOT NULL,
+    forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (see rack_list_create's forceracksfile)
+    previous_artifact_key TEXT             -- combined KLV from generation - 1; NULL for generation 1
+);
+
+-- Live per-rack occurrence progress for the in-progress generation of a leave-gen job.
+-- Upserted transactionally on every accepted leave task result; drives both generation-transition
+-- detection (all racks >= target) and the live dashboard figure.
+CREATE TABLE leave_rack_progress (
+    job_id           UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation       INT NOT NULL,
+    rack             TEXT NOT NULL,
+    occurrence_count BIGINT NOT NULL DEFAULT 0,
+    equity_sum       DOUBLE PRECISION NOT NULL DEFAULT 0,  -- occurrence_count-weighted; equity_sum / occurrence_count = mean
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, generation, rack)
 );
 
 -- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
@@ -1295,12 +1314,25 @@ CREATE TABLE game_pair_records (
     submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Full leave tables are large binary data; store in S3 and reference by key.
+-- One row per accepted leave task (a single worker's forced-rack partition of a generation).
+-- artifact_key points to that worker's own "<rack>,<count>,<mean>" CSV in S3 (kept for audit/rebuild);
+-- the {rack, count, mean} summary from the same submission is what's folded into leave_rack_progress.
 CREATE TABLE leave_records (
     task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     artifact_key    TEXT NOT NULL,
     submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One row per completed generation: the server-built combined KLV (see Aggregation in
+-- "Leave Generation — On-demand, partitioned generations"), not tied to any single task_claim
+-- since it's produced by the server from all of that generation's leave_rack_progress rows.
+CREATE TABLE leave_generation_artifacts (
+    job_id        UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation    INT NOT NULL,
+    artifact_key  TEXT NOT NULL,
+    completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, generation)
 );
 
 -- Glicko ratings per (player_config, job) pair
@@ -1356,24 +1388,44 @@ CREATE TABLE audit_log (
 
 ---
 
-## Required MAGPIE Changes
+## Testing
 
-MAGPIE requires the following additions to be compatible with birdtest. These changes should be made in the [MAGPIE repository](https://github.com/jvc56/MAGPIE) and versioned with semver so birdtest can enforce `min_magpie_version` per job.
+Every component — backend, worker client, and frontend — carries a coverage gate enforced in CI: a build fails if coverage drops below 100% (line and branch, per the tool's definition) on any component's own tracked source tree. Reaching and holding that number honestly (not by writing assertion-free tests that merely execute lines) is a deliberate combination of the practices below, not a single tool setting.
 
-### `version` command
+### Coverage Enforcement
 
-MAGPIE currently has no way to report its version. Add a `version` command (invocable as `magpie version`) that prints a single semver string to stdout and exits with code 0:
+| Component | Framework | Coverage tool | Gate |
+|---|---|---|---|
+| Backend (Rust/Axum) | `cargo test` (unit + integration) | `cargo llvm-cov` | `cargo llvm-cov --fail-under-lines 100 --fail-under-branch 100` in CI |
+| Worker client (Python) | `pytest` | `pytest-cov` (branch mode) | `pytest --cov=worker --cov-branch --cov-fail-under=100` in CI |
+| Frontend (SvelteKit) | Vitest (unit/component) + Playwright (e2e) | `@vitest/coverage-v8`, merged with Playwright's Istanbul instrumentation | `vitest run --coverage.thresholds.100` in CI |
 
-```
-1.4.0
-```
+**Guarding against hollow coverage**: line/branch coverage alone can be satisfied by tests with no real assertions. To catch that, mutation testing runs as a separate (non-blocking-per-PR, scheduled) CI job — `cargo-mutants` for the backend, `mutmut` for the worker client — and a low mutation-kill score on a file is treated as a signal that its "100%" is fake and needs real assertions, not just execution.
 
-The birdtest worker calls this once at startup (`_get_magpie_version`) to cache the version for per-task compatibility checks.
+**Pragmatic exclusions**: a small, explicitly annotated allowlist is permitted for code that is either truly unreachable in-process (`log_fatal`-style panics guarding invariants already enforced by types, `main()`'s top-level wiring) or environment-dependent in a way no test double can honestly exercise (a `SIGTERM` handler's OS-level effect). Every exclusion is a named `#[coverage(off)]` / `# pragma: no cover` annotation with a one-line justification in the same commit — an unannotated gap fails CI same as any other. This keeps "100%" meaning "100% of code we chose to write and can meaningfully test," not "100% of every syntactic branch the compiler can theoretically emit."
 
-### Additional changes (to be identified during implementation)
+### Backend
 
-Further integration requirements will be discovered as the worker handlers are implemented. Known areas likely to require changes:
+- **Unit tests** cover pure logic in isolation: SPRT LLR/boundary computation, Glicko-2 rating updates, the deficit-based job-selection ratio math, task-state derivation from `(accepted_count, active_claim_count, redundancy)`, rack-occurrence weighted-mean aggregation (`equity_sum / occurrence_count`), API-key/session hashing helpers, and request/response (de)serialization for every job type's typed tables. These run with no DB and no network, so they're also what CI runs first (fail fast).
+- **Integration tests** run against a real, ephemeral Postgres per test run (via `testcontainers-rs`, migrated with the same `sqlx migrate run` path production uses) rather than mocks — the task claim/reclaim/submit cycle is concurrency-sensitive (`SELECT ... FOR UPDATE SKIP LOCKED`, claim-token races, lazy heartbeat reclamation) and a mocked pool can't exercise real lock contention or the unique-index conflict path in on-demand task creation. Each `JobHandler` implementation gets a full-cycle integration test: create job → claim → submit → verify record + counters, for every creation strategy (pre-populated and on-demand) and every job type.
+- **Concurrency/race tests**: multiple simulated workers claiming concurrently against the same job (particularly the seed-gap allocation for games/game-pairs and the `leave_rack_progress` upsert path for leave-gen) to verify no duplicate seeds, no lost updates, and correct behavior when two workers race to create the same on-demand task (one wins, one retries).
+- **Endpoint/contract tests** exercise every route in [API](#api) through the real Axum router (via `tower::ServiceExt::oneshot`, no separate server process) — auth flows including CSRF and rate-limit behavior, admin authorization checks (403 for non-admins), and pagination/filtering on the public API.
+- **Migration tests**: every migration is tested both forward (applies cleanly to the previous migration's schema) and, where a down-migration exists, in reverse; a migration that can't run against a freshly seeded prior-version test DB fails CI before it fails staging.
+- **SPRT/Glicko correctness**: golden-value tests against hand-computed or reference-implementation expected values (not just "it runs"), since these are the two places a subtly wrong formula would silently produce wrong job outcomes rather than crashing.
 
-- **Structured / machine-readable output** — the worker needs to reliably parse autoplay and analysis results. If MAGPIE's current output format is human-readable text, a JSON or CSV output mode may be needed.
-- **Rack occurrence reporting for leave generation** — the worker needs to extract per-rack occurrence counts from an autoplay run to report progress via heartbeat. MAGPIE may need a flag to emit this data.
-- **Non-interactive (scripted) execution mode** — `autoplay` and position analysis must run to completion without requiring interactive input. Confirm that the existing `-mo` / `mode` option covers this, or add a dedicated batch mode.
+### Worker Client
+
+- MAGPIE itself is treated as an external dependency and is not what's under test here — `subprocess.run` (or the `libmagpie` FFI call, if the client migrates to it) is mocked/faked so worker unit tests are fast and don't require a MAGPIE build. Fakes return canned structured (`-hr`-off) output covering both the happy path and every documented error shape (non-zero exit, malformed output line, missing expected field) for each of `_handle_opening_rack`, `_handle_game`, `_handle_game_pair`, and `_handle_leave_gen`.
+- **HTTP layer** is tested against a local mock server (`responses` or a `pytest`-scoped `httpx` transport mock) covering claim/heartbeat/result/version-check round trips, including the 204-no-work and stale-claim-token paths, and the self-update re-exec flow (`_check_for_self_update`) with a fake newer-version response.
+- **One real end-to-end suite** (separate from the unit/coverage-gated suite, run nightly rather than per-PR) builds an actual MAGPIE binary from the pinned `min_magpie_version` commit and runs the worker against it for one real task of each job type, plus one full real leave-gen partition-task cycle, to catch drift between MAGPIE's actual output format and the client's parsing — this is what would have caught a MAGPIE-side format regression that mocks structurally cannot.
+- **Golden-file tests** for output parsing: a corpus of real captured MAGPIE stdout (checked into `worker/testdata/`) for each recorder type is parsed and asserted against expected structured results, so a MAGPIE output-format change shows up as a diff against a committed fixture rather than a silent misparse.
+
+### Frontend
+
+- **Component tests** (Vitest + `@testing-library/svelte`) for every component in `lib/components/` and every route's business logic (form validation, SSE-driven state merges, auth-guard redirects) in isolation from the network via a typed fetch mock matching `lib/api.ts`.
+- **End-to-end tests** (Playwright) drive full user flows against the real backend running in a test/dev configuration with a seeded Postgres: registration → email confirmation → login, API key generation/rotation, admin job creation → activation → dashboard live-update via SSE, and the full worker-visible flow (a scripted fake worker hitting the real Worker API) reflected on the dashboard within one SSE tick.
+- **Accessibility and responsive checks** are folded into the same Playwright suite (`axe-core` assertions per page, viewport-width smoke tests) rather than a separate track, since the dashboard is the only user-facing surface.
+
+### CI Structure
+
+Per-PR: fast unit tests + coverage gate (blocking) for all three components, run in parallel. Integration tests (DB-backed, Playwright e2e) run blocking but after unit tests pass, to keep feedback fast on the common failure. Nightly: the real-MAGPIE worker e2e suite, mutation testing, and a full migration-history replay from an empty database — these are slower and more environment-sensitive, so they gate `main` health rather than every PR, with failures surfaced as an alert rather than a blocked merge.
