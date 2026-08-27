@@ -352,11 +352,51 @@ Small, because the HTTP API does not change:
   one record per game with `score1`, `score2`, `winner`, `num_turns` — is what
   the `gamelog` recorder produces, so the mismatch discovered against the
   subprocess client resolves without changing the schema.
-- **Testing loses its Docker worker.** The compose `worker` profile was going to
-  be how local runs exercised the real client. Its replacement is either a
-  MAGPIE build in the test image, or a small scripted fake worker that speaks
-  the HTTP API without MAGPIE — worth keeping regardless, since it makes
-  scheduler and dashboard tests fast and MAGPIE-free.
+### The client stops being birdtest's code
+
+This is the part with the widest blast radius, and it is organisational as much
+as technical. Today the client is birdtest's: same repo, same PR, same CI, same
+review. Afterwards it is MAGPIE's, and the HTTP API becomes a **cross-repo
+integration boundary** between two independently released programs.
+
+Consequences worth planning for rather than discovering:
+
+- A client bug is a MAGPIE bug — filed there, fixed there, released on MAGPIE's
+  cadence, and only reaching contributors when they update MAGPIE.
+- A server change that alters the worker API can break every deployed client.
+  `min_magpie_version` per job is a floor, not a ceiling, so it does not stop an
+  *old server* from confusing a *new client*. Either the worker API gets an
+  explicit version, or it gets treated as frozen and only extended additively.
+- Nothing in either repo currently pins the contract. It exists implicitly in
+  `worker.py` and `routes/worker.rs` agreeing. Once they are in different repos
+  that agreement needs to be written down and checked — a committed set of
+  request/response fixtures both sides test against is the cheap version.
+
+### Testing has to be re-planned
+
+The [Testing](PLAN.md) section assumes three components with coverage gates:
+backend, frontend, and worker client. The worker component disappears from
+birdtest entirely, and with it the pytest suite, its 100% gate, and the
+golden-file corpus of captured MAGPIE output. Those tests do not transfer —
+they exist to verify subprocess output parsing, which is precisely what this
+change deletes.
+
+What replaces them is a three-tier arrangement:
+
+1. **A fake worker** — a small test-only HTTP client that speaks the worker API
+   and submits synthetic results without running MAGPIE at all. This is what
+   most server tests want: it makes scheduler, SPRT, Glicko, redundancy,
+   reclamation and dashboard tests fast and deterministic, and it is the only
+   practical way to test the *adversarial* paths — malformed submissions, stale
+   claim tokens, and the chi-square anomaly detection, which needs a client that
+   deliberately submits bad data. Worth building whether or not MAGPIE takes
+   over the real client.
+2. **A real MAGPIE client in CI** — one job that builds MAGPIE with `contribute`
+   and runs it against a seeded stack for one task of each type. In-container
+   MAGPIE compiles in about 22 seconds, so this is affordable per-PR, not just
+   nightly.
+3. **Contract fixtures** shared with MAGPIE, so a change to either side that
+   breaks the other fails in both repos.
 
 ---
 
@@ -381,17 +421,76 @@ Each phase is independently useful and independently reviewable.
 
 ## Open questions
 
-1. **Static linking.** Is a self-contained MAGPIE binary a requirement for
-   contributors? If so, static libcurl + TLS needs deciding early — it
-   constrains the whole HTTP layer.
-2. **Wordmap generation policy.** Build on demand when a task needs a missing
+### 1. How does the HTTP dependency get onto a contributor's machine?
+
+MAGPIE links exactly one library today (`LDLIBS := -lm`), which is part of libc
+and always present. That is why "download MAGPIE and run it" works. Adding
+libcurl means adding a dependency on `libcurl.so.4`, which itself pulls in a TLS
+library. Four ways to handle that, and the choice constrains the whole HTTP
+layer, so it wants deciding first:
+
+| Option | Contributor installs | Cost |
+|---|---|---|
+| **Dynamic libcurl** | MAGPIE **and** libcurl | `apt install libcurl4` on Linux; ships with macOS; DLLs to bundle on Windows. Re-introduces the setup step this project is trying to delete. |
+| **Static libcurl + TLS** | MAGPIE only | Genuinely one file, but MAGPIE's build now has to produce or vendor static libcurl and OpenSSL. You inherit TLS security updates — an OpenSSL CVE means contributors run a vulnerable MAGPIE until you rebuild and they re-download. Full static against glibc is also awkward (NSS), so this usually means building against musl. |
+| **Keep shelling out to `curl`** | MAGPIE **and** the `curl` binary | Zero build changes; it is what `get_gcg.c` does today. Status codes and headers are recoverable (`-w '%{http_code}'`, `-D -`), but every request becomes a shell string built partly from server-controlled values, and `curl` is not reliably present on Windows. |
+| **Per-platform native HTTP** | MAGPIE only | WinHTTP on Windows, `NSURLSession`/CFNetwork on macOS, libcurl on Linux where it is effectively always installed. No new dependency anywhere, and TLS trust is the OS's problem rather than yours. Three small backends instead of one, but the client only makes five kinds of request. |
+
+**A detail that catches people out:** a statically linked TLS stack does not know
+where the system CA store lives, so certificate verification needs either a
+probe of the usual paths (`/etc/ssl/certs/ca-certificates.crt` and friends) or an
+embedded CA bundle, which then goes stale. The OS-native backends get this right
+for free, which is the strongest argument for the last row.
+### 5. Where does per-user state live?
+
+MAGPIE has no concept of per-user state today. It has a shared, read-mostly
+`data/` directory resolved through `-path`, and a `settings.txt` that is written
+relative to the **current working directory** — so MAGPIE already behaves
+differently depending on where you launch it.
+
+The client needs to persist four things with quite different characteristics:
+
+| What | Size | Sensitive | Losing it costs |
+|---|---|---|---|
+| Worker UUID | bytes | no | Contribution history: the contributor silently becomes a new anonymous worker |
+| API key | bytes | **yes** | Re-generate from the account page |
+| Server URL / preferences | bytes | no | Nothing |
+| Generated wordmaps | ~122 MB per lexicon | no | ~1.3s per lexicon to rebuild |
+
+Those do not belong in one place: the first three are tiny and precious, the
+last is large and disposable. Every platform has a convention for exactly that
+split:
+
+| | Config (UUID, key, prefs) | Derived data (wordmaps) |
+|---|---|---|
+| Linux/BSD | `$XDG_CONFIG_HOME/magpie/`, default `~/.config/magpie/` | `$XDG_CACHE_HOME/magpie/`, default `~/.cache/magpie/` |
+| macOS | `~/Library/Application Support/MAGPIE/` | `~/Library/Caches/MAGPIE/` |
+| Windows | `%APPDATA%\MAGPIE\` | `%LOCALAPPDATA%\MAGPIE\` |
+
+This matters beyond tidiness. If MAGPIE is installed system-wide, `data/` is
+read-only, so generated wordmaps **must** go somewhere user-writable — which the
+existing `-path` semantics already accommodate, since writes go to the first
+entry of the search list. The client should prepend a user-writable directory
+automatically rather than requiring the contributor to pass `-path`.
+
+The open question is one of **scope**: is this a birdtest-client feature, or does
+MAGPIE adopt a user-state directory generally and move `settings.txt` into it?
+Doing it only for the client leaves MAGPIE with two conventions. Doing it
+generally is the better end state but changes behaviour for existing users who
+rely on a per-directory `settings.txt`, so it probably wants an override
+(`MAGPIE_HOME`) and a portable mode for people running from a USB stick.
+
+Also: the API key file needs `0600` on POSIX and equivalent ACLs on Windows, and
+must never be written by `-savesettings`.
+
+### Smaller open questions
+
+- **Wordmap generation policy.** Build on demand when a task needs a missing
    lexicon, or refuse and tell the user to run `convert text2wordmap` first?
-   On-demand is friendlier; refusing keeps `contribute` free of side effects on
-   the data directory.
-3. **Should `contribute` be able to run without a wordmap at all?** A
-   contributor on a small disk might prefer `-wmp false` and slower games to
-   122 MB per lexicon.
-4. **Thread budget.** `contribute` should probably default to leaving a core
-   free rather than saturating a contributor's machine.
-5. **Where does per-user state live on each platform**, and does MAGPIE want a
-   general answer to that question rather than a birdtest-specific one?
+  On-demand is friendlier; refusing keeps `contribute` free of side effects on
+  the data directory.
+- **Should `contribute` be able to run without a wordmap at all?** A
+  contributor on a small disk might prefer `-wmp false` and slower games to
+  122 MB per lexicon.
+- **Thread budget.** `contribute` should probably default to leaving a core
+  free rather than saturating a contributor's machine.
