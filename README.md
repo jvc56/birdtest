@@ -129,6 +129,20 @@ bind-mounted from `frontend/`, alongside the production-style Nginx build on
 5173. `node_modules` lives in a named volume so the container's install never
 collides with a host one.
 
+### After a schema change
+
+There is a single migration until release — schema changes edit
+`backend/migrations/0001_initial.sql` in place rather than adding a numbered
+one. sqlx checksums applied migrations, so an edited `0001` will not apply over
+a database that already has the old version, and the backend will refuse to
+start. Reset it:
+
+```bash
+docker compose exec postgres \
+  psql -U birdtest -d birdtest -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+docker compose restart backend
+```
+
 ### Updating MAGPIE
 
 The binary and the data are separate build stages with separate build args, so

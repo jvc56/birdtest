@@ -214,7 +214,7 @@ CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 -- task counters (accepted_count, active_claim_count) must be decremented and tasks may need
 -- to revert from completed → available. The deletion sequence is:
 --   1. For each active/completed claim: update task counters.
---   2. Delete all task records (game_records, etc.) linked to those claims.
+--   2. Delete all task records (game_results, etc.) linked to those claims.
 --   3. Delete the task_claim rows.
 --   4. Delete the user row (cascades to api_keys, email_confirmations, password_reset_tokens).
 
@@ -325,20 +325,43 @@ CREATE TABLE position_analysis_plies (
 );
 CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
--- Shared by games and game pairs: one row per individual game. A `games` task submits
--- one row per game in its batch (games_per_batch); a `game_pairs` task submits exactly
--- two rows (game_index 0 and 1, one per ordering) from the same task_claim_id. Pair-level
--- outcome is derived by pairing up the two game_index rows at read time, not stored here.
-CREATE TABLE game_records (
-    task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
-    game_index      SMALLINT NOT NULL DEFAULT 0,  -- 0 for games; 0/1 (ordering) for game pairs
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    score1          INT NOT NULL,
-    score2          INT NOT NULL,
-    winner          SMALLINT NOT NULL CHECK (winner IN (0, 1, 2)),  -- 0 = draw
-    num_turns       INT NOT NULL,
-    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (task_claim_id, game_index)
+-- Shared by games and game pairs: one row per accepted task, holding the aggregate
+-- MAGPIE's autoplay reports. Autoplay does not emit individual games -- it reports
+-- counts and score moments for a batch, and in `-gp` mode a second such summary
+-- covering only the *divergent* pairs: those whose two games did not play
+-- identically. A pair that played identically is a guaranteed tie carrying no
+-- information, so excluding those is the variance reduction pairing exists to
+-- provide, and the divergent aggregate is what SPRT and Glicko are computed from.
+CREATE TABLE game_results (
+    task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+
+    -- Every game this task played. Two per pair for a game_pairs task.
+    games             INT NOT NULL CHECK (games >= 0),
+    wins              INT NOT NULL CHECK (wins >= 0),      -- player 1
+    losses            INT NOT NULL CHECK (losses >= 0),
+    ties              INT NOT NULL CHECK (ties >= 0),
+    p1_score_mean     DOUBLE PRECISION NOT NULL,
+    p1_score_sd       DOUBLE PRECISION NOT NULL,
+    p2_score_mean     DOUBLE PRECISION NOT NULL,
+    p2_score_sd       DOUBLE PRECISION NOT NULL,
+    CONSTRAINT game_results_counts_sum CHECK (wins + losses + ties = games),
+
+    -- The divergent subset. NULL for `games` jobs, which do not play pairs.
+    divergent_games   INT CHECK (divergent_games >= 0),
+    divergent_wins    INT CHECK (divergent_wins >= 0),
+    divergent_losses  INT CHECK (divergent_losses >= 0),
+    divergent_ties    INT CHECK (divergent_ties >= 0),
+    CONSTRAINT game_results_divergent_all_or_nothing CHECK (
+        (divergent_games IS NULL AND divergent_wins IS NULL
+             AND divergent_losses IS NULL AND divergent_ties IS NULL)
+        OR (divergent_games IS NOT NULL AND divergent_wins IS NOT NULL
+             AND divergent_losses IS NOT NULL AND divergent_ties IS NOT NULL
+             AND divergent_wins + divergent_losses + divergent_ties = divergent_games
+             AND divergent_games <= games)
+    ),
+
+    submitted_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- One row per accepted leave task (a single worker's forced-rack partition of a generation).
@@ -402,7 +425,7 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
 CREATE INDEX        tasks_job_idx             ON tasks (job_id);
-CREATE INDEX        game_records_task_idx     ON game_records (task_id);
+CREATE INDEX        game_results_task_idx     ON game_results (task_id);
 CREATE INDEX        leave_records_task_idx    ON leave_records (task_id);
 CREATE INDEX        position_records_task_idx ON position_analysis_records (task_id);
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);

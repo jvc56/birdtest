@@ -258,6 +258,8 @@ Every significant action (task claimed, result submitted, job created, user bann
 
 **Database migrations**: `sqlx migrate run` executes at container startup before the server accepts connections. No separate migration runner needed.
 
+Until birdtest is deployed there is only ever **one migration**. Schema changes edit `0001_initial.sql` in place rather than adding a numbered migration, because there is no live database whose history needs preserving, and a single file is far easier to read than a schema reconstructed from a chain of diffs. The cost is that sqlx records a checksum per applied migration, so editing `0001` means any existing development database must be reset — see [Development](#development). Once there is a deployment to migrate, this convention ends and migrations become append-only.
+
 **Observability**: Structured JSON logs via `tracing` + `tracing-subscriber` (JSON formatter). No metrics or distributed tracing for v1.
 
 **Auth**: Sessions use Paseto tokens stored in httpOnly cookies. API keys are random strings hashed with Argon2 before storage.
@@ -909,9 +911,8 @@ birdtest/
 ├── backend/                        # Axum web server (Rust)
 │   ├── Cargo.toml
 │   ├── .env.example                # DATABASE_URL, SESSION_SIGNING_KEY, MAIL_BACKEND=console, etc. for local dev
-│   ├── migrations/                 # sqlx migration files
-│   │   ├── 0001_initial.sql
-│   │   └── 0002_game_result_aggregates.sql
+│   ├── migrations/                 # sqlx migration files — a single one until release;
+│   │   └── 0001_initial.sql        # see Development for why
 │   └── src/
 │       ├── main.rs                 # server startup, router assembly
 │       ├── config.rs               # config from env (ECS injects SSM values as env vars)
@@ -1530,7 +1531,24 @@ process before it binds, so there is no separate migration container.
 Every host port is overridable via `.env` (see `.env.example`), so a machine
 that already has something on 5432 does not need the compose file edited.
 
-### 2. Configuration
+### 2. Resetting the database after a schema change
+
+There is a single migration until release, and schema changes edit it in place.
+sqlx records a checksum for each applied migration, so an edited `0001` will not
+apply over a database that already has the old one — the backend will fail to
+start with a "migration was previously applied but has been modified" error.
+
+Drop the schema and let the backend rebuild it:
+
+```bash
+docker compose exec postgres \
+  psql -U birdtest -d birdtest -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+docker compose restart backend
+```
+
+`docker compose down -v` also works but discards the MinIO bucket with it.
+
+### 3. Configuration
 
 The backend's environment is set inline in `docker-compose.yml` rather than
 from a file, so the default stack has nothing to copy first. `MAIL_BACKEND` is
@@ -1543,7 +1561,7 @@ there is no separate code path.
 `backend/.env.example` documents the same variables for running the server
 directly on the host with `cargo run`.
 
-### 3. Optional profiles
+### 4. Optional profiles
 
 ```bash
 docker compose --profile dev up      # adds Vite with HMR on :5174
@@ -1556,7 +1574,7 @@ and the container's install never collides with a host one built for a
 different platform. It runs *alongside* the Nginx build rather than replacing
 it, on a separate port.
 
-### 4. Worker client
+### 5. Worker client
 
 ```bash
 docker compose --profile worker up --build
@@ -1573,7 +1591,7 @@ The worker needs an actual admin-created, activated job to have anything to
 claim (see step 5) — with no active job, `_claim_task` just gets 204s and the
 worker sleeps in its retry loop, which is expected and not an error.
 
-### 5. Seeding a local admin and a first job
+### 6. Seeding a local admin and a first job
 
 There's no seed script needed for the minimum path — the first registered user isn't automatically an admin (avoids a footgun where every dev DB has an implicit admin), so promotion is a one-line manual step against the local DB:
 
