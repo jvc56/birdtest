@@ -264,33 +264,71 @@ reads results out of the result structs. No subprocess, no stdout, no parsing.
   run `leavegen`, and read the rack-equity table directly out of `RackList`
   rather than via `-writerackequitycsv` and a CSV re-read.
 
-### 6. A per-game autoplay recorder
+### 6. Result granularity - what MAGPIE actually needs to report
 
-The one genuinely new MAGPIE capability. `AUTOPLAY_RECORDER_TYPE_GAME`
-aggregates into a `GameData`; birdtest needs the individual games.
+An earlier draft of this document called for a per-game autoplay recorder. That
+was overstated. Testing against the binary shows the requirement is narrower and
+splits by job type.
 
-Add a recorder — call it `gamelog` — that appends a row per game instead of
-folding it in:
+**`games` jobs need nothing new.** SPRT consumes wins, losses and draws, and
+that is exactly what `autoplay` already reports:
 
-```c
-typedef struct GameRecord {
-  int score1;
-  int score2;
-  int winner;        // 1, 2, or 0 for a draw
-  int num_turns;
-  uint64_t seed;
-  int game_index;    // ordering within a pair, 0 or 1
-} GameRecord;
+```
+autoplay games <total> <p0_wins> <p0_losses> <p0_ties> <p0_firsts> <p0_mean> <p0_sd> <p1_mean> <p1_sd> ...
 ```
 
-`game_data_add_game()` already computes `p0_game_score`, `p1_game_score` and
-`args->number_of_turns`, so the recorder body is a mutex-guarded append. It
-must be selectable via the existing options string (`autoplay games,gamelog`)
-so it is useful from the command line too, and it needs a bound — a batch of
-100k games should not accumulate 100k records in memory unbounded.
+birdtest's `game_records` table stores one row per game, but nothing downstream
+reads the individual rows for a `games` job - SPRT and the dashboard percentages
+both work off the counts. The schema is finer-grained than any consumer needs.
 
-This also gives command-line MAGPIE users per-game output, which it does not
-have today.
+**`game_pairs` jobs need something pair-aware, but coarser than per-game.** What
+SPRT wants for a pair is a single outcome - did player 1 take the pair, split
+it, or lose it - not two score lines. And the pooled per-game aggregate cannot
+supply it: two pairs recorded as two wins and two losses could be two splits, or
+one pair won and one lost, and those are different distributions.
+
+MAGPIE already has machinery pointed at this problem. In `-gp` mode it tracks
+whether the two games of a pair **diverged** (played different moves at any
+point), and reports a second `GameData` covering divergent games only. Pairs
+that played identically are guaranteed ties that carry no signal, so excluding
+them is the same variance reduction that pentanomial pair scoring achieves by a
+different route.
+
+So there are two candidate designs, and this needs deciding before anything is
+built:
+
+| | What MAGPIE reports | What birdtest stores |
+|---|---|---|
+| **Adopt MAGPIE's model** | The existing all-games and divergent-games aggregates | Two aggregates per task; SPRT runs on the divergent counts |
+| **Pair-outcome reporting** | A new recorder emitting one win/split/loss per pair | One row per pair |
+
+The first needs no MAGPIE change at all. The second is a smaller change than a
+per-game recorder and keeps birdtest's SPRT operating on units it already
+understands.
+
+**Per-game records are only required for the raw-data export** - the
+`GET /api/jobs/:id/results/stream` download offered for offline analysis. That
+is a product decision about what birdtest promises contributors and researchers,
+not a statistical necessity. If that export is worth keeping at per-game
+granularity, a `gamelog` recorder is the way to get it, and it would incidentally
+give command-line MAGPIE per-game output it does not have today.
+
+#### Two things to resolve first
+
+Both came out of running the binary and neither is settled:
+
+1. **birdtest's pair-derivation logic looks wrong.** It assumes the two games of
+   a pair swap the players, and inverts the second game's winner accordingly.
+   MAGPIE's `game_runner_start` changes only `starting_player_index` - which
+   player moves first - and leaves player identity alone. If that reading is
+   right, the current SQL inverts half of every pair.
+2. **The `-gp` aggregate behaved unexpectedly under test.** With two clearly
+   different players (`-s1 equity -s2 score`), unpaired autoplay gave 13-17
+   across 30 games, while the same players in `-gp` mode gave exactly 20-20
+   across 20 pairs with *identical* score means and standard deviations to six
+   decimal places, and zero divergent games. Symmetry that exact is a
+   construction, not a coincidence. Until it is understood, neither design above
+   can be specified with confidence.
 
 ### 7. Wordmap auto-provisioning
 
@@ -378,10 +416,11 @@ Small, because the HTTP API does not change:
   run `contribute`".
 - **`GET /api/worker/client-version`** changes meaning from "script version and
   download URL" to "minimum MAGPIE version".
-- **`GameResultsResponse` becomes achievable as specified.** The current schema —
-  one record per game with `score1`, `score2`, `winner`, `num_turns` — is what
-  the `gamelog` recorder produces, so the mismatch discovered against the
-  subprocess client resolves without changing the schema.
+- **The result schema is probably too fine-grained.** `game_records` stores one
+  row per game, but nothing reads the individual rows: SPRT and the dashboard
+  both work off counts. See section 6 — the likely outcome is that `games` jobs
+  store an aggregate per task and `game_pairs` jobs store one row per pair, with
+  per-game rows kept only if the raw-data export is worth them.
 ### The client stops being birdtest's code
 
 This is the part with the widest blast radius, and it is organisational as much
@@ -437,8 +476,10 @@ Each phase is independently useful and independently reviewable.
 1. **Foundations** — `http_client`, `json`, UUID generation, `ClientState`.
    Convert `get_gcg.c` to the new HTTP client as the first consumer, which
    tests it against a real endpoint before any birdtest code exists.
-2. **The `gamelog` recorder** — valuable to command-line MAGPIE on its own, and
-   it unblocks the games and game-pairs executors.
+2. **Settle result granularity for pairs** (section 6) — understand the `-gp`
+   aggregate, confirm the pair semantics, and decide between MAGPIE's
+   divergent-games model and pair-outcome reporting. `games` jobs need nothing
+   here, so they are not blocked on it.
 3. **`contribute`, single job type** — claim, heartbeat, execute and submit for
    `games` only. This proves the whole loop end to end.
 4. **Remaining job types** — opening rack analysis, game pairs, leave
