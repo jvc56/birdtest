@@ -361,13 +361,12 @@ Some request types are shared across job types:
 
 ### Task Response Types
 
-A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results).
+A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit and store plain per-game results (`{score1, score2, winner, num_turns}`); a game pair is just two of these, one per ordering, played from the same seed. Pair-level outcome (who won the pair, accounting for the color swap) is derived at read time by pairing up consecutive results for a `game_pairs` task, not stored as its own type.
 
 | Type | Used by |
 |---|---|
 | `PositionAnalysisResponse` | Opening rack analysis |
-| `GameResultsResponse` | Games |
-| `GamePairResultsResponse` | Game pairs |
+| `GameResultsResponse` | Games, game pairs |
 | `LeaveResponse` | Leave generation |
 
 ### Task Record Types
@@ -377,8 +376,7 @@ A task record is the normalized form stored in a typed table after a response is
 | Type | Used by |
 |---|---|
 | `PositionAnalysisRecord` | Opening rack analysis |
-| `GameResultsRecord` | Games |
-| `GamePairResultsRecord` | Game pairs |
+| `GameResultsRecord` | Games, game pairs |
 | `LeaveRecord` | Leave generation |
 
 ### Creation Strategies
@@ -420,7 +418,7 @@ SPRT and finish-condition checks run during result submission, not at claim time
 
 #### Game Pairs — On-demand
 
-Same as games, except the batch size is `pairs_per_batch` from the job config. Each task seed is spaced `pairs_per_batch` apart: `SELECT COALESCE(MAX(seed) + $pairs_per_batch, 1) FROM tasks WHERE job_id = $job_id`. The job type signals MAGPIE to run both orderings (p1/p2 then p2/p1) with the same seed in a single invocation. Results are `GamePairResultsResponse`. SPRT is evaluated on pair outcomes. Glicko ratings are automatically updated after each submitted result.
+Same as games, except the batch size is `pairs_per_batch` from the job config. Each task seed is spaced `pairs_per_batch` apart: `SELECT COALESCE(MAX(seed) + $pairs_per_batch, 1) FROM tasks WHERE job_id = $job_id`. The job type signals MAGPIE to run both orderings (p1/p2 then p2/p1) with the same seed in a single invocation. Results are a `GameResultsResponse` — the same type games use — containing exactly two entries per pair (first ordering, then second), stored as two rows in `game_records` tied to the same `task_claim_id` via a `game_index` column. SPRT and Glicko are evaluated on the derived pair outcome (win/loss/tie across the two orderings), computed by pairing up those two rows rather than read from a dedicated column.
 
 ---
 
@@ -438,11 +436,11 @@ At claim time:
 5. `INSERT INTO task_claims (...)`.
 6. Return the request and claim token.
 
-**Worker behaviour**: The worker downloads the previous generation's combined leave file from S3 (or uses the lexicon's default leaves for generation 1), writes the forced-rack subset to a local file, invokes `autoplay` with `-forceracksfile <file> -writerackequitycsv true` for the configured batch of games, then uploads the resulting `<rack>,<count>,<mean>` CSV to S3 and submits the key **plus an inline `{rack, count, mean}` summary for just its forced racks** as the `LeaveResponse` — small and bounded, so the server can update `leave_rack_progress` synchronously on result submission without a round trip to S3.
+**Worker behaviour**: The worker downloads the previous generation's combined leave file from S3 (or uses the lexicon's default leaves for generation 1), writes the forced-rack subset to a local file, invokes `autoplay` with `-forceracksfile <file> -writerackequitycsv true` for the configured batch of games, then parses the resulting `<rack>,<count>,<mean>` CSV — covering **every rack that occurred during the batch, forced or not**, since racks the games happen to draw naturally also count toward that rack's occurrence target — and submits it in full as an inline `{rack, count, mean}` list in the `LeaveResponse`. The CSV is a local scratch file only; nothing downstream needs it once parsed, so it's discarded rather than uploaded anywhere. This list scales with distinct racks drawn per batch (potentially thousands of rows for a real batch size, not just `racks_per_task`), but that's still an ordinary-sized POST body (tens to low hundreds of KB), not something warranting object storage.
 
-**On result acceptance**: within the same transaction that accepts the task result, for each `{rack, count, mean}` in the response, upsert into `leave_rack_progress`: `occurrence_count += count`, `equity_sum += count * mean`. This is what drives the live dashboard figure — no heartbeat involved.
+**On result acceptance**: within the same transaction that accepts the task result, upsert all `{rack, count, mean}` entries from the response into `leave_rack_progress` in a single bulk statement (multi-row `INSERT ... ON CONFLICT (job_id, generation, rack) DO UPDATE SET occurrence_count = leave_rack_progress.occurrence_count + excluded.occurrence_count, equity_sum = leave_rack_progress.equity_sum + excluded.equity_sum`) rather than row-by-row, since a submission can carry thousands of rows. This is what drives the live dashboard figure — no heartbeat involved.
 
-**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into a `rack,value` CSV (`value = equity_sum / occurrence_count` per rack — this is the format `magpie convert csv2klv` expects, distinct from the `rack,count,mean` format workers upload) and runs `magpie convert csv2klv` to produce the generation's combined KLV, uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete. This conversion is a small, synchronous, server-side operation — the recommended approach is linking `libmagpie` into the Rust backend via FFI over the `cmd_api.c` C API rather than dispatching it as a worker task, since it needs no game simulation, just a deterministic file conversion. This does mean the backend container needs `libmagpie` and lexicon data available at runtime, alongside the existing `data/letterdistributions/` dependency — call out in Tech Stack / ECS if adopted.
+**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into a `rack,value` CSV (`value = equity_sum / occurrence_count` per rack — this is the format `magpie convert csv2klv` expects, distinct from the `rack,count,mean` format workers submit) and shells out to `magpie convert csv2klv` (the same subprocess-invocation pattern the worker already uses for `autoplay`, just run from the backend) to produce the generation's combined KLV, uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete. This runs once per generation, not once per task, so there's no performance case for linking `libmagpie` into the backend via FFI — that would only add an unsafe binding surface to keep in sync with MAGPIE's C API across version bumps, and let a crash in `libmagpie` take down the whole backend process instead of an isolated subprocess. The backend container needs the `magpie` executable and lexicon data available at runtime, alongside the existing `data/letterdistributions/` dependency — call out in Tech Stack / ECS if adopted.
 
 **Dashboard progress**: because progress is now driven by many small task completions across possibly many workers rather than one long-running worker, the rack-with-fewest-occurrences figure ([Leave generation](#leave-generation) job detail bullet) is live and derived directly from `leave_rack_progress`, updating on every accepted task result via the existing per-job SSE stream — no heartbeat payload is needed.
 
@@ -627,8 +625,9 @@ def _handle_game_pair(request: dict, cfg: Config) -> dict:
 
 def _handle_leave_gen(request: dict, cfg: Config) -> dict:
     """Download previous-gen leaves from S3, write the forced-rack subset to a local
-    file, run autoplay with -forceracksfile, upload the resulting rack-equity CSV,
-    and return its S3 key plus the inline {rack, count, mean} summary."""
+    file, run autoplay with -forceracksfile, parse the resulting rack-equity CSV (every
+    rack that occurred, forced or not), and return it as an inline {rack, count, mean}
+    list — the CSV itself is scratch and is not uploaded anywhere."""
     ...
 
 _HANDLERS = {
@@ -1298,34 +1297,29 @@ CREATE TABLE position_analysis_plies (
 );
 CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
+-- Shared by games and game pairs: one row per individual game. A `games` task submits
+-- one row per game in its batch (games_per_batch); a `game_pairs` task submits exactly
+-- two rows (game_index 0 and 1, one per ordering) from the same task_claim_id. Pair-level
+-- outcome is derived by pairing up the two game_index rows at read time, not stored here.
 CREATE TABLE game_records (
-    task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
+    game_index      SMALLINT NOT NULL DEFAULT 0,  -- 0 for games; 0/1 (ordering) for game pairs
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     score1          INT NOT NULL,
     score2          INT NOT NULL,
     winner          SMALLINT NOT NULL CHECK (winner IN (0, 1, 2)),  -- 0 = draw
     num_turns       INT NOT NULL,
-    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE TABLE game_pair_records (
-    task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    score1_game1    INT NOT NULL,
-    score2_game1    INT NOT NULL,
-    score1_game2    INT NOT NULL,
-    score2_game2    INT NOT NULL,
-    winner          SMALLINT NOT NULL CHECK (winner IN (0, 1, 2)),  -- 0 = tie
-    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_claim_id, game_index)
 );
 
 -- One row per accepted leave task (a single worker's forced-rack partition of a generation).
--- artifact_key points to that worker's own "<rack>,<count>,<mean>" CSV in S3 (kept for audit/rebuild);
--- the {rack, count, mean} summary from the same submission is what's folded into leave_rack_progress.
+-- The full {rack, count, mean} submission is folded into leave_rack_progress and not kept
+-- separately — nothing reads it back, so there's no CSV artifact to reference here.
 CREATE TABLE leave_records (
     task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    artifact_key    TEXT NOT NULL,
+    rack_count      INT NOT NULL,  -- number of distinct racks in this submission, for audit
     submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -1528,7 +1522,7 @@ Every component — backend, worker client, and frontend — carries a coverage 
 
 ### Worker Client
 
-- MAGPIE itself is treated as an external dependency and is not what's under test here — `subprocess.run` (or the `libmagpie` FFI call, if the client migrates to it) is mocked/faked so worker unit tests are fast and don't require a MAGPIE build. Fakes return canned structured (`-hr`-off) output covering both the happy path and every documented error shape (non-zero exit, malformed output line, missing expected field) for each of `_handle_opening_rack`, `_handle_game`, `_handle_game_pair`, and `_handle_leave_gen`.
+- MAGPIE itself is treated as an external dependency and is not what's under test here — `subprocess.run` is mocked/faked so worker unit tests are fast and don't require a MAGPIE build. Fakes return canned structured (`-hr`-off) output covering both the happy path and every documented error shape (non-zero exit, malformed output line, missing expected field) for each of `_handle_opening_rack`, `_handle_game`, `_handle_game_pair`, and `_handle_leave_gen`.
 - **HTTP layer** is tested against a local mock server (`responses` or a `pytest`-scoped `httpx` transport mock) covering claim/heartbeat/result/version-check round trips, including the 204-no-work and stale-claim-token paths, and the self-update re-exec flow (`_check_for_self_update`) with a fake newer-version response.
 - **One real end-to-end suite** (separate from the unit/coverage-gated suite, run nightly rather than per-PR) builds an actual MAGPIE binary from the pinned `min_magpie_version` commit and runs the worker against it for one real task of each job type, plus one full real leave-gen partition-task cycle, to catch drift between MAGPIE's actual output format and the client's parsing — this is what would have caught a MAGPIE-side format regression that mocks structurally cannot.
 - **Golden-file tests** for output parsing: a corpus of real captured MAGPIE stdout (checked into `worker/testdata/`) for each recorder type is parsed and asserted against expected structured results, so a MAGPIE output-format change shows up as a diff against a committed fixture rather than a silent misparse.
