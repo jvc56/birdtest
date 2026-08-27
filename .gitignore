@@ -1,0 +1,18 @@
+# Rust
+/backend/target/
+# Node
+node_modules/
+/frontend/.svelte-kit/
+/frontend/build/
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+# Env
+.env
+.env.local
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*

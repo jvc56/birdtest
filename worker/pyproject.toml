@@ -1,0 +1,16 @@
+[project]
+name = "birdtest-worker"
+version = "1.0.0"
+description = "birdtest worker client — claims tasks, invokes MAGPIE, submits results"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31"]
+
+[project.scripts]
+birdtest-worker = "worker:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["worker"]

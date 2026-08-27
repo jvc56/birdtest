@@ -1,0 +1,207 @@
+//! The job type system: one request / response / record triple plus a creation
+//! strategy per job type.
+
+use crate::error::AppResult;
+use crate::models::job::PlayerConfig;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use sqlx::PgConnection;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreationStrategy {
+    /// All tasks are written at job creation; workers claim from the pool.
+    PrePopulated,
+    /// Tasks are generated, inserted and claimed atomically at claim time.
+    OnDemand,
+}
+
+/// Every job type implements this. The trait is used through static dispatch
+/// from [`crate::jobs::registry`], where the `JobType` match is exhaustive — a
+/// new variant will not compile until all four components exist.
+#[allow(async_fn_in_trait)]
+pub trait JobHandler {
+    type Request: Serialize;
+    type Response: DeserializeOwned;
+    type Record;
+
+    fn creation_strategy() -> CreationStrategy;
+
+    /// Persist the typed request row alongside the `tasks` row.
+    async fn insert_request(conn: &mut PgConnection, task_id: Uuid, req: &Self::Request)
+        -> AppResult<()>;
+
+    /// Read back a stored request (pre-populated jobs claim tasks written earlier).
+    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request>;
+
+    /// Normalize a worker submission into its stored form.
+    fn process_response(response: Self::Response) -> AppResult<Self::Record>;
+
+    async fn insert_record(
+        conn: &mut PgConnection,
+        task_id: Uuid,
+        claim_id: Uuid,
+        record: &Self::Record,
+    ) -> AppResult<()>;
+}
+
+// ---------------------------------------------------------------------------
+// Shared wire types
+// ---------------------------------------------------------------------------
+
+/// A player configuration flattened into the form the worker passes to MAGPIE.
+/// Denormalized into every request so a worker never needs a second round trip.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerSpec {
+    pub name: String,
+    pub recorder_type: String,
+    pub sort_strategy: Option<String>,
+    pub leaves: Option<String>,
+    pub max_iterations: Option<i32>,
+    pub plies: Option<i32>,
+    pub top_plays: Option<i32>,
+    pub stopping_pct: Option<f64>,
+    pub use_inference: Option<bool>,
+    pub time_limit_secs: Option<f64>,
+}
+
+impl From<PlayerConfig> for PlayerSpec {
+    fn from(c: PlayerConfig) -> Self {
+        Self {
+            name: c.name,
+            recorder_type: c.recorder_type,
+            sort_strategy: c.sort_strategy,
+            leaves: c.leaves,
+            max_iterations: c.max_iterations,
+            plies: c.plies,
+            top_plays: c.top_plays,
+            stopping_pct: c.stopping_pct,
+            use_inference: c.use_inference,
+            time_limit_secs: c.time_limit_secs,
+        }
+    }
+}
+
+// --- Requests --------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionRequest {
+    pub lexicon: String,
+    pub variant: String,
+    /// CGP-encoded board + rack.
+    pub position: String,
+    pub previous_play: Option<String>,
+    pub player: PlayerSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameRequest {
+    pub lexicon: String,
+    pub variant: String,
+    /// uint64 at the application layer; stored as a signed BIGINT.
+    pub seed: u64,
+    pub num_games: i32,
+    /// True for `game_pairs`: MAGPIE runs both orderings from the same seed.
+    pub game_pairs: bool,
+    pub player1: PlayerSpec,
+    pub player2: PlayerSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeaveRequest {
+    pub lexicon: String,
+    pub variant: String,
+    pub generation: i32,
+    pub forced_racks: Vec<String>,
+    /// Combined KLV from the previous generation; NULL for generation 1, where
+    /// the worker falls back to the lexicon's default leaves.
+    pub previous_artifact_key: Option<String>,
+    pub num_games: i32,
+}
+
+/// What actually goes over the wire to the worker. Internally tagged so the
+/// client can dispatch on `task_request["job_type"]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "job_type", rename_all = "snake_case")]
+pub enum TaskRequest {
+    OpeningRackAnalysis(PositionRequest),
+    Games(GameRequest),
+    GamePairs(GameRequest),
+    LeaveGeneration(LeaveRequest),
+}
+
+// --- Responses -------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlyStats {
+    pub ply: i16,
+    pub bingo_percentage: f64,
+    pub average_score: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MoveEntry {
+    #[serde(rename = "move")]
+    pub play: String,
+    pub score: i32,
+    pub equity: f64,
+    #[serde(default)]
+    pub plies: Vec<PlyStats>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PositionAnalysisResponse {
+    /// Ranked best-first as MAGPIE emitted them.
+    pub moves: Vec<MoveEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GameOutcome {
+    pub score1: i32,
+    pub score2: i32,
+    /// 1 = player 1, 2 = player 2, 0 = draw.
+    pub winner: i16,
+    pub num_turns: i32,
+}
+
+/// Shared by games and game pairs: a game pair is simply two outcomes, one per
+/// ordering, from the same seed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GameResultsResponse {
+    pub games: Vec<GameOutcome>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RackOccurrence {
+    pub rack: String,
+    pub count: i64,
+    pub mean: f64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeaveResponse {
+    /// Every rack that occurred during the batch, forced or not — racks the
+    /// games happen to draw naturally count toward their target too.
+    pub racks: Vec<RackOccurrence>,
+}
+
+// --- Records ---------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct PositionAnalysisRecord {
+    pub best_move: String,
+    pub best_score: i32,
+    pub best_equity: f64,
+    pub num_moves: i32,
+    pub moves: Vec<MoveEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GameResultsRecord {
+    pub games: Vec<GameOutcome>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LeaveRecord {
+    pub racks: Vec<RackOccurrence>,
+}

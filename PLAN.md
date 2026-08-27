@@ -745,6 +745,7 @@ All endpoints return JSON. State-mutating, session-cookie-backed endpoints (Auth
 | `POST` | `/api/worker/task` | Send a task claim. Returns a job-type-specific task request, claim token, and `min_magpie_version` for the assigned job. |
 | `POST` | `/api/worker/heartbeat` | Keep-alive ping for a claimed task. Updates `last_heartbeat_at`. |
 | `POST` | `/api/worker/result` | Submit the result for a claimed task. Requires the claim token. |
+| `GET` | `/api/worker/artifact?key=<artifact-key>` | Download a stored artifact — in v1, a previous generation's combined KLV for a leave-generation task. Proxied through the server so contributors never need AWS credentials; only keys the server itself minted are reachable. |
 
 ### Auth API
 
@@ -864,32 +865,41 @@ birdtest/
 │   │   └── 0001_initial.sql
 │   └── src/
 │       ├── main.rs                 # server startup, router assembly
-│       ├── config.rs               # config loading from SSM / env
-│       ├── db.rs                   # PgPool initialization
+│       ├── config.rs               # config from env (ECS injects SSM values as env vars)
+│       ├── state.rs                # AppState shared by every handler
+│       ├── db.rs                   # PgPool initialization and migrations
 │       ├── error.rs                # AppError type, IntoResponse impl
 │       ├── auth/
-│       │   ├── mod.rs
+│       │   ├── mod.rs              # CurrentUser / AdminUser / WorkerIdentity extractors
 │       │   ├── session.rs          # Paseto token creation / validation
-│       │   ├── api_key.rs          # API key hashing / verification
-│       │   └── csrf.rs             # CSRF token middleware
-│       ├── email.rs                # SES email sending
-│       ├── jobs/                   # job type system
+│       │   ├── api_key.rs          # API key, password and code hashing
+│       │   └── csrf.rs             # CSRF double-submit verification
+│       ├── email.rs                # SES / console mail backends
+│       ├── artifacts.rs            # S3 (MinIO in dev) artifact store
+│       ├── ratelimit.rs            # in-memory governor token buckets
+│       ├── audit.rs                # append-only audit log writes
+│       ├── scheduler.rs            # job selection, lazy reclamation, task claiming
+│       ├── jobstats.rs             # aggregate job stats (REST + SSE payload)
+│       ├── ratings.rs              # Glicko bookkeeping for game-pair jobs
+│       ├── stats/
 │       │   ├── mod.rs
-│       │   ├── handler.rs          # JobHandler trait definition
-│       │   ├── registry.rs         # JobType enum and dispatch
+│       │   ├── sprt.rs             # SPRT LLR and boundaries
+│       │   └── glicko.rs           # Glicko-2 rating update
+│       ├── jobs/                   # job type system
+│       │   ├── mod.rs              # shared request/record helpers
+│       │   ├── handler.rs          # JobHandler trait plus wire types
+│       │   ├── registry.rs         # JobType dispatch (exhaustive matches)
+│       │   ├── racks.rs            # letter distributions, rack/leave enumeration, CGP
 │       │   ├── opening_rack.rs
 │       │   ├── game.rs
 │       │   ├── game_pair.rs
 │       │   └── leave_gen.rs
-│       ├── models/                 # SQLx row types (one file per table group)
+│       ├── models/                 # SQLx row types
 │       │   ├── mod.rs
 │       │   ├── job.rs
-│       │   ├── task.rs
-│       │   ├── claim.rs
-│       │   ├── user.rs
-│       │   └── worker.rs
+│       │   └── user.rs
 │       ├── routes/                 # Axum handlers (one file per API section)
-│       │   ├── mod.rs
+│       │   ├── mod.rs              # pagination helpers
 │       │   ├── worker.rs           # /api/worker/*
 │       │   ├── auth.rs             # /api/auth/*
 │       │   ├── account.rs          # /api/me/*
@@ -964,6 +974,8 @@ birdtest/
 ├── data/
 │   └── letterdistributions/        # letter distribution files, mirroring MAGPIE-DATA/data/letterdistributions/
 │                                   # used by the server to enumerate racks for opening rack analysis jobs
+│                                   # and the leave universe for leave generation jobs. TESTDIST.csv is a
+│                                   # deliberately tiny bag for local development.
 │
 └── infra/                          # Terraform
     ├── main.tf
@@ -1155,7 +1167,16 @@ CREATE TABLE job_leave_config (
     job_id         UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     lexicon        TEXT NOT NULL,
     variant        TEXT NOT NULL,
-    num_iterations INT NOT NULL
+    -- Games each leave-gen task plays over its forced-rack subset.
+    num_iterations INT NOT NULL,
+    -- How many sequential generations this job runs before it is complete.
+    generation_count  INT NOT NULL DEFAULT 1 CHECK (generation_count >= 1),
+    -- Per-generation occurrence target every rack must reach before the generation closes.
+    target_rack_count INT NOT NULL CHECK (target_rack_count >= 1),
+    -- Size of the forced-rack subset handed to a single task.
+    racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
+    -- Largest leave size enumerated into the rack universe (leaves are 1..N tiles).
+    max_leave_size    INT NOT NULL DEFAULT 6 CHECK (max_leave_size BETWEEN 1 AND 6)
 );
 
 -- Tasks
@@ -1171,6 +1192,7 @@ CREATE TABLE tasks (
     -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate join/aggregate.
     accepted_count       INT NOT NULL DEFAULT 0,
     active_claim_count   INT NOT NULL DEFAULT 0,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at         TIMESTAMPTZ
 );
 
@@ -1244,6 +1266,7 @@ CREATE TABLE leave_requests (
     variant             TEXT NOT NULL,
     generation          INT NOT NULL,
     forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (see rack_list_create's forceracksfile)
+    num_games           INT NOT NULL,      -- denormalized from job_leave_config.num_iterations
     previous_artifact_key TEXT             -- combined KLV from generation - 1; NULL for generation 1
 );
 
