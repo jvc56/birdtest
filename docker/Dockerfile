@@ -169,3 +169,18 @@ RUN mkdir -p /home/worker/.birdtest && chown -R worker:worker /home/worker/.bird
 USER worker
 ENV BIRDTEST_MAGPIE_DIR=/magpie
 ENTRYPOINT ["python", "worker.py"]
+
+# ---------------------------------------------------------------------------
+# Fake worker
+# ---------------------------------------------------------------------------
+# Speaks the worker API and submits synthetic results. No MAGPIE, so this image
+# is a few hundred KB on top of python-slim and starts instantly.
+
+FROM python:3.11-slim AS fake-worker
+
+RUN useradd --create-home --uid 10001 worker
+WORKDIR /app
+RUN pip install --no-cache-dir requests
+COPY worker/fake_worker.py ./
+USER worker
+ENTRYPOINT ["python", "fake_worker.py"]

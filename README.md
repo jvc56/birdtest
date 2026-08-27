@@ -16,7 +16,7 @@ MAGPIE itself, so contributing needs MAGPIE and nothing else.
 |---|---|
 | `backend/` | Axum + SQLx server. Owns scheduling, validation, SPRT, Glicko and aggregation. |
 | `frontend/` | SvelteKit SPA (dark mode only), built statically and served by Nginx in production. |
-| `worker/` | Single-file Python worker client. Shells out to MAGPIE; contains no business logic. |
+| `worker/` | Test clients. `worker.py` runs real MAGPIE; `fake_worker.py` submits synthetic results without it. The contributor-facing client is [moving into MAGPIE](MAGPIE-CLIENT.md). |
 | `data/letterdistributions/` | Tile distributions, mirroring MAGPIE-DATA's layout. Used to enumerate racks and leaves. |
 | `infra/` | Terraform: VPC, ALB, ECS Fargate, RDS Postgres, S3, SES, SSM. |
 
@@ -70,38 +70,53 @@ creation time — for a real English bag that is millions of rows. Use lexicon
 `TESTDIST` while poking at the UI; it is a deliberately tiny bag that exists
 for exactly this.
 
-### Running a worker
+### Testing without MAGPIE — the fake worker
+
+Most server behaviour is best tested without a real engine in the loop.
+Scheduling, SPRT, Glicko, redundancy and claim reclamation all want a *chosen*
+outcome and a fast one, and the adversarial paths have no real-client
+equivalent at all:
+
+```bash
+docker compose --profile fake-worker up            # or, directly:
+python worker/fake_worker.py --server-url http://localhost:8080 --tasks 10
+```
+
+| Flag | What it exercises |
+|---|---|
+| `--workers N` | Concurrent claims — seed-tiling races, per-identity slot limits |
+| `--p1-win-rate 0.65` | Drives SPRT to a chosen verdict instead of waiting for chance |
+| `--mode malformed` | Submissions the server should reject with 400 |
+| `--mode stale` | A claim token that was never issued; must be ignored, not accepted |
+| `--mode abandon` | Claim and never submit, so the heartbeat timeout has to reclaim |
+| `--seed` | Makes any of the above reproducible |
+
+Every mode is deterministic under `--seed`, so a failing CI run reproduces.
+
+### Running a worker with real MAGPIE
 
 MAGPIE is compiled from source into the worker image, along with the lexical
-data it needs. There is no host checkout, no `--magpie-dir`, and nothing to
-install:
+data it needs. There is no host checkout and nothing to install:
 
 ```bash
 docker compose --profile worker up --build
 ```
 
-This is the *same image a real contributor runs* — the only difference is that
-compose points it at `http://backend:8080` instead of a deployed URL. There is
-no separate mock client, so the local worker exercises the real MAGPIE path.
-
-A contributor's whole setup is one command:
-
-```bash
-docker run ghcr.io/jvc56/birdtest-worker \
-  --server-url https://birdtest.example --api-key bt_...
-```
-
-Set `BIRDTEST_API_KEY` in `.env` to attribute the local worker's results to
-your account rather than an anonymous UUID.
-
 **Wordmaps** (`.wmp`) make game play dramatically faster, so a client that runs
 games always wants one — but they are roughly ten times the size of everything
-else MAGPIE ships. They are never transmitted. The image carries each lexicon's
+else MAGPIE ships, and are never transmitted. The image carries each lexicon's
 `.kwg`, and the worker derives the word list and the wordmap from it on first
 use, in about 1.3 seconds per lexicon, into a volume that survives restarts.
 
 The backend image carries MAGPIE too, but no wordmaps: it never plays games, and
 only shells out to `magpie convert csv2klv` once per completed leave generation.
+
+> **Note:** this client cannot yet complete `games` or `game_pairs` tasks.
+> `autoplay` reports only aggregate statistics, while birdtest's schema stores
+> one record per game — a mismatch that is fixed by moving the client into
+> MAGPIE, where per-game data is available in-process. See
+> [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md). Use the fake worker for those job types
+> in the meantime.
 
 ### Frontend hot reload
 
@@ -139,9 +154,9 @@ The backend and frontend still run directly on the host if you would rather:
 You need a Postgres to point `DATABASE_URL` at — `docker compose up -d postgres
 minio minio-init` gives you one without the rest of the stack.
 
-The worker is Docker-only by design: shipping MAGPIE inside the image is what
-lets a contributor start with one command, and it pins every contributor to the
-same MAGPIE build, which the per-worker anomaly detection depends on.
+The real-MAGPIE worker is Docker-only, because shipping MAGPIE inside the image
+is what lets it start with one command. The fake worker needs only `requests`
+and runs anywhere.
 
 ## Deploying
 

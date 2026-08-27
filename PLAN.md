@@ -1011,9 +1011,10 @@ birdtest/
 │               └── audit-log/
 │                   └── +page.svelte                # /admin/audit-log
 │
-├── worker/                         # Python worker client
+├── worker/                         # test clients (the contributor client is moving into MAGPIE)
 │   ├── pyproject.toml
-│   └── worker.py                   # single-file implementation (see Worker Client section)
+│   ├── worker.py                   # reference client; runs real MAGPIE
+│   └── fake_worker.py              # synthetic results, no MAGPIE — see Testing
 │
 ├── data/
 │   └── letterdistributions/        # letter distribution files, mirroring MAGPIE-DATA/data/letterdistributions/
@@ -1585,7 +1586,7 @@ Every component — backend, worker client, and frontend — carries a coverage 
 | Component | Framework | Coverage tool | Gate |
 |---|---|---|---|
 | Backend (Rust/Axum) | `cargo test` (unit + integration) | `cargo llvm-cov` | `cargo llvm-cov --fail-under-lines 100 --fail-under-branch 100` in CI |
-| Worker client (Python) | `pytest` | `pytest-cov` (branch mode) | `pytest --cov=worker --cov-branch --cov-fail-under=100` in CI |
+| Test clients (Python) | `pytest` | `pytest-cov` (branch mode) | `pytest --cov=worker --cov-branch --cov-fail-under=100` in CI |
 | Frontend (SvelteKit) | Vitest (unit/component) + Playwright (e2e) | `@vitest/coverage-v8`, merged with Playwright's Istanbul instrumentation | `vitest run --coverage.thresholds.100` in CI |
 
 **Guarding against hollow coverage**: line/branch coverage alone can be satisfied by tests with no real assertions. To catch that, mutation testing runs as a separate (non-blocking-per-PR, scheduled) CI job — `cargo-mutants` for the backend, `mutmut` for the worker client — and a low mutation-kill score on a file is treated as a signal that its "100%" is fake and needs real assertions, not just execution.
@@ -1601,12 +1602,43 @@ Every component — backend, worker client, and frontend — carries a coverage 
 - **Migration tests**: every migration is tested both forward (applies cleanly to the previous migration's schema) and, where a down-migration exists, in reverse; a migration that can't run against a freshly seeded prior-version test DB fails CI before it fails staging.
 - **SPRT/Glicko correctness**: golden-value tests against hand-computed or reference-implementation expected values (not just "it runs"), since these are the two places a subtly wrong formula would silently produce wrong job outcomes rather than crashing.
 
-### Worker Client
+### Test Clients
 
-- MAGPIE itself is treated as an external dependency and is not what's under test here — `subprocess.run` is mocked/faked so worker unit tests are fast and don't require a MAGPIE build. Fakes return canned structured (`-hr`-off) output covering both the happy path and every documented error shape (non-zero exit, malformed output line, missing expected field) for each of `_handle_opening_rack`, `_handle_game`, `_handle_game_pair`, and `_handle_leave_gen`.
-- **HTTP layer** is tested against a local mock server (`responses` or a `pytest`-scoped `httpx` transport mock) covering claim/heartbeat/result/version-check round trips, including the 204-no-work and stale-claim-token paths, and the self-update re-exec flow (`_check_for_self_update`) with a fake newer-version response.
-- **One real end-to-end suite** (separate from the unit/coverage-gated suite, run nightly rather than per-PR) builds an actual MAGPIE binary from the pinned `min_magpie_version` commit and runs the worker against it for one real task of each job type, plus one full real leave-gen partition-task cycle, to catch drift between MAGPIE's actual output format and the client's parsing — this is what would have caught a MAGPIE-side format regression that mocks structurally cannot.
-- **Golden-file tests** for output parsing: a corpus of real captured MAGPIE stdout (checked into `worker/testdata/`) for each recorder type is parsed and asserted against expected structured results, so a MAGPIE output-format change shows up as a diff against a committed fixture rather than a silent misparse.
+`worker/` holds two clients, and neither is what a contributor will eventually
+run — that is [moving into MAGPIE](MAGPIE-CLIENT.md). What stays here is the
+tooling birdtest needs to test its *server*.
+
+**`fake_worker.py` — synthetic results, no MAGPIE.** This is what most
+server-side tests should use. Scheduling (priority tiers, deficit allocation),
+the claim lifecycle (heartbeat timeouts, stale tokens, reclamation), SPRT and
+Glicko, and redundancy all want a chosen outcome and a fast one; a real engine
+makes them slow and non-deterministic. It also covers paths a real client
+cannot reach on purpose:
+
+- `--mode malformed` — submissions the server must reject with `400`.
+- `--mode stale` — a claim token that was never issued, which must be silently
+  ignored rather than accepted.
+- `--mode abandon` — claim and never submit, so the heartbeat timeout has to
+  reclaim the task.
+- `--workers N` — concurrent claims, for the seed-tiling race and the
+  per-identity slot limit.
+- `--p1-win-rate` — bias results to drive SPRT to a known verdict.
+
+Every mode is deterministic under `--seed`. Rate-limit responses are backed off
+and retried rather than counted as rejections, so "the server throttled me"
+never masquerades as "the server refused my data".
+
+**`worker.py` — the reference client that runs real MAGPIE.** Its value is as an
+end-to-end check that the HTTP contract and the MAGPIE invocations both hold,
+not as a unit-testing target. MAGPIE is treated as an external dependency:
+`subprocess.run` is faked in unit tests so they are fast and need no MAGPIE
+build.
+
+**One real end-to-end suite** (run nightly rather than per-PR) runs the real
+client against a real MAGPIE for one task of each job type, to catch drift
+between MAGPIE's actual behaviour and the client's assumptions — the class of
+problem that mocks structurally cannot find, and which has already produced
+several findings.
 
 ### Frontend
 

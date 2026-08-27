@@ -133,6 +133,32 @@ services:
     ports:
       - "${DEV_PORT:-5174}:5173"
 
+  # --- profile: fake-worker -------------------------------------------------
+  # Synthetic results, no MAGPIE. This is what most server-side testing wants:
+  # scheduling, SPRT, Glicko, redundancy and reclamation are all faster and more
+  # deterministic without a real engine in the loop, and the adversarial modes
+  # have no real-client equivalent at all.
+  fake-worker:
+    profiles: [fake-worker]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: fake-worker
+    depends_on:
+      backend:
+        condition: service_healthy
+    command:
+      - --server-url
+      - http://backend:8080
+      - --workers
+      - "${FAKE_WORKERS:-2}"
+      - --tasks
+      - "${FAKE_TASKS:-0}"
+      - --p1-win-rate
+      - "${FAKE_P1_WIN_RATE:-0.5}"
+      - --mode
+      - "${FAKE_MODE:-normal}"
+
   # --- profile: worker ------------------------------------------------------
   # The same image a real contributor runs, pointed at the local backend rather
   # than a deployed one. There is no separate mock client.
