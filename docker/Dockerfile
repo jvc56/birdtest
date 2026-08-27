@@ -24,7 +24,7 @@
 # ---------------------------------------------------------------------------
 
 FROM debian:bookworm-slim AS magpie-bin-build
-ARG MAGPIE_REF=d513d35020d2e87b83bfa68880f23d7921c660a7
+ARG MAGPIE_REF=e4eda016fc000f0e26079651bff5cc90e94d4dee
 ARG MAGPIE_BOARD_DIM=15
 # MAGPIE's release profile hardcodes `-march=native`, which would bake the
 # build machine's CPU features into an image other people run and crash with

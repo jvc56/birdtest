@@ -313,49 +313,48 @@ not a statistical necessity. If that export is worth keeping at per-game
 granularity, a `gamelog` recorder is the way to get it, and it would incidentally
 give command-line MAGPIE per-game output it does not have today.
 
-#### A MAGPIE bug found while testing this
+#### The pairs signal, confirmed
 
-Under `-gp`, **`-s1`/`-s2` (move sort type) and `-r1`/`-r2` (move record type)
-do not differentiate the two players.** `-l1`/`-l2` (lexicon) and `-k1`/`-k2`
-(leaves) do. Reproduced from a clean directory with no `settings.txt` present,
-20 pairs, seed 50, NWL23:
+Testing initially showed `-gp` producing perfectly symmetric, uninformative
+aggregates. That turned out to be a MAGPIE bug, not a property of `-gp`: static
+play called `get_top_equity_move` unconditionally, so a player's configured
+move sort type never affected which move it chose, both games of every pair
+played identically, and every pair was a guaranteed tie. Fixed in
+[jvc56/MAGPIE#655](https://github.com/jvc56/MAGPIE/pull/655) and verified here
+against `main` at `e4eda01`, 20 pairs, seed 50, NWL23:
 
-| Players differ by | Divergent games | Player stats |
-|---|---|---|
-| `-l1 NWL23 -l2 CSW21` | 40 / 40 | 14-26, means 412.3 vs 466.5 |
-| `-k1 NWL23 -k2 CSW21` | 26 / 40 | means 426.9 vs 420.0 |
-| `-s1 equity -s2 score` | **0 / 40** | identical to six decimal places |
-| `-r1 best -r2 all` | **0 / 40** | identical to six decimal places |
+| Players differ by | Divergent games | Player 1 W-L-D | Score means |
+|---|---|---|---|
+| `-s1 equity -s2 score` | 40 / 40 | 25-14-1 | 429.5 / 403.4 |
+| `-l1 NWL23 -l2 CSW21` | 40 / 40 | 14-26-0 | 412.3 / 466.5 |
+| `-k1 NWL23 -k2 CSW21` | 26 / 40 | 20-20-0 | 426.9 / 420.0 |
+| nothing (same config) | 0 / 40 | 20-20-0 | identical |
+| `-r1 best -r2 all` | 0 / 40 | 20-20-0 | identical |
 
-Sort type is not inert in general: the same `-s1 equity -s2 score` in *unpaired*
-autoplay gives 13-17 over 30 games with clearly different score means. It stops
-having any effect only under `-gp`, where both games of every pair play
-identically and the pair therefore contributes a guaranteed tie.
+The last row is **correct, not a residual bug**: move *record* type governs what
+gets recorded, not which move is played, and the fix explicitly forces
+`MOVE_RECORD_BEST` for static play. An earlier version of this document wrongly
+grouped `-r` with `-s`; only the sort-type half was ever broken. birdtest's own
+schema already notes that autoplay should always use `best`, so the two are
+consistent.
 
-`autoplay_test.c` differentiates players by lexicon (line 183) and by leaves
-(line 207), and by nothing else - so the two settings that work are covered and
-the two that do not are not, which is presumably why this has gone unnoticed.
-`move_sort_type` does live in `PlayersData` alongside the KWG and KLV, so this
-is not a case of the setting having nowhere to live; the exact point where it is
-lost was not identified.
+**This settles the design.** `-gp` reports exactly what pair-level SPRT needs -
+the all-games aggregate plus the divergent-games aggregate, both already
+accounting for both sides of the pair, with identical pairs excluded as the
+noise-free ties they are. So:
 
-**Consequences for birdtest, now, before any of this work starts:**
-
-- A `game_pairs` job whose two `player_configs` differ *only* in
-  `recorder_type` or `sort_strategy` will silently produce an exact tie
-  regardless of which strategy is better. Both are first-class columns in
-  `player_configs`, and "static equity player vs static score player" is an
-  obvious first experiment to want to run. Until this is fixed, such a job
-  produces a meaningless result rather than an error.
-- Once it *is* fixed, `-gp` reports exactly what pair-level SPRT needs: the
-  all-games aggregate plus the divergent-games aggregate, already accounting
-  for both sides of the pair. That points firmly at the "adopt MAGPIE's model"
-  row of the table above - **no new MAGPIE recorder, and no per-game records.**
-- birdtest should therefore stop deriving pair outcomes from per-game rows. The
-  current SQL pairs consecutive `game_index` rows and inverts the second game's
-  winner on the assumption that the players swapped seats; with `-gp` the
-  reported aggregates already account for both orderings, so that derivation is
-  both unnecessary and, as far as I can tell, wrong.
+- **No new MAGPIE recorder is needed.** Not per-game, not per-pair.
+- **birdtest should store the two aggregates per task**, not one row per game.
+  `game_records` is finer-grained than any consumer, and for `game_pairs` the
+  per-game rows cannot reconstruct the pair outcomes anyway.
+- **birdtest should stop deriving pair outcomes in SQL.** The current query
+  pairs consecutive `game_index` rows and inverts the second game's winner on
+  the assumption that the players swapped seats. With `-gp` the reported
+  aggregates already account for both orderings, so that derivation is
+  unnecessary and wrong.
+- SPRT for a pairs job should run on the **divergent** counts, which is where
+  the variance reduction lives; the all-games aggregate is still worth storing
+  for the dashboard's raw win/loss/draw display.
 
 ### 7. Wordmap auto-provisioning
 
@@ -443,11 +442,12 @@ Small, because the HTTP API does not change:
   run `contribute`".
 - **`GET /api/worker/client-version`** changes meaning from "script version and
   download URL" to "minimum MAGPIE version".
-- **The result schema is probably too fine-grained.** `game_records` stores one
-  row per game, but nothing reads the individual rows: SPRT and the dashboard
-  both work off counts. See section 6 — the likely outcome is that `games` jobs
-  store an aggregate per task and `game_pairs` jobs store one row per pair, with
-  per-game rows kept only if the raw-data export is worth them.
+- **The result schema is too fine-grained** and, for pairs, wrong. `game_records`
+  stores one row per game; nothing reads the individual rows, and the pair
+  derivation built on them is incorrect. See section 6: both job types should
+  store the aggregates `autoplay` reports, and `game_pairs` should run SPRT on
+  the divergent-games counts. This is a birdtest change, not a MAGPIE one, and
+  it does not depend on the client move - it is worth doing either way.
 ### The client stops being birdtest's code
 
 This is the part with the widest blast radius, and it is organisational as much
@@ -503,10 +503,10 @@ Each phase is independently useful and independently reviewable.
 1. **Foundations** — `http_client`, `json`, UUID generation, `ClientState`.
    Convert `get_gcg.c` to the new HTTP client as the first consumer, which
    tests it against a real endpoint before any birdtest code exists.
-2. **Settle result granularity for pairs** (section 6) — understand the `-gp`
-   aggregate, confirm the pair semantics, and decide between MAGPIE's
-   divergent-games model and pair-outcome reporting. `games` jobs need nothing
-   here, so they are not blocked on it.
+2. **Move birdtest's result schema onto the aggregates** (section 6) — store
+   what `autoplay` reports rather than one row per game, and run pairs SPRT on
+   the divergent counts. Needs no MAGPIE change and does not depend on the
+   client move, so it can happen first and independently.
 3. **`contribute`, single job type** — claim, heartbeat, execute and submit for
    `games` only. This proves the whole loop end to end.
 4. **Remaining job types** — opening rack analysis, game pairs, leave
