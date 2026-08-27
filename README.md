@@ -7,6 +7,8 @@ aggregates everything onto a live dashboard.
 
 [PLAN.md](PLAN.md) is the design document — architecture, schema, API surface
 and rationale all live there. This file is how to run it.
+[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) specifies moving the worker client into
+MAGPIE itself, so contributing needs MAGPIE and nothing else.
 
 ## Layout
 

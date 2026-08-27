@@ -506,6 +506,8 @@ Contributors run a client program that polls for tasks, executes them, and submi
 
 ### Engine Dependency (MAGPIE)
 
+> **Direction of travel:** the client is intended to move *into* MAGPIE, so that a contributor needs MAGPIE and nothing else — no Python, no Docker — and a future MAGPIE GUI can start contributing from a single button. [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) specifies the changes MAGPIE needs for that. The rest of this section describes the current Python client, which that work would retire.
+
 The worker client shells out to **MAGPIE** ([github.com/jvc56/MAGPIE](https://github.com/jvc56/MAGPIE)) for the actual word game computation.
 
 **MAGPIE is distributed as part of the worker container image**, compiled from a pinned commit at image build time. A contributor's entire setup is one command:
