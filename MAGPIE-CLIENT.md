@@ -1,34 +1,68 @@
 # Bringing the birdtest Client into MAGPIE
 
+Implementation specification. Every design decision here is settled; there are
+no open questions left to resolve before starting.
+
 ## Goal
 
 A contributor should need **only MAGPIE**. No Python, no Docker, no separate
 worker script. Today's client is a Python program that shells out to MAGPIE and
-parses its stdout; this document specifies what MAGPIE needs to gain so that
-the client becomes a MAGPIE command instead.
+parses its stdout; this specifies what MAGPIE gains so the client becomes a
+MAGPIE command instead.
 
-The immediate target is a command:
+Immediate target:
 
 ```
-magpie> contribute https://birdtest.example -apikey bt_...
+magpie> contribute -server https://birdtest.example -apikey bt_...
 ```
 
-The eventual target is a MAGPIE GUI button that calls the same code path, which
-is why the design below runs asynchronously and exposes machine-readable status
-rather than assuming a terminal.
+Eventual target: a MAGPIE GUI button calling the same code path, which is why
+the command runs asynchronously and exposes machine-readable status rather than
+assuming a terminal.
 
-### A second reason to do this
+### The second reason to do this
 
 The current client's fragility is almost entirely about **crossing the process
 boundary**. It invokes `autoplay`, `gen` and `leavegen` as subprocesses and
-reconstructs results by parsing human- or UCGI-formatted stdout. That is where
-every integration bug found so far has lived, and one of them is not fixable
-from outside: `autoplay` only ever *reports* aggregate statistics
-(`autoplay games <n> <p0_wins> <p0_losses> ...`), while birdtest's schema stores
-one record per game. Internally MAGPIE has exactly what birdtest wants —
-`game_data_add_game()` receives the full `Game` and turn count for every single
-game before aggregating them away. Running in-process makes the mismatch
-disappear rather than requiring a workaround on either side.
+reconstructs results by parsing formatted stdout. Every integration bug found so
+far has lived there: invented flags, output formats that turned out to be
+aggregate-only, a rack-equity CSV written under a name the client did not
+predict, and MAGPIE resolving its board layout from `./data` before parsing
+`-path`. Running in-process deletes that entire class of problem.
+
+---
+
+## Ground rules
+
+### Platform-specific code lives only in `src/compat/`
+
+**No file outside `src/compat/` may contain `#ifdef _WIN32`, `#ifdef __APPLE__`,
+`#ifdef __wasm__`, or any other platform test.** Everything else in MAGPIE is
+platform-neutral and calls into compat through a neutral API.
+
+This invariant **currently holds exactly**: grepping the tree for `_WIN32`,
+`__APPLE__` and `__wasm__` outside `src/compat/` returns nothing. `cpthread.h`
+wraps pthreads, `csched.h` stubs `sched_yield` for wasm, `endian_conv.h`
+branches on `_WIN32`, `ctime.h` wraps clocks. The client work is the largest
+new source of platform behaviour MAGPIE has taken on, and must not be what
+breaks it. Concretely, three new pieces of
+platform behaviour are needed, and all three go in `src/compat/`:
+
+| Need | Compat file | Neutral API it exposes |
+|---|---|---|
+| HTTP + TLS | `src/compat/chttp.h` / `chttp.c` | `chttp_request()` |
+| Cryptographic random bytes (worker UUID) | `src/compat/crandom.h` | `crandom_bytes()` |
+| Restricting a file to the owner (API key) | `src/compat/cfile.h` | `cfile_restrict_to_owner()` |
+
+Everything above them — request construction, retry policy, JSON, the task loop
+— is ordinary portable C in `src/util/`, `src/ent/` and `src/impl/`.
+
+### The WASM build compiles everything
+
+`Makefile-wasm` compiles every `.c` under `src`'s subdirectories, so every new
+file must compile under Emscripten. Networking is meaningless there, so the compat layer defines
+`MAGPIE_NO_NETWORK` for wasm and `chttp_request()` becomes a stub that pushes an
+error onto the stack. Nothing above compat needs to know.
 
 ---
 
@@ -36,292 +70,333 @@ disappear rather than requiring a workaround on either side.
 
 | Responsibility | Current implementation |
 |---|---|
-| Persistent worker identity | UUID generated on first run, stored in `~/.birdtest/worker_uuid` |
+| Persistent worker identity | UUID generated on first run, stored on disk |
 | Authentication | `Authorization: Bearer <api-key>`, or `X-Worker-UUID` when anonymous |
-| Claim a task | `POST /api/worker/task` → JSON task request, or 204 when idle |
-| Version gate | Skip the task if MAGPIE is older than the job's `min_magpie_version` |
+| Claim a task | `POST /api/worker/task` -> task request, or 204 when idle |
+| Version gate | Refuse the task if MAGPIE is older than the job's `min_magpie_version` |
 | Execute | Dispatch on `job_type` to one of four handlers |
 | Heartbeat | Background thread, `POST /api/worker/heartbeat` every 30s while working |
-| Submit | `POST /api/worker/result` with the claim token and a JSON result |
+| Submit | `POST /api/worker/result` with the claim token |
 | Artifact fetch | `GET /api/worker/artifact?key=...` for a previous generation's KLV |
 | Backoff | Sleep on 204 and on 429 (`Retry-After`) |
-| Self-update | Re-exec a newer copy of the script fetched from the server |
-
-Four job types, each mapping to work MAGPIE already knows how to do:
-
-| Job type | MAGPIE equivalent | Result birdtest stores |
-|---|---|---|
-| `opening_rack_analysis` | `gen` or `sim` on a CGP position | Ranked move list with per-ply sim stats |
-| `games` | `autoplay games` from a seed | One record per game |
-| `game_pairs` | `autoplay` with `-gp true` | Two records per pair, one per ordering |
-| `leave_generation` | `leavegen` over a forced-rack subset | Per-rack occurrence counts and mean equity |
 
 ---
 
-## What MAGPIE already has, and what is missing
+## What MAGPIE already has
 
 | Capability | Status |
 |---|---|
-| HTTP requests | **Partial.** `src/impl/get_gcg.c` shells out to the `curl` *binary* through `get_process_output()` (a `popen` wrapper). No headers, no POST bodies, no status codes. |
-| JSON | **No.** `get_gcg.c` scrapes with `strstr(response, "\"gcg\":\"")`. There is no parser and no serializer. |
+| HTTP requests | **Partial.** `src/impl/get_gcg.c` shells out to the `curl` *binary* via `get_process_output()` (a `popen` wrapper). No headers, no POST bodies, no status codes. |
+| JSON | **No.** `get_gcg.c` scrapes with `strstr(response, "\"gcg\":\"")`. |
 | Threads | **Yes.** `src/compat/cpthread.h`, `src/ent/thread_control.h`. |
 | Async command execution | **Yes.** `EXEC_MODE_ASYNC`, `src/compat/async_command_control.h`. |
 | Command registration | **Yes.** `cmd()` / `arg()` in `config.c`. |
-| Config persistence | **Partial.** `settings.txt` via `-savesettings`. No per-user state directory. |
-| File path resolution | **Yes.** `data_filepaths.c`, colon-separated `-path` search list. |
-| Structured error reporting | **Yes.** `ErrorStack` + `error_stack_push()`. |
-| Per-game result capture | **Internally yes, externally no.** See above. |
+| File path resolution | **Yes.** `data_filepaths.c`, colon-separated `-path` search list, writes to the first entry. |
+| Structured errors | **Yes.** `ErrorStack` + `error_stack_push()`. |
+| Per-player settings under `-gp` | **Yes**, as of [#655](https://github.com/jvc56/MAGPIE/pull/655). |
 
 ---
 
 ## Design overview
 
-Add one long-running command, `contribute`, that owns a claim → execute →
-submit loop. Task execution calls MAGPIE's existing implementation functions
-directly; nothing is serialized to stdout and re-parsed.
-
 ```
 contribute
-  ├── client_identity      load/create UUID + API key from the client state file
-  ├── birdtest_api         typed wrappers over the five worker endpoints
-  │     ├── http_client    POST/GET with headers, status codes, timeouts
-  │     └── json           parse + serialize
-  ├── heartbeat thread     runs for the lifetime of a claim
-  └── task dispatch        one executor per job_type, each calling existing impls
-        ├── opening rack → config_execute_gen / config_execute_sim
-        ├── games        → autoplay with a per-game recorder
-        ├── game pairs   → autoplay -gp with a per-game recorder
-        └── leave gen    → leavegen over the forced-rack subset
+  |- client_state       load/create UUID + API key + server URL
+  |- birdtest_api       typed wrappers over the five worker endpoints
+  |    |- http_client   portable request/retry logic
+  |    |    `- chttp    COMPAT: libcurl (POSIX) / WinHTTP (Windows) / stub (wasm)
+  |    `- json          portable wrapper over vendored cJSON
+  |- heartbeat thread   runs for the lifetime of a claim
+  `- task dispatch      one executor per job_type, calling existing impls directly
 ```
 
 ---
 
-## Required changes
+## 1. HTTP: `src/compat/chttp.{h,c}` + `src/util/http_client.{h,c}`
 
-### 1. HTTP client — `src/util/http_client.{c,h}` (new)
+### The compat layer
 
-The worker API needs POST with a JSON body, request headers, response status
-codes, and `Retry-After`. Shelling out to `curl` cannot supply these without
-building shell command strings out of server-controlled values, which is both
-fragile and an injection risk.
+One neutral entry point. Everything platform-specific is behind it.
 
 ```c
-typedef struct HttpResponse {
+typedef enum { CHTTP_GET, CHTTP_POST } chttp_method_t;
+
+typedef struct ChttpRequest {
+  chttp_method_t method;
+  const char *url;
+  const char *const *headers;   // "Name: value" strings
+  int num_headers;
+  const char *body;             // NULL for GET
+  size_t body_length;
+  int timeout_seconds;
+} ChttpRequest;
+
+typedef struct ChttpResponse {
   long status_code;
-  char *body;          // NUL-terminated, caller frees
-  int retry_after_seconds;  // parsed from the header; -1 when absent
-} HttpResponse;
+  char *body;                   // caller frees; NUL-terminated
+  size_t body_length;           // body may be binary (KLV artifacts)
+  int retry_after_seconds;      // from the header; -1 when absent
+} ChttpResponse;
 
-HttpResponse *http_get(const char *url, const char *const *headers,
-                       int num_headers, int timeout_seconds,
-                       ErrorStack *error_stack);
-HttpResponse *http_post_json(const char *url, const char *body,
-                             const char *const *headers, int num_headers,
-                             int timeout_seconds, ErrorStack *error_stack);
-void http_response_destroy(HttpResponse *response);
+void chttp_request(const ChttpRequest *request, ChttpResponse *response,
+                   ErrorStack *error_stack);
+void chttp_response_destroy(ChttpResponse *response);
 ```
 
-**Implementation: OS-native backends, no new installable dependency.**
+Three implementations behind one `#ifdef` ladder in `chttp.c`:
 
-In practice this is two backends rather than three, because libcurl already
-ships with macOS (`/usr/lib/libcurl.4.dylib`) and is present on essentially
-every Linux desktop:
-
-| Platform | Backend | Why |
+| Platform | Backend | Notes |
 |---|---|---|
-| Linux / BSD / macOS | **libcurl**, against the system copy | Already present; no static build, no vendored TLS, no CA bundle to keep fresh - certificate trust stays the OS's problem |
-| Windows | **WinHTTP** (`winhttp.dll`) | Ships with the OS, no redistributable, and the Schannel trust store is already configured |
+| Linux, BSD, macOS | **libcurl**, `dlopen`ed at first use | Linux ships no OS HTTP API; libcurl is what the platform provides, and macOS ships it too (`/usr/lib/libcurl.4.dylib`), so one implementation covers both. |
+| Windows | **WinHTTP** (`winhttp.dll`) | Ships with the OS, no redistributable, Schannel trust store already configured. |
+| wasm | Stub | Pushes a new `ERROR_STATUS_HTTP_UNAVAILABLE`. |
 
-The point is that a contributor installs MAGPIE and nothing else on every
-platform, while MAGPIE never owns a TLS implementation or a certificate bundle.
+**`dlopen` rather than link-time binding.** Only these symbols are needed:
+`curl_easy_init`, `curl_easy_setopt`, `curl_easy_perform`, `curl_easy_getinfo`,
+`curl_easy_cleanup`, `curl_slist_append`, `curl_slist_free_all`. Resolving them
+at first use means a machine without libcurl still runs every offline MAGPIE
+command, and `contribute` fails with "libcurl not found; install libcurl4" —
+rather than MAGPIE refusing to start at all. Try `libcurl.so.4`, then
+`libcurl.so`, then `libcurl.4.dylib`.
 
-Structure it as one header with two implementations selected by the existing
-platform conventions in `src/compat/`:
+Requirements that hold on every backend:
 
-```
-src/util/http_client.h          // the interface above
-src/util/http_client_curl.c     // #if !defined(_WIN32)
-src/util/http_client_winhttp.c  // #if defined(_WIN32)
-```
+- **TLS certificate verification is on and cannot be disabled.** No flag, no
+  environment variable.
+- Follow redirects, bounded at 5.
+- `timeout_seconds` covers the whole exchange.
+- The response body is length-delimited, not NUL-delimited: artifacts are binary.
+- No global process state at exit; `contribute` may run many requests.
 
-Two details worth deciding up front:
+### The portable layer
 
-- **Prefer `dlopen`ing libcurl over link-time binding.** A minimal Linux install
-  (a container, a headless server) can genuinely lack `libcurl.so.4`. Resolving
-  it at runtime turns that from "MAGPIE will not start" into "MAGPIE runs, and
-  `contribute` reports that libcurl is missing and names the package" - which
-  also keeps every non-networking command working on a machine without it.
-- **`Makefile-wasm` globs all of `src`**, so both files must compile under
-  Emscripten. Guard them with `MAGPIE_NO_NETWORK`, which the WASM build defines,
-  leaving stubs that push an error onto the stack.
+`src/util/http_client.c` holds everything that is not platform-specific:
+building the header list, the `Authorization` / `X-Worker-UUID` choice,
+JSON content type, and the retry policy.
 
-Also replace the three `curl`-via-`popen` call sites in `get_gcg.c` with this
-client, so there is one HTTP path rather than two.
+**Retry policy**, applied uniformly:
 
-### 2. JSON — `src/util/json.{c,h}` (new)
+| Response | Action |
+|---|---|
+| 2xx | Return it. |
+| 204 | Return it; the caller decides (for `/task` it means "no work"). |
+| 429 | Sleep `Retry-After` (default 1s) and retry, up to 5 times. |
+| 5xx, or a transport error | Exponential backoff 1s, 2s, 4s, 8s, 16s; then fail. |
+| 4xx other than 429 | Return it; the caller decides. Never retried. |
 
-Needed for both directions: parsing task requests (nested objects, arrays of
-player configs) and serializing results (arrays of per-game records, arrays of
-rack occurrences with floating-point means).
+---
 
-Vendor a small permissively-licensed parser rather than writing one — cJSON
-(MIT, one `.c` + one `.h`) is the usual choice and matches MAGPIE's existing
-habit of vendoring (`src/compat/linenoise.c`). Wrap it in a thin MAGPIE-flavoured
-API so the rest of the codebase sees `ErrorStack` rather than the vendor's error
-conventions:
+## 2. JSON: vendored cJSON + `src/util/json.{h,c}`
+
+Vendor [cJSON](https://github.com/DaveGamble/cJSON) (MIT, one `.c` + one `.h`)
+into `src/util/cjson.{c,h}` **verbatim and unmodified**, so it can be updated by
+replacing the files. It is portable C89 and compiles under Emscripten unchanged,
+so it does not belong in `src/compat/`.
+
+Wrap it in `src/util/json.{h,c}` so the rest of MAGPIE sees `ErrorStack` rather
+than cJSON's conventions, and so a future swap touches one file:
 
 ```c
 JsonValue *json_parse(const char *text, ErrorStack *error_stack);
-const JsonValue *json_object_get(const JsonValue *obj, const char *key);
-bool json_get_bool(const JsonValue *v, const char *key, bool fallback);
-int64_t json_get_int(const JsonValue *v, const char *key, ErrorStack *es);
-double json_get_double(const JsonValue *v, const char *key, ErrorStack *es);
-const char *json_get_string(const JsonValue *v, const char *key, ErrorStack *es);
+void json_destroy(JsonValue *value);
+
+const JsonValue *json_object_get(const JsonValue *object, const char *key);
+bool         json_is_null(const JsonValue *value);
+int          json_array_length(const JsonValue *array);
+const JsonValue *json_array_get(const JsonValue *array, int index);
+
+// Each pushes onto the error stack if absent or the wrong type.
+const char *json_get_string(const JsonValue *object, const char *key, ErrorStack *es);
+int64_t     json_get_int   (const JsonValue *object, const char *key, ErrorStack *es);
+uint64_t    json_get_uint64(const JsonValue *object, const char *key, ErrorStack *es);
+double      json_get_double(const JsonValue *object, const char *key, ErrorStack *es);
+bool        json_get_bool  (const JsonValue *object, const char *key, bool fallback);
+
 // Serialization builds on the existing StringBuilder.
+void json_write_object_start(StringBuilder *sb);
+void json_write_int(StringBuilder *sb, const char *key, int64_t value);
+void json_write_double(StringBuilder *sb, const char *key, double value);
+void json_write_string(StringBuilder *sb, const char *key, const char *value);
+void json_write_object_end(StringBuilder *sb);
 ```
 
-Two parsing details that bite: `seed` is a `uint64` and must not round-trip
-through a `double`, and equity values are signed floats that need locale-
-independent formatting (`%.6f` with the C locale, not `%g`).
+Two details that will otherwise bite:
 
-### 3. Client identity and state - `src/ent/client_state.{c,h}` (new)
+- **`seed` is a `uint64`** and must not round-trip through a `double`. cJSON
+  stores numbers as `double`, which loses precision above 2^53. Read `seed` from
+  its raw string form (`valuestring` is not populated for numbers, so keep the
+  token text) or, simplest, have birdtest send it as a JSON string. **Decision:
+  the server sends `seed` as a decimal string**; see the contract below.
+- **Equity values are floats and must be locale-independent.** Write with
+  `"%.6f"` under the C locale, never `%g`, and never rely on the process locale.
 
-Three single-value files in the current working directory, matching how
-`settings.txt` is already resolved:
+---
+
+## 3. Client state: `src/ent/client_state.{h,c}`
+
+Three single-value files in the **current working directory**, matching how
+`settings.txt` is already resolved. No platform state directories.
 
 ```
-birdtest_worker_uuid    generated on first run, persisted
-birdtest_api_key        optional; mode 0600
+birdtest_worker_uuid    generated on first run
+birdtest_api_key        optional; owner-only permissions
 birdtest_server         server URL
 ```
 
 ```c
 typedef struct ClientState {
   char *worker_uuid;
-  char *api_key;
+  char *api_key;      // NULL when contributing anonymously
   char *server_url;
 } ClientState;
 
-ClientState *client_state_load(ErrorStack *error_stack);   // creates the UUID if absent
+ClientState *client_state_load(ErrorStack *error_stack);  // creates the UUID if absent
 void client_state_save(const ClientState *state, ErrorStack *error_stack);
 void client_state_destroy(ClientState *state);
 ```
 
-MAGPIE has no UUID generator today; a v4 UUID from `/dev/urandom` (and
-`BCryptGenRandom` on Windows) is a dozen lines and belongs in `src/util/`.
+Command-line `-server` / `-apikey` override the files and are written back, so
+`contribute` is configured once and then runs bare.
 
-**The API key must never be printed** by `-savesettings`, status output, or the
-error stack.
+**The UUID** is v4, from 16 cryptographically random bytes via
+`crandom_bytes()`, formatted `8-4-4-4-12` lowercase hex, with the version and
+variant bits set (byte 6 `= (b & 0x0F) | 0x40`, byte 8 `= (b & 0x3F) | 0x80`).
 
-### 4. The `contribute` command
-
-Registered alongside the others in `config.c`:
+**`src/compat/crandom.h`:**
 
 ```c
-cmd(ARG_TOKEN_CONTRIBUTE, "contribute", 0, 1, contribute, contribute, false);
-
-arg(ARG_TOKEN_CONTRIBUTE_SERVER,   "server",     1, 1);
-arg(ARG_TOKEN_CONTRIBUTE_API_KEY,  "apikey",     1, 1);
-arg(ARG_TOKEN_CONTRIBUTE_MAX_TASKS,"maxtasks",   1, 1);  // 0 = run forever
-arg(ARG_TOKEN_CONTRIBUTE_IDLE_SECS,"idlewait",   1, 1);
+// Fills buffer with cryptographically secure random bytes.
+void crandom_bytes(uint8_t *buffer, size_t length, ErrorStack *error_stack);
 ```
 
-Implementation in `src/impl/contribute.c`, following the shape of the other
-`impl_*` entry points: `impl_contribute(Config *config, ErrorStack *error_stack)`.
+`getrandom(2)` on Linux, `/dev/urandom` as fallback, `arc4random_buf` on BSD and
+macOS, `BCryptGenRandom` on Windows, and an error push on wasm.
 
-The loop:
+**`src/compat/cfile.h`:**
 
-1. Resolve identity from `ClientState`, overridden by any `-server` / `-apikey`.
-2. `POST /api/worker/task`. On 204, sleep `idlewait` and repeat. On 429, honour
-   `Retry-After`.
-3. Compare the job's `min_magpie_version` against MAGPIE's own version. On a
-   mismatch, report it through the error stack and **stop**, rather than looping
-   on tasks it cannot run — a GUI needs to surface "your MAGPIE is too old"
-   once, not every second.
+```c
+// Restricts a file to its owner: chmod 0600 on POSIX, owner-only ACL on Windows.
+void cfile_restrict_to_owner(const char *path, ErrorStack *error_stack);
+```
+
+**The API key is a bearer credential.** Never write it via `-savesettings`,
+never include it in status output, never put it in an error message.
+
+A consequence worth documenting for users: because state is cwd-relative, a
+contributor who runs MAGPIE from a different directory becomes a **new anonymous
+worker** and loses their contribution history — the same footgun `settings.txt`
+already has. Authenticating with an API key avoids it, since attribution then
+follows the account. The GUI should steer people toward signing in.
+
+---
+
+## 4. The `contribute` command
+
+Registered in `config.c` alongside the others:
+
+```c
+cmd(ARG_TOKEN_CONTRIBUTE, "contribute", 0, 0, contribute, contribute, false);
+
+arg(ARG_TOKEN_CONTRIBUTE_SERVER,    "server",   1, 1);
+arg(ARG_TOKEN_CONTRIBUTE_API_KEY,   "apikey",   1, 1);
+arg(ARG_TOKEN_CONTRIBUTE_MAX_TASKS, "maxtasks", 1, 1);  // 0 = run until stopped
+arg(ARG_TOKEN_CONTRIBUTE_IDLE_WAIT, "idlewait", 1, 1);  // seconds; default 5
+```
+
+Implemented as `impl_contribute(Config *config, ErrorStack *error_stack)` in
+`src/impl/contribute.c`, following the other `impl_*` entry points.
+
+**Threads.** Default to `num_cores - 1`, minimum 1. Contributing should leave the
+machine usable — this will eventually be a background activity someone opts into
+on their daily driver, and a machine that becomes unresponsive is a machine
+whose owner turns contributing off. `-threads` overrides.
+
+**The loop:**
+
+1. Load `ClientState`; apply `-server` / `-apikey` overrides and save.
+2. `POST /api/worker/task`.
+   - 204: sleep `idlewait`, repeat.
+   - 200: continue.
+3. **Version gate.** The response carries `min_magpie_version`. If it is present
+   and this build is older, **stop the loop and report an error**: "this job
+   requires MAGPIE >= 1.4.0; you are running 1.2.0. Update MAGPIE to continue
+   contributing." Do not submit, do not retry — the claim lapses via the
+   heartbeat timeout and another worker picks it up. A GUI shows one actionable
+   message rather than a scrolling error.
+   The same applies to a `job_type` this build does not recognise: it means the
+   server is newer than this MAGPIE, so exit the same way.
 4. Start the heartbeat thread.
-5. Dispatch on `job_type`.
+5. Dispatch on `job_type` (section 5).
 6. `POST /api/worker/result`.
-7. Stop the heartbeat, repeat.
+7. Stop the heartbeat. If `maxtasks` is reached, stop; otherwise repeat.
 
-Because it is registered as a normal command it inherits `-mode async`, so a GUI
-can start it, poll status, and halt it with the existing machinery rather than
-new plumbing.
+**Stopping.** Cooperative. A stop request during a task lets the task finish and
+submit; a stop request while idle returns immediately. A hard interrupt simply
+abandons the claim, which the server's heartbeat timeout reclaims.
 
-### 5. Per-job-type executors
+**Errors during execution** are reported and the claim is abandoned without
+submitting; the loop continues. An error *claiming* or *submitting* is handled by
+the retry policy in section 1, and only stops the loop if it exhausts retries.
 
-Each executor builds the same in-memory configuration the equivalent
-command-line invocation would, calls the implementation function directly, and
-reads results out of the result structs. No subprocess, no stdout, no parsing.
+Because it is a normal command it inherits `-mode async`, so a GUI can start it,
+poll status, and stop it with the existing machinery.
 
-- **Opening rack analysis** — load the CGP from the request, apply the player
-  config (`-r1`, `-s1`, sim parameters), call the existing move generation or
-  simulation path, and read the ranked moves out of `MoveList` / `SimResults`,
-  including per-ply `bingo_percentage` and `average_score`.
-- **Games / game pairs** — set the seed, batch size, both player configs and
-  `-gp`, then run autoplay with the new per-game recorder (§6).
+---
+
+## 5. Per-job-type executors
+
+Each builds the in-memory configuration the equivalent command line would, calls
+the implementation function directly, and reads results out of the result
+structs. No subprocess, no stdout, no parsing.
+
+**Player configuration** arrives as a JSON object per player and maps onto the
+per-player settings, where `N` is 1 or 2:
+
+| JSON field | Setting | Notes |
+|---|---|---|
+| `recorder_type` | `-rN` | `best` for all birdtest jobs |
+| `sort_strategy` | `-sN` | `equity` or `score`; null for simming players |
+| `leaves` | `-kN` | null means the lexicon default |
+| `max_iterations` | `-iN` | null for a static player |
+| `plies` | `-plN` | |
+| `top_plays` | `-npN` | |
+| `stopping_pct` | `-scN` | |
+| `use_inference` | `-siN` | |
+| `time_limit_secs` | `-tlN` | |
+
+A player with `max_iterations` null is static; the simulation settings are all
+null together and must be omitted rather than passed as zero.
+
+- **Opening rack analysis** — load the CGP, apply the single player config, run
+  move generation (or simulation when `max_iterations` is set), and read the
+  ranked moves out of `MoveList` / `SimResults`, including per-ply
+  `bingo_percentage` and `average_score`.
+- **Games / game pairs** — set seed, batch size, both player configs, and `-gp`
+  for pairs. Read counts and score moments out of the `GameData` the autoplay
+  recorder already maintains: `total_games`, `p0_wins`, `p0_losses`, `p0_ties`,
+  and the score `Stat` means and standard deviations. For pairs, read the
+  divergent `GameData` as well.
 - **Leave generation** — fetch the previous generation's KLV via
   `GET /api/worker/artifact`, write the forced-rack subset to a scratch file,
   run `leavegen`, and read the rack-equity table directly out of `RackList`
   rather than via `-writerackequitycsv` and a CSV re-read.
 
-### 6. Result granularity - what MAGPIE actually needs to report
+---
 
-An earlier draft of this document called for a per-game autoplay recorder. That
-was overstated. Testing against the binary shows the requirement is narrower and
-splits by job type.
+## 6. Result granularity: nothing new is needed
 
-**`games` jobs need nothing new.** SPRT consumes wins, losses and draws, and
-that is exactly what `autoplay` already reports:
+An earlier draft called for a per-game autoplay recorder. That was wrong, and the
+question is now settled in both directions:
 
-```
-autoplay games <total> <p0_wins> <p0_losses> <p0_ties> <p0_firsts> <p0_mean> <p0_sd> <p1_mean> <p1_sd> ...
-```
+- **`games` jobs.** SPRT consumes wins, losses and draws, which is exactly what
+  autoplay already reports. Nothing downstream ever needed individual games.
+- **`game_pairs` jobs.** In `-gp` mode MAGPIE reports a second `GameData` over
+  the **divergent** pairs — those whose two games did not play identically. A
+  pair that played identically is a guaranteed tie carrying no information, so
+  excluding those is the variance reduction pairing exists to provide. That is
+  precisely the signal SPRT wants.
 
-birdtest's `game_records` table stores one row per game, but nothing downstream
-reads the individual rows for a `games` job - SPRT and the dashboard percentages
-both work off the counts. The schema is finer-grained than any consumer needs.
-
-**`game_pairs` jobs need something pair-aware, but coarser than per-game.** What
-SPRT wants for a pair is a single outcome - did player 1 take the pair, split
-it, or lose it - not two score lines. And the pooled per-game aggregate cannot
-supply it: two pairs recorded as two wins and two losses could be two splits, or
-one pair won and one lost, and those are different distributions.
-
-MAGPIE already has machinery pointed at this problem. In `-gp` mode it tracks
-whether the two games of a pair **diverged** (played different moves at any
-point), and reports a second `GameData` covering divergent games only. Pairs
-that played identically are guaranteed ties that carry no signal, so excluding
-them is the same variance reduction that pentanomial pair scoring achieves by a
-different route.
-
-So there are two candidate designs, and this needs deciding before anything is
-built:
-
-| | What MAGPIE reports | What birdtest stores |
-|---|---|---|
-| **Adopt MAGPIE's model** | The existing all-games and divergent-games aggregates | Two aggregates per task; SPRT runs on the divergent counts |
-| **Pair-outcome reporting** | A new recorder emitting one win/split/loss per pair | One row per pair |
-
-The first needs no MAGPIE change at all. The second is a smaller change than a
-per-game recorder and keeps birdtest's SPRT operating on units it already
-understands.
-
-**Per-game records are only required for the raw-data export** - the
-`GET /api/jobs/:id/results/stream` download offered for offline analysis. That
-is a product decision about what birdtest promises contributors and researchers,
-not a statistical necessity. If that export is worth keeping at per-game
-granularity, a `gamelog` recorder is the way to get it, and it would incidentally
-give command-line MAGPIE per-game output it does not have today.
-
-#### The pairs signal, confirmed
-
-Testing initially showed `-gp` producing perfectly symmetric, uninformative
-aggregates. That turned out to be a MAGPIE bug, not a property of `-gp`: static
-play called `get_top_equity_move` unconditionally, so a player's configured
-move sort type never affected which move it chose, both games of every pair
-played identically, and every pair was a guaranteed tie. Fixed in
-[jvc56/MAGPIE#655](https://github.com/jvc56/MAGPIE/pull/655) and verified here
-against `main` at `e4eda01`, 20 pairs, seed 50, NWL23:
+Verified against `main` at `e4eda01`, 20 pairs, seed 50, NWL23:
 
 | Players differ by | Divergent games | Player 1 W-L-D | Score means |
 |---|---|---|---|
@@ -331,234 +406,255 @@ against `main` at `e4eda01`, 20 pairs, seed 50, NWL23:
 | nothing (same config) | 0 / 40 | 20-20-0 | identical |
 | `-r1 best -r2 all` | 0 / 40 | 20-20-0 | identical |
 
-The last row is **correct, not a residual bug**: move *record* type governs what
-gets recorded, not which move is played, and the fix explicitly forces
-`MOVE_RECORD_BEST` for static play. An earlier version of this document wrongly
-grouped `-r` with `-s`; only the sort-type half was ever broken. birdtest's own
-schema already notes that autoplay should always use `best`, so the two are
-consistent.
+The last row is correct rather than a bug: move *record* type governs what is
+recorded, not which move is played, and static play forces `MOVE_RECORD_BEST`.
 
-**This settles the design.** `-gp` reports exactly what pair-level SPRT needs -
-the all-games aggregate plus the divergent-games aggregate, both already
-accounting for both sides of the pair, with identical pairs excluded as the
-noise-free ties they are. So:
+**birdtest has already been changed to match** — `game_records` is gone,
+replaced by `game_results` storing the two aggregates, with pairs SPRT and Glicko
+computed from the divergent counts. So there is no schema work waiting on this,
+and **no new MAGPIE recorder is required.**
 
-- **No new MAGPIE recorder is needed.** Not per-game, not per-pair.
-- **birdtest should store the two aggregates per task**, not one row per game.
-  `game_records` is finer-grained than any consumer, and for `game_pairs` the
-  per-game rows cannot reconstruct the pair outcomes anyway.
-- **birdtest should stop deriving pair outcomes in SQL.** The current query
-  pairs consecutive `game_index` rows and inverts the second game's winner on
-  the assumption that the players swapped seats. With `-gp` the reported
-  aggregates already account for both orderings, so that derivation is
-  unnecessary and wrong.
-- SPRT for a pairs job should run on the **divergent** counts, which is where
-  the variance reduction lives; the all-games aggregate is still worth storing
-  for the dashboard's raw win/loss/draw display.
+---
 
-### 7. Wordmap auto-provisioning
+## 7. Wordmap auto-provisioning
 
-Wordmaps make game play dramatically faster, so a contributing client is
-**required** to use one - there is no `-wmp false` path for `contribute`. They
-are also cheap to build: the `kwg -> txt -> wmp` chain measures **~1.3 seconds**
-per lexicon.
+Clients are **required** to use wordmaps: games run dramatically faster with one,
+and a contributor without one is donating far less compute than they think. There
+is no `-wmp false` path for `contribute`.
 
-So `contribute` builds a missing wordmap on demand rather than failing with
-`file 'NWL23' not found for data type wordmap`, writing it into `./data`
-alongside every other MAGPIE artifact. The data directory is assumed writable;
-if it is not, that is a clear error and `contribute` stops, rather than falling
-back to a second location.
+Wordmaps are also never transmitted — they are roughly ten times the size of
+everything else MAGPIE ships — so the client builds what it needs from the
+`.kwg` it already has. The full `kwg -> txt -> wmp` chain measures **~1.3 seconds**
+per lexicon (0.17s + 1.1s, NWL23, 4 threads).
 
-One safety requirement: two MAGPIE processes contributing from the same
-directory must not race. Generate to a temporary name and `rename()` into place.
+Before running any task, if `<lexicon>.wmp` is absent:
 
-### 8. Heartbeat thread
+1. If `<lexicon>.txt` is absent, `convert dawg2text <lexicon>`.
+2. `convert text2wordmap <lexicon> -threads <n>`.
 
-`POST /api/worker/heartbeat` every 30s for the lifetime of a claim, using
-`cpthread` and a stop flag. Failures are logged and ignored — the server treats
-a missed heartbeat as a lapsed claim and reassigns the task, which is already
-the designed behaviour.
+Both write into `./data`, which is **assumed writable**. If it is not, that is a
+clear error and `contribute` stops — there is no fallback location.
 
-### 9. Version negotiation replaces self-update
+Generate to a temporary name and `rename()` into place, so two MAGPIE processes
+contributing from the same directory cannot race.
+
+---
+
+## 8. Heartbeat thread
+
+`POST /api/worker/heartbeat` with `{"claim_token": "..."}` every 30 seconds for
+the lifetime of a claim, using `cpthread` and a stop flag. Failures are logged
+and ignored: the server treats a missed heartbeat as a lapsed claim and
+reassigns the task, which is the designed behaviour.
+
+The heartbeat must start *before* task execution, because wordmap generation and
+a large batch both happen inside it.
+
+---
+
+## 9. Version negotiation replaces self-update
 
 The Python client re-execs itself from a newer script the server offers. MAGPIE
 cannot responsibly do that: it is a compiled binary, and an auto-updating
-executable is a much larger security proposition than a script.
+executable is a much larger security proposition.
 
-Instead, `contribute` should report its version on every claim and surface a
-clear, actionable message when the server requires a newer one. `GET
-/api/worker/client-version` becomes a *minimum MAGPIE version* endpoint rather
-than a script download, and birdtest's `min_magpie_version` per job is already
-the right mechanism.
+Instead the server states a minimum and the client reports clearly when it falls
+short (section 4, step 3). `GET /api/worker/client-version` changes meaning from
+"script version and download URL" to "minimum MAGPIE version", and
+`min_magpie_version` per job is the per-job form of the same thing.
 
-### 10. Build and platform
+---
 
-- No new *installable* dependency: libcurl is resolved at runtime on POSIX and
-  WinHTTP is linked on Windows. `MAGPIE_NO_NETWORK` guards both for the WASM
-  build, which compiles everything under `src`.
-- The vendored JSON parser joins the existing `src/compat` precedent.
-- Windows: the client is the first part of MAGPIE that would need
-  `BCryptGenRandom` (for the worker UUID) and the WinHTTP backend. Both belong
-  in `src/compat/` and `src/util/` respectively.
-- `-march=native` in the release profile bakes the build machine's CPU features
-  into the binary. Anyone distributing prebuilt MAGPIE binaries to contributors
-  needs a portable baseline (`x86-64-v2` or similar) instead.
+## 10. The worker API contract
 
-### 11. Security
+Five endpoints. Authentication on all of them is either
+`Authorization: Bearer <api-key>` **or** `X-Worker-UUID: <uuid>`, never both.
 
-- TLS certificate verification on by default; no flag to disable it.
-- The API key is a bearer credential: never logged, never in `settings.txt`,
-  never in error messages, file mode `0600`.
-- Treat every field of a task request as untrusted input. It becomes file
-  paths (`forced_racks`, artifact keys) and numeric parameters. Validate
-  lexicon and variant names against known values before they reach
-  `data_filepaths`, and reject artifact keys containing `..` or absolute paths.
-- Bound everything the server can ask for: batch sizes, rack-subset sizes,
-  iteration counts. A compromised or buggy server should not be able to make a
+### `POST /api/worker/task`
+
+Empty body. `204` when there is no work. `200`:
+
+```json
+{
+  "claim_token": "6f3d7198-178a-47c8-9ccc-6aa6995a5a9c",
+  "job_id": "4c7b64ad-8e5e-4db7-aeb0-afc44ee1ebf5",
+  "min_magpie_version": "1.4.0",
+  "task_request": { "job_type": "games", "...": "..." }
+}
+```
+
+`min_magpie_version` may be `null`. `task_request` is internally tagged by
+`job_type`, one of four shapes:
+
+```json
+{ "job_type": "opening_rack_analysis",
+  "lexicon": "NWL23", "variant": "classic",
+  "position": "15/15/... AABCELT/ 0/0 0",
+  "previous_play": null,
+  "player": { "name": "static", "recorder_type": "best", "sort_strategy": "equity",
+              "leaves": null, "max_iterations": null, "plies": null,
+              "top_plays": null, "stopping_pct": null, "use_inference": null,
+              "time_limit_secs": null } }
+
+{ "job_type": "games",
+  "lexicon": "NWL23", "variant": "classic",
+  "seed": "1", "num_games": 10, "game_pairs": false,
+  "player1": { ... }, "player2": { ... } }
+
+{ "job_type": "game_pairs", "...": "as games, with game_pairs true",
+  "num_games": 10 }
+
+{ "job_type": "leave_generation",
+  "lexicon": "NWL23", "variant": "classic",
+  "generation": 2,
+  "forced_racks": ["AA", "AB"],
+  "previous_artifact_key": "leaves/<job>/generation-1.klv2",
+  "num_games": 10000 }
+```
+
+`seed` is a **decimal string**, because it is a `uint64` and JSON numbers are
+doubles. For `game_pairs`, `num_games` counts *pairs*; MAGPIE plays two games per
+pair.
+
+### `POST /api/worker/heartbeat`
+
+`{"claim_token": "..."}` -> `204`.
+
+### `POST /api/worker/result`
+
+```json
+{ "claim_token": "...", "result": { } }
+```
+
+Returns `200` with `{"accepted": true}`, or `{"accepted": false}` when the claim
+had already lapsed — which is **not an error**, just work that was reassigned.
+Returns `400` when the result does not satisfy its shape.
+
+Result shapes by job type:
+
+```json
+{ "moves": [ { "move": "8D BEAD", "score": 24, "equity": 31.5,
+               "plies": [ { "ply": 0, "bingo_percentage": 0.0,
+                            "average_score": 24.0 } ] } ] }
+
+{ "all_games": { "games": 20, "wins": 11, "losses": 9, "ties": 0,
+                 "p1_score_mean": 429.5, "p1_score_sd": 60.8,
+                 "p2_score_mean": 403.4, "p2_score_sd": 55.9 } }
+
+{ "all_games": { "...": "as above" },
+  "divergent_games": { "...": "same shape, the divergent subset" } }
+
+{ "racks": [ { "rack": "AA", "count": 30, "mean": 1.5 } ] }
+```
+
+Server-side validation, so the client must satisfy it:
+
+- `wins + losses + ties == games`, all non-negative.
+- `games_pairs`: `games` is even and non-zero, `divergent_games` is required, its
+  own counts are consistent, and `divergent_games.games` is even and `<= games`.
+- `moves` and `racks` must be non-empty.
+
+### `GET /api/worker/artifact?key=<key>`
+
+Returns `application/octet-stream`. Only keys the server itself minted resolve;
+anything else is `404`. Used for the previous generation's KLV.
+
+### `GET /api/worker/client-version`
+
+`{"version": "...", "download_url": "..."}` today; becomes the minimum MAGPIE
+version (section 9).
+
+### Rate limiting
+
+Worker endpoints are limited to roughly one request per second per identity with
+a small burst. A `429` carries `Retry-After` in seconds. A task costs at least
+two requests, so this is reached under normal operation and must be handled as
+backoff, not as an error.
+
+---
+
+## 11. Security
+
+- TLS certificate verification on by default, with no way to disable it.
+- The API key never appears in `settings.txt`, status output, logs, or errors.
+  Its file is owner-only via `cfile_restrict_to_owner()`.
+- **Every field of a task request is untrusted input.** It becomes file paths
+  (`forced_racks`, `previous_artifact_key`) and numeric parameters. Validate
+  lexicon and variant against known values before they reach `data_filepaths`,
+  and reject artifact keys containing `..` or a leading `/`.
+- Bound everything the server can ask for — batch sizes, rack-subset sizes,
+  iteration counts. A compromised or buggy server must not be able to make a
   contributor's machine allocate without limit.
 
-### 12. GUI integration surface
+---
 
-For the one-click button to work, `contribute` needs to expose, in async mode:
+## 12. GUI integration surface
+
+In async mode `contribute` must expose:
 
 - **State**: idle / claiming / working / submitting / stopped / error.
-- **Progress**: current job type, games completed within the current task.
-- **Totals**: tasks completed this session, plus the identity being credited.
-- **Last error**, if any, in a form suitable for display.
+- **Progress**: current job type, and games completed within the current task.
+- **Totals**: tasks completed this session, and the identity being credited.
+- **Last error**, in a form suitable for display.
 
 Emit these through the existing `-hr false` machine-readable convention so the
-GUI parses one format, and make stop cooperative — a task in flight should be
-allowed to finish and submit, or be abandoned cleanly so the server's heartbeat
-timeout reclaims it promptly.
+GUI parses one format.
 
 ---
 
 ## Changes on the birdtest side
 
-Small, because the HTTP API does not change:
+The HTTP API does not change, so these are small:
 
-- **Retire `worker/` entirely** — the Python client, its Dockerfile and the
-  worker compose profile. The contributor instructions become "install MAGPIE,
-  run `contribute`".
-- **`GET /api/worker/client-version`** changes meaning from "script version and
-  download URL" to "minimum MAGPIE version".
-- **The result schema is too fine-grained** and, for pairs, wrong. `game_records`
-  stores one row per game; nothing reads the individual rows, and the pair
-  derivation built on them is incorrect. See section 6: both job types should
-  store the aggregates `autoplay` reports, and `game_pairs` should run SPRT on
-  the divergent-games counts. This is a birdtest change, not a MAGPIE one, and
-  it does not depend on the client move - it is worth doing either way.
+- **Retire `worker/worker.py`** and the `worker` Docker profile. Contributor
+  instructions become "install MAGPIE, run `contribute`".
+- **`GET /api/worker/client-version`** changes meaning to a minimum MAGPIE
+  version.
+- **Send `seed` as a string** rather than a JSON number.
+- **Keep `worker/fake_worker.py`.** It speaks the worker API and submits
+  synthetic results with no MAGPIE in the loop, which is what most server tests
+  want — and it reaches paths a real client cannot reach deliberately
+  (`--mode malformed`, `--mode stale`, `--mode abandon`).
+
 ### The client stops being birdtest's code
 
-This is the part with the widest blast radius, and it is organisational as much
-as technical. Today the client is birdtest's: same repo, same PR, same CI, same
-review. Afterwards it is MAGPIE's, and the HTTP API becomes a **cross-repo
-integration boundary** between two independently released programs.
+Organisational as much as technical. The HTTP API becomes a **cross-repo
+integration boundary** between two independently released programs:
 
-Consequences worth planning for rather than discovering:
+- A client bug is a MAGPIE bug, fixed on MAGPIE's cadence, reaching contributors
+  only when they update.
+- A server change can break every deployed client. `min_magpie_version` is a
+  floor, not a ceiling, so it does not stop an old server confusing a new client.
+  The worker API should be treated as frozen and extended only additively.
+- Nothing currently pins the contract; it exists implicitly in `worker.py` and
+  `routes/worker.rs` agreeing. Committed request/response fixtures that both
+  repos test against are the cheap version of fixing that.
 
-- A client bug is a MAGPIE bug — filed there, fixed there, released on MAGPIE's
-  cadence, and only reaching contributors when they update MAGPIE.
-- A server change that alters the worker API can break every deployed client.
-  `min_magpie_version` per job is a floor, not a ceiling, so it does not stop an
-  *old server* from confusing a *new client*. Either the worker API gets an
-  explicit version, or it gets treated as frozen and only extended additively.
-- Nothing in either repo currently pins the contract. It exists implicitly in
-  `worker.py` and `routes/worker.rs` agreeing. Once they are in different repos
-  that agreement needs to be written down and checked — a committed set of
-  request/response fixtures both sides test against is the cheap version.
+### Testing
 
-### Testing has to be re-planned
+birdtest's worker component and its coverage gate disappear. What replaces them:
 
-The [Testing](PLAN.md) section assumes three components with coverage gates:
-backend, frontend, and worker client. The worker component disappears from
-birdtest entirely, and with it the pytest suite, its 100% gate, and the
-golden-file corpus of captured MAGPIE output. Those tests do not transfer —
-they exist to verify subprocess output parsing, which is precisely what this
-change deletes.
-
-What replaces them is a three-tier arrangement:
-
-1. **A fake worker** — a small test-only HTTP client that speaks the worker API
-   and submits synthetic results without running MAGPIE at all. This is what
-   most server tests want: it makes scheduler, SPRT, Glicko, redundancy,
-   reclamation and dashboard tests fast and deterministic, and it is the only
-   practical way to test the *adversarial* paths — malformed submissions, stale
-   claim tokens, and the chi-square anomaly detection, which needs a client that
-   deliberately submits bad data. Worth building whether or not MAGPIE takes
-   over the real client.
-2. **A real MAGPIE client in CI** — one job that builds MAGPIE with `contribute`
-   and runs it against a seeded stack for one task of each type. In-container
-   MAGPIE compiles in about 22 seconds, so this is affordable per-PR, not just
-   nightly.
-3. **Contract fixtures** shared with MAGPIE, so a change to either side that
-   breaks the other fails in both repos.
+1. **The fake worker** for server-side tests — scheduling, claim lifecycle,
+   SPRT, Glicko, redundancy, reclamation, and the adversarial paths.
+2. **A real MAGPIE client in CI**, building MAGPIE with `contribute` and running
+   it against a seeded stack for one task of each type. MAGPIE compiles in a
+   container in about 22 seconds, so this is affordable per-PR.
+3. **Contract fixtures** shared with MAGPIE.
 
 ---
 
-## Suggested phasing
+## Phasing
 
-Each phase is independently useful and independently reviewable.
-
-1. **Foundations** — `http_client`, `json`, UUID generation, `ClientState`.
-   Convert `get_gcg.c` to the new HTTP client as the first consumer, which
-   tests it against a real endpoint before any birdtest code exists.
-2. ~~**Move birdtest's result schema onto the aggregates** (section 6).~~
-   **Done** — `game_records` is replaced by `game_results`, which stores the
-   two aggregates `autoplay` reports; pairs SPRT and Glicko run on the
-   divergent counts; and the SQL that re-derived pair outcomes is gone. Needed
-   no MAGPIE change.
-3. **`contribute`, single job type** — claim, heartbeat, execute and submit for
-   `games` only. This proves the whole loop end to end.
+1. **Compat foundations** — `chttp` (both backends plus the wasm stub),
+   `crandom`, `cfile`. Convert `get_gcg.c`'s three `curl`-via-`popen` call sites
+   to `chttp_request()` as the first consumer: it exercises the layer against a
+   real endpoint before any birdtest code exists, and removes MAGPIE's dependency
+   on the `curl` binary.
+2. **Portable foundations** — vendored cJSON, the `json` wrapper,
+   `http_client`, `client_state`.
+3. **`contribute`, `games` only** — claim, heartbeat, execute, submit. Proves
+   the whole loop end to end against a local birdtest stack.
 4. **Remaining job types** — opening rack analysis, game pairs, leave
    generation, plus wordmap auto-provisioning.
-5. **Async status surface** — the GUI-facing state machine and machine-readable
-   status output.
-6. **Retire the Python client.**
-
----
-
-## Open questions
-
-### 1. How the HTTP dependency reaches a contributor - **decided**
-
-**OS-native backends.** libcurl on POSIX (system-provided on both Linux and
-macOS, resolved at runtime), WinHTTP on Windows. MAGPIE stays a single download
-on every platform, takes no static TLS dependency, and never ships a CA bundle.
-
-Rejected: dynamic libcurl as a hard link-time dependency (re-adds an install
-step), static libcurl + TLS (MAGPIE would inherit OpenSSL CVEs and a stale CA
-bundle), and continuing to shell out to the `curl` binary (unreliable on
-Windows, and builds shell strings out of server-controlled values).
-
-### 2. Where per-user state lives - **decided**
-
-Deliberately simple, matching `settings.txt`'s existing convention rather than
-introducing platform state directories:
-
-- **Generated wordmaps go in `./data`**, like every other MAGPIE artifact. The
-  data directory is **assumed writable**; if it is not, `contribute` fails with
-  a clear error rather than falling back somewhere else. One convention for
-  where MAGPIE's files live, at the cost of not supporting a read-only
-  system-wide install - worth revisiting only if that install shape appears.
-- **Clients are required to use wordmaps.** There is no `-wmp false` path for
-  `contribute`: a missing wordmap is generated, and a data directory that
-  cannot be written is an error. Games run dramatically faster with one, and a
-  contributor running without one is donating much less compute than they think.
-- **Client state goes in three files in the current working directory**, each
-  holding one value: the worker UUID, the API key, and the server URL. Same
-  cwd-relative model as `settings.txt`, so MAGPIE gains no new concept.
-- The API key file is still a credential: `0600` on POSIX, never echoed by
-  `-savesettings`, never in status output or error messages.
-
-A consequence worth stating: because state is cwd-relative, a contributor who
-runs MAGPIE from a different directory becomes a **new anonymous worker** and
-loses their contribution history. That is the same footgun `settings.txt`
-already has. Authenticating with an API key avoids it, since attribution then
-follows the account rather than the generated UUID - a good reason for the GUI
-to steer people toward signing in.
-
-### Remaining open questions
-
-- **Thread budget.** `contribute` should probably default to leaving a core
-  free rather than saturating a contributor's machine.
+5. **Async status surface** — the GUI-facing state machine.
+6. **Retire the Python contributor client**, keeping the fake worker.
