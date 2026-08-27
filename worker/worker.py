@@ -49,10 +49,29 @@ class Config:
     worker_uuid: str  # persistent across runs; generated on first run
     heartbeat_interval: int = 30  # seconds between heartbeats
     retry_delay_seconds: int = 5  # seconds to wait when the server has no work
+    threads: int = 0  # MAGPIE worker threads; 0 → one per available CPU
 
     @property
     def magpie_bin(self) -> Path:
         return self.magpie_dir / "bin" / "magpie"
+
+    @property
+    def magpie_data_dir(self) -> Path:
+        return self.magpie_dir / "data"
+
+    @property
+    def magpie_generated_dir(self) -> Path:
+        """Where MAGPIE writes the artifacts this client builds for itself.
+
+        Listed first in every `-path`, because MAGPIE writes to the first entry
+        and searches all of them in order — so generated files shadow the
+        shipped ones without the image's data directory ever being written to.
+        """
+        return self.magpie_dir / "generated"
+
+    @property
+    def magpie_search_path(self) -> str:
+        return f"{self.magpie_generated_dir}:{self.magpie_data_dir}"
 
 
 def _load_or_generate_uuid(state_dir: Path) -> str:
@@ -79,21 +98,20 @@ def _load_config(args: argparse.Namespace) -> Config:
             return value
         return file_values.get(name, default)
 
-    magpie_dir = pick("magpie_dir")
-    if magpie_dir is None:
-        raise SystemExit(
-            "--magpie-dir (or magpie_dir in the config file) is required: "
-            "point it at a directory containing an already-built MAGPIE"
-        )
+    # MAGPIE ships inside the worker image; there is no host checkout to point
+    # at. The flag stays as an escape hatch for running this script outside the
+    # container during development.
+    magpie_dir = pick("magpie_dir") or os.environ.get("BIRDTEST_MAGPIE_DIR", "/magpie")
 
     state_dir = Path(file_values.get("state_dir", "~/.birdtest")).expanduser()
     return Config(
         server_url=str(pick("server_url", "http://localhost:8080")).rstrip("/"),
         magpie_dir=Path(magpie_dir).expanduser(),
-        api_key=pick("api_key"),
+        api_key=pick("api_key") or os.environ.get("BIRDTEST_API_KEY") or None,
         worker_uuid=_load_or_generate_uuid(state_dir),
         heartbeat_interval=int(file_values.get("heartbeat_interval", 30)),
         retry_delay_seconds=int(file_values.get("retry_delay_seconds", 5)),
+        threads=int(file_values.get("threads", 0)) or (os.cpu_count() or 1),
     )
 
 
@@ -229,8 +247,19 @@ def _player_args(player: dict, slot: int) -> list[str]:
 
 
 def _run_magpie(cfg: Config, args: list[str]) -> str:
-    """Run MAGPIE and return stdout, raising on a non-zero exit."""
-    command = [str(cfg.magpie_bin), *args]
+    """Run MAGPIE and return stdout.
+
+    Two invariants every call needs. The working directory is the MAGPIE root
+    because MAGPIE resolves its default board layout from `./data` while
+    building its config, before it has parsed `-path`. And `-path` puts the
+    generated directory first, so anything MAGPIE writes lands there rather
+    than in the image's read-only data directory.
+
+    MAGPIE reports many failures on an error stack and still exits 0, so the
+    exit status is checked but is not on its own proof of success — callers that
+    expect an output file must confirm it appeared.
+    """
+    command = [str(cfg.magpie_bin), *args, "-path", cfg.magpie_search_path]
     logger.debug("running %s", " ".join(command))
     result = subprocess.run(command, capture_output=True, text=True, cwd=cfg.magpie_dir)
     if result.returncode != 0:
@@ -238,6 +267,35 @@ def _run_magpie(cfg: Config, args: list[str]) -> str:
             f"MAGPIE exited {result.returncode}: {result.stderr.strip() or result.stdout.strip()}"
         )
     return result.stdout
+
+
+def _ensure_wordmap(cfg: Config, lexicon: str) -> None:
+    """Build this lexicon's wordmap if it is not already present.
+
+    Wordmaps make game play dramatically faster, so a client that runs games
+    always wants one. They are also ~10x the size of everything else MAGPIE
+    ships, so they are never transmitted: the image carries the `.kwg` and the
+    client derives the rest locally. On this machine the whole chain costs about
+    1.3 seconds per lexicon, once, and the result persists in the generated
+    volume.
+    """
+    generated = cfg.magpie_generated_dir / "lexica"
+    if (generated / f"{lexicon}.wmp").exists():
+        return
+
+    generated.mkdir(parents=True, exist_ok=True)
+
+    # `text2wordmap` reads the word list, which is itself derived from the .kwg.
+    if not (generated / f"{lexicon}.txt").exists():
+        logger.info("building word list for %s", lexicon)
+        _run_magpie(cfg, ["convert", "dawg2text", lexicon])
+        if not (generated / f"{lexicon}.txt").exists():
+            raise RuntimeError(f"MAGPIE did not produce a word list for {lexicon}")
+
+    logger.info("building wordmap for %s (one time, ~1s)", lexicon)
+    _run_magpie(cfg, ["convert", "text2wordmap", lexicon, "-threads", str(cfg.threads)])
+    if not (generated / f"{lexicon}.wmp").exists():
+        raise RuntimeError(f"MAGPIE did not produce a wordmap for {lexicon}")
 
 
 def _parse_json_output(raw: str) -> dict:
@@ -259,6 +317,7 @@ def _parse_json_output(raw: str) -> dict:
 
 def _handle_opening_rack(request: dict, cfg: Config) -> dict:
     """Invoke MAGPIE to analyze a single opening rack position."""
+    _ensure_wordmap(cfg, request["lexicon"])
     args = [
         "sim" if request["player"].get("max_iterations") else "gen",
         "-lex", request["lexicon"],
@@ -295,12 +354,14 @@ def _handle_opening_rack(request: dict, cfg: Config) -> dict:
 
 def _autoplay(request: dict, cfg: Config, extra: list[str]) -> dict:
     """Shared driver for the games and game-pairs handlers."""
+    _ensure_wordmap(cfg, request["lexicon"])
     args = [
         "autoplay",
         "-lex", request["lexicon"],
         "-var", request["variant"],
         "-seed", str(request["seed"]),
         "-gms", str(request["num_games"]),
+        "-threads", str(cfg.threads),
         "-hr", "false",
         *_player_args(request["player1"], 1),
         *_player_args(request["player2"], 2),
@@ -344,11 +405,13 @@ def _handle_leave_gen(request: dict, cfg: Config) -> dict:
         racks_file.write_text("\n".join(request["forced_racks"]) + "\n")
         csv_path = scratch / "rack_equity.csv"
 
+        _ensure_wordmap(cfg, request["lexicon"])
         args = [
             "autoplay",
             "-lex", request["lexicon"],
             "-var", request["variant"],
             "-gms", str(request["num_games"]),
+            "-threads", str(cfg.threads),
             "-forceracksfile", str(racks_file),
             "-writerackequitycsv", "true",
             "-rackequitycsvpath", str(csv_path),
@@ -497,7 +560,12 @@ def _worker_loop(cfg: Config, magpie_version: str) -> None:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="birdtest worker client")
     p.add_argument("--config", type=Path, default=Path("~/.birdtest/config.toml").expanduser())
-    p.add_argument("--magpie-dir", type=Path)
+    p.add_argument(
+        "--magpie-dir",
+        type=Path,
+        help="MAGPIE root. Defaults to /magpie, where the worker image puts it; "
+             "only needed when running this script outside the container.",
+    )
     p.add_argument("--api-key")
     p.add_argument("--server-url")
     return p.parse_args()

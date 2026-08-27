@@ -70,22 +70,36 @@ for exactly this.
 
 ### Running a worker
 
-The worker needs MAGPIE, which is *not* in the image: birdtest does not build,
-fetch or manage it, and its lexical data dwarfs the client. Point the stack at
-a MAGPIE checkout on the host and it is bind-mounted into the container at
-`/magpie`:
+MAGPIE is compiled from source into the worker image, along with the lexical
+data it needs. There is no host checkout, no `--magpie-dir`, and nothing to
+install:
 
 ```bash
-# Defaults to $HOME/MAGPIE; set MAGPIE_DIR in .env for anywhere else.
 docker compose --profile worker up --build
 ```
 
-Set `BIRDTEST_API_KEY` in `.env` (generate one at `/account`) to attribute the
-work to your account rather than an anonymous UUID.
+This is the *same image a real contributor runs* — the only difference is that
+compose points it at `http://backend:8080` instead of a deployed URL. There is
+no separate mock client, so the local worker exercises the real MAGPIE path.
 
-The same mount is given to the backend read-only, because leave-generation
-aggregation shells out to `magpie convert csv2klv` once per completed
-generation. Everything except leave-generation works fine without it.
+A contributor's whole setup is one command:
+
+```bash
+docker run ghcr.io/jvc56/birdtest-worker \
+  --server-url https://birdtest.example --api-key bt_...
+```
+
+Set `BIRDTEST_API_KEY` in `.env` to attribute the local worker's results to
+your account rather than an anonymous UUID.
+
+**Wordmaps** (`.wmp`) make game play dramatically faster, so a client that runs
+games always wants one — but they are roughly ten times the size of everything
+else MAGPIE ships. They are never transmitted. The image carries each lexicon's
+`.kwg`, and the worker derives the word list and the wordmap from it on first
+use, in about 1.3 seconds per lexicon, into a volume that survives restarts.
+
+The backend image carries MAGPIE too, but no wordmaps: it never plays games, and
+only shells out to `magpie convert csv2klv` once per completed leave generation.
 
 ### Frontend hot reload
 
@@ -98,13 +112,34 @@ bind-mounted from `frontend/`, alongside the production-style Nginx build on
 5173. `node_modules` lives in a named volume so the container's install never
 collides with a host one.
 
+### Updating MAGPIE
+
+The binary and the data are separate build stages with separate build args, so
+bumping one leaves the other's layers cached:
+
+```bash
+MAGPIE_REF=<git-sha> docker compose build            # binary only (~25s)
+MAGPIE_DATA_VERSION=<yyyymmdd> docker compose build   # data only (~10s)
+```
+
+Both stages are also `FROM scratch` payload images in their own right, ready to
+publish and consume from a registry rather than rebuilt per clone:
+
+```bash
+docker build -f docker/Dockerfile --target magpie-bin  -t ghcr.io/jvc56/magpie-bin:<sha> .
+docker build -f docker/Dockerfile --target magpie-data -t ghcr.io/jvc56/magpie-data:<ver> .
+```
+
 ### Without Docker
 
-Each component still runs directly on the host if you would rather: `cargo run`
-in `backend/` (see `.env.example`), `npm run dev` in `frontend/`, and
-`pip install -e . && python worker.py` in `worker/`. You need a Postgres to
-point `DATABASE_URL` at — `docker compose up -d postgres minio minio-init`
-gives you one without the rest of the stack.
+The backend and frontend still run directly on the host if you would rather:
+`cargo run` in `backend/` (see `.env.example`) and `npm run dev` in `frontend/`.
+You need a Postgres to point `DATABASE_URL` at — `docker compose up -d postgres
+minio minio-init` gives you one without the rest of the stack.
+
+The worker is Docker-only by design: shipping MAGPIE inside the image is what
+lets a contributor start with one command, and it pins every contributor to the
+same MAGPIE build, which the per-worker anomaly detection depends on.
 
 ## Deploying
 

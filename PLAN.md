@@ -506,9 +506,35 @@ Contributors run a client program that polls for tasks, executes them, and submi
 
 ### Engine Dependency (MAGPIE)
 
-The worker client shells out to **MAGPIE** ([github.com/jvc56/MAGPIE](https://github.com/jvc56/MAGPIE)) for the actual word game computation. For v1, the contributor or admin supplies a path to a local MAGPIE directory containing an already-compiled MAGPIE executable. The worker client does **not** build, install, fetch, or manage MAGPIE — it only invokes the binary at the given path.
+The worker client shells out to **MAGPIE** ([github.com/jvc56/MAGPIE](https://github.com/jvc56/MAGPIE)) for the actual word game computation.
 
-The MAGPIE directory path is a required configuration value for the worker client, provided via a config file or CLI flag (e.g. `--magpie-dir /path/to/MAGPIE`).
+**MAGPIE is distributed as part of the worker container image**, compiled from a pinned commit at image build time. A contributor's entire setup is one command:
+
+```bash
+docker run ghcr.io/jvc56/birdtest-worker --server-url https://birdtest.example --api-key bt_...
+```
+
+There is no host checkout, no `--magpie-dir` to supply, and no build step. This is the only supported way to obtain MAGPIE for a worker. Beyond removing the setup burden, it pins every contributor to the same MAGPIE build — which matters for the per-worker anomaly detection described under [Worker Integrity](#worker-integrity-and-anomaly-detection), since "deviates from the population" is a much weaker signal when every client is a different build. It also makes a job's `min_magpie_version` enforceable: the server states a floor and contributors pull a newer image tag.
+
+#### Packaging: binary and data as separate stages
+
+The image is assembled from two independently-versioned build stages, so bumping one leaves the other's layers cached:
+
+| Stage | Build arg | Contents |
+|---|---|---|
+| `magpie-bin` | `MAGPIE_REF` (git sha), `MAGPIE_BOARD_DIM` | The compiled executable, ~1 MB |
+| `magpie-data` | `MAGPIE_DATA_VERSION` | `.kwg`, `.klv2`, letter distributions, board layouts, strategy — ~147 MB |
+
+Both are `FROM scratch` payload images in their own right and can be published to and consumed from a registry rather than rebuilt per clone.
+
+Two things are deliberately *not* shipped, because both are derivable:
+
+- **Wordmaps (`.wmp`)** are roughly 90% of a full MAGPIE data directory (2.25 GB of a 2.5 GB tree) and make game play dramatically faster, so a client that runs games always wants one. They must never cross a network. The image carries each lexicon's `.kwg` and the worker builds the wordmap it needs on first use, into a writable directory listed first in MAGPIE's `-path` so generated files shadow shipped ones without the image's data directory ever being written to. The whole `kwg → txt → wmp` chain costs about 1.3 seconds per lexicon, once, and persists in a volume across restarts.
+- **Word lists (`.txt`)** are regenerated from the `.kwg` in ~0.2s as the first half of that chain. Note that board layouts are `.txt` files too, so this prune is scoped to `lexica/` — MAGPIE loads a layout before it has parsed any argument, and dropping those breaks every command.
+
+The backend image carries the binary and the same data but never builds a wordmap: it does not play games, and only shells out to `magpie convert csv2klv` once per completed leave generation.
+
+MAGPIE's release profile hardcodes `-march=native`, which would bake the build machine's CPU features into an image other people run. The build retargets to `x86-64-v2` (SSE4.2 + popcnt) as a portable floor.
 
 ### Skeleton Implementation
 
@@ -869,8 +895,10 @@ birdtest/
 ├── docker-compose.yml               # the whole local stack: Postgres, MinIO (S3 stub), backend,
 │                                    # frontend, plus `dev` and `worker` profiles — see Development
 ├── .env.example                     # compose port and MAGPIE_DIR overrides
+├── docker/
+│   └── Dockerfile                  # backend + worker targets, sharing the two MAGPIE stages
+│                                    # (magpie-bin / magpie-data), each independently versioned
 ├── backend/                        # Axum web server (Rust)
-│   ├── Dockerfile                  # multi-stage build; context is the repo root, to ship data/
 │   ├── Cargo.toml
 │   ├── .env.example                # DATABASE_URL, SESSION_SIGNING_KEY, MAIL_BACKEND=console, etc. for local dev
 │   ├── migrations/                 # sqlx migration files
@@ -982,7 +1010,6 @@ birdtest/
 │                   └── +page.svelte                # /admin/audit-log
 │
 ├── worker/                         # Python worker client
-│   ├── Dockerfile                  # MAGPIE is bind-mounted at /magpie, never baked in
 │   ├── pyproject.toml
 │   └── worker.py                   # single-file implementation (see Worker Client section)
 │
@@ -1439,7 +1466,8 @@ host.
 | Tool | Used for |
 |---|---|
 | Docker / Docker Compose | The entire stack |
-| A compiled MAGPIE directory (see [Engine Dependency (MAGPIE)](#engine-dependency-magpie)) | Only needed to run a worker, or leave-generation aggregation. Bind-mounted from the host — birdtest does not vendor, build or fetch it, and its lexical data is orders of magnitude larger than birdtest itself. |
+
+(No MAGPIE checkout is needed. It is compiled from source into the images — see [Engine Dependency (MAGPIE)](#engine-dependency-magpie).)
 
 Working directly on the host is still supported and needs Rust (stable), Node
 (LTS) and Python 3.11+ per component; see [Without Docker](#without-docker) in
@@ -1506,13 +1534,12 @@ it, on a separate port.
 docker compose --profile worker up --build
 ```
 
-MAGPIE is bind-mounted from the host at `/magpie` (`MAGPIE_DIR`, defaulting to
-`$HOME/MAGPIE`) rather than baked into the image. Set `BIRDTEST_API_KEY` in
-`.env` to attribute results to an account instead of an anonymous UUID.
+This runs the *same image a contributor runs*, pointed at `http://backend:8080`
+instead of a deployed URL. There is no separate mock client, so the local worker
+exercises the real MAGPIE path.
 
-The backend gets the same mount read-only, because leave-generation aggregation
-shells out to `magpie convert csv2klv` once per completed generation. Every
-other job type works with no MAGPIE on the host at all.
+Set `BIRDTEST_API_KEY` in `.env` to attribute results to an account instead of
+an anonymous UUID.
 
 The worker needs an actual admin-created, activated job to have anything to
 claim (see step 5) — with no active job, `_claim_task` just gets 204s and the

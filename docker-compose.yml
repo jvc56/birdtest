@@ -1,8 +1,11 @@
 # Full local stack. `docker compose up` needs nothing on the host but Docker:
 # database, object storage, backend and frontend all run in containers.
 #
+# MAGPIE is built and packaged into the images from source; nothing on the host
+# is required and there is no MAGPIE checkout to point at.
+#
 # Optional profiles:
-#   --profile worker   a worker client, with MAGPIE bind-mounted from the host
+#   --profile worker   a worker client — the same image a real contributor runs
 #   --profile dev      the Vite dev server with hot reload, alongside the
 #                      production-style Nginx frontend
 #
@@ -60,7 +63,11 @@ services:
   backend:
     build:
       context: .
-      dockerfile: backend/Dockerfile
+      dockerfile: docker/Dockerfile
+      target: backend
+      args:
+        MAGPIE_REF: ${MAGPIE_REF:-d513d35020d2e87b83bfa68880f23d7921c660a7}
+        MAGPIE_DATA_VERSION: ${MAGPIE_DATA_VERSION:-20251004}
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,10 +94,6 @@ services:
       AWS_SECRET_ACCESS_KEY: birdtestbirdtest
       AWS_REGION: us-east-1
       RUST_LOG: ${RUST_LOG:-birdtest=debug,tower_http=info}
-    volumes:
-      # Read-only: `magpie convert csv2klv` writes into a scratch directory
-      # passed first in -path, never into the mounted data directory.
-      - ${MAGPIE_DIR:-${HOME}/MAGPIE}:/magpie:ro
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     healthcheck:
@@ -131,29 +134,31 @@ services:
       - "${DEV_PORT:-5174}:5173"
 
   # --- profile: worker ------------------------------------------------------
+  # The same image a real contributor runs, pointed at the local backend rather
+  # than a deployed one. There is no separate mock client.
   worker:
     profiles: [worker]
     build:
-      context: ./worker
+      context: .
+      dockerfile: docker/Dockerfile
+      target: worker
+      args:
+        MAGPIE_REF: ${MAGPIE_REF:-d513d35020d2e87b83bfa68880f23d7921c660a7}
+        MAGPIE_DATA_VERSION: ${MAGPIE_DATA_VERSION:-20251004}
     depends_on:
       backend:
         condition: service_healthy
-    command:
-      - --server-url
-      - http://backend:8080
-      - --magpie-dir
-      - /magpie
+    command: ["--server-url", "http://backend:8080"]
     environment:
       BIRDTEST_API_KEY: ${BIRDTEST_API_KEY:-}
     volumes:
-      # Writable, unlike the backend's mount: MAGPIE runs with this as its
-      # working directory and the client's autoplay invocations are not yet
-      # verified against a real binary, so a read-only mount would add a second
-      # failure mode on top of that.
-      - ${MAGPIE_DIR:-${HOME}/MAGPIE}:/magpie
       # Persists the generated worker UUID, so contributions stay attributed to
       # the same anonymous identity across restarts.
       - workerstate:/home/worker/.birdtest
+      # Wordmaps the client builds for itself on first use. Keeping them here
+      # means a restart does not rebuild them; losing the volume costs about a
+      # second per lexicon.
+      - workermagpie:/magpie/generated
     restart: unless-stopped
 
 volumes:
@@ -161,3 +166,4 @@ volumes:
   miniodata:
   frontend_node_modules:
   workerstate:
+  workermagpie:
