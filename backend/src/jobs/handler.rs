@@ -94,11 +94,31 @@ pub struct PositionRequest {
     pub player: PlayerSpec,
 }
 
+/// `seed` crosses the wire as a decimal string, not a JSON number.
+///
+/// It is a full `uint64`, and JSON numbers are doubles — any client parsing
+/// with a conventional JSON library would silently lose precision above 2^53.
+/// A string costs nothing and the client parses it where it needs an integer.
+mod seed_as_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(seed: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&seed.to_string())
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameRequest {
     pub lexicon: String,
     pub variant: String,
     /// uint64 at the application layer; stored as a signed BIGINT.
+    #[serde(with = "seed_as_string")]
     pub seed: u64,
     pub num_games: i32,
     /// True for `game_pairs`: MAGPIE runs both orderings from the same seed.

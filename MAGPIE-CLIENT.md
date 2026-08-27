@@ -13,8 +13,11 @@ MAGPIE command instead.
 Immediate target:
 
 ```
-magpie> contribute -server https://birdtest.example -apikey bt_...
+magpie> contribute
 ```
+
+with everything it needs — server, credentials, limits — in a `contribute.txt`
+beside it, so no API key ever reaches a command line or `settings.txt`.
 
 Eventual target: a MAGPIE GUI button calling the same code path, which is why
 the command runs asynchronously and exposes machine-readable status rather than
@@ -101,7 +104,7 @@ error onto the stack. Nothing above compat needs to know.
 
 ```
 contribute
-  |- client_state       load/create UUID + API key + server URL
+  |- client_state       read contribute.txt; generate the UUID on first run
   |- birdtest_api       typed wrappers over the five worker endpoints
   |    |- http_client   portable request/retry logic
   |    |    `- chttp    COMPAT: libcurl (POSIX) / WinHTTP (Windows) / stub (wasm)
@@ -226,94 +229,136 @@ Two details that will otherwise bite:
   stores numbers as `double`, which loses precision above 2^53. Read `seed` from
   its raw string form (`valuestring` is not populated for numbers, so keep the
   token text) or, simplest, have birdtest send it as a JSON string. **Decision:
-  the server sends `seed` as a decimal string**; see the contract below.
+  the server already sends `seed` as a decimal string**, so MAGPIE reads it
+  with `strtoull`; see the contract below.
 - **Equity values are floats and must be locale-independent.** Write with
   `"%.6f"` under the C locale, never `%g`, and never rely on the process locale.
 
 ---
 
-## 3. Client state: `src/ent/client_state.{h,c}`
+## 3. Contribution settings: `src/ent/client_state.{h,c}`
 
-Three single-value files in the **current working directory**, matching how
-`settings.txt` is already resolved. No platform state directories.
+**Nothing about contributing is passed on the command line.** All of it lives in
+a single settings file, for two reasons: an API key on a command line ends up in
+shell history and in `ps` output, and contribution settings have no business
+mixed into `settings.txt` alongside board layouts and simulation parameters.
+
+### The file
+
+`contribute.txt` in the current working directory, one setting per line as
+`key value`. Blank lines and lines beginning with `#` are ignored.
 
 ```
-birdtest_worker_uuid    generated on first run
-birdtest_api_key        optional; owner-only permissions
-birdtest_server         server URL
+# birdtest contribution settings
+server    https://birdtest.example
+apikey    bt_9f2c...
+threads   7
+maxtasks  0
+idlewait  5
+uuid      6f3d7198-178a-47c8-9ccc-6aa6995a5a9c
 ```
+
+| Key | Required | Default | Meaning |
+|---|---|---|---|
+| `server` | **yes** | — | birdtest base URL |
+| `apikey` | no | absent | Attributes work to an account. Without it the worker is anonymous, identified by `uuid`. |
+| `threads` | no | cores − 1 | Threads given to MAGPIE while working |
+| `maxtasks` | no | `0` | Tasks to complete before stopping; `0` runs until stopped |
+| `idlewait` | no | `5` | Seconds to wait after the server reports no work |
+| `uuid` | no | generated | The anonymous worker identity |
+
+An unknown key is an error rather than a silent ignore — a typo'd `apikey`
+should not quietly downgrade someone to anonymous.
+
+### Reading and writing
 
 ```c
 typedef struct ClientState {
-  char *worker_uuid;
-  char *api_key;      // NULL when contributing anonymously
   char *server_url;
+  char *api_key;      // NULL when contributing anonymously
+  char *worker_uuid;
+  int threads;
+  int max_tasks;
+  int idle_wait_seconds;
 } ClientState;
 
-ClientState *client_state_load(ErrorStack *error_stack);  // creates the UUID if absent
-void client_state_save(const ClientState *state, ErrorStack *error_stack);
+ClientState *client_state_load(const char *path, ErrorStack *error_stack);
 void client_state_destroy(ClientState *state);
 ```
 
-Command-line `-server` / `-apikey` override the files and are written back, so
-`contribute` is configured once and then runs bare.
+The file is **user-authored and MAGPIE does not rewrite it**, with exactly one
+exception: if `uuid` is absent, MAGPIE generates one and **appends a single
+line**. Appending rather than rewriting means comments, ordering and formatting
+the contributor put there survive untouched.
 
-**The UUID** is v4, from 16 cryptographically random bytes via
-`crandom_bytes()`, formatted `8-4-4-4-12` lowercase hex, with the version and
-variant bits set (byte 6 `= (b & 0x0F) | 0x40`, byte 8 `= (b & 0x3F) | 0x80`).
+If `server` is missing, `contribute` fails with a message naming the file and
+the missing key — not a usage string, since the fix is editing a file.
 
-**`src/compat/crandom.h`:**
+### The worker UUID
+
+v4, from 16 cryptographically random bytes via `crandom_bytes()`, formatted
+`8-4-4-4-12` lowercase hex with the version and variant bits set (byte 6
+`= (b & 0x0F) | 0x40`, byte 8 `= (b & 0x3F) | 0x80`).
+
+Because the file is resolved relative to the working directory, a contributor
+who runs MAGPIE from a different directory has no `contribute.txt` there and
+`contribute` stops with a clear error — which is a better failure than silently
+becoming a new anonymous worker and losing their contribution history.
+
+### `src/compat/crandom.h`
 
 ```c
 // Fills buffer with cryptographically secure random bytes.
 void crandom_bytes(uint8_t *buffer, size_t length, ErrorStack *error_stack);
 ```
 
-`getrandom(2)` on Linux, `/dev/urandom` as fallback, `arc4random_buf` on BSD and
-macOS, `BCryptGenRandom` on Windows, and an error push on wasm.
+`getrandom(2)` on Linux with `/dev/urandom` as fallback, `arc4random_buf` on BSD
+and macOS, `BCryptGenRandom` on Windows, and an error push on wasm.
 
-**`src/compat/cfile.h`:**
+### `src/compat/cfile.h`
 
 ```c
 // Restricts a file to its owner: chmod 0600 on POSIX, owner-only ACL on Windows.
 void cfile_restrict_to_owner(const char *path, ErrorStack *error_stack);
+
+// True if anyone other than the owner can read the file.
+bool cfile_is_world_readable(const char *path);
 ```
 
-**The API key is a bearer credential.** Never write it via `-savesettings`,
-never include it in status output, never put it in an error message.
-
-A consequence worth documenting for users: because state is cwd-relative, a
-contributor who runs MAGPIE from a different directory becomes a **new anonymous
-worker** and loses their contribution history — the same footgun `settings.txt`
-already has. Authenticating with an API key avoids it, since attribution then
-follows the account. The GUI should steer people toward signing in.
-
----
+`contribute.txt` holds a bearer credential. On load, if it contains an `apikey`
+and `cfile_is_world_readable()` is true, warn and call
+`cfile_restrict_to_owner()`. The key must never appear in status output, logs,
+or error messages.
 
 ## 4. The `contribute` command
 
-Registered in `config.c` alongside the others:
+Registered in `config.c` alongside the others, taking **no settings arguments** —
+only an optional path to the settings file (section 3), which defaults to
+`contribute.txt`:
 
 ```c
-cmd(ARG_TOKEN_CONTRIBUTE, "contribute", 0, 0, contribute, contribute, false);
+cmd(ARG_TOKEN_CONTRIBUTE, "contribute", 0, 1, contribute, contribute, false);
+```
 
-arg(ARG_TOKEN_CONTRIBUTE_SERVER,    "server",   1, 1);
-arg(ARG_TOKEN_CONTRIBUTE_API_KEY,   "apikey",   1, 1);
-arg(ARG_TOKEN_CONTRIBUTE_MAX_TASKS, "maxtasks", 1, 1);  // 0 = run until stopped
-arg(ARG_TOKEN_CONTRIBUTE_IDLE_WAIT, "idlewait", 1, 1);  // seconds; default 5
+```
+magpie> contribute                      # reads ./contribute.txt
+magpie> contribute /path/to/other.txt   # a path is not a secret
 ```
 
 Implemented as `impl_contribute(Config *config, ErrorStack *error_stack)` in
 `src/impl/contribute.c`, following the other `impl_*` entry points.
 
-**Threads.** Default to `num_cores - 1`, minimum 1. Contributing should leave the
-machine usable — this will eventually be a background activity someone opts into
-on their daily driver, and a machine that becomes unresponsive is a machine
-whose owner turns contributing off. `-threads` overrides.
+**Threads.** Default to `num_cores - 1`, minimum 1, overridable by the `threads`
+key. Contributing should leave the machine usable — this will eventually be a
+background activity someone opts into on their daily driver, and a machine that
+becomes unresponsive is a machine whose owner turns contributing off. Note this
+is deliberately independent of the global `-threads` setting: contributing
+should not silently inherit whatever a user last set for simulation.
 
 **The loop:**
 
-1. Load `ClientState`; apply `-server` / `-apikey` overrides and save.
+1. Load `ClientState` from the settings file, generating and appending a `uuid`
+   if absent.
 2. `POST /api/worker/task`.
    - 204: sleep `idlewait`, repeat.
    - 200: continue.
@@ -576,8 +621,10 @@ backoff, not as an error.
 ## 11. Security
 
 - TLS certificate verification on by default, with no way to disable it.
-- The API key never appears in `settings.txt`, status output, logs, or errors.
-  Its file is owner-only via `cfile_restrict_to_owner()`.
+- The API key is never accepted on the command line, never written to
+  `settings.txt`, and never appears in status output, logs or errors. It lives
+  only in `contribute.txt`, which is kept owner-only via
+  `cfile_restrict_to_owner()`.
 - **Every field of a task request is untrusted input.** It becomes file paths
   (`forced_racks`, `previous_artifact_key`) and numeric parameters. Validate
   lexicon and variant against known values before they reach `data_filepaths`,
@@ -610,7 +657,7 @@ The HTTP API does not change, so these are small:
   instructions become "install MAGPIE, run `contribute`".
 - **`GET /api/worker/client-version`** changes meaning to a minimum MAGPIE
   version.
-- **Send `seed` as a string** rather than a JSON number.
+- ~~Send `seed` as a string rather than a JSON number.~~ **Done.**
 - **Keep `worker/fake_worker.py`.** It speaks the worker API and submits
   synthetic results with no MAGPIE in the loop, which is what most server tests
   want — and it reaches paths a real client cannot reach deliberately
