@@ -93,6 +93,24 @@ python worker/fake_worker.py --server-url http://localhost:8080 --tasks 10
 
 Every mode is deterministic under `--seed`, so a failing CI run reproduces.
 
+### Contributing with MAGPIE directly
+
+MAGPIE can now act as the worker itself, with no Python and no Docker. Put a
+`contribute.txt` beside it:
+
+```
+server   http://localhost:5173
+threads  7
+maxtasks 0
+```
+
+then run `magpie contribute`. Settings never go on the command line, so an API
+key stays out of shell history and `ps` output. See
+[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md).
+
+This is the intended contributor path. The Python clients below remain for
+testing.
+
 ### Running a worker with real MAGPIE
 
 MAGPIE is compiled from source into the worker image, along with the lexical

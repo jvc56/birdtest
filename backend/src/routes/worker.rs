@@ -28,14 +28,20 @@ pub fn router() -> Router<AppState> {
 
 #[derive(Serialize)]
 struct ClientVersion {
-    version: String,
+    /// The oldest MAGPIE a client may contribute with. Individual jobs can
+    /// require newer still, via `min_magpie_version`.
+    min_magpie_version: String,
+    /// Where to get MAGPIE. The client cannot update itself -- it is a compiled
+    /// binary, and an auto-updating executable is a far larger security
+    /// proposition than a script re-execing itself -- so this is for humans.
     download_url: String,
 }
 
+/// Version negotiation, replacing the self-update the Python client used.
 async fn client_version(State(state): State<AppState>) -> Json<ClientVersion> {
     Json(ClientVersion {
-        version: state.cfg.worker_client_version.clone(),
-        download_url: state.cfg.worker_client_download_url.clone(),
+        min_magpie_version: state.cfg.min_magpie_version.clone(),
+        download_url: state.cfg.magpie_download_url.clone(),
     })
 }
 

@@ -25,8 +25,10 @@ pub struct Config {
     pub heartbeat_timeout: Duration,
     pub s3_bucket: String,
     pub s3_endpoint: Option<String>,
-    pub worker_client_version: String,
-    pub worker_client_download_url: String,
+    /// The oldest MAGPIE that may contribute at all, reported by
+    /// `GET /api/worker/client-version`. Jobs may require newer.
+    pub min_magpie_version: String,
+    pub magpie_download_url: String,
 }
 
 impl Config {
@@ -94,10 +96,10 @@ impl Config {
             ),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            worker_client_version: var_or("WORKER_CLIENT_VERSION", "1.0.0"),
-            worker_client_download_url: var_or(
-                "WORKER_CLIENT_DOWNLOAD_URL",
-                "https://birdtest.invalid/worker.py",
+            min_magpie_version: var_or("MIN_MAGPIE_VERSION", "0.0.0"),
+            magpie_download_url: var_or(
+                "MAGPIE_DOWNLOAD_URL",
+                "https://github.com/jvc56/MAGPIE",
             ),
         })
     }

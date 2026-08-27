@@ -1,7 +1,32 @@
 # Bringing the birdtest Client into MAGPIE
 
-Implementation specification. Every design decision here is settled; there are
-no open questions left to resolve before starting.
+Implementation specification. Every design decision here is settled.
+
+## Status
+
+Implemented on MAGPIE's `birdtest-contribute` branch and verified end to end
+against a local birdtest instance: `magpie contribute` claims tasks, plays real
+games, and submits results the server records and credits.
+
+| Piece | State |
+|---|---|
+| `src/compat/chttp` (libcurl via dlopen, WinHTTP, wasm stub) | Done. Also now backs `get_gcg.c`, replacing its three `curl`-binary calls. |
+| `src/compat/crandom`, `cfile`, `csleep` | Done |
+| Vendored cJSON + `src/util/json` wrapper | Done |
+| `src/util/http_client` (retry policy) | Done |
+| `src/ent/client_state` (`contribute.txt`) | Done |
+| `contribute` command and task loop | Done |
+| `games` / `game_pairs` executors | Done, verified end to end |
+| `opening_rack_analysis` executor | Written; not verified end to end (needs a job whose lexicon MAGPIE has, and a full English rack enumeration is millions of tasks) |
+| `leave_generation` executor | **Not implemented.** Needs artifact download and reading the rack-equity table out of `RackList`; currently reports that clearly and stops. |
+| Async GUI status surface (section 12) | Not implemented |
+| Windows WinHTTP backend | Written, not compiled or run on Windows |
+
+Two things learned while building it are folded in below: a task that fails
+does not count toward `maxtasks`, so the loop needs a consecutive-failure guard
+or an unrunnable job spins forever; and `arg_token_t` is private to `config.c`,
+so the settings-file path is read there and passed into `impl_contribute`
+rather than looked up inside it.
 
 ## Goal
 
@@ -705,3 +730,6 @@ birdtest's worker component and its coverage gate disappear. What replaces them:
    generation, plus wordmap auto-provisioning.
 5. **Async status surface** — the GUI-facing state machine.
 6. **Retire the Python contributor client**, keeping the fake worker.
+
+Phases 1-3 are done, phase 4 is partial (opening rack written, leave generation
+not), and phases 5-6 remain.
