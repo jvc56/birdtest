@@ -249,7 +249,9 @@ pub async fn seed_generation(
 pub async fn run_transition(
     pool: &sqlx::PgPool,
     artifacts: &ArtifactStore,
+    magpie_dir: &Path,
     magpie_bin: &Path,
+    magpie_data_dir: &Path,
     data_path: &Path,
     job_id: Uuid,
     generation: i32,
@@ -276,34 +278,66 @@ pub async fn run_transition(
         csv.push_str(&format!("{rack},{:.6}\n", equity_sum / count as f64));
     }
 
+    // `magpie convert` addresses files by *data name*, not by path: it reads
+    // `<data path>/lexica/<name>.csv` and writes the result to the same
+    // relative location under the FIRST entry of the colon-separated `-path`
+    // list. So the scratch directory has to be laid out like a MAGPIE data
+    // directory and listed first; MAGPIE's own data directory comes second, to
+    // supply the letter distribution, and is never written to.
     let dir = std::env::temp_dir().join(format!("birdtest-leavegen-{job_id}-{generation}"));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| AppError::internal(format!("could not create {}: {e}", dir.display())))?;
-    let csv_path = dir.join("leaves.csv");
-    let klv_path = dir.join("leaves.klv2");
+    let lexica_dir = dir.join("lexica");
+    std::fs::create_dir_all(&lexica_dir).map_err(|e| {
+        AppError::internal(format!("could not create {}: {e}", lexica_dir.display()))
+    })?;
+
+    let name = format!("birdtest-{job_id}-gen{generation}");
+    let csv_path = lexica_dir.join(format!("{name}.csv"));
+    let klv_path = lexica_dir.join(format!("{name}.klv2"));
     std::fs::write(&csv_path, csv)
         .map_err(|e| AppError::internal(format!("could not write leave CSV: {e}")))?;
+
+    // birdtest's own data directory is on the search path too, so the letter
+    // distribution resolves from the files mirrored into
+    // `data/letterdistributions/`. Every entry is absolutised because the
+    // command runs with a different working directory (see below).
+    let absolute = |path: &Path| {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    };
+    let search_path = format!(
+        "{}:{}:{}",
+        absolute(&dir).display(),
+        absolute(data_path).display(),
+        absolute(magpie_data_dir).display()
+    );
 
     let output = tokio::process::Command::new(magpie_bin)
         .arg("convert")
         .arg("csv2klv")
-        .arg(&config.lexicon)
-        .arg(&csv_path)
-        .arg(&klv_path)
-        .env("MAGPIE_DATA_PATH", data_path)
+        .arg(&name)
+        // `convert` can only infer the distribution when the data name *is* a
+        // lexicon name; ours is a generated one, so it is passed explicitly.
+        .arg(super::racks::letter_distribution_name(&config.lexicon))
+        .arg("-path")
+        .arg(&search_path)
+        // MAGPIE loads its default board layout from `./data` while building
+        // its config, before it has parsed `-path` — so the working directory
+        // has to be the MAGPIE checkout regardless of what the search path says.
+        .current_dir(magpie_dir)
         .output()
         .await
         .map_err(|e| AppError::internal(format!("could not run {}: {e}", magpie_bin.display())))?;
 
-    if !output.status.success() {
-        return Err(AppError::internal(format!(
-            "magpie convert csv2klv failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    let klv = std::fs::read(&klv_path)
-        .map_err(|e| AppError::internal(format!("could not read generated KLV: {e}")))?;
+    // MAGPIE reports conversion failures on its error stack and still exits 0,
+    // so the exit status alone proves nothing — whether the output file appeared
+    // is the real check, and MAGPIE's own output is what explains a failure.
+    let klv = std::fs::read(&klv_path).map_err(|e| {
+        AppError::internal(format!(
+            "magpie convert csv2klv produced no KLV at {} ({e}); magpie said: {}{}",
+            klv_path.display(),
+            String::from_utf8_lossy(&output.stdout).trim(),
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ))
+    })?;
     let key = format!("leaves/{job_id}/generation-{generation}.klv2");
     artifacts.put(&key, klv).await?;
 

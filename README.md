@@ -20,79 +20,91 @@ and rationale all live there. This file is how to run it.
 
 ## Running locally
 
-Everything runs on a laptop with no AWS access. SES is replaced by logging to
-stdout, S3 by MinIO, and SSM by plain environment variables.
-
-### Prerequisites
-
-Rust (stable), Node 18+, Docker Compose, Python 3.11+, and — only if you want a
-worker doing real computation — a compiled MAGPIE checkout.
-
-### 1. Database and object storage
+`docker compose up` is the whole setup. Database, object storage, backend and
+frontend all run in containers, so Docker is the only thing the host needs —
+no Rust, Node, Python or Postgres install.
 
 ```bash
-docker compose up -d
+docker compose up --build
 ```
 
-Postgres comes up on 5432 with `birdtest`/`birdtest`/`birdtest`, and MinIO
-(standing in for S3) on 9000. If either port is taken, override it:
+Then open **http://localhost:5173**. Nginx serves the SPA and proxies `/api` to
+the backend, exactly as the ALB does in production, so the app runs on a single
+origin locally too. The API is also exposed directly on :8080 for poking at
+with `curl`.
+
+Migrations run inside the backend process before it binds, and the artifact
+bucket is created by a one-shot `minio-init` container, so there is nothing to
+sequence by hand.
+
+If a port is taken, copy `.env.example` to `.env` and override it — no need to
+edit the compose file:
 
 ```bash
-POSTGRES_PORT=5433 MINIO_PORT=9002 MINIO_CONSOLE_PORT=9003 docker compose up -d
+WEB_PORT=5174 POSTGRES_PORT=5433 MINIO_PORT=9002 docker compose up --build
 ```
 
-### 2. Backend
-
-```bash
-cd backend
-cp .env.example .env     # adjust DATABASE_URL / S3_ENDPOINT if you overrode ports
-cargo run                # http://localhost:8080
-```
-
-Migrations run automatically at startup, before the server binds — there is no
-separate migration step.
-
-### 3. Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev              # http://localhost:5173, proxying /api/* to :8080
-```
-
-### 4. An admin and a first job
+### An admin and a first job
 
 The first registered user is deliberately *not* an admin, so promotion is a
-manual step against the local database:
+manual step:
 
 ```bash
-# Register at http://localhost:5173/register, then confirm the email —
-# MAIL_BACKEND=console puts the confirmation link in the backend's stdout.
-psql "$DATABASE_URL" -c "UPDATE users SET is_admin = true WHERE username = 'you';"
+# 1. Register at http://localhost:5173/register. MAIL_BACKEND=console puts the
+#    confirmation link in the backend's log:
+docker compose logs -f backend
+
+# 2. Promote yourself:
+docker compose exec postgres \
+  psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE username = 'you';"
 ```
 
-Then, signed in as that account: create a player config at
-`/admin/player-configs/new`, create a job at `/admin/jobs/new`, and activate it
-with an allocation from the admin job page. Nothing dispatches until a job is
-active.
+Then create a player config at `/admin/player-configs/new`, create a job at
+`/admin/jobs/new`, and activate it with an allocation. Nothing dispatches until
+a job is active.
 
 Opening-rack and leave-generation jobs enumerate their whole rack space at
-creation time. For a real English bag that is millions of rows, so
-`data/letterdistributions/TESTDIST.csv` exists as a deliberately tiny bag —
-use lexicon `TESTDIST` while you are poking at the UI.
+creation time — for a real English bag that is millions of rows. Use lexicon
+`TESTDIST` while poking at the UI; it is a deliberately tiny bag that exists
+for exactly this.
 
-### 5. Worker
+### Running a worker
+
+The worker needs MAGPIE, which is *not* in the image: birdtest does not build,
+fetch or manage it, and its lexical data dwarfs the client. Point the stack at
+a MAGPIE checkout on the host and it is bind-mounted into the container at
+`/magpie`:
 
 ```bash
-cd worker
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-python worker.py --server-url http://localhost:8080 --magpie-dir /path/to/MAGPIE
+# Defaults to $HOME/MAGPIE; set MAGPIE_DIR in .env for anywhere else.
+docker compose --profile worker up --build
 ```
 
-With no active job the worker gets 204s and sleeps in its retry loop; that is
-expected, not an error. Pass `--api-key` (generated at `/account`) to attribute
-the work to your account rather than an anonymous UUID.
+Set `BIRDTEST_API_KEY` in `.env` (generate one at `/account`) to attribute the
+work to your account rather than an anonymous UUID.
+
+The same mount is given to the backend read-only, because leave-generation
+aggregation shells out to `magpie convert csv2klv` once per completed
+generation. Everything except leave-generation works fine without it.
+
+### Frontend hot reload
+
+```bash
+docker compose --profile dev up
+```
+
+That adds a Vite dev server with HMR on **http://localhost:5174**, source
+bind-mounted from `frontend/`, alongside the production-style Nginx build on
+5173. `node_modules` lives in a named volume so the container's install never
+collides with a host one.
+
+### Without Docker
+
+Each component still runs directly on the host if you would rather: `cargo run`
+in `backend/` (see `.env.example`), `npm run dev` in `frontend/`, and
+`pip install -e . && python worker.py` in `worker/`. You need a Postgres to
+point `DATABASE_URL` at — `docker compose up -d postgres minio minio-init`
+gives you one without the rest of the stack.
 
 ## Deploying
 

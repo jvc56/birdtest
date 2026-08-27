@@ -126,20 +126,33 @@ def _check_for_self_update(cfg: Config) -> None:
 
 
 def _get_magpie_version(cfg: Config) -> str:
-    """Run `magpie version` once and return the version string. Cached by the caller."""
+    """Run `magpie version` once and return the version string. Cached by the caller.
+
+    Run from the MAGPIE directory because MAGPIE resolves its default data
+    relative to the working directory while building its config.
+    """
     result = subprocess.run(
         [str(cfg.magpie_bin), "version"],
         capture_output=True,
         text=True,
         check=True,
+        cwd=cfg.magpie_dir,
     )
     return result.stdout.strip()
 
 
-def _parse_semver(version: str) -> tuple[int, ...]:
+def _parse_semver(version: str) -> Optional[tuple[int, ...]]:
     """Parses a "X.Y.Z" string into a tuple of ints for correct numeric comparison —
-    plain string comparison is wrong here ("1.10.0" < "1.9.0" as strings)."""
-    return tuple(int(part) for part in version.split("."))
+    plain string comparison is wrong here ("1.10.0" < "1.9.0" as strings).
+
+    Returns None for anything that is not a dotted numeric version, so an
+    unexpected MAGPIE build string degrades to "cannot compare" rather than
+    taking down the worker loop.
+    """
+    try:
+        return tuple(int(part) for part in version.strip().split("."))
+    except ValueError:
+        return None
 
 
 def _claim_task(cfg: Config) -> Optional[dict]:
@@ -438,12 +451,19 @@ def _worker_loop(cfg: Config, magpie_version: str) -> None:
         # 2. Version gate — skip task if MAGPIE is too old; claim expires server-side
         # Compared as a tuple of ints (_parse_semver), not string order: "1.10.0" < "1.9.0"
         # as strings, which is backwards.
-        if min_ver and _parse_semver(magpie_version) < _parse_semver(min_ver):
-            logger.error(
-                "MAGPIE %s < required %s for this job; skipping task", magpie_version, min_ver
-            )
-            time.sleep(cfg.retry_delay_seconds)
-            continue
+        if min_ver:
+            have, want = _parse_semver(magpie_version), _parse_semver(min_ver)
+            if have is None or want is None:
+                logger.warning(
+                    "cannot compare MAGPIE version %r against required %r; attempting the task",
+                    magpie_version, min_ver,
+                )
+            elif have < want:
+                logger.error(
+                    "MAGPIE %s < required %s for this job; skipping task", magpie_version, min_ver
+                )
+                time.sleep(cfg.retry_delay_seconds)
+                continue
 
         handler = _HANDLERS[task_request["job_type"]]
 

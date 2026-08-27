@@ -19,12 +19,24 @@ pub struct Config {
     pub mail_from: String,
     pub public_url: String,
     pub data_path: PathBuf,
-    pub magpie_bin: PathBuf,
+    /// Root of a MAGPIE checkout: the executable is `<dir>/bin/magpie` and its
+    /// lexical data is `<dir>/data`. Only leave-generation aggregation uses it.
+    pub magpie_dir: PathBuf,
     pub heartbeat_timeout: Duration,
     pub s3_bucket: String,
     pub s3_endpoint: Option<String>,
     pub worker_client_version: String,
     pub worker_client_download_url: String,
+}
+
+impl Config {
+    pub fn magpie_bin(&self) -> PathBuf {
+        self.magpie_dir.join("bin").join("magpie")
+    }
+
+    pub fn magpie_data_dir(&self) -> PathBuf {
+        self.magpie_dir.join("data")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +88,7 @@ impl Config {
             mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
             public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
             data_path: PathBuf::from(var_or("DATA_PATH", "../data")),
-            magpie_bin: PathBuf::from(var_or("MAGPIE_BIN", "magpie")),
+            magpie_dir: PathBuf::from(var_or("MAGPIE_DIR", "../MAGPIE")),
             heartbeat_timeout: Duration::from_secs(
                 var_or("HEARTBEAT_TIMEOUT_SECONDS", "300").parse().unwrap_or(300),
             ),

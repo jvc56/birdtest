@@ -1,3 +1,16 @@
+# Full local stack. `docker compose up` needs nothing on the host but Docker:
+# database, object storage, backend and frontend all run in containers.
+#
+# Optional profiles:
+#   --profile worker   a worker client, with MAGPIE bind-mounted from the host
+#   --profile dev      the Vite dev server with hot reload, alongside the
+#                      production-style Nginx frontend
+#
+# Ports are overridable so a host that already has something on 5432 (or 9000,
+# or 5173) does not need the file edited. See .env.example.
+
+name: birdtest
+
 services:
   postgres:
     image: postgres:16
@@ -6,10 +19,14 @@ services:
       POSTGRES_PASSWORD: birdtest
       POSTGRES_DB: birdtest
     ports:
-      # Override POSTGRES_PORT if 5432 is already taken on your machine.
       - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U birdtest -d birdtest"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   minio:
     image: minio/minio:latest
@@ -23,6 +40,124 @@ services:
     volumes:
       - miniodata:/data
 
+  # One-shot: creates the artifact bucket the backend writes leave-generation
+  # KLVs into. Retries rather than relying on a MinIO healthcheck, since the
+  # server image does not ship a reliable one.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 birdtest birdtestbirdtest; do
+          echo 'waiting for minio...'; sleep 1;
+        done
+        mc mb --ignore-existing local/birdtest-artifacts
+    restart: on-failure
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://birdtest:birdtest@postgres:5432/birdtest
+      BIND_ADDR: 0.0.0.0:8080
+      # Throwaway dev key, committed on purpose. Real environments get their
+      # own from SSM.
+      SESSION_SIGNING_KEY: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+      SECURE_COOKIES: "false"
+      # Confirmation codes and reset links go to this container's stdout:
+      #   docker compose logs -f backend
+      MAIL_BACKEND: console
+      MAIL_FROM: no-reply@birdtest.local
+      PUBLIC_URL: http://localhost:${WEB_PORT:-5173}
+      DATA_PATH: /app/data
+      # Only leave-generation aggregation uses this, once per generation.
+      MAGPIE_DIR: /magpie
+      S3_BUCKET: birdtest-artifacts
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: birdtest
+      AWS_SECRET_ACCESS_KEY: birdtestbirdtest
+      AWS_REGION: us-east-1
+      RUST_LOG: ${RUST_LOG:-birdtest=debug,tower_http=info}
+    volumes:
+      # Read-only: `magpie convert csv2klv` writes into a scratch directory
+      # passed first in -path, never into the mounted data directory.
+      - ${MAGPIE_DIR:-${HOME}/MAGPIE}:/magpie:ro
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-5173}:80"
+
+  # --- profile: dev ---------------------------------------------------------
+  # Hot reload without Node on the host. node_modules lives in a named volume
+  # so the container's install never collides with a host one on a different
+  # platform.
+  frontend-dev:
+    profiles: [dev]
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BIRDTEST_API: http://backend:8080
+      # Bind-mounted source does not always deliver inotify events.
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "${DEV_PORT:-5174}:5173"
+
+  # --- profile: worker ------------------------------------------------------
+  worker:
+    profiles: [worker]
+    build:
+      context: ./worker
+    depends_on:
+      backend:
+        condition: service_healthy
+    command:
+      - --server-url
+      - http://backend:8080
+      - --magpie-dir
+      - /magpie
+    environment:
+      BIRDTEST_API_KEY: ${BIRDTEST_API_KEY:-}
+    volumes:
+      # Writable, unlike the backend's mount: MAGPIE runs with this as its
+      # working directory and the client's autoplay invocations are not yet
+      # verified against a real binary, so a read-only mount would add a second
+      # failure mode on top of that.
+      - ${MAGPIE_DIR:-${HOME}/MAGPIE}:/magpie
+      # Persists the generated worker UUID, so contributions stay attributed to
+      # the same anonymous identity across restarts.
+      - workerstate:/home/worker/.birdtest
+    restart: unless-stopped
+
 volumes:
   pgdata:
   miniodata:
+  frontend_node_modules:
+  workerstate:

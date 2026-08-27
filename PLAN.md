@@ -244,6 +244,7 @@ Every significant action (task claimed, result submitted, job created, user bann
 | Secrets | AWS SSM Parameter Store |
 | Artifact storage | AWS S3 |
 | Infrastructure as Code | Terraform |
+| Local development | Docker Compose — the full stack (Postgres, MinIO, backend, Nginx frontend) runs in containers so Docker is the only host dependency |
 
 #### Key Technology Notes
 
@@ -397,7 +398,9 @@ Steps:
 3. For each rack, encode it as a CGP position string for an empty board with that rack (the format MAGPIE accepts for `cg` / position analysis).
 4. Within one transaction: `INSERT INTO tasks (job_id, seed, state, ...) VALUES ($job_id, NULL, 'available', ...)` then `INSERT INTO position_requests (task_id, lexicon, variant, position, previous_play, player_config_id) VALUES (...)`. `previous_play` is NULL for all opening racks (empty board, no prior move). `player_config_id` is copied from `job_opening_rack_config`. Repeat for all racks.
 
-Uniqueness is enforced by the position content (the same rack on an empty board always produces the same CGP string). The letter distribution files in `data/letterdistributions/` are used to enumerate the bag. The total task count for a standard English Scrabble bag is on the order of several hundred thousand.
+Uniqueness is enforced by the position content (the same rack on an empty board always produces the same CGP string). The letter distribution files in `data/letterdistributions/` are used to enumerate the bag.
+
+A lexicon and a letter distribution are not the same thing: MAGPIE derives the distribution from the lexicon name's prefix (NWL, CSW, TWL, … → `english`; FRA → `french`, and so on) and ships one file per distribution, not per lexicon. `jobs::racks::letter_distribution_name` mirrors that mapping so both sides agree on which file to read and so the name handed to `magpie convert csv2klv` resolves. An unrecognized lexicon falls back to its own lowercased name, which is what lets the tiny `testdist` development bag work. The total task count for a standard English Scrabble bag is on the order of several hundred thousand.
 
 ---
 
@@ -440,7 +443,13 @@ At claim time:
 
 **On result acceptance**: within the same transaction that accepts the task result, upsert all `{rack, count, mean}` entries from the response into `leave_rack_progress` in a single bulk statement (multi-row `INSERT ... ON CONFLICT (job_id, generation, rack) DO UPDATE SET occurrence_count = leave_rack_progress.occurrence_count + excluded.occurrence_count, equity_sum = leave_rack_progress.equity_sum + excluded.equity_sum`) rather than row-by-row, since a submission can carry thousands of rows. This is what drives the live dashboard figure — no heartbeat involved.
 
-**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into a `rack,value` CSV (`value = equity_sum / occurrence_count` per rack — this is the format `magpie convert csv2klv` expects, distinct from the `rack,count,mean` format workers submit) and shells out to `magpie convert csv2klv` (the same subprocess-invocation pattern the worker already uses for `autoplay`, just run from the backend) to produce the generation's combined KLV, uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete. This runs once per generation, not once per task, so there's no performance case for linking `libmagpie` into the backend via FFI — that would only add an unsafe binding surface to keep in sync with MAGPIE's C API across version bumps, and let a crash in `libmagpie` take down the whole backend process instead of an isolated subprocess. The backend container needs the `magpie` executable and lexicon data available at runtime, alongside the existing `data/letterdistributions/` dependency — call out in Tech Stack / ECS if adopted.
+**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into a `rack,value` CSV (`value = equity_sum / occurrence_count` per rack — this is the format `magpie convert csv2klv` expects, distinct from the `rack,count,mean` format workers submit) and shells out to `magpie convert csv2klv` (the same subprocess-invocation pattern the worker already uses for `autoplay`, just run from the backend) to produce the generation's combined KLV, uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete. This runs once per generation, not once per task, so there's no performance case for linking `libmagpie` into the backend via FFI — that would only add an unsafe binding surface to keep in sync with MAGPIE's C API across version bumps, and let a crash in `libmagpie` take down the whole backend process instead of an isolated subprocess. The backend container needs the `magpie` executable and lexicon data available at runtime, alongside the existing `data/letterdistributions/` dependency; locally this is a bind mount of a host MAGPIE checkout at `/magpie`, and in ECS it is baked into the backend image.
+
+Three details of MAGPIE's CLI shape this call, all verified against the binary:
+
+- `convert` addresses files by **data name**, not path. It reads `<data path>/lexica/<name>.csv` and writes the result to the same relative location under the **first** entry of the colon-separated `-path` list, so the scratch directory is laid out like a MAGPIE data directory and listed first. MAGPIE's own data directory follows, read-only, to supply the letter distribution.
+- MAGPIE loads its default board layout from `./data` while building its config, *before* it has parsed `-path`. The subprocess therefore runs with the MAGPIE checkout as its working directory regardless of the search path, and every `-path` entry is absolute.
+- **MAGPIE reports conversion failures on an error stack and still exits 0.** The exit status proves nothing; whether the output file appeared is the real check, and MAGPIE's stdout is what explains a failure.
 
 **Dashboard progress**: because progress is now driven by many small task completions across possibly many workers rather than one long-running worker, the rack-with-fewest-occurrences figure ([Leave generation](#leave-generation) job detail bullet) is live and derived directly from `leave_rack_progress`, updating on every accepted task result via the existing per-job SSE stream — no heartbeat payload is needed.
 
@@ -857,8 +866,11 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 
 ```
 birdtest/
-├── docker-compose.yml               # local Postgres + MinIO (S3 stub) for development — see Development
+├── docker-compose.yml               # the whole local stack: Postgres, MinIO (S3 stub), backend,
+│                                    # frontend, plus `dev` and `worker` profiles — see Development
+├── .env.example                     # compose port and MAGPIE_DIR overrides
 ├── backend/                        # Axum web server (Rust)
+│   ├── Dockerfile                  # multi-stage build; context is the repo root, to ship data/
 │   ├── Cargo.toml
 │   ├── .env.example                # DATABASE_URL, SESSION_SIGNING_KEY, MAIL_BACKEND=console, etc. for local dev
 │   ├── migrations/                 # sqlx migration files
@@ -908,6 +920,8 @@ birdtest/
 │       └── sse.rs                  # SSE broadcaster (job result push)
 │
 ├── frontend/                       # SvelteKit app
+│   ├── Dockerfile                  # static build served by Nginx — the same artifact ECS runs
+│   ├── docker/nginx.conf           # SPA fallback + /api proxy (SSE needs proxy_buffering off)
 │   ├── package.json
 │   ├── svelte.config.js
 │   ├── vite.config.ts
@@ -968,6 +982,7 @@ birdtest/
 │                   └── +page.svelte                # /admin/audit-log
 │
 ├── worker/                         # Python worker client
+│   ├── Dockerfile                  # MAGPIE is bind-mounted at /magpie, never baked in
 │   ├── pyproject.toml
 │   └── worker.py                   # single-file implementation (see Worker Client section)
 │
@@ -1412,83 +1427,96 @@ CREATE TABLE audit_log (
 
 ## Development
 
-Everything needed to run birdtest locally — backend, frontend, and a worker doing real work against it — runs on a laptop with no AWS access. AWS services (SES, SSM, S3) are stubbed or swapped for local equivalents in dev; only the deployed environment touches real AWS.
+Everything needed to run birdtest locally — backend, frontend, and a worker doing real work against it — runs on a laptop with no AWS access, and `docker compose up` is the whole setup. AWS services (SES, SSM, S3) are stubbed or swapped for local equivalents in dev; only the deployed environment touches real AWS.
 
 ### Prerequisites
 
+**Docker, and nothing else** — for everything except a worker doing real
+computation. The backend, frontend, Postgres and the S3 stand-in all run as
+containers, so no Rust, Node, Python or Postgres install is required on the
+host.
+
 | Tool | Used for |
 |---|---|
-| Rust (stable, via `rustup`) + `sqlx-cli` (`cargo install sqlx-cli`) | Backend build and migrations |
-| Node.js (LTS) + `npm` | Frontend |
-| Docker / Docker Compose | Local Postgres |
-| Python 3.11+ | Worker client |
-| A compiled MAGPIE binary (see [Engine Dependency (MAGPIE)](#engine-dependency-magpie)) | Worker client's actual computation — clone and build [MAGPIE](https://github.com/jvc56/MAGPIE) separately per its own README; birdtest does not vendor or build it |
+| Docker / Docker Compose | The entire stack |
+| A compiled MAGPIE directory (see [Engine Dependency (MAGPIE)](#engine-dependency-magpie)) | Only needed to run a worker, or leave-generation aggregation. Bind-mounted from the host — birdtest does not vendor, build or fetch it, and its lexical data is orders of magnitude larger than birdtest itself. |
 
-### 1. Database
+Working directly on the host is still supported and needs Rust (stable), Node
+(LTS) and Python 3.11+ per component; see [Without Docker](#without-docker) in
+the README.
 
-A `docker-compose.yml` at the repo root brings up Postgres on the standard port with a fixed local user/password/db name (`birdtest`/`birdtest`/`birdtest`), so `DATABASE_URL` is the same for every contributor:
-
-```yaml
-services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: birdtest
-      POSTGRES_PASSWORD: birdtest
-      POSTGRES_DB: birdtest
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-volumes:
-  pgdata:
-```
+### 1. The whole stack
 
 ```bash
-docker compose up -d postgres
+docker compose up --build
 ```
 
-### 2. Backend
+This brings up five services:
+
+| Service | Role |
+|---|---|
+| `postgres` | Postgres 16, on `${POSTGRES_PORT:-5432}` |
+| `minio` | S3-compatible object storage, on `${MINIO_PORT:-9000}` |
+| `minio-init` | One-shot: creates the artifact bucket, then exits |
+| `backend` | The Axum server, on `${BACKEND_PORT:-8080}` |
+| `frontend` | Nginx serving the SvelteKit build, on `${WEB_PORT:-5173}` |
+
+The site is at `http://localhost:5173`. Nginx proxies `/api` to the backend —
+the same split the ALB performs in production — so the app is single-origin
+locally too, and the session cookie and CSRF double-submit behave identically.
+SSE needs `proxy_buffering off` on that location, or the job stream is buffered
+and the dashboard never updates.
+
+`backend` waits on a Postgres healthcheck and on `minio-init` completing;
+`frontend` waits on the backend's `/health`. Migrations run inside the backend
+process before it binds, so there is no separate migration container.
+
+Every host port is overridable via `.env` (see `.env.example`), so a machine
+that already has something on 5432 does not need the compose file edited.
+
+### 2. Configuration
+
+The backend's environment is set inline in `docker-compose.yml` rather than
+from a file, so the default stack has nothing to copy first. `MAIL_BACKEND` is
+`console`, which logs confirmation codes and reset links to the container's
+stdout (`docker compose logs -f backend`) instead of sending them — there is no
+local SES, and standing up a real mail sink is not worth it for dev.
+`S3_ENDPOINT` points at MinIO; the AWS SDK works against it unmodified, so
+there is no separate code path.
+
+`backend/.env.example` documents the same variables for running the server
+directly on the host with `cargo run`.
+
+### 3. Optional profiles
 
 ```bash
-cd backend
-cp .env.example .env        # DATABASE_URL, session signing key, etc. — see below
-sqlx migrate run            # applies backend/migrations/ against the local DB
-cargo run                   # serves on http://localhost:8080 by default
+docker compose --profile dev up      # adds Vite with HMR on :5174
+docker compose --profile worker up   # adds a worker client
 ```
 
-`config.rs` reads from environment variables in dev instead of AWS SSM Parameter Store (SSM is only consulted when an `AWS_REGION`/task-role environment indicates it's actually running in ECS). `.env.example` documents every variable the backend needs locally:
-
-| Variable | Local default | Notes |
-|---|---|---|
-| `DATABASE_URL` | `postgres://birdtest:birdtest@localhost:5432/birdtest` | Matches the Compose service above |
-| `SESSION_SIGNING_KEY` | a fixed dev-only key committed in `.env.example` | Never the real key; rotated per environment in SSM for staging/prod |
-| `MAIL_BACKEND` | `console` | In `console` mode, confirmation codes and password-reset links are logged to stdout instead of sent via SES — there is no local SES equivalent, and standing up a real mail sink isn't worth it for dev. `MAIL_BACKEND=ses` (with real AWS credentials) is available for testing the SES path specifically. |
-| `DATA_PATH` | `../data` | Points at the mirrored `data/letterdistributions/` used for opening-rack enumeration |
-| `RUST_LOG` | `birdtest=debug,tower_http=debug` | Standard `tracing` env filter |
-
-S3 (artifact storage for full move lists, leave files, rack-equity CSVs) is stubbed with [MinIO](https://min.io/) in dev — add a `minio` service to the same `docker-compose.yml`, exposed S3-API-compatible on `localhost:9000`, and point the backend's `S3_ENDPOINT` env var at it. The AWS SDK works unmodified against MinIO; no separate code path is needed.
-
-### 3. Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev                 # serves on http://localhost:5173, proxying /api/* to :8080 (see vite.config.ts)
-```
-
-`vite.config.ts`'s dev server proxy means the frontend never needs its own copy of API base-URL configuration in dev — it talks to whatever `npm run dev`'s proxy target points at, defaulting to the backend's `localhost:8080`.
+The `dev` profile runs the Vite dev server with `frontend/` bind-mounted and
+`node_modules` in a named volume, so hot reload works without Node on the host
+and the container's install never collides with a host one built for a
+different platform. It runs *alongside* the Nginx build rather than replacing
+it, on a separate port.
 
 ### 4. Worker client
 
 ```bash
-cd worker
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-python worker.py --server-url http://localhost:8080 --magpie-dir /path/to/MAGPIE
+docker compose --profile worker up --build
 ```
 
-The worker needs an actual admin-created, activated job to have anything to claim (see step 5) — with no active job, `_claim_task` just gets 204s and the worker sleeps in its retry loop, which is expected and not an error.
+MAGPIE is bind-mounted from the host at `/magpie` (`MAGPIE_DIR`, defaulting to
+`$HOME/MAGPIE`) rather than baked into the image. Set `BIRDTEST_API_KEY` in
+`.env` to attribute results to an account instead of an anonymous UUID.
+
+The backend gets the same mount read-only, because leave-generation aggregation
+shells out to `magpie convert csv2klv` once per completed generation. Every
+other job type works with no MAGPIE on the host at all.
+
+The worker needs an actual admin-created, activated job to have anything to
+claim (see step 5) — with no active job, `_claim_task` just gets 204s and the
+worker sleeps in its retry loop, which is expected and not an error.
 
 ### 5. Seeding a local admin and a first job
 
@@ -1497,10 +1525,11 @@ There's no seed script needed for the minimum path — the first registered user
 ```bash
 # 1. Register normally through the frontend (or POST /api/auth/register), then confirm
 #    the email — MAIL_BACKEND=console means the confirmation code is in the backend's
-#    stdout log rather than an inbox.
+#    log (docker compose logs -f backend) rather than an inbox.
 # 2. Promote that user to admin directly in Postgres (no API for this by design —
 #    is_admin is not settable through any endpoint):
-psql "$DATABASE_URL" -c "UPDATE users SET is_admin = true WHERE username = 'you';"
+docker compose exec postgres \
+  psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE username = 'you';"
 ```
 
 From there, use the now-admin account's session to create a player config and a job through `/admin/player-configs/new` and `/admin/jobs/new` (or the equivalent `POST /api/admin/...` calls directly), then activate the job with an allocation via `/api/admin/jobs/:id/activate`. Once a job is active, the worker client from step 4 will start claiming and completing real tasks against it, and the dashboard at `http://localhost:5173/jobs/:id` updates live via SSE — this is the fastest way to confirm a full change (backend, frontend, and worker together) actually works end to end.

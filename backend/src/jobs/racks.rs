@@ -14,6 +14,36 @@ pub struct Tile {
     pub count: u32,
 }
 
+/// The letter distribution a lexicon uses.
+///
+/// MAGPIE derives this from the lexicon name's prefix (`ld_get_type_from_lex_name`)
+/// rather than storing it, and there is no `nwl23` distribution file — NWL23 and
+/// CSW21 both use `english`. This mirrors that mapping so both sides agree on
+/// which file to read, and so the name handed to `magpie convert csv2klv`
+/// resolves. An unrecognized lexicon falls back to its own lowercased name,
+/// which is what makes the `testdist` development bag work.
+pub fn letter_distribution_name(lexicon: &str) -> String {
+    const ENGLISH: [&str; 7] = ["CSW", "NWL", "OSPD", "OSW", "TWL", "AMERICA", "CEL"];
+    let upper = lexicon.to_uppercase();
+
+    if ENGLISH.iter().any(|prefix| upper.starts_with(prefix)) {
+        return "english".to_string();
+    }
+    for (prefix, name) in [
+        ("RD", "german"),
+        ("NSF", "norwegian"),
+        ("DISC", "catalan"),
+        ("FRA", "french"),
+        ("OSPS", "polish"),
+        ("DSW", "dutch"),
+    ] {
+        if upper.starts_with(prefix) {
+            return name.to_string();
+        }
+    }
+    lexicon.to_lowercase()
+}
+
 #[derive(Debug, Clone)]
 pub struct LetterDistribution {
     pub tiles: Vec<Tile>,
@@ -21,7 +51,8 @@ pub struct LetterDistribution {
 
 impl LetterDistribution {
     pub fn load(data_path: &Path, lexicon: &str) -> AppResult<Self> {
-        let path = data_path.join("letterdistributions").join(format!("{lexicon}.csv"));
+        let dir = data_path.join("letterdistributions");
+        let path = dir.join(format!("{}.csv", letter_distribution_name(lexicon)));
         let text = std::fs::read_to_string(&path).map_err(|e| {
             AppError::bad_request(format!(
                 "no letter distribution for lexicon {lexicon:?} at {}: {e}",
@@ -35,6 +66,9 @@ impl LetterDistribution {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
+            // MAGPIE's files carry seven columns — upper, lower, count, score,
+            // is_vowel, and the two fullwidth display forms. Only the letter and
+            // the count matter here; the rest are read by MAGPIE itself.
             let cols: Vec<&str> = line.split(',').collect();
             if cols.len() < 3 {
                 return Err(AppError::internal(format!(
