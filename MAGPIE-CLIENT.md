@@ -313,22 +313,49 @@ not a statistical necessity. If that export is worth keeping at per-game
 granularity, a `gamelog` recorder is the way to get it, and it would incidentally
 give command-line MAGPIE per-game output it does not have today.
 
-#### Two things to resolve first
+#### A MAGPIE bug found while testing this
 
-Both came out of running the binary and neither is settled:
+Under `-gp`, **`-s1`/`-s2` (move sort type) and `-r1`/`-r2` (move record type)
+do not differentiate the two players.** `-l1`/`-l2` (lexicon) and `-k1`/`-k2`
+(leaves) do. Reproduced from a clean directory with no `settings.txt` present,
+20 pairs, seed 50, NWL23:
 
-1. **birdtest's pair-derivation logic looks wrong.** It assumes the two games of
-   a pair swap the players, and inverts the second game's winner accordingly.
-   MAGPIE's `game_runner_start` changes only `starting_player_index` - which
-   player moves first - and leaves player identity alone. If that reading is
-   right, the current SQL inverts half of every pair.
-2. **The `-gp` aggregate behaved unexpectedly under test.** With two clearly
-   different players (`-s1 equity -s2 score`), unpaired autoplay gave 13-17
-   across 30 games, while the same players in `-gp` mode gave exactly 20-20
-   across 20 pairs with *identical* score means and standard deviations to six
-   decimal places, and zero divergent games. Symmetry that exact is a
-   construction, not a coincidence. Until it is understood, neither design above
-   can be specified with confidence.
+| Players differ by | Divergent games | Player stats |
+|---|---|---|
+| `-l1 NWL23 -l2 CSW21` | 40 / 40 | 14-26, means 412.3 vs 466.5 |
+| `-k1 NWL23 -k2 CSW21` | 26 / 40 | means 426.9 vs 420.0 |
+| `-s1 equity -s2 score` | **0 / 40** | identical to six decimal places |
+| `-r1 best -r2 all` | **0 / 40** | identical to six decimal places |
+
+Sort type is not inert in general: the same `-s1 equity -s2 score` in *unpaired*
+autoplay gives 13-17 over 30 games with clearly different score means. It stops
+having any effect only under `-gp`, where both games of every pair play
+identically and the pair therefore contributes a guaranteed tie.
+
+`autoplay_test.c` differentiates players by lexicon (line 183) and by leaves
+(line 207), and by nothing else - so the two settings that work are covered and
+the two that do not are not, which is presumably why this has gone unnoticed.
+`move_sort_type` does live in `PlayersData` alongside the KWG and KLV, so this
+is not a case of the setting having nowhere to live; the exact point where it is
+lost was not identified.
+
+**Consequences for birdtest, now, before any of this work starts:**
+
+- A `game_pairs` job whose two `player_configs` differ *only* in
+  `recorder_type` or `sort_strategy` will silently produce an exact tie
+  regardless of which strategy is better. Both are first-class columns in
+  `player_configs`, and "static equity player vs static score player" is an
+  obvious first experiment to want to run. Until this is fixed, such a job
+  produces a meaningless result rather than an error.
+- Once it *is* fixed, `-gp` reports exactly what pair-level SPRT needs: the
+  all-games aggregate plus the divergent-games aggregate, already accounting
+  for both sides of the pair. That points firmly at the "adopt MAGPIE's model"
+  row of the table above - **no new MAGPIE recorder, and no per-game records.**
+- birdtest should therefore stop deriving pair outcomes from per-game rows. The
+  current SQL pairs consecutive `game_index` rows and inverts the second game's
+  winner on the assumption that the players swapped seats; with `-gp` the
+  reported aggregates already account for both orderings, so that derivation is
+  both unnecessary and, as far as I can tell, wrong.
 
 ### 7. Wordmap auto-provisioning
 
