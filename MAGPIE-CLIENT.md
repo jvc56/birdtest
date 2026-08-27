@@ -121,19 +121,39 @@ HttpResponse *http_post_json(const char *url, const char *body,
 void http_response_destroy(HttpResponse *response);
 ```
 
-**Implementation: link libcurl.** It is the only realistic option that gives
-TLS certificate verification without vendoring a TLS stack. This is the first
-true external dependency MAGPIE would take, so it needs:
+**Implementation: OS-native backends, no new installable dependency.**
 
-- `LDLIBS += -lcurl` and a `pkg-config --cflags libcurl` probe in the `Makefile`.
-- A `MAGPIE_NO_NETWORK` compile guard. `Makefile-wasm` globs `src/**/*.c`, so
-  the WASM build will try to compile this file; it must compile to stubs that
-  push an error rather than failing to link.
-- A note in `setup.sh` / the README that `libcurl4-openssl-dev` (or platform
-  equivalent) is a build prerequisite.
-- For distributing a self-contained binary to contributors, either static
-  linking against libcurl + a TLS library, or accepting the shared dependency.
-  **This is the single largest packaging decision in this document.**
+In practice this is two backends rather than three, because libcurl already
+ships with macOS (`/usr/lib/libcurl.4.dylib`) and is present on essentially
+every Linux desktop:
+
+| Platform | Backend | Why |
+|---|---|---|
+| Linux / BSD / macOS | **libcurl**, against the system copy | Already present; no static build, no vendored TLS, no CA bundle to keep fresh - certificate trust stays the OS's problem |
+| Windows | **WinHTTP** (`winhttp.dll`) | Ships with the OS, no redistributable, and the Schannel trust store is already configured |
+
+The point is that a contributor installs MAGPIE and nothing else on every
+platform, while MAGPIE never owns a TLS implementation or a certificate bundle.
+
+Structure it as one header with two implementations selected by the existing
+platform conventions in `src/compat/`:
+
+```
+src/util/http_client.h          // the interface above
+src/util/http_client_curl.c     // #if !defined(_WIN32)
+src/util/http_client_winhttp.c  // #if defined(_WIN32)
+```
+
+Two details worth deciding up front:
+
+- **Prefer `dlopen`ing libcurl over link-time binding.** A minimal Linux install
+  (a container, a headless server) can genuinely lack `libcurl.so.4`. Resolving
+  it at runtime turns that from "MAGPIE will not start" into "MAGPIE runs, and
+  `contribute` reports that libcurl is missing and names the package" - which
+  also keeps every non-networking command working on a machine without it.
+- **`Makefile-wasm` globs all of `src`**, so both files must compile under
+  Emscripten. Guard them with `MAGPIE_NO_NETWORK`, which the WASM build defines,
+  leaving stubs that push an error onto the stack.
 
 Also replace the three `curl`-via-`popen` call sites in `get_gcg.c` with this
 client, so there is one HTTP path rather than two.
@@ -164,21 +184,28 @@ Two parsing details that bite: `seed` is a `uint64` and must not round-trip
 through a `double`, and equity values are signed floats that need locale-
 independent formatting (`%.6f` with the C locale, not `%g`).
 
-### 3. Client identity and state — `src/ent/client_state.{c,h}` (new)
+### 3. Client identity and state - `src/ent/client_state.{c,h}` (new)
+
+Three single-value files in the current working directory, matching how
+`settings.txt` is already resolved:
+
+```
+birdtest_worker_uuid    generated on first run, persisted
+birdtest_api_key        optional; mode 0600
+birdtest_server         server URL
+```
 
 ```c
 typedef struct ClientState {
-  char *worker_uuid;   // generated on first run, persisted
-  char *api_key;       // optional
+  char *worker_uuid;
+  char *api_key;
   char *server_url;
 } ClientState;
-```
 
-Stored in a per-user directory (`$XDG_CONFIG_HOME/magpie/birdtest.txt`, falling
-back to `$HOME/.magpie/`), **not** in the MAGPIE data directory — a contributor
-may run MAGPIE from a read-only install, and the API key must not sit next to
-shared lexica. Use the existing `settings.txt` key/value conventions rather than
-inventing a second format.
+ClientState *client_state_load(ErrorStack *error_stack);   // creates the UUID if absent
+void client_state_save(const ClientState *state, ErrorStack *error_stack);
+void client_state_destroy(ClientState *state);
+```
 
 MAGPIE has no UUID generator today; a v4 UUID from `/dev/urandom` (and
 `BCryptGenRandom` on Windows) is a dozen lines and belongs in `src/util/`.
@@ -267,19 +294,19 @@ have today.
 
 ### 7. Wordmap auto-provisioning
 
-Wordmaps make game play dramatically faster, so a contributing client always
-wants one, but they are ~10x the size of everything else and are cheap to
-build: the `kwg → txt → wmp` chain measures **~1.3 seconds** per lexicon.
+Wordmaps make game play dramatically faster, so a contributing client is
+**required** to use one - there is no `-wmp false` path for `contribute`. They
+are also cheap to build: the `kwg -> txt -> wmp` chain measures **~1.3 seconds**
+per lexicon.
 
-`contribute` should build a missing wordmap on demand rather than failing with
-`file 'NWL23' not found for data type wordmap`. Two prerequisites:
+So `contribute` builds a missing wordmap on demand rather than failing with
+`file 'NWL23' not found for data type wordmap`, writing it into `./data`
+alongside every other MAGPIE artifact. The data directory is assumed writable;
+if it is not, that is a clear error and `contribute` stops, rather than falling
+back to a second location.
 
-- A **writable data path**. Reuse the existing search-list semantics: MAGPIE
-  writes to the first `-path` entry and reads from all of them, so a client
-  writes generated artifacts into a user-owned directory while shared lexica
-  stay read-only.
-- Concurrency safety. Two MAGPIE processes contributing on one machine must not
-  race; generate to a temporary name and `rename()` into place.
+One safety requirement: two MAGPIE processes contributing from the same
+directory must not race. Generate to a temporary name and `rename()` into place.
 
 ### 8. Heartbeat thread
 
@@ -302,10 +329,13 @@ the right mechanism.
 
 ### 10. Build and platform
 
-- `libcurl` linkage, `pkg-config` probe, `MAGPIE_NO_NETWORK` guard for WASM.
+- No new *installable* dependency: libcurl is resolved at runtime on POSIX and
+  WinHTTP is linked on Windows. `MAGPIE_NO_NETWORK` guards both for the WASM
+  build, which compiles everything under `src`.
 - The vendored JSON parser joins the existing `src/compat` precedent.
 - Windows: the client is the first part of MAGPIE that would need
-  `BCryptGenRandom` and `%APPDATA%` path handling. Both belong in `src/compat/`.
+  `BCryptGenRandom` (for the worker UUID) and the WinHTTP backend. Both belong
+  in `src/compat/` and `src/util/` respectively.
 - `-march=native` in the release profile bakes the build machine's CPU features
   into the binary. Anyone distributing prebuilt MAGPIE binaries to contributors
   needs a portable baseline (`x86-64-v2` or similar) instead.
@@ -421,76 +451,45 @@ Each phase is independently useful and independently reviewable.
 
 ## Open questions
 
-### 1. How does the HTTP dependency get onto a contributor's machine?
+### 1. How the HTTP dependency reaches a contributor - **decided**
 
-MAGPIE links exactly one library today (`LDLIBS := -lm`), which is part of libc
-and always present. That is why "download MAGPIE and run it" works. Adding
-libcurl means adding a dependency on `libcurl.so.4`, which itself pulls in a TLS
-library. Four ways to handle that, and the choice constrains the whole HTTP
-layer, so it wants deciding first:
+**OS-native backends.** libcurl on POSIX (system-provided on both Linux and
+macOS, resolved at runtime), WinHTTP on Windows. MAGPIE stays a single download
+on every platform, takes no static TLS dependency, and never ships a CA bundle.
 
-| Option | Contributor installs | Cost |
-|---|---|---|
-| **Dynamic libcurl** | MAGPIE **and** libcurl | `apt install libcurl4` on Linux; ships with macOS; DLLs to bundle on Windows. Re-introduces the setup step this project is trying to delete. |
-| **Static libcurl + TLS** | MAGPIE only | Genuinely one file, but MAGPIE's build now has to produce or vendor static libcurl and OpenSSL. You inherit TLS security updates — an OpenSSL CVE means contributors run a vulnerable MAGPIE until you rebuild and they re-download. Full static against glibc is also awkward (NSS), so this usually means building against musl. |
-| **Keep shelling out to `curl`** | MAGPIE **and** the `curl` binary | Zero build changes; it is what `get_gcg.c` does today. Status codes and headers are recoverable (`-w '%{http_code}'`, `-D -`), but every request becomes a shell string built partly from server-controlled values, and `curl` is not reliably present on Windows. |
-| **Per-platform native HTTP** | MAGPIE only | WinHTTP on Windows, `NSURLSession`/CFNetwork on macOS, libcurl on Linux where it is effectively always installed. No new dependency anywhere, and TLS trust is the OS's problem rather than yours. Three small backends instead of one, but the client only makes five kinds of request. |
+Rejected: dynamic libcurl as a hard link-time dependency (re-adds an install
+step), static libcurl + TLS (MAGPIE would inherit OpenSSL CVEs and a stale CA
+bundle), and continuing to shell out to the `curl` binary (unreliable on
+Windows, and builds shell strings out of server-controlled values).
 
-**A detail that catches people out:** a statically linked TLS stack does not know
-where the system CA store lives, so certificate verification needs either a
-probe of the usual paths (`/etc/ssl/certs/ca-certificates.crt` and friends) or an
-embedded CA bundle, which then goes stale. The OS-native backends get this right
-for free, which is the strongest argument for the last row.
-### 5. Where does per-user state live?
+### 2. Where per-user state lives - **decided**
 
-MAGPIE has no concept of per-user state today. It has a shared, read-mostly
-`data/` directory resolved through `-path`, and a `settings.txt` that is written
-relative to the **current working directory** — so MAGPIE already behaves
-differently depending on where you launch it.
+Deliberately simple, matching `settings.txt`'s existing convention rather than
+introducing platform state directories:
 
-The client needs to persist four things with quite different characteristics:
+- **Generated wordmaps go in `./data`**, like every other MAGPIE artifact. The
+  data directory is **assumed writable**; if it is not, `contribute` fails with
+  a clear error rather than falling back somewhere else. One convention for
+  where MAGPIE's files live, at the cost of not supporting a read-only
+  system-wide install - worth revisiting only if that install shape appears.
+- **Clients are required to use wordmaps.** There is no `-wmp false` path for
+  `contribute`: a missing wordmap is generated, and a data directory that
+  cannot be written is an error. Games run dramatically faster with one, and a
+  contributor running without one is donating much less compute than they think.
+- **Client state goes in three files in the current working directory**, each
+  holding one value: the worker UUID, the API key, and the server URL. Same
+  cwd-relative model as `settings.txt`, so MAGPIE gains no new concept.
+- The API key file is still a credential: `0600` on POSIX, never echoed by
+  `-savesettings`, never in status output or error messages.
 
-| What | Size | Sensitive | Losing it costs |
-|---|---|---|---|
-| Worker UUID | bytes | no | Contribution history: the contributor silently becomes a new anonymous worker |
-| API key | bytes | **yes** | Re-generate from the account page |
-| Server URL / preferences | bytes | no | Nothing |
-| Generated wordmaps | ~122 MB per lexicon | no | ~1.3s per lexicon to rebuild |
+A consequence worth stating: because state is cwd-relative, a contributor who
+runs MAGPIE from a different directory becomes a **new anonymous worker** and
+loses their contribution history. That is the same footgun `settings.txt`
+already has. Authenticating with an API key avoids it, since attribution then
+follows the account rather than the generated UUID - a good reason for the GUI
+to steer people toward signing in.
 
-Those do not belong in one place: the first three are tiny and precious, the
-last is large and disposable. Every platform has a convention for exactly that
-split:
+### Remaining open questions
 
-| | Config (UUID, key, prefs) | Derived data (wordmaps) |
-|---|---|---|
-| Linux/BSD | `$XDG_CONFIG_HOME/magpie/`, default `~/.config/magpie/` | `$XDG_CACHE_HOME/magpie/`, default `~/.cache/magpie/` |
-| macOS | `~/Library/Application Support/MAGPIE/` | `~/Library/Caches/MAGPIE/` |
-| Windows | `%APPDATA%\MAGPIE\` | `%LOCALAPPDATA%\MAGPIE\` |
-
-This matters beyond tidiness. If MAGPIE is installed system-wide, `data/` is
-read-only, so generated wordmaps **must** go somewhere user-writable — which the
-existing `-path` semantics already accommodate, since writes go to the first
-entry of the search list. The client should prepend a user-writable directory
-automatically rather than requiring the contributor to pass `-path`.
-
-The open question is one of **scope**: is this a birdtest-client feature, or does
-MAGPIE adopt a user-state directory generally and move `settings.txt` into it?
-Doing it only for the client leaves MAGPIE with two conventions. Doing it
-generally is the better end state but changes behaviour for existing users who
-rely on a per-directory `settings.txt`, so it probably wants an override
-(`MAGPIE_HOME`) and a portable mode for people running from a USB stick.
-
-Also: the API key file needs `0600` on POSIX and equivalent ACLs on Windows, and
-must never be written by `-savesettings`.
-
-### Smaller open questions
-
-- **Wordmap generation policy.** Build on demand when a task needs a missing
-   lexicon, or refuse and tell the user to run `convert text2wordmap` first?
-  On-demand is friendlier; refusing keeps `contribute` free of side effects on
-  the data directory.
-- **Should `contribute` be able to run without a wordmap at all?** A
-  contributor on a small disk might prefer `-wmp false` and slower games to
-  122 MB per lexicon.
 - **Thread budget.** `contribute` should probably default to leaving a core
   free rather than saturating a contributor's machine.
