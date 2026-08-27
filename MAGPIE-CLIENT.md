@@ -503,10 +503,11 @@ Each phase is independently useful and independently reviewable.
 1. **Foundations** — `http_client`, `json`, UUID generation, `ClientState`.
    Convert `get_gcg.c` to the new HTTP client as the first consumer, which
    tests it against a real endpoint before any birdtest code exists.
-2. **Move birdtest's result schema onto the aggregates** (section 6) — store
-   what `autoplay` reports rather than one row per game, and run pairs SPRT on
-   the divergent counts. Needs no MAGPIE change and does not depend on the
-   client move, so it can happen first and independently.
+2. ~~**Move birdtest's result schema onto the aggregates** (section 6).~~
+   **Done** — `game_records` is replaced by `game_results`, which stores the
+   two aggregates `autoplay` reports; pairs SPRT and Glicko run on the
+   divergent counts; and the SQL that re-derived pair outcomes is gone. Needed
+   no MAGPIE change.
 3. **`contribute`, single job type** — claim, heartbeat, execute and submit for
    `games` only. This proves the whole loop end to end.
 4. **Remaining job types** — opening rack analysis, game pairs, leave

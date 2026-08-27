@@ -77,25 +77,36 @@ pub(crate) async fn load_game_request(
     })
 }
 
-pub(crate) async fn insert_game_records(
+pub(crate) async fn insert_game_results(
     conn: &mut PgConnection,
     task_id: Uuid,
     claim_id: Uuid,
     record: &GameResultsRecord,
 ) -> AppResult<()> {
-    let mut builder = sqlx::QueryBuilder::new(
-        "INSERT INTO game_records
-             (task_claim_id, game_index, task_id, score1, score2, winner, num_turns) ",
-    );
-    builder.push_values(record.games.iter().enumerate(), |mut b, (index, game)| {
-        b.push_bind(claim_id)
-            .push_bind(index as i16)
-            .push_bind(task_id)
-            .push_bind(game.score1)
-            .push_bind(game.score2)
-            .push_bind(game.winner)
-            .push_bind(game.num_turns);
-    });
-    builder.build().execute(conn).await?;
+    let all = &record.all_games;
+    let divergent = record.divergent_games.as_ref();
+    sqlx::query(
+        "INSERT INTO game_results
+             (task_claim_id, task_id, games, wins, losses, ties,
+              p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
+              divergent_games, divergent_wins, divergent_losses, divergent_ties)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+    )
+    .bind(claim_id)
+    .bind(task_id)
+    .bind(all.games)
+    .bind(all.wins)
+    .bind(all.losses)
+    .bind(all.ties)
+    .bind(all.p1_score_mean)
+    .bind(all.p1_score_sd)
+    .bind(all.p2_score_mean)
+    .bind(all.p2_score_sd)
+    .bind(divergent.map(|d| d.games))
+    .bind(divergent.map(|d| d.wins))
+    .bind(divergent.map(|d| d.losses))
+    .bind(divergent.map(|d| d.ties))
+    .execute(conn)
+    .await?;
     Ok(())
 }

@@ -155,20 +155,48 @@ pub struct PositionAnalysisResponse {
     pub moves: Vec<MoveEntry>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct GameOutcome {
-    pub score1: i32,
-    pub score2: i32,
-    /// 1 = player 1, 2 = player 2, 0 = draw.
-    pub winner: i16,
-    pub num_turns: i32,
+/// One `autoplay` summary line.
+///
+/// MAGPIE reports a batch of games as counts and score moments, not as
+/// individual games — this is that report, with player 1 as the reference:
+///
+/// ```text
+/// autoplay games <total> <p1_wins> <p1_losses> <p1_ties> <p1_firsts>
+///                <p1_score_mean> <p1_score_sd> <p2_score_mean> <p2_score_sd> ...
+/// ```
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GameAggregate {
+    pub games: i32,
+    pub wins: i32,
+    pub losses: i32,
+    pub ties: i32,
+    pub p1_score_mean: f64,
+    pub p1_score_sd: f64,
+    pub p2_score_mean: f64,
+    pub p2_score_sd: f64,
 }
 
-/// Shared by games and game pairs: a game pair is simply two outcomes, one per
-/// ordering, from the same seed.
+impl GameAggregate {
+    pub(super) fn is_consistent(&self) -> bool {
+        self.games >= 0
+            && self.wins >= 0
+            && self.losses >= 0
+            && self.ties >= 0
+            && self.wins + self.losses + self.ties == self.games
+    }
+}
+
+/// Shared by games and game pairs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GameResultsResponse {
-    pub games: Vec<GameOutcome>,
+    /// Every game the task played. For game pairs that is two per pair.
+    pub all_games: GameAggregate,
+    /// The divergent subset: pairs whose two games did not play identically.
+    /// Required for game pairs, absent for plain games. Pairs that played
+    /// identically are guaranteed ties carrying no information, so the
+    /// divergent subset is where a pairs job's signal lives.
+    #[serde(default)]
+    pub divergent_games: Option<GameAggregate>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -198,7 +226,8 @@ pub struct PositionAnalysisRecord {
 
 #[derive(Debug, Clone)]
 pub struct GameResultsRecord {
-    pub games: Vec<GameOutcome>,
+    pub all_games: GameAggregate,
+    pub divergent_games: Option<GameAggregate>,
 }
 
 #[derive(Debug, Clone)]

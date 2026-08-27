@@ -61,35 +61,32 @@ class Stats:
 # ---------------------------------------------------------------------------
 
 
-def _game(rng: random.Random, p1_win_probability: float) -> dict:
-    """One plausible game outcome with a chosen bias toward player 1.
+def _aggregate(rng: random.Random, games: int, p1_win_probability: float) -> dict:
+    """One synthetic `autoplay` summary — the shape MAGPIE actually reports.
 
-    Scores are drawn around a typical Scrabble range; the winner is decided
-    first and the scores are then made consistent with it, because tests care
-    about the win rate driving SPRT, not about score realism.
+    Draws each game's outcome so the counts have realistic sampling noise
+    rather than being the exact expectation, which is what makes SPRT runs
+    interesting.
     """
-    roll = rng.random()
-    if roll < p1_win_probability:
-        winner = 1
-    elif roll < p1_win_probability + 0.02:
-        winner = 0  # draws are rare but must be exercised
-    else:
-        winner = 2
-
-    high = rng.randint(400, 520)
-    low = rng.randint(300, high - 1)
-    if winner == 1:
-        score1, score2 = high, low
-    elif winner == 2:
-        score1, score2 = low, high
-    else:
-        score1 = score2 = high
+    wins = losses = ties = 0
+    for _ in range(games):
+        roll = rng.random()
+        if roll < p1_win_probability:
+            wins += 1
+        elif roll < p1_win_probability + 0.02:
+            ties += 1  # draws are rare but must be exercised
+        else:
+            losses += 1
 
     return {
-        "score1": score1,
-        "score2": score2,
-        "winner": winner,
-        "num_turns": rng.randint(10, 16),
+        "games": games,
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "p1_score_mean": round(rng.uniform(400, 460), 6),
+        "p1_score_sd": round(rng.uniform(45, 70), 6),
+        "p2_score_mean": round(rng.uniform(400, 460), 6),
+        "p2_score_sd": round(rng.uniform(45, 70), 6),
     }
 
 
@@ -97,22 +94,26 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
     job_type = request["job_type"]
 
     if job_type == "games":
-        return {
-            "games": [
-                _game(rng, p1_win_probability) for _ in range(request["num_games"])
-            ]
-        }
+        return {"all_games": _aggregate(rng, request["num_games"], p1_win_probability)}
 
     if job_type == "game_pairs":
-        # Two games per pair, one per ordering — the server derives the pair
-        # outcome by pairing consecutive game_index rows, so the count must be
-        # even or the submission is correctly rejected.
-        return {
-            "games": [
-                _game(rng, p1_win_probability)
-                for _ in range(request["num_games"] * 2)
-            ]
+        # Two games per pair. Pairs whose games played identically are
+        # guaranteed ties and are excluded from the divergent subset, which is
+        # what the server computes the LLR from — so the divergent count is a
+        # fraction of the total, and the outcomes live there.
+        games = request["num_games"] * 2
+        divergent = max(2, (int(games * rng.uniform(0.5, 1.0)) // 2) * 2)
+        identical_pairs = (games - divergent) // 2
+        divergent_agg = _aggregate(rng, divergent, p1_win_probability)
+        all_games = {
+            **divergent_agg,
+            "games": games,
+            # Each identical pair contributes one win to each side: the same
+            # game played from both seats.
+            "wins": divergent_agg["wins"] + identical_pairs,
+            "losses": divergent_agg["losses"] + identical_pairs,
         }
+        return {"all_games": all_games, "divergent_games": divergent_agg}
 
     if job_type == "opening_rack_analysis":
         rack = request["position"].split()[1].rstrip("/")
@@ -159,20 +160,29 @@ def _corrupt(result: dict, rng: random.Random) -> dict:
     Each variant violates a different rule, so a run with enough tasks
     exercises all of them.
     """
-    variants = ["wrong_type", "missing_field", "odd_pair_count", "empty"]
+    variants = [
+        "wrong_type", "missing_field", "inconsistent_counts", "odd_pair_count", "empty",
+    ]
     choice = rng.choice(variants)
 
     if choice == "empty":
         return {}
     if choice == "wrong_type":
-        return {"games": "not-a-list", "moves": "not-a-list", "racks": "not-a-list"}
-    if choice == "missing_field" and result.get("games"):
-        stripped = [dict(g) for g in result["games"]]
-        stripped[0].pop("winner", None)
-        return {"games": stripped}
-    if choice == "odd_pair_count" and result.get("games"):
-        # A game_pairs task must submit two games per pair.
-        return {"games": result["games"][:-1] or result["games"]}
+        return {"all_games": "not-an-object", "moves": "not-a-list", "racks": "not-a-list"}
+    if choice == "missing_field" and result.get("all_games"):
+        stripped = dict(result["all_games"])
+        stripped.pop("wins", None)
+        return {**result, "all_games": stripped}
+    if choice == "inconsistent_counts" and result.get("all_games"):
+        # wins + losses + ties must equal games.
+        broken = {**result["all_games"], "wins": result["all_games"]["wins"] + 7}
+        return {**result, "all_games": broken}
+    if choice == "odd_pair_count" and result.get("all_games"):
+        # A game_pairs task must report an even number of games, two per pair.
+        broken = {**result["all_games"]}
+        broken["games"] += 1
+        broken["wins"] += 1
+        return {**result, "all_games": broken}
     return {"unexpected": True}
 
 

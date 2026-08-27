@@ -76,8 +76,14 @@ pub fn llr(tally: &Tally, elo_low: f64, elo_high: f64) -> f64 {
     n * (mu1 - mu0) * (mean - 0.5 * (mu0 + mu1)) / variance
 }
 
+/// `units_completed` is deliberately separate from `tally.total()`. For a plain
+/// `games` job they are the same number. For `game_pairs` they are not: the
+/// job's `min_pairs` / `max_pairs` gates count *pairs played*, while the tally
+/// that drives the LLR counts games within the divergent subset, which is a
+/// smaller and different number.
 pub fn evaluate(
     tally: &Tally,
+    units_completed: u64,
     min_units: u64,
     max_units: u64,
     alpha: f64,
@@ -87,7 +93,7 @@ pub fn evaluate(
 ) -> SprtResult {
     let (lower_bound, upper_bound) = bounds(alpha, beta);
     let llr = llr(tally, elo_low, elo_high);
-    let n = tally.total();
+    let n = units_completed;
 
     // The minimum-units floor exists to stop an early lucky streak from ending
     // the job; below it the LLR is reported but never acted on.

@@ -1,5 +1,5 @@
 use super::handler::*;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::job::GamePairConfig;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -30,7 +30,32 @@ impl JobHandler for GamePairHandler {
     }
 
     fn process_response(response: Self::Response) -> AppResult<Self::Record> {
-        Ok(GameResultsRecord { games: response.games })
+        super::game::validate_aggregate(&response.all_games, "all_games")?;
+
+        // Every pair is two games, so an odd total means the worker ran
+        // something other than what was asked for.
+        if response.all_games.games == 0 || response.all_games.games % 2 != 0 {
+            return Err(AppError::bad_request(
+                "a game_pairs result must contain an even, non-zero number of games (two per pair)",
+            ));
+        }
+
+        // The divergent subset is where a pairs job's signal lives, so a result
+        // without it cannot be evaluated.
+        let divergent = response.divergent_games.ok_or_else(|| {
+            AppError::bad_request("a game_pairs result must report divergent_games")
+        })?;
+        super::game::validate_aggregate(&divergent, "divergent_games")?;
+        if divergent.games % 2 != 0 || divergent.games > response.all_games.games {
+            return Err(AppError::bad_request(
+                "divergent_games must be even and no larger than the total games played",
+            ));
+        }
+
+        Ok(GameResultsRecord {
+            all_games: response.all_games,
+            divergent_games: Some(divergent),
+        })
     }
 
     async fn insert_record(
@@ -39,7 +64,7 @@ impl JobHandler for GamePairHandler {
         claim_id: Uuid,
         record: &Self::Record,
     ) -> AppResult<()> {
-        super::insert_game_records(conn, task_id, claim_id, record).await
+        super::insert_game_results(conn, task_id, claim_id, record).await
     }
 }
 

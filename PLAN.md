@@ -113,7 +113,9 @@ For game and game-pair jobs, results are evaluated using the Sequential Probabil
 
 SPRT is evaluated inline on every result submission (no background sweep). The server flips the job to `completed` automatically when either condition is met.
 
-For all game pair jobs, Glicko ratings are automatically computed after every game pair result. Ratings are keyed by `(player_config_id, job_id)` — each job maintains its own independent rating table for the player configs involved. The static bot is seeded at 2000; all other player configs start at the Glicko default of 1500. The dashboard displays the current Glicko snapshot for each player config in the job. The dashboard also displays estimated time to completion for active jobs based on current throughput and SPRT progress.
+For game pair jobs, both SPRT and Glicko are computed over the **divergent** pairs only — those whose two games did not play identically — since an identical pair is a guaranteed tie that moves neither the LLR nor a rating. The job's `min_pairs` and `max_pairs` still count every pair played.
+
+For all game pair jobs, Glicko ratings are automatically computed after every game pair result, applied as a single Glicko-2 rating period per submission rather than game by game, which is the algorithm's native form. Ratings are keyed by `(player_config_id, job_id)` — each job maintains its own independent rating table for the player configs involved. The static bot is seeded at 2000; all other player configs start at the Glicko default of 1500. The dashboard displays the current Glicko snapshot for each player config in the job. The dashboard also displays estimated time to completion for active jobs based on current throughput and SPRT progress.
 
 ---
 
@@ -362,12 +364,12 @@ Some request types are shared across job types:
 
 ### Task Response Types
 
-A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit and store plain per-game results (`{score1, score2, winner, num_turns}`); a game pair is just two of these, one per ordering, played from the same seed. Pair-level outcome (who won the pair, accounting for the color swap) is derived at read time by pairing up consecutive results for a `game_pairs` task, not stored as its own type.
+A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit the aggregate MAGPIE's autoplay reports for a batch (`{games, wins, losses, ties, score means and standard deviations}`), with game pairs adding a second aggregate over the divergent pairs. Autoplay does not emit individual games, and nothing downstream needs them: SPRT and the dashboard both work off counts.
 
 | Type | Used by |
 |---|---|
 | `PositionAnalysisResponse` | Opening rack analysis |
-| `GameResultsResponse` | Games, game pairs |
+| `GameResultsResponse` | Games, game pairs — one aggregate per batch, plus a divergent-pairs aggregate for game pairs |
 | `LeaveResponse` | Leave generation |
 
 ### Task Record Types
@@ -421,7 +423,11 @@ SPRT and finish-condition checks run during result submission, not at claim time
 
 #### Game Pairs — On-demand
 
-Same as games, except the batch size is `pairs_per_batch` from the job config. Each task seed is spaced `pairs_per_batch` apart: `SELECT COALESCE(MAX(seed) + $pairs_per_batch, 1) FROM tasks WHERE job_id = $job_id`. The job type signals MAGPIE to run both orderings (p1/p2 then p2/p1) with the same seed in a single invocation. Results are a `GameResultsResponse` — the same type games use — containing exactly two entries per pair (first ordering, then second), stored as two rows in `game_records` tied to the same `task_claim_id` via a `game_index` column. SPRT and Glicko are evaluated on the derived pair outcome (win/loss/tie across the two orderings), computed by pairing up those two rows rather than read from a dedicated column.
+Same as games, except the batch size is `pairs_per_batch` from the job config. Each task seed is spaced `pairs_per_batch` apart: `SELECT COALESCE(MAX(seed) + $pairs_per_batch, 1) FROM tasks WHERE job_id = $job_id`. The job type sets MAGPIE's `-gp` flag, so both orderings of each seed are played in a single invocation.
+
+Results are a `GameResultsResponse` — the same type games use — carrying two aggregates: every game played, and the **divergent** subset. A pair whose two games played identically is a guaranteed tie carrying no information, so excluding those is the variance reduction that pairing exists to provide, and the divergent aggregate is what SPRT and Glicko are computed from. Progress, by contrast, is measured in pairs played, because that is the unit `min_pairs` and `max_pairs` bound.
+
+This treats the two games of a divergent pair as independent observations. They are not quite — they share a seed — so the LLR is slightly optimistic. Correcting it would require per-pair outcomes, which MAGPIE does not report.
 
 ---
 
@@ -904,7 +910,8 @@ birdtest/
 │   ├── Cargo.toml
 │   ├── .env.example                # DATABASE_URL, SESSION_SIGNING_KEY, MAIL_BACKEND=console, etc. for local dev
 │   ├── migrations/                 # sqlx migration files
-│   │   └── 0001_initial.sql
+│   │   ├── 0001_initial.sql
+│   │   └── 0002_game_result_aggregates.sql
 │   └── src/
 │       ├── main.rs                 # server startup, router assembly
 │       ├── config.rs               # config from env (ECS injects SSM values as env vars)
@@ -1254,7 +1261,7 @@ CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 -- task counters (accepted_count, active_claim_count) must be decremented and tasks may need
 -- to revert from completed → available. The deletion sequence is:
 --   1. For each active/completed claim: update task counters.
---   2. Delete all task records (game_records, etc.) linked to those claims.
+--   2. Delete all task records (game_results, etc.) linked to those claims.
 --   3. Delete the task_claim rows.
 --   4. Delete the user row (cascades to api_keys, email_confirmations, password_reset_tokens).
 
@@ -1365,20 +1372,38 @@ CREATE TABLE position_analysis_plies (
 );
 CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
--- Shared by games and game pairs: one row per individual game. A `games` task submits
--- one row per game in its batch (games_per_batch); a `game_pairs` task submits exactly
--- two rows (game_index 0 and 1, one per ordering) from the same task_claim_id. Pair-level
--- outcome is derived by pairing up the two game_index rows at read time, not stored here.
-CREATE TABLE game_records (
-    task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
-    game_index      SMALLINT NOT NULL DEFAULT 0,  -- 0 for games; 0/1 (ordering) for game pairs
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    score1          INT NOT NULL,
-    score2          INT NOT NULL,
-    winner          SMALLINT NOT NULL CHECK (winner IN (0, 1, 2)),  -- 0 = draw
-    num_turns       INT NOT NULL,
-    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (task_claim_id, game_index)
+-- Shared by games and game pairs: one row per accepted task, holding the
+-- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games;
+-- it reports counts and score moments per batch, and in `-gp` mode a second
+-- such summary covering only the divergent pairs.
+CREATE TABLE game_results (
+    task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- Every game this task played. Two per pair for a game_pairs task.
+    games             INT NOT NULL CHECK (games >= 0),
+    wins              INT NOT NULL CHECK (wins >= 0),      -- player 1
+    losses            INT NOT NULL CHECK (losses >= 0),
+    ties              INT NOT NULL CHECK (ties >= 0),
+    p1_score_mean     DOUBLE PRECISION NOT NULL,
+    p1_score_sd       DOUBLE PRECISION NOT NULL,
+    p2_score_mean     DOUBLE PRECISION NOT NULL,
+    p2_score_sd       DOUBLE PRECISION NOT NULL,
+    CONSTRAINT game_results_counts_sum CHECK (wins + losses + ties = games),
+    -- The divergent subset: pairs whose two games did not play identically.
+    -- NULL for `games` jobs, which do not play pairs.
+    divergent_games   INT CHECK (divergent_games >= 0),
+    divergent_wins    INT CHECK (divergent_wins >= 0),
+    divergent_losses  INT CHECK (divergent_losses >= 0),
+    divergent_ties    INT CHECK (divergent_ties >= 0),
+    CONSTRAINT game_results_divergent_all_or_nothing CHECK (
+        (divergent_games IS NULL AND divergent_wins IS NULL
+             AND divergent_losses IS NULL AND divergent_ties IS NULL)
+        OR (divergent_games IS NOT NULL AND divergent_wins IS NOT NULL
+             AND divergent_losses IS NOT NULL AND divergent_ties IS NOT NULL
+             AND divergent_wins + divergent_losses + divergent_ties = divergent_games
+             AND divergent_games <= games)
+    ),
+    submitted_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- One row per accepted leave task (a single worker's forced-rack partition of a generation).

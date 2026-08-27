@@ -174,15 +174,7 @@ pub async fn store_result(
             game::GameHandler::insert_record(conn, task_id, claim_id, &record).await
         }
         JobType::GamePairs => {
-            let response: GameResultsResponse = decode(payload)?;
-            // A pair is exactly two orderings of the same seed; anything else
-            // means the worker ran the wrong thing.
-            if response.games.len() % 2 != 0 {
-                return Err(AppError::bad_request(
-                    "a game_pairs result must contain an even number of games (two per pair)",
-                ));
-            }
-            let record = game_pair::GamePairHandler::process_response(response)?;
+            let record = game_pair::GamePairHandler::process_response(decode(payload)?)?;
             game_pair::GamePairHandler::insert_record(conn, task_id, claim_id, &record).await
         }
         JobType::LeaveGeneration => {

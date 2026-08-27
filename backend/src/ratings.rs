@@ -74,61 +74,51 @@ async fn store_rating(
     Ok(())
 }
 
-/// Apply every pair contained in one accepted submission, oldest pair first.
+/// Apply one accepted submission's divergent games to both players' ratings.
+///
+/// The divergent subset is the whole signal: pairs whose two games played
+/// identically are guaranteed ties and move nobody's rating. Applied as a
+/// single Glicko-2 rating period rather than game by game, which is the
+/// algorithm's native form.
 pub async fn apply_claim(
     conn: &mut PgConnection,
     job_id: Uuid,
     claim_id: Uuid,
     config: &GamePairConfig,
 ) -> AppResult<()> {
-    // Player 1's score in each pair: their result in the first ordering plus
-    // their result in the second, where the two players have swapped seats.
-    let pairs = sqlx::query(
-        "SELECT game_index / 2 AS pair_index,
-                SUM(CASE
-                    WHEN game_index % 2 = 0 THEN
-                        CASE winner WHEN 1 THEN 1.0 WHEN 2 THEN 0.0 ELSE 0.5 END
-                    ELSE
-                        CASE winner WHEN 2 THEN 1.0 WHEN 1 THEN 0.0 ELSE 0.5 END
-                END)::float8 AS score,
-                COUNT(*) AS games
-         FROM game_records
-         WHERE task_claim_id = $1
-         GROUP BY 1
-         HAVING COUNT(*) = 2
-         ORDER BY 1",
+    let row = sqlx::query(
+        "SELECT divergent_games, divergent_wins, divergent_ties
+         FROM game_results WHERE task_claim_id = $1",
     )
     .bind(claim_id)
-    .fetch_all(&mut *conn)
+    .fetch_optional(&mut *conn)
     .await?;
 
-    if pairs.is_empty() {
+    let Some(row) = row else { return Ok(()) };
+    let games: Option<i32> = row.get("divergent_games");
+    let (Some(games), Some(wins), Some(ties)) = (
+        games,
+        row.get::<Option<i32>, _>("divergent_wins"),
+        row.get::<Option<i32>, _>("divergent_ties"),
+    ) else {
+        return Ok(());
+    };
+    if games <= 0 {
         return Ok(());
     }
 
-    let mut r1 = load_rating(conn, job_id, config.player1_config_id).await?;
-    let mut r2 = load_rating(conn, job_id, config.player2_config_id).await?;
+    let r1 = load_rating(conn, job_id, config.player1_config_id).await?;
+    let r2 = load_rating(conn, job_id, config.player2_config_id).await?;
 
-    for row in &pairs {
-        // A pair is worth 2 points; >1 is a pair win for player 1.
-        let raw: f64 = row.get("score");
-        let score1 = if raw > 1.0 {
-            1.0
-        } else if raw < 1.0 {
-            0.0
-        } else {
-            0.5
-        };
-        let (next1, next2) = (
-            glicko::update(r1, r2, score1),
-            glicko::update(r2, r1, 1.0 - score1),
-        );
-        r1 = next1;
-        r2 = next2;
-    }
+    let games = games as f64;
+    let score1 = wins as f64 + 0.5 * ties as f64;
+    let next1 = glicko::update(r1, r2, score1, games);
+    let next2 = glicko::update(r2, r1, games - score1, games);
 
-    let count = pairs.len() as i32;
-    store_rating(conn, job_id, config.player1_config_id, r1, count).await?;
-    store_rating(conn, job_id, config.player2_config_id, r2, count).await?;
+    // Ratings are counted in pairs, matching how the dashboard and the job's
+    // min/max thresholds talk about progress.
+    let pairs = (games / 2.0).round() as i32;
+    store_rating(conn, job_id, config.player1_config_id, next1, pairs).await?;
+    store_rating(conn, job_id, config.player2_config_id, next2, pairs).await?;
     Ok(())
 }

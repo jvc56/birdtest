@@ -127,6 +127,13 @@
           {stats.games.losses.toLocaleString()} L ({stats.games.loss_pct.toFixed(1)}%) ·
           {stats.games.draws.toLocaleString()} D ({stats.games.draw_pct.toFixed(1)}%)
         </p>
+        {#if stats.games.divergent_pairs !== undefined}
+          <p class="text-xs text-muted-foreground">
+            Counted over {stats.games.divergent_pairs.toLocaleString()} divergent pairs of
+            {stats.games.units_completed.toLocaleString()} played. Pairs whose two games play
+            identically are guaranteed ties and carry no signal, so they are excluded.
+          </p>
+        {/if}
       </div>
     {/if}
 

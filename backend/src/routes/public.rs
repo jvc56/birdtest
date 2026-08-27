@@ -61,8 +61,8 @@ async fn list_jobs(
                 (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id) AS tasks_total,
                 (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id AND t.state = 'completed')
                     AS tasks_completed,
-                (SELECT COUNT(*) FROM game_records r JOIN tasks t ON t.id = r.task_id
-                 WHERE t.job_id = j.id) AS game_rows,
+                (SELECT COALESCE(SUM(r.games), 0) FROM game_results r
+                 JOIN tasks t ON t.id = r.task_id WHERE t.job_id = j.id) AS game_rows,
                 gc.max_games, pc.max_pairs
          FROM jobs j
          LEFT JOIN job_game_config gc ON gc.job_id = j.id
@@ -83,10 +83,10 @@ async fn list_jobs(
         .into_iter()
         .map(|row| {
             let job_type: JobType = row.get("job_type");
+            // Games played; two per pair.
             let game_rows: i64 = row.get("game_rows");
             let max_games: Option<i32> = row.get("max_games");
             let max_pairs: Option<i32> = row.get("max_pairs");
-            // Two game rows make one pair.
             let (units_completed, max_units) = match job_type {
                 JobType::Games => (Some(game_rows), max_games),
                 JobType::GamePairs => (Some(game_rows / 2), max_pairs),
@@ -188,16 +188,19 @@ async fn job_results(
         }
         JobType::Games | JobType::GamePairs => {
             let rows = sqlx::query(
-                "SELECT r.task_id, r.game_index, r.score1, r.score2, r.winner, r.num_turns,
-                        r.submitted_at, t.seed, u.username, c.claimed_by_anon_uuid
-                 FROM game_records r
+                "SELECT r.task_id, r.games, r.wins, r.losses, r.ties,
+                        r.p1_score_mean, r.p1_score_sd, r.p2_score_mean, r.p2_score_sd,
+                        r.divergent_games, r.divergent_wins, r.divergent_losses,
+                        r.divergent_ties, r.submitted_at,
+                        t.seed, u.username, c.claimed_by_anon_uuid
+                 FROM game_results r
                  JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE t.job_id = $1
                    AND ($2::text IS NULL
                         OR u.username = $2 OR c.claimed_by_anon_uuid::text = $2)
-                 ORDER BY r.submitted_at DESC, r.game_index ASC
+                 ORDER BY r.submitted_at DESC
                  LIMIT $3 OFFSET $4",
             )
             .bind(id)
@@ -212,11 +215,18 @@ async fn job_results(
                     serde_json::json!({
                         "task_id": r.get::<Uuid, _>("task_id"),
                         "seed": r.get::<Option<i64>, _>("seed"),
-                        "game_index": r.get::<i16, _>("game_index"),
-                        "score1": r.get::<i32, _>("score1"),
-                        "score2": r.get::<i32, _>("score2"),
-                        "winner": r.get::<i16, _>("winner"),
-                        "num_turns": r.get::<i32, _>("num_turns"),
+                        "games": r.get::<i32, _>("games"),
+                        "wins": r.get::<i32, _>("wins"),
+                        "losses": r.get::<i32, _>("losses"),
+                        "ties": r.get::<i32, _>("ties"),
+                        "p1_score_mean": r.get::<f64, _>("p1_score_mean"),
+                        "p1_score_sd": r.get::<f64, _>("p1_score_sd"),
+                        "p2_score_mean": r.get::<f64, _>("p2_score_mean"),
+                        "p2_score_sd": r.get::<f64, _>("p2_score_sd"),
+                        "divergent_games": r.get::<Option<i32>, _>("divergent_games"),
+                        "divergent_wins": r.get::<Option<i32>, _>("divergent_wins"),
+                        "divergent_losses": r.get::<Option<i32>, _>("divergent_losses"),
+                        "divergent_ties": r.get::<Option<i32>, _>("divergent_ties"),
                         "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
                         "username": r.get::<Option<String>, _>("username"),
                         "anon_uuid": r.get::<Option<Uuid>, _>("claimed_by_anon_uuid"),
@@ -334,7 +344,7 @@ async fn job_results_stream(
                 "SELECT to_jsonb(r) AS row FROM position_analysis_records r
                  JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
             JobType::Games | JobType::GamePairs =>
-                "SELECT to_jsonb(r) AS row FROM game_records r
+                "SELECT to_jsonb(r) AS row FROM game_results r
                  JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
             JobType::LeaveGeneration =>
                 "SELECT to_jsonb(r) AS row FROM leave_rack_progress r WHERE r.job_id = $1",

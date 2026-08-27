@@ -92,10 +92,14 @@ export interface SprtResult {
 
 export interface GameStats {
   unit: 'game' | 'pair';
+  /** Counts over the tally the LLR is computed from — for pairs, the divergent subset. */
   wins: number;
   losses: number;
   draws: number;
+  /** Games for a `games` job, pairs for a `game_pairs` job. */
   units_completed: number;
+  /** Game pairs only: how many pairs diverged and so carried any signal. */
+  divergent_pairs?: number;
   min_units: number;
   max_units: number;
   win_pct: number;

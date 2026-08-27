@@ -54,7 +54,13 @@ pub struct GameStats {
     pub wins: u64,
     pub losses: u64,
     pub draws: u64,
+    /// Games for a `games` job, pairs for a `game_pairs` job — the unit the
+    /// job's min/max thresholds are stated in.
     pub units_completed: u64,
+    /// Game pairs only: how many of those pairs diverged and so contributed to
+    /// the tally above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub divergent_pairs: Option<u64>,
     pub min_units: i32,
     pub max_units: i32,
     pub win_pct: f64,
@@ -225,6 +231,8 @@ async fn lexicon_and_variant(
     })
 }
 
+/// Sum the per-task aggregates for a plain `games` job. The SPRT unit is a
+/// game, so the tally and the unit count are the same number.
 async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
         .bind(job.id)
@@ -232,11 +240,11 @@ async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
         .await?;
 
     let row = sqlx::query(
-        "SELECT
-             COUNT(*) FILTER (WHERE r.winner = 1)::bigint AS wins,
-             COUNT(*) FILTER (WHERE r.winner = 2)::bigint AS losses,
-             COUNT(*) FILTER (WHERE r.winner = 0)::bigint AS draws
-         FROM game_records r JOIN tasks t ON t.id = r.task_id
+        "SELECT COALESCE(SUM(r.games), 0)::bigint  AS games,
+                COALESCE(SUM(r.wins), 0)::bigint   AS wins,
+                COALESCE(SUM(r.losses), 0)::bigint AS losses,
+                COALESCE(SUM(r.ties), 0)::bigint   AS ties
+         FROM game_results r JOIN tasks t ON t.id = r.task_id
          WHERE t.job_id = $1",
     )
     .bind(job.id)
@@ -246,15 +254,24 @@ async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
     let tally = Tally {
         wins: row.get::<i64, _>("wins") as u64,
         losses: row.get::<i64, _>("losses") as u64,
-        draws: row.get::<i64, _>("draws") as u64,
+        draws: row.get::<i64, _>("ties") as u64,
     };
-    Ok(build_game_stats("game", tally, &SprtParams::from(&config)))
+    let games = row.get::<i64, _>("games") as u64;
+    Ok(build_game_stats("game", tally, games, &SprtParams::from(&config)))
 }
 
-/// A pair's outcome is derived here rather than stored: consecutive
-/// `game_index` rows (2k, 2k+1) are the two orderings of one seed, so player 1's
-/// pair score is their result in the first plus their result in the second,
-/// where the second has the players swapped.
+/// A game-pairs job reports two numbers that mean different things.
+///
+/// Progress is measured in **pairs played** — two games each — because that is
+/// what `min_pairs` and `max_pairs` bound. The LLR, though, is computed over the
+/// **divergent** games only: a pair whose two games played identically is a
+/// guaranteed tie carrying no information, and excluding those is the variance
+/// reduction that pairing exists to provide.
+///
+/// This does treat the two games of a divergent pair as independent
+/// observations. They are not quite — they share a seed — so the LLR is
+/// slightly optimistic. Correcting it would need per-pair outcomes, which
+/// MAGPIE does not report.
 async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
     let config =
         sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
@@ -263,24 +280,13 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
             .await?;
 
     let row = sqlx::query(
-        "WITH pairs AS (
-             SELECT r.task_claim_id, r.game_index / 2 AS pair_index,
-                    SUM(CASE
-                        WHEN r.game_index % 2 = 0 THEN
-                            CASE r.winner WHEN 1 THEN 1.0 WHEN 2 THEN 0.0 ELSE 0.5 END
-                        ELSE
-                            CASE r.winner WHEN 2 THEN 1.0 WHEN 1 THEN 0.0 ELSE 0.5 END
-                    END)::float8 AS score,
-                    COUNT(*) AS games
-             FROM game_records r JOIN tasks t ON t.id = r.task_id
-             WHERE t.job_id = $1
-             GROUP BY r.task_claim_id, r.game_index / 2
-         )
-         SELECT
-             COUNT(*) FILTER (WHERE score > 1.0)::bigint  AS wins,
-             COUNT(*) FILTER (WHERE score < 1.0)::bigint  AS losses,
-             COUNT(*) FILTER (WHERE score = 1.0)::bigint  AS draws
-         FROM pairs WHERE games = 2",
+        "SELECT COALESCE(SUM(r.games), 0)::bigint            AS games,
+                COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games,
+                COALESCE(SUM(r.divergent_wins), 0)::bigint   AS wins,
+                COALESCE(SUM(r.divergent_losses), 0)::bigint AS losses,
+                COALESCE(SUM(r.divergent_ties), 0)::bigint   AS ties
+         FROM game_results r JOIN tasks t ON t.id = r.task_id
+         WHERE t.job_id = $1",
     )
     .bind(job.id)
     .fetch_one(pool)
@@ -289,16 +295,27 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
     let tally = Tally {
         wins: row.get::<i64, _>("wins") as u64,
         losses: row.get::<i64, _>("losses") as u64,
-        draws: row.get::<i64, _>("draws") as u64,
+        draws: row.get::<i64, _>("ties") as u64,
     };
-    Ok(build_game_stats("pair", tally, &SprtParams::from(&config)))
+    let pairs_played = row.get::<i64, _>("games") as u64 / 2;
+    let mut stats = build_game_stats("pair", tally, pairs_played, &SprtParams::from(&config));
+    stats.divergent_pairs = Some(row.get::<i64, _>("divergent_games") as u64 / 2);
+    Ok(stats)
 }
 
-fn build_game_stats(unit: &'static str, tally: Tally, params: &SprtParams) -> GameStats {
+fn build_game_stats(
+    unit: &'static str,
+    tally: Tally,
+    units_completed: u64,
+    params: &SprtParams,
+) -> GameStats {
+    // Percentages describe the tally the LLR is computed from, which for pairs
+    // is the divergent subset rather than every game played.
     let total = tally.total();
     let pct = |n: u64| if total == 0 { 0.0 } else { 100.0 * n as f64 / total as f64 };
     let sprt = sprt::evaluate(
         &tally,
+        units_completed,
         params.min_units as u64,
         params.max_units as u64,
         params.alpha,
@@ -311,7 +328,8 @@ fn build_game_stats(unit: &'static str, tally: Tally, params: &SprtParams) -> Ga
         wins: tally.wins,
         losses: tally.losses,
         draws: tally.draws,
-        units_completed: total,
+        units_completed,
+        divergent_pairs: None,
         min_units: params.min_units,
         max_units: params.max_units,
         win_pct: pct(tally.wins),

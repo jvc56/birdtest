@@ -352,46 +352,80 @@ def _handle_opening_rack(request: dict, cfg: Config) -> dict:
     return {"moves": moves}
 
 
-def _autoplay(request: dict, cfg: Config, extra: list[str]) -> dict:
-    """Shared driver for the games and game-pairs handlers."""
+def _parse_autoplay_line(line: str) -> dict:
+    """Parse one machine-readable `autoplay` summary line.
+
+    MAGPIE reports a batch of games as counts and score moments, not as
+    individual games:
+
+        autoplay games <total> <p1_wins> <p1_losses> <p1_ties> <p1_firsts>
+                       <p1_score_mean> <p1_score_sd> <p2_score_mean> <p2_score_sd>
+                       <end_none> <end_standard> <end_pass>
+    """
+    fields = line.split()
+    if len(fields) < 11 or fields[0] != "autoplay":
+        raise ValueError(f"unrecognized autoplay output line: {line!r}")
+    return {
+        "games": int(fields[2]),
+        "wins": int(fields[3]),
+        "losses": int(fields[4]),
+        "ties": int(fields[5]),
+        "p1_score_mean": float(fields[7]),
+        "p1_score_sd": float(fields[8]),
+        "p2_score_mean": float(fields[9]),
+        "p2_score_sd": float(fields[10]),
+    }
+
+
+def _autoplay(request: dict, cfg: Config, game_pairs: bool) -> dict:
+    """Shared driver for the games and game-pairs handlers.
+
+    In `-gp` mode MAGPIE emits a second summary line covering only the
+    *divergent* pairs - those whose two games did not play identically. Pairs
+    that played identically are guaranteed ties carrying no information, so the
+    divergent subset is where a pairs job's signal lives, and the server
+    computes the LLR from it.
+    """
     _ensure_wordmap(cfg, request["lexicon"])
     args = [
         "autoplay",
+        "games",
+        str(request["num_games"]),
         "-lex", request["lexicon"],
         "-var", request["variant"],
         "-seed", str(request["seed"]),
-        "-gms", str(request["num_games"]),
         "-threads", str(cfg.threads),
         "-hr", "false",
         *_player_args(request["player1"], 1),
         *_player_args(request["player2"], 2),
-        *extra,
     ]
-    output = _parse_json_output(_run_magpie(cfg, args))
-    games = [
-        {
-            "score1": int(g["score1"]),
-            "score2": int(g["score2"]),
-            "winner": int(g["winner"]),
-            "num_turns": int(g["num_turns"]),
-        }
-        for g in output["games"]
-    ]
-    return {"games": games}
+    if game_pairs:
+        args += ["-gp", "true"]
+
+    lines = [ln for ln in _run_magpie(cfg, args).splitlines() if ln.startswith("autoplay ")]
+    if not lines:
+        raise RuntimeError("MAGPIE produced no autoplay summary line")
+
+    result = {"all_games": _parse_autoplay_line(lines[0])}
+    if game_pairs:
+        if len(lines) < 2:
+            raise RuntimeError("MAGPIE reported no divergent-games line for a game pair run")
+        result["divergent_games"] = _parse_autoplay_line(lines[1])
+    return result
 
 
 def _handle_game(request: dict, cfg: Config) -> dict:
     """Invoke MAGPIE autoplay to run a batch of games."""
-    return _autoplay(request, cfg, [])
+    return _autoplay(request, cfg, game_pairs=False)
 
 
 def _handle_game_pair(request: dict, cfg: Config) -> dict:
     """Invoke MAGPIE autoplay with -gp true for a batch of game pairs.
 
-    MAGPIE plays both orderings from the same seed, emitting two games per pair
-    in order, which is exactly the shape the server stores.
+    MAGPIE plays both orderings from the same seed and reports both the overall
+    summary and the divergent-pairs summary.
     """
-    return _autoplay(request, cfg, ["-gp", "true"])
+    return _autoplay(request, cfg, game_pairs=True)
 
 
 def _handle_leave_gen(request: dict, cfg: Config) -> dict:

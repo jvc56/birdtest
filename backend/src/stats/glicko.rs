@@ -29,9 +29,17 @@ fn e(mu: f64, mu_j: f64, phi_j: f64) -> f64 {
     1.0 / (1.0 + (-g(phi_j) * (mu - mu_j)).exp())
 }
 
-/// Returns the player's updated rating after scoring `score` (1.0 win, 0.5 draw,
-/// 0.0 loss) against `opponent`.
-pub fn update(player: Rating, opponent: Rating, score: f64) -> Rating {
+/// Returns the player's updated rating after `num_games` games against one
+/// opponent, where `score_sum` is their total score across them (a win counting
+/// 1, a draw 0.5).
+///
+/// Glicko-2 is defined over a rating period containing many games, so this is
+/// the algorithm's native form — applying the single-game update repeatedly
+/// would shrink the rating deviation once per game and overstate confidence.
+pub fn update(player: Rating, opponent: Rating, score_sum: f64, num_games: f64) -> Rating {
+    if num_games <= 0.0 {
+        return player;
+    }
     let mu = (player.rating - 1500.0) / SCALE;
     let phi = player.deviation / SCALE;
     let sigma = player.volatility;
@@ -41,8 +49,10 @@ pub fn update(player: Rating, opponent: Rating, score: f64) -> Rating {
     let g_j = g(phi_j);
     let e_j = e(mu, mu_j, phi_j);
 
-    let v = 1.0 / (g_j * g_j * e_j * (1.0 - e_j));
-    let delta = v * g_j * (score - e_j);
+    // Every game in the period is against the same opponent, so the sums in
+    // Glickman's step 3 and 4 collapse to a factor of `num_games`.
+    let v = 1.0 / (num_games * g_j * g_j * e_j * (1.0 - e_j));
+    let delta = v * g_j * (score_sum - num_games * e_j);
 
     // Illinois-method root find for the new volatility (Glickman step 5).
     let a = (sigma * sigma).ln();
@@ -82,7 +92,7 @@ pub fn update(player: Rating, opponent: Rating, score: f64) -> Rating {
     let new_sigma = (big_a / 2.0).exp();
     let phi_star = (phi * phi + new_sigma * new_sigma).sqrt();
     let new_phi = 1.0 / (1.0 / (phi_star * phi_star) + 1.0 / v).sqrt();
-    let new_mu = mu + new_phi * new_phi * g_j * (score - e_j);
+    let new_mu = mu + new_phi * new_phi * g_j * (score_sum - num_games * e_j);
 
     Rating {
         rating: SCALE * new_mu + 1500.0,

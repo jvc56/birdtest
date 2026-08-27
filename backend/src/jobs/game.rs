@@ -1,10 +1,22 @@
 use super::handler::*;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::job::GameConfig;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 pub struct GameHandler;
+
+/// Counts a worker reports must be internally consistent before they are
+/// stored; the DB has the same constraint, but a 400 is a better answer than a
+/// constraint violation.
+pub(super) fn validate_aggregate(aggregate: &GameAggregate, field: &str) -> AppResult<()> {
+    if !aggregate.is_consistent() {
+        return Err(AppError::bad_request(format!(
+            "{field}: wins + losses + ties must equal games, and all must be non-negative"
+        )));
+    }
+    Ok(())
+}
 
 impl JobHandler for GameHandler {
     type Request = GameRequest;
@@ -28,7 +40,13 @@ impl JobHandler for GameHandler {
     }
 
     fn process_response(response: Self::Response) -> AppResult<Self::Record> {
-        Ok(GameResultsRecord { games: response.games })
+        validate_aggregate(&response.all_games, "all_games")?;
+        if response.all_games.games == 0 {
+            return Err(AppError::bad_request("a games result must contain at least one game"));
+        }
+        // A plain `games` job does not play pairs, so there is no divergent
+        // subset to report; ignore it rather than storing something meaningless.
+        Ok(GameResultsRecord { all_games: response.all_games, divergent_games: None })
     }
 
     async fn insert_record(
@@ -37,7 +55,7 @@ impl JobHandler for GameHandler {
         claim_id: Uuid,
         record: &Self::Record,
     ) -> AppResult<()> {
-        super::insert_game_records(conn, task_id, claim_id, record).await
+        super::insert_game_results(conn, task_id, claim_id, record).await
     }
 }
 
