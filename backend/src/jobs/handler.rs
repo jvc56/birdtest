@@ -6,15 +6,8 @@ use crate::models::job::PlayerConfig;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
+use std::path::Path;
 use uuid::Uuid;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CreationStrategy {
-    /// All tasks are written at job creation; workers claim from the pool.
-    PrePopulated,
-    /// Tasks are generated, inserted and claimed atomically at claim time.
-    OnDemand,
-}
 
 /// Every job type implements this. The trait is used through static dispatch
 /// from [`crate::jobs::registry`], where the `JobType` match is exhaustive — a
@@ -25,14 +18,15 @@ pub trait JobHandler {
     type Response: DeserializeOwned;
     type Record;
 
-    fn creation_strategy() -> CreationStrategy;
-
-    /// Persist the typed request row alongside the `tasks` row.
-    async fn insert_request(conn: &mut PgConnection, task_id: Uuid, req: &Self::Request)
-        -> AppResult<()>;
-
-    /// Read back a stored request (pre-populated jobs claim tasks written earlier).
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request>;
+    /// Read back a stored request. A task whose claim lapsed is re-dispatched
+    /// through here rather than regenerated, so the request a worker sees is
+    /// always the one recorded against the task.
+    ///
+    /// `data_path` is only meaningful to opening rack analysis, which stores a
+    /// range of the rack space rather than the racks themselves and needs the
+    /// letter distribution to expand it.
+    async fn load_request(conn: &mut PgConnection, task_id: Uuid,
+                          data_path: &Path) -> AppResult<Self::Request>;
 
     /// Normalize a worker submission into its stored form.
     fn process_response(response: Self::Response) -> AppResult<Self::Record>;
@@ -88,9 +82,15 @@ impl From<PlayerConfig> for PlayerSpec {
 pub struct PositionRequest {
     pub lexicon: String,
     pub variant: String,
-    /// An opening rack is by definition the start of the game, so only the
-    /// rack crosses the wire -- MAGPIE assumes the empty starting board.
-    pub rack: String,
+    /// A batch of racks. An opening rack is by definition the start of the
+    /// game, so only the letters cross the wire -- MAGPIE assumes the empty
+    /// starting board.
+    ///
+    /// Batching matters here more than anywhere else: the rack space runs to
+    /// millions, and one rack per task would spend a claim/submit round trip
+    /// on each, which the per-worker rate limit alone caps at well under a
+    /// rack per second.
+    pub racks: Vec<String>,
     pub previous_play: Option<String>,
     pub player: PlayerSpec,
 }
@@ -171,9 +171,17 @@ pub struct MoveEntry {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PositionAnalysisResponse {
-    /// Ranked best-first as MAGPIE emitted them.
+pub struct RackAnalysis {
+    pub rack: String,
+    /// Ranked best-first as MAGPIE emitted them. The server keeps only the
+    /// leading `top_moves_stored`.
     pub moves: Vec<MoveEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct PositionAnalysisResponse {
+    /// One entry per rack in the request.
+    pub racks: Vec<RackAnalysis>,
 }
 
 /// One `autoplay` summary line.
@@ -237,12 +245,21 @@ pub struct LeaveResponse {
 // --- Records ---------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub struct PositionAnalysisRecord {
+pub struct RackRecord {
+    pub rack: String,
     pub best_move: String,
     pub best_score: i32,
     pub best_equity: f64,
+    /// How many moves the worker ranked, which is generally far more than the
+    /// number kept in `moves`.
     pub num_moves: i32,
+    /// Truncated to the job's `top_moves_stored`.
     pub moves: Vec<MoveEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PositionAnalysisRecord {
+    pub racks: Vec<RackRecord>,
 }
 
 #[derive(Debug, Clone)]

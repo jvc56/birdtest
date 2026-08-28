@@ -164,7 +164,12 @@
         <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
           <div>
             <dt class="text-muted-foreground">Racks analyzed</dt>
-            <dd class="text-xl tabular-nums">{stats.opening_racks.racks_analyzed.toLocaleString()}</dd>
+            <dd class="text-xl tabular-nums">
+              {stats.opening_racks.racks_analyzed.toLocaleString()}
+              <span class="text-sm text-muted-foreground">
+                / {stats.opening_racks.racks_total.toLocaleString()}
+              </span>
+            </dd>
           </div>
           <div>
             <dt class="text-muted-foreground">Average best equity</dt>

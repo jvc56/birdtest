@@ -133,7 +133,20 @@ CREATE TABLE job_opening_rack_config (
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
     -- The player config used to analyze each rack (may be a simmer or static player).
-    player_config_id  UUID NOT NULL REFERENCES player_configs(id)
+    player_config_id  UUID NOT NULL REFERENCES player_configs(id),
+    -- Racks handed out per task. One rack per task means one claim/submit round
+    -- trip per rack, and the worker rate limit alone would then cap a worker at
+    -- well under a rack per second against a space of millions.
+    racks_per_batch   INT NOT NULL DEFAULT 500 CHECK (racks_per_batch >= 1),
+    rack_size         INT NOT NULL DEFAULT 7 CHECK (rack_size BETWEEN 1 AND 7),
+    -- How many of the worker's ranked moves are kept per rack. Distinct from how
+    -- many the worker generates or simulates, which is the player config's
+    -- top_plays: the worker may sim hundreds to rank them correctly while only
+    -- the leaders are worth storing for every rack in the space.
+    top_moves_stored  INT NOT NULL DEFAULT 20 CHECK (top_moves_stored >= 1),
+    -- Size of the rack space, computed at job creation. Tasks address ranges of
+    -- it, so this is what tells the scheduler when the job is exhausted.
+    total_racks       BIGINT NOT NULL CHECK (total_racks >= 0)
 );
 
 CREATE TABLE job_game_config (
@@ -245,11 +258,17 @@ CREATE UNIQUE INDEX task_claims_anon_unique_idx
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
+-- One row per task, covering a contiguous range of the rack space. The racks
+-- themselves are not stored: they are unranked from `rack_start` on demand,
+-- which is what lets a job over millions of racks be created in constant time.
 CREATE TABLE position_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
-    rack              TEXT NOT NULL,         -- the rack to analyze; MAGPIE assumes the empty starting board
+    -- Index of the first rack in this batch, and how many it covers. The final
+    -- batch of a job may be short.
+    rack_start        BIGINT NOT NULL CHECK (rack_start >= 0),
+    rack_count        INT NOT NULL CHECK (rack_count >= 1),
     previous_play     TEXT,                  -- GCG-encoded previous move; required when inference is enabled; NULL for opening racks
     player_config_id  UUID NOT NULL REFERENCES player_configs(id)
 );
@@ -291,30 +310,40 @@ CREATE TABLE leave_rack_progress (
 -- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
 -- task_id is denormalized here for efficient job-results queries without joining through task_claims.
 
+-- One row per rack per accepted claim: a task now covers a batch of racks.
 CREATE TABLE position_analysis_records (
-    task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
+    rack            TEXT NOT NULL,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     best_move       TEXT NOT NULL,
     best_score      INT NOT NULL,
     best_equity     DOUBLE PRECISION NOT NULL,
+    -- How many moves the worker ranked, which is generally far more than the
+    -- top_moves_stored kept below.
     num_moves       INT NOT NULL,
-    artifact_key    TEXT,           -- S3 key for full ranked move list
-    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (task_claim_id, rack)
 );
+CREATE INDEX position_analysis_records_rack_idx ON position_analysis_records (task_id, rack);
 
--- Top moves stored relationally for querying; full list is in S3 via artifact_key.
+-- The top `top_moves_stored` moves per rack. Storing every move the worker
+-- ranked would be untenable: a job over the full English 7-tile space is
+-- roughly 3.2 million racks, and an opening rack generates far more than a
+-- handful of legal placements.
 CREATE TABLE position_analysis_moves (
     id              BIGSERIAL PRIMARY KEY,
     task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
+    rack            TEXT NOT NULL,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
     score           INT NOT NULL,
     equity          DOUBLE PRECISION NOT NULL
 );
-CREATE INDEX position_analysis_moves_task_idx ON position_analysis_moves (task_id);
+CREATE INDEX position_analysis_moves_task_idx ON position_analysis_moves (task_id, rack);
 
--- Per-ply simulation stats for each candidate move.
+-- Per-ply simulation stats for each candidate move. Only populated for simming
+-- player configs; a static player has no per-ply statistics to record.
 CREATE TABLE position_analysis_plies (
     id               BIGSERIAL PRIMARY KEY,
     move_id          BIGINT NOT NULL REFERENCES position_analysis_moves(id) ON DELETE CASCADE,

@@ -146,7 +146,7 @@ async fn try_claim_from_job(
 ) -> Result<Option<ClaimOutcome>, JobClaimError> {
     let mut tx = state.pool.begin().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
 
-    let acquired = match registry::acquire(&mut tx, job).await {
+    let acquired = match registry::acquire(&mut tx, job, &state.cfg.data_path).await {
         Ok(acquired) => acquired,
         Err(err) => {
             let _ = tx.rollback().await;

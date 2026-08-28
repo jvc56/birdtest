@@ -258,7 +258,23 @@ async fn finish_if_done(state: &AppState, job: &Job, stats: &jobstats::JobStats)
         Some(games) => games.sprt.status.is_finished(),
         None => match job.job_type {
             JobType::OpeningRackAnalysis => {
-                stats.tasks_total > 0 && stats.tasks_completed >= stats.tasks_total
+                // Tasks are generated on demand, so "all tasks complete" is not
+                // enough -- it is trivially true before anything is dispatched.
+                // The job is done once the rack space is exhausted as well.
+                let exhausted = sqlx::query_scalar::<_, bool>(
+                    "SELECT COALESCE(MAX(t.seed) + c.racks_per_batch, 0) >= c.total_racks
+                     FROM job_opening_rack_config c
+                     LEFT JOIN tasks t ON t.job_id = c.job_id
+                     WHERE c.job_id = $1
+                     GROUP BY c.racks_per_batch, c.total_racks",
+                )
+                .bind(job.id)
+                .fetch_optional(&state.pool)
+                .await?
+                .unwrap_or(false);
+                exhausted
+                    && stats.tasks_total > 0
+                    && stats.tasks_completed >= stats.tasks_total
             }
             // Leave generation completes in `run_transition` once the final
             // generation is aggregated.

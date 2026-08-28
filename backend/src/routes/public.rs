@@ -150,17 +150,16 @@ async fn job_results(
     let items = match job.job_type {
         JobType::OpeningRackAnalysis => {
             let rows = sqlx::query(
-                "SELECT r.task_id, q.position, r.best_move, r.best_score, r.best_equity,
+                "SELECT r.task_id, r.rack, r.best_move, r.best_score, r.best_equity,
                         r.num_moves, r.submitted_at, u.username, c.claimed_by_anon_uuid
                  FROM position_analysis_records r
                  JOIN tasks t ON t.id = r.task_id
-                 JOIN position_requests q ON q.task_id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE t.job_id = $1
                    AND ($2::text IS NULL
                         OR u.username = $2 OR c.claimed_by_anon_uuid::text = $2)
-                 ORDER BY r.submitted_at DESC
+                 ORDER BY r.submitted_at DESC, r.rack ASC
                  LIMIT $3 OFFSET $4",
             )
             .bind(id)
@@ -174,7 +173,7 @@ async fn job_results(
                 .map(|r| {
                     serde_json::json!({
                         "task_id": r.get::<Uuid, _>("task_id"),
-                        "position": r.get::<String, _>("position"),
+                        "rack": r.get::<String, _>("rack"),
                         "best_move": r.get::<String, _>("best_move"),
                         "best_score": r.get::<i32, _>("best_score"),
                         "best_equity": r.get::<f64, _>("best_equity"),
@@ -281,9 +280,8 @@ async fn rack_lookup(
     let rows = sqlx::query(
         "SELECT m.rank, m.move, m.score, m.equity
          FROM position_analysis_moves m
-         JOIN position_requests q ON q.task_id = m.task_id
          JOIN tasks t ON t.id = m.task_id
-         WHERE t.job_id = $1 AND q.rack = $2
+         WHERE t.job_id = $1 AND m.rack = $2
          ORDER BY m.rank ASC",
     )
     .bind(job_id)

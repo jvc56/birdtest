@@ -130,6 +130,8 @@ export interface JobStats {
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
+    /** Size of the rack space — the denominator for progress. */
+    racks_total: number;
     average_best_equity: number | null;
     best_move_types: { move_type: string; count: number }[];
   };

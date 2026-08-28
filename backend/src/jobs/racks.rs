@@ -143,3 +143,126 @@ impl LetterDistribution {
         }
     }
 }
+
+/// Indexes the space of distinct racks so a task can name a *range* of them
+/// rather than carrying the racks themselves.
+///
+/// `counts[i][k]` is how many distinct k-tile racks can be drawn from tiles
+/// `i..`, which is enough both to count the whole space and to address the
+/// k-th rack in it directly. The table is tiny -- 27 letters by 8 sizes for
+/// English -- so unranking one rack is a handful of additions rather than a
+/// walk over the millions of racks that precede it.
+pub struct RackIndex {
+    tiles: Vec<Tile>,
+    counts: Vec<Vec<u64>>,
+    size: usize,
+}
+
+impl RackIndex {
+    pub fn new(distribution: &LetterDistribution, size: usize) -> Self {
+        let tiles = distribution.tiles.clone();
+        let n = tiles.len();
+        // The extra row is the empty suffix, which can only make the empty rack.
+        let mut counts = vec![vec![0u64; size + 1]; n + 1];
+        counts[n][0] = 1;
+        for i in (0..n).rev() {
+            let available = tiles[i].count as usize;
+            for k in 0..=size {
+                let mut total: u64 = 0;
+                for take in 0..=available.min(k) {
+                    total = total.saturating_add(counts[i + 1][k - take]);
+                }
+                counts[i][k] = total;
+            }
+        }
+        Self { tiles, counts, size }
+    }
+
+    /// How many distinct racks of this size exist -- the job's total.
+    pub fn total(&self) -> u64 {
+        self.counts[0][self.size]
+    }
+
+    /// The rack at `index`, or `None` past the end.
+    ///
+    /// Ordering is by ascending count of each tile in distribution order, and
+    /// must stay stable: results are recorded against racks unranked from an
+    /// index, so changing the order would silently re-point old results.
+    pub fn rack_at(&self, index: u64) -> Option<String> {
+        if index >= self.total() {
+            return None;
+        }
+        let mut remaining_index = index;
+        let mut remaining_size = self.size;
+        let mut rack = String::with_capacity(self.size);
+
+        for i in 0..self.tiles.len() {
+            let available = self.tiles[i].count as usize;
+            for take in 0..=available.min(remaining_size) {
+                let block = self.counts[i + 1][remaining_size - take];
+                if remaining_index < block {
+                    for _ in 0..take {
+                        rack.push(self.tiles[i].letter);
+                    }
+                    remaining_size -= take;
+                    break;
+                }
+                remaining_index -= block;
+            }
+        }
+        Some(rack)
+    }
+
+    /// The racks in `[start, start + count)`, stopping at the end of the space.
+    /// The final batch of a job comes up short this way.
+    pub fn racks_in_range(&self, start: u64, count: u64) -> Vec<String> {
+        (start..start.saturating_add(count))
+            .map_while(|index| self.rack_at(index))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny() -> LetterDistribution {
+        LetterDistribution {
+            tiles: vec![
+                Tile { letter: 'A', count: 2 },
+                Tile { letter: 'B', count: 1 },
+                Tile { letter: 'C', count: 3 },
+            ],
+        }
+    }
+
+    #[test]
+    fn unranking_matches_full_enumeration() {
+        // The index must address exactly the same set the naive walk produces,
+        // or results recorded against an index would mean the wrong rack.
+        for size in 1..=4 {
+            let distribution = tiny();
+            let index = RackIndex::new(&distribution, size);
+            let mut enumerated = distribution.enumerate_racks(size);
+            enumerated.sort();
+
+            assert_eq!(index.total() as usize, enumerated.len(), "size {size}");
+
+            let mut unranked: Vec<String> =
+                (0..index.total()).filter_map(|i| index.rack_at(i)).collect();
+            assert_eq!(unranked.len(), enumerated.len(), "size {size}");
+            unranked.sort();
+            assert_eq!(unranked, enumerated, "size {size}");
+        }
+    }
+
+    #[test]
+    fn unranking_is_past_the_end_safe() {
+        let index = RackIndex::new(&tiny(), 3);
+        assert!(index.rack_at(index.total()).is_none());
+        // A range that runs off the end yields only what exists, which is how
+        // the final batch of a job comes up short.
+        let tail = index.racks_in_range(index.total() - 2, 10);
+        assert_eq!(tail.len(), 2);
+    }
+}

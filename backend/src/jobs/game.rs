@@ -2,6 +2,7 @@ use super::handler::*;
 use crate::error::{AppError, AppResult};
 use crate::models::job::GameConfig;
 use sqlx::{PgConnection, Row};
+use std::path::Path;
 use uuid::Uuid;
 
 pub struct GameHandler;
@@ -23,19 +24,10 @@ impl JobHandler for GameHandler {
     type Response = GameResultsResponse;
     type Record = GameResultsRecord;
 
-    fn creation_strategy() -> CreationStrategy {
-        CreationStrategy::OnDemand
-    }
 
-    async fn insert_request(
-        conn: &mut PgConnection,
-        task_id: Uuid,
-        req: &Self::Request,
-    ) -> AppResult<()> {
-        super::insert_game_request(conn, task_id, req).await
-    }
 
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
+    async fn load_request(conn: &mut PgConnection, task_id: Uuid,
+                          _data_path: &Path) -> AppResult<Self::Request> {
         super::load_game_request(conn, task_id, false).await
     }
 

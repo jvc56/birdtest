@@ -9,39 +9,39 @@ use uuid::Uuid;
 
 pub struct LeaveGenHandler;
 
+/// Writes the typed request row alongside the task.
+pub async fn insert_request(
+    conn: &mut PgConnection,
+    task_id: Uuid,
+    req: &LeaveRequest,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO leave_requests
+             (task_id, lexicon, variant, generation, forced_racks, num_games,
+              previous_artifact_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(task_id)
+    .bind(&req.lexicon)
+    .bind(&req.variant)
+    .bind(req.generation)
+    .bind(&req.forced_racks)
+    .bind(req.num_games)
+    .bind(&req.previous_artifact_key)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 impl JobHandler for LeaveGenHandler {
     type Request = LeaveRequest;
     type Response = LeaveResponse;
     type Record = LeaveRecord;
 
-    fn creation_strategy() -> CreationStrategy {
-        CreationStrategy::OnDemand
-    }
 
-    async fn insert_request(
-        conn: &mut PgConnection,
-        task_id: Uuid,
-        req: &Self::Request,
-    ) -> AppResult<()> {
-        sqlx::query(
-            "INSERT INTO leave_requests
-                 (task_id, lexicon, variant, generation, forced_racks, num_games,
-                  previous_artifact_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(task_id)
-        .bind(&req.lexicon)
-        .bind(&req.variant)
-        .bind(req.generation)
-        .bind(&req.forced_racks)
-        .bind(req.num_games)
-        .bind(&req.previous_artifact_key)
-        .execute(conn)
-        .await?;
-        Ok(())
-    }
 
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
+    async fn load_request(conn: &mut PgConnection, task_id: Uuid,
+                          _data_path: &Path) -> AppResult<Self::Request> {
         let row = sqlx::query(
             "SELECT lexicon, variant, generation, forced_racks, num_games, previous_artifact_key
              FROM leave_requests WHERE task_id = $1",

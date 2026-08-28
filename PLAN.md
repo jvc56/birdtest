@@ -104,6 +104,12 @@ Contributors run a client program that loops continuously: it sends a **task cla
 
 ---
 
+#### How much of an analysis is kept
+
+A worker reports every move it ranked. The server keeps only the leading `top_moves_stored` per rack, which is **deliberately a different number from how many the worker generated or simulated** (the player config's `top_plays`): a simmer may need to rank hundreds of candidates to order the top few correctly, while storing hundreds of rows for each of millions of racks is not something the database should be asked to do. `position_analysis_records.num_moves` records how many were ranked, so the discarded tail is still visible as a count.
+
+`position_analysis_plies` is populated only for **simming** player configs. A static player produces no per-ply statistics, so for the common case the table stays empty rather than filling with placeholder rows.
+
 ### Statistical Result Evaluation
 
 For game and game-pair jobs, results are evaluated using the Sequential Probability Ratio Test (SPRT). A job has two finish conditions:
@@ -370,7 +376,7 @@ A task response is what the worker submits after completing a task. It is valida
 
 | Type | Used by |
 |---|---|
-| `PositionAnalysisResponse` | Opening rack analysis |
+| `PositionAnalysisResponse` | Opening rack analysis — one entry per rack in the batch |
 | `GameResultsResponse` | Games, game pairs — one aggregate per batch, plus a divergent-pairs aggregate for game pairs |
 | `LeaveResponse` | Leave generation |
 
@@ -386,27 +392,28 @@ A task record is the normalized form stored in a typed table after a response is
 
 ### Creation Strategies
 
-**Pre-populated**: At job creation time the server generates all task requests and inserts them into the `tasks` table with `state = 'available'`. Workers then claim from this pool. Suitable for finite, enumerable work spaces — opening rack analysis.
+**Every job type is on-demand.** No tasks are inserted at job creation. When a worker requests a task, the server generates the next task request, then inserts and claims it atomically in a single transaction, issuing a claim token.
 
-**On-demand**: No tasks are inserted at job creation. When a worker requests a task, the server generates the next task request, then inserts and claims it atomically in a single transaction, issuing a claim token. The task never passes through `available` state. Suitable for seed-based work where the space is effectively unbounded — games, game pairs, leave generation.
+Opening rack analysis was the last pre-populated type. It became on-demand once tasks addressed *ranges* of the rack space rather than materializing a row per rack, and with it the pre-populated strategy disappeared entirely — there is no `CreationStrategy` any more, and one fewer axis on which job types differ.
 
 ### Per-Job-Type Creation Details
 
-#### Opening Rack Analysis — Pre-populated
+#### Opening Rack Analysis — On-demand, range-addressed
 
-At job creation the server enumerates every distinct 7-tile multiset drawable from the lexicon's tile bag and inserts one task + one `position_requests` row per rack, all in a single transaction (or a streaming batch insert).
+Each task covers a contiguous batch of `racks_per_batch` racks. One rack per task would spend a claim/submit round trip on each, and the space is large: the distinct 7-tile racks drawable from the English bag number **3,199,724**. At roughly one worker request per second, a rack per task would cap a single worker below one rack every two seconds before any analysis happened.
 
-Steps:
-1. Load the tile distribution for the job's `lexicon` (letter counts, blank count).
-2. Enumerate all distinct 7-tile multisets via combinatorial iteration over the tile multiset. Each rack is represented as a canonical string of sorted tile characters (e.g., `"AABCELT"`, blanks as `"?"`).
-3. For each rack, encode it as a CGP position string for an empty board with that rack (the format MAGPIE accepts for `cg` / position analysis).
-4. Within one transaction: `INSERT INTO tasks (job_id, seed, state, ...) VALUES ($job_id, NULL, 'available', ...)` then `INSERT INTO position_requests (task_id, lexicon, variant, position, previous_play, player_config_id) VALUES (...)`. `previous_play` is NULL for all opening racks (empty board, no prior move). `player_config_id` is copied from `job_opening_rack_config`. Repeat for all racks.
+Nothing is enumerated up front. A task names the range `[rack_start, rack_start + rack_count)` and the racks are **unranked** from those indices on demand: a small dynamic-programming table over the letter distribution — how many k-tile racks can be drawn from tiles `i` onward — is enough both to count the space and to address the k-th rack in it directly, so producing one rack is a handful of additions rather than a walk over the millions preceding it. Job creation over the full English space is therefore constant time and writes no rows.
 
-Uniqueness is enforced by the position content (the same rack on an empty board always produces the same CGP string). The letter distribution files in `data/letterdistributions/` are used to enumerate the bag.
+Ranges tile the space exactly as game seeds do, reusing `tasks.seed` as the starting index and the `(job_id, seed)` unique index to resolve two workers racing for the same slice. `total_racks` is computed once at job creation from the same table, so the scheduler knows when the space is exhausted without re-deriving it.
 
-A lexicon and a letter distribution are not the same thing: MAGPIE derives the distribution from the lexicon name's prefix (NWL, CSW, TWL, … → `english`; FRA → `french`, and so on) and ships one file per distribution, not per lexicon. `jobs::racks::letter_distribution_name` mirrors that mapping so both sides agree on which file to read and so the name handed to `magpie convert csv2klv` resolves. An unrecognized lexicon falls back to its own lowercased name, which is what lets the tiny `testdist` development bag work. The total task count for a standard English Scrabble bag is on the order of several hundred thousand.
+The unranking order must stay stable: results are recorded against racks expanded from an index, so changing it would silently re-point existing results.
 
----
+At claim time (all in one transaction):
+1. Compute the next start: `SELECT COALESCE(MAX(seed) + $racks_per_batch, 0) FROM tasks WHERE job_id = $job_id`. If it has reached `total_racks`, the job has no work left.
+2. Unrank that range into racks.
+3. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $next_start, 'available')`.
+4. `INSERT INTO position_requests (task_id, lexicon, variant, rack_start, rack_count, player_config_id)` — the range, not the racks.
+5. Return the expanded racks and a claim token.
 
 #### Games — On-demand
 

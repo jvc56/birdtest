@@ -59,6 +59,10 @@ pub struct OpeningRackConfig {
     pub lexicon: String,
     pub variant: String,
     pub player_config_id: Uuid,
+    pub racks_per_batch: i32,
+    pub rack_size: i32,
+    pub top_moves_stored: i32,
+    pub total_racks: i64,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

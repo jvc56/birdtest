@@ -182,6 +182,12 @@ enum JobTypeConfig {
         lexicon: String,
         variant: String,
         player_config_id: Uuid,
+        #[serde(default = "default_racks_per_batch")]
+        racks_per_batch: i32,
+        #[serde(default = "default_rack_size")]
+        rack_size: i32,
+        #[serde(default = "default_top_moves_stored")]
+        top_moves_stored: i32,
     },
     Game {
         lexicon: String,
@@ -244,13 +250,24 @@ fn default_elo_high() -> f64 {
 fn default_max_leave_size() -> i32 {
     6
 }
+fn default_racks_per_batch() -> i32 {
+    500
+}
+fn default_rack_size() -> i32 {
+    7
+}
+/// Ranked moves kept per rack. Independent of how many the worker generates or
+/// simulates, which is the player config's `top_plays`.
+fn default_top_moves_stored() -> i32 {
+    20
+}
 
 #[derive(Serialize)]
 struct CreatedJob {
     job: Job,
-    /// Rows written up front: tasks for a pre-populated job, or the rack
-    /// universe for generation 1 of a leave-gen job.
-    prepopulated: i64,
+    /// Rows written up front. Only leave generation has any: the rack universe
+    /// that generation 1 is measured against. No job type pre-populates tasks.
+    initialized: i64,
 }
 
 /// Jobs are always created inactive. Allocation is supplied later, at
@@ -278,9 +295,9 @@ async fn create_job(
     .fetch_one(&mut *tx)
     .await?;
 
-    insert_job_config(&mut tx, &job, &body.config).await?;
+    insert_job_config(&mut tx, &job, &body.config, &state.cfg.data_path).await?;
 
-    let prepopulated = registry::prepopulate(&mut tx, &job, &state.cfg.data_path).await?;
+    let initialized = registry::initialize_job_state(&mut tx, &job, &state.cfg.data_path).await?;
 
     audit::log(
         &mut tx,
@@ -294,28 +311,47 @@ async fn create_job(
     .await?;
     tx.commit().await?;
 
-    Ok((StatusCode::CREATED, Json(CreatedJob { job, prepopulated })))
+    Ok((StatusCode::CREATED, Json(CreatedJob { job, initialized })))
 }
 
 async fn insert_job_config(
     conn: &mut sqlx::PgConnection,
     job: &Job,
     config: &JobTypeConfig,
+    data_path: &std::path::Path,
 ) -> AppResult<()> {
     // The untagged config must actually match the declared job type, or the job
     // would exist with no config row and never dispatch anything.
     let mismatch = || AppError::bad_request("config fields do not match the requested job_type");
 
     match (job.job_type, config) {
-        (JobType::OpeningRackAnalysis, JobTypeConfig::OpeningRack { lexicon, variant, player_config_id }) => {
+        (
+            JobType::OpeningRackAnalysis,
+            JobTypeConfig::OpeningRack {
+                lexicon, variant, player_config_id, racks_per_batch, rack_size,
+                top_moves_stored,
+            },
+        ) => {
+            // Counting the space is cheap -- a small dynamic-programming table
+            // over the letter distribution -- and recording it here means the
+            // scheduler can tell when the job is exhausted without re-deriving
+            // it on every claim.
+            let total_racks =
+                crate::jobs::opening_rack::total_racks(data_path, lexicon, *rack_size)?;
             sqlx::query(
-                "INSERT INTO job_opening_rack_config (job_id, lexicon, variant, player_config_id)
-                 VALUES ($1, $2, $3, $4)",
+                "INSERT INTO job_opening_rack_config
+                     (job_id, lexicon, variant, player_config_id, racks_per_batch,
+                      rack_size, top_moves_stored, total_racks)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(job.id)
             .bind(lexicon)
             .bind(variant)
             .bind(player_config_id)
+            .bind(racks_per_batch)
+            .bind(rack_size)
+            .bind(top_moves_stored)
+            .bind(total_racks)
             .execute(conn)
             .await?;
         }
@@ -536,30 +572,18 @@ async fn purge_job(
         .execute(&mut *tx)
         .await?;
 
-    let tasks_reset = match registry::creation_strategy(job.job_type) {
-        crate::jobs::handler::CreationStrategy::PrePopulated => {
-            sqlx::query(
-                "UPDATE tasks SET state = 'available', accepted_count = 0,
-                                  active_claim_count = 0, completed_at = NULL
-                 WHERE job_id = $1",
-            )
-            .bind(id)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected()
-        }
-        crate::jobs::handler::CreationStrategy::OnDemand => {
-            sqlx::query("DELETE FROM tasks WHERE job_id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected()
-        }
-    };
+    // Every job type generates its tasks on demand, so purging deletes them
+    // outright: they are regenerated from the start of the space at the next
+    // claim. Leaving them would advance the seed cursor past work never done.
+    let tasks_reset = sqlx::query("DELETE FROM tasks WHERE job_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
 
     // Leave-gen needs its generation-1 rack universe back to have anything to
     // measure progress against.
-    registry::prepopulate(&mut tx, &job, &state.cfg.data_path).await?;
+    registry::initialize_job_state(&mut tx, &job, &state.cfg.data_path).await?;
 
     audit::log(
         &mut tx,

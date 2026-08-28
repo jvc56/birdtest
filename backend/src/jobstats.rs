@@ -71,7 +71,10 @@ pub struct GameStats {
 
 #[derive(Debug, Serialize)]
 pub struct OpeningRackStats {
+    /// Distinct racks with at least one accepted analysis.
     pub racks_analyzed: i64,
+    /// Size of the rack space; the denominator for progress.
+    pub racks_total: i64,
     pub average_best_equity: Option<f64>,
     pub best_move_types: Vec<MoveTypeCount>,
 }
@@ -341,13 +344,21 @@ fn build_game_stats(
 
 async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRackStats> {
     let row = sqlx::query(
-        "SELECT COUNT(*)::bigint AS analyzed, AVG(best_equity) AS avg_equity
+        "SELECT COUNT(DISTINCT r.rack)::bigint AS analyzed, AVG(r.best_equity) AS avg_equity
          FROM position_analysis_records r JOIN tasks t ON t.id = r.task_id
          WHERE t.job_id = $1",
     )
     .bind(job_id)
     .fetch_one(pool)
     .await?;
+
+    let racks_total = sqlx::query_scalar::<_, i64>(
+        "SELECT total_racks FROM job_opening_rack_config WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(0);
 
     // A play containing a '.' is a placement; anything else is an exchange or a
     // pass. That is the only distinction the dashboard draws.
@@ -368,6 +379,7 @@ async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRac
 
     Ok(OpeningRackStats {
         racks_analyzed: row.get("analyzed"),
+        racks_total,
         average_best_equity: row.get("avg_equity"),
         best_move_types: types
             .into_iter()
