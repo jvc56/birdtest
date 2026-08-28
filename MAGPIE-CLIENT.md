@@ -16,7 +16,7 @@ games, and submits results the server records and credits.
 | `src/ent/client_state` (`contribute.txt`) | Done |
 | `contribute` command and task loop | Done |
 | `games` / `game_pairs` executors | Done, verified end to end |
-| `opening_rack_analysis` executor | Written; not verified end to end (needs a job whose lexicon MAGPIE has, and a full English rack enumeration is millions of tasks) |
+| `opening_rack` executor | Written; not verified end to end (needs a job whose lexicon MAGPIE has, and a full English rack enumeration is millions of tasks) |
 | `leave_generation` executor | **Not implemented.** Needs artifact download and reading the rack-equity table out of `RackList`; currently reports that clearly and stops. |
 | Async GUI status surface (section 12) | Not implemented |
 | Windows WinHTTP backend | Written, not compiled or run on Windows |
@@ -580,7 +580,7 @@ client persists this and sends it as `X-Worker-UUID` from then on. `task_request
 is internally tagged by `job_type`, one of four shapes:
 
 ```json
-{ "job_type": "opening_rack_analysis",
+{ "job_type": "opening_rack",
   "lexicon": "NWL23", "variant": "classic",
   "rack": "AABCELT",
   "previous_play": null,

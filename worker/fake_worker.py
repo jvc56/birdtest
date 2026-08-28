@@ -115,7 +115,7 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
         }
         return {"all_games": all_games, "divergent_games": divergent_agg}
 
-    if job_type == "opening_rack_analysis":
+    if job_type == "opening_rack":
         rack = request["position"].split()[1].rstrip("/")
         count = rng.randint(2, 6)
         moves = []

@@ -9,7 +9,7 @@ use uuid::Uuid;
 pub struct OpeningRackHandler;
 
 impl JobHandler for OpeningRackHandler {
-    type Request = PositionRequest;
+    type Request = OpeningRackRequest;
     type Response = PositionAnalysisResponse;
     type Record = PositionAnalysisRecord;
 
@@ -18,7 +18,7 @@ impl JobHandler for OpeningRackHandler {
         let row = sqlx::query(
             "SELECT r.lexicon, r.variant, r.rack_start, r.rack_count, r.previous_play,
                     r.player_config_id, c.rack_size
-             FROM position_requests r
+             FROM opening_rack_requests r
              JOIN tasks t ON t.id = r.task_id
              JOIN job_opening_rack_config c ON c.job_id = t.job_id
              WHERE r.task_id = $1",
@@ -36,7 +36,7 @@ impl JobHandler for OpeningRackHandler {
         // The racks are not stored, only the range they came from -- which is
         // what makes a job over millions of racks cheap to create. Expanding
         // is a handful of additions per rack, not a walk over the space.
-        Ok(PositionRequest {
+        Ok(OpeningRackRequest {
             racks: RackRange {
                 lexicon: lexicon.clone(),
                 rack_size,
@@ -58,17 +58,16 @@ impl JobHandler for OpeningRackHandler {
 
         let mut racks = Vec::with_capacity(response.racks.len());
         for analysis in response.racks {
-            let best = analysis.moves.first().ok_or_else(|| {
-                AppError::bad_request(format!(
+            // The moves arrive ranked best-first, so an empty list means the
+            // worker analyzed nothing -- there is no best move to record.
+            if analysis.moves.is_empty() {
+                return Err(AppError::bad_request(format!(
                     "rack {} was analyzed with no moves",
                     analysis.rack
-                ))
-            })?;
+                )));
+            }
             racks.push(RackRecord {
                 rack: analysis.rack.clone(),
-                best_move: best.play.clone(),
-                best_score: best.score,
-                best_equity: best.equity,
                 num_moves: analysis.moves.len() as i32,
                 moves: analysis.moves,
             });
@@ -101,15 +100,12 @@ impl JobHandler for OpeningRackHandler {
 
         let mut records = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_records
-                 (task_claim_id, rack, task_id, best_move, best_score, best_equity, num_moves) ",
+                 (task_claim_id, rack, task_id, num_moves) ",
         );
         records.push_values(record.racks.iter(), |mut b, rack| {
             b.push_bind(claim_id)
                 .push_bind(rack.rack.clone())
                 .push_bind(task_id)
-                .push_bind(rack.best_move.clone())
-                .push_bind(rack.best_score)
-                .push_bind(rack.best_equity)
                 .push_bind(rack.num_moves);
         });
         records.build().execute(&mut *conn).await?;
@@ -195,7 +191,7 @@ pub async fn next_request(
     job_id: Uuid,
     config: &OpeningRackConfig,
     data_path: &Path,
-) -> AppResult<Option<(i64, PositionRequest)>> {
+) -> AppResult<Option<(i64, OpeningRackRequest)>> {
     let next_start = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(seed) FROM tasks WHERE job_id = $1",
     )
@@ -223,7 +219,7 @@ pub async fn next_request(
     let player = super::load_player_spec(conn, config.player_config_id).await?;
     Ok(Some((
         next_start,
-        PositionRequest {
+        OpeningRackRequest {
             lexicon: config.lexicon.clone(),
             variant: config.variant.clone(),
             racks,
@@ -243,7 +239,7 @@ pub async fn insert_range(
     count: usize,
 ) -> AppResult<()> {
     sqlx::query(
-        "INSERT INTO position_requests
+        "INSERT INTO opening_rack_requests
              (task_id, lexicon, variant, rack_start, rack_count, previous_play,
               player_config_id)
          VALUES ($1, $2, $3, $4, $5, NULL, $6)",

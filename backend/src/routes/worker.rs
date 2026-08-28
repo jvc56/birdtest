@@ -257,7 +257,7 @@ async fn finish_if_done(state: &AppState, job: &Job, stats: &jobstats::JobStats)
     let should_finish = match &stats.games {
         Some(games) => games.sprt.status.is_finished(),
         None => match job.job_type {
-            JobType::OpeningRackAnalysis => {
+            JobType::OpeningRack => {
                 // Tasks are generated on demand, so "all tasks complete" is not
                 // enough -- it is trivially true before anything is dispatched.
                 // The job is done once the rack space is exhausted as well.

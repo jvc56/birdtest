@@ -143,18 +143,22 @@ async fn job_results(
     let job = load_job(&state, id).await?;
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
-    if let (JobType::OpeningRackAnalysis, Some(rack)) = (job.job_type, query.rack.as_ref()) {
+    if let (JobType::OpeningRack, Some(rack)) = (job.job_type, query.rack.as_ref()) {
         return Ok(Json(rack_lookup(&state, id, rack).await?));
     }
 
     let items = match job.job_type {
-        JobType::OpeningRackAnalysis => {
+        JobType::OpeningRack => {
             let rows = sqlx::query(
-                "SELECT r.task_id, r.rack, r.best_move, r.best_score, r.best_equity,
-                        r.num_moves, r.submitted_at, u.username, c.claimed_by_anon_uuid
+                "SELECT r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
+                        m.equity AS best_equity, r.num_moves, r.submitted_at,
+                        u.username, c.claimed_by_anon_uuid
                  FROM position_analysis_records r
                  JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
+                 LEFT JOIN position_analysis_moves m
+                     ON m.task_claim_id = r.task_claim_id AND m.rack = r.rack
+                        AND m.rank = 1
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE t.job_id = $1
                    AND ($2::text IS NULL
@@ -174,9 +178,9 @@ async fn job_results(
                     serde_json::json!({
                         "task_id": r.get::<Uuid, _>("task_id"),
                         "rack": r.get::<String, _>("rack"),
-                        "best_move": r.get::<String, _>("best_move"),
-                        "best_score": r.get::<i32, _>("best_score"),
-                        "best_equity": r.get::<f64, _>("best_equity"),
+                        "best_move": r.get::<Option<String>, _>("best_move"),
+                        "best_score": r.get::<Option<i32>, _>("best_score"),
+                        "best_equity": r.get::<Option<f64>, _>("best_equity"),
                         "num_moves": r.get::<i32, _>("num_moves"),
                         "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
                         "username": r.get::<Option<String>, _>("username"),
@@ -337,7 +341,7 @@ async fn job_results_stream(
 
     let stream = async_stream::stream! {
         let query = match job.job_type {
-            JobType::OpeningRackAnalysis =>
+            JobType::OpeningRack =>
                 "SELECT to_jsonb(r) AS row FROM position_analysis_records r
                  JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
             JobType::Games | JobType::GamePairs =>

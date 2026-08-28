@@ -25,7 +25,7 @@ export function datetime(value: string | null): string {
 export function jobTypeLabel(type: string): string {
   return (
     {
-      opening_rack_analysis: 'Opening rack analysis',
+      opening_rack: 'Opening rack analysis',
       games: 'Games',
       game_pairs: 'Game pairs',
       leave_generation: 'Leave generation'

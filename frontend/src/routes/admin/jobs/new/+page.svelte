@@ -32,7 +32,7 @@
   let racksPerTask = 50;
   let maxLeaveSize = 6;
 
-  const types: JobType[] = ['opening_rack_analysis', 'games', 'game_pairs', 'leave_generation'];
+  const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
   onMount(async () => {
     configs = await api.playerConfigs();
@@ -57,7 +57,7 @@
       elo_high: eloHigh
     };
     switch (jobType) {
-      case 'opening_rack_analysis':
+      case 'opening_rack':
         return { ...common, lexicon, variant, player_config_id: playerConfigId };
       case 'games':
         return {
@@ -137,7 +137,7 @@
     </div>
   </div>
 
-  {#if jobType === 'opening_rack_analysis'}
+  {#if jobType === 'opening_rack'}
     <div>
       <label class="label" for="pc">Player config</label>
       <select id="pc" class="input" bind:value={playerConfigId}>

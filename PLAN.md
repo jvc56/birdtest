@@ -104,6 +104,19 @@ Contributors run a client program that loops continuously: it sends a **task cla
 
 ---
 
+#### Naming: the request is an opening rack, the result is a position analysis
+
+`opening_rack_requests` is named for what it asks for -- a set of opening racks
+-- while the result tables stay `position_analysis_*`, because what comes back
+from analyzing one is a position analysis. There is no general position-analysis
+job, so nothing else writes a request here.
+
+The record deliberately does **not** store the best move, its score or its
+equity. Those are the rank 1 row of `position_analysis_moves`, and a second copy
+is only something to keep consistent. `num_moves` stays, since the stored moves
+are truncated to `top_moves_stored` and cannot tell you how many were ranked. A
+partial index on rank 1 keeps the dashboard's aggregates cheap.
+
 #### How much of an analysis is kept
 
 A worker reports every move it ranked. The server keeps only the leading `top_moves_stored` per rack, which is **deliberately a different number from how many the worker generated or simulated** (the player config's `top_plays`): a simmer may need to rank hundreds of candidates to order the top few correctly, while storing hundreds of rows for each of millions of racks is not something the database should be asked to do. `position_analysis_records.num_moves` records how many were ranked, so the discarded tail is still visible as a count.
@@ -366,7 +379,7 @@ Some request types are shared across job types:
 
 | Type | Used by |
 |---|---|
-| `PositionRequest` | Opening rack analysis |
+| `OpeningRackRequest` | Opening rack |
 | `GameRequest` | Games, game pairs |
 | `LeaveRequest` | Leave generation |
 
@@ -412,7 +425,7 @@ At claim time (all in one transaction):
 1. Compute the next start: `SELECT COALESCE(MAX(seed) + $racks_per_batch, 0) FROM tasks WHERE job_id = $job_id`. If it has reached `total_racks`, the job has no work left.
 2. Unrank that range into racks.
 3. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $next_start, 'available')`.
-4. `INSERT INTO position_requests (task_id, lexicon, variant, rack_start, rack_count, player_config_id)` — the range, not the racks.
+4. `INSERT INTO opening_rack_requests (task_id, lexicon, variant, rack_start, rack_count, player_config_id)` — the range, not the racks.
 5. Return the expanded racks and a claim token.
 
 #### Games — On-demand
@@ -685,7 +698,7 @@ def _handle_leave_gen(request: dict, cfg: Config) -> dict:
     ...
 
 _HANDLERS = {
-    "opening_rack_analysis": _handle_opening_rack,
+    "opening_rack": _handle_opening_rack,
     "games":                 _handle_game,
     "game_pairs":            _handle_game_pair,
     "leave_generation":      _handle_leave_gen,
@@ -1119,7 +1132,7 @@ CREATE TABLE worker_bans (
 -- Jobs
 
 CREATE TYPE job_type AS ENUM (
-    'opening_rack_analysis',
+    'opening_rack',
     'games',
     'game_pairs',
     'leave_generation'
@@ -1302,7 +1315,7 @@ CREATE UNIQUE INDEX task_claims_anon_unique_idx
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
-CREATE TABLE position_requests (
+CREATE TABLE opening_rack_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,

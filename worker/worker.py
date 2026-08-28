@@ -499,7 +499,7 @@ def _download_artifact(cfg: Config, key: str, destination: Path) -> None:
 
 
 _HANDLERS = {
-    "opening_rack_analysis": _handle_opening_rack,
+    "opening_rack": _handle_opening_rack,
     "games":                 _handle_game,
     "game_pairs":            _handle_game_pair,
     "leave_generation":      _handle_leave_gen,

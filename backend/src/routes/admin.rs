@@ -326,7 +326,7 @@ async fn insert_job_config(
 
     match (job.job_type, config) {
         (
-            JobType::OpeningRackAnalysis,
+            JobType::OpeningRack,
             JobTypeConfig::OpeningRack {
                 lexicon, variant, player_config_id, racks_per_batch, rack_size,
                 top_moves_stored,

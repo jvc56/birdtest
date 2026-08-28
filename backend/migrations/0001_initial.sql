@@ -62,7 +62,7 @@ CREATE TABLE worker_bans (
 -- Jobs
 
 CREATE TYPE job_type AS ENUM (
-    'opening_rack_analysis',
+    'opening_rack',
     'games',
     'game_pairs',
     'leave_generation'
@@ -261,7 +261,12 @@ CREATE UNIQUE INDEX task_claims_anon_unique_idx
 -- One row per task, covering a contiguous range of the rack space. The racks
 -- themselves are not stored: they are unranked from `rack_start` on demand,
 -- which is what lets a job over millions of racks be created in constant time.
-CREATE TABLE position_requests (
+--
+-- Named for opening racks rather than positions: the request is specifically a
+-- set of opening racks, and there is no general position-analysis job. What
+-- comes back from analyzing one *is* a position analysis, which is why the
+-- record tables below keep that name.
+CREATE TABLE opening_rack_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
@@ -315,11 +320,13 @@ CREATE TABLE position_analysis_records (
     task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
     rack            TEXT NOT NULL,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    best_move       TEXT NOT NULL,
-    best_score      INT NOT NULL,
-    best_equity     DOUBLE PRECISION NOT NULL,
     -- How many moves the worker ranked, which is generally far more than the
-    -- top_moves_stored kept below.
+    -- top_moves_stored kept below. This is the one thing about the analysis
+    -- that the stored moves cannot tell you, since they are truncated.
+    --
+    -- The best move, its score and its equity are deliberately *not* stored
+    -- here: they are the rank 1 row in position_analysis_moves, and duplicating
+    -- them is a second copy to keep consistent for no gain.
     num_moves       INT NOT NULL,
     submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (task_claim_id, rack)
@@ -341,6 +348,12 @@ CREATE TABLE position_analysis_moves (
     equity          DOUBLE PRECISION NOT NULL
 );
 CREATE INDEX position_analysis_moves_task_idx ON position_analysis_moves (task_id, rack);
+-- The dashboard's aggregates are all over best moves, which are now read from
+-- here rather than duplicated onto the record. A partial index keeps that a
+-- scan of one row per rack rather than of every stored move.
+CREATE INDEX position_analysis_moves_best_idx
+    ON position_analysis_moves (task_id, rack) INCLUDE (move, score, equity)
+    WHERE rank = 1;
 
 -- Per-ply simulation stats for each candidate move. Only populated for simming
 -- player configs; a static player has no per-ply statistics to record.

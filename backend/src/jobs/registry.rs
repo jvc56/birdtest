@@ -36,7 +36,7 @@ pub async fn acquire(conn: &mut PgConnection, job: &Job,
     // Every job type generates its tasks at claim time; there is no
     // pre-populated strategy any more.
     match job.job_type {
-        JobType::OpeningRackAnalysis => generate_opening_rack(conn, job, data_path).await,
+        JobType::OpeningRack => generate_opening_rack(conn, job, data_path).await,
         JobType::Games => generate_games(conn, job).await,
         JobType::GamePairs => generate_game_pairs(conn, job).await,
         JobType::LeaveGeneration => generate_leave_gen(conn, job).await,
@@ -61,7 +61,7 @@ async fn generate_opening_rack(conn: &mut PgConnection, job: &Job,
 
     let task_id = insert_on_demand_task(conn, job.id, Some(start)).await?;
     opening_rack::insert_range(conn, task_id, &config, start, request.racks.len()).await?;
-    Ok(Acquired::Task { task_id, request: TaskRequest::OpeningRackAnalysis(request) })
+    Ok(Acquired::Task { task_id, request: TaskRequest::OpeningRack(request) })
 }
 
 /// Pre-populated jobs draw from the pool with `FOR UPDATE SKIP LOCKED`, which is
@@ -86,7 +86,7 @@ pub async fn load_request(
     data_path: &Path,
 ) -> AppResult<TaskRequest> {
     Ok(match job_type {
-        JobType::OpeningRackAnalysis => TaskRequest::OpeningRackAnalysis(
+        JobType::OpeningRack => TaskRequest::OpeningRack(
             opening_rack::OpeningRackHandler::load_request(conn, task_id, data_path).await?,
         ),
         JobType::Games => {
@@ -180,7 +180,7 @@ pub async fn store_result(
     }
 
     match job.job_type {
-        JobType::OpeningRackAnalysis => {
+        JobType::OpeningRack => {
             let record = opening_rack::OpeningRackHandler::process_response(decode(payload)?)?;
             opening_rack::OpeningRackHandler::insert_record(conn, task_id, claim_id, &record).await
         }
@@ -215,6 +215,6 @@ pub async fn initialize_job_state(conn: &mut PgConnection, job: &Job,
                     .await?;
             leave_gen::seed_generation(conn, job.id, 1, &config, data_path).await
         }
-        JobType::OpeningRackAnalysis | JobType::Games | JobType::GamePairs => Ok(0),
+        JobType::OpeningRack | JobType::Games | JobType::GamePairs => Ok(0),
     }
 }

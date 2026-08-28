@@ -59,7 +59,7 @@ const del = <T>(path: string) => request<T>('DELETE', path);
 
 // --- Shared shapes ---------------------------------------------------------
 
-export type JobType = 'opening_rack_analysis' | 'games' | 'game_pairs' | 'leave_generation';
+export type JobType = 'opening_rack' | 'games' | 'game_pairs' | 'leave_generation';
 export type JobStatus = 'active' | 'inactive' | 'completed';
 
 export interface Page<T> {

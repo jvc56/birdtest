@@ -156,7 +156,7 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
     };
 
     let opening_racks = match job.job_type {
-        JobType::OpeningRackAnalysis => Some(opening_rack_stats(pool, job.id).await?),
+        JobType::OpeningRack => Some(opening_rack_stats(pool, job.id).await?),
         _ => None,
     };
 
@@ -217,7 +217,7 @@ async fn lexicon_and_variant(
     job: &Job,
 ) -> AppResult<(Option<String>, Option<String>)> {
     let table = match job.job_type {
-        JobType::OpeningRackAnalysis => "job_opening_rack_config",
+        JobType::OpeningRack => "job_opening_rack_config",
         JobType::Games => "job_game_config",
         JobType::GamePairs => "job_game_pair_config",
         JobType::LeaveGeneration => "job_leave_config",
@@ -343,9 +343,15 @@ fn build_game_stats(
 }
 
 async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRackStats> {
+    // Best move, score and equity are not duplicated onto the record: they are
+    // the rank 1 row in position_analysis_moves, which a partial index makes
+    // cheap to reach.
     let row = sqlx::query(
-        "SELECT COUNT(DISTINCT r.rack)::bigint AS analyzed, AVG(r.best_equity) AS avg_equity
-         FROM position_analysis_records r JOIN tasks t ON t.id = r.task_id
+        "SELECT COUNT(DISTINCT r.rack)::bigint AS analyzed, AVG(m.equity) AS avg_equity
+         FROM position_analysis_records r
+         JOIN tasks t ON t.id = r.task_id
+         LEFT JOIN position_analysis_moves m
+             ON m.task_claim_id = r.task_claim_id AND m.rack = r.rack AND m.rank = 1
          WHERE t.job_id = $1",
     )
     .bind(job_id)
@@ -360,17 +366,19 @@ async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRac
     .await?
     .unwrap_or(0);
 
-    // A play containing a '.' is a placement; anything else is an exchange or a
-    // pass. That is the only distinction the dashboard draws.
+    // MAGPIE renders a pass as "(Pass)" and an exchange as "(exch ABC)";
+    // anything else is a placement like "8G WUZ". Matching on a leading "ex"
+    // silently classified every exchange as a placement.
     let types = sqlx::query(
         "SELECT CASE
-                    WHEN r.best_move ILIKE 'ex%' THEN 'exchange'
-                    WHEN r.best_move ILIKE 'pass%' THEN 'pass'
+                    WHEN m.move ILIKE '(exch%' THEN 'exchange'
+                    WHEN m.move ILIKE '(pass%' THEN 'pass'
                     ELSE 'placement'
                 END AS move_type,
                 COUNT(*)::bigint AS count
-         FROM position_analysis_records r JOIN tasks t ON t.id = r.task_id
-         WHERE t.job_id = $1
+         FROM position_analysis_moves m
+         JOIN tasks t ON t.id = m.task_id
+         WHERE t.job_id = $1 AND m.rank = 1
          GROUP BY 1 ORDER BY 2 DESC",
     )
     .bind(job_id)

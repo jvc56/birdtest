@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[sqlx(type_name = "job_type", rename_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
 pub enum JobType {
-    OpeningRackAnalysis,
+    OpeningRack,
     Games,
     GamePairs,
     LeaveGeneration,

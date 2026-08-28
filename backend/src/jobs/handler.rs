@@ -79,7 +79,7 @@ impl From<PlayerConfig> for PlayerSpec {
 // --- Requests --------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PositionRequest {
+pub struct OpeningRackRequest {
     pub lexicon: String,
     pub variant: String,
     /// A batch of racks. An opening rack is by definition the start of the
@@ -145,7 +145,7 @@ pub struct LeaveRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "job_type", rename_all = "snake_case")]
 pub enum TaskRequest {
-    OpeningRackAnalysis(PositionRequest),
+    OpeningRack(OpeningRackRequest),
     Games(GameRequest),
     GamePairs(GameRequest),
     LeaveGeneration(LeaveRequest),
@@ -247,13 +247,12 @@ pub struct LeaveResponse {
 #[derive(Debug, Clone)]
 pub struct RackRecord {
     pub rack: String,
-    pub best_move: String,
-    pub best_score: i32,
-    pub best_equity: f64,
     /// How many moves the worker ranked, which is generally far more than the
-    /// number kept in `moves`.
+    /// number kept in `moves`. The only part of the analysis the stored moves
+    /// cannot recover, since they are truncated.
     pub num_moves: i32,
-    /// Truncated to the job's `top_moves_stored`.
+    /// Truncated to the job's `top_moves_stored`. The best move is simply the
+    /// first of these, so it is not carried separately.
     pub moves: Vec<MoveEntry>,
 }
 
