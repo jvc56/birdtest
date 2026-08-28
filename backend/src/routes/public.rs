@@ -157,8 +157,7 @@ async fn job_results(
                  JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN position_analysis_moves m
-                     ON m.task_claim_id = r.task_claim_id AND m.rack = r.rack
-                        AND m.rank = 1
+                     ON m.record_id = r.id AND m.rank = 1
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE t.job_id = $1
                    AND ($2::text IS NULL
@@ -284,8 +283,9 @@ async fn rack_lookup(
     let rows = sqlx::query(
         "SELECT m.rank, m.move, m.score, m.equity
          FROM position_analysis_moves m
-         JOIN tasks t ON t.id = m.task_id
-         WHERE t.job_id = $1 AND m.rack = $2
+         JOIN position_analysis_records r ON r.id = m.record_id
+         JOIN tasks t ON t.id = r.task_id
+         WHERE t.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
          ORDER BY m.rank ASC",
     )
     .bind(job_id)

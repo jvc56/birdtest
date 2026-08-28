@@ -124,6 +124,12 @@ pub struct GameRequest {
     pub num_games: i32,
     /// True for `game_pairs`: MAGPIE runs both orderings from the same seed.
     pub game_pairs: bool,
+    /// Whether to keep the position analyses produced while playing. The worker
+    /// analyses a position every turn regardless; this decides whether it
+    /// reports them.
+    pub capture_positions: bool,
+    /// Ranked moves to report per captured position.
+    pub capture_top_moves: i32,
     pub player1: PlayerSpec,
     pub player2: PlayerSpec,
 }
@@ -216,6 +222,20 @@ impl GameAggregate {
 }
 
 /// Shared by games and game pairs.
+/// One position analysed during a game, when capture is on.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CapturedPosition {
+    /// Which game of the batch, and which turn of it.
+    pub game_index: i16,
+    pub turn_number: i16,
+    pub rack: String,
+    /// CGP of the position as it stood before the move was played.
+    pub position: String,
+    /// How many moves were ranked, before truncation to `capture_top_moves`.
+    pub num_moves: i32,
+    pub moves: Vec<MoveEntry>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GameResultsResponse {
     /// Every game the task played. For game pairs that is two per pair.
@@ -226,6 +246,10 @@ pub struct GameResultsResponse {
     /// divergent subset is where a pairs job's signal lives.
     #[serde(default)]
     pub divergent_games: Option<GameAggregate>,
+    /// Empty unless the job asked for capture, which keeps every existing
+    /// client valid.
+    #[serde(default)]
+    pub positions: Vec<CapturedPosition>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -245,26 +269,47 @@ pub struct LeaveResponse {
 // --- Records ---------------------------------------------------------------
 
 #[derive(Debug, Clone)]
-pub struct RackRecord {
+pub struct PositionAnalysis {
     pub rack: String,
+    /// CGP of the position. `None` for an opening rack, where the board is
+    /// empty by definition.
+    pub position: Option<String>,
+    /// In-game positions only: which game of the batch, and which turn of it.
+    pub game_index: Option<i16>,
+    pub turn_number: Option<i16>,
     /// How many moves the worker ranked, which is generally far more than the
     /// number kept in `moves`. The only part of the analysis the stored moves
     /// cannot recover, since they are truncated.
     pub num_moves: i32,
-    /// Truncated to the job's `top_moves_stored`. The best move is simply the
+    /// Truncated by the caller to the job's cap. The best move is simply the
     /// first of these, so it is not carried separately.
     pub moves: Vec<MoveEntry>,
 }
 
+impl PositionAnalysis {
+    /// An opening rack: no board, no game, no turn.
+    pub fn opening_rack(rack: String, moves: Vec<MoveEntry>) -> Self {
+        Self {
+            rack,
+            position: None,
+            game_index: None,
+            turn_number: None,
+            num_moves: moves.len() as i32,
+            moves,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PositionAnalysisRecord {
-    pub racks: Vec<RackRecord>,
+    pub positions: Vec<PositionAnalysis>,
 }
 
 #[derive(Debug, Clone)]
 pub struct GameResultsRecord {
     pub all_games: GameAggregate,
     pub divergent_games: Option<GameAggregate>,
+    pub positions: Vec<PositionAnalysis>,
 }
 
 #[derive(Debug, Clone)]

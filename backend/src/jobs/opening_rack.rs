@@ -66,13 +66,12 @@ impl JobHandler for OpeningRackHandler {
                     analysis.rack
                 )));
             }
-            racks.push(RackRecord {
-                rack: analysis.rack.clone(),
-                num_moves: analysis.moves.len() as i32,
-                moves: analysis.moves,
-            });
+            racks.push(PositionAnalysis::opening_rack(
+                analysis.rack.clone(),
+                analysis.moves,
+            ));
         }
-        Ok(PositionAnalysisRecord { racks })
+        Ok(PositionAnalysisRecord { positions: racks })
     }
 
     async fn insert_record(
@@ -98,41 +97,35 @@ impl JobHandler for OpeningRackHandler {
         let top_moves_stored: i32 = row.get("top_moves_stored");
         let simming: bool = row.get("simming");
 
-        let mut records = sqlx::QueryBuilder::new(
-            "INSERT INTO position_analysis_records
-                 (task_claim_id, rack, task_id, num_moves) ",
-        );
-        records.push_values(record.racks.iter(), |mut b, rack| {
-            b.push_bind(claim_id)
-                .push_bind(rack.rack.clone())
-                .push_bind(task_id)
-                .push_bind(rack.num_moves);
-        });
-        records.build().execute(&mut *conn).await?;
+        // An opening rack is unique per (claim, rack), so a conflict here would
+        // be a duplicate within one submission rather than a redundant claim.
+        super::insert_position_analyses(conn, task_id, claim_id, &record.positions,
+                                        top_moves_stored, false)
+            .await?;
 
-        for rack in &record.racks {
-            let kept = rack.moves.iter().take(top_moves_stored as usize);
-            for (index, entry) in kept.enumerate() {
+        // A static player produces no per-ply statistics, so only a simming
+        // config stores them.
+        if !simming {
+            return Ok(());
+        }
+        for position in &record.positions {
+            for (index, entry) in
+                position.moves.iter().take(top_moves_stored as usize).enumerate()
+            {
+                if entry.plies.is_empty() {
+                    continue;
+                }
                 let move_id = sqlx::query_scalar::<_, i64>(
-                    "INSERT INTO position_analysis_moves
-                         (task_claim_id, rack, task_id, rank, move, score, equity)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+                    "SELECT m.id FROM position_analysis_moves m
+                     JOIN position_analysis_records r ON r.id = m.record_id
+                     WHERE r.task_claim_id = $1 AND r.rack = $2 AND m.rank = $3",
                 )
                 .bind(claim_id)
-                .bind(&rack.rack)
-                .bind(task_id)
+                .bind(&position.rack)
                 .bind((index + 1) as i16)
-                .bind(&entry.play)
-                .bind(entry.score)
-                .bind(entry.equity)
                 .fetch_one(&mut *conn)
                 .await?;
 
-                // A static player has no per-ply statistics; only a simming
-                // config produces them, so only a simming config stores them.
-                if !simming {
-                    continue;
-                }
                 for ply in &entry.plies {
                     sqlx::query(
                         "INSERT INTO position_analysis_plies

@@ -44,9 +44,12 @@ impl JobHandler for GamePairHandler {
             ));
         }
 
+        let positions =
+            super::game::validate_positions(response.positions, response.all_games.games)?;
         Ok(GameResultsRecord {
             all_games: response.all_games,
             divergent_games: Some(divergent),
+            positions,
         })
     }
 
@@ -86,6 +89,8 @@ pub async fn next_request(
             seed: next_seed as u64,
             num_games: config.pairs_per_batch,
             game_pairs: true,
+            capture_positions: config.capture_positions,
+            capture_top_moves: config.capture_top_moves,
             player1,
             player2,
         },

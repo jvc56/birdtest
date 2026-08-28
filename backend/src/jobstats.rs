@@ -350,8 +350,7 @@ async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRac
         "SELECT COUNT(DISTINCT r.rack)::bigint AS analyzed, AVG(m.equity) AS avg_equity
          FROM position_analysis_records r
          JOIN tasks t ON t.id = r.task_id
-         LEFT JOIN position_analysis_moves m
-             ON m.task_claim_id = r.task_claim_id AND m.rack = r.rack AND m.rank = 1
+         LEFT JOIN position_analysis_moves m ON m.record_id = r.id AND m.rank = 1
          WHERE t.job_id = $1",
     )
     .bind(job_id)

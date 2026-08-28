@@ -1,7 +1,29 @@
 # Capturing Position Analyses From Games
 
-**Status: proposed, not implemented.** Nothing in the code stores in-game
-position analyses today; `game_results` holds only the per-batch aggregate.
+**Status: implemented.** Verified end to end: MAGPIE captured 98 positions
+across 4 real games, with the CGP evolving turn by turn, and the redundancy
+deduplication held under `redundancy = 2`.
+
+The asymmetry this plan is built around is directly visible in the stored data.
+A `games` job pairing a simming player against a static one, `capture_top_moves`
+of 6:
+
+| Turn | Player | Ranked | Stored |
+|---|---|---|---|
+| 0 | simming | 6 | 6 |
+| 1 | static | 1 | 1 |
+| 2 | simming | 6 | 6 |
+| 3 | static | 1 | 1 |
+
+Players alternate, and so does what is capturable. Capturing a real ranked list
+from a static player still needs the `MOVE_RECORD_BEST` override relaxed
+(phase 5, not done).
+
+**One semantic worth knowing:** for a simming player the `rank` is the
+simulation's ordering while the stored `equity` is the *static* equity, so the
+two disagree -- a captured position can show rank 1 at equity 1.11 and rank 6 at
+14.89. That is correct but easy to misread; exposing the simulated evaluation
+would need `SimResults` access from the recorder.
 
 ## The idea
 

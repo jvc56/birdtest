@@ -163,7 +163,16 @@ CREATE TABLE job_game_config (
     sprt_alpha          DOUBLE PRECISION NOT NULL DEFAULT 0.05,
     sprt_beta           DOUBLE PRECISION NOT NULL DEFAULT 0.05,
     elo_low             DOUBLE PRECISION NOT NULL DEFAULT -10.0,
-    elo_high            DOUBLE PRECISION NOT NULL DEFAULT 10.0
+    elo_high            DOUBLE PRECISION NOT NULL DEFAULT 10.0,
+    -- Keep the position analyses the worker produces while playing. A worker
+    -- analyses a position every turn regardless; this decides whether those are
+    -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
+    -- rows a job produces.
+    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Ranked moves kept per captured position. As with top_moves_stored, this
+    -- is not how many the player generated -- for a simming player the ceiling
+    -- is its top_plays.
+    capture_top_moves   INT NOT NULL DEFAULT 10 CHECK (capture_top_moves >= 1)
 );
 
 CREATE TABLE job_game_pair_config (
@@ -178,7 +187,16 @@ CREATE TABLE job_game_pair_config (
     sprt_alpha          DOUBLE PRECISION NOT NULL DEFAULT 0.05,
     sprt_beta           DOUBLE PRECISION NOT NULL DEFAULT 0.05,
     elo_low             DOUBLE PRECISION NOT NULL DEFAULT -10.0,
-    elo_high            DOUBLE PRECISION NOT NULL DEFAULT 10.0
+    elo_high            DOUBLE PRECISION NOT NULL DEFAULT 10.0,
+    -- Keep the position analyses the worker produces while playing. A worker
+    -- analyses a position every turn regardless; this decides whether those are
+    -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
+    -- rows a job produces.
+    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Ranked moves kept per captured position. As with top_moves_stored, this
+    -- is not how many the player generated -- for a simming player the ceiling
+    -- is its top_plays.
+    capture_top_moves   INT NOT NULL DEFAULT 10 CHECK (capture_top_moves >= 1)
 );
 
 CREATE TABLE job_leave_config (
@@ -282,6 +300,10 @@ CREATE TABLE game_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
+    -- Denormalized from the job config, like everything else here, so the
+    -- request a re-dispatched task replays is exactly the one it was given.
+    capture_positions BOOLEAN NOT NULL DEFAULT FALSE,
+    capture_top_moves INT NOT NULL DEFAULT 10,
     -- seed is also stored on the tasks row; duplicated here for convenience when reading the full request.
     seed              BIGINT NOT NULL,
     num_games         INT NOT NULL DEFAULT 1,
@@ -315,44 +337,84 @@ CREATE TABLE leave_rack_progress (
 -- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
 -- task_id is denormalized here for efficient job-results queries without joining through task_claims.
 
--- One row per rack per accepted claim: a task now covers a batch of racks.
+-- One analysed position per row, whatever produced it.
+--
+-- Opening rack jobs write one per rack. Games and game-pairs jobs write one per
+-- turn when `capture_positions` is on: a worker analyses a position on every
+-- turn anyway, and keeping those makes a job a corpus of analysed positions as
+-- well as an Elo measurement.
+--
+-- The request that produced these is job-type-specific -- opening_rack_requests
+-- or game_requests -- but what comes back is a position analysis either way,
+-- which is why both share this table.
 CREATE TABLE position_analysis_records (
+    -- Surrogate, because the natural key differs by source: an opening rack is
+    -- unique per (claim, rack), while an in-game position recurs at the same
+    -- rack across turns and games.
+    id              BIGSERIAL PRIMARY KEY,
     task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
-    rack            TEXT NOT NULL,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    rack            TEXT NOT NULL,
+    -- CGP of the position analysed. NULL for an opening rack, where the board
+    -- is empty by definition and the rack is the whole position.
+    position        TEXT,
+    -- In-game positions only: which game of the batch, and which turn of it.
+    game_index      SMALLINT,
+    turn_number     SMALLINT,
     -- How many moves the worker ranked, which is generally far more than the
-    -- top_moves_stored kept below. This is the one thing about the analysis
-    -- that the stored moves cannot tell you, since they are truncated.
+    -- stored moves. The one thing about the analysis those cannot tell you,
+    -- since they are truncated.
     --
     -- The best move, its score and its equity are deliberately *not* stored
     -- here: they are the rank 1 row in position_analysis_moves, and duplicating
     -- them is a second copy to keep consistent for no gain.
     num_moves       INT NOT NULL,
     submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (task_claim_id, rack)
+    CONSTRAINT position_analysis_in_game_together CHECK (
+        (game_index IS NULL AND turn_number IS NULL)
+        OR (game_index IS NOT NULL AND turn_number IS NOT NULL)
+    )
 );
-CREATE INDEX position_analysis_records_rack_idx ON position_analysis_records (task_id, rack);
 
--- The top `top_moves_stored` moves per rack. Storing every move the worker
--- ranked would be untenable: a job over the full English 7-tile space is
--- roughly 3.2 million racks, and an opening rack generates far more than a
--- handful of legal placements.
+-- Games are seeded and deterministic, so redundant claims replay identical
+-- games and would capture identical positions. Keying on the task rather than
+-- the claim makes the first accepted claim the one that lands and the rest
+-- no-ops, so redundancy still verifies the *result* without multiplying the
+-- corpus.
+CREATE UNIQUE INDEX position_analysis_records_in_game_idx
+    ON position_analysis_records (task_id, game_index, turn_number)
+    WHERE game_index IS NOT NULL;
+
+-- Opening racks keep their natural key: one analysis per rack per claim, so
+-- redundant claims each record their own and can be compared.
+CREATE UNIQUE INDEX position_analysis_records_rack_idx
+    ON position_analysis_records (task_claim_id, rack)
+    WHERE game_index IS NULL;
+
+CREATE INDEX position_analysis_records_task_idx
+    ON position_analysis_records (task_id, rack);
+
+-- The top `top_moves_stored` (opening racks) or `capture_top_moves` (games)
+-- moves per position. Storing every move the worker ranked would be untenable:
+-- a job over the full English 7-tile space is roughly 3.2 million racks, and a
+-- 40,000-pair job with capture on is 1.8 million positions.
 CREATE TABLE position_analysis_moves (
     id              BIGSERIAL PRIMARY KEY,
-    task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
-    rack            TEXT NOT NULL,
+    record_id       BIGINT NOT NULL REFERENCES position_analysis_records(id) ON DELETE CASCADE,
+    -- Denormalized so job-wide aggregates need not join through the record.
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
     score           INT NOT NULL,
     equity          DOUBLE PRECISION NOT NULL
 );
-CREATE INDEX position_analysis_moves_task_idx ON position_analysis_moves (task_id, rack);
--- The dashboard's aggregates are all over best moves, which are now read from
--- here rather than duplicated onto the record. A partial index keeps that a
--- scan of one row per rack rather than of every stored move.
+CREATE INDEX position_analysis_moves_record_idx
+    ON position_analysis_moves (record_id, rank);
+-- The dashboard's aggregates are all over best moves, which are read from here
+-- rather than duplicated onto the record. A partial index keeps that a scan of
+-- one row per position rather than of every stored move.
 CREATE INDEX position_analysis_moves_best_idx
-    ON position_analysis_moves (task_id, rack) INCLUDE (move, score, equity)
+    ON position_analysis_moves (task_id) INCLUDE (move, equity)
     WHERE rank = 1;
 
 -- Per-ply simulation stats for each candidate move. Only populated for simming

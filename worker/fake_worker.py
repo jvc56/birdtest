@@ -90,11 +90,46 @@ def _aggregate(rng: random.Random, games: int, p1_win_probability: float) -> dic
     }
 
 
+def _add_captured_positions(result: dict, request: dict, rng: random.Random,
+                            games: int) -> None:
+    """Synthesize the per-turn analyses a real worker would capture.
+
+    Only when the job asked for them, so the default path stays the shape every
+    existing client produces.
+    """
+    if not request.get("capture_positions"):
+        return
+    top_moves = request.get("capture_top_moves", 10)
+    positions = []
+    for game_index in range(games):
+        # Real games run about 22 turns; varying it exercises the turn bound.
+        for turn in range(rng.randint(18, 26)):
+            ranked = rng.randint(top_moves, 400)
+            positions.append({
+                "game_index": game_index,
+                "turn_number": turn,
+                "rack": "".join(rng.choice("AEINRSTLOU") for _ in range(7)),
+                "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
+                "num_moves": ranked,
+                "moves": [
+                    {
+                        "move": f"8{chr(ord('D') + i % 8)} WORD{i}",
+                        "score": rng.randint(10, 90),
+                        "equity": round(rng.uniform(-5, 60), 3),
+                    }
+                    for i in range(top_moves)
+                ],
+            })
+    result["positions"] = positions
+
+
 def _result_for(request: dict, rng: random.Random, p1_win_probability: float) -> dict:
     job_type = request["job_type"]
 
     if job_type == "games":
-        return {"all_games": _aggregate(rng, request["num_games"], p1_win_probability)}
+        result = {"all_games": _aggregate(rng, request["num_games"], p1_win_probability)}
+        _add_captured_positions(result, request, rng, request["num_games"])
+        return result
 
     if job_type == "game_pairs":
         # Two games per pair. Pairs whose games played identically are
@@ -113,7 +148,9 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
             "wins": divergent_agg["wins"] + identical_pairs,
             "losses": divergent_agg["losses"] + identical_pairs,
         }
-        return {"all_games": all_games, "divergent_games": divergent_agg}
+        result = {"all_games": all_games, "divergent_games": divergent_agg}
+        _add_captured_positions(result, request, rng, games)
+        return result
 
     if job_type == "opening_rack":
         rack = request["position"].split()[1].rstrip("/")

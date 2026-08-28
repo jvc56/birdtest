@@ -79,6 +79,11 @@ pub struct GameConfig {
     pub sprt_beta: f64,
     pub elo_low: f64,
     pub elo_high: f64,
+    /// Keep the position analyses produced while playing. Off by default: at
+    /// ~22.5 turns a game it roughly doubles the rows a job produces.
+    pub capture_positions: bool,
+    /// Ranked moves kept per captured position.
+    pub capture_top_moves: i32
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -95,6 +100,11 @@ pub struct GamePairConfig {
     pub sprt_beta: f64,
     pub elo_low: f64,
     pub elo_high: f64,
+    /// Keep the position analyses produced while playing. Off by default: at
+    /// ~22.5 turns a game it roughly doubles the rows a job produces.
+    pub capture_positions: bool,
+    /// Ranked moves kept per captured position.
+    pub capture_top_moves: i32
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

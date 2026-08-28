@@ -104,6 +104,36 @@ Contributors run a client program that loops continuously: it sends a **task cla
 
 ---
 
+#### Position analyses from games
+
+`games` and `game_pairs` jobs can keep the position analyses their workers
+produce while playing, by setting `capture_positions`. A worker analyses a
+position on every turn regardless; this decides whether those are recorded
+rather than discarded, turning a job run to settle an Elo question into a corpus
+of analysed positions as well.
+
+They share `position_analysis_records` with opening racks -- the request differs
+by job type, but what comes back is a position analysis either way. In-game rows
+carry the CGP, the game index and the turn number, which are NULL for an opening
+rack.
+
+Two things this design turns on, both consequences of games being deterministic:
+
+- **Redundant claims replay identical games**, so in-game positions are keyed on
+  `(task_id, game_index, turn_number)` rather than on the claim, with
+  `ON CONFLICT DO NOTHING`. The first accepted claim records them and the rest
+  are no-ops, so redundancy still verifies the *result* without multiplying the
+  corpus. Opening racks keep their per-claim key, so redundant analyses of the
+  same rack can still be compared.
+- **There is no sampling and no per-task cap.** Every position of every game is
+  captured, which makes `games_per_batch` the control on submission size: a
+  batch of 20 games is a few hundred KB, a batch of 1,000 is on the order of
+  15 MB.
+
+Capture roughly doubles the rows a job produces -- at ~22.5 turns a game, a
+40,000-pair job is 1.8 million positions -- so it is off by default. See
+[GAME-POSITION-CAPTURE.md](GAME-POSITION-CAPTURE.md).
+
 #### Naming: the request is an opening rack, the result is a position analysis
 
 `opening_rack_requests` is named for what it asks for -- a set of opening racks

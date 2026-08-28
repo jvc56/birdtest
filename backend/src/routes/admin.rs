@@ -206,6 +206,10 @@ enum JobTypeConfig {
         elo_low: f64,
         #[serde(default = "default_elo_high")]
         elo_high: f64,
+        #[serde(default)]
+        capture_positions: bool,
+        #[serde(default = "default_capture_top_moves")]
+        capture_top_moves: i32,
     },
     GamePair {
         lexicon: String,
@@ -224,6 +228,10 @@ enum JobTypeConfig {
         elo_low: f64,
         #[serde(default = "default_elo_high")]
         elo_high: f64,
+        #[serde(default)]
+        capture_positions: bool,
+        #[serde(default = "default_capture_top_moves")]
+        capture_top_moves: i32,
     },
     Leave {
         lexicon: String,
@@ -249,6 +257,10 @@ fn default_elo_high() -> f64 {
 }
 fn default_max_leave_size() -> i32 {
     6
+}
+/// Ranked moves kept per captured in-game position.
+fn default_capture_top_moves() -> i32 {
+    10
 }
 fn default_racks_per_batch() -> i32 {
     500
@@ -360,19 +372,21 @@ async fn insert_job_config(
             JobTypeConfig::Game {
                 lexicon, variant, player1_config_id, player2_config_id, games_per_batch,
                 min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
+                capture_positions, capture_top_moves,
             },
         ) => {
             sqlx::query(
                 "INSERT INTO job_game_config
                      (job_id, lexicon, variant, player1_config_id, player2_config_id,
                       games_per_batch, min_games, max_games, sprt_alpha, sprt_beta,
-                      elo_low, elo_high)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                      elo_low, elo_high, capture_positions, capture_top_moves)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
             )
             .bind(job.id).bind(lexicon).bind(variant)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(games_per_batch).bind(min_games).bind(max_games)
             .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
+            .bind(capture_positions).bind(capture_top_moves)
             .execute(conn)
             .await?;
         }
@@ -381,19 +395,21 @@ async fn insert_job_config(
             JobTypeConfig::GamePair {
                 lexicon, variant, player1_config_id, player2_config_id, pairs_per_batch,
                 min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
+                capture_positions, capture_top_moves,
             },
         ) => {
             sqlx::query(
                 "INSERT INTO job_game_pair_config
                      (job_id, lexicon, variant, player1_config_id, player2_config_id,
                       pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta,
-                      elo_low, elo_high)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                      elo_low, elo_high, capture_positions, capture_top_moves)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
             )
             .bind(job.id).bind(lexicon).bind(variant)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(pairs_per_batch).bind(min_pairs).bind(max_pairs)
             .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
+            .bind(capture_positions).bind(capture_top_moves)
             .execute(conn)
             .await?;
         }
