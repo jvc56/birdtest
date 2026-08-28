@@ -168,7 +168,9 @@ export interface PlayerConfig {
   leaves: string | null;
   max_iterations: number | null;
   plies: number | null;
-  top_plays: number | null;
+  num_plies_recorded: number | null;
+  num_plays: number | null;
+  num_plays_recorded: number | null;
   stopping_pct: number | null;
   use_inference: boolean | null;
   time_limit_secs: number | null;

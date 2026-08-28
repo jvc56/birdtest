@@ -53,7 +53,9 @@ pub struct PlayerSpec {
     pub leaves: Option<String>,
     pub max_iterations: Option<i32>,
     pub plies: Option<i32>,
-    pub top_plays: Option<i32>,
+    pub num_plies_recorded: Option<i32>,
+    pub num_plays: Option<i32>,
+    pub num_plays_recorded: Option<i32>,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<f64>,
@@ -68,7 +70,9 @@ impl From<PlayerConfig> for PlayerSpec {
             leaves: c.leaves,
             max_iterations: c.max_iterations,
             plies: c.plies,
-            top_plays: c.top_plays,
+            num_plies_recorded: c.num_plies_recorded,
+            num_plays: c.num_plays,
+            num_plays_recorded: c.num_plays_recorded,
             stopping_pct: c.stopping_pct,
             use_inference: c.use_inference,
             time_limit_secs: c.time_limit_secs,
@@ -82,6 +86,8 @@ impl From<PlayerConfig> for PlayerSpec {
 pub struct OpeningRackRequest {
     pub lexicon: String,
     pub variant: String,
+    /// Stated by the job rather than inferred from the lexicon name.
+    pub letter_distribution: String,
     /// A batch of racks. An opening rack is by definition the start of the
     /// game, so only the letters cross the wire -- MAGPIE assumes the empty
     /// starting board.
@@ -118,6 +124,8 @@ mod seed_as_string {
 pub struct GameRequest {
     pub lexicon: String,
     pub variant: String,
+    /// Stated by the job rather than inferred from the lexicon name.
+    pub letter_distribution: String,
     /// uint64 at the application layer; stored as a signed BIGINT.
     #[serde(with = "seed_as_string")]
     pub seed: u64,
@@ -126,10 +134,9 @@ pub struct GameRequest {
     pub game_pairs: bool,
     /// Whether to keep the position analyses produced while playing. The worker
     /// analyses a position every turn regardless; this decides whether it
-    /// reports them.
+    /// reports them. How many ranked moves come back per position is the
+    /// player config's `num_plays_recorded`.
     pub capture_positions: bool,
-    /// Ranked moves to report per captured position.
-    pub capture_top_moves: i32,
     pub player1: PlayerSpec,
     pub player2: PlayerSpec,
 }
@@ -138,6 +145,8 @@ pub struct GameRequest {
 pub struct LeaveRequest {
     pub lexicon: String,
     pub variant: String,
+    /// Stated by the job rather than inferred from the lexicon name.
+    pub letter_distribution: String,
     pub generation: i32,
     pub forced_racks: Vec<String>,
     /// Combined KLV from the previous generation; NULL for generation 1, where
@@ -172,6 +181,10 @@ pub struct MoveEntry {
     pub play: String,
     pub score: i32,
     pub equity: f64,
+    /// The simulated win percentage. Absent for a static player, which ranks on
+    /// equity alone and simulates nothing.
+    #[serde(default)]
+    pub win_percentage: Option<f64>,
     #[serde(default)]
     pub plies: Vec<PlyStats>,
 }
@@ -180,7 +193,7 @@ pub struct MoveEntry {
 pub struct RackAnalysis {
     pub rack: String,
     /// Ranked best-first as MAGPIE emitted them. The server keeps only the
-    /// leading `top_moves_stored`.
+    /// leading `num_plays_recorded`.
     pub moves: Vec<MoveEntry>,
 }
 
@@ -231,7 +244,7 @@ pub struct CapturedPosition {
     pub rack: String,
     /// CGP of the position as it stood before the move was played.
     pub position: String,
-    /// How many moves were ranked, before truncation to `capture_top_moves`.
+    /// How many moves were ranked, before truncation to `num_plays_recorded`.
     pub num_moves: i32,
     pub moves: Vec<MoveEntry>,
 }

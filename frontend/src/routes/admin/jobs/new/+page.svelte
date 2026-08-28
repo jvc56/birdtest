@@ -14,6 +14,7 @@
   let minMagpieVersion = '';
   let lexicon = 'NWL23';
   let variant = 'classic';
+  let letterDistribution = 'english';
 
   // Per-type fields. Only the ones the selected type uses are submitted.
   let playerConfigId = '';
@@ -58,22 +59,22 @@
     };
     switch (jobType) {
       case 'opening_rack':
-        return { ...common, lexicon, variant, player_config_id: playerConfigId };
+        return { ...common, lexicon, variant, letter_distribution: letterDistribution, player_config_id: playerConfigId };
       case 'games':
         return {
-          ...common, lexicon, variant,
+          ...common, lexicon, variant, letter_distribution: letterDistribution,
           player1_config_id: player1, player2_config_id: player2,
           games_per_batch: batchSize, min_games: minUnits, max_games: maxUnits, ...sprt
         };
       case 'game_pairs':
         return {
-          ...common, lexicon, variant,
+          ...common, lexicon, variant, letter_distribution: letterDistribution,
           player1_config_id: player1, player2_config_id: player2,
           pairs_per_batch: batchSize, min_pairs: minUnits, max_pairs: maxUnits, ...sprt
         };
       case 'leave_generation':
         return {
-          ...common, lexicon, variant,
+          ...common, lexicon, variant, letter_distribution: letterDistribution,
           num_iterations: numIterations,
           generation_count: generationCount,
           target_rack_count: targetRackCount,
@@ -134,6 +135,10 @@
     <div>
       <label class="label" for="variant">Variant</label>
       <input id="variant" class="input" bind:value={variant} />
+    </div>
+    <div>
+      <label class="label" for="ld">Letter distribution</label>
+      <input id="ld" class="input" bind:value={letterDistribution} />
     </div>
   </div>
 

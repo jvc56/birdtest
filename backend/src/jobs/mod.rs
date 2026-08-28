@@ -44,7 +44,7 @@ pub(crate) async fn insert_game_request(
     sqlx::query(
         "INSERT INTO game_requests
              (task_id, lexicon, variant, seed, num_games, player1_config_id,
-              player2_config_id, capture_positions, capture_top_moves)
+              player2_config_id, capture_positions, letter_distribution)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(task_id)
@@ -55,7 +55,7 @@ pub(crate) async fn insert_game_request(
     .bind(p1)
     .bind(p2)
     .bind(req.capture_positions)
-    .bind(req.capture_top_moves)
+    .bind(&req.letter_distribution)
     .execute(conn)
     .await?;
     Ok(())
@@ -76,7 +76,7 @@ pub(crate) async fn load_game_request(
         num_games: row.get("num_games"),
         game_pairs,
         capture_positions: row.get("capture_positions"),
-        capture_top_moves: row.get("capture_top_moves"),
+        letter_distribution: row.get("letter_distribution"),
         player1,
         player2,
     })
@@ -130,7 +130,8 @@ pub(crate) async fn insert_position_analyses(
             continue;
         }
         let mut builder = sqlx::QueryBuilder::new(
-            "INSERT INTO position_analysis_moves (record_id, task_id, rank, move, score, equity) ",
+            "INSERT INTO position_analysis_moves
+                 (record_id, task_id, rank, move, score, equity, win_percentage) ",
         );
         builder.push_values(kept.iter().enumerate(), |mut b, (index, entry)| {
             b.push_bind(record_id)
@@ -138,9 +139,36 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind((index + 1) as i16)
                 .push_bind(entry.play.clone())
                 .push_bind(entry.score)
-                .push_bind(entry.equity);
+                .push_bind(entry.equity)
+                // NULL for a static player, which simulates nothing.
+                .push_bind(entry.win_percentage);
         });
-        builder.build().execute(&mut *conn).await?;
+        // Returned in insertion order, so the ids line up with `kept` and the
+        // per-ply rows can be attached without looking each move back up.
+        builder.push(" RETURNING id");
+        let move_ids: Vec<i64> = builder
+            .build_query_scalar()
+            .fetch_all(&mut *conn)
+            .await?;
+
+        for (move_id, entry) in move_ids.iter().zip(kept.iter()) {
+            // Only a simming player produces per-ply statistics; for a static
+            // player this is empty and nothing is written.
+            for ply in &entry.plies {
+                sqlx::query(
+                    "INSERT INTO position_analysis_plies
+                         (move_id, ply, bingo_percentage, average_score)
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (move_id, ply) DO NOTHING",
+                )
+                .bind(move_id)
+                .bind(ply.ply)
+                .bind(ply.bingo_percentage)
+                .bind(ply.average_score)
+                .execute(&mut *conn)
+                .await?;
+            }
+        }
     }
     Ok(())
 }
@@ -179,12 +207,19 @@ pub(crate) async fn insert_game_results(
 
     // Deterministic games mean redundant claims replay identical positions, so
     // the first accepted claim records them and the rest are no-ops.
-    let top_moves = sqlx::query_scalar::<_, i32>(
-        "SELECT capture_top_moves FROM game_requests WHERE task_id = $1",
+    // How many ranked moves to keep: the player config's num_plays_recorded,
+    // which is also what told the worker how many to report.
+    let top_moves = sqlx::query_scalar::<_, Option<i32>>(
+        "SELECT COALESCE(p1.num_plays_recorded, p2.num_plays_recorded)
+         FROM game_requests r
+         JOIN player_configs p1 ON p1.id = r.player1_config_id
+         JOIN player_configs p2 ON p2.id = r.player2_config_id
+         WHERE r.task_id = $1",
     )
     .bind(task_id)
     .fetch_one(&mut *conn)
-    .await?;
+    .await?
+    .unwrap_or(i32::MAX);
 
     insert_position_analyses(conn, task_id, claim_id, &record.positions, top_moves, true).await
 }

@@ -14,48 +14,23 @@ pub struct Tile {
     pub count: u32,
 }
 
-/// The letter distribution a lexicon uses.
-///
-/// MAGPIE derives this from the lexicon name's prefix (`ld_get_type_from_lex_name`)
-/// rather than storing it, and there is no `nwl23` distribution file — NWL23 and
-/// CSW21 both use `english`. This mirrors that mapping so both sides agree on
-/// which file to read, and so the name handed to `magpie convert csv2klv`
-/// resolves. An unrecognized lexicon falls back to its own lowercased name,
-/// which is what makes the `testdist` development bag work.
-pub fn letter_distribution_name(lexicon: &str) -> String {
-    const ENGLISH: [&str; 7] = ["CSW", "NWL", "OSPD", "OSW", "TWL", "AMERICA", "CEL"];
-    let upper = lexicon.to_uppercase();
-
-    if ENGLISH.iter().any(|prefix| upper.starts_with(prefix)) {
-        return "english".to_string();
-    }
-    for (prefix, name) in [
-        ("RD", "german"),
-        ("NSF", "norwegian"),
-        ("DISC", "catalan"),
-        ("FRA", "french"),
-        ("OSPS", "polish"),
-        ("DSW", "dutch"),
-    ] {
-        if upper.starts_with(prefix) {
-            return name.to_string();
-        }
-    }
-    lexicon.to_lowercase()
-}
-
 #[derive(Debug, Clone)]
 pub struct LetterDistribution {
     pub tiles: Vec<Tile>,
 }
 
 impl LetterDistribution {
-    pub fn load(data_path: &Path, lexicon: &str) -> AppResult<Self> {
-        let dir = data_path.join("letterdistributions");
-        let path = dir.join(format!("{}.csv", letter_distribution_name(lexicon)));
+    /// Loads a distribution by name -- `english`, `testdist` -- as the job
+    /// states it. Nothing is inferred from the lexicon: MAGPIE derives a
+    /// distribution from the lexicon's prefix, and mirroring that inference
+    /// here made birdtest guess at something the job can simply say.
+    pub fn load(data_path: &Path, name: &str) -> AppResult<Self> {
+        let path = data_path
+            .join("letterdistributions")
+            .join(format!("{}.csv", name.to_lowercase()));
         let text = std::fs::read_to_string(&path).map_err(|e| {
             AppError::bad_request(format!(
-                "no letter distribution for lexicon {lexicon:?} at {}: {e}",
+                "no letter distribution named {name:?} at {}: {e}",
                 path.display()
             ))
         })?;
@@ -192,6 +167,26 @@ impl RackIndex {
         if index >= self.total() {
             return None;
         }
+        self.rack_at_enumeration_index(self.scatter(index))
+    }
+
+    /// Maps an index onto a different one, bijectively.
+    ///
+    /// Multiplying by a value coprime with the total permutes `[0, total)`, so
+    /// every index still names exactly one distinct rack and the space is still
+    /// covered exactly once. The multiplier is a prime larger than any plausible
+    /// rack space, which makes it coprime with every total.
+    fn scatter(&self, index: u64) -> u64 {
+        // 2^61 - 1, a Mersenne prime.
+        const MULTIPLIER: u128 = 2_305_843_009_213_693_951;
+        ((index as u128 * MULTIPLIER) % self.total() as u128) as u64
+    }
+
+    /// The rack at a raw enumeration index, in ascending tile-count order.
+    fn rack_at_enumeration_index(&self, index: u64) -> Option<String> {
+        if index >= self.total() {
+            return None;
+        }
         let mut remaining_index = index;
         let mut remaining_size = self.size;
         let mut rack = String::with_capacity(self.size);
@@ -238,8 +233,9 @@ mod tests {
 
     #[test]
     fn unranking_matches_full_enumeration() {
-        // The index must address exactly the same set the naive walk produces,
-        // or results recorded against an index would mean the wrong rack.
+        // The scattered index must still cover exactly the set the naive walk
+        // produces -- every rack once, none twice -- or a job would analyse
+        // some racks twice and miss others entirely.
         for size in 1..=4 {
             let distribution = tiny();
             let index = RackIndex::new(&distribution, size);
@@ -254,6 +250,22 @@ mod tests {
             unranked.sort();
             assert_eq!(unranked, enumerated, "size {size}");
         }
+    }
+
+    #[test]
+    fn scattering_spreads_adjacent_indices() {
+        // The point of scattering: a contiguous batch must not be a run of
+        // near-identical racks. In the raw enumeration the first few indices
+        // share a prefix; scattered, they should not.
+        let distribution = tiny();
+        let index = RackIndex::new(&distribution, 3);
+        let batch = index.racks_in_range(0, 4);
+        let distinct_first_letters: std::collections::HashSet<char> =
+            batch.iter().filter_map(|rack| rack.chars().next()).collect();
+        assert!(
+            distinct_first_letters.len() > 1,
+            "a batch should span the space, got {batch:?}"
+        );
     }
 
     #[test]

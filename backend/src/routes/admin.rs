@@ -65,7 +65,9 @@ struct CreatePlayerConfigBody {
     leaves: Option<String>,
     max_iterations: Option<i32>,
     plies: Option<i32>,
-    top_plays: Option<i32>,
+    num_plies_recorded: Option<i32>,
+    num_plays: Option<i32>,
+    num_plays_recorded: Option<i32>,
     stopping_pct: Option<f64>,
     use_inference: Option<bool>,
     time_limit_secs: Option<f64>,
@@ -92,9 +94,10 @@ async fn create_player_config(
 
     let config = sqlx::query_as::<_, PlayerConfig>(
         "INSERT INTO player_configs
-             (name, recorder_type, sort_strategy, leaves, max_iterations, plies, top_plays,
+             (name, recorder_type, sort_strategy, leaves, max_iterations, plies,
+              num_plies_recorded, num_plays, num_plays_recorded,
               stopping_pct, use_inference, time_limit_secs, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
          RETURNING *",
     )
     .bind(body.name.trim())
@@ -103,7 +106,9 @@ async fn create_player_config(
     .bind(&body.leaves)
     .bind(body.max_iterations)
     .bind(body.plies)
-    .bind(body.top_plays)
+    .bind(body.num_plies_recorded)
+    .bind(body.num_plays)
+    .bind(body.num_plays_recorded)
     .bind(body.stopping_pct)
     .bind(body.use_inference)
     .bind(body.time_limit_secs)
@@ -181,17 +186,17 @@ enum JobTypeConfig {
     OpeningRack {
         lexicon: String,
         variant: String,
+        letter_distribution: String,
         player_config_id: Uuid,
         #[serde(default = "default_racks_per_batch")]
         racks_per_batch: i32,
         #[serde(default = "default_rack_size")]
         rack_size: i32,
-        #[serde(default = "default_top_moves_stored")]
-        top_moves_stored: i32,
     },
     Game {
         lexicon: String,
         variant: String,
+        letter_distribution: String,
         player1_config_id: Uuid,
         player2_config_id: Uuid,
         #[serde(default = "one")]
@@ -208,12 +213,11 @@ enum JobTypeConfig {
         elo_high: f64,
         #[serde(default)]
         capture_positions: bool,
-        #[serde(default = "default_capture_top_moves")]
-        capture_top_moves: i32,
     },
     GamePair {
         lexicon: String,
         variant: String,
+        letter_distribution: String,
         player1_config_id: Uuid,
         player2_config_id: Uuid,
         #[serde(default = "one")]
@@ -230,12 +234,11 @@ enum JobTypeConfig {
         elo_high: f64,
         #[serde(default)]
         capture_positions: bool,
-        #[serde(default = "default_capture_top_moves")]
-        capture_top_moves: i32,
     },
     Leave {
         lexicon: String,
         variant: String,
+        letter_distribution: String,
         num_iterations: i32,
         #[serde(default = "one")]
         generation_count: i32,
@@ -258,20 +261,11 @@ fn default_elo_high() -> f64 {
 fn default_max_leave_size() -> i32 {
     6
 }
-/// Ranked moves kept per captured in-game position.
-fn default_capture_top_moves() -> i32 {
-    10
-}
 fn default_racks_per_batch() -> i32 {
     500
 }
 fn default_rack_size() -> i32 {
     7
-}
-/// Ranked moves kept per rack. Independent of how many the worker generates or
-/// simulates, which is the player config's `top_plays`.
-fn default_top_moves_stored() -> i32 {
-    20
 }
 
 #[derive(Serialize)]
@@ -340,29 +334,29 @@ async fn insert_job_config(
         (
             JobType::OpeningRack,
             JobTypeConfig::OpeningRack {
-                lexicon, variant, player_config_id, racks_per_batch, rack_size,
-                top_moves_stored,
+                lexicon, variant, letter_distribution, player_config_id,
+                racks_per_batch, rack_size,
             },
         ) => {
             // Counting the space is cheap -- a small dynamic-programming table
             // over the letter distribution -- and recording it here means the
             // scheduler can tell when the job is exhausted without re-deriving
             // it on every claim.
-            let total_racks =
-                crate::jobs::opening_rack::total_racks(data_path, lexicon, *rack_size)?;
+            let total_racks = crate::jobs::opening_rack::total_racks(
+                data_path, letter_distribution, *rack_size)?;
             sqlx::query(
                 "INSERT INTO job_opening_rack_config
-                     (job_id, lexicon, variant, player_config_id, racks_per_batch,
-                      rack_size, top_moves_stored, total_racks)
+                     (job_id, lexicon, variant, letter_distribution, player_config_id,
+                      racks_per_batch, rack_size, total_racks)
                  VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(job.id)
             .bind(lexicon)
             .bind(variant)
+            .bind(letter_distribution)
             .bind(player_config_id)
             .bind(racks_per_batch)
             .bind(rack_size)
-            .bind(top_moves_stored)
             .bind(total_racks)
             .execute(conn)
             .await?;
@@ -370,63 +364,66 @@ async fn insert_job_config(
         (
             JobType::Games,
             JobTypeConfig::Game {
-                lexicon, variant, player1_config_id, player2_config_id, games_per_batch,
+                lexicon, variant, letter_distribution, player1_config_id,
+                player2_config_id, games_per_batch,
                 min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
-                capture_positions, capture_top_moves,
+                capture_positions,
             },
         ) => {
             sqlx::query(
                 "INSERT INTO job_game_config
-                     (job_id, lexicon, variant, player1_config_id, player2_config_id,
-                      games_per_batch, min_games, max_games, sprt_alpha, sprt_beta,
-                      elo_low, elo_high, capture_positions, capture_top_moves)
+                     (job_id, lexicon, variant, letter_distribution, player1_config_id,
+                      player2_config_id, games_per_batch, min_games, max_games, sprt_alpha, sprt_beta,
+                      elo_low, elo_high, capture_positions)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
             )
-            .bind(job.id).bind(lexicon).bind(variant)
+            .bind(job.id).bind(lexicon).bind(variant).bind(letter_distribution)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(games_per_batch).bind(min_games).bind(max_games)
             .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
-            .bind(capture_positions).bind(capture_top_moves)
+            .bind(capture_positions)
             .execute(conn)
             .await?;
         }
         (
             JobType::GamePairs,
             JobTypeConfig::GamePair {
-                lexicon, variant, player1_config_id, player2_config_id, pairs_per_batch,
+                lexicon, variant, letter_distribution, player1_config_id,
+                player2_config_id, pairs_per_batch,
                 min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
-                capture_positions, capture_top_moves,
+                capture_positions,
             },
         ) => {
             sqlx::query(
                 "INSERT INTO job_game_pair_config
-                     (job_id, lexicon, variant, player1_config_id, player2_config_id,
-                      pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta,
-                      elo_low, elo_high, capture_positions, capture_top_moves)
+                     (job_id, lexicon, variant, letter_distribution, player1_config_id,
+                      player2_config_id, pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta,
+                      elo_low, elo_high, capture_positions)
                  VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
             )
-            .bind(job.id).bind(lexicon).bind(variant)
+            .bind(job.id).bind(lexicon).bind(variant).bind(letter_distribution)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(pairs_per_batch).bind(min_pairs).bind(max_pairs)
             .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
-            .bind(capture_positions).bind(capture_top_moves)
+            .bind(capture_positions)
             .execute(conn)
             .await?;
         }
         (
             JobType::LeaveGeneration,
             JobTypeConfig::Leave {
-                lexicon, variant, num_iterations, generation_count, target_rack_count,
-                racks_per_task, max_leave_size,
+                lexicon, variant, letter_distribution, num_iterations,
+                generation_count, target_rack_count, racks_per_task, max_leave_size,
             },
         ) => {
             sqlx::query(
                 "INSERT INTO job_leave_config
-                     (job_id, lexicon, variant, num_iterations, generation_count,
-                      target_rack_count, racks_per_task, max_leave_size)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                     (job_id, lexicon, variant, letter_distribution, num_iterations,
+                      generation_count, target_rack_count, racks_per_task,
+                      max_leave_size)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
             )
-            .bind(job.id).bind(lexicon).bind(variant)
+            .bind(job.id).bind(lexicon).bind(variant).bind(letter_distribution)
             .bind(num_iterations).bind(generation_count).bind(target_rack_count)
             .bind(racks_per_task).bind(max_leave_size)
             .execute(conn)

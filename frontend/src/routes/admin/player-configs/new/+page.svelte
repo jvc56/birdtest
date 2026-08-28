@@ -9,7 +9,9 @@
   let simming = false;
   let maxIterations = 1000;
   let plies = 2;
-  let topPlays = 10;
+  let numPlays = 10;
+  let numPlaysRecorded = 10;
+  let numPliesRecorded = 2;
   let stoppingPct = 99;
   let useInference = false;
   let timeLimitSecs: number | '' = '';
@@ -28,7 +30,9 @@
         leaves: leaves || null,
         max_iterations: simming ? maxIterations : null,
         plies: simming ? plies : null,
-        top_plays: simming ? topPlays : null,
+        num_plays: simming ? numPlays : null,
+        num_plays_recorded: numPlaysRecorded,
+        num_plies_recorded: simming ? numPliesRecorded : null,
         stopping_pct: simming ? stoppingPct : null,
         use_inference: simming ? useInference : null,
         time_limit_secs: simming && timeLimitSecs !== '' ? Number(timeLimitSecs) : null
@@ -66,6 +70,15 @@
     </div>
   </div>
 
+  <div>
+    <label class="label" for="npres">Plays to report (maxnumdplays)</label>
+    <input id="npres" type="number" class="input" bind:value={numPlaysRecorded} />
+    <p class="mt-1 text-xs text-muted-foreground">
+      How many ranked plays birdtest stores per analysed position. Separate from
+      how many are generated or simulated.
+    </p>
+  </div>
+
   <label class="flex items-center gap-2 text-sm">
     <input type="checkbox" bind:checked={simming} />
     Simming player
@@ -75,7 +88,8 @@
     <div class="grid grid-cols-2 gap-3">
       <div><label class="label" for="iters">Max iterations (-i)</label><input id="iters" type="number" class="input" bind:value={maxIterations} /></div>
       <div><label class="label" for="plies">Plies (-pl)</label><input id="plies" type="number" class="input" bind:value={plies} /></div>
-      <div><label class="label" for="np">Top plays (-np)</label><input id="np" type="number" class="input" bind:value={topPlays} /></div>
+      <div><label class="label" for="np">Plays to simulate (-np)</label><input id="np" type="number" class="input" bind:value={numPlays} /></div>
+      <div><label class="label" for="npr">Plies to report (shplies)</label><input id="npr" type="number" class="input" bind:value={numPliesRecorded} /></div>
       <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="0.1" class="input" bind:value={stoppingPct} /></div>
       <div><label class="label" for="tl">Time limit seconds (-tl)</label><input id="tl" type="number" step="0.1" class="input" bind:value={timeLimitSecs} /></div>
       <label class="flex items-end gap-2 text-sm">

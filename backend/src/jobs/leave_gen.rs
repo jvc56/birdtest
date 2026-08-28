@@ -17,13 +17,14 @@ pub async fn insert_request(
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO leave_requests
-             (task_id, lexicon, variant, generation, forced_racks, num_games,
-              previous_artifact_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+             (task_id, lexicon, variant, letter_distribution, generation,
+              forced_racks, num_games, previous_artifact_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(task_id)
     .bind(&req.lexicon)
     .bind(&req.variant)
+    .bind(&req.letter_distribution)
     .bind(req.generation)
     .bind(&req.forced_racks)
     .bind(req.num_games)
@@ -43,7 +44,8 @@ impl JobHandler for LeaveGenHandler {
     async fn load_request(conn: &mut PgConnection, task_id: Uuid,
                           _data_path: &Path) -> AppResult<Self::Request> {
         let row = sqlx::query(
-            "SELECT lexicon, variant, generation, forced_racks, num_games, previous_artifact_key
+            "SELECT lexicon, variant, letter_distribution, generation, forced_racks,
+                    num_games, previous_artifact_key
              FROM leave_requests WHERE task_id = $1",
         )
         .bind(task_id)
@@ -52,6 +54,7 @@ impl JobHandler for LeaveGenHandler {
         Ok(LeaveRequest {
             lexicon: row.get("lexicon"),
             variant: row.get("variant"),
+            letter_distribution: row.get("letter_distribution"),
             generation: row.get("generation"),
             forced_racks: row.get("forced_racks"),
             num_games: row.get("num_games"),
@@ -203,6 +206,7 @@ pub async fn next_step(
     Ok(LeaveGenStep::Dispatch(LeaveRequest {
         lexicon: config.lexicon.clone(),
         variant: config.variant.clone(),
+        letter_distribution: config.letter_distribution.clone(),
         generation,
         forced_racks: racks,
         previous_artifact_key,
@@ -221,7 +225,7 @@ pub async fn seed_generation(
     config: &LeaveConfig,
     data_path: &Path,
 ) -> AppResult<i64> {
-    let dist = LetterDistribution::load(data_path, &config.lexicon)?;
+    let dist = LetterDistribution::load(data_path, &config.letter_distribution)?;
     let leaves = dist.enumerate_leaves(config.max_leave_size as usize);
     tracing::info!(job_id = %job_id, generation, leaves = leaves.len(), "seeding leave rack universe");
 
@@ -315,8 +319,9 @@ pub async fn run_transition(
         .arg("csv2klv")
         .arg(&name)
         // `convert` can only infer the distribution when the data name *is* a
-        // lexicon name; ours is a generated one, so it is passed explicitly.
-        .arg(super::racks::letter_distribution_name(&config.lexicon))
+        // lexicon name; ours is generated, and the job states its distribution
+        // anyway.
+        .arg(&config.letter_distribution)
         .arg("-path")
         .arg(&search_path)
         // MAGPIE loads its default board layout from `./data` while building

@@ -233,7 +233,9 @@ def _player_args(player: dict, slot: int) -> list[str]:
         "leaves": "-k%d",
         "max_iterations": "-i%d",
         "plies": "-pl%d",
-        "top_plays": "-np%d",
+        "num_plays": "-np%d",
+        "num_plays_recorded": "-maxnumdplays",
+        "num_plies_recorded": "-shplies",
         "stopping_pct": "-sc%d",
         "time_limit_secs": "-tl%d",
     }

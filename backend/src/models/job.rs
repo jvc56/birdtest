@@ -44,8 +44,12 @@ pub struct PlayerConfig {
     pub sort_strategy: Option<String>,
     pub leaves: Option<String>,
     pub max_iterations: Option<i32>,
+    /// Plies to simulate, and how many of them to report back.
     pub plies: Option<i32>,
-    pub top_plays: Option<i32>,
+    pub num_plies_recorded: Option<i32>,
+    /// Plays to simulate, and how many of them to report back.
+    pub num_plays: Option<i32>,
+    pub num_plays_recorded: Option<i32>,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<f64>,
@@ -58,10 +62,10 @@ pub struct OpeningRackConfig {
     pub job_id: Uuid,
     pub lexicon: String,
     pub variant: String,
+    pub letter_distribution: String,
     pub player_config_id: Uuid,
     pub racks_per_batch: i32,
     pub rack_size: i32,
-    pub top_moves_stored: i32,
     pub total_racks: i64,
 }
 
@@ -70,6 +74,7 @@ pub struct GameConfig {
     pub job_id: Uuid,
     pub lexicon: String,
     pub variant: String,
+    pub letter_distribution: String,
     pub player1_config_id: Uuid,
     pub player2_config_id: Uuid,
     pub games_per_batch: i32,
@@ -82,8 +87,6 @@ pub struct GameConfig {
     /// Keep the position analyses produced while playing. Off by default: at
     /// ~22.5 turns a game it roughly doubles the rows a job produces.
     pub capture_positions: bool,
-    /// Ranked moves kept per captured position.
-    pub capture_top_moves: i32
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -91,6 +94,7 @@ pub struct GamePairConfig {
     pub job_id: Uuid,
     pub lexicon: String,
     pub variant: String,
+    pub letter_distribution: String,
     pub player1_config_id: Uuid,
     pub player2_config_id: Uuid,
     pub pairs_per_batch: i32,
@@ -103,8 +107,6 @@ pub struct GamePairConfig {
     /// Keep the position analyses produced while playing. Off by default: at
     /// ~22.5 turns a game it roughly doubles the rows a job produces.
     pub capture_positions: bool,
-    /// Ranked moves kept per captured position.
-    pub capture_top_moves: i32
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -112,6 +114,7 @@ pub struct LeaveConfig {
     pub job_id: Uuid,
     pub lexicon: String,
     pub variant: String,
+    pub letter_distribution: String,
     pub num_iterations: i32,
     pub generation_count: i32,
     pub target_rack_count: i32,

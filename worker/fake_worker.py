@@ -99,7 +99,7 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
     """
     if not request.get("capture_positions"):
         return
-    top_moves = request.get("capture_top_moves", 10)
+    top_moves = (request.get("player1") or {}).get("num_plays_recorded") or 10
     positions = []
     for game_index in range(games):
         # Real games run about 22 turns; varying it exercises the turn bound.
@@ -116,6 +116,16 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
                         "move": f"8{chr(ord('D') + i % 8)} WORD{i}",
                         "score": rng.randint(10, 90),
                         "equity": round(rng.uniform(-5, 60), 3),
+                        # Absent for a static player, which simulates nothing.
+                        "win_percentage": round(rng.uniform(20, 80), 3),
+                        "plies": [
+                            {
+                                "ply": p,
+                                "bingo_percentage": round(rng.uniform(0, 25), 3),
+                                "average_score": round(rng.uniform(25, 45), 3),
+                            }
+                            for p in range(2)
+                        ],
                     }
                     for i in range(top_moves)
                 ],
@@ -236,7 +246,9 @@ class FakeWorker:
     def __init__(self, args: argparse.Namespace, index: int, stats: Stats):
         self.args = args
         self.stats = stats
-        self.worker_uuid = str(uuid.uuid4())
+        # Left unset until the server issues one. A client-invented UUID is
+        # rejected: birdtest only accepts identities it handed out.
+        self.worker_uuid: Optional[str] = None
         self.session = requests.Session()
         # Each simulated worker gets its own stream so concurrent runs stay
         # reproducible regardless of thread interleaving.
@@ -246,7 +258,11 @@ class FakeWorker:
     def headers(self) -> dict:
         if self.args.api_key:
             return {"Authorization": f"Bearer {self.args.api_key}"}
-        return {"X-Worker-UUID": self.worker_uuid}
+        if self.worker_uuid:
+            return {"X-Worker-UUID": self.worker_uuid}
+        # No header at all on the first claim, which is how a worker asks to be
+        # issued an identity.
+        return {}
 
     def _url(self, path: str) -> str:
         return f"{self.args.server_url.rstrip('/')}{path}"
@@ -264,7 +280,11 @@ class FakeWorker:
             return None
         response.raise_for_status()
         self.stats.bump("claimed")
-        return response.json()
+        assignment = response.json()
+        # Adopt the identity the server assigned and use it from here on.
+        if not self.args.api_key and not self.worker_uuid:
+            self.worker_uuid = assignment.get("worker_uuid")
+        return assignment
 
     def submit(self, claim_token: str, result: dict) -> None:
         # Back off and retry rather than counting a throttle as a rejection —

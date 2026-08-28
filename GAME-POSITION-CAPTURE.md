@@ -5,8 +5,7 @@ across 4 real games, with the CGP evolving turn by turn, and the redundancy
 deduplication held under `redundancy = 2`.
 
 The asymmetry this plan is built around is directly visible in the stored data.
-A `games` job pairing a simming player against a static one, `capture_top_moves`
-of 6:
+A `games` job pairing a simming player against a static one, the player config's `num_plays_recorded` of 6:
 
 | Turn | Player | Ranked | Stored |
 |---|---|---|---|
@@ -142,12 +141,13 @@ Two columns on both `job_game_config` and `job_game_pair_config`:
 | Column | Default | Meaning |
 |---|---|---|
 | `capture_positions` | `false` | Off unless asked for |
-| `capture_top_moves` | `10` | Ranked moves stored per captured position |
 
-`capture_top_moves` is the same distinction `top_moves_stored` draws for opening
-racks: how many of the worker's ranked candidates the server keeps, which is not
-how many the player generated. For a simming player the ceiling is that player's
-`top_plays` (`-np`), since that is how many candidates the simulation ranked.
+
+How many ranked plays come back per position is the player config's
+`num_plays_recorded` (MAGPIE's `maxnumdplays`), not a job setting -- it pairs
+with `num_plays` (`-np`), which is how many the player simulates. Per-ply
+statistics pair the same way: `num_plies_recorded` (`shplies`) against `plies`
+(`-pl`).
 
 There is deliberately no sample rate, no turn limit and no per-task cap. Capture
 is all-or-nothing per job, which removes the need for the sampling to be
@@ -227,7 +227,7 @@ Per-turn, `positions_data_add_move` records:
 - **The position**, via `game_get_cgp(game, false)` from `src/impl/cgp.h`.
 - **The rack**, from the player on turn.
 - **`game_number`, `pair_game_number`, `turn_number`** for provenance.
-- **The top `capture_top_moves` entries of `move_list`**, formatted with
+- **The top `num_plays_recorded` entries of `move_list`**, formatted with
   `string_builder_add_move()` exactly as the opening-rack executor already does,
   with `equity_is_convertible()` guarding the pass sentinel.
 
@@ -270,7 +270,7 @@ typedef struct AutoplayPosition {
   int pair_game_number;
   int turn_number;
   int num_moves;              // how many were ranked, before truncation
-  AutoplayPositionMove *moves; // capture_top_moves of them
+  AutoplayPositionMove *moves; // num_plays_recorded of them
   int num_stored_moves;
 } AutoplayPosition;
 
@@ -288,7 +288,7 @@ formatted output. `config_contribute_games` then serializes the array into the
 
 The contribution client sets the recorder option when the task request asks for
 it, so `capture_positions` on the birdtest job becomes `autoplay games,positions`
-on the MAGPIE invocation, with `capture_top_moves` bounding how many entries per
+on the MAGPIE invocation, with `num_plays_recorded` bounding how many entries per
 turn are serialized.
 
 ## Wire format

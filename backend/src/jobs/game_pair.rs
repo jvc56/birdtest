@@ -86,11 +86,11 @@ pub async fn next_request(
         GameRequest {
             lexicon: config.lexicon.clone(),
             variant: config.variant.clone(),
+            letter_distribution: config.letter_distribution.clone(),
             seed: next_seed as u64,
             num_games: config.pairs_per_batch,
             game_pairs: true,
             capture_positions: config.capture_positions,
-            capture_top_moves: config.capture_top_moves,
             player1,
             player2,
         },

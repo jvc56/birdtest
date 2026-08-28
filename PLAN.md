@@ -104,6 +104,28 @@ Contributors run a client program that loops continuously: it sends a **task cla
 
 ---
 
+#### Letter distributions are stated, not inferred
+
+Every job config names its `letter_distribution` alongside its lexicon, and the
+name is carried on the request the worker receives. MAGPIE derives a
+distribution from the lexicon's prefix; birdtest used to mirror that inference,
+which meant guessing at something the job can simply say.
+
+#### Two generate/report pairs on the player config
+
+`player_configs` carries two pairs, each "how much to compute" against "how much
+to report":
+
+| Compute | Report | MAGPIE |
+|---|---|---|
+| `num_plays` | `num_plays_recorded` | `-np` / `maxnumdplays` |
+| `plies` | `num_plies_recorded` | `-pl` / `shplies` |
+
+A simmer may rank hundreds of candidates to order the top few correctly while
+only the leaders are worth storing, and the same holds for plies. Because these
+live on the player config rather than the job, one setting governs both opening
+rack analysis and positions captured during games.
+
 #### Position analyses from games
 
 `games` and `game_pairs` jobs can keep the position analyses their workers
@@ -144,12 +166,12 @@ job, so nothing else writes a request here.
 The record deliberately does **not** store the best move, its score or its
 equity. Those are the rank 1 row of `position_analysis_moves`, and a second copy
 is only something to keep consistent. `num_moves` stays, since the stored moves
-are truncated to `top_moves_stored` and cannot tell you how many were ranked. A
+are truncated to `num_plays_recorded` and cannot tell you how many were ranked. A
 partial index on rank 1 keeps the dashboard's aggregates cheap.
 
 #### How much of an analysis is kept
 
-A worker reports every move it ranked. The server keeps only the leading `top_moves_stored` per rack, which is **deliberately a different number from how many the worker generated or simulated** (the player config's `top_plays`): a simmer may need to rank hundreds of candidates to order the top few correctly, while storing hundreds of rows for each of millions of racks is not something the database should be asked to do. `position_analysis_records.num_moves` records how many were ranked, so the discarded tail is still visible as a count.
+A worker reports every move it ranked. The server keeps only the leading `num_plays_recorded` per rack, which is **deliberately a different number from how many the worker generated or simulated** (the player config's `num_plays`): a simmer may need to rank hundreds of candidates to order the top few correctly, while storing hundreds of rows for each of millions of racks is not something the database should be asked to do. `position_analysis_records.num_moves` records how many were ranked, so the discarded tail is still visible as a count.
 
 `position_analysis_plies` is populated only for **simming** player configs. A static player produces no per-ply statistics, so for the common case the table stays empty rather than filling with placeholder rows.
 

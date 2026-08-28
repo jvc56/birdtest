@@ -150,23 +150,44 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     let uuid = Uuid::parse_str(raw).map_err(|_| {
                         AppError::bad_request("X-Worker-UUID is not a valid UUID")
                     })?;
+
+                    // Only identities the server itself issued are accepted. A
+                    // client-invented UUID would otherwise let anyone
+                    // manufacture contributors -- attributing work to identities
+                    // that never claimed anything, and giving per-worker anomaly
+                    // detection a population it does not control.
+                    let known = sqlx::query(
+                        "UPDATE anonymous_workers SET last_seen_at = now()
+                         WHERE uuid = $1",
+                    )
+                    .bind(uuid)
+                    .execute(&state.pool)
+                    .await?
+                    .rows_affected()
+                        > 0;
+
+                    if !known {
+                        return Err(AppError::unauthorized(
+                            "unrecognized worker UUID. Omit the X-Worker-UUID \
+                             header to be issued one, or authenticate with an \
+                             API key.",
+                        ));
+                    }
                     (uuid, false)
                 }
                 // No identity at all: the client has never contributed before, so
                 // the server mints the UUID rather than trusting the client to
                 // generate one. Handed back to the client in the claim response
                 // (see `claim_task`) for it to persist and resend from then on.
-                None => (Uuid::new_v4(), true),
+                None => {
+                    let uuid = Uuid::new_v4();
+                    sqlx::query("INSERT INTO anonymous_workers (uuid) VALUES ($1)")
+                        .bind(uuid)
+                        .execute(&state.pool)
+                        .await?;
+                    (uuid, true)
+                }
             };
-
-            // Upsert so contribution tracking works for a worker we've never seen.
-            sqlx::query(
-                "INSERT INTO anonymous_workers (uuid) VALUES ($1)
-                 ON CONFLICT (uuid) DO UPDATE SET last_seen_at = now()",
-            )
-            .bind(uuid)
-            .execute(&state.pool)
-            .await?;
 
             WorkerIdentity::Anonymous { uuid, newly_assigned }
         };

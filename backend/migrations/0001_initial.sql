@@ -117,8 +117,13 @@ CREATE TABLE player_configs (
     leaves           TEXT,                  -- leave file name; NULL = lexicon default  (-k1 / -k2)
     -- Simulation parameters (all NULL for a static player)
     max_iterations   INT,                   -- -i1 / -i2
-    plies            INT,                   -- -pl1 / -pl2
-    top_plays        INT,                   -- -np1 / -np2
+    -- Two pairs of "how much to compute" / "how much to report". MAGPIE
+    -- generates plays and plies, then displays a subset of each; birdtest
+    -- stores exactly what is displayed.
+    plies              INT,                 -- plies to simulate    (-pl1 / -pl2)
+    num_plies_recorded INT,                 -- plies to report      (shplies)
+    num_plays          INT,                 -- plays to simulate    (-np1 / -np2)
+    num_plays_recorded INT,                 -- plays to report      (maxnumdplays)
     stopping_pct     DOUBLE PRECISION,      -- -sc1 / -sc2 (0–100)
     use_inference    BOOLEAN,               -- -si1 / -si2
     time_limit_secs  DOUBLE PRECISION,      -- -tl1 / -tl2
@@ -132,6 +137,11 @@ CREATE TABLE job_opening_rack_config (
     job_id            UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
+    -- The letter distribution to play with. Explicit rather than derived from
+    -- the lexicon name: MAGPIE infers one from the lexicon's prefix, and
+    -- mirroring that inference here made birdtest guess at something the job
+    -- can simply state.
+    letter_distribution TEXT NOT NULL,
     -- The player config used to analyze each rack (may be a simmer or static player).
     player_config_id  UUID NOT NULL REFERENCES player_configs(id),
     -- Racks handed out per task. One rack per task means one claim/submit round
@@ -139,11 +149,6 @@ CREATE TABLE job_opening_rack_config (
     -- well under a rack per second against a space of millions.
     racks_per_batch   INT NOT NULL DEFAULT 500 CHECK (racks_per_batch >= 1),
     rack_size         INT NOT NULL DEFAULT 7 CHECK (rack_size BETWEEN 1 AND 7),
-    -- How many of the worker's ranked moves are kept per rack. Distinct from how
-    -- many the worker generates or simulates, which is the player config's
-    -- top_plays: the worker may sim hundreds to rank them correctly while only
-    -- the leaders are worth storing for every rack in the space.
-    top_moves_stored  INT NOT NULL DEFAULT 20 CHECK (top_moves_stored >= 1),
     -- Size of the rack space, computed at job creation. Tasks address ranges of
     -- it, so this is what tells the scheduler when the job is exhausted.
     total_racks       BIGINT NOT NULL CHECK (total_racks >= 0)
@@ -153,6 +158,11 @@ CREATE TABLE job_game_config (
     job_id              UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     lexicon             TEXT NOT NULL,
     variant             TEXT NOT NULL,
+    -- The letter distribution to play with. Explicit rather than derived from
+    -- the lexicon name: MAGPIE infers one from the lexicon's prefix, and
+    -- mirroring that inference here made birdtest guess at something the job
+    -- can simply state.
+    letter_distribution TEXT NOT NULL,
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     games_per_batch     INT NOT NULL DEFAULT 1,
@@ -168,17 +178,18 @@ CREATE TABLE job_game_config (
     -- analyses a position every turn regardless; this decides whether those are
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
-    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
-    -- Ranked moves kept per captured position. As with top_moves_stored, this
-    -- is not how many the player generated -- for a simming player the ceiling
-    -- is its top_plays.
-    capture_top_moves   INT NOT NULL DEFAULT 10 CHECK (capture_top_moves >= 1)
+    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE job_game_pair_config (
     job_id              UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     lexicon             TEXT NOT NULL,
     variant             TEXT NOT NULL,
+    -- The letter distribution to play with. Explicit rather than derived from
+    -- the lexicon name: MAGPIE infers one from the lexicon's prefix, and
+    -- mirroring that inference here made birdtest guess at something the job
+    -- can simply state.
+    letter_distribution TEXT NOT NULL,
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     pairs_per_batch     INT NOT NULL DEFAULT 1,
@@ -192,17 +203,18 @@ CREATE TABLE job_game_pair_config (
     -- analyses a position every turn regardless; this decides whether those are
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
-    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
-    -- Ranked moves kept per captured position. As with top_moves_stored, this
-    -- is not how many the player generated -- for a simming player the ceiling
-    -- is its top_plays.
-    capture_top_moves   INT NOT NULL DEFAULT 10 CHECK (capture_top_moves >= 1)
+    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE TABLE job_leave_config (
     job_id         UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     lexicon        TEXT NOT NULL,
     variant        TEXT NOT NULL,
+    -- The letter distribution to play with. Explicit rather than derived from
+    -- the lexicon name: MAGPIE infers one from the lexicon's prefix, and
+    -- mirroring that inference here made birdtest guess at something the job
+    -- can simply state.
+    letter_distribution TEXT NOT NULL,
     -- Games each leave-gen task plays over its forced-rack subset.
     num_iterations INT NOT NULL,
     -- How many sequential generations this job runs before it is complete.
@@ -288,6 +300,7 @@ CREATE TABLE opening_rack_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
+    letter_distribution TEXT NOT NULL,
     -- Index of the first rack in this batch, and how many it covers. The final
     -- batch of a job may be short.
     rack_start        BIGINT NOT NULL CHECK (rack_start >= 0),
@@ -300,10 +313,10 @@ CREATE TABLE game_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
+    letter_distribution TEXT NOT NULL,
     -- Denormalized from the job config, like everything else here, so the
     -- request a re-dispatched task replays is exactly the one it was given.
     capture_positions BOOLEAN NOT NULL DEFAULT FALSE,
-    capture_top_moves INT NOT NULL DEFAULT 10,
     -- seed is also stored on the tasks row; duplicated here for convenience when reading the full request.
     seed              BIGINT NOT NULL,
     num_games         INT NOT NULL DEFAULT 1,
@@ -315,6 +328,7 @@ CREATE TABLE leave_requests (
     task_id             UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon             TEXT NOT NULL,
     variant             TEXT NOT NULL,
+    letter_distribution TEXT NOT NULL,
     generation          INT NOT NULL,
     forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (see rack_list_create's forceracksfile)
     num_games           INT NOT NULL,      -- denormalized from job_leave_config.num_iterations
@@ -394,8 +408,8 @@ CREATE UNIQUE INDEX position_analysis_records_rack_idx
 CREATE INDEX position_analysis_records_task_idx
     ON position_analysis_records (task_id, rack);
 
--- The top `top_moves_stored` (opening racks) or `capture_top_moves` (games)
--- moves per position. Storing every move the worker ranked would be untenable:
+-- The top `num_plays_recorded` moves per position, from the player config that
+-- produced them. Storing every move the worker ranked would be untenable:
 -- a job over the full English 7-tile space is roughly 3.2 million racks, and a
 -- 40,000-pair job with capture on is 1.8 million positions.
 CREATE TABLE position_analysis_moves (
@@ -406,7 +420,10 @@ CREATE TABLE position_analysis_moves (
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
     score           INT NOT NULL,
-    equity          DOUBLE PRECISION NOT NULL
+    equity          DOUBLE PRECISION NOT NULL,
+    -- The simulated win percentage. NULL for a static player, which ranks on
+    -- equity alone and simulates nothing.
+    win_percentage  DOUBLE PRECISION
 );
 CREATE INDEX position_analysis_moves_record_idx
     ON position_analysis_moves (record_id, rank);
