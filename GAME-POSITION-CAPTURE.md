@@ -37,28 +37,38 @@ So the honest framing is:
 The feature is most defensible for simming players. For static players it should
 be possible but clearly marked as slowing the job down.
 
-## Volume is the dominant constraint
+## Volume
 
-A game runs about **22.5 turns** (measured). Two games per pair. So:
+Every position of every game is captured -- there is no sampling. A game runs
+about **22.5 turns** (measured), and a pair is two games, so these are the actual
+row counts a job produces, not a worst case:
 
 | Job | Positions | Move rows at 10 kept each |
 |---|---|---|
 | `max_pairs = 40,000` | 1,800,000 | 18,000,000 |
 | `max_games = 400,000` | 9,000,000 | 90,000,000 |
 
-Capturing every position of every game is not viable as a default. **Capture is
-off unless configured, and sampled when on.**
+That is the price of the feature and it is worth stating plainly: turning
+capture on roughly doubles the storage a job produces per unit of Elo
+information, and does so in the largest table in the schema.
 
-### Redundancy makes it worse, and the fix is cheap
+**`games_per_batch` becomes the memory and payload control.** With no per-task
+cap, the size of a submission is a direct function of the batch size: a batch of
+20 games is about 450 positions and a few hundred KB of JSON, while a batch of
+1,000 games is 22,500 positions and on the order of 15 MB. That is a real
+consideration for a job that wants both capture and large batches, and it is the
+existing knob rather than a new one.
+
+### Redundancy would multiply the corpus, and the fix is cheap
 
 Games are seeded and deterministic, so with `redundancy > 1` every worker on a
-task plays *identical* games and would capture *identical* positions. That is
-pure duplication -- X copies of the same analysis.
+task plays *identical* games and captures *identical* positions. That is pure
+duplication -- X copies of the same analysis.
 
 Keying captured positions on `(task_id, game_index, turn_number)` rather than on
 the claim, with `ON CONFLICT DO NOTHING`, makes the first accepted claim the one
 that lands and the rest no-ops. Redundancy keeps doing its job for the *result*
-(agreement between workers is still checked) without multiplying the corpus.
+-- agreement between workers is still checked -- without multiplying the corpus.
 
 ## Schema
 
@@ -105,48 +115,159 @@ CREATE UNIQUE INDEX position_analysis_records_rack_idx
 
 ## Configuration
 
-On both `job_game_config` and `job_game_pair_config`:
+Two columns on both `job_game_config` and `job_game_pair_config`:
 
 | Column | Default | Meaning |
 |---|---|---|
 | `capture_positions` | `false` | Off unless asked for |
-| `capture_sample_rate` | `0.01` | Fraction of positions kept |
-| `capture_top_moves` | `10` | Ranked moves stored per captured position -- the same distinction as `top_moves_stored`, separate from how many the player generated |
-| `capture_max_turn` | `NULL` | Only turns at or below this, so a job can target openings |
-| `capture_max_per_task` | `1000` | Safety valve against a misconfigured rate |
+| `capture_top_moves` | `10` | Ranked moves stored per captured position |
 
-**Sampling must be deterministic.** Derive the decision from
-`hash(seed, game_index, turn_number) < rate` rather than from a random number
-generator, so re-running a task captures the same positions. Without that,
-redundant claims sample *different* positions and the `ON CONFLICT` dedup above
-stops working.
+`capture_top_moves` is the same distinction `top_moves_stored` draws for opening
+racks: how many of the worker's ranked candidates the server keeps, which is not
+how many the player generated. For a simming player the ceiling is that player's
+`top_plays` (`-np`), since that is how many candidates the simulation ranked.
 
-A later refinement worth more than a blanket rate: capture only positions where
-the top two candidates are within some equity margin. Those are the decisions
-that discriminate between strategies, and they are a small fraction of turns.
-It needs more than one candidate to exist, so it only applies to simming players.
+There is deliberately no sample rate, no turn limit and no per-task cap. Capture
+is all-or-nothing per job, which removes the need for the sampling to be
+deterministic and removes the failure mode where redundant claims sample
+different positions and defeat the deduplication above.
 
 ## MAGPIE changes
 
-A new autoplay recorder, `positions`, selectable through the existing options
-string (`autoplay games,positions`) the way `games`, `winpct` and `leaves`
-already are.
+Good news: **the hook already exists.** `autoplay_results_add_move()` is called
+once per turn from `autoplay.c`, immediately after the move is chosen and before
+it is played:
 
-- It needs a per-turn hook. `game_data_add_game` fires once per game; this fires
-  once per turn, after the move is chosen and while `move_lists[player]` still
-  holds the candidates.
-- It records the CGP, the rack, the turn number, and the top `capture_top_moves`
-  entries of the move list.
-- It must be bounded in memory: a batch of 20 pairs at 22.5 turns is 900 turns,
-  and an unbounded accumulator over a large batch is a leak in all but name.
-  Cap it at `capture_max_per_task` and stop recording past that.
-- The sampling predicate belongs on the MAGPIE side, so unsampled positions cost
-  nothing rather than being serialized and discarded by the server.
+```c
+const Move *move = game_runner_get_best_move(autoplay_worker, game_runner);
+...
+autoplay_results_add_move(autoplay_worker->autoplay_results,
+                          game_runner->game, move, &rare_rack_or_move_leave);
+```
 
-For static players, capture additionally requires an option that relaxes the
-`MOVE_RECORD_BEST` override in `get_top_move_for_player_on_turn` -- and that
-option should be what makes the slowdown visible, rather than it being an
-invisible consequence of a birdtest setting.
+`Recorder` already carries an `add_move_func`, and three recorders already use
+it (`leaves_data_add_move`, `fj_data_add_move`, `win_pct_data_add_move`). A
+positions recorder is a fourth instance of an established pattern rather than
+new machinery.
+
+### 1. `RecorderArgs` needs three more fields
+
+This is the one real gap. The struct today is:
+
+```c
+typedef struct RecorderArgs {
+  const Game *game;
+  const Move *move;        // the move chosen, not the ones considered
+  const Rack *leave;
+  int number_of_turns;
+  uint64_t seed;
+  bool divergent;
+  bool human_readable;
+  const AutoplayGameTiming *timing;
+} RecorderArgs;
+```
+
+and `autoplay_results_add_move` populates only `game`, `move` and `leave` --
+everything else is zeroed. So a recorder can see *which move was played* but not
+*what else was considered*, nor which game or turn it belongs to. Add:
+
+```c
+  const MoveList *move_list;  // the ranked candidates this turn
+  int game_number;            // which game of the batch
+  int pair_game_number;       // 0 or 1 within a pair; 0 when not pairing
+  int turn_number;            // turn within the game
+```
+
+All four are available at the call site: the candidates are
+`autoplay_worker->move_lists[player_on_turn_index]`, and `game_runner` already
+tracks `game_number`, `pair_game_number` and `turn_number`. Widening
+`autoplay_results_add_move`'s signature to take them is the bulk of the change,
+and it touches the three existing `add_move` recorders only insofar as they
+ignore the new fields.
+
+### 2. A `positions` recorder
+
+`AUTOPLAY_RECORDER_TYPE_POSITION` alongside the existing enum values, registered
+through `autoplay_results_set_recorder()` with the same seven function pointers
+the others use, and selectable through the options string:
+
+```c
+} else if (has_iprefix(option_str, "positions")) {
+  options |= autoplay_results_build_option(AUTOPLAY_RECORDER_TYPE_POSITION);
+}
+```
+
+so `autoplay games,positions` works from the command line too, which makes the
+recorder testable without birdtest in the loop.
+
+Per-turn, `positions_data_add_move` records:
+
+- **The position**, via `game_get_cgp(game, false)` from `src/impl/cgp.h`.
+- **The rack**, from the player on turn.
+- **`game_number`, `pair_game_number`, `turn_number`** for provenance.
+- **The top `capture_top_moves` entries of `move_list`**, formatted with
+  `string_builder_add_move()` exactly as the opening-rack executor already does,
+  with `equity_is_convertible()` guarding the pass sentinel.
+
+Two details that will otherwise bite:
+
+- **The move list is reused across turns.** `autoplay_worker->move_lists[]` is
+  allocated once per worker and refilled every turn, so the recorder must copy
+  what it needs rather than retaining the pointer.
+- **`MOVE_RECORD_BEST` leaves one entry.** For a static player the list holds
+  only the chosen move (see the cost table above), so the recorder will capture
+  a one-move "ranking" unless the override is relaxed. That is correct
+  behaviour, not a bug, but it means capture on a static-player job produces
+  much less than it looks like it should.
+
+### 3. Threading and consolidation
+
+Autoplay runs one `AutoplayWorker` per thread, each with its own recorder
+instance, merged at the end through `consolidate_func`. A positions recorder
+accumulates a list per thread and concatenates on consolidate, following
+`leaves_data_consolidate`.
+
+Because positions are recorded per thread and threads interleave games, the
+merged list is **not** in game or turn order. Either sort on consolidate, or
+accept unordered output and let the server key on
+`(game_number, pair_game_number, turn_number)` -- which it must do anyway. The
+latter is simpler and is what the schema above assumes.
+
+### 4. Emitting it
+
+The existing `str_func` produces the `-hr false` summary lines that the
+contribution client parses for game results. Positions are far too large for
+that shape, and the client reads results in-process anyway, so the recorder
+should expose a typed accessor rather than a string:
+
+```c
+typedef struct AutoplayPosition {
+  char *cgp;
+  char *rack;
+  int game_number;
+  int pair_game_number;
+  int turn_number;
+  int num_moves;              // how many were ranked, before truncation
+  AutoplayPositionMove *moves; // capture_top_moves of them
+  int num_stored_moves;
+} AutoplayPosition;
+
+// Borrowed, owned by the recorder; valid until the next autoplay run.
+const AutoplayPosition *autoplay_results_get_positions(
+    const AutoplayResults *results, int *count);
+```
+
+This mirrors `autoplay_results_get_game_summary()`, which was added for exactly
+this reason -- so the client reads results out of the structs instead of parsing
+formatted output. `config_contribute_games` then serializes the array into the
+`positions` field of its submission.
+
+### 5. Turning it on
+
+The contribution client sets the recorder option when the task request asks for
+it, so `capture_positions` on the birdtest job becomes `autoplay games,positions`
+on the MAGPIE invocation, with `capture_top_moves` bounding how many entries per
+turn are serialized.
 
 ## Wire format
 
@@ -169,34 +290,43 @@ already carries:
 
 Absent when capture is off, which keeps every existing client valid.
 
-Server-side validation should reject positions outside the task's own games
-(`game_index` beyond the batch) and cap the array length at
-`capture_max_per_task`, since a submission carrying millions of positions is
-otherwise an easy way to exhaust the database.
+Server-side validation should reject positions outside the task's own games --
+a `game_index` beyond the batch, or a `turn_number` beyond any plausible game --
+since the submission is otherwise unbounded input written straight into the
+largest table in the schema. The natural bound is the batch's own size: at most
+`games_per_batch` games, and a generous per-game turn ceiling.
 
 ## Phasing
 
 1. **Schema** -- surrogate key, provenance columns, the two partial unique
    indexes. Independent of MAGPIE and worth doing first, since it also
    simplifies `position_analysis_moves`'s foreign key.
-2. **Config and validation** -- the five columns, the wire field, the server-side
-   caps. Testable end to end with the fake worker before MAGPIE can produce
+2. **Config and validation** -- the two columns, the wire field, the server-side
+   bounds. Testable end to end with the fake worker before MAGPIE can produce
    anything.
-3. **MAGPIE `positions` recorder** for simming players, where the analysis is
-   already computed.
-4. **Static-player capture**, behind an option that names its cost.
-5. **Equity-margin filtering**, if the blanket sample rate proves too blunt.
+3. **`RecorderArgs` widening** -- the move list, game and turn fields. Mechanical,
+   touches the three existing `add_move` recorders only as a signature change,
+   and is worth landing on its own so the recorder itself reviews cleanly.
+4. **MAGPIE `positions` recorder** for simming players, where the analysis is
+   already computed. Testable from the command line via
+   `autoplay games,positions`.
+5. **Static-player capture**, behind an option that relaxes the
+   `MOVE_RECORD_BEST` override and names its cost.
 
 ## Open questions
 
-1. **Is the corpus worth the storage?** A job producing 18M move rows as a side
-   effect of settling an Elo question is a significant commitment. It may be that
-   what is actually wanted is a much smaller, targeted capture -- opening turns
-   only, or close decisions only -- rather than a sampled cross-section.
-2. **Should captured positions feed the opening rack tables at all?** An opening
-   rack job analyzes turn 1 exhaustively; a games job would capture turn 1
-   positions incidentally, with a different player config. Sharing a table means
-   queries must always filter by job, or by `position IS NULL`.
-3. **Does anything read this yet?** No dashboard surface is proposed here. Without
-   a consumer, the feature is a write-only corpus, and the sample rate should
-   probably start much lower than 1%.
+1. **Should captured positions share the opening rack tables?** An opening rack
+   job analyzes turn 1 exhaustively; a games job captures turn 1 positions
+   incidentally, under a different player config. Sharing a table means queries
+   must always filter by job, or on `position IS NULL`. The alternative is a
+   separate `game_position_analyses` table, which duplicates the moves table.
+2. **What bounds a submission?** With no per-task cap, `games_per_batch` is the
+   only control on payload size, and a job configured with both capture and a
+   large batch will produce very large submissions. Worth deciding whether the
+   server should reject over some size rather than discovering the limit in
+   production.
+
+There is deliberately no consumer yet: this is a corpus being built for later
+use. That is a legitimate reason to capture everything rather than sample, but
+it does mean the first real query against it may want an index that does not
+exist yet.
