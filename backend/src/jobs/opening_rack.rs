@@ -1,5 +1,5 @@
 use super::handler::*;
-use super::racks::{empty_board_cgp, LetterDistribution};
+use super::racks::LetterDistribution;
 use crate::error::{AppError, AppResult};
 use crate::models::job::OpeningRackConfig;
 use sqlx::{PgConnection, Row};
@@ -33,13 +33,13 @@ impl JobHandler for OpeningRackHandler {
 
         sqlx::query(
             "INSERT INTO position_requests
-                 (task_id, lexicon, variant, position, previous_play, player_config_id)
+                 (task_id, lexicon, variant, rack, previous_play, player_config_id)
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(task_id)
         .bind(&req.lexicon)
         .bind(&req.variant)
-        .bind(&req.position)
+        .bind(&req.rack)
         .bind(&req.previous_play)
         .bind(player_config_id)
         .execute(conn)
@@ -49,7 +49,7 @@ impl JobHandler for OpeningRackHandler {
 
     async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         let row = sqlx::query(
-            "SELECT r.lexicon, r.variant, r.position, r.previous_play, r.player_config_id
+            "SELECT r.lexicon, r.variant, r.rack, r.previous_play, r.player_config_id
              FROM position_requests r WHERE r.task_id = $1",
         )
         .bind(task_id)
@@ -60,7 +60,7 @@ impl JobHandler for OpeningRackHandler {
         Ok(PositionRequest {
             lexicon: row.get("lexicon"),
             variant: row.get("variant"),
-            position: row.get("position"),
+            rack: row.get("rack"),
             previous_play: row.get("previous_play"),
             player,
         })
@@ -166,13 +166,13 @@ pub async fn prepopulate(
 
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_requests
-                 (task_id, lexicon, variant, position, previous_play, player_config_id) ",
+                 (task_id, lexicon, variant, rack, previous_play, player_config_id) ",
         );
         builder.push_values(task_ids.iter().zip(chunk.iter()), |mut b, (task_id, rack)| {
             b.push_bind(*task_id)
                 .push_bind(config.lexicon.clone())
                 .push_bind(config.variant.clone())
-                .push_bind(empty_board_cgp(rack))
+                .push_bind(rack.clone())
                 // Opening racks sit on an empty board, so there is no prior move.
                 .push_bind(Option::<String>::None)
                 .push_bind(config.player_config_id);

@@ -249,7 +249,7 @@ CREATE TABLE position_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
-    position          TEXT NOT NULL,         -- CGP-encoded board + rack
+    rack              TEXT NOT NULL,         -- the rack to analyze; MAGPIE assumes the empty starting board
     previous_play     TEXT,                  -- GCG-encoded previous move; required when inference is enabled; NULL for opening racks
     player_config_id  UUID NOT NULL REFERENCES player_configs(id)
 );

@@ -88,8 +88,9 @@ impl From<PlayerConfig> for PlayerSpec {
 pub struct PositionRequest {
     pub lexicon: String,
     pub variant: String,
-    /// CGP-encoded board + rack.
-    pub position: String,
+    /// An opening rack is by definition the start of the game, so only the
+    /// rack crosses the wire -- MAGPIE assumes the empty starting board.
+    pub rack: String,
     pub previous_play: Option<String>,
     pub player: PlayerSpec,
 }

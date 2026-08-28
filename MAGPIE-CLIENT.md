@@ -582,7 +582,7 @@ is internally tagged by `job_type`, one of four shapes:
 ```json
 { "job_type": "opening_rack_analysis",
   "lexicon": "NWL23", "variant": "classic",
-  "position": "15/15/... AABCELT/ 0/0 0",
+  "rack": "AABCELT",
   "previous_play": null,
   "player": { "name": "static", "recorder_type": "best", "sort_strategy": "equity",
               "leaves": null, "max_iterations": null, "plies": null,

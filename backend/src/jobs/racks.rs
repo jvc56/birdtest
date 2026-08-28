@@ -143,13 +143,3 @@ impl LetterDistribution {
         }
     }
 }
-
-/// CGP for an empty standard board holding `rack` on turn for player 1.
-///
-/// The board is 15 rows of 15 empty squares; the trailing fields are the two
-/// racks, the two scores, and the consecutive-zero-score count.
-pub fn empty_board_cgp(rack: &str) -> String {
-    let row = "15";
-    let board = std::iter::repeat(row).take(15).collect::<Vec<_>>().join("/");
-    format!("{board} {rack}/ 0/0 0")
-}

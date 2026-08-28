@@ -277,18 +277,17 @@ async fn rack_lookup(
         chars.sort_unstable();
         chars.into_iter().collect()
     };
-    let position = crate::jobs::racks::empty_board_cgp(&canonical);
 
     let rows = sqlx::query(
         "SELECT m.rank, m.move, m.score, m.equity
          FROM position_analysis_moves m
          JOIN position_requests q ON q.task_id = m.task_id
          JOIN tasks t ON t.id = m.task_id
-         WHERE t.job_id = $1 AND q.position = $2
+         WHERE t.job_id = $1 AND q.rack = $2
          ORDER BY m.rank ASC",
     )
     .bind(job_id)
-    .bind(&position)
+    .bind(&canonical)
     .fetch_all(&state.pool)
     .await?;
 
