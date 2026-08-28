@@ -11,8 +11,7 @@ games, and submits results the server records and credits.
 | Piece | State |
 |---|---|
 | `src/compat/chttp` (libcurl via dlopen, WinHTTP, wasm stub) | Done. Also now backs `get_gcg.c`, replacing its three `curl`-binary calls. |
-| `src/compat/crandom`, `cfile`, `csleep` | Done |
-| Vendored cJSON + `src/util/json` wrapper | Done |
+| Vendored cJSON (`src/compat/cjson`, platform-conditional so it lives in `compat`) + `src/util/json` wrapper | Done |
 | `src/util/http_client` (retry policy) | Done |
 | `src/ent/client_state` (`contribute.txt`) | Done |
 | `contribute` command and task loop | Done |
@@ -22,11 +21,12 @@ games, and submits results the server records and credits.
 | Async GUI status surface (section 12) | Not implemented |
 | Windows WinHTTP backend | Written, not compiled or run on Windows |
 
-Two things learned while building it are folded in below: a task that fails
+Three things learned while building it are folded in below: a task that fails
 does not count toward `maxtasks`, so the loop needs a consecutive-failure guard
-or an unrunnable job spins forever; and `arg_token_t` is private to `config.c`,
-so the settings-file path is read there and passed into `impl_contribute`
-rather than looked up inside it.
+or an unrunnable job spins forever; `arg_token_t` is private to `config.c`, so
+the settings-file path is read there and passed into `impl_contribute` rather
+than looked up inside it; and the worker UUID is minted by the **server**, not
+the client -- see "The worker UUID" below.
 
 ## Goal
 
@@ -73,14 +73,30 @@ This invariant **currently holds exactly**: grepping the tree for `_WIN32`,
 wraps pthreads, `csched.h` stubs `sched_yield` for wasm, `endian_conv.h`
 branches on `_WIN32`, `ctime.h` wraps clocks. The client work is the largest
 new source of platform behaviour MAGPIE has taken on, and must not be what
-breaks it. Concretely, three new pieces of
-platform behaviour are needed, and all three go in `src/compat/`:
+breaks it. Concretely, one new piece of platform behaviour is needed, and it
+goes in `src/compat/`:
 
 | Need | Compat file | Neutral API it exposes |
 |---|---|---|
 | HTTP + TLS | `src/compat/chttp.h` / `chttp.c` | `chttp_request()` |
-| Cryptographic random bytes (worker UUID) | `src/compat/crandom.h` | `crandom_bytes()` |
-| Restricting a file to the owner (API key) | `src/compat/cfile.h` | `cfile_restrict_to_owner()` |
+
+The vendored cJSON parser also lives in `src/compat/` (`cjson.h` / `cjson.c`),
+not because MAGPIE's own code branches on platform, but because the vendored
+source itself has a `#ifdef _WIN32`-shaped block -- the same reason it counts
+as platform-specific code under this rule. `src/util/json` wraps it in an
+`ErrorStack`-aware API and is the only file that includes `cjson.h`, so
+everything above that wrapper stays platform-neutral.
+
+Two things this design **does not need**, despite an earlier draft of this
+spec calling for them:
+
+- **No `src/compat/crandom.h`.** The worker UUID is minted by the server, not
+  generated locally -- see "The worker UUID" below. A client never needs a
+  secure random source at all.
+- **No `src/compat/csleep.h`.** `src/compat/ctime.h` already has a portable
+  blocking sleep, `ctime_nap(double seconds)`, used elsewhere in MAGPIE (e.g.
+  the pre-endgame solver's poll loop). The task loop's poll/backoff waits call
+  that directly instead of introducing a second sleep abstraction.
 
 Everything above them — request construction, retry policy, JSON, the task loop
 — is ordinary portable C in `src/util/`, `src/ent/` and `src/impl/`.
@@ -98,7 +114,7 @@ error onto the stack. Nothing above compat needs to know.
 
 | Responsibility | Current implementation |
 |---|---|
-| Persistent worker identity | UUID generated on first run, stored on disk |
+| Persistent worker identity | UUID assigned by the server on the first claimed task, stored on disk |
 | Authentication | `Authorization: Bearer <api-key>`, or `X-Worker-UUID` when anonymous |
 | Claim a task | `POST /api/worker/task` -> task request, or 204 when idle |
 | Version gate | Refuse the task if MAGPIE is older than the job's `min_magpie_version` |
@@ -290,7 +306,7 @@ uuid      6f3d7198-178a-47c8-9ccc-6aa6995a5a9c
 | `threads` | no | cores − 1 | Threads given to MAGPIE while working |
 | `maxtasks` | no | `0` | Tasks to complete before stopping; `0` runs until stopped |
 | `idlewait` | no | `5` | Seconds to wait after the server reports no work |
-| `uuid` | no | generated | The anonymous worker identity |
+| `uuid` | no | assigned by the server | The anonymous worker identity |
 
 An unknown key is an error rather than a silent ignore — a typo'd `apikey`
 should not quietly downgrade someone to anonymous.
@@ -301,7 +317,7 @@ should not quietly downgrade someone to anonymous.
 typedef struct ClientState {
   char *server_url;
   char *api_key;      // NULL when contributing anonymously
-  char *worker_uuid;
+  char *worker_uuid;  // NULL until the server assigns one
   int threads;
   int max_tasks;
   int idle_wait_seconds;
@@ -309,51 +325,50 @@ typedef struct ClientState {
 
 ClientState *client_state_load(const char *path, ErrorStack *error_stack);
 void client_state_destroy(ClientState *state);
+
+// Records a UUID the server assigned during this run: updates the in-memory
+// state and appends it to the settings file.
+void client_state_set_worker_uuid(ClientState *state, const char *uuid);
 ```
 
 The file is **user-authored and MAGPIE does not rewrite it**, with exactly one
-exception: if `uuid` is absent, MAGPIE generates one and **appends a single
-line**. Appending rather than rewriting means comments, ordering and formatting
-the contributor put there survive untouched.
+exception: once the server assigns a `uuid` (see below), MAGPIE **appends a
+single line**. Appending rather than rewriting means comments, ordering and
+formatting the contributor put there survive untouched.
 
 If `server` is missing, `contribute` fails with a message naming the file and
 the missing key — not a usage string, since the fix is editing a file.
 
 ### The worker UUID
 
-v4, from 16 cryptographically random bytes via `crandom_bytes()`, formatted
-`8-4-4-4-12` lowercase hex with the version and variant bits set (byte 6
-`= (b & 0x0F) | 0x40`, byte 8 `= (b & 0x3F) | 0x80`).
+**The server mints it, not the client.** A worker with no `apikey` and no
+`uuid` yet sends no identity at all on its first request; the server responds
+with a UUID (via the JSON body of the first successful `/api/worker/task`
+claim, once there is actually a task to hand out — see section 5), and the
+client persists it and sends it as `X-Worker-UUID` on every request after that,
+for the rest of this run and every run to come.
+
+This is a deliberate reversal from letting the client generate its own UUID: a
+client-generated identity trusts a value the server never gets to validate.
+Having the server mint it costs one extra round trip for a brand-new anonymous
+worker's first task and nothing after that, and means MAGPIE's `contribute`
+code needs no cryptographically secure random source at all.
 
 Because the file is resolved relative to the working directory, a contributor
 who runs MAGPIE from a different directory has no `contribute.txt` there and
 `contribute` stops with a clear error — which is a better failure than silently
 becoming a new anonymous worker and losing their contribution history.
 
-### `src/compat/crandom.h`
+### The API key needs no special file handling
 
-```c
-// Fills buffer with cryptographically secure random bytes.
-void crandom_bytes(uint8_t *buffer, size_t length, ErrorStack *error_stack);
-```
-
-`getrandom(2)` on Linux with `/dev/urandom` as fallback, `arc4random_buf` on BSD
-and macOS, `BCryptGenRandom` on Windows, and an error push on wasm.
-
-### `src/compat/cfile.h`
-
-```c
-// Restricts a file to its owner: chmod 0600 on POSIX, owner-only ACL on Windows.
-void cfile_restrict_to_owner(const char *path, ErrorStack *error_stack);
-
-// True if anyone other than the owner can read the file.
-bool cfile_is_world_readable(const char *path);
-```
-
-`contribute.txt` holds a bearer credential. On load, if it contains an `apikey`
-and `cfile_is_world_readable()` is true, warn and call
-`cfile_restrict_to_owner()`. The key must never appear in status output, logs,
-or error messages.
+`contribute.txt` holds a bearer credential when `apikey` is set, but nothing
+about that requires MAGPIE-side file permission handling: it is a plain text
+file the contributor already created and controls the permissions of, on their
+own machine, the same as `settings.txt` or any CGP file MAGPIE reads. MAGPIE
+does not `chmod` it, check who else can read it, or otherwise treat it as
+special. The key still never appears on the command line, in `settings.txt`, or
+in status output, logs, or error messages -- the file is the only place it
+lives.
 
 ## 4. The `contribute` command
 
@@ -382,11 +397,14 @@ should not silently inherit whatever a user last set for simulation.
 
 **The loop:**
 
-1. Load `ClientState` from the settings file, generating and appending a `uuid`
-   if absent.
-2. `POST /api/worker/task`.
+1. Load `ClientState` from the settings file. `uuid` may be absent -- the
+   server assigns one, see step 2.
+2. `POST /api/worker/task`, identifying with the API key if set, the stored
+   `uuid` if set, or no identity header at all if neither is set yet.
    - 204: sleep `idlewait`, repeat.
-   - 200: continue.
+   - 200: if the response carries a `worker_uuid` and this worker had none
+     locally, adopt it -- update `ClientState` and the request identity used
+     from here on, and append it to the settings file. Continue.
 3. **Version gate.** The response carries `min_magpie_version`. If it is present
    and this build is older, **stop the loop and report an error**: "this job
    requires MAGPIE >= 1.4.0; you are running 1.2.0. Update MAGPIE to continue
@@ -542,19 +560,24 @@ Five endpoints. Authentication on all of them is either
 
 ### `POST /api/worker/task`
 
-Empty body. `204` when there is no work. `200`:
+Empty body. `204` when there is no work -- no body, so a request that arrived
+with no identity is not assigned a UUID here; it tries again with no identity
+next time, and gets one for keeps once a task is actually available. `200`:
 
 ```json
 {
   "claim_token": "6f3d7198-178a-47c8-9ccc-6aa6995a5a9c",
   "job_id": "4c7b64ad-8e5e-4db7-aeb0-afc44ee1ebf5",
   "min_magpie_version": "1.4.0",
+  "worker_uuid": "6f3d7198-178a-47c8-9ccc-6aa6995a5a9c",
   "task_request": { "job_type": "games", "...": "..." }
 }
 ```
 
-`min_magpie_version` may be `null`. `task_request` is internally tagged by
-`job_type`, one of four shapes:
+`min_magpie_version` may be `null`. `worker_uuid` is present only when the
+request carried no identity at all and the server just minted one for it; the
+client persists this and sends it as `X-Worker-UUID` from then on. `task_request`
+is internally tagged by `job_type`, one of four shapes:
 
 ```json
 { "job_type": "opening_rack_analysis",
@@ -648,8 +671,10 @@ backoff, not as an error.
 - TLS certificate verification on by default, with no way to disable it.
 - The API key is never accepted on the command line, never written to
   `settings.txt`, and never appears in status output, logs or errors. It lives
-  only in `contribute.txt`, which is kept owner-only via
-  `cfile_restrict_to_owner()`.
+  only in `contribute.txt`, an ordinary file the contributor already controls
+  the permissions of on their own machine.
+- The worker UUID is minted by the server, never trusted from the client, so a
+  client cannot pick or collide an identity on its own.
 - **Every field of a task request is untrusted input.** It becomes file paths
   (`forced_racks`, `previous_artifact_key`) and numeric parameters. Validate
   lexicon and variant against known values before they reach `data_filepaths`,
@@ -717,8 +742,8 @@ birdtest's worker component and its coverage gate disappear. What replaces them:
 
 ## Phasing
 
-1. **Compat foundations** — `chttp` (both backends plus the wasm stub),
-   `crandom`, `cfile`. Convert `get_gcg.c`'s three `curl`-via-`popen` call sites
+1. **Compat foundations** — `chttp` (both backends plus the wasm stub).
+   Convert `get_gcg.c`'s three `curl`-via-`popen` call sites
    to `chttp_request()` as the first consumer: it exercises the layer against a
    real endpoint before any birdtest code exists, and removes MAGPIE's dependency
    on the `curl` binary.

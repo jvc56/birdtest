@@ -64,11 +64,14 @@ impl FromRequestParts<AppState> for AdminUser {
 }
 
 /// Who is asking for work. Authenticated workers present an API key; anonymous
-/// workers present a self-generated UUID.
+/// workers present the UUID the server previously assigned them via
+/// `X-Worker-UUID`. A request with neither is still anonymous -- it just has
+/// no identity yet, so one is minted here and handed back to the client in
+/// the claim response for it to reuse on every later request.
 #[derive(Debug, Clone)]
 pub enum WorkerIdentity {
     User { user_id: Uuid },
-    Anonymous { uuid: Uuid },
+    Anonymous { uuid: Uuid, newly_assigned: bool },
 }
 
 impl WorkerIdentity {
@@ -82,7 +85,18 @@ impl WorkerIdentity {
     pub fn anon_uuid(&self) -> Option<Uuid> {
         match self {
             WorkerIdentity::User { .. } => None,
-            WorkerIdentity::Anonymous { uuid } => Some(*uuid),
+            WorkerIdentity::Anonymous { uuid, .. } => Some(*uuid),
+        }
+    }
+
+    /// The UUID to hand back to the client, when the server just minted one
+    /// for a request that arrived with no identity at all.
+    pub fn newly_assigned_uuid(&self) -> Option<Uuid> {
+        match self {
+            WorkerIdentity::User { .. } => None,
+            WorkerIdentity::Anonymous { uuid, newly_assigned } => {
+                newly_assigned.then_some(*uuid)
+            }
         }
     }
 
@@ -90,7 +104,7 @@ impl WorkerIdentity {
     pub fn rate_key(&self) -> String {
         match self {
             WorkerIdentity::User { user_id } => format!("u:{user_id}"),
-            WorkerIdentity::Anonymous { uuid } => format!("a:{uuid}"),
+            WorkerIdentity::Anonymous { uuid, .. } => format!("a:{uuid}"),
         }
     }
 }
@@ -129,12 +143,21 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             let raw = parts
                 .headers
                 .get("x-worker-uuid")
-                .and_then(|v| v.to_str().ok())
-                .ok_or_else(|| {
-                    AppError::unauthorized("provide an API key or an X-Worker-UUID header")
-                })?;
-            let uuid = Uuid::parse_str(raw)
-                .map_err(|_| AppError::bad_request("X-Worker-UUID is not a valid UUID"))?;
+                .and_then(|v| v.to_str().ok());
+
+            let (uuid, newly_assigned) = match raw {
+                Some(raw) => {
+                    let uuid = Uuid::parse_str(raw).map_err(|_| {
+                        AppError::bad_request("X-Worker-UUID is not a valid UUID")
+                    })?;
+                    (uuid, false)
+                }
+                // No identity at all: the client has never contributed before, so
+                // the server mints the UUID rather than trusting the client to
+                // generate one. Handed back to the client in the claim response
+                // (see `claim_task`) for it to persist and resend from then on.
+                None => (Uuid::new_v4(), true),
+            };
 
             // Upsert so contribution tracking works for a worker we've never seen.
             sqlx::query(
@@ -145,7 +168,7 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             .execute(&state.pool)
             .await?;
 
-            WorkerIdentity::Anonymous { uuid }
+            WorkerIdentity::Anonymous { uuid, newly_assigned }
         };
 
         ensure_not_banned(state, &identity).await?;

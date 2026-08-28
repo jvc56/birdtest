@@ -85,6 +85,11 @@ struct TaskAssignment {
     job_id: Uuid,
     task_request: TaskRequest,
     min_magpie_version: Option<String>,
+    /// Present only when the request carried no identity at all and the
+    /// server just minted one. The client persists this and sends it as
+    /// `X-Worker-UUID` on every later request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_uuid: Option<Uuid>,
 }
 
 /// The task claim: a minimal message saying "I am ready for work". Everything
@@ -94,13 +99,18 @@ async fn claim_task(State(state): State<AppState>, identity: WorkerIdentity) -> 
 
     match scheduler::claim(&state, &identity).await? {
         // 204 rather than an error: "no work right now" is the normal state of a
-        // quiet server, and the client just sleeps and asks again.
+        // quiet server, and the client just sleeps and asks again. A brand new
+        // anonymous identity minted for this request is not reported here --
+        // there is no body to carry it in, and a client that finds no work has
+        // nothing to persist yet. It tries again with no identity next time,
+        // and gets one for keeps once a task is actually available.
         None => Ok(StatusCode::NO_CONTENT.into_response()),
         Some(outcome) => Ok(Json(TaskAssignment {
             claim_token: outcome.claim_token,
             job_id: outcome.job_id,
             task_request: outcome.request,
             min_magpie_version: outcome.min_magpie_version,
+            worker_uuid: identity.newly_assigned_uuid(),
         })
         .into_response()),
     }
