@@ -174,6 +174,18 @@ export interface PlayerConfig {
   stopping_pct: number | null;
   use_inference: boolean | null;
   time_limit_secs: number | null;
+  lexicon: string | null;
+  use_wordmap: boolean | null;
+  use_rit: boolean | null;
+  min_play_iterations: number | null;
+  threshold: string | null;
+  sampling_rule: string | null;
+  inference_margin: number | null;
+  utility_w_winpct: number | null;
+  utility_w_spread: number | null;
+  utility_spread_scale: number | null;
+  win_pct_model: string | null;
+  movegen_margin: number | null;
   created_at: string;
 }
 

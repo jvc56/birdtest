@@ -59,6 +59,18 @@ pub struct PlayerSpec {
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<f64>,
+    pub lexicon: Option<String>,
+    pub use_wordmap: Option<bool>,
+    pub use_rit: Option<bool>,
+    pub min_play_iterations: Option<i32>,
+    pub threshold: Option<String>,
+    pub sampling_rule: Option<String>,
+    pub inference_margin: Option<f64>,
+    pub utility_w_winpct: Option<f64>,
+    pub utility_w_spread: Option<f64>,
+    pub utility_spread_scale: Option<f64>,
+    pub win_pct_model: Option<String>,
+    pub movegen_margin: Option<f64>,
 }
 
 impl From<PlayerConfig> for PlayerSpec {
@@ -76,6 +88,18 @@ impl From<PlayerConfig> for PlayerSpec {
             stopping_pct: c.stopping_pct,
             use_inference: c.use_inference,
             time_limit_secs: c.time_limit_secs,
+            lexicon: c.lexicon,
+            use_wordmap: c.use_wordmap,
+            use_rit: c.use_rit,
+            min_play_iterations: c.min_play_iterations,
+            threshold: c.threshold,
+            sampling_rule: c.sampling_rule,
+            inference_margin: c.inference_margin,
+            utility_w_winpct: c.utility_w_winpct,
+            utility_w_spread: c.utility_w_spread,
+            utility_spread_scale: c.utility_spread_scale,
+            win_pct_model: c.win_pct_model,
+            movegen_margin: c.movegen_margin,
         }
     }
 }
@@ -185,6 +209,11 @@ pub struct MoveEntry {
     /// equity alone and simulates nothing.
     #[serde(default)]
     pub win_percentage: Option<f64>,
+    /// Mean win%+spread blend in [0, 1], sometimes used to rank moves instead
+    /// of equity or raw win percentage. Absent for a static player, same as
+    /// win_percentage.
+    #[serde(default)]
+    pub blended_utility: Option<f64>,
     #[serde(default)]
     pub plies: Vec<PlyStats>,
 }
@@ -244,6 +273,12 @@ pub struct CapturedPosition {
     pub rack: String,
     /// CGP of the position as it stood before the move was played.
     pub position: String,
+    /// The move played on the previous turn of this game, and its score.
+    /// Absent on the first turn of a game.
+    #[serde(default)]
+    pub previous_move: Option<String>,
+    #[serde(default)]
+    pub previous_move_score: Option<i32>,
     /// How many moves were ranked, before truncation to `num_plays_recorded`.
     pub num_moves: i32,
     pub moves: Vec<MoveEntry>,
@@ -290,6 +325,10 @@ pub struct PositionAnalysis {
     /// In-game positions only: which game of the batch, and which turn of it.
     pub game_index: Option<i16>,
     pub turn_number: Option<i16>,
+    /// The move played on the previous turn of this game, and its score.
+    /// `None` for turn 0 of a game and for opening racks.
+    pub previous_move: Option<String>,
+    pub previous_move_score: Option<i32>,
     /// How many moves the worker ranked, which is generally far more than the
     /// number kept in `moves`. The only part of the analysis the stored moves
     /// cannot recover, since they are truncated.
@@ -300,13 +339,15 @@ pub struct PositionAnalysis {
 }
 
 impl PositionAnalysis {
-    /// An opening rack: no board, no game, no turn.
+    /// An opening rack: no board, no game, no turn, no previous move.
     pub fn opening_rack(rack: String, moves: Vec<MoveEntry>) -> Self {
         Self {
             rack,
             position: None,
             game_index: None,
             turn_number: None,
+            previous_move: None,
+            previous_move_score: None,
             num_moves: moves.len() as i32,
             moves,
         }

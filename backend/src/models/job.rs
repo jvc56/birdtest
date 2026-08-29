@@ -53,6 +53,22 @@ pub struct PlayerConfig {
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<f64>,
+    /// Per-player lexicon override; `None` means the job's lexicon.
+    pub lexicon: Option<String>,
+    pub use_wordmap: Option<bool>,
+    pub use_rit: Option<bool>,
+    pub min_play_iterations: Option<i32>,
+    pub threshold: Option<String>,
+    pub sampling_rule: Option<String>,
+    pub inference_margin: Option<f64>,
+    pub utility_w_winpct: Option<f64>,
+    pub utility_w_spread: Option<f64>,
+    pub utility_spread_scale: Option<f64>,
+    /// Shared MAGPIE settings, not really per-player, but stored here anyway
+    /// so this table is the exhaustive source of what a job asked for; a
+    /// job's two player configs must agree on these (validated at creation).
+    pub win_pct_model: Option<String>,
+    pub movegen_margin: Option<f64>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
 }

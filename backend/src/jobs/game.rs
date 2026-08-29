@@ -48,6 +48,8 @@ pub(super) fn validate_positions(
             position: Some(position.position),
             game_index: Some(position.game_index),
             turn_number: Some(position.turn_number),
+            previous_move: position.previous_move,
+            previous_move_score: position.previous_move_score,
             num_moves: position.num_moves,
             moves: position.moves,
         });

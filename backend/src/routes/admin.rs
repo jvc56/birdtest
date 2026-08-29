@@ -71,6 +71,30 @@ struct CreatePlayerConfigBody {
     stopping_pct: Option<f64>,
     use_inference: Option<bool>,
     time_limit_secs: Option<f64>,
+    #[serde(default)]
+    lexicon: Option<String>,
+    #[serde(default)]
+    use_wordmap: Option<bool>,
+    #[serde(default)]
+    use_rit: Option<bool>,
+    #[serde(default)]
+    min_play_iterations: Option<i32>,
+    #[serde(default)]
+    threshold: Option<String>,
+    #[serde(default)]
+    sampling_rule: Option<String>,
+    #[serde(default)]
+    inference_margin: Option<f64>,
+    #[serde(default)]
+    utility_w_winpct: Option<f64>,
+    #[serde(default)]
+    utility_w_spread: Option<f64>,
+    #[serde(default)]
+    utility_spread_scale: Option<f64>,
+    #[serde(default)]
+    win_pct_model: Option<String>,
+    #[serde(default)]
+    movegen_margin: Option<f64>,
 }
 
 async fn create_player_config(
@@ -91,13 +115,29 @@ async fn create_player_config(
             return Err(AppError::bad_request("sort_strategy must be 'equity', 'score' or null"));
         }
     }
+    if let Some(threshold) = &body.threshold {
+        if !matches!(threshold.as_str(), "none" | "gk16") {
+            return Err(AppError::bad_request("threshold must be 'none', 'gk16' or null"));
+        }
+    }
+    if let Some(rule) = &body.sampling_rule {
+        if !matches!(rule.as_str(), "round_robin" | "top_two_ids") {
+            return Err(AppError::bad_request(
+                "sampling_rule must be 'round_robin', 'top_two_ids' or null",
+            ));
+        }
+    }
 
     let config = sqlx::query_as::<_, PlayerConfig>(
         "INSERT INTO player_configs
              (name, recorder_type, sort_strategy, leaves, max_iterations, plies,
               num_plies_recorded, num_plays, num_plays_recorded,
-              stopping_pct, use_inference, time_limit_secs, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+              stopping_pct, use_inference, time_limit_secs,
+              lexicon, use_wordmap, use_rit, min_play_iterations, threshold,
+              sampling_rule, inference_margin, utility_w_winpct, utility_w_spread,
+              utility_spread_scale, win_pct_model, movegen_margin, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
+                 $18,$19,$20,$21,$22,$23,$24,$25)
          RETURNING *",
     )
     .bind(body.name.trim())
@@ -112,6 +152,18 @@ async fn create_player_config(
     .bind(body.stopping_pct)
     .bind(body.use_inference)
     .bind(body.time_limit_secs)
+    .bind(&body.lexicon)
+    .bind(body.use_wordmap)
+    .bind(body.use_rit)
+    .bind(body.min_play_iterations)
+    .bind(&body.threshold)
+    .bind(&body.sampling_rule)
+    .bind(body.inference_margin)
+    .bind(body.utility_w_winpct)
+    .bind(body.utility_w_spread)
+    .bind(body.utility_spread_scale)
+    .bind(&body.win_pct_model)
+    .bind(body.movegen_margin)
     .bind(admin.0.id)
     .fetch_one(&state.pool)
     .await?;
@@ -320,6 +372,50 @@ async fn create_job(
     Ok((StatusCode::CREATED, Json(CreatedJob { job, initialized })))
 }
 
+/// MAGPIE has one value for these for the whole run, not one per player, even
+/// though they live on `player_configs` (so that table stays the exhaustive
+/// source of what a job asked for -- see the migration comment on
+/// `win_pct_model`/`movegen_margin`). A `games`/`game_pairs` job whose two
+/// player configs disagree on one of these can't be honored, so job creation
+/// rejects it here rather than leaving one worker's value to win silently.
+async fn validate_shared_player_options(
+    conn: &mut sqlx::PgConnection,
+    player1_config_id: Uuid,
+    player2_config_id: Uuid,
+) -> AppResult<()> {
+    if player1_config_id == player2_config_id {
+        return Ok(());
+    }
+    let row = sqlx::query(
+        "SELECT p1.win_pct_model AS p1_win_pct_model, p2.win_pct_model AS p2_win_pct_model,
+                p1.movegen_margin AS p1_movegen_margin, p2.movegen_margin AS p2_movegen_margin
+         FROM player_configs p1, player_configs p2
+         WHERE p1.id = $1 AND p2.id = $2",
+    )
+    .bind(player1_config_id)
+    .bind(player2_config_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| AppError::bad_request("player config not found"))?;
+
+    use sqlx::Row;
+    let p1_win_pct_model: Option<String> = row.get("p1_win_pct_model");
+    let p2_win_pct_model: Option<String> = row.get("p2_win_pct_model");
+    if p1_win_pct_model != p2_win_pct_model {
+        return Err(AppError::bad_request(
+            "player configs disagree on win_pct_model, which MAGPIE cannot vary per player",
+        ));
+    }
+    let p1_movegen_margin: Option<f64> = row.get("p1_movegen_margin");
+    let p2_movegen_margin: Option<f64> = row.get("p2_movegen_margin");
+    if p1_movegen_margin != p2_movegen_margin {
+        return Err(AppError::bad_request(
+            "player configs disagree on movegen_margin, which MAGPIE cannot vary per player",
+        ));
+    }
+    Ok(())
+}
+
 async fn insert_job_config(
     conn: &mut sqlx::PgConnection,
     job: &Job,
@@ -370,6 +466,8 @@ async fn insert_job_config(
                 capture_positions,
             },
         ) => {
+            validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
+                .await?;
             sqlx::query(
                 "INSERT INTO job_game_config
                      (job_id, lexicon, variant, letter_distribution, player1_config_id,
@@ -394,6 +492,8 @@ async fn insert_job_config(
                 capture_positions,
             },
         ) => {
+            validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
+                .await?;
             sqlx::query(
                 "INSERT INTO job_game_pair_config
                      (job_id, lexicon, variant, letter_distribution, player1_config_id,

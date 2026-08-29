@@ -99,14 +99,16 @@ pub(crate) async fn insert_position_analyses(
     for position in positions {
         let insert = if on_conflict_ignore {
             "INSERT INTO position_analysis_records
-                 (task_claim_id, task_id, rack, position, game_index, turn_number, num_moves)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 (task_claim_id, task_id, rack, position, game_index, turn_number,
+                  previous_move, previous_move_score, num_moves)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT DO NOTHING
              RETURNING id"
         } else {
             "INSERT INTO position_analysis_records
-                 (task_claim_id, task_id, rack, position, game_index, turn_number, num_moves)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)
+                 (task_claim_id, task_id, rack, position, game_index, turn_number,
+                  previous_move, previous_move_score, num_moves)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              RETURNING id"
         };
 
@@ -117,6 +119,8 @@ pub(crate) async fn insert_position_analyses(
             .bind(&position.position)
             .bind(position.game_index)
             .bind(position.turn_number)
+            .bind(&position.previous_move)
+            .bind(position.previous_move_score)
             .bind(position.num_moves)
             .fetch_optional(&mut *conn)
             .await?;
@@ -131,7 +135,8 @@ pub(crate) async fn insert_position_analyses(
         }
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_moves
-                 (record_id, task_id, rank, move, score, equity, win_percentage) ",
+                 (record_id, task_id, rank, move, score, equity, win_percentage,
+                  blended_utility) ",
         );
         builder.push_values(kept.iter().enumerate(), |mut b, (index, entry)| {
             b.push_bind(record_id)
@@ -141,7 +146,8 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(entry.score)
                 .push_bind(entry.equity)
                 // NULL for a static player, which simulates nothing.
-                .push_bind(entry.win_percentage);
+                .push_bind(entry.win_percentage)
+                .push_bind(entry.blended_utility);
         });
         // Returned in insertion order, so the ids line up with `kept` and the
         // per-ply rows can be attached without looking each move back up.

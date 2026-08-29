@@ -17,7 +17,7 @@ games, and submits results the server records and credits.
 | `contribute` command and task loop | Done |
 | `games` / `game_pairs` executors | Done, verified end to end |
 | `opening_rack` executor | Written; not verified end to end (needs a job whose lexicon MAGPIE has, and a full English rack enumeration is millions of tasks) |
-| `leave_generation` executor | **Not implemented.** Needs artifact download and reading the rack-equity table out of `RackList`; currently reports that clearly and stops. |
+| `leave_generation` executor | Implemented: `config_contribute_leave_gen` fetches the previous generation's KLV via `contribute_fetch_artifact`, writes the forced-rack subset to a scratch file, runs the existing `leavegen` autoplay type bounded by a new `leavegen_max_games` cap (0 = unbounded, the CLI's own default), and reads results out of `RackList` via the new `rack_list_get_rack_equity_json` rather than a CSV round trip. |
 | Async GUI status surface (section 12) | Not implemented |
 | Windows WinHTTP backend | Written, not compiled or run on Windows |
 
@@ -451,9 +451,25 @@ per-player settings, where `N` is 1 or 2:
 | `stopping_pct` | `-scN` | |
 | `use_inference` | `-siN` | |
 | `time_limit_secs` | `-tlN` | |
+| `lexicon` | `-lN` | per-player lexicon override; null means the job's lexicon |
+| `use_wordmap` | `-wN` | applied directly against `players_data`, not `-wN`'s own arg parsing |
+| `use_rit` | `-ritN` | same |
+| `min_play_iterations` | `-miN` | |
+| `threshold` | `-thN` | `'none'` \| `'gk16'` |
+| `sampling_rule` | `-saN` | `'round_robin'` \| `'top_two_ids'` |
+| `inference_margin` | `-imN` | |
+| `utility_w_winpct` | `-uwinN` | blended-utility weight on win% |
+| `utility_w_spread` | `-uspreadN` | blended-utility weight on spread |
+| `utility_spread_scale` | `-uspreadscaleN` | |
 
 A player with `max_iterations` null is static; the simulation settings are all
 null together and must be omitted rather than passed as zero.
+
+Two more fields are sent once per player (on `player1`) but are really one
+shared MAGPIE setting for the whole run, not per-player: `win_pct_model`
+(`-winpct`) and `movegen_margin` (`-mmargin`). birdtest validates a job's two
+player configs agree on these before the job is even created, since MAGPIE
+has no way to vary them by player.
 
 - **Opening rack analysis** — load the CGP, apply the single player config, run
   move generation (or simulation when `max_iterations` is set), and read the

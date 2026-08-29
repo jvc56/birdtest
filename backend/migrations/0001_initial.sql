@@ -127,6 +127,26 @@ CREATE TABLE player_configs (
     stopping_pct     DOUBLE PRECISION,      -- -sc1 / -sc2 (0–100)
     use_inference    BOOLEAN,               -- -si1 / -si2
     time_limit_secs  DOUBLE PRECISION,      -- -tl1 / -tl2
+    -- The remaining MAGPIE options that can affect how a player plays.
+    -- Exhaustive on purpose: anything not stated here falls back to whatever
+    -- value a worker's own MAGPIE process happens to have, which can differ
+    -- across workers and silently produce non-comparable data.
+    lexicon              TEXT,               -- per-player lexicon override; NULL = the job's lexicon  (-l1 / -l2)
+    use_wordmap          BOOLEAN,            -- -w1 / -w2
+    use_rit               BOOLEAN,           -- rack info table            (-rit1 / -rit2)
+    min_play_iterations   INT,               -- -mi1 / -mi2
+    threshold             TEXT,              -- 'none' | 'gk16'            (-th1 / -th2)
+    sampling_rule         TEXT,              -- 'round_robin' | 'top_two_ids' (-sa1 / -sa2)
+    inference_margin       DOUBLE PRECISION, -- -im1 / -im2
+    utility_w_winpct       DOUBLE PRECISION, -- blended-utility weight on win%     (-uwin1 / -uwin2)
+    utility_w_spread       DOUBLE PRECISION, -- blended-utility weight on spread   (-uspread1 / -uspread2)
+    utility_spread_scale   DOUBLE PRECISION, -- blended-utility spread scale       (-uspreadscale1 / -uspreadscale2)
+    -- Options that are one shared MAGPIE setting for the whole run rather
+    -- than per-player. Stored here anyway (duplicated on both players'
+    -- rows in a job, validated equal at job-creation time) so this table
+    -- stays the single, exhaustive source of what a job asked MAGPIE for.
+    win_pct_model         TEXT,              -- win% model file; NULL = lexicon default (-winpct)
+    movegen_margin         DOUBLE PRECISION, -- move-gen equity margin for 'equity' recording (-mmargin)
     created_by       UUID NOT NULL REFERENCES users(id),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -375,6 +395,10 @@ CREATE TABLE position_analysis_records (
     -- In-game positions only: which game of the batch, and which turn of it.
     game_index      SMALLINT,
     turn_number     SMALLINT,
+    -- The move played on the previous turn of this game, and its score.
+    -- NULL for turn 0 of a game (nothing preceded it) and for opening racks.
+    previous_move       TEXT,
+    previous_move_score INT,
     -- How many moves the worker ranked, which is generally far more than the
     -- stored moves. The one thing about the analysis those cannot tell you,
     -- since they are truncated.
@@ -423,7 +447,12 @@ CREATE TABLE position_analysis_moves (
     equity          DOUBLE PRECISION NOT NULL,
     -- The simulated win percentage. NULL for a static player, which ranks on
     -- equity alone and simulates nothing.
-    win_percentage  DOUBLE PRECISION
+    win_percentage  DOUBLE PRECISION,
+    -- Mean win%+spread blend in [0, 1] (see the player config's
+    -- utility_w_winpct/utility_w_spread/utility_spread_scale), sometimes used
+    -- to rank moves instead of equity or raw win percentage. NULL for a
+    -- static player, same as win_percentage.
+    blended_utility DOUBLE PRECISION
 );
 CREATE INDEX position_analysis_moves_record_idx
     ON position_analysis_moves (record_id, rank);

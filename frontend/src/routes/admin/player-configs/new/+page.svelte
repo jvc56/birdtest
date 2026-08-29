@@ -15,6 +15,22 @@
   let stoppingPct = 99;
   let useInference = false;
   let timeLimitSecs: number | '' = '';
+  let showAdvanced = false;
+  // Exhaustive on purpose: any MAGPIE option not stated here falls back to
+  // whatever a worker's own process happens to have, which can differ across
+  // workers.
+  let lexicon = '';
+  let useWordmap = true;
+  let useRit = false;
+  let minPlayIterations: number | '' = '';
+  let threshold = '';
+  let samplingRule = '';
+  let inferenceMargin: number | '' = '';
+  let utilityWWinpct: number | '' = '';
+  let utilityWSpread: number | '' = '';
+  let utilitySpreadScale: number | '' = '';
+  let winPctModel = '';
+  let movegenMargin: number | '' = '';
   let error = '';
   let busy = false;
 
@@ -35,7 +51,19 @@
         num_plies_recorded: simming ? numPliesRecorded : null,
         stopping_pct: simming ? stoppingPct : null,
         use_inference: simming ? useInference : null,
-        time_limit_secs: simming && timeLimitSecs !== '' ? Number(timeLimitSecs) : null
+        time_limit_secs: simming && timeLimitSecs !== '' ? Number(timeLimitSecs) : null,
+        lexicon: lexicon || null,
+        use_wordmap: useWordmap,
+        use_rit: useRit,
+        min_play_iterations: minPlayIterations === '' ? null : Number(minPlayIterations),
+        threshold: threshold || null,
+        sampling_rule: samplingRule || null,
+        inference_margin: inferenceMargin === '' ? null : Number(inferenceMargin),
+        utility_w_winpct: utilityWWinpct === '' ? null : Number(utilityWWinpct),
+        utility_w_spread: utilityWSpread === '' ? null : Number(utilityWSpread),
+        utility_spread_scale: utilitySpreadScale === '' ? null : Number(utilitySpreadScale),
+        win_pct_model: winPctModel || null,
+        movegen_margin: movegenMargin === '' ? null : Number(movegenMargin)
       });
       goto('/admin/player-configs');
       return created;
@@ -104,6 +132,78 @@
         <option value="equity">equity — score plus leave value (standard static player)</option>
         <option value="score">score — raw score only</option>
       </select>
+    </div>
+  {/if}
+
+  <button type="button" class="text-sm text-muted-foreground underline" on:click={() => (showAdvanced = !showAdvanced)}>
+    {showAdvanced ? 'Hide' : 'Show'} advanced options
+  </button>
+
+  {#if showAdvanced}
+    <div class="grid grid-cols-2 gap-3 rounded border p-3">
+      <div>
+        <label class="label" for="lexicon">Lexicon override (-l)</label>
+        <input id="lexicon" class="input" bind:value={lexicon} placeholder="job's lexicon" />
+      </div>
+      <label class="flex items-end gap-2 text-sm">
+        <input type="checkbox" bind:checked={useWordmap} />
+        Use wordmap (-w)
+      </label>
+      <label class="flex items-end gap-2 text-sm">
+        <input type="checkbox" bind:checked={useRit} />
+        Use rack info table (-rit)
+      </label>
+      <div>
+        <label class="label" for="minpi">Min play iterations (-mi)</label>
+        <input id="minpi" type="number" class="input" bind:value={minPlayIterations} />
+      </div>
+      <div>
+        <label class="label" for="threshold">Threshold (-th)</label>
+        <select id="threshold" class="input" bind:value={threshold}>
+          <option value="">lexicon default</option>
+          <option value="none">none</option>
+          <option value="gk16">gk16</option>
+        </select>
+      </div>
+      <div>
+        <label class="label" for="samplingrule">Sampling rule (-sa)</label>
+        <select id="samplingrule" class="input" bind:value={samplingRule}>
+          <option value="">lexicon default</option>
+          <option value="round_robin">round_robin</option>
+          <option value="top_two_ids">top_two_ids</option>
+        </select>
+      </div>
+      <div>
+        <label class="label" for="im">Inference margin (-im)</label>
+        <input id="im" type="number" step="0.1" class="input" bind:value={inferenceMargin} />
+      </div>
+      <div>
+        <label class="label" for="uwin">Utility weight: win% (-uwin)</label>
+        <input id="uwin" type="number" step="0.1" class="input" bind:value={utilityWWinpct} />
+      </div>
+      <div>
+        <label class="label" for="uspread">Utility weight: spread (-uspread)</label>
+        <input id="uspread" type="number" step="0.1" class="input" bind:value={utilityWSpread} />
+      </div>
+      <div>
+        <label class="label" for="uspreadscale">Utility spread scale (-uspreadscale)</label>
+        <input id="uspreadscale" type="number" step="0.1" class="input" bind:value={utilitySpreadScale} />
+      </div>
+      <div>
+        <label class="label" for="winpctmodel">Win% model file (-winpct)</label>
+        <input id="winpctmodel" class="input" bind:value={winPctModel} placeholder="lexicon default" />
+        <p class="mt-1 text-xs text-muted-foreground">
+          Shared across both players in a job -- a games/game_pairs job's two
+          configs must agree on this.
+        </p>
+      </div>
+      <div>
+        <label class="label" for="mmargin">Move-gen equity margin (-mmargin)</label>
+        <input id="mmargin" type="number" step="0.1" class="input" bind:value={movegenMargin} />
+        <p class="mt-1 text-xs text-muted-foreground">
+          Shared across both players in a job, same as win% model.
+        </p>
+      </div>
     </div>
   {/if}
 

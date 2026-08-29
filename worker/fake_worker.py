@@ -105,7 +105,7 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
         # Real games run about 22 turns; varying it exercises the turn bound.
         for turn in range(rng.randint(18, 26)):
             ranked = rng.randint(top_moves, 400)
-            positions.append({
+            position = {
                 "game_index": game_index,
                 "turn_number": turn,
                 "rack": "".join(rng.choice("AEINRSTLOU") for _ in range(7)),
@@ -118,6 +118,9 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
                         "equity": round(rng.uniform(-5, 60), 3),
                         # Absent for a static player, which simulates nothing.
                         "win_percentage": round(rng.uniform(20, 80), 3),
+                        # Same nullability as win_percentage: the win%+spread
+                        # blend, sometimes used to rank moves instead.
+                        "blended_utility": round(rng.uniform(0, 1), 3),
                         "plies": [
                             {
                                 "ply": p,
@@ -129,7 +132,12 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
                     }
                     for i in range(top_moves)
                 ],
-            })
+            }
+            # Absent on the first turn of a game: nothing preceded it.
+            if turn > 0:
+                position["previous_move"] = f"7C WORD{rng.randint(0, top_moves)}"
+                position["previous_move_score"] = rng.randint(10, 90)
+            positions.append(position)
     result["positions"] = positions
 
 

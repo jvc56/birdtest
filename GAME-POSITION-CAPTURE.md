@@ -304,11 +304,18 @@ already carries:
     { "game_index": 0, "turn_number": 3,
       "rack": "AEINRST",
       "position": "15/15/... AEINRST/ 0/0 0",
+      "previous_move": "8D DOG", "previous_move_score": 10,
       "num_moves": 412,
-      "moves": [ { "move": "8D RETAINS", "score": 74, "equity": 81.2 } ] }
+      "moves": [ { "move": "8D RETAINS", "score": 74, "equity": 81.2,
+                   "win_percentage": 62.1, "blended_utility": 0.64 } ] }
   ]
 }
 ```
+
+`previous_move`/`previous_move_score` are absent on turn 0 of a game, where
+nothing preceded it. `blended_utility` -- the win%+spread blend, sometimes
+used to rank moves instead of equity or raw win percentage -- has the same
+nullability as `win_percentage`: present only for a simming player.
 
 Absent when capture is off, which keeps every existing client valid.
 
