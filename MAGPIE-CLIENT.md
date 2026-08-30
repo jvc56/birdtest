@@ -719,10 +719,10 @@ GUI parses one format.
 
 The HTTP API does not change, so these are small:
 
-- **Retire `worker/worker.py`** and the `worker` Docker profile. Contributor
-  instructions become "install MAGPIE, run `contribute`".
-- **`GET /api/worker/client-version`** changes meaning to a minimum MAGPIE
-  version.
+- ~~Retire `worker/worker.py` and the `worker` Docker profile.~~ **Done.**
+  Contributor instructions are now "install MAGPIE, run `contribute`".
+- ~~`GET /api/worker/client-version` changes meaning to a minimum MAGPIE
+  version.~~ **Done.**
 - ~~Send `seed` as a string rather than a JSON number.~~ **Done.**
 - **Keep `worker/fake_worker.py`.** It speaks the worker API and submits
   synthetic results with no MAGPIE in the loop, which is what most server tests
@@ -739,9 +739,10 @@ integration boundary** between two independently released programs:
 - A server change can break every deployed client. `min_magpie_version` is a
   floor, not a ceiling, so it does not stop an old server confusing a new client.
   The worker API should be treated as frozen and extended only additively.
-- Nothing currently pins the contract; it exists implicitly in `worker.py` and
-  `routes/worker.rs` agreeing. Committed request/response fixtures that both
-  repos test against are the cheap version of fixing that.
+- Nothing currently pins the contract; it exists implicitly in MAGPIE's
+  `config_contribute_*` functions and birdtest's `routes/worker.rs` agreeing.
+  Committed request/response fixtures that both repos test against are the
+  cheap version of fixing that.
 
 ### Testing
 

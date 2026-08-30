@@ -571,38 +571,27 @@ A top-level `JobType` enum dispatches to each concrete handler. The compiler enf
 
 ## Worker Client
 
-Contributors run a client program that polls for tasks, executes them, and submits results. The client handles authentication (API key or anonymous UUID), heartbeating, and the request/result cycle automatically.
+The contributor client is **MAGPIE itself** — a contributor needs MAGPIE and
+nothing else, no Python, no Docker. `magpie contribute` polls for tasks,
+executes them in-process, and submits results, handling authentication (API
+key or anonymous UUID), heartbeating, and the request/result cycle
+automatically, all driven by a local `contribute.txt`. [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md)
+is the full specification — the worker HTTP API it drives against
+(`/api/worker/task`, `/heartbeat`, `/result`, `/artifact`,
+`/client-version`) is documented under [Worker API](#worker-api) below.
 
-### Responsibilities
+This used to be a separate Python client (`worker/worker.py`) that shelled
+out to a MAGPIE binary distributed in its own Docker image. That client is
+retired; `worker/fake_worker.py` remains as a MAGPIE-free way to test the
+server itself (see [Test Clients](#test-clients)).
 
-1. On startup: load or generate a persistent worker UUID; optionally load an API key from config.
-2. Send a **task claim** to `/api/worker/task`.
-3. Deserialize the **task request** from the response and execute the appropriate work (run the word game analysis tool).
-4. Send periodic heartbeats to `/api/worker/heartbeat` while working.
-5. Submit a **task response** to `/api/worker/result` with the claim token.
-6. Loop.
+### Engine build for birdtest's own image
 
-### Language
-
-**Python.** Chosen for ease of setup across contributor machines — no compilation step required. The client is lightweight and shells out to the word game engine for all computation, so raw client performance is not a concern.
-
-### Engine Dependency (MAGPIE)
-
-> **Direction of travel:** the client is intended to move *into* MAGPIE, so that a contributor needs MAGPIE and nothing else — no Python, no Docker — and a future MAGPIE GUI can start contributing from a single button. [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) specifies the changes MAGPIE needs for that. The rest of this section describes the current Python client, which that work would retire.
-
-The worker client shells out to **MAGPIE** ([github.com/jvc56/MAGPIE](https://github.com/jvc56/MAGPIE)) for the actual word game computation.
-
-**MAGPIE is distributed as part of the worker container image**, compiled from a pinned commit at image build time. A contributor's entire setup is one command:
-
-```bash
-docker run ghcr.io/jvc56/birdtest-worker --server-url https://birdtest.example --api-key bt_...
-```
-
-There is no host checkout, no `--magpie-dir` to supply, and no build step. This is the only supported way to obtain MAGPIE for a worker. Beyond removing the setup burden, it pins every contributor to the same MAGPIE build — which matters for the per-worker anomaly detection described under [Worker Integrity](#worker-integrity-and-anomaly-detection), since "deviates from the population" is a much weaker signal when every client is a different build. It also makes a job's `min_magpie_version` enforceable: the server states a floor and contributors pull a newer image tag.
-
-#### Packaging: binary and data as separate stages
-
-The image is assembled from two independently-versioned build stages, so bumping one leaves the other's layers cached:
+The backend's leave-generation aggregation step shells out to `magpie
+convert csv2klv` once per completed generation (see [Leave generation](#leave-generation)),
+so the backend's own Docker image still carries a compiled MAGPIE binary and
+its lexical data, built from two independently-versioned stages so bumping
+one leaves the other's layers cached:
 
 | Stage | Build arg | Contents |
 |---|---|---|
@@ -611,244 +600,13 @@ The image is assembled from two independently-versioned build stages, so bumping
 
 Both are `FROM scratch` payload images in their own right and can be published to and consumed from a registry rather than rebuilt per clone.
 
-Two things are deliberately *not* shipped, because both are derivable:
+Two things are deliberately *not* shipped, because both are derivable and the
+backend never needs them (it does not play games):
 
-- **Wordmaps (`.wmp`)** are roughly 90% of a full MAGPIE data directory (2.25 GB of a 2.5 GB tree) and make game play dramatically faster, so a client that runs games always wants one. They must never cross a network. The image carries each lexicon's `.kwg` and the worker builds the wordmap it needs on first use, into a writable directory listed first in MAGPIE's `-path` so generated files shadow shipped ones without the image's data directory ever being written to. The whole `kwg → txt → wmp` chain costs about 1.3 seconds per lexicon, once, and persists in a volume across restarts.
+- **Wordmaps (`.wmp`)** are roughly 90% of a full MAGPIE data directory (2.25 GB of a 2.5 GB tree). A contributor's own MAGPIE builds the wordmap it needs from the `.kwg` it already has on first use (see [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) §7, wordmap auto-provisioning) — the whole `kwg → txt → wmp` chain costs about 1.3 seconds per lexicon, once.
 - **Word lists (`.txt`)** are regenerated from the `.kwg` in ~0.2s as the first half of that chain. Note that board layouts are `.txt` files too, so this prune is scoped to `lexica/` — MAGPIE loads a layout before it has parsed any argument, and dropping those breaks every command.
 
-The backend image carries the binary and the same data but never builds a wordmap: it does not play games, and only shells out to `magpie convert csv2klv` once per completed leave generation.
-
 MAGPIE's release profile hardcodes `-march=native`, which would bake the build machine's CPU features into an image other people run. The build retargets to `x86-64-v2` (SSE4.2 + popcnt) as a portable floor.
-
-### Skeleton Implementation
-
-Single file (`worker/worker.py`). Business logic (MAGPIE invocation, result parsing) is omitted; structure and all integration points are shown.
-
-```python
-#!/usr/bin/env python3
-"""birdtest worker client — claims tasks, invokes MAGPIE, submits results."""
-
-import argparse
-import logging
-import os
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-import uuid
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
-
-import requests
-import tomllib
-
-__version__ = "1.0.0"
-
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Config:
-    server_url: str
-    magpie_dir: Path
-    api_key: Optional[str]        # None → anonymous worker (X-Worker-UUID header)
-    worker_uuid: str              # persistent across runs; generated on first run
-    heartbeat_interval: int = 30  # seconds between heartbeats
-    retry_delay_seconds: int = 5  # seconds to wait when the server has no work
-
-def _load_or_generate_uuid(state_dir: Path) -> str:
-    """Read persistent UUID from disk; generate and save one if absent."""
-    path = state_dir / "worker_uuid"
-    if path.exists():
-        return path.read_text().strip()
-    worker_uuid = str(uuid.uuid4())
-    state_dir.mkdir(parents=True, exist_ok=True)
-    path.write_text(worker_uuid)
-    return worker_uuid
-
-def _load_config(args: argparse.Namespace) -> Config:
-    """Merge TOML config file with CLI flags; flags take precedence."""
-    ...
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
-def _auth_headers(cfg: Config) -> dict:
-    if cfg.api_key:
-        return {"Authorization": f"Bearer {cfg.api_key}"}
-    return {"X-Worker-UUID": cfg.worker_uuid}
-
-def _check_for_self_update(cfg: Config) -> None:
-    """
-    GET /api/worker/client-version. If the server reports a version different from
-    __version__, download the new script to a temp file and re-exec this process with
-    it, passing along all original argv. Does not return if an update is applied.
-    """
-    info = requests.get(f"{cfg.server_url}/api/worker/client-version").json()
-    if info["version"] == __version__:
-        return
-    logger.info("Updating worker %s → %s", __version__, info["version"])
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as tmp:
-        tmp.write(requests.get(info["download_url"]).content)
-        tmp_path = tmp.name
-    os.chmod(tmp_path, 0o755)
-    os.execv(sys.executable, [sys.executable, tmp_path] + sys.argv[1:])
-
-def _get_magpie_version(cfg: Config) -> str:
-    """Run `magpie version` once and return the version string. Cached by the caller."""
-    result = subprocess.run(
-        [cfg.magpie_dir / "bin" / "magpie", "version"],
-        capture_output=True, text=True, check=True,
-    )
-    return result.stdout.strip()
-
-def _parse_semver(version: str) -> tuple[int, ...]:
-    """Parses a "X.Y.Z" string into a tuple of ints for correct numeric comparison —
-    plain string comparison is wrong here ("1.10.0" < "1.9.0" as strings)."""
-    return tuple(int(part) for part in version.split("."))
-
-def _claim_task(cfg: Config) -> Optional[dict]:
-    """POST /api/worker/task. Returns parsed body, or None on 204 (no work available)."""
-    ...
-
-def _send_heartbeat(cfg: Config, claim_token: str) -> None:
-    """POST /api/worker/heartbeat. Pure liveness ping — no payload; leave-gen progress
-    is derived server-side from accepted task results, not from heartbeats."""
-    ...
-
-def _submit_result(cfg: Config, claim_token: str, result: dict) -> None:
-    """POST /api/worker/result."""
-    ...
-
-# ---------------------------------------------------------------------------
-# Task handlers — one function per job type
-# ---------------------------------------------------------------------------
-
-def _handle_opening_rack(request: dict, cfg: Config) -> dict:
-    """Invoke MAGPIE to analyze a single opening rack position."""
-    ...
-
-def _handle_game(request: dict, cfg: Config) -> dict:
-    """Invoke MAGPIE autoplay to run a batch of games."""
-    ...
-
-def _handle_game_pair(request: dict, cfg: Config) -> dict:
-    """Invoke MAGPIE autoplay with -gp true for a batch of game pairs."""
-    ...
-
-def _handle_leave_gen(request: dict, cfg: Config) -> dict:
-    """Download previous-gen leaves from S3, write the forced-rack subset to a local
-    file, run autoplay with -forceracksfile, parse the resulting rack-equity CSV (every
-    rack that occurred, forced or not), and return it as an inline {rack, count, mean}
-    list — the CSV itself is scratch and is not uploaded anywhere."""
-    ...
-
-_HANDLERS = {
-    "opening_rack": _handle_opening_rack,
-    "games":                 _handle_game,
-    "game_pairs":            _handle_game_pair,
-    "leave_generation":      _handle_leave_gen,
-}
-
-# ---------------------------------------------------------------------------
-# Heartbeat thread
-# ---------------------------------------------------------------------------
-
-def _heartbeat_loop(
-    cfg: Config,
-    claim_token: str,
-    stop: threading.Event,
-) -> None:
-    while not stop.wait(timeout=cfg.heartbeat_interval):
-        try:
-            _send_heartbeat(cfg, claim_token)
-        except Exception:
-            logger.warning("Heartbeat failed", exc_info=True)
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
-def _worker_loop(cfg: Config, magpie_version: str) -> None:
-    while True:
-        # 1. Claim
-        response = _claim_task(cfg)
-        if response is None:
-            time.sleep(cfg.retry_delay_seconds)
-            continue
-
-        claim_token = response["claim_token"]
-        task_request = response["task_request"]
-        min_ver = response.get("min_magpie_version")
-
-        # 2. Version gate — skip task if MAGPIE is too old; claim expires server-side
-        # Compared as a tuple of ints (_parse_semver), not string order: "1.10.0" < "1.9.0"
-        # as strings, which is backwards.
-        if min_ver and _parse_semver(magpie_version) < _parse_semver(min_ver):
-            logger.error(
-                "MAGPIE %s < required %s for this job; skipping task", magpie_version, min_ver
-            )
-            continue
-
-        handler = _HANDLERS[task_request["job_type"]]
-
-        # 3. Heartbeat
-        stop = threading.Event()
-        hb = threading.Thread(
-            target=_heartbeat_loop,
-            args=(cfg, claim_token, stop),
-            daemon=True,
-        )
-        hb.start()
-
-        result = None
-        try:
-            # 4. Execute
-            result = handler(task_request, cfg)
-        except Exception:
-            logger.exception("Task execution failed; claim will expire server-side")
-        finally:
-            stop.set()
-            hb.join()
-
-        # 5. Submit
-        if result is not None:
-            _submit_result(cfg, claim_token, result)
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="birdtest worker client")
-    p.add_argument("--config", type=Path, default=Path("~/.birdtest/config.toml").expanduser())
-    p.add_argument("--magpie-dir", type=Path)
-    p.add_argument("--api-key")
-    p.add_argument("--server-url")
-    return p.parse_args()
-
-def main() -> None:
-    args = _parse_args()
-    cfg = _load_config(args)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-    # 1. Self-update check — re-execs this process if a newer script is available
-    _check_for_self_update(cfg)
-
-    # 2. Cache MAGPIE version once at startup
-    magpie_version = _get_magpie_version(cfg)
-    logger.info(
-        "Worker started (uuid=%s, authenticated=%s, magpie=%s, client=%s)",
-        cfg.worker_uuid, cfg.api_key is not None, magpie_version, __version__,
-    )
-
-    _worker_loop(cfg, magpie_version)
-
-if __name__ == "__main__":
-    main()
-```
 
 ---
 
@@ -977,10 +735,10 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 ```
 birdtest/
 ├── docker-compose.yml               # the whole local stack: Postgres, MinIO (S3 stub), backend,
-│                                    # frontend, plus `dev` and `worker` profiles — see Development
+│                                    # frontend, plus `dev` and `fake-worker` profiles — see Development
 ├── .env.example                     # compose port and MAGPIE_DIR overrides
 ├── docker/
-│   └── Dockerfile                  # backend + worker targets, sharing the two MAGPIE stages
+│   └── Dockerfile                  # backend + fake-worker targets, sharing the two MAGPIE stages
 │                                    # (magpie-bin / magpie-data), each independently versioned
 ├── backend/                        # Axum web server (Rust)
 │   ├── Cargo.toml
@@ -1093,9 +851,7 @@ birdtest/
 │               └── audit-log/
 │                   └── +page.svelte                # /admin/audit-log
 │
-├── worker/                         # test clients (the contributor client is moving into MAGPIE)
-│   ├── pyproject.toml
-│   ├── worker.py                   # reference client; runs real MAGPIE
+├── worker/                         # fake_worker.py only; the contributor client is MAGPIE itself
 │   └── fake_worker.py              # synthetic results, no MAGPIE — see Testing
 │
 ├── data/
@@ -1638,8 +1394,8 @@ directly on the host with `cargo run`.
 ### 4. Optional profiles
 
 ```bash
-docker compose --profile dev up      # adds Vite with HMR on :5174
-docker compose --profile worker up   # adds a worker client
+docker compose --profile dev up          # adds Vite with HMR on :5174
+docker compose --profile fake-worker up  # adds synthetic-result test clients
 ```
 
 The `dev` profile runs the Vite dev server with `frontend/` bind-mounted and
@@ -1648,18 +1404,12 @@ and the container's install never collides with a host one built for a
 different platform. It runs *alongside* the Nginx build rather than replacing
 it, on a separate port.
 
-### 5. Worker client
+### 5. Contributing locally
 
-```bash
-docker compose --profile worker up --build
-```
-
-This runs the *same image a contributor runs*, pointed at `http://backend:8080`
-instead of a deployed URL. There is no separate mock client, so the local worker
-exercises the real MAGPIE path.
-
-Set `BIRDTEST_API_KEY` in `.env` to attribute results to an account instead of
-an anonymous UUID.
+A real contributor client is MAGPIE itself, not anything this compose file
+builds — point a local `contribute.txt` at `http://localhost:${WEB_PORT:-5173}`
+and run `magpie contribute`. See [Worker Client](#worker-client) and
+[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md).
 
 The worker needs an actual admin-created, activated job to have anything to
 claim (see step 5) — with no active job, `_claim_task` just gets 204s and the
@@ -1721,9 +1471,10 @@ Every component — backend, worker client, and frontend — carries a coverage 
 
 ### Test Clients
 
-`worker/` holds two clients, and neither is what a contributor will eventually
-run — that is [moving into MAGPIE](MAGPIE-CLIENT.md). What stays here is the
-tooling birdtest needs to test its *server*.
+The real contributor client is MAGPIE itself (`magpie contribute`; see
+[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md)) — nothing in this repo builds or runs
+it. `worker/fake_worker.py` is the one client birdtest keeps, purely to test
+its *server*.
 
 **`fake_worker.py` — synthetic results, no MAGPIE.** This is what most
 server-side tests should use. Scheduling (priority tiers, deficit allocation),
@@ -1745,17 +1496,12 @@ Every mode is deterministic under `--seed`. Rate-limit responses are backed off
 and retried rather than counted as rejections, so "the server throttled me"
 never masquerades as "the server refused my data".
 
-**`worker.py` — the reference client that runs real MAGPIE.** Its value is as an
-end-to-end check that the HTTP contract and the MAGPIE invocations both hold,
-not as a unit-testing target. MAGPIE is treated as an external dependency:
-`subprocess.run` is faked in unit tests so they are fast and need no MAGPIE
-build.
-
-**One real end-to-end suite** (run nightly rather than per-PR) runs the real
-client against a real MAGPIE for one task of each job type, to catch drift
-between MAGPIE's actual behaviour and the client's assumptions — the class of
-problem that mocks structurally cannot find, and which has already produced
-several findings.
+**One real end-to-end suite** (run nightly rather than per-PR) builds MAGPIE
+and runs `magpie contribute` against a real server for one task of each job
+type, to catch drift between MAGPIE's actual behaviour and the HTTP contract
+— the class of problem a synthetic client structurally cannot find. See
+MAGPIE-CLIENT.md's own Testing section for the fixtures this shares with
+MAGPIE's side of the contract.
 
 ### Frontend
 

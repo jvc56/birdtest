@@ -10,8 +10,9 @@ interesting server property is about something else:
   * SPRT and Glicko — which need a *chosen* win rate to reach a known verdict
   * anomaly detection — which needs a client that misbehaves deliberately
 
-None of those want a real engine in the loop. `worker.py` is the reference
-client that does; this is its counterpart for everything else.
+None of those want a real engine in the loop. MAGPIE itself (`magpie
+contribute`) is the client that does; this is its counterpart for everything
+else.
 
 Every mode is deterministic under `--seed`, so a failing CI run reproduces.
 """

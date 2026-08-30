@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
 #
-# Backend and worker in one file, because both consume the same two MAGPIE
-# stages and BuildKit then builds each stage once and caches it for both.
+# Backend and fake-worker in one file, because both consume the same two
+# MAGPIE stages and BuildKit then builds each stage once and caches it for
+# both. (The real contributor client is MAGPIE itself, via `magpie
+# contribute` — see MAGPIE-CLIENT.md. Nothing in this repo builds it.)
 #
 # The MAGPIE binary and the MAGPIE data are separate stages parameterised by
 # separate build args, so bumping one does not rebuild the other:
@@ -17,7 +19,7 @@
 # Those two targets are `FROM scratch` payload images: nothing but the binary
 # and the data, so they carry no toolchain and no base OS.
 #
-# Build with `--target backend` or `--target worker`.
+# Build with `--target backend` or `--target fake-worker`.
 
 # ---------------------------------------------------------------------------
 # MAGPIE executable
@@ -77,8 +79,9 @@ RUN set -eu; \
     mkdir -p /out && tar -xzf data.tgz -C /out
 
 # Everything derivable is dropped rather than shipped. Wordmaps are 90% of a
-# full MAGPIE data directory and are generated locally by the worker, never
-# transmitted; word lists are regenerated from the .kwg in ~0.2s.
+# full MAGPIE data directory and are generated locally by the contributor's
+# own MAGPIE, never transmitted; word lists are regenerated from the .kwg in
+# ~0.2s.
 #
 # Scoped to lexica/ deliberately: board layouts are .txt files too, and MAGPIE
 # loads one before it has parsed anything, so deleting those breaks every
@@ -140,35 +143,6 @@ EXPOSE 8080
 # Migrations run inside the process, before it binds, so there is no separate
 # migration step to sequence here.
 CMD ["birdtest"]
-
-# ---------------------------------------------------------------------------
-# Worker
-# ---------------------------------------------------------------------------
-
-FROM python:3.11-slim AS worker
-
-RUN useradd --create-home --uid 10001 worker
-
-COPY --from=magpie-bin  /magpie/bin/magpie /magpie/bin/magpie
-COPY --from=magpie-data /data             /magpie/data
-
-# Wordmaps make game play dramatically faster, so the client always wants them —
-# but they are ~10x the size of everything else combined and must never cross a
-# network. The worker generates the ones it needs from the shipped .kwg on first
-# use and writes them here, which is why this directory is the worker's own and
-# is writable.
-RUN mkdir -p /magpie/generated/lexica && chown -R worker:worker /magpie/generated
-VOLUME /magpie/generated
-
-WORKDIR /app
-COPY worker/pyproject.toml worker/worker.py ./
-RUN pip install --no-cache-dir .
-
-RUN mkdir -p /home/worker/.birdtest && chown -R worker:worker /home/worker/.birdtest
-
-USER worker
-ENV BIRDTEST_MAGPIE_DIR=/magpie
-ENTRYPOINT ["python", "worker.py"]
 
 # ---------------------------------------------------------------------------
 # Fake worker

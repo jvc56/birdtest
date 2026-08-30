@@ -28,19 +28,19 @@
   </div>
 
   <div class="card space-y-3">
-    <h2 class="text-lg font-medium">Run a worker</h2>
+    <h2 class="text-lg font-medium">Contribute</h2>
     <p class="text-sm text-muted-foreground">
-      You need Python 3.11+ and a compiled
-      <a href="https://github.com/jvc56/MAGPIE">MAGPIE</a> checkout. The worker never builds or
-      fetches MAGPIE — point it at the one you built.
+      You need only <a href="https://github.com/jvc56/MAGPIE">MAGPIE</a> — no Python, no Docker.
+      Put a <code class="rounded bg-muted px-1">contribute.txt</code> beside it:
     </p>
     <pre class="overflow-x-auto rounded-md bg-muted p-4 text-xs"><code
-        >python worker.py --server-url {typeof window !== 'undefined'
-          ? window.location.origin
-          : ''} --magpie-dir /path/to/MAGPIE</code
+        >server   {typeof window !== 'undefined' ? window.location.origin : ''}
+threads  7
+maxtasks 0</code
       ></pre>
     <p class="text-sm text-muted-foreground">
-      Add <code class="rounded bg-muted px-1">--api-key</code> to attribute your work to your account
+      then run <code class="rounded bg-muted px-1">magpie contribute</code>. Add an
+      <code class="rounded bg-muted px-1">apikey</code> line to attribute your work to your account
       instead of an anonymous UUID.
     </p>
   </div>

@@ -5,9 +5,13 @@
 # is required and there is no MAGPIE checkout to point at.
 #
 # Optional profiles:
-#   --profile worker   a worker client — the same image a real contributor runs
-#   --profile dev      the Vite dev server with hot reload, alongside the
-#                      production-style Nginx frontend
+#   --profile fake-worker   synthetic results, no MAGPIE — see README
+#   --profile dev           the Vite dev server with hot reload, alongside the
+#                           production-style Nginx frontend
+#
+# There is no "worker" profile: the real contributor client is MAGPIE itself,
+# via `magpie contribute` (see MAGPIE-CLIENT.md) — nothing to build or run
+# here for that.
 #
 # Ports are overridable so a host that already has something on 5432 (or 9000,
 # or 5173) does not need the file edited. See .env.example.
@@ -159,37 +163,7 @@ services:
       - --mode
       - "${FAKE_MODE:-normal}"
 
-  # --- profile: worker ------------------------------------------------------
-  # The same image a real contributor runs, pointed at the local backend rather
-  # than a deployed one. There is no separate mock client.
-  worker:
-    profiles: [worker]
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-      target: worker
-      args:
-        MAGPIE_REF: ${MAGPIE_REF:-e4eda016fc000f0e26079651bff5cc90e94d4dee}
-        MAGPIE_DATA_VERSION: ${MAGPIE_DATA_VERSION:-20251004}
-    depends_on:
-      backend:
-        condition: service_healthy
-    command: ["--server-url", "http://backend:8080"]
-    environment:
-      BIRDTEST_API_KEY: ${BIRDTEST_API_KEY:-}
-    volumes:
-      # Persists the generated worker UUID, so contributions stay attributed to
-      # the same anonymous identity across restarts.
-      - workerstate:/home/worker/.birdtest
-      # Wordmaps the client builds for itself on first use. Keeping them here
-      # means a restart does not rebuild them; losing the volume costs about a
-      # second per lexicon.
-      - workermagpie:/magpie/generated
-    restart: unless-stopped
-
 volumes:
   pgdata:
   miniodata:
   frontend_node_modules:
-  workerstate:
-  workermagpie:

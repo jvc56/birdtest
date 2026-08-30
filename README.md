@@ -1,14 +1,14 @@
 # birdtest
 
 Crowdsourced word game analysis, modelled after Fishnet. Admins define jobs;
-contributors run a worker that claims tasks, executes them locally with
-[MAGPIE](https://github.com/jvc56/MAGPIE), and submits results. The site
+contributors run [MAGPIE](https://github.com/jvc56/MAGPIE) itself — `magpie
+contribute` claims tasks, executes them locally, and submits results. The site
 aggregates everything onto a live dashboard.
 
 [PLAN.md](PLAN.md) is the design document — architecture, schema, API surface
 and rationale all live there. This file is how to run it.
-[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) specifies moving the worker client into
-MAGPIE itself, so contributing needs MAGPIE and nothing else.
+[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) specifies the `contribute` command
+contributors run, so contributing needs MAGPIE and nothing else.
 [GAME-POSITION-CAPTURE.md](GAME-POSITION-CAPTURE.md) proposes keeping the
 position analyses workers already produce while playing games.
 
@@ -18,7 +18,7 @@ position analyses workers already produce while playing games.
 |---|---|
 | `backend/` | Axum + SQLx server. Owns scheduling, validation, SPRT, Glicko and aggregation. |
 | `frontend/` | SvelteKit SPA (dark mode only), built statically and served by Nginx in production. |
-| `worker/` | Test clients. `worker.py` runs real MAGPIE; `fake_worker.py` submits synthetic results without it. The contributor-facing client is [moving into MAGPIE](MAGPIE-CLIENT.md). |
+| `worker/` | `fake_worker.py`, a test client that submits synthetic results with no MAGPIE in the loop — see [Testing without MAGPIE](#testing-without-magpie--the-fake-worker). The real contributor client is MAGPIE itself; see [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md). |
 | `data/letterdistributions/` | Tile distributions, mirroring MAGPIE-DATA's layout. Used to enumerate racks and leaves. |
 | `infra/` | Terraform: VPC, ALB, ECS Fargate, RDS Postgres, S3, SES, SSM. |
 
@@ -95,10 +95,10 @@ python worker/fake_worker.py --server-url http://localhost:8080 --tasks 10
 
 Every mode is deterministic under `--seed`, so a failing CI run reproduces.
 
-### Contributing with MAGPIE directly
+### Contributing with MAGPIE
 
-MAGPIE can now act as the worker itself, with no Python and no Docker. Put a
-`contribute.txt` beside it:
+A contributor needs only MAGPIE — no Python, no Docker, nothing else to
+install. Put a `contribute.txt` beside it:
 
 ```
 server   http://localhost:5173
@@ -107,36 +107,12 @@ maxtasks 0
 ```
 
 then run `magpie contribute`. Settings never go on the command line, so an API
-key stays out of shell history and `ps` output. See
-[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md).
-
-This is the intended contributor path. The Python clients below remain for
-testing.
-
-### Running a worker with real MAGPIE
-
-MAGPIE is compiled from source into the worker image, along with the lexical
-data it needs. There is no host checkout and nothing to install:
-
-```bash
-docker compose --profile worker up --build
-```
-
-**Wordmaps** (`.wmp`) make game play dramatically faster, so a client that runs
-games always wants one — but they are roughly ten times the size of everything
-else MAGPIE ships, and are never transmitted. The image carries each lexicon's
-`.kwg`, and the worker derives the word list and the wordmap from it on first
-use, in about 1.3 seconds per lexicon, into a volume that survives restarts.
-
-The backend image carries MAGPIE too, but no wordmaps: it never plays games, and
-only shells out to `magpie convert csv2klv` once per completed leave generation.
-
-> **Note:** this client cannot yet complete `games` or `game_pairs` tasks.
-> `autoplay` reports only aggregate statistics, while birdtest's schema stores
-> one record per game — a mismatch that is fixed by moving the client into
-> MAGPIE, where per-game data is available in-process. See
-> [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md). Use the fake worker for those job types
-> in the meantime.
+key stays out of shell history and `ps` output. Wordmaps (`.wmp`) make game
+play dramatically faster, so MAGPIE always wants one for a lexicon it's
+contributing with; it derives the word list and the wordmap from the `.kwg` it
+already has on first use, in about 1.3 seconds per lexicon, and never
+transmits either. See [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) for the full
+protocol.
 
 ### Frontend hot reload
 
@@ -188,9 +164,7 @@ The backend and frontend still run directly on the host if you would rather:
 You need a Postgres to point `DATABASE_URL` at — `docker compose up -d postgres
 minio minio-init` gives you one without the rest of the stack.
 
-The real-MAGPIE worker is Docker-only, because shipping MAGPIE inside the image
-is what lets it start with one command. The fake worker needs only `requests`
-and runs anywhere.
+The fake worker needs only `requests` and runs anywhere.
 
 ## Deploying
 
