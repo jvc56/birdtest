@@ -139,24 +139,6 @@ docker compose exec postgres \
 docker compose restart backend
 ```
 
-### Updating MAGPIE
-
-The binary and the data are separate build stages with separate build args, so
-bumping one leaves the other's layers cached:
-
-```bash
-MAGPIE_REF=<git-sha> docker compose build            # binary only (~25s)
-MAGPIE_DATA_VERSION=<yyyymmdd> docker compose build   # data only (~10s)
-```
-
-Both stages are also `FROM scratch` payload images in their own right, ready to
-publish and consume from a registry rather than rebuilt per clone:
-
-```bash
-docker build -f docker/Dockerfile --target magpie-bin  -t ghcr.io/jvc56/magpie-bin:<sha> .
-docker build -f docker/Dockerfile --target magpie-data -t ghcr.io/jvc56/magpie-data:<ver> .
-```
-
 ### Without Docker
 
 The backend and frontend still run directly on the host if you would rather:
@@ -178,6 +160,6 @@ aws ssm put-parameter --name /birdtest/SESSION_SIGNING_KEY --type SecureString -
   --value "$(openssl rand -hex 32)"
 ```
 
-The backend image needs the `magpie` executable and `data/` on board: the
-leave-generation aggregation step shells out to `magpie convert csv2klv` once
-per generation.
+The backend has no MAGPIE dependency at all: leave-generation aggregation
+builds its KLV artifact directly (`backend/src/jobs/klv.rs`), so the image
+needs only `data/` on board.

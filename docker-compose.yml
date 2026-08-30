@@ -1,8 +1,8 @@
 # Full local stack. `docker compose up` needs nothing on the host but Docker:
-# database, object storage, backend and frontend all run in containers.
-#
-# MAGPIE is built and packaged into the images from source; nothing on the host
-# is required and there is no MAGPIE checkout to point at.
+# database, object storage, backend and frontend all run in containers. None
+# of them need MAGPIE: the backend builds its own leave-generation KLV
+# artifacts directly (see backend/src/jobs/klv.rs) instead of shelling out to
+# it, and the fake worker submits synthetic results.
 #
 # Optional profiles:
 #   --profile fake-worker   synthetic results, no MAGPIE — see README
@@ -69,9 +69,6 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       target: backend
-      args:
-        MAGPIE_REF: ${MAGPIE_REF:-e4eda016fc000f0e26079651bff5cc90e94d4dee}
-        MAGPIE_DATA_VERSION: ${MAGPIE_DATA_VERSION:-20251004}
     depends_on:
       postgres:
         condition: service_healthy
@@ -90,8 +87,6 @@ services:
       MAIL_FROM: no-reply@birdtest.local
       PUBLIC_URL: http://localhost:${WEB_PORT:-5173}
       DATA_PATH: /app/data
-      # Only leave-generation aggregation uses this, once per generation.
-      MAGPIE_DIR: /magpie
       S3_BUCKET: birdtest-artifacts
       S3_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: birdtest

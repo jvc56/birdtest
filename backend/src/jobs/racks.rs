@@ -17,6 +17,13 @@ pub struct Tile {
 #[derive(Debug, Clone)]
 pub struct LetterDistribution {
     pub tiles: Vec<Tile>,
+    /// Letters in the order they appeared in the distribution file, before
+    /// the canonical sort below. This is MAGPIE's own machine-letter
+    /// numbering: it assigns index 0, 1, 2, ... to each row as it reads the
+    /// file, in file order, never re-sorted. `klv.rs` needs this exact
+    /// numbering baked into a KWG's node bytes; nothing else in this struct
+    /// does, which is why it's kept separately rather than replacing `tiles`.
+    machine_letters: Vec<char>,
 }
 
 impl LetterDistribution {
@@ -65,10 +72,33 @@ impl LetterDistribution {
         if tiles.is_empty() {
             return Err(AppError::internal(format!("{} contains no tiles", path.display())));
         }
+        let machine_letters: Vec<char> = tiles.iter().map(|t| t.letter).collect();
         // Canonical rack strings are sorted, so sorting the distribution once
         // means the enumeration emits already-canonical strings.
         tiles.sort_by_key(|t| t.letter);
-        Ok(Self { tiles })
+        Ok(Self { tiles, machine_letters })
+    }
+
+    /// MAGPIE's machine-letter index for `letter` -- see the `machine_letters`
+    /// field comment. `None` means the letter isn't in this distribution at
+    /// all, which for a leave actually enumerated from it is a bug, not a
+    /// legitimate input to handle gracefully.
+    pub fn machine_letter(&self, letter: char) -> Option<u8> {
+        self.machine_letters
+            .iter()
+            .position(|&c| c == letter)
+            .map(|i| i as u8)
+    }
+
+    /// Builds a distribution from an explicit tile list, in `klv.rs`'s tests
+    /// only -- everywhere else always goes through [`Self::load`], which is
+    /// the only place that should ever construct one from scratch.
+    #[cfg(test)]
+    pub fn from_tiles_for_test(tiles: Vec<Tile>) -> Self {
+        let machine_letters = tiles.iter().map(|t| t.letter).collect();
+        let mut tiles = tiles;
+        tiles.sort_by_key(|t| t.letter);
+        Self { tiles, machine_letters }
     }
 
     /// Every distinct multiset of exactly `size` tiles drawable from the bag,
@@ -228,6 +258,7 @@ mod tests {
                 Tile { letter: 'B', count: 1 },
                 Tile { letter: 'C', count: 3 },
             ],
+            machine_letters: vec!['A', 'B', 'C'],
         }
     }
 

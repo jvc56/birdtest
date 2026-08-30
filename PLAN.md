@@ -525,7 +525,9 @@ At claim time:
 
 **On result acceptance**: within the same transaction that accepts the task result, upsert all `{rack, count, mean}` entries from the response into `leave_rack_progress` in a single bulk statement (multi-row `INSERT ... ON CONFLICT (job_id, generation, rack) DO UPDATE SET occurrence_count = leave_rack_progress.occurrence_count + excluded.occurrence_count, equity_sum = leave_rack_progress.equity_sum + excluded.equity_sum`) rather than row-by-row, since a submission can carry thousands of rows. This is what drives the live dashboard figure — no heartbeat involved.
 
-**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into a `rack,value` CSV (`value = equity_sum / occurrence_count` per rack — this is the format `magpie convert csv2klv` expects, distinct from the `rack,count,mean` format workers submit) and shells out to `magpie convert csv2klv` (the same subprocess-invocation pattern the worker already uses for `autoplay`, just run from the backend) to produce the generation's combined KLV, uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete. This runs once per generation, not once per task, so there's no performance case for linking `libmagpie` into the backend via FFI — that would only add an unsafe binding surface to keep in sync with MAGPIE's C API across version bumps, and let a crash in `libmagpie` take down the whole backend process instead of an isolated subprocess. The backend container needs the `magpie` executable and lexicon data available at runtime, alongside the existing `data/letterdistributions/` dependency; locally this is a bind mount of a host MAGPIE checkout at `/magpie`, and in ECS it is baked into the backend image.
+**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into per-rack mean equities (`value = equity_sum / occurrence_count`) and builds the generation's KLV artifact directly in Rust (`backend/src/jobs/klv.rs`), uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete.
+
+This is a from-scratch reimplementation of what `magpie convert csv2klv` does — a KWG (trie) of every leave the domain admits, plus one `f32` value per leave addressed by a *word index* computed from the graph's own topology at load time rather than stored in the file — not a guess at the format: it's translated line-for-line from MAGPIE's own `klv.h`/`klv_csv.c`, and is cross-validated against a real MAGPIE binary (`jobs::klv::tests::round_trips_through_a_real_magpie_*`; `#[ignore]`d by default since they need a local MAGPIE build and this repo has no CI yet to run them automatically) rather than trusted on inspection alone. Building a plain (non-suffix-shared) trie is enough — the word-index algorithm only needs a topologically correct graph, not MAGPIE's own DAWG-minimizing construction, since both sides compute indices fresh from whatever graph is actually on disk. Doing this in Rust rather than shelling out means the backend has no MAGPIE dependency at all: no binary or lexical data baked into its image, and no subprocess boundary to keep working across MAGPIE version bumps for a format unlikely to change.
 
 Three details of MAGPIE's CLI shape this call, all verified against the binary:
 
@@ -585,28 +587,12 @@ out to a MAGPIE binary distributed in its own Docker image. That client is
 retired; `worker/fake_worker.py` remains as a MAGPIE-free way to test the
 server itself (see [Test Clients](#test-clients)).
 
-### Engine build for birdtest's own image
-
-The backend's leave-generation aggregation step shells out to `magpie
-convert csv2klv` once per completed generation (see [Leave generation](#leave-generation)),
-so the backend's own Docker image still carries a compiled MAGPIE binary and
-its lexical data, built from two independently-versioned stages so bumping
-one leaves the other's layers cached:
-
-| Stage | Build arg | Contents |
-|---|---|---|
-| `magpie-bin` | `MAGPIE_REF` (git sha), `MAGPIE_BOARD_DIM` | The compiled executable, ~1 MB |
-| `magpie-data` | `MAGPIE_DATA_VERSION` | `.kwg`, `.klv2`, letter distributions, board layouts, strategy — ~147 MB |
-
-Both are `FROM scratch` payload images in their own right and can be published to and consumed from a registry rather than rebuilt per clone.
-
-Two things are deliberately *not* shipped, because both are derivable and the
-backend never needs them (it does not play games):
-
-- **Wordmaps (`.wmp`)** are roughly 90% of a full MAGPIE data directory (2.25 GB of a 2.5 GB tree). A contributor's own MAGPIE builds the wordmap it needs from the `.kwg` it already has on first use (see [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) §7, wordmap auto-provisioning) — the whole `kwg → txt → wmp` chain costs about 1.3 seconds per lexicon, once.
-- **Word lists (`.txt`)** are regenerated from the `.kwg` in ~0.2s as the first half of that chain. Note that board layouts are `.txt` files too, so this prune is scoped to `lexica/` — MAGPIE loads a layout before it has parsed any argument, and dropping those breaks every command.
-
-MAGPIE's release profile hardcodes `-march=native`, which would bake the build machine's CPU features into an image other people run. The build retargets to `x86-64-v2` (SSE4.2 + popcnt) as a portable floor.
+birdtest's own backend has no MAGPIE dependency at all, and never has to
+build or ship one: leave-generation aggregation, the one place the server
+used to shell out to `magpie convert csv2klv`, now builds its KLV artifact
+directly (see [Leave generation](#leave-generation) and
+`backend/src/jobs/klv.rs`). The backend's Docker image carries only its own
+compiled Rust binary and `data/letterdistributions/`.
 
 ---
 
@@ -736,10 +722,9 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 birdtest/
 ├── docker-compose.yml               # the whole local stack: Postgres, MinIO (S3 stub), backend,
 │                                    # frontend, plus `dev` and `fake-worker` profiles — see Development
-├── .env.example                     # compose port and MAGPIE_DIR overrides
+├── .env.example                     # compose port overrides
 ├── docker/
-│   └── Dockerfile                  # backend + fake-worker targets, sharing the two MAGPIE stages
-│                                    # (magpie-bin / magpie-data), each independently versioned
+│   └── Dockerfile                  # backend + fake-worker targets; neither needs MAGPIE
 ├── backend/                        # Axum web server (Rust)
 │   ├── Cargo.toml
 │   ├── .env.example                # DATABASE_URL, SESSION_SIGNING_KEY, MAIL_BACKEND=console, etc. for local dev

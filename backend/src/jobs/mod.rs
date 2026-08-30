@@ -1,6 +1,7 @@
 pub mod game;
 pub mod game_pair;
 pub mod handler;
+pub mod klv;
 pub mod leave_gen;
 pub mod opening_rack;
 pub mod racks;

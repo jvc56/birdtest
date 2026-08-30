@@ -264,9 +264,6 @@ async fn run_leave_generation_transition(
     let key = leave_gen::run_transition(
         &state.pool,
         &state.artifacts,
-        &state.cfg.magpie_dir,
-        &state.cfg.magpie_bin(),
-        &state.cfg.magpie_data_dir(),
         &state.cfg.data_path,
         job.id,
         generation,
