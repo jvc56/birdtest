@@ -201,8 +201,7 @@ async fn ensure_not_banned(state: &AppState, identity: &WorkerIdentity) -> AppRe
     let banned = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (
              SELECT 1 FROM worker_bans
-             WHERE (user_id IS NOT DISTINCT FROM $1 AND $1 IS NOT NULL)
-                OR (anon_uuid IS NOT DISTINCT FROM $2 AND $2 IS NOT NULL)
+             WHERE user_id = $1 OR anon_uuid = $2
          )",
     )
     .bind(identity.user_id())
