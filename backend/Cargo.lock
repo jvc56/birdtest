@@ -755,6 +755,7 @@ dependencies = [
  "hex",
  "pasetors",
  "password-hash",
+ "percent-encoding",
  "rand",
  "serde",
  "serde_json",

@@ -33,3 +33,4 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 aws-sdk-sesv2 = "1"
 async-stream = "0.3.6"
+percent-encoding = "2"

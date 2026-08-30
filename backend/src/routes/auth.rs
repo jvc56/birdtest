@@ -8,6 +8,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{Duration, Utc};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use uuid::Uuid;
@@ -138,7 +139,11 @@ async fn register(
     .await?;
     tx.commit().await?;
 
-    let link = format!("{}/confirm-email?code={raw_code}", state.cfg.public_url);
+    // raw_code is hex today, already URL-safe, but encoding it anyway means
+    // this link stays correct even if generate_code's alphabet ever changes,
+    // rather than relying on that alphabet implicitly forever.
+    let encoded_code = utf8_percent_encode(&raw_code, NON_ALPHANUMERIC);
+    let link = format!("{}/confirm-email?code={encoded_code}", state.cfg.public_url);
     state
         .mailer
         .send(
@@ -274,7 +279,10 @@ async fn request_password_reset(
         .execute(&state.pool)
         .await?;
 
-        let link = format!("{}/reset-password/confirm?token={raw_token}", state.cfg.public_url);
+        // See the same encoding note on the confirm-email link above.
+        let encoded_token = utf8_percent_encode(&raw_token, NON_ALPHANUMERIC);
+        let link =
+            format!("{}/reset-password/confirm?token={encoded_token}", state.cfg.public_url);
         state
             .mailer
             .send(
