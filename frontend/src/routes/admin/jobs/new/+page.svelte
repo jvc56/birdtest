@@ -32,6 +32,7 @@
   let targetRackCount = 500;
   let racksPerTask = 50;
   let maxLeaveSize = 6;
+  let leaveUseWordmap = true;
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
@@ -79,7 +80,8 @@
           generation_count: generationCount,
           target_rack_count: targetRackCount,
           racks_per_task: racksPerTask,
-          max_leave_size: maxLeaveSize
+          max_leave_size: maxLeaveSize,
+          use_wordmap: leaveUseWordmap
         };
     }
   }
@@ -216,6 +218,10 @@
         <input id="mls" type="number" min="1" max="6" class="input" bind:value={maxLeaveSize} />
       </div>
     </div>
+    <label class="flex items-center gap-2">
+      <input type="checkbox" bind:checked={leaveUseWordmap} />
+      <span class="label mb-0">Use wordmap</span>
+    </label>
   {/if}
 
   {#if error}<p class="field-error">{error}</p>{/if}

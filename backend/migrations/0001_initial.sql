@@ -244,7 +244,11 @@ CREATE TABLE job_leave_config (
     -- Size of the forced-rack subset handed to a single task.
     racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
     -- Largest leave size enumerated into the rack universe (leaves are 1..N tiles).
-    max_leave_size    INT NOT NULL DEFAULT 6 CHECK (max_leave_size BETWEEN 1 AND 6)
+    max_leave_size    INT NOT NULL DEFAULT 6 CHECK (max_leave_size BETWEEN 1 AND 6),
+    -- Whether the leave-generating bot plays with a wordmap. Sent to the worker,
+    -- which builds one from its .kwg if it does not already have it. A player
+    -- setting like any other -- workers assume nothing about wordmaps.
+    use_wordmap       BOOLEAN NOT NULL DEFAULT TRUE
 );
 
 -- Tasks
@@ -350,9 +354,11 @@ CREATE TABLE leave_requests (
     variant             TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
     generation          INT NOT NULL,
-    forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (see rack_list_create's forceracksfile)
+    forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (passed to MAGPIE's rack_list_create)
     num_games           INT NOT NULL,      -- denormalized from job_leave_config.num_iterations
-    previous_artifact_key TEXT             -- combined KLV from generation - 1; NULL for generation 1
+    previous_artifact_key TEXT,            -- combined KLV from generation - 1; NULL for generation 1
+    target_rack_count   INT NOT NULL,      -- denormalized from job_leave_config.target_rack_count
+    use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
 );
 
 -- Live per-rack occurrence progress for the in-progress generation of a leave-gen job.

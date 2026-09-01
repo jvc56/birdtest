@@ -18,8 +18,9 @@ pub async fn insert_request(
     sqlx::query(
         "INSERT INTO leave_requests
              (task_id, lexicon, variant, letter_distribution, generation,
-              forced_racks, num_games, previous_artifact_key)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+              forced_racks, num_games, previous_artifact_key,
+              target_rack_count, use_wordmap)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(task_id)
     .bind(&req.lexicon)
@@ -29,6 +30,8 @@ pub async fn insert_request(
     .bind(&req.forced_racks)
     .bind(req.num_games)
     .bind(&req.previous_artifact_key)
+    .bind(req.target_rack_count)
+    .bind(req.use_wordmap)
     .execute(conn)
     .await?;
     Ok(())
@@ -45,7 +48,7 @@ impl JobHandler for LeaveGenHandler {
                           _data_path: &Path) -> AppResult<Self::Request> {
         let row = sqlx::query(
             "SELECT lexicon, variant, letter_distribution, generation, forced_racks,
-                    num_games, previous_artifact_key
+                    num_games, previous_artifact_key, target_rack_count, use_wordmap
              FROM leave_requests WHERE task_id = $1",
         )
         .bind(task_id)
@@ -59,6 +62,8 @@ impl JobHandler for LeaveGenHandler {
             forced_racks: row.get("forced_racks"),
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
+            target_rack_count: row.get("target_rack_count"),
+            use_wordmap: row.get("use_wordmap"),
         })
     }
 
@@ -210,6 +215,8 @@ pub async fn next_step(
         forced_racks: racks,
         previous_artifact_key,
         num_games: config.num_iterations,
+        target_rack_count: config.target_rack_count,
+        use_wordmap: config.use_wordmap,
     }))
 }
 

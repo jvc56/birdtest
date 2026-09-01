@@ -136,6 +136,7 @@ pub struct LeaveConfig {
     pub target_rack_count: i32,
     pub racks_per_task: i32,
     pub max_leave_size: i32,
+    pub use_wordmap: bool,
 }
 
 /// `games` and `game_pairs` share every SPRT-relevant field; the only difference

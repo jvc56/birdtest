@@ -298,6 +298,11 @@ enum JobTypeConfig {
         racks_per_task: i32,
         #[serde(default = "default_max_leave_size")]
         max_leave_size: i32,
+        /// Whether the leave-generating bot plays with a wordmap. Defaults on:
+        /// leave generation is the most game-heavy job type there is, and a
+        /// wordmap is a large speedup. Workers build one on demand.
+        #[serde(default = "default_true")]
+        use_wordmap: bool,
     },
 }
 
@@ -312,6 +317,9 @@ fn default_elo_high() -> f64 {
 }
 fn default_max_leave_size() -> i32 {
     6
+}
+fn default_true() -> bool {
+    true
 }
 fn default_racks_per_batch() -> i32 {
     500
@@ -514,18 +522,19 @@ async fn insert_job_config(
             JobTypeConfig::Leave {
                 lexicon, variant, letter_distribution, num_iterations,
                 generation_count, target_rack_count, racks_per_task, max_leave_size,
+                use_wordmap,
             },
         ) => {
             sqlx::query(
                 "INSERT INTO job_leave_config
                      (job_id, lexicon, variant, letter_distribution, num_iterations,
                       generation_count, target_rack_count, racks_per_task,
-                      max_leave_size)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+                      max_leave_size, use_wordmap)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
             )
             .bind(job.id).bind(lexicon).bind(variant).bind(letter_distribution)
             .bind(num_iterations).bind(generation_count).bind(target_rack_count)
-            .bind(racks_per_task).bind(max_leave_size)
+            .bind(racks_per_task).bind(max_leave_size).bind(use_wordmap)
             .execute(conn)
             .await?;
         }

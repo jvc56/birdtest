@@ -177,6 +177,16 @@ pub struct LeaveRequest {
     /// the worker falls back to the lexicon's default leaves.
     pub previous_artifact_key: Option<String>,
     pub num_games: i32,
+    /// This generation's minimum rack target: how many times every rack must
+    /// occur before the generation closes. The server owns the running totals
+    /// across every task in the generation, so for a worker this is only an
+    /// early-out — a task whose own forced racks all reach it before
+    /// `num_games` stops rather than playing games that can no longer change
+    /// what it reports.
+    pub target_rack_count: i32,
+    /// Leave generation has one bot rather than a player pair, so its wordmap
+    /// setting sits on the request instead of on a player spec.
+    pub use_wordmap: bool,
 }
 
 /// What actually goes over the wire to the worker. Internally tagged so the

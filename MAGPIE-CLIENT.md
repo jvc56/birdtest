@@ -17,7 +17,7 @@ games, and submits results the server records and credits.
 | `contribute` command and task loop | Done |
 | `games` / `game_pairs` executors | Done, verified end to end |
 | `opening_rack` executor | Written; not verified end to end (needs a job whose lexicon MAGPIE has, and a full English rack enumeration is millions of tasks) |
-| `leave_generation` executor | Implemented: `config_contribute_leave_gen` fetches the previous generation's KLV via `contribute_fetch_artifact`, writes the forced-rack subset to a scratch file, runs the existing `leavegen` autoplay type bounded by a new `leavegen_max_games` cap (0 = unbounded, the CLI's own default), and reads results out of `RackList` via the new `rack_list_get_rack_equity_json` rather than a CSV round trip. |
+| `leave_generation` executor | Implemented: `config_contribute_leave_gen` fetches the previous generation's KLV via `contribute_fetch_artifact`, passes the request's forced-rack subset straight to `config_autoplay` as an in-memory rack list, runs the existing `leavegen` autoplay type for a single generation at the server's `target_rack_count`, bounded by a new `leavegen_max_games` cap (0 = unbounded, the CLI's own default, since `leavegen` otherwise stops on its rack targets rather than on any game count), and reads results out of `RackList` via the new `rack_list_get_rack_equity_json`. Neither the forced racks nor the results touch the filesystem. |
 | Async GUI status surface (section 12) | Not implemented |
 | Windows WinHTTP backend | Written, not compiled or run on Windows |
 
@@ -481,9 +481,10 @@ has no way to vary them by player.
   and the score `Stat` means and standard deviations. For pairs, read the
   divergent `GameData` as well.
 - **Leave generation** — fetch the previous generation's KLV via
-  `GET /api/worker/artifact`, write the forced-rack subset to a scratch file,
-  run `leavegen`, and read the rack-equity table directly out of `RackList`
-  rather than via `-writerackequitycsv` and a CSV re-read.
+  `GET /api/worker/artifact`, hand the request's forced racks to `leavegen` as
+  an in-memory rack list, and read the rack-equity table directly out of
+  `RackList`. The racks arrive in the task's JSON request and the results go
+  back in its JSON response, so neither goes through a file.
 
 ---
 
@@ -522,22 +523,33 @@ and **no new MAGPIE recorder is required.**
 
 ## 7. Wordmap auto-provisioning
 
-Clients are **required** to use wordmaps: games run dramatically faster with one,
-and a contributor without one is donating far less compute than they think. There
-is no `-wmp false` path for `contribute`.
+Whether a wordmap is used is the **job's** decision, not the client's: it is a
+player setting like any other, sent as `use_wordmap` on each player object
+(and, for `leave_generation`, which has one bot rather than a player pair, on
+the request itself). A job that omits it runs without a wordmap. Games run
+dramatically faster with one, so most jobs will ask for it — but the client
+neither assumes it nor builds one it was not asked for, and a wordmap already
+sitting in `./data` from an earlier job is not switched on by its mere
+presence.
 
-Wordmaps are also never transmitted — they are roughly ten times the size of
-everything else MAGPIE ships — so the client builds what it needs from the
-`.kwg` it already has. The full `kwg -> txt -> wmp` chain measures **~1.3 seconds**
-per lexicon (0.17s + 1.1s, NWL23, 4 threads).
+When a job *does* ask for one, the client provisions it. Wordmaps are never
+transmitted — they are roughly ten times the size of everything else MAGPIE
+ships — so the client builds what it needs from the `.kwg` it already has. The
+full `kwg -> txt -> wmp` chain measures **~1.3 seconds** per lexicon (0.17s +
+1.1s, NWL23, 4 threads). Only the lexicon a player that asked for a wordmap
+actually plays with is built: `use_wordmap` applies to that player's own
+`lexicon` when it overrides the job's, and two players sharing a lexicon build
+it once.
 
-Before running any task, if `<lexicon>.wmp` is absent:
+Before running such a task, if `<lexicon>.wmp` is absent:
 
 1. If `<lexicon>.txt` is absent, `convert dawg2text <lexicon>`.
 2. `convert text2wordmap <lexicon> -threads <n>`.
 
 Both write into `./data`, which is **assumed writable**. If it is not, that is a
-clear error and `contribute` stops — there is no fallback location.
+clear error and `contribute` stops — there is no fallback location. A job that
+did not ask for a wordmap never reaches this path, so an unwritable `./data`
+does not block it.
 
 Generate to a temporary name and `rename()` into place, so two MAGPIE processes
 contributing from the same directory cannot race.
@@ -618,8 +630,22 @@ is internally tagged by `job_type`, one of four shapes:
   "generation": 2,
   "forced_racks": ["AA", "AB"],
   "previous_artifact_key": "leaves/<job>/generation-1.klv2",
+  "target_rack_count": 200,
+  "use_wordmap": true,
   "num_games": 10000 }
 ```
+
+`target_rack_count` is the generation's **minimum rack target**: how many times
+every rack must occur before the generation closes. It is the job's
+`target_rack_count`, the same number a hand-run `leavegen` passes as one entry
+of a per-generation list like `100,200,500,1000,1000,1000` — so it is typically
+in the hundreds or thousands, and effectively never 1. The server owns the
+running per-rack totals across every task in the generation; a task cannot tell
+whether the target has been met overall, so for the client this is only an
+early-out: a task whose own forced racks all reach it before `num_games` games
+stops rather than playing games that can no longer change what it reports.
+Either way — target reached, or `num_games` exhausted — the racks that occurred
+are reported and the server folds them into its totals.
 
 `seed` is a **decimal string**, because it is a `uint64` and JSON numbers are
 doubles. For `game_pairs`, `num_games` counts *pairs*; MAGPIE plays two games per
