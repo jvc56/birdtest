@@ -104,6 +104,77 @@ Contributors run a client program that loops continuously: it sends a **task cla
 
 ---
 
+#### Letter distributions are stated, not inferred
+
+Every job config names its `letter_distribution` alongside its lexicon, and the
+name is carried on the request the worker receives. MAGPIE derives a
+distribution from the lexicon's prefix; birdtest used to mirror that inference,
+which meant guessing at something the job can simply say.
+
+#### Two generate/report pairs on the player config
+
+`player_configs` carries two pairs, each "how much to compute" against "how much
+to report":
+
+| Compute | Report | MAGPIE |
+|---|---|---|
+| `num_plays` | `num_plays_recorded` | `-np` / `maxnumdplays` |
+| `plies` | `num_plies_recorded` | `-pl` / `shplies` |
+
+A simmer may rank hundreds of candidates to order the top few correctly while
+only the leaders are worth storing, and the same holds for plies. Because these
+live on the player config rather than the job, one setting governs both opening
+rack analysis and positions captured during games.
+
+#### Position analyses from games
+
+`games` and `game_pairs` jobs can keep the position analyses their workers
+produce while playing, by setting `capture_positions`. A worker analyses a
+position on every turn regardless; this decides whether those are recorded
+rather than discarded, turning a job run to settle an Elo question into a corpus
+of analysed positions as well.
+
+They share `position_analysis_records` with opening racks -- the request differs
+by job type, but what comes back is a position analysis either way. In-game rows
+carry the CGP, the game index and the turn number, which are NULL for an opening
+rack.
+
+Two things this design turns on, both consequences of games being deterministic:
+
+- **Redundant claims replay identical games**, so in-game positions are keyed on
+  `(task_id, game_index, turn_number)` rather than on the claim, with
+  `ON CONFLICT DO NOTHING`. The first accepted claim records them and the rest
+  are no-ops, so redundancy still verifies the *result* without multiplying the
+  corpus. Opening racks keep their per-claim key, so redundant analyses of the
+  same rack can still be compared.
+- **There is no sampling and no per-task cap.** Every position of every game is
+  captured, which makes `games_per_batch` the control on submission size: a
+  batch of 20 games is a few hundred KB, a batch of 1,000 is on the order of
+  15 MB.
+
+Capture roughly doubles the rows a job produces -- at ~22.5 turns a game, a
+40,000-pair job is 1.8 million positions -- so it is off by default. See
+[GAME-POSITION-CAPTURE.md](GAME-POSITION-CAPTURE.md).
+
+#### Naming: the request is an opening rack, the result is a position analysis
+
+`opening_rack_requests` is named for what it asks for -- a set of opening racks
+-- while the result tables stay `position_analysis_*`, because what comes back
+from analyzing one is a position analysis. There is no general position-analysis
+job, so nothing else writes a request here.
+
+The record deliberately does **not** store the best move, its score or its
+equity. Those are the rank 1 row of `position_analysis_moves`, and a second copy
+is only something to keep consistent. `num_moves` stays, since the stored moves
+are truncated to `num_plays_recorded` and cannot tell you how many were ranked. A
+partial index on rank 1 keeps the dashboard's aggregates cheap.
+
+#### How much of an analysis is kept
+
+A worker reports every move it ranked. The server keeps only the leading `num_plays_recorded` per rack, which is **deliberately a different number from how many the worker generated or simulated** (the player config's `num_plays`): a simmer may need to rank hundreds of candidates to order the top few correctly, while storing hundreds of rows for each of millions of racks is not something the database should be asked to do. `position_analysis_records.num_moves` records how many were ranked, so the discarded tail is still visible as a count.
+
+`position_analysis_plies` is populated only for **simming** player configs. A static player produces no per-ply statistics, so for the common case the table stays empty rather than filling with placeholder rows.
+
 ### Statistical Result Evaluation
 
 For game and game-pair jobs, results are evaluated using the Sequential Probability Ratio Test (SPRT). A job has two finish conditions:
@@ -113,7 +184,9 @@ For game and game-pair jobs, results are evaluated using the Sequential Probabil
 
 SPRT is evaluated inline on every result submission (no background sweep). The server flips the job to `completed` automatically when either condition is met.
 
-For all game pair jobs, Glicko ratings are automatically computed after every game pair result. Ratings are keyed by `(player_config_id, job_id)` — each job maintains its own independent rating table for the player configs involved. The static bot is seeded at 2000; all other player configs start at the Glicko default of 1500. The dashboard displays the current Glicko snapshot for each player config in the job. The dashboard also displays estimated time to completion for active jobs based on current throughput and SPRT progress.
+For game pair jobs, both SPRT and Glicko are computed over the **divergent** pairs only — those whose two games did not play identically — since an identical pair is a guaranteed tie that moves neither the LLR nor a rating. The job's `min_pairs` and `max_pairs` still count every pair played.
+
+For all game pair jobs, Glicko ratings are automatically computed after every game pair result, applied as a single Glicko-2 rating period per submission rather than game by game, which is the algorithm's native form. Ratings are keyed by `(player_config_id, job_id)` — each job maintains its own independent rating table for the player configs involved. The static bot is seeded at 2000; all other player configs start at the Glicko default of 1500. The dashboard displays the current Glicko snapshot for each player config in the job. The dashboard also displays estimated time to completion for active jobs based on current throughput and SPRT progress.
 
 ---
 
@@ -244,6 +317,7 @@ Every significant action (task claimed, result submitted, job created, user bann
 | Secrets | AWS SSM Parameter Store |
 | Artifact storage | AWS S3 |
 | Infrastructure as Code | Terraform |
+| Local development | Docker Compose — the full stack (Postgres, MinIO, backend, Nginx frontend) runs in containers so Docker is the only host dependency |
 
 #### Key Technology Notes
 
@@ -254,6 +328,8 @@ Every significant action (task claimed, result submitted, job created, user bann
 **ECS with Fargate**: Two containers share a single ECS task definition — one running the Axum backend, one running an Nginx container serving the SvelteKit static build. The frontend will be split out to S3 + CloudFront in a later phase.
 
 **Database migrations**: `sqlx migrate run` executes at container startup before the server accepts connections. No separate migration runner needed.
+
+Until birdtest is deployed there is only ever **one migration**. Schema changes edit `0001_initial.sql` in place rather than adding a numbered migration, because there is no live database whose history needs preserving, and a single file is far easier to read than a schema reconstructed from a chain of diffs. The cost is that sqlx records a checksum per applied migration, so editing `0001` means any existing development database must be reset — see [Development](#development). Once there is a deployment to migrate, this convention ends and migrations become append-only.
 
 **Observability**: Structured JSON logs via `tracing` + `tracing-subscriber` (JSON formatter). No metrics or distributed tracing for v1.
 
@@ -355,18 +431,18 @@ Some request types are shared across job types:
 
 | Type | Used by |
 |---|---|
-| `PositionRequest` | Opening rack analysis |
+| `OpeningRackRequest` | Opening rack |
 | `GameRequest` | Games, game pairs |
 | `LeaveRequest` | Leave generation |
 
 ### Task Response Types
 
-A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit and store plain per-game results (`{score1, score2, winner, num_turns}`); a game pair is just two of these, one per ordering, played from the same seed. Pair-level outcome (who won the pair, accounting for the color swap) is derived at read time by pairing up consecutive results for a `game_pairs` task, not stored as its own type.
+A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit the aggregate MAGPIE's autoplay reports for a batch (`{games, wins, losses, ties, score means and standard deviations}`), with game pairs adding a second aggregate over the divergent pairs. Autoplay does not emit individual games, and nothing downstream needs them: SPRT and the dashboard both work off counts.
 
 | Type | Used by |
 |---|---|
-| `PositionAnalysisResponse` | Opening rack analysis |
-| `GameResultsResponse` | Games, game pairs |
+| `PositionAnalysisResponse` | Opening rack analysis — one entry per rack in the batch |
+| `GameResultsResponse` | Games, game pairs — one aggregate per batch, plus a divergent-pairs aggregate for game pairs |
 | `LeaveResponse` | Leave generation |
 
 ### Task Record Types
@@ -381,25 +457,28 @@ A task record is the normalized form stored in a typed table after a response is
 
 ### Creation Strategies
 
-**Pre-populated**: At job creation time the server generates all task requests and inserts them into the `tasks` table with `state = 'available'`. Workers then claim from this pool. Suitable for finite, enumerable work spaces — opening rack analysis.
+**Every job type is on-demand.** No tasks are inserted at job creation. When a worker requests a task, the server generates the next task request, then inserts and claims it atomically in a single transaction, issuing a claim token.
 
-**On-demand**: No tasks are inserted at job creation. When a worker requests a task, the server generates the next task request, then inserts and claims it atomically in a single transaction, issuing a claim token. The task never passes through `available` state. Suitable for seed-based work where the space is effectively unbounded — games, game pairs, leave generation.
+Opening rack analysis was the last pre-populated type. It became on-demand once tasks addressed *ranges* of the rack space rather than materializing a row per rack, and with it the pre-populated strategy disappeared entirely — there is no `CreationStrategy` any more, and one fewer axis on which job types differ.
 
 ### Per-Job-Type Creation Details
 
-#### Opening Rack Analysis — Pre-populated
+#### Opening Rack Analysis — On-demand, range-addressed
 
-At job creation the server enumerates every distinct 7-tile multiset drawable from the lexicon's tile bag and inserts one task + one `position_requests` row per rack, all in a single transaction (or a streaming batch insert).
+Each task covers a contiguous batch of `racks_per_batch` racks. One rack per task would spend a claim/submit round trip on each, and the space is large: the distinct 7-tile racks drawable from the English bag number **3,199,724**. At roughly one worker request per second, a rack per task would cap a single worker below one rack every two seconds before any analysis happened.
 
-Steps:
-1. Load the tile distribution for the job's `lexicon` (letter counts, blank count).
-2. Enumerate all distinct 7-tile multisets via combinatorial iteration over the tile multiset. Each rack is represented as a canonical string of sorted tile characters (e.g., `"AABCELT"`, blanks as `"?"`).
-3. For each rack, encode it as a CGP position string for an empty board with that rack (the format MAGPIE accepts for `cg` / position analysis).
-4. Within one transaction: `INSERT INTO tasks (job_id, seed, state, ...) VALUES ($job_id, NULL, 'available', ...)` then `INSERT INTO position_requests (task_id, lexicon, variant, position, previous_play, player_config_id) VALUES (...)`. `previous_play` is NULL for all opening racks (empty board, no prior move). `player_config_id` is copied from `job_opening_rack_config`. Repeat for all racks.
+Nothing is enumerated up front. A task names the range `[rack_start, rack_start + rack_count)` and the racks are **unranked** from those indices on demand: a small dynamic-programming table over the letter distribution — how many k-tile racks can be drawn from tiles `i` onward — is enough both to count the space and to address the k-th rack in it directly, so producing one rack is a handful of additions rather than a walk over the millions preceding it. Job creation over the full English space is therefore constant time and writes no rows.
 
-Uniqueness is enforced by the position content (the same rack on an empty board always produces the same CGP string). The letter distribution files in `data/letterdistributions/` are used to enumerate the bag. The total task count for a standard English Scrabble bag is on the order of several hundred thousand.
+Ranges tile the space exactly as game seeds do, reusing `tasks.seed` as the starting index and the `(job_id, seed)` unique index to resolve two workers racing for the same slice. `total_racks` is computed once at job creation from the same table, so the scheduler knows when the space is exhausted without re-deriving it.
 
----
+The unranking order must stay stable: results are recorded against racks expanded from an index, so changing it would silently re-point existing results.
+
+At claim time (all in one transaction):
+1. Compute the next start: `SELECT COALESCE(MAX(seed) + $racks_per_batch, 0) FROM tasks WHERE job_id = $job_id`. If it has reached `total_racks`, the job has no work left.
+2. Unrank that range into racks.
+3. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $next_start, 'available')`.
+4. `INSERT INTO opening_rack_requests (task_id, lexicon, variant, rack_start, rack_count, player_config_id)` — the range, not the racks.
+5. Return the expanded racks and a claim token.
 
 #### Games — On-demand
 
@@ -409,6 +488,8 @@ At claim time (all in one transaction):
 1. Compute next seed: `SELECT COALESCE(MAX(seed) + $games_per_batch, 1) FROM tasks WHERE job_id = $job_id`. This yields seed 1 for the first task, then `1 + games_per_batch`, `1 + 2*games_per_batch`, etc. The insert in step 3 will conflict on the unique seed index if two workers race; the loser retries.
 2. `INSERT INTO tasks (job_id, seed, state, active_claim_count) VALUES ($job_id, $next_seed, 'claimed', 1) RETURNING id`.
 3. `INSERT INTO game_requests (task_id, lexicon, variant, seed, num_games, player1_config_id, player2_config_id)` — denormalize all values from the job config so the worker receives a self-contained request.
+
+   The seed crosses the wire to the worker as a **decimal string**, not a JSON number. It is a full `uint64`, and JSON numbers are doubles, so any client using a conventional JSON library would silently lose precision above 2^53. It is stored as a signed `BIGINT` and reinterpreted at the application layer as before.
 4. `INSERT INTO task_claims (task_id, claim_token, state, claimed_by_...)`.
 5. Return the request + claim token to the worker.
 
@@ -418,7 +499,11 @@ SPRT and finish-condition checks run during result submission, not at claim time
 
 #### Game Pairs — On-demand
 
-Same as games, except the batch size is `pairs_per_batch` from the job config. Each task seed is spaced `pairs_per_batch` apart: `SELECT COALESCE(MAX(seed) + $pairs_per_batch, 1) FROM tasks WHERE job_id = $job_id`. The job type signals MAGPIE to run both orderings (p1/p2 then p2/p1) with the same seed in a single invocation. Results are a `GameResultsResponse` — the same type games use — containing exactly two entries per pair (first ordering, then second), stored as two rows in `game_records` tied to the same `task_claim_id` via a `game_index` column. SPRT and Glicko are evaluated on the derived pair outcome (win/loss/tie across the two orderings), computed by pairing up those two rows rather than read from a dedicated column.
+Same as games, except the batch size is `pairs_per_batch` from the job config. Each task seed is spaced `pairs_per_batch` apart: `SELECT COALESCE(MAX(seed) + $pairs_per_batch, 1) FROM tasks WHERE job_id = $job_id`. The job type sets MAGPIE's `-gp` flag, so both orderings of each seed are played in a single invocation.
+
+Results are a `GameResultsResponse` — the same type games use — carrying two aggregates: every game played, and the **divergent** subset. A pair whose two games played identically is a guaranteed tie carrying no information, so excluding those is the variance reduction that pairing exists to provide, and the divergent aggregate is what SPRT and Glicko are computed from. Progress, by contrast, is measured in pairs played, because that is the unit `min_pairs` and `max_pairs` bound.
+
+This treats the two games of a divergent pair as independent observations. They are not quite — they share a seed — so the LLR is slightly optimistic. Correcting it would require per-pair outcomes, which MAGPIE does not report.
 
 ---
 
@@ -440,7 +525,15 @@ At claim time:
 
 **On result acceptance**: within the same transaction that accepts the task result, upsert all `{rack, count, mean}` entries from the response into `leave_rack_progress` in a single bulk statement (multi-row `INSERT ... ON CONFLICT (job_id, generation, rack) DO UPDATE SET occurrence_count = leave_rack_progress.occurrence_count + excluded.occurrence_count, equity_sum = leave_rack_progress.equity_sum + excluded.equity_sum`) rather than row-by-row, since a submission can carry thousands of rows. This is what drives the live dashboard figure — no heartbeat involved.
 
-**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into a `rack,value` CSV (`value = equity_sum / occurrence_count` per rack — this is the format `magpie convert csv2klv` expects, distinct from the `rack,count,mean` format workers submit) and shells out to `magpie convert csv2klv` (the same subprocess-invocation pattern the worker already uses for `autoplay`, just run from the backend) to produce the generation's combined KLV, uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete. This runs once per generation, not once per task, so there's no performance case for linking `libmagpie` into the backend via FFI — that would only add an unsafe binding surface to keep in sync with MAGPIE's C API across version bumps, and let a crash in `libmagpie` take down the whole backend process instead of an isolated subprocess. The backend container needs the `magpie` executable and lexicon data available at runtime, alongside the existing `data/letterdistributions/` dependency — call out in Tech Stack / ECS if adopted.
+**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server combines `leave_rack_progress` for that generation into per-rack mean equities (`value = equity_sum / occurrence_count`) and builds the generation's KLV artifact directly in Rust (`backend/src/jobs/klv.rs`), uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete.
+
+This is a from-scratch reimplementation of what `magpie convert csv2klv` does — a KWG (trie) of every leave the domain admits, plus one `f32` value per leave addressed by a *word index* computed from the graph's own topology at load time rather than stored in the file — not a guess at the format: it's translated line-for-line from MAGPIE's own `klv.h`/`klv_csv.c`, and is cross-validated against a real MAGPIE binary (`jobs::klv::tests::round_trips_through_a_real_magpie_*`; `#[ignore]`d by default since they need a local MAGPIE build and this repo has no CI yet to run them automatically) rather than trusted on inspection alone. Building a plain (non-suffix-shared) trie is enough — the word-index algorithm only needs a topologically correct graph, not MAGPIE's own DAWG-minimizing construction, since both sides compute indices fresh from whatever graph is actually on disk. Doing this in Rust rather than shelling out means the backend has no MAGPIE dependency at all: no binary or lexical data baked into its image, and no subprocess boundary to keep working across MAGPIE version bumps for a format unlikely to change.
+
+Three details of MAGPIE's CLI shape this call, all verified against the binary:
+
+- `convert` addresses files by **data name**, not path. It reads `<data path>/lexica/<name>.csv` and writes the result to the same relative location under the **first** entry of the colon-separated `-path` list, so the scratch directory is laid out like a MAGPIE data directory and listed first. MAGPIE's own data directory follows, read-only, to supply the letter distribution.
+- MAGPIE loads its default board layout from `./data` while building its config, *before* it has parsed `-path`. The subprocess therefore runs with the MAGPIE checkout as its working directory regardless of the search path, and every `-path` entry is absolute.
+- **MAGPIE reports conversion failures on an error stack and still exits 0.** The exit status proves nothing; whether the output file appeared is the real check, and MAGPIE's stdout is what explains a failure.
 
 **Dashboard progress**: because progress is now driven by many small task completions across possibly many workers rather than one long-running worker, the rack-with-fewest-occurrences figure ([Leave generation](#leave-generation) job detail bullet) is live and derived directly from `leave_rack_progress`, updating on every accepted task result via the existing per-job SSE stream — no heartbeat payload is needed.
 
@@ -480,256 +573,26 @@ A top-level `JobType` enum dispatches to each concrete handler. The compiler enf
 
 ## Worker Client
 
-Contributors run a client program that polls for tasks, executes them, and submits results. The client handles authentication (API key or anonymous UUID), heartbeating, and the request/result cycle automatically.
+The contributor client is **MAGPIE itself** — a contributor needs MAGPIE and
+nothing else, no Python, no Docker. `magpie contribute` polls for tasks,
+executes them in-process, and submits results, handling authentication (API
+key or anonymous UUID), heartbeating, and the request/result cycle
+automatically, all driven by a local `contribute.txt`. [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md)
+is the full specification — the worker HTTP API it drives against
+(`/api/worker/task`, `/heartbeat`, `/result`, `/artifact`,
+`/client-version`) is documented under [Worker API](#worker-api) below.
 
-### Responsibilities
+This used to be a separate Python client (`worker/worker.py`) that shelled
+out to a MAGPIE binary distributed in its own Docker image. That client is
+retired; `worker/fake_worker.py` remains as a MAGPIE-free way to test the
+server itself (see [Test Clients](#test-clients)).
 
-1. On startup: load or generate a persistent worker UUID; optionally load an API key from config.
-2. Send a **task claim** to `/api/worker/task`.
-3. Deserialize the **task request** from the response and execute the appropriate work (run the word game analysis tool).
-4. Send periodic heartbeats to `/api/worker/heartbeat` while working.
-5. Submit a **task response** to `/api/worker/result` with the claim token.
-6. Loop.
-
-### Language
-
-**Python.** Chosen for ease of setup across contributor machines — no compilation step required. The client is lightweight and shells out to the word game engine for all computation, so raw client performance is not a concern.
-
-### Engine Dependency (MAGPIE)
-
-The worker client shells out to **MAGPIE** ([github.com/jvc56/MAGPIE](https://github.com/jvc56/MAGPIE)) for the actual word game computation. For v1, the contributor or admin supplies a path to a local MAGPIE directory containing an already-compiled MAGPIE executable. The worker client does **not** build, install, fetch, or manage MAGPIE — it only invokes the binary at the given path.
-
-The MAGPIE directory path is a required configuration value for the worker client, provided via a config file or CLI flag (e.g. `--magpie-dir /path/to/MAGPIE`).
-
-### Skeleton Implementation
-
-Single file (`worker/worker.py`). Business logic (MAGPIE invocation, result parsing) is omitted; structure and all integration points are shown.
-
-```python
-#!/usr/bin/env python3
-"""birdtest worker client — claims tasks, invokes MAGPIE, submits results."""
-
-import argparse
-import logging
-import os
-import subprocess
-import sys
-import tempfile
-import threading
-import time
-import uuid
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
-
-import requests
-import tomllib
-
-__version__ = "1.0.0"
-
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
-@dataclass
-class Config:
-    server_url: str
-    magpie_dir: Path
-    api_key: Optional[str]        # None → anonymous worker (X-Worker-UUID header)
-    worker_uuid: str              # persistent across runs; generated on first run
-    heartbeat_interval: int = 30  # seconds between heartbeats
-    retry_delay_seconds: int = 5  # seconds to wait when the server has no work
-
-def _load_or_generate_uuid(state_dir: Path) -> str:
-    """Read persistent UUID from disk; generate and save one if absent."""
-    path = state_dir / "worker_uuid"
-    if path.exists():
-        return path.read_text().strip()
-    worker_uuid = str(uuid.uuid4())
-    state_dir.mkdir(parents=True, exist_ok=True)
-    path.write_text(worker_uuid)
-    return worker_uuid
-
-def _load_config(args: argparse.Namespace) -> Config:
-    """Merge TOML config file with CLI flags; flags take precedence."""
-    ...
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
-def _auth_headers(cfg: Config) -> dict:
-    if cfg.api_key:
-        return {"Authorization": f"Bearer {cfg.api_key}"}
-    return {"X-Worker-UUID": cfg.worker_uuid}
-
-def _check_for_self_update(cfg: Config) -> None:
-    """
-    GET /api/worker/client-version. If the server reports a version different from
-    __version__, download the new script to a temp file and re-exec this process with
-    it, passing along all original argv. Does not return if an update is applied.
-    """
-    info = requests.get(f"{cfg.server_url}/api/worker/client-version").json()
-    if info["version"] == __version__:
-        return
-    logger.info("Updating worker %s → %s", __version__, info["version"])
-    with tempfile.NamedTemporaryFile(suffix=".py", delete=False) as tmp:
-        tmp.write(requests.get(info["download_url"]).content)
-        tmp_path = tmp.name
-    os.chmod(tmp_path, 0o755)
-    os.execv(sys.executable, [sys.executable, tmp_path] + sys.argv[1:])
-
-def _get_magpie_version(cfg: Config) -> str:
-    """Run `magpie version` once and return the version string. Cached by the caller."""
-    result = subprocess.run(
-        [cfg.magpie_dir / "bin" / "magpie", "version"],
-        capture_output=True, text=True, check=True,
-    )
-    return result.stdout.strip()
-
-def _parse_semver(version: str) -> tuple[int, ...]:
-    """Parses a "X.Y.Z" string into a tuple of ints for correct numeric comparison —
-    plain string comparison is wrong here ("1.10.0" < "1.9.0" as strings)."""
-    return tuple(int(part) for part in version.split("."))
-
-def _claim_task(cfg: Config) -> Optional[dict]:
-    """POST /api/worker/task. Returns parsed body, or None on 204 (no work available)."""
-    ...
-
-def _send_heartbeat(cfg: Config, claim_token: str) -> None:
-    """POST /api/worker/heartbeat. Pure liveness ping — no payload; leave-gen progress
-    is derived server-side from accepted task results, not from heartbeats."""
-    ...
-
-def _submit_result(cfg: Config, claim_token: str, result: dict) -> None:
-    """POST /api/worker/result."""
-    ...
-
-# ---------------------------------------------------------------------------
-# Task handlers — one function per job type
-# ---------------------------------------------------------------------------
-
-def _handle_opening_rack(request: dict, cfg: Config) -> dict:
-    """Invoke MAGPIE to analyze a single opening rack position."""
-    ...
-
-def _handle_game(request: dict, cfg: Config) -> dict:
-    """Invoke MAGPIE autoplay to run a batch of games."""
-    ...
-
-def _handle_game_pair(request: dict, cfg: Config) -> dict:
-    """Invoke MAGPIE autoplay with -gp true for a batch of game pairs."""
-    ...
-
-def _handle_leave_gen(request: dict, cfg: Config) -> dict:
-    """Download previous-gen leaves from S3, write the forced-rack subset to a local
-    file, run autoplay with -forceracksfile, parse the resulting rack-equity CSV (every
-    rack that occurred, forced or not), and return it as an inline {rack, count, mean}
-    list — the CSV itself is scratch and is not uploaded anywhere."""
-    ...
-
-_HANDLERS = {
-    "opening_rack_analysis": _handle_opening_rack,
-    "games":                 _handle_game,
-    "game_pairs":            _handle_game_pair,
-    "leave_generation":      _handle_leave_gen,
-}
-
-# ---------------------------------------------------------------------------
-# Heartbeat thread
-# ---------------------------------------------------------------------------
-
-def _heartbeat_loop(
-    cfg: Config,
-    claim_token: str,
-    stop: threading.Event,
-) -> None:
-    while not stop.wait(timeout=cfg.heartbeat_interval):
-        try:
-            _send_heartbeat(cfg, claim_token)
-        except Exception:
-            logger.warning("Heartbeat failed", exc_info=True)
-
-# ---------------------------------------------------------------------------
-# Main loop
-# ---------------------------------------------------------------------------
-
-def _worker_loop(cfg: Config, magpie_version: str) -> None:
-    while True:
-        # 1. Claim
-        response = _claim_task(cfg)
-        if response is None:
-            time.sleep(cfg.retry_delay_seconds)
-            continue
-
-        claim_token = response["claim_token"]
-        task_request = response["task_request"]
-        min_ver = response.get("min_magpie_version")
-
-        # 2. Version gate — skip task if MAGPIE is too old; claim expires server-side
-        # Compared as a tuple of ints (_parse_semver), not string order: "1.10.0" < "1.9.0"
-        # as strings, which is backwards.
-        if min_ver and _parse_semver(magpie_version) < _parse_semver(min_ver):
-            logger.error(
-                "MAGPIE %s < required %s for this job; skipping task", magpie_version, min_ver
-            )
-            continue
-
-        handler = _HANDLERS[task_request["job_type"]]
-
-        # 3. Heartbeat
-        stop = threading.Event()
-        hb = threading.Thread(
-            target=_heartbeat_loop,
-            args=(cfg, claim_token, stop),
-            daemon=True,
-        )
-        hb.start()
-
-        result = None
-        try:
-            # 4. Execute
-            result = handler(task_request, cfg)
-        except Exception:
-            logger.exception("Task execution failed; claim will expire server-side")
-        finally:
-            stop.set()
-            hb.join()
-
-        # 5. Submit
-        if result is not None:
-            _submit_result(cfg, claim_token, result)
-
-def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="birdtest worker client")
-    p.add_argument("--config", type=Path, default=Path("~/.birdtest/config.toml").expanduser())
-    p.add_argument("--magpie-dir", type=Path)
-    p.add_argument("--api-key")
-    p.add_argument("--server-url")
-    return p.parse_args()
-
-def main() -> None:
-    args = _parse_args()
-    cfg = _load_config(args)
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-    # 1. Self-update check — re-execs this process if a newer script is available
-    _check_for_self_update(cfg)
-
-    # 2. Cache MAGPIE version once at startup
-    magpie_version = _get_magpie_version(cfg)
-    logger.info(
-        "Worker started (uuid=%s, authenticated=%s, magpie=%s, client=%s)",
-        cfg.worker_uuid, cfg.api_key is not None, magpie_version, __version__,
-    )
-
-    _worker_loop(cfg, magpie_version)
-
-if __name__ == "__main__":
-    main()
-```
+birdtest's own backend has no MAGPIE dependency at all, and never has to
+build or ship one: leave-generation aggregation, the one place the server
+used to shell out to `magpie convert csv2klv`, now builds its KLV artifact
+directly (see [Leave generation](#leave-generation) and
+`backend/src/jobs/klv.rs`). The backend's Docker image carries only its own
+compiled Rust binary and `data/letterdistributions/`.
 
 ---
 
@@ -745,6 +608,7 @@ All endpoints return JSON. State-mutating, session-cookie-backed endpoints (Auth
 | `POST` | `/api/worker/task` | Send a task claim. Returns a job-type-specific task request, claim token, and `min_magpie_version` for the assigned job. |
 | `POST` | `/api/worker/heartbeat` | Keep-alive ping for a claimed task. Updates `last_heartbeat_at`. |
 | `POST` | `/api/worker/result` | Submit the result for a claimed task. Requires the claim token. |
+| `GET` | `/api/worker/artifact?key=<artifact-key>` | Download a stored artifact — in v1, a previous generation's combined KLV for a leave-generation task. Proxied through the server so contributors never need AWS credentials; only keys the server itself minted are reachable. |
 
 ### Auth API
 
@@ -856,40 +720,53 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 
 ```
 birdtest/
-├── docker-compose.yml               # local Postgres + MinIO (S3 stub) for development — see Development
+├── docker-compose.yml               # the whole local stack: Postgres, MinIO (S3 stub), backend,
+│                                    # frontend, plus `dev` and `fake-worker` profiles — see Development
+├── .env.example                     # compose port overrides
+├── docker/
+│   └── Dockerfile                  # backend + fake-worker targets; neither needs MAGPIE
 ├── backend/                        # Axum web server (Rust)
 │   ├── Cargo.toml
 │   ├── .env.example                # DATABASE_URL, SESSION_SIGNING_KEY, MAIL_BACKEND=console, etc. for local dev
-│   ├── migrations/                 # sqlx migration files
-│   │   └── 0001_initial.sql
+│   ├── migrations/                 # sqlx migration files — a single one until release;
+│   │   └── 0001_initial.sql        # see Development for why
 │   └── src/
 │       ├── main.rs                 # server startup, router assembly
-│       ├── config.rs               # config loading from SSM / env
-│       ├── db.rs                   # PgPool initialization
+│       ├── config.rs               # config from env (ECS injects SSM values as env vars)
+│       ├── state.rs                # AppState shared by every handler
+│       ├── db.rs                   # PgPool initialization and migrations
 │       ├── error.rs                # AppError type, IntoResponse impl
 │       ├── auth/
-│       │   ├── mod.rs
+│       │   ├── mod.rs              # CurrentUser / AdminUser / WorkerIdentity extractors
 │       │   ├── session.rs          # Paseto token creation / validation
-│       │   ├── api_key.rs          # API key hashing / verification
-│       │   └── csrf.rs             # CSRF token middleware
-│       ├── email.rs                # SES email sending
-│       ├── jobs/                   # job type system
+│       │   ├── api_key.rs          # API key, password and code hashing
+│       │   └── csrf.rs             # CSRF double-submit verification
+│       ├── email.rs                # SES / console mail backends
+│       ├── artifacts.rs            # S3 (MinIO in dev) artifact store
+│       ├── ratelimit.rs            # in-memory governor token buckets
+│       ├── audit.rs                # append-only audit log writes
+│       ├── scheduler.rs            # job selection, lazy reclamation, task claiming
+│       ├── jobstats.rs             # aggregate job stats (REST + SSE payload)
+│       ├── ratings.rs              # Glicko bookkeeping for game-pair jobs
+│       ├── stats/
 │       │   ├── mod.rs
-│       │   ├── handler.rs          # JobHandler trait definition
-│       │   ├── registry.rs         # JobType enum and dispatch
+│       │   ├── sprt.rs             # SPRT LLR and boundaries
+│       │   └── glicko.rs           # Glicko-2 rating update
+│       ├── jobs/                   # job type system
+│       │   ├── mod.rs              # shared request/record helpers
+│       │   ├── handler.rs          # JobHandler trait plus wire types
+│       │   ├── registry.rs         # JobType dispatch (exhaustive matches)
+│       │   ├── racks.rs            # letter distributions, rack/leave enumeration, CGP
 │       │   ├── opening_rack.rs
 │       │   ├── game.rs
 │       │   ├── game_pair.rs
 │       │   └── leave_gen.rs
-│       ├── models/                 # SQLx row types (one file per table group)
+│       ├── models/                 # SQLx row types
 │       │   ├── mod.rs
 │       │   ├── job.rs
-│       │   ├── task.rs
-│       │   ├── claim.rs
-│       │   ├── user.rs
-│       │   └── worker.rs
+│       │   └── user.rs
 │       ├── routes/                 # Axum handlers (one file per API section)
-│       │   ├── mod.rs
+│       │   ├── mod.rs              # pagination helpers
 │       │   ├── worker.rs           # /api/worker/*
 │       │   ├── auth.rs             # /api/auth/*
 │       │   ├── account.rs          # /api/me/*
@@ -898,6 +775,8 @@ birdtest/
 │       └── sse.rs                  # SSE broadcaster (job result push)
 │
 ├── frontend/                       # SvelteKit app
+│   ├── Dockerfile                  # static build served by Nginx — the same artifact ECS runs
+│   ├── docker/nginx.conf           # SPA fallback + /api proxy (SSE needs proxy_buffering off)
 │   ├── package.json
 │   ├── svelte.config.js
 │   ├── vite.config.ts
@@ -957,13 +836,14 @@ birdtest/
 │               └── audit-log/
 │                   └── +page.svelte                # /admin/audit-log
 │
-├── worker/                         # Python worker client
-│   ├── pyproject.toml
-│   └── worker.py                   # single-file implementation (see Worker Client section)
+├── worker/                         # fake_worker.py only; the contributor client is MAGPIE itself
+│   └── fake_worker.py              # synthetic results, no MAGPIE — see Testing
 │
 ├── data/
 │   └── letterdistributions/        # letter distribution files, mirroring MAGPIE-DATA/data/letterdistributions/
 │                                   # used by the server to enumerate racks for opening rack analysis jobs
+│                                   # and the leave universe for leave generation jobs. TESTDIST.csv is a
+│                                   # deliberately tiny bag for local development.
 │
 └── infra/                          # Terraform
     ├── main.tf
@@ -1045,7 +925,7 @@ CREATE TABLE worker_bans (
 -- Jobs
 
 CREATE TYPE job_type AS ENUM (
-    'opening_rack_analysis',
+    'opening_rack',
     'games',
     'game_pairs',
     'leave_generation'
@@ -1155,7 +1035,16 @@ CREATE TABLE job_leave_config (
     job_id         UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
     lexicon        TEXT NOT NULL,
     variant        TEXT NOT NULL,
-    num_iterations INT NOT NULL
+    -- Games each leave-gen task plays over its forced-rack subset.
+    num_iterations INT NOT NULL,
+    -- How many sequential generations this job runs before it is complete.
+    generation_count  INT NOT NULL DEFAULT 1 CHECK (generation_count >= 1),
+    -- Per-generation occurrence target every rack must reach before the generation closes.
+    target_rack_count INT NOT NULL CHECK (target_rack_count >= 1),
+    -- Size of the forced-rack subset handed to a single task.
+    racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
+    -- Largest leave size enumerated into the rack universe (leaves are 1..N tiles).
+    max_leave_size    INT NOT NULL DEFAULT 6 CHECK (max_leave_size BETWEEN 1 AND 6)
 );
 
 -- Tasks
@@ -1171,6 +1060,7 @@ CREATE TABLE tasks (
     -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate join/aggregate.
     accepted_count       INT NOT NULL DEFAULT 0,
     active_claim_count   INT NOT NULL DEFAULT 0,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at         TIMESTAMPTZ
 );
 
@@ -1187,7 +1077,7 @@ CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 -- task counters (accepted_count, active_claim_count) must be decremented and tasks may need
 -- to revert from completed → available. The deletion sequence is:
 --   1. For each active/completed claim: update task counters.
---   2. Delete all task records (game_records, etc.) linked to those claims.
+--   2. Delete all task records (game_results, etc.) linked to those claims.
 --   3. Delete the task_claim rows.
 --   4. Delete the user row (cascades to api_keys, email_confirmations, password_reset_tokens).
 
@@ -1218,7 +1108,7 @@ CREATE UNIQUE INDEX task_claims_anon_unique_idx
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
-CREATE TABLE position_requests (
+CREATE TABLE opening_rack_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
     lexicon           TEXT NOT NULL,
     variant           TEXT NOT NULL,
@@ -1244,6 +1134,7 @@ CREATE TABLE leave_requests (
     variant             TEXT NOT NULL,
     generation          INT NOT NULL,
     forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (see rack_list_create's forceracksfile)
+    num_games           INT NOT NULL,      -- denormalized from job_leave_config.num_iterations
     previous_artifact_key TEXT             -- combined KLV from generation - 1; NULL for generation 1
 );
 
@@ -1297,20 +1188,38 @@ CREATE TABLE position_analysis_plies (
 );
 CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
--- Shared by games and game pairs: one row per individual game. A `games` task submits
--- one row per game in its batch (games_per_batch); a `game_pairs` task submits exactly
--- two rows (game_index 0 and 1, one per ordering) from the same task_claim_id. Pair-level
--- outcome is derived by pairing up the two game_index rows at read time, not stored here.
-CREATE TABLE game_records (
-    task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
-    game_index      SMALLINT NOT NULL DEFAULT 0,  -- 0 for games; 0/1 (ordering) for game pairs
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
-    score1          INT NOT NULL,
-    score2          INT NOT NULL,
-    winner          SMALLINT NOT NULL CHECK (winner IN (0, 1, 2)),  -- 0 = draw
-    num_turns       INT NOT NULL,
-    submitted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (task_claim_id, game_index)
+-- Shared by games and game pairs: one row per accepted task, holding the
+-- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games;
+-- it reports counts and score moments per batch, and in `-gp` mode a second
+-- such summary covering only the divergent pairs.
+CREATE TABLE game_results (
+    task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
+    task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- Every game this task played. Two per pair for a game_pairs task.
+    games             INT NOT NULL CHECK (games >= 0),
+    wins              INT NOT NULL CHECK (wins >= 0),      -- player 1
+    losses            INT NOT NULL CHECK (losses >= 0),
+    ties              INT NOT NULL CHECK (ties >= 0),
+    p1_score_mean     DOUBLE PRECISION NOT NULL,
+    p1_score_sd       DOUBLE PRECISION NOT NULL,
+    p2_score_mean     DOUBLE PRECISION NOT NULL,
+    p2_score_sd       DOUBLE PRECISION NOT NULL,
+    CONSTRAINT game_results_counts_sum CHECK (wins + losses + ties = games),
+    -- The divergent subset: pairs whose two games did not play identically.
+    -- NULL for `games` jobs, which do not play pairs.
+    divergent_games   INT CHECK (divergent_games >= 0),
+    divergent_wins    INT CHECK (divergent_wins >= 0),
+    divergent_losses  INT CHECK (divergent_losses >= 0),
+    divergent_ties    INT CHECK (divergent_ties >= 0),
+    CONSTRAINT game_results_divergent_all_or_nothing CHECK (
+        (divergent_games IS NULL AND divergent_wins IS NULL
+             AND divergent_losses IS NULL AND divergent_ties IS NULL)
+        OR (divergent_games IS NOT NULL AND divergent_wins IS NOT NULL
+             AND divergent_losses IS NOT NULL AND divergent_ties IS NOT NULL
+             AND divergent_wins + divergent_losses + divergent_ties = divergent_games
+             AND divergent_games <= games)
+    ),
+    submitted_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- One row per accepted leave task (a single worker's forced-rack partition of a generation).
@@ -1389,95 +1298,120 @@ CREATE TABLE audit_log (
 
 ## Development
 
-Everything needed to run birdtest locally — backend, frontend, and a worker doing real work against it — runs on a laptop with no AWS access. AWS services (SES, SSM, S3) are stubbed or swapped for local equivalents in dev; only the deployed environment touches real AWS.
+Everything needed to run birdtest locally — backend, frontend, and a worker doing real work against it — runs on a laptop with no AWS access, and `docker compose up` is the whole setup. AWS services (SES, SSM, S3) are stubbed or swapped for local equivalents in dev; only the deployed environment touches real AWS.
 
 ### Prerequisites
 
+**Docker, and nothing else** — for everything except a worker doing real
+computation. The backend, frontend, Postgres and the S3 stand-in all run as
+containers, so no Rust, Node, Python or Postgres install is required on the
+host.
+
 | Tool | Used for |
 |---|---|
-| Rust (stable, via `rustup`) + `sqlx-cli` (`cargo install sqlx-cli`) | Backend build and migrations |
-| Node.js (LTS) + `npm` | Frontend |
-| Docker / Docker Compose | Local Postgres |
-| Python 3.11+ | Worker client |
-| A compiled MAGPIE binary (see [Engine Dependency (MAGPIE)](#engine-dependency-magpie)) | Worker client's actual computation — clone and build [MAGPIE](https://github.com/jvc56/MAGPIE) separately per its own README; birdtest does not vendor or build it |
+| Docker / Docker Compose | The entire stack |
 
-### 1. Database
+(No MAGPIE checkout is needed. It is compiled from source into the images — see [Engine Dependency (MAGPIE)](#engine-dependency-magpie).)
 
-A `docker-compose.yml` at the repo root brings up Postgres on the standard port with a fixed local user/password/db name (`birdtest`/`birdtest`/`birdtest`), so `DATABASE_URL` is the same for every contributor:
+Working directly on the host is still supported and needs Rust (stable), Node
+(LTS) and Python 3.11+ per component; see [Without Docker](#without-docker) in
+the README.
 
-```yaml
-services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_USER: birdtest
-      POSTGRES_PASSWORD: birdtest
-      POSTGRES_DB: birdtest
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-volumes:
-  pgdata:
-```
+### 1. The whole stack
 
 ```bash
-docker compose up -d postgres
+docker compose up --build
 ```
 
-### 2. Backend
+This brings up five services:
+
+| Service | Role |
+|---|---|
+| `postgres` | Postgres 16, on `${POSTGRES_PORT:-5432}` |
+| `minio` | S3-compatible object storage, on `${MINIO_PORT:-9000}` |
+| `minio-init` | One-shot: creates the artifact bucket, then exits |
+| `backend` | The Axum server, on `${BACKEND_PORT:-8080}` |
+| `frontend` | Nginx serving the SvelteKit build, on `${WEB_PORT:-5173}` |
+
+The site is at `http://localhost:5173`. Nginx proxies `/api` to the backend —
+the same split the ALB performs in production — so the app is single-origin
+locally too, and the session cookie and CSRF double-submit behave identically.
+SSE needs `proxy_buffering off` on that location, or the job stream is buffered
+and the dashboard never updates.
+
+`backend` waits on a Postgres healthcheck and on `minio-init` completing;
+`frontend` waits on the backend's `/health`. Migrations run inside the backend
+process before it binds, so there is no separate migration container.
+
+Every host port is overridable via `.env` (see `.env.example`), so a machine
+that already has something on 5432 does not need the compose file edited.
+
+### 2. Resetting the database after a schema change
+
+There is a single migration until release, and schema changes edit it in place.
+sqlx records a checksum for each applied migration, so an edited `0001` will not
+apply over a database that already has the old one — the backend will fail to
+start with a "migration was previously applied but has been modified" error.
+
+Drop the schema and let the backend rebuild it:
 
 ```bash
-cd backend
-cp .env.example .env        # DATABASE_URL, session signing key, etc. — see below
-sqlx migrate run            # applies backend/migrations/ against the local DB
-cargo run                   # serves on http://localhost:8080 by default
+docker compose exec postgres \
+  psql -U birdtest -d birdtest -c 'DROP SCHEMA public CASCADE; CREATE SCHEMA public;'
+docker compose restart backend
 ```
 
-`config.rs` reads from environment variables in dev instead of AWS SSM Parameter Store (SSM is only consulted when an `AWS_REGION`/task-role environment indicates it's actually running in ECS). `.env.example` documents every variable the backend needs locally:
+`docker compose down -v` also works but discards the MinIO bucket with it.
 
-| Variable | Local default | Notes |
-|---|---|---|
-| `DATABASE_URL` | `postgres://birdtest:birdtest@localhost:5432/birdtest` | Matches the Compose service above |
-| `SESSION_SIGNING_KEY` | a fixed dev-only key committed in `.env.example` | Never the real key; rotated per environment in SSM for staging/prod |
-| `MAIL_BACKEND` | `console` | In `console` mode, confirmation codes and password-reset links are logged to stdout instead of sent via SES — there is no local SES equivalent, and standing up a real mail sink isn't worth it for dev. `MAIL_BACKEND=ses` (with real AWS credentials) is available for testing the SES path specifically. |
-| `DATA_PATH` | `../data` | Points at the mirrored `data/letterdistributions/` used for opening-rack enumeration |
-| `RUST_LOG` | `birdtest=debug,tower_http=debug` | Standard `tracing` env filter |
+### 3. Configuration
 
-S3 (artifact storage for full move lists, leave files, rack-equity CSVs) is stubbed with [MinIO](https://min.io/) in dev — add a `minio` service to the same `docker-compose.yml`, exposed S3-API-compatible on `localhost:9000`, and point the backend's `S3_ENDPOINT` env var at it. The AWS SDK works unmodified against MinIO; no separate code path is needed.
+The backend's environment is set inline in `docker-compose.yml` rather than
+from a file, so the default stack has nothing to copy first. `MAIL_BACKEND` is
+`console`, which logs confirmation codes and reset links to the container's
+stdout (`docker compose logs -f backend`) instead of sending them — there is no
+local SES, and standing up a real mail sink is not worth it for dev.
+`S3_ENDPOINT` points at MinIO; the AWS SDK works against it unmodified, so
+there is no separate code path.
 
-### 3. Frontend
+`backend/.env.example` documents the same variables for running the server
+directly on the host with `cargo run`.
+
+### 4. Optional profiles
 
 ```bash
-cd frontend
-npm install
-npm run dev                 # serves on http://localhost:5173, proxying /api/* to :8080 (see vite.config.ts)
+docker compose --profile dev up          # adds Vite with HMR on :5174
+docker compose --profile fake-worker up  # adds synthetic-result test clients
 ```
 
-`vite.config.ts`'s dev server proxy means the frontend never needs its own copy of API base-URL configuration in dev — it talks to whatever `npm run dev`'s proxy target points at, defaulting to the backend's `localhost:8080`.
+The `dev` profile runs the Vite dev server with `frontend/` bind-mounted and
+`node_modules` in a named volume, so hot reload works without Node on the host
+and the container's install never collides with a host one built for a
+different platform. It runs *alongside* the Nginx build rather than replacing
+it, on a separate port.
 
-### 4. Worker client
+### 5. Contributing locally
 
-```bash
-cd worker
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
-python worker.py --server-url http://localhost:8080 --magpie-dir /path/to/MAGPIE
-```
+A real contributor client is MAGPIE itself, not anything this compose file
+builds — point a local `contribute.txt` at `http://localhost:${WEB_PORT:-5173}`
+and run `magpie contribute`. See [Worker Client](#worker-client) and
+[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md).
 
-The worker needs an actual admin-created, activated job to have anything to claim (see step 5) — with no active job, `_claim_task` just gets 204s and the worker sleeps in its retry loop, which is expected and not an error.
+The worker needs an actual admin-created, activated job to have anything to
+claim (see step 5) — with no active job, `_claim_task` just gets 204s and the
+worker sleeps in its retry loop, which is expected and not an error.
 
-### 5. Seeding a local admin and a first job
+### 6. Seeding a local admin and a first job
 
 There's no seed script needed for the minimum path — the first registered user isn't automatically an admin (avoids a footgun where every dev DB has an implicit admin), so promotion is a one-line manual step against the local DB:
 
 ```bash
 # 1. Register normally through the frontend (or POST /api/auth/register), then confirm
 #    the email — MAIL_BACKEND=console means the confirmation code is in the backend's
-#    stdout log rather than an inbox.
+#    log (docker compose logs -f backend) rather than an inbox.
 # 2. Promote that user to admin directly in Postgres (no API for this by design —
 #    is_admin is not settable through any endpoint):
-psql "$DATABASE_URL" -c "UPDATE users SET is_admin = true WHERE username = 'you';"
+docker compose exec postgres \
+  psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE username = 'you';"
 ```
 
 From there, use the now-admin account's session to create a player config and a job through `/admin/player-configs/new` and `/admin/jobs/new` (or the equivalent `POST /api/admin/...` calls directly), then activate the job with an allocation via `/api/admin/jobs/:id/activate`. Once a job is active, the worker client from step 4 will start claiming and completing real tasks against it, and the dashboard at `http://localhost:5173/jobs/:id` updates live via SSE — this is the fastest way to confirm a full change (backend, frontend, and worker together) actually works end to end.
@@ -1504,7 +1438,7 @@ Every component — backend, worker client, and frontend — carries a coverage 
 | Component | Framework | Coverage tool | Gate |
 |---|---|---|---|
 | Backend (Rust/Axum) | `cargo test` (unit + integration) | `cargo llvm-cov` | `cargo llvm-cov --fail-under-lines 100 --fail-under-branch 100` in CI |
-| Worker client (Python) | `pytest` | `pytest-cov` (branch mode) | `pytest --cov=worker --cov-branch --cov-fail-under=100` in CI |
+| Test clients (Python) | `pytest` | `pytest-cov` (branch mode) | `pytest --cov=worker --cov-branch --cov-fail-under=100` in CI |
 | Frontend (SvelteKit) | Vitest (unit/component) + Playwright (e2e) | `@vitest/coverage-v8`, merged with Playwright's Istanbul instrumentation | `vitest run --coverage.thresholds.100` in CI |
 
 **Guarding against hollow coverage**: line/branch coverage alone can be satisfied by tests with no real assertions. To catch that, mutation testing runs as a separate (non-blocking-per-PR, scheduled) CI job — `cargo-mutants` for the backend, `mutmut` for the worker client — and a low mutation-kill score on a file is treated as a signal that its "100%" is fake and needs real assertions, not just execution.
@@ -1520,12 +1454,39 @@ Every component — backend, worker client, and frontend — carries a coverage 
 - **Migration tests**: every migration is tested both forward (applies cleanly to the previous migration's schema) and, where a down-migration exists, in reverse; a migration that can't run against a freshly seeded prior-version test DB fails CI before it fails staging.
 - **SPRT/Glicko correctness**: golden-value tests against hand-computed or reference-implementation expected values (not just "it runs"), since these are the two places a subtly wrong formula would silently produce wrong job outcomes rather than crashing.
 
-### Worker Client
+### Test Clients
 
-- MAGPIE itself is treated as an external dependency and is not what's under test here — `subprocess.run` is mocked/faked so worker unit tests are fast and don't require a MAGPIE build. Fakes return canned structured (`-hr`-off) output covering both the happy path and every documented error shape (non-zero exit, malformed output line, missing expected field) for each of `_handle_opening_rack`, `_handle_game`, `_handle_game_pair`, and `_handle_leave_gen`.
-- **HTTP layer** is tested against a local mock server (`responses` or a `pytest`-scoped `httpx` transport mock) covering claim/heartbeat/result/version-check round trips, including the 204-no-work and stale-claim-token paths, and the self-update re-exec flow (`_check_for_self_update`) with a fake newer-version response.
-- **One real end-to-end suite** (separate from the unit/coverage-gated suite, run nightly rather than per-PR) builds an actual MAGPIE binary from the pinned `min_magpie_version` commit and runs the worker against it for one real task of each job type, plus one full real leave-gen partition-task cycle, to catch drift between MAGPIE's actual output format and the client's parsing — this is what would have caught a MAGPIE-side format regression that mocks structurally cannot.
-- **Golden-file tests** for output parsing: a corpus of real captured MAGPIE stdout (checked into `worker/testdata/`) for each recorder type is parsed and asserted against expected structured results, so a MAGPIE output-format change shows up as a diff against a committed fixture rather than a silent misparse.
+The real contributor client is MAGPIE itself (`magpie contribute`; see
+[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md)) — nothing in this repo builds or runs
+it. `worker/fake_worker.py` is the one client birdtest keeps, purely to test
+its *server*.
+
+**`fake_worker.py` — synthetic results, no MAGPIE.** This is what most
+server-side tests should use. Scheduling (priority tiers, deficit allocation),
+the claim lifecycle (heartbeat timeouts, stale tokens, reclamation), SPRT and
+Glicko, and redundancy all want a chosen outcome and a fast one; a real engine
+makes them slow and non-deterministic. It also covers paths a real client
+cannot reach on purpose:
+
+- `--mode malformed` — submissions the server must reject with `400`.
+- `--mode stale` — a claim token that was never issued, which must be silently
+  ignored rather than accepted.
+- `--mode abandon` — claim and never submit, so the heartbeat timeout has to
+  reclaim the task.
+- `--workers N` — concurrent claims, for the seed-tiling race and the
+  per-identity slot limit.
+- `--p1-win-rate` — bias results to drive SPRT to a known verdict.
+
+Every mode is deterministic under `--seed`. Rate-limit responses are backed off
+and retried rather than counted as rejections, so "the server throttled me"
+never masquerades as "the server refused my data".
+
+**One real end-to-end suite** (run nightly rather than per-PR) builds MAGPIE
+and runs `magpie contribute` against a real server for one task of each job
+type, to catch drift between MAGPIE's actual behaviour and the HTTP contract
+— the class of problem a synthetic client structurally cannot find. See
+MAGPIE-CLIENT.md's own Testing section for the fixtures this shares with
+MAGPIE's side of the contract.
 
 ### Frontend
 

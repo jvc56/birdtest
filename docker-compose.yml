@@ -1,0 +1,164 @@
+# Full local stack. `docker compose up` needs nothing on the host but Docker:
+# database, object storage, backend and frontend all run in containers. None
+# of them need MAGPIE: the backend builds its own leave-generation KLV
+# artifacts directly (see backend/src/jobs/klv.rs) instead of shelling out to
+# it, and the fake worker submits synthetic results.
+#
+# Optional profiles:
+#   --profile fake-worker   synthetic results, no MAGPIE — see README
+#   --profile dev           the Vite dev server with hot reload, alongside the
+#                           production-style Nginx frontend
+#
+# There is no "worker" profile: the real contributor client is MAGPIE itself,
+# via `magpie contribute` (see MAGPIE-CLIENT.md) — nothing to build or run
+# here for that.
+#
+# Ports are overridable so a host that already has something on 5432 (or 9000,
+# or 5173) does not need the file edited. See .env.example.
+
+name: birdtest
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: birdtest
+      POSTGRES_PASSWORD: birdtest
+      POSTGRES_DB: birdtest
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U birdtest -d birdtest"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: birdtest
+      MINIO_ROOT_PASSWORD: birdtestbirdtest
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - miniodata:/data
+
+  # One-shot: creates the artifact bucket the backend writes leave-generation
+  # KLVs into. Retries rather than relying on a MinIO healthcheck, since the
+  # server image does not ship a reliable one.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        until mc alias set local http://minio:9000 birdtest birdtestbirdtest; do
+          echo 'waiting for minio...'; sleep 1;
+        done
+        mc mb --ignore-existing local/birdtest-artifacts
+    restart: on-failure
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://birdtest:birdtest@postgres:5432/birdtest
+      BIND_ADDR: 0.0.0.0:8080
+      # Throwaway dev key, committed on purpose. Real environments get their
+      # own from SSM.
+      SESSION_SIGNING_KEY: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+      SECURE_COOKIES: "false"
+      # Confirmation codes and reset links go to this container's stdout:
+      #   docker compose logs -f backend
+      MAIL_BACKEND: console
+      MAIL_FROM: no-reply@birdtest.local
+      PUBLIC_URL: http://localhost:${WEB_PORT:-5173}
+      DATA_PATH: /app/data
+      S3_BUCKET: birdtest-artifacts
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: birdtest
+      AWS_SECRET_ACCESS_KEY: birdtestbirdtest
+      AWS_REGION: us-east-1
+      RUST_LOG: ${RUST_LOG:-birdtest=debug,tower_http=info}
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  frontend:
+    build:
+      context: ./frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-5173}:80"
+
+  # --- profile: dev ---------------------------------------------------------
+  # Hot reload without Node on the host. node_modules lives in a named volume
+  # so the container's install never collides with a host one on a different
+  # platform.
+  frontend-dev:
+    profiles: [dev]
+    image: node:20-alpine
+    working_dir: /app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      BIRDTEST_API: http://backend:8080
+      # Bind-mounted source does not always deliver inotify events.
+      CHOKIDAR_USEPOLLING: "true"
+    volumes:
+      - ./frontend:/app
+      - frontend_node_modules:/app/node_modules
+    ports:
+      - "${DEV_PORT:-5174}:5173"
+
+  # --- profile: fake-worker -------------------------------------------------
+  # Synthetic results, no MAGPIE. This is what most server-side testing wants:
+  # scheduling, SPRT, Glicko, redundancy and reclamation are all faster and more
+  # deterministic without a real engine in the loop, and the adversarial modes
+  # have no real-client equivalent at all.
+  fake-worker:
+    profiles: [fake-worker]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: fake-worker
+    depends_on:
+      backend:
+        condition: service_healthy
+    command:
+      - --server-url
+      - http://backend:8080
+      - --workers
+      - "${FAKE_WORKERS:-2}"
+      - --tasks
+      - "${FAKE_TASKS:-0}"
+      - --p1-win-rate
+      - "${FAKE_P1_WIN_RATE:-0.5}"
+      - --mode
+      - "${FAKE_MODE:-normal}"
+
+volumes:
+  pgdata:
+  miniodata:
+  frontend_node_modules:

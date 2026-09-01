@@ -1,0 +1,55 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    @apply bg-background text-foreground;
+  }
+  body {
+    @apply min-h-screen antialiased;
+  }
+  a {
+    @apply text-primary hover:underline;
+  }
+}
+
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center rounded-md px-3 py-2 text-sm font-medium
+           transition-colors disabled:pointer-events-none disabled:opacity-50
+           focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring;
+  }
+  .btn-primary {
+    @apply btn bg-primary text-primary-foreground hover:bg-primary/90;
+  }
+  .btn-secondary {
+    @apply btn border border-border bg-card text-foreground hover:bg-muted;
+  }
+  .btn-destructive {
+    @apply btn bg-destructive text-destructive-foreground hover:bg-destructive/90;
+  }
+  .input {
+    @apply w-full rounded-md border border-input bg-background px-3 py-2 text-sm
+           placeholder:text-muted-foreground focus-visible:outline-none
+           focus-visible:ring-2 focus-visible:ring-ring;
+  }
+  .label {
+    @apply mb-1 block text-sm font-medium text-foreground;
+  }
+  .card {
+    @apply rounded-lg border border-border bg-card p-5;
+  }
+  .table {
+    @apply w-full text-left text-sm;
+  }
+  .table th {
+    @apply border-b border-border px-3 py-2 font-medium text-muted-foreground;
+  }
+  .table td {
+    @apply border-b border-border/50 px-3 py-2;
+  }
+  .field-error {
+    @apply mt-1 text-xs text-destructive;
+  }
+}

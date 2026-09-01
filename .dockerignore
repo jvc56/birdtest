@@ -1,0 +1,9 @@
+.git
+backend/target
+frontend/node_modules
+frontend/.svelte-kit
+frontend/build
+worker/.venv
+**/__pycache__
+**/*.pyc
+**/.env
