@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::path::PathBuf;
 use std::time::Duration;
 
 /// Runtime configuration.
@@ -18,7 +17,6 @@ pub struct Config {
     pub mail_backend: MailBackend,
     pub mail_from: String,
     pub public_url: String,
-    pub data_path: PathBuf,
     pub heartbeat_timeout: Duration,
     pub s3_bucket: String,
     pub s3_endpoint: Option<String>,
@@ -29,6 +27,13 @@ pub struct Config {
     /// artifact directly (see `jobs::klv`).
     pub min_magpie_version: String,
     pub magpie_download_url: String,
+    /// Where import fetches versioned tarballs from. Configuration, never user
+    /// input: the residual exposure of parsing an archive from the network is
+    /// a compromised upstream, not an arbitrary URL.
+    pub magpie_data_repo: String,
+    /// Optional in development, set in production: unauthenticated GitHub ref
+    /// resolution is 60 calls an hour per IP.
+    pub github_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,17 +84,22 @@ impl Config {
             mail_backend,
             mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
             public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
-            data_path: PathBuf::from(var_or("DATA_PATH", "../data")),
             heartbeat_timeout: Duration::from_secs(
                 var_or("HEARTBEAT_TIMEOUT_SECONDS", "300").parse().unwrap_or(300),
             ),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            min_magpie_version: var_or("MIN_MAGPIE_VERSION", "0.0.0"),
+            // A placeholder for the MAGPIE release that implements the
+            // expected_data check, to be raised to that release's real number
+            // before launch. Not 0.0.0: every job pins data now, and a floor of
+            // zero would admit a client that cannot verify it.
+            min_magpie_version: var_or("MIN_MAGPIE_VERSION", "0.0.1"),
             magpie_download_url: var_or(
                 "MAGPIE_DOWNLOAD_URL",
                 "https://github.com/jvc56/MAGPIE",
             ),
+            magpie_data_repo: var_or("MAGPIE_DATA_REPO", "jvc56/MAGPIE-DATA"),
+            github_token: var("GITHUB_TOKEN"),
         })
     }
 }

@@ -81,6 +81,8 @@ export interface JobListItem {
   tasks_completed: number;
   units_completed: number | null;
   max_units: number | null;
+  /** Workers are declining this job and none is completing it — usually data nobody has. */
+  stalled: boolean;
 }
 
 export interface SprtResult {
@@ -116,9 +118,10 @@ export interface JobStats {
     priority: number;
     allocation: number | null;
     redundancy: number;
-    min_magpie_version: string | null;
+    min_magpie_version: string;
     created_at: string;
     created_by: string | null;
+    /** The lexicons in play. A games job comparing two reads "CSW21 vs NWL23". */
     lexicon: string | null;
     variant: string | null;
   };
@@ -165,16 +168,21 @@ export interface PlayerConfig {
   name: string;
   recorder_type: string;
   sort_strategy: string | null;
-  leaves: string | null;
+  /** The files this player pins, as input_data rows rather than names. */
+  kwg_id: string;
+  klv_id: string;
+  /** Null for a static player, which never loads a win% model. */
+  winpct_id: string | null;
+  /** Set when this config was cloned onto newer data; ratings do not carry over. */
+  cloned_from_id: string | null;
   max_iterations: number | null;
-  plies: number | null;
+  num_plies: number | null;
   num_plies_recorded: number | null;
   num_plays: number | null;
   num_plays_recorded: number | null;
   stopping_pct: number | null;
   use_inference: boolean | null;
   time_limit_secs: number | null;
-  lexicon: string | null;
   use_wordmap: boolean | null;
   use_rit: boolean | null;
   min_play_iterations: number | null;
@@ -184,9 +192,60 @@ export interface PlayerConfig {
   utility_w_winpct: number | null;
   utility_w_spread: number | null;
   utility_spread_scale: number | null;
-  win_pct_model: string | null;
   movegen_margin: number | null;
   created_at: string;
+}
+
+/** One input data file birdtest knows about, identified by content. */
+export interface InputData {
+  id: string;
+  path: string;
+  role: 'kwg' | 'klv' | 'winpct' | 'letterdist' | 'layout';
+  name: string;
+  sha256: string;
+  bytes: number;
+  /** The versioned tarball this content was FIRST seen in. */
+  tarball_date: string;
+  imported_at: string;
+  /** Jobs and player configs pinning this row; a delete is refused while > 0. */
+  references: number;
+}
+
+export interface ImportDetail {
+  id: string;
+  tarball_date: string;
+  commit_sha: string;
+  tarball_sha256: string | null;
+  state: 'running' | 'staged' | 'confirmed' | 'cancelled' | 'failed';
+  progress_bytes: number;
+  progress_entries: number;
+  error: string | null;
+  requested_at: string;
+  confirmed_at: string | null;
+  files: {
+    path: string;
+    role: string;
+    name: string;
+    sha256: string;
+    bytes: number;
+    /** `collision` is a known path with different bytes — worth a second look. */
+    disposition: 'new' | 'known' | 'collision';
+  }[];
+}
+
+export interface DataGap {
+  role: string;
+  name: string;
+  expected: string;
+  workers: number;
+  declines: number;
+  last_reported_at: string;
+}
+
+export interface FleetVersion {
+  magpie_version: string | null;
+  workers: number;
+  claims: number;
 }
 
 export interface ApiKey {
@@ -241,11 +300,23 @@ export const api = {
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
   workers: (page = 0) => get<Page<Record<string, unknown>>>(`/api/workers?page=${page}`),
 
+  clientVersion: () =>
+    get<{ min_magpie_version: string; download_url: string }>('/api/worker/client-version'),
+
   // Admin
   playerConfigs: () => get<PlayerConfig[]>('/api/admin/player-configs'),
   createPlayerConfig: (body: Record<string, unknown>) =>
     post<PlayerConfig>('/api/admin/player-configs', body),
   deletePlayerConfig: (id: string) => del<void>(`/api/admin/player-configs/${id}`),
+  inputData: () => get<InputData[]>('/api/admin/input-data'),
+  deleteInputData: (id: string) => del<void>(`/api/admin/input-data/${id}`),
+  startImport: (body: { tarball_date: string; git_ref?: string }) =>
+    post<{ id: string; state: string }>('/api/admin/input-data/imports', body),
+  getImport: (id: string) => get<ImportDetail>(`/api/admin/input-data/imports/${id}`),
+  confirmImport: (id: string) =>
+    post<{ inserted: number }>(`/api/admin/input-data/imports/${id}/confirm`),
+  jobDataGaps: (id: string) => get<DataGap[]>(`/api/admin/jobs/${id}/data-gaps`),
+  fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
   createJob: (body: Record<string, unknown>) =>
     post<{ job: JobListItem; prepopulated: number }>('/api/admin/jobs', body),
   activateJob: (id: string, allocation: number) =>

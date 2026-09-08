@@ -30,10 +30,32 @@ pub struct Job {
     pub redundancy: i32,
     pub status: JobStatus,
     pub created_by: Option<Uuid>,
-    pub min_magpie_version: Option<String>,
+    /// Rules setting, not a file: 'classic' | 'wordsmog'.
+    pub variant: String,
+    /// One per job -- MAGPIE takes one `-ld` for the whole game, and two
+    /// players cannot draw from different bags. Same for the board.
+    pub letterdist_id: Uuid,
+    pub layout_id: Uuid,
+    /// The floor as sortable parts. Semver in `TEXT` compares lexically, where
+    /// `'1.10.0' < '1.9.0'`.
+    pub min_magpie_major: i32,
+    pub min_magpie_minor: i32,
+    pub min_magpie_patch: i32,
     pub created_at: DateTime<Utc>,
     pub activated_at: Option<DateTime<Utc>>,
     pub deactivated_at: Option<DateTime<Utc>>,
+}
+
+impl Job {
+    /// The floor as the assignment states it. Stored as three integers so it
+    /// compares numerically; rendered here only for the wire.
+    pub fn min_magpie_version(&self) -> crate::version::Version {
+        crate::version::Version::new(
+            self.min_magpie_major,
+            self.min_magpie_minor,
+            self.min_magpie_patch,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
@@ -42,19 +64,24 @@ pub struct PlayerConfig {
     pub name: String,
     pub recorder_type: String,
     pub sort_strategy: Option<String>,
-    pub leaves: Option<String>,
+    /// The files this player loads, pinned by content. `winpct_id` is `None`
+    /// for a static player, which never loads a win% model at all.
+    pub kwg_id: Uuid,
+    pub klv_id: Uuid,
+    pub winpct_id: Option<Uuid>,
+    /// Set when this config was cloned onto newer data. Ratings do not carry
+    /// over, so the UI shows the lineage instead.
+    pub cloned_from_id: Option<Uuid>,
     pub max_iterations: Option<i32>,
     /// Plies to simulate, and how many of them to report back.
-    pub plies: Option<i32>,
+    pub num_plies: Option<i32>,
     pub num_plies_recorded: Option<i32>,
     /// Plays to simulate, and how many of them to report back.
     pub num_plays: Option<i32>,
     pub num_plays_recorded: Option<i32>,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
-    pub time_limit_secs: Option<f64>,
-    /// Per-player lexicon override; `None` means the job's lexicon.
-    pub lexicon: Option<String>,
+    pub time_limit_secs: Option<i32>,
     pub use_wordmap: Option<bool>,
     pub use_rit: Option<bool>,
     pub min_play_iterations: Option<i32>,
@@ -64,10 +91,9 @@ pub struct PlayerConfig {
     pub utility_w_winpct: Option<f64>,
     pub utility_w_spread: Option<f64>,
     pub utility_spread_scale: Option<f64>,
-    /// Shared MAGPIE settings, not really per-player, but stored here anyway
+    /// A shared MAGPIE setting, not really per-player, but stored here anyway
     /// so this table is the exhaustive source of what a job asked for; a
-    /// job's two player configs must agree on these (validated at creation).
-    pub win_pct_model: Option<String>,
+    /// job's two player configs must agree on it (validated at creation).
     pub movegen_margin: Option<f64>,
     pub created_by: Uuid,
     pub created_at: DateTime<Utc>,
@@ -76,9 +102,6 @@ pub struct PlayerConfig {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct OpeningRackConfig {
     pub job_id: Uuid,
-    pub lexicon: String,
-    pub variant: String,
-    pub letter_distribution: String,
     pub player_config_id: Uuid,
     pub racks_per_batch: i32,
     pub rack_size: i32,
@@ -88,9 +111,6 @@ pub struct OpeningRackConfig {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct GameConfig {
     pub job_id: Uuid,
-    pub lexicon: String,
-    pub variant: String,
-    pub letter_distribution: String,
     pub player1_config_id: Uuid,
     pub player2_config_id: Uuid,
     pub games_per_batch: i32,
@@ -108,9 +128,6 @@ pub struct GameConfig {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct GamePairConfig {
     pub job_id: Uuid,
-    pub lexicon: String,
-    pub variant: String,
-    pub letter_distribution: String,
     pub player1_config_id: Uuid,
     pub player2_config_id: Uuid,
     pub pairs_per_batch: i32,
@@ -128,9 +145,9 @@ pub struct GamePairConfig {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct LeaveConfig {
     pub job_id: Uuid,
-    pub lexicon: String,
-    pub variant: String,
-    pub letter_distribution: String,
+    /// Leave generation has one bot and no `player_configs` row to hold its
+    /// lexicon, so this is the one place a lexicon still sits on a job.
+    pub kwg_id: Uuid,
     pub num_iterations: i32,
     pub generation_count: i32,
     pub target_rack_count: i32,
@@ -176,4 +193,27 @@ impl From<&GamePairConfig> for SprtParams {
             elo_high: c.elo_high,
         }
     }
+}
+
+/// A player config with the names of the files it pins, which is what crosses
+/// the wire: MAGPIE's command-line surface takes names, and the digests that
+/// pin the bytes travel separately in `expected_data`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NamedPlayerConfig {
+    #[sqlx(flatten)]
+    pub config: PlayerConfig,
+    pub kwg_name: String,
+    pub klv_name: String,
+    pub winpct_name: Option<String>,
+}
+
+impl NamedPlayerConfig {
+    /// The join every caller needs; `{}` is a predicate on `pc`.
+    pub const SELECT: &'static str = "
+        SELECT pc.*, kwg.name AS kwg_name, klv.name AS klv_name,
+               wp.name AS winpct_name
+        FROM player_configs pc
+        JOIN input_data kwg ON kwg.id = pc.kwg_id
+        JOIN input_data klv ON klv.id = pc.klv_id
+        LEFT JOIN input_data wp ON wp.id = pc.winpct_id";
 }

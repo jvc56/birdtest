@@ -14,4 +14,7 @@ pub struct AppState {
     pub limits: RateLimiters,
     pub mailer: Mailer,
     pub artifacts: ArtifactStore,
+    /// Shared HTTP client, used only by the admin import path. Cloning it is
+    /// cheap and shares the connection pool.
+    pub http: reqwest::Client,
 }

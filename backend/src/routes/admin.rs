@@ -26,6 +26,380 @@ pub fn router() -> Router<AppState> {
         .route("/workers/ban", post(ban_worker))
         .route("/workers/ban/:id", delete(unban_worker))
         .route("/audit-log", get(audit_log))
+        .route("/input-data", get(list_input_data))
+        .route("/input-data/:id", delete(delete_input_data))
+        .route("/input-data/imports", post(start_import))
+        .route("/input-data/imports/:id", get(get_import))
+        .route("/input-data/imports/:id/confirm", post(confirm_import))
+        .route("/jobs/:id/data-gaps", get(job_data_gaps))
+        .route("/fleet", get(fleet))
+}
+
+// ---------------------------------------------------------------------------
+// Input data
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, sqlx::FromRow)]
+struct InputDataRow {
+    id: Uuid,
+    path: String,
+    role: String,
+    name: String,
+    sha256: String,
+    bytes: i64,
+    tarball_date: String,
+    imported_at: chrono::DateTime<chrono::Utc>,
+    /// How many jobs and player configs would block a delete.
+    references: i64,
+}
+
+/// The vocabulary the job and player forms pick from, newest first.
+async fn list_input_data(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> AppResult<Json<Vec<InputDataRow>>> {
+    Ok(Json(
+        sqlx::query_as::<_, InputDataRow>(
+            "SELECT d.id, d.path, d.role, d.name, d.sha256, d.bytes, d.tarball_date,
+                    d.imported_at,
+                    (SELECT COUNT(*) FROM jobs j
+                      WHERE j.letterdist_id = d.id OR j.layout_id = d.id)
+                  + (SELECT COUNT(*) FROM player_configs pc
+                      WHERE pc.kwg_id = d.id OR pc.klv_id = d.id OR pc.winpct_id = d.id)
+                  + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = d.id)
+                    AS references
+             FROM input_data d
+             ORDER BY d.tarball_date DESC, d.role, d.name",
+        )
+        .fetch_all(&state.pool)
+        .await?,
+    ))
+}
+
+/// Deleting relies on the foreign keys to refuse a referenced row: they carry
+/// no `ON DELETE` clause, so Postgres defaults to `NO ACTION` and the
+/// constraint *is* the safety mechanism. The raw violation is unreadable
+/// though, so it is translated into what an admin needs to know.
+async fn delete_input_data(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> AppResult<StatusCode> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    let uses: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM jobs j
+                  WHERE j.letterdist_id = $1 OR j.layout_id = $1)
+              + (SELECT COUNT(*) FROM player_configs pc
+                  WHERE pc.kwg_id = $1 OR pc.klv_id = $1 OR pc.winpct_id = $1)
+              + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = $1)",
+    )
+    .bind(id)
+    .fetch_one(&state.pool)
+    .await?;
+    if uses > 0 {
+        return Err(AppError::conflict(format!(
+            "this file is pinned by {uses} job{} or player config{}",
+            if uses == 1 { "" } else { "s" },
+            if uses == 1 { "" } else { "s" }
+        )));
+    }
+
+    let deleted = sqlx::query("DELETE FROM input_data WHERE id = $1")
+        .bind(id)
+        .execute(&state.pool)
+        .await?;
+    if deleted.rows_affected() == 0 {
+        return Err(AppError::not_found("no such input data row"));
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct StartImportBody {
+    tarball_date: String,
+    /// A tag, branch or commit sha, resolved to a commit at import time so the
+    /// record names a commit and never a moving branch.
+    #[serde(default = "default_ref")]
+    git_ref: String,
+}
+
+fn default_ref() -> String {
+    "main".to_string()
+}
+
+#[derive(Serialize)]
+struct StartedImport {
+    id: Uuid,
+    state: &'static str,
+}
+
+/// Phase 1, in the background. The archive is ~94 MB, so the request returns an
+/// id immediately and the admin UI polls `GET .../imports/<id>`; nothing waits
+/// on the download and no transaction is held open across it.
+async fn start_import(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Json(body): Json<StartImportBody>,
+) -> AppResult<(StatusCode, Json<StartedImport>)> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    let tarball_date = body.tarball_date.trim().to_string();
+    if tarball_date.len() != 8 || !tarball_date.chars().all(|c| c.is_ascii_digit()) {
+        return Err(AppError::bad_request("tarball_date must be YYYYMMDD"));
+    }
+
+    // Resolving the ref is a single GitHub API call and its failure modes are
+    // worth reporting synchronously -- a typo'd ref should not become a failed
+    // background task.
+    let commit_sha = crate::inputdata::resolve_ref(&state, &body.git_ref).await?;
+
+    let mut tx = state.pool.begin().await?;
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO input_data_imports (tarball_date, commit_sha, requested_by)
+         VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(&tarball_date)
+    .bind(&commit_sha)
+    .bind(admin.0.id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    audit::log(
+        &mut tx,
+        "input_data.import_staged",
+        Some(admin.0.id),
+        None,
+        Some("input_data_import"),
+        Some(id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+
+    tokio::spawn(crate::inputdata::run_import(
+        state.clone(),
+        id,
+        tarball_date,
+        commit_sha,
+    ));
+
+    Ok((StatusCode::ACCEPTED, Json(StartedImport { id, state: "running" })))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ImportRow {
+    id: Uuid,
+    tarball_date: String,
+    commit_sha: String,
+    tarball_sha256: Option<String>,
+    state: String,
+    progress_bytes: i64,
+    progress_entries: i32,
+    error: Option<String>,
+    requested_at: chrono::DateTime<chrono::Utc>,
+    confirmed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ImportFileRow {
+    path: String,
+    role: String,
+    name: String,
+    sha256: String,
+    bytes: i64,
+    /// `new`, `known`, or `collision` -- a path already known under a different
+    /// digest, which is either a legitimate data update or a tarball re-cut
+    /// under a name that was already used.
+    disposition: String,
+}
+
+#[derive(Serialize)]
+struct ImportDetail {
+    #[serde(flatten)]
+    import: ImportRow,
+    files: Vec<ImportFileRow>,
+}
+
+/// Polled while the import runs, then read for the staged diff.
+async fn get_import(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<ImportDetail>> {
+    let import = sqlx::query_as::<_, ImportRow>(
+        "SELECT id, tarball_date, commit_sha, tarball_sha256, state, progress_bytes,
+                progress_entries, error, requested_at, confirmed_at
+         FROM input_data_imports WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such import"))?;
+
+    let files = sqlx::query_as::<_, ImportFileRow>(
+        "SELECT path, role, name, sha256, bytes, disposition
+         FROM input_data_import_rows WHERE import_id = $1
+         ORDER BY disposition, path",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    Ok(Json(ImportDetail { import, files }))
+}
+
+#[derive(Serialize)]
+struct ConfirmedImport {
+    inserted: i64,
+}
+
+/// Phase 2: insert the new rows, in one transaction, exactly as shown.
+///
+/// Only `new` rows are inserted -- `known` is already there, and a `collision`
+/// is a different file at a known path, which is a new row by content anyway.
+/// The bytes of the roles the server reads were kept at staging, so nothing is
+/// downloaded again.
+async fn confirm_import(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> AppResult<Json<ConfirmedImport>> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    let mut tx = state.pool.begin().await?;
+    let import = sqlx::query_as::<_, ImportRow>(
+        "SELECT id, tarball_date, commit_sha, tarball_sha256, state, progress_bytes,
+                progress_entries, error, requested_at, confirmed_at
+         FROM input_data_imports WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such import"))?;
+
+    if import.state != "staged" {
+        return Err(AppError::conflict(format!(
+            "this import is {}, not staged",
+            import.state
+        )));
+    }
+
+    let inserted = sqlx::query(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date,
+                                 content, imported_by)
+         SELECT r.path, r.role, r.name, r.sha256, r.bytes, $2, r.content, $3
+         FROM input_data_import_rows r
+         WHERE r.import_id = $1 AND r.disposition <> 'known'
+         ON CONFLICT (path, sha256) DO NOTHING",
+    )
+    .bind(id)
+    .bind(&import.tarball_date)
+    .bind(admin.0.id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected() as i64;
+
+    sqlx::query(
+        "UPDATE input_data_imports SET state = 'confirmed', confirmed_at = now()
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    audit::log(
+        &mut tx,
+        "input_data.import_confirmed",
+        Some(admin.0.id),
+        None,
+        Some("input_data_import"),
+        Some(id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(Json(ConfirmedImport { inserted }))
+}
+
+// ---------------------------------------------------------------------------
+// What the fleet is missing, and what it is running
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, sqlx::FromRow)]
+struct DataGap {
+    role: String,
+    name: String,
+    expected: String,
+    /// Distinct workers that reported this gap, which is what turns "this job
+    /// is quiet" into "14 workers are all missing one file".
+    workers: i64,
+    declines: i64,
+    last_reported_at: chrono::DateTime<chrono::Utc>,
+}
+
+async fn job_data_gaps(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<DataGap>>> {
+    Ok(Json(
+        sqlx::query_as::<_, DataGap>(
+            "SELECT g.role, g.name, g.expected,
+                    COUNT(DISTINCT COALESCE(c.claimed_by_user_id, c.claimed_by_anon_uuid))
+                        AS workers,
+                    COUNT(*) AS declines,
+                    MAX(g.reported_at) AS last_reported_at
+             FROM worker_data_gaps g
+             JOIN task_claims c ON c.id = g.claim_id
+             WHERE g.job_id = $1
+             GROUP BY g.role, g.name, g.expected
+             ORDER BY workers DESC, g.role, g.name",
+        )
+        .bind(id)
+        .fetch_all(&state.pool)
+        .await?,
+    ))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct FleetVersion {
+    magpie_version: Option<String>,
+    workers: i64,
+    claims: i64,
+}
+
+/// What the field is running, over the last week. This is the evidence for
+/// raising a job's floor: the difference between doing it on evidence and doing
+/// it on hope.
+async fn fleet(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> AppResult<Json<Vec<FleetVersion>>> {
+    Ok(Json(
+        sqlx::query_as::<_, FleetVersion>(
+            "SELECT magpie_version,
+                    COUNT(DISTINCT COALESCE(claimed_by_user_id, claimed_by_anon_uuid))
+                        AS workers,
+                    COUNT(*) AS claims
+             FROM task_claims
+             WHERE claimed_at > now() - interval '7 days'
+             GROUP BY magpie_version
+             ORDER BY workers DESC",
+        )
+        .fetch_all(&state.pool)
+        .await?,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -62,17 +436,23 @@ struct CreatePlayerConfigBody {
     name: String,
     recorder_type: String,
     sort_strategy: Option<String>,
-    leaves: Option<String>,
+    /// The files this player loads, as `input_data` rows rather than names.
+    /// `winpct_id` is null for a static player, which never loads one.
+    kwg_id: Uuid,
+    klv_id: Uuid,
+    #[serde(default)]
+    winpct_id: Option<Uuid>,
+    /// Set when this config is a clone onto newer data.
+    #[serde(default)]
+    cloned_from_id: Option<Uuid>,
     max_iterations: Option<i32>,
-    plies: Option<i32>,
+    num_plies: Option<i32>,
     num_plies_recorded: Option<i32>,
     num_plays: Option<i32>,
     num_plays_recorded: Option<i32>,
     stopping_pct: Option<f64>,
     use_inference: Option<bool>,
-    time_limit_secs: Option<f64>,
-    #[serde(default)]
-    lexicon: Option<String>,
+    time_limit_secs: Option<i32>,
     #[serde(default)]
     use_wordmap: Option<bool>,
     #[serde(default)]
@@ -91,8 +471,6 @@ struct CreatePlayerConfigBody {
     utility_w_spread: Option<f64>,
     #[serde(default)]
     utility_spread_scale: Option<f64>,
-    #[serde(default)]
-    win_pct_model: Option<String>,
     #[serde(default)]
     movegen_margin: Option<f64>,
 }
@@ -128,31 +506,69 @@ async fn create_player_config(
         }
     }
 
+    // Postgres cannot express this: the foreign keys point at `input_data`
+    // without constraining which role each one lands on, so `kwg_id` could name
+    // a letter distribution as far as the database is concerned.
+    let kwg = require_role(&state.pool, body.kwg_id, "kwg").await?;
+    let klv = require_role(&state.pool, body.klv_id, "klv").await?;
+    let winpct = match body.winpct_id {
+        Some(id) => Some(require_role(&state.pool, id, "winpct").await?),
+        None => None,
+    };
+
+    // A player with simulation parameters loads a win% model; a static player
+    // never opens one. Getting this wrong would either fail at the worker or
+    // lock a contributor out of jobs that would never have read the file.
+    let simming = body.max_iterations.is_some()
+        || body.num_plies.is_some()
+        || body.num_plays.is_some()
+        || body.stopping_pct.is_some();
+    match (simming, &winpct) {
+        (true, None) => {
+            return Err(AppError::bad_request(
+                "a simming player config must name a win% model (winpct_id)",
+            ))
+        }
+        (false, Some(_)) => {
+            return Err(AppError::bad_request(
+                "a static player config must not name a win% model: MAGPIE never loads one for it",
+            ))
+        }
+        _ => {}
+    }
+
+    // Leaves are named after the lexicon they were built for, and MAGPIE
+    // refuses a pairing from two different letter distributions.
+    crate::compat::validate_lexicon_and_leaves(&kwg, &klv)?;
+
     let config = sqlx::query_as::<_, PlayerConfig>(
         "INSERT INTO player_configs
-             (name, recorder_type, sort_strategy, leaves, max_iterations, plies,
+             (name, recorder_type, sort_strategy, kwg_id, klv_id, winpct_id,
+              cloned_from_id, max_iterations, num_plies,
               num_plies_recorded, num_plays, num_plays_recorded,
               stopping_pct, use_inference, time_limit_secs,
-              lexicon, use_wordmap, use_rit, min_play_iterations, threshold,
+              use_wordmap, use_rit, min_play_iterations, threshold,
               sampling_rule, inference_margin, utility_w_winpct, utility_w_spread,
-              utility_spread_scale, win_pct_model, movegen_margin, created_by)
+              utility_spread_scale, movegen_margin, created_by)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                 $18,$19,$20,$21,$22,$23,$24,$25)
+                 $18,$19,$20,$21,$22,$23,$24,$25,$26)
          RETURNING *",
     )
     .bind(body.name.trim())
     .bind(&body.recorder_type)
     .bind(&body.sort_strategy)
-    .bind(&body.leaves)
+    .bind(body.kwg_id)
+    .bind(body.klv_id)
+    .bind(body.winpct_id)
+    .bind(body.cloned_from_id)
     .bind(body.max_iterations)
-    .bind(body.plies)
+    .bind(body.num_plies)
     .bind(body.num_plies_recorded)
     .bind(body.num_plays)
     .bind(body.num_plays_recorded)
     .bind(body.stopping_pct)
     .bind(body.use_inference)
     .bind(body.time_limit_secs)
-    .bind(&body.lexicon)
     .bind(body.use_wordmap)
     .bind(body.use_rit)
     .bind(body.min_play_iterations)
@@ -162,7 +578,6 @@ async fn create_player_config(
     .bind(body.utility_w_winpct)
     .bind(body.utility_w_spread)
     .bind(body.utility_spread_scale)
-    .bind(&body.win_pct_model)
     .bind(body.movegen_margin)
     .bind(admin.0.id)
     .fetch_one(&state.pool)
@@ -210,6 +625,30 @@ async fn delete_player_config(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Reads an `input_data` row's name, insisting it is the role the caller
+/// expects. The foreign keys cannot express this -- every one of them points at
+/// the same table -- so it is validated wherever a role column is written.
+async fn require_role(
+    pool: &sqlx::PgPool,
+    id: Uuid,
+    role: &str,
+) -> AppResult<String> {
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT role, name FROM input_data WHERE id = $1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((actual, name)) = row else {
+        return Err(AppError::bad_request(format!("no input data row {id}")));
+    };
+    if actual != role {
+        return Err(AppError::bad_request(format!(
+            "expected a {role} row, but {name} is a {actual} row"
+        )));
+    }
+    Ok(name)
+}
+
 // ---------------------------------------------------------------------------
 // Jobs
 // ---------------------------------------------------------------------------
@@ -221,6 +660,16 @@ struct CreateJobBody {
     priority: i32,
     #[serde(default = "one")]
     redundancy: i32,
+    /// Rules setting shared by every job type.
+    variant: String,
+    /// One letter distribution and one board per job: MAGPIE takes a single
+    /// `-ld` for the whole game, and two players cannot draw from different
+    /// bags.
+    letterdist_id: Uuid,
+    layout_id: Uuid,
+    /// Defaults to the server-wide floor when the form leaves it out. The
+    /// effective value is shown on the creation form so the default is visible
+    /// rather than hidden.
     min_magpie_version: Option<String>,
     #[serde(flatten)]
     config: JobTypeConfig,
@@ -236,9 +685,6 @@ fn one() -> i32 {
 #[serde(untagged)]
 enum JobTypeConfig {
     OpeningRack {
-        lexicon: String,
-        variant: String,
-        letter_distribution: String,
         player_config_id: Uuid,
         #[serde(default = "default_racks_per_batch")]
         racks_per_batch: i32,
@@ -246,9 +692,6 @@ enum JobTypeConfig {
         rack_size: i32,
     },
     Game {
-        lexicon: String,
-        variant: String,
-        letter_distribution: String,
         player1_config_id: Uuid,
         player2_config_id: Uuid,
         #[serde(default = "one")]
@@ -267,9 +710,6 @@ enum JobTypeConfig {
         capture_positions: bool,
     },
     GamePair {
-        lexicon: String,
-        variant: String,
-        letter_distribution: String,
         player1_config_id: Uuid,
         player2_config_id: Uuid,
         #[serde(default = "one")]
@@ -288,9 +728,9 @@ enum JobTypeConfig {
         capture_positions: bool,
     },
     Leave {
-        lexicon: String,
-        variant: String,
-        letter_distribution: String,
+        /// The one place a lexicon still sits on a job: leave generation has a
+        /// single bot and no player config to hold it.
+        kwg_id: Uuid,
         num_iterations: i32,
         #[serde(default = "one")]
         generation_count: i32,
@@ -348,22 +788,40 @@ async fn create_job(
 ) -> AppResult<(StatusCode, Json<CreatedJob>)> {
     csrf::verify(&method, &headers, &jar)?;
 
+    let letterdist_name = require_role(&state.pool, body.letterdist_id, "letterdist").await?;
+    require_role(&state.pool, body.layout_id, "layout").await?;
+
+    // Defaulted from config rather than typed, so the form shows the effective
+    // value; unparseable text is 0.0.0, which no job would accept.
+    let floor = crate::version::Version::parse_or_zero(
+        body.min_magpie_version
+            .as_deref()
+            .unwrap_or(&state.cfg.min_magpie_version),
+    );
+
     let mut tx = state.pool.begin().await?;
     let job = sqlx::query_as::<_, Job>(
-        "INSERT INTO jobs (job_type, priority, redundancy, min_magpie_version, created_by)
-         VALUES ($1, $2, $3, $4, $5) RETURNING *",
+        "INSERT INTO jobs
+             (job_type, priority, redundancy, variant, letterdist_id, layout_id,
+              min_magpie_major, min_magpie_minor, min_magpie_patch, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *",
     )
     .bind(body.job_type)
     .bind(body.priority)
     .bind(body.redundancy)
-    .bind(&body.min_magpie_version)
+    .bind(&body.variant)
+    .bind(body.letterdist_id)
+    .bind(body.layout_id)
+    .bind(floor.major)
+    .bind(floor.minor)
+    .bind(floor.patch)
     .bind(admin.0.id)
     .fetch_one(&mut *tx)
     .await?;
 
-    insert_job_config(&mut tx, &job, &body.config, &state.cfg.data_path).await?;
+    insert_job_config(&mut tx, &job, &body.config, &letterdist_name).await?;
 
-    let initialized = registry::initialize_job_state(&mut tx, &job, &state.cfg.data_path).await?;
+    let initialized = registry::initialize_job_state(&mut tx, &job).await?;
 
     audit::log(
         &mut tx,
@@ -376,6 +834,10 @@ async fn create_job(
     )
     .await?;
     tx.commit().await?;
+
+    // Generation 1's zeroed KLV: a multi-megabyte build and an object-store
+    // write, so it happens after the transaction commits rather than inside it.
+    registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
 
     Ok((StatusCode::CREATED, Json(CreatedJob { job, initialized })))
 }
@@ -424,11 +886,53 @@ async fn validate_shared_player_options(
     Ok(())
 }
 
+/// The names a player config's files carry, for the compatibility check.
+async fn player_file_names(
+    conn: &mut sqlx::PgConnection,
+    player_config_id: Uuid,
+) -> AppResult<(String, String)> {
+    let row: (String, String) = sqlx::query_as(
+        "SELECT kwg.name, klv.name
+         FROM player_configs pc
+         JOIN input_data kwg ON kwg.id = pc.kwg_id
+         JOIN input_data klv ON klv.id = pc.klv_id
+         WHERE pc.id = $1",
+    )
+    .bind(player_config_id)
+    .fetch_optional(conn)
+    .await?
+    .ok_or_else(|| AppError::bad_request("no such player config"))?;
+    Ok(row)
+}
+
+/// MAGPIE decides compatibility from names, and birdtest must not be able to
+/// build a job MAGPIE would refuse to load.
+async fn validate_player_compatibility(
+    conn: &mut sqlx::PgConnection,
+    players: &[(&str, Uuid)],
+    letterdist_name: &str,
+) -> AppResult<()> {
+    let mut names = Vec::new();
+    for (label, id) in players {
+        let (lexicon, leaves) = player_file_names(&mut *conn, *id).await?;
+        names.push((*label, lexicon, leaves));
+    }
+    let files: Vec<crate::compat::PlayerFiles<'_>> = names
+        .iter()
+        .map(|(label, lexicon, leaves)| crate::compat::PlayerFiles {
+            label,
+            lexicon,
+            leaves,
+        })
+        .collect();
+    crate::compat::validate_job_files(&files, letterdist_name)
+}
+
 async fn insert_job_config(
     conn: &mut sqlx::PgConnection,
     job: &Job,
     config: &JobTypeConfig,
-    data_path: &std::path::Path,
+    letterdist_name: &str,
 ) -> AppResult<()> {
     // The untagged config must actually match the declared job type, or the job
     // would exist with no config row and never dispatch anything.
@@ -437,27 +941,30 @@ async fn insert_job_config(
     match (job.job_type, config) {
         (
             JobType::OpeningRack,
-            JobTypeConfig::OpeningRack {
-                lexicon, variant, letter_distribution, player_config_id,
-                racks_per_batch, rack_size,
-            },
+            JobTypeConfig::OpeningRack { player_config_id, racks_per_batch, rack_size },
         ) => {
+            validate_player_compatibility(
+                &mut *conn,
+                &[("player", *player_config_id)],
+                letterdist_name,
+            )
+            .await?;
             // Counting the space is cheap -- a small dynamic-programming table
             // over the letter distribution -- and recording it here means the
             // scheduler can tell when the job is exhausted without re-deriving
-            // it on every claim.
-            let total_racks = crate::jobs::opening_rack::total_racks(
-                data_path, letter_distribution, *rack_size)?;
+            // it on every claim. It counts over the *pinned* bytes: a count
+            // taken from a different copy of the distribution would size a
+            // universe the workers never play in.
+            let job_data = crate::jobs::load_job_data(&mut *conn, job.id).await?;
+            let total_racks =
+                crate::jobs::opening_rack::total_racks(&job_data.letterdist, *rack_size);
             sqlx::query(
                 "INSERT INTO job_opening_rack_config
-                     (job_id, lexicon, variant, letter_distribution, player_config_id,
+                     (job_id, player_config_id,
                       racks_per_batch, rack_size, total_racks)
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                 VALUES ($1, $2, $3, $4, $5)",
             )
             .bind(job.id)
-            .bind(lexicon)
-            .bind(variant)
-            .bind(letter_distribution)
             .bind(player_config_id)
             .bind(racks_per_batch)
             .bind(rack_size)
@@ -468,22 +975,27 @@ async fn insert_job_config(
         (
             JobType::Games,
             JobTypeConfig::Game {
-                lexicon, variant, letter_distribution, player1_config_id,
-                player2_config_id, games_per_batch,
+                player1_config_id, player2_config_id, games_per_batch,
                 min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
                 capture_positions,
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
                 .await?;
+            validate_player_compatibility(
+                &mut *conn,
+                &[("player1", *player1_config_id), ("player2", *player2_config_id)],
+                letterdist_name,
+            )
+            .await?;
             sqlx::query(
                 "INSERT INTO job_game_config
-                     (job_id, lexicon, variant, letter_distribution, player1_config_id,
+                     (job_id, player1_config_id,
                       player2_config_id, games_per_batch, min_games, max_games, sprt_alpha, sprt_beta,
                       elo_low, elo_high, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             )
-            .bind(job.id).bind(lexicon).bind(variant).bind(letter_distribution)
+            .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(games_per_batch).bind(min_games).bind(max_games)
             .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
@@ -494,22 +1006,27 @@ async fn insert_job_config(
         (
             JobType::GamePairs,
             JobTypeConfig::GamePair {
-                lexicon, variant, letter_distribution, player1_config_id,
-                player2_config_id, pairs_per_batch,
+                player1_config_id, player2_config_id, pairs_per_batch,
                 min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
                 capture_positions,
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
                 .await?;
+            validate_player_compatibility(
+                &mut *conn,
+                &[("player1", *player1_config_id), ("player2", *player2_config_id)],
+                letterdist_name,
+            )
+            .await?;
             sqlx::query(
                 "INSERT INTO job_game_pair_config
-                     (job_id, lexicon, variant, letter_distribution, player1_config_id,
+                     (job_id, player1_config_id,
                       player2_config_id, pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta,
                       elo_low, elo_high, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
             )
-            .bind(job.id).bind(lexicon).bind(variant).bind(letter_distribution)
+            .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(pairs_per_batch).bind(min_pairs).bind(max_pairs)
             .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
@@ -520,19 +1037,40 @@ async fn insert_job_config(
         (
             JobType::LeaveGeneration,
             JobTypeConfig::Leave {
-                lexicon, variant, letter_distribution, num_iterations,
+                kwg_id, num_iterations,
                 generation_count, target_rack_count, racks_per_task, max_leave_size,
                 use_wordmap,
             },
         ) => {
+            let lexicon: (String, String) = sqlx::query_as(
+                "SELECT role, name FROM input_data WHERE id = $1",
+            )
+            .bind(kwg_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| AppError::bad_request("no such input data row"))?;
+            if lexicon.0 != "kwg" {
+                return Err(AppError::bad_request(format!(
+                    "expected a kwg row, but {} is a {} row",
+                    lexicon.1, lexicon.0
+                )));
+            }
+            // No leaves to check: every generation plays with a server-built
+            // KLV, generation 1's being a zeroed one.
+            if !crate::compat::lex_ld_compat(&lexicon.1, letterdist_name) {
+                return Err(AppError::bad_request(format!(
+                    "lexicon {:?} is not compatible with letter distribution {letterdist_name:?}",
+                    lexicon.1
+                )));
+            }
             sqlx::query(
                 "INSERT INTO job_leave_config
-                     (job_id, lexicon, variant, letter_distribution, num_iterations,
+                     (job_id, kwg_id, num_iterations,
                       generation_count, target_rack_count, racks_per_task,
                       max_leave_size, use_wordmap)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
             )
-            .bind(job.id).bind(lexicon).bind(variant).bind(letter_distribution)
+            .bind(job.id).bind(kwg_id)
             .bind(num_iterations).bind(generation_count).bind(target_rack_count)
             .bind(racks_per_task).bind(max_leave_size).bind(use_wordmap)
             .execute(conn)
@@ -705,7 +1243,7 @@ async fn purge_job(
 
     // Leave-gen needs its generation-1 rack universe back to have anything to
     // measure progress against.
-    registry::initialize_job_state(&mut tx, &job, &state.cfg.data_path).await?;
+    registry::initialize_job_state(&mut tx, &job).await?;
 
     audit::log(
         &mut tx,
@@ -718,6 +1256,10 @@ async fn purge_job(
     )
     .await?;
     tx.commit().await?;
+
+    // The generation-0 KLV was deleted with the artifacts above; rebuild it, or
+    // generation 1 would have nothing to play with.
+    registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
 
     Ok(Json(PurgeResult { tasks_reset }))
 }

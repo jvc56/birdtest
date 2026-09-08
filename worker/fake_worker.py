@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import requests
 
@@ -36,6 +36,8 @@ logger = logging.getLogger("fake-worker")
 @dataclass
 class Stats:
     claimed: int = 0
+    declined: int = 0
+    shutdown: int = 0
     submitted: int = 0
     accepted: int = 0
     rejected: int = 0
@@ -50,7 +52,8 @@ class Stats:
 
     def summary(self) -> str:
         return (
-            f"claimed={self.claimed} submitted={self.submitted} "
+            f"claimed={self.claimed} declined={self.declined} "
+            f"shutdown={self.shutdown} submitted={self.submitted} "
             f"accepted={self.accepted} rejected={self.rejected} "
             f"no_work={self.no_work} rate_limited={self.rate_limited} "
             f"errors={self.errors}"
@@ -255,6 +258,13 @@ class FakeWorker:
     def __init__(self, args: argparse.Namespace, index: int, stats: Stats):
         self.args = args
         self.stats = stats
+        # Jobs this worker has found it cannot run, resent with every claim.
+        # In memory only, exactly like MAGPIE's: a client that remembered its
+        # limitations across restarts would refuse work it can now do.
+        self.unsupported: List[str] = []
+        # Set when the server tells the worker it will never be useful again
+        # until something on its end changes.
+        self.shutdown: Optional[dict] = None
         # Left unset until the server issues one. A client-invented UUID is
         # rejected: birdtest only accepts identities it handed out.
         self.worker_uuid: Optional[str] = None
@@ -277,10 +287,19 @@ class FakeWorker:
         return f"{self.args.server_url.rstrip('/')}{path}"
 
     def claim(self) -> Optional[dict]:
+        # The body is required: the version drives the per-job floor filter, so
+        # a server that had to assume one would be guessing.
+        body = {
+            "magpie_version": self.args.magpie_version,
+            "unsupported_jobs": self.unsupported,
+        }
         response = self.session.post(
-            self._url("/api/worker/task"), headers=self.headers, timeout=30
+            self._url("/api/worker/task"), headers=self.headers, json=body, timeout=30
         )
         if response.status_code == 204:
+            # "Nothing right now" -- sleep and ask again. Not the same as a
+            # shutdown directive, which says the worker will never be useful
+            # until its data or its MAGPIE changes.
             self.stats.bump("no_work")
             return None
         if response.status_code == 429:
@@ -288,12 +307,54 @@ class FakeWorker:
             time.sleep(float(response.headers.get("Retry-After", "1")))
             return None
         response.raise_for_status()
-        self.stats.bump("claimed")
         assignment = response.json()
+        if "shutdown" in assignment:
+            self.shutdown = assignment["shutdown"]
+            self.stats.bump("shutdown")
+            logger.info(
+                "shutdown (%s): %s",
+                self.shutdown.get("reason"),
+                self.shutdown.get("message"),
+            )
+            return None
+        self.stats.bump("claimed")
         # Adopt the identity the server assigned and use it from here on.
         if not self.args.api_key and not self.worker_uuid:
             self.worker_uuid = assignment.get("worker_uuid")
         return assignment
+
+    def decline(self, assignment: dict, reason: str) -> None:
+        """Give a claim straight back, the way a worker with missing data does."""
+        missing = []
+        if reason == "missing_data":
+            for entry in assignment.get("expected_data", {}).get("files", []):
+                missing.append(
+                    {
+                        "role": entry["role"],
+                        "name": entry["name"],
+                        "expected": entry["sha256"],
+                        # None means "not found at all", which is what a
+                        # contributor who never installed the file reports.
+                        "actual": None,
+                    }
+                )
+        response = self.session.post(
+            self._url("/api/worker/decline"),
+            headers=self.headers,
+            json={
+                "claim_token": assignment["claim_token"],
+                "reason": reason,
+                "missing": missing,
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        self.stats.bump("declined")
+        # Remembering is the whole point: a client that declines and forgets
+        # spins on claim -> decline -> claim.
+        job_id = assignment.get("job_id")
+        if job_id and job_id not in self.unsupported:
+            self.unsupported.append(job_id)
 
     def submit(self, claim_token: str, result: dict) -> None:
         # Back off and retry rather than counting a throttle as a rejection —
@@ -341,10 +402,29 @@ class FakeWorker:
                 time.sleep(self.args.idle_wait)
                 continue
 
+            if self.shutdown is not None:
+                # Exit cleanly rather than spinning: nothing here is doable
+                # until the contributor updates something.
+                return
+
             if assignment is None:
                 if self.args.stop_when_idle:
                     return
                 time.sleep(self.args.idle_wait)
+                continue
+
+            if self.args.mode in ("decline", "decline-version", "decline-job-type"):
+                reason = {
+                    "decline": "missing_data",
+                    "decline-version": "magpie_version",
+                    "decline-job-type": "unknown_job_type",
+                }[self.args.mode]
+                try:
+                    self.decline(assignment, reason)
+                except Exception:
+                    self.stats.bump("errors")
+                    logger.warning("decline failed", exc_info=True)
+                completed += 1
                 continue
 
             token = assignment["claim_token"]
@@ -399,12 +479,25 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["normal", "malformed", "stale", "abandon"],
+        choices=[
+            "normal", "malformed", "stale", "abandon",
+            "decline", "decline-version", "decline-job-type",
+        ],
         default="normal",
         help=(
             "normal: plausible results. malformed: submissions the server should "
             "reject. stale: submit under a claim token that was never issued. "
-            "abandon: claim and never submit, so the heartbeat timeout reclaims."
+            "abandon: claim and never submit, so the heartbeat timeout reclaims. "
+            "decline: report every expected file as missing, accumulating an "
+            "unsupported set across claims until the server says to shut down. "
+            "decline-version / decline-job-type: the other two decline reasons."
+        ),
+    )
+    parser.add_argument(
+        "--magpie-version", default="99.0.0",
+        help=(
+            "the version reported with every claim. Sent as-is, so '0.1.0' or "
+            "nonsense exercises the floor filter and the magpie_too_old shutdown."
         ),
     )
     parser.add_argument(

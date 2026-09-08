@@ -265,17 +265,25 @@ whether it has been reached globally. Without a cap, a task whose forced-rack
 subset happens to be slow to fill would run forever: it would hold its claim,
 miss no heartbeat, and never submit.
 
-`leavegen_max_games` is that cap, set from the request's `num_games`. The task
-then terminates on whichever comes first:
+`leavegen_max_games` is that cap, set from the request's `num_games`, and it
+is the *only* thing that ends a contribute task: the task plays `num_games`
+games and stops.
 
-1. its own forced racks all reach `target_rack_count` — an early-out, since
-   further games cannot change what this task reports; or
-2. `num_games` games are played.
+It would be tempting to also stop early once the task's own forced racks have
+each occurred some target number of times, and an earlier draft of this design
+did exactly that. It is wrong. A game contributes an occurrence for *every*
+rack it draws, not only for the forced subset, and the server folds all of them
+into `leave_rack_progress` — the result upsert does not filter against
+`forced_racks`. So games played after the forced racks are "done" still produce
+coverage the server uses, and stopping early throws it away. The generation's
+rack target is therefore server-only state and is not sent in the request at
+all; the client passes `leavegen` a target it cannot reach, so termination is
+purely by game count.
 
-Either way `postgen_prebroadcast_func` runs at the checkpoint after the
-generation loop, `leave_results_json` is set, and the racks that did occur are
-reported. The server folds them into `leave_rack_progress` and decides on its
-own whether the generation is finished.
+`postgen_prebroadcast_func` runs at the checkpoint after the generation loop,
+`leave_results_json` is set, and the racks that occurred are reported. The
+server folds them into `leave_rack_progress` and decides on its own whether the
+generation is finished.
 
 ### One subtlety
 

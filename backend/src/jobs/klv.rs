@@ -360,8 +360,17 @@ mod tests {
     /// Needs a MAGPIE checkout built at `MAGPIE_BIN` (env var, default
     /// `../../MAGPIE/bin/magpie` relative to this crate) and
     /// `MAGPIE_DATA_PATH` (default `../../MAGPIE/data`, for the default
-    /// board layout MAGPIE loads before parsing `-path`).
-    fn assert_round_trips_through_a_real_magpie(distribution_name: &str) {
+    /// board layout MAGPIE loads before parsing `-path`, and for `english`).
+    ///
+    /// `distribution_bytes` is what birdtest parses and what MAGPIE is given:
+    /// the same bytes go into the temp directory on MAGPIE's search path, so
+    /// the two sides cannot be reading different copies of the alphabet. That
+    /// is the whole point of pinning content, and it is why nothing here reads
+    /// a `DATA_PATH`.
+    fn assert_round_trips_through_a_real_magpie(
+        distribution_name: &str,
+        distribution_bytes: &[u8],
+    ) {
         let magpie_bin = std::env::var("MAGPIE_BIN")
             .unwrap_or_else(|_| "../../MAGPIE/bin/magpie".to_string());
         let magpie_data = std::env::var("MAGPIE_DATA_PATH")
@@ -371,9 +380,8 @@ mod tests {
             "no magpie binary at {magpie_bin} -- set MAGPIE_BIN, or build one"
         );
 
-        let data_path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../data");
-        let distribution = LetterDistribution::load(&data_path, distribution_name).unwrap();
+        let distribution =
+            LetterDistribution::parse(distribution_bytes, distribution_name).unwrap();
         let leaves = distribution.enumerate_leaves(MAX_LEAVE_SIZE);
 
         // A distinct, exactly-representable-in-f32-after-the-1000x-round-trip
@@ -391,20 +399,26 @@ mod tests {
             std::process::id()
         ));
         let lexica_dir = dir.join("lexica");
+        let ld_dir = dir.join("letterdistributions");
         std::fs::create_dir_all(&lexica_dir).unwrap();
+        std::fs::create_dir_all(&ld_dir).unwrap();
         let name = "birdtest_klv_roundtrip_test";
         std::fs::write(lexica_dir.join(format!("{name}.klv2")), &bytes).unwrap();
+        // MAGPIE reads the distribution by name off its search path, so the
+        // fixture goes where MAGPIE will look. `testdist` is birdtest's own and
+        // is not in MAGPIE-DATA at all.
+        std::fs::write(
+            ld_dir.join(format!("{distribution_name}.csv")),
+            distribution_bytes,
+        )
+        .unwrap();
 
         let absolute = |p: &std::path::Path| {
             std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
         };
         let search_path = format!(
-            "{}:{}:{}",
+            "{}:{}",
             absolute(&dir).display(),
-            // Non-MAGPIE-DATA distributions (testdist) need birdtest's own
-            // data dir on the path too -- matching what the old shelled-out
-            // run_transition did.
-            absolute(&data_path).display(),
             absolute(std::path::Path::new(&magpie_data)).display()
         );
 
@@ -452,15 +466,29 @@ mod tests {
     // doc comment). Run explicitly with, e.g.:
     //   cargo test --bin birdtest round_trips -- --ignored
 
+    /// birdtest's own tiny alphabet, small enough to enumerate exhaustively.
+    /// Compiled in rather than read from disk: it is a test fixture, not
+    /// runtime data, and birdtest no longer has a data directory.
+    const TESTDIST: &[u8] = include_bytes!("testdata/testdist.csv");
+
     #[test]
     #[ignore]
     fn round_trips_through_a_real_magpie_testdist() {
-        assert_round_trips_through_a_real_magpie("testdist");
+        assert_round_trips_through_a_real_magpie("testdist", TESTDIST);
     }
 
     #[test]
     #[ignore]
     fn round_trips_through_a_real_magpie_english() {
-        assert_round_trips_through_a_real_magpie("english");
+        // The real English distribution, from the MAGPIE checkout the test
+        // already requires -- birdtest keeps no copy of a MAGPIE-DATA file.
+        let magpie_data = std::env::var("MAGPIE_DATA_PATH")
+            .unwrap_or_else(|_| "../../MAGPIE/data".to_string());
+        let path = std::path::Path::new(&magpie_data)
+            .join("letterdistributions")
+            .join("english.csv");
+        let bytes = std::fs::read(&path)
+            .unwrap_or_else(|e| panic!("no english.csv at {}: {e}", path.display()));
+        assert_round_trips_through_a_real_magpie("english", &bytes);
     }
 }

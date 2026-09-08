@@ -1,8 +1,8 @@
 use super::handler::*;
+use super::JobData;
 use crate::error::{AppError, AppResult};
 use crate::models::job::GameConfig;
 use sqlx::{PgConnection, Row};
-use std::path::Path;
 use uuid::Uuid;
 
 pub struct GameHandler;
@@ -73,8 +73,7 @@ impl JobHandler for GameHandler {
 
 
 
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid,
-                          _data_path: &Path) -> AppResult<Self::Request> {
+    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         super::load_game_request(conn, task_id, false).await
     }
 
@@ -114,6 +113,7 @@ pub async fn next_request(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &GameConfig,
+    job_data: &JobData,
 ) -> AppResult<(i64, GameRequest)> {
     let next_seed = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(seed) FROM tasks WHERE job_id = $1",
@@ -130,9 +130,8 @@ pub async fn next_request(
     Ok((
         next_seed,
         GameRequest {
-            lexicon: config.lexicon.clone(),
-            variant: config.variant.clone(),
-            letter_distribution: config.letter_distribution.clone(),
+            variant: job_data.variant.clone(),
+            letter_distribution: job_data.letterdist_name.clone(),
             seed: next_seed as u64,
             num_games: config.games_per_batch,
             game_pairs: false,
@@ -148,7 +147,7 @@ pub(super) async fn load_game_request_row(
     task_id: Uuid,
 ) -> AppResult<sqlx::postgres::PgRow> {
     Ok(sqlx::query(
-        "SELECT lexicon, variant, letter_distribution, seed, num_games,
+        "SELECT variant, letter_distribution, seed, num_games,
                 player1_config_id, player2_config_id, capture_positions
          FROM game_requests WHERE task_id = $1",
     )

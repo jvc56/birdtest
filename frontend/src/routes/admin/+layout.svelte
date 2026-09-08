@@ -5,6 +5,8 @@
   const tabs = [
     { href: '/admin/jobs/new', label: 'New job' },
     { href: '/admin/player-configs', label: 'Player configs' },
+    { href: '/admin/input-data', label: 'Input data' },
+    { href: '/admin/fleet', label: 'Fleet' },
     { href: '/admin/users', label: 'Users' },
     { href: '/admin/workers', label: 'Bans' },
     { href: '/admin/audit-log', label: 'Audit log' }

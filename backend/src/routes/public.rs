@@ -47,6 +47,14 @@ struct JobListItem {
     /// `max_pairs`, not a task count that grows as work is handed out.
     units_completed: Option<i64>,
     max_units: Option<i32>,
+    /// Workers are declining this job and none is completing it.
+    ///
+    /// A job pinned to data nobody has does not announce itself: the workers
+    /// go on contributing elsewhere and this one simply gets nothing done. The
+    /// symptom is an absence, so it has to be stated rather than noticed.
+    /// There is deliberately no alert -- that needs a notification channel
+    /// birdtest does not have -- so this is shown where an admin already looks.
+    stalled: bool,
 }
 
 async fn list_jobs(
@@ -63,7 +71,24 @@ async fn list_jobs(
                     AS tasks_completed,
                 (SELECT COALESCE(SUM(r.games), 0) FROM game_results r
                  JOIN tasks t ON t.id = r.task_id WHERE t.job_id = j.id) AS game_rows,
-                gc.max_games, pc.max_pairs
+                gc.max_games, pc.max_pairs,
+                -- Stalled: at least one decline and no submission in the last
+                -- 24 hours, with nothing currently claimed. Long enough not to
+                -- flap overnight, short enough that an admin sees it the next
+                -- morning. Everything it reads is already recorded.
+                (j.status = 'active'
+                 AND EXISTS (SELECT 1 FROM worker_data_gaps g
+                              WHERE g.job_id = j.id
+                                AND g.reported_at > now() - interval '24 hours')
+                 AND NOT EXISTS (SELECT 1 FROM task_claims c
+                                 JOIN tasks t ON t.id = c.task_id
+                                 WHERE t.job_id = j.id
+                                   AND c.state = 'completed'
+                                   AND c.completed_at > now() - interval '24 hours')
+                 AND NOT EXISTS (SELECT 1 FROM task_claims c
+                                 JOIN tasks t ON t.id = c.task_id
+                                 WHERE t.job_id = j.id AND c.state = 'claimed')
+                ) AS stalled
          FROM jobs j
          LEFT JOIN job_game_config gc ON gc.job_id = j.id
          LEFT JOIN job_game_pair_config pc ON pc.job_id = j.id
@@ -104,6 +129,7 @@ async fn list_jobs(
                 tasks_completed: row.get("tasks_completed"),
                 units_completed,
                 max_units,
+                stalled: row.get("stalled"),
             }
         })
         .collect();

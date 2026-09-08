@@ -1,6 +1,7 @@
 mod artifacts;
 mod audit;
 mod auth;
+mod compat;
 mod config;
 mod db;
 mod email;
@@ -14,7 +15,9 @@ mod routes;
 mod scheduler;
 mod sse;
 mod state;
+mod inputdata;
 mod stats;
+mod version;
 
 use anyhow::Result;
 use axum::routing::get;
@@ -52,7 +55,21 @@ async fn main() -> Result<()> {
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,
+        http: reqwest::Client::builder()
+            .user_agent("birdtest")
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .read_timeout(std::time::Duration::from_secs(120))
+            .build()
+            .expect("HTTP client"),
     };
+
+    // Single instance: an import row left `running` belongs to a process that
+    // is gone, so nothing else can be working on it.
+    match inputdata::fail_orphaned_imports(&state.pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "failed input data imports left running by a restart"),
+        Err(err) => tracing::error!(error = %err.message, "could not reap orphaned imports"),
+    }
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))

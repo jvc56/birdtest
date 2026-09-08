@@ -21,6 +21,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/client-version", get(client_version))
         .route("/task", post(claim_task))
+        .route("/decline", post(decline_task))
         .route("/heartbeat", post(heartbeat))
         .route("/result", post(submit_result))
         .route("/artifact", get(artifact))
@@ -79,12 +80,33 @@ async fn artifact(
         .into_response())
 }
 
+/// What the worker says about itself. Required, not optional: the version
+/// drives the per-job floor filter, and a server that has to assume a version
+/// is giving a wrong answer dressed as a safe one.
+#[derive(Deserialize)]
+struct ClaimBody {
+    magpie_version: String,
+    /// Jobs this worker has already found it cannot run, for any reason.
+    /// Attacker-controlled, so it is capped and bound as an array rather than
+    /// interpolated.
+    #[serde(default)]
+    unsupported_jobs: Vec<Uuid>,
+}
+
+/// Far above any honest client: the list is bounded by the jobs a worker has
+/// actually been offered. Past the cap it is truncated rather than rejected --
+/// a truncated list costs at most a wasted claim.
+const MAX_UNSUPPORTED_JOBS: usize = 200;
+
 #[derive(Serialize)]
 struct TaskAssignment {
     claim_token: Uuid,
     job_id: Uuid,
     task_request: TaskRequest,
-    min_magpie_version: Option<String>,
+    min_magpie_version: String,
+    /// Every file this task will load, with the digest the worker must be able
+    /// to reproduce from its own copy.
+    expected_data: ExpectedData,
     /// Present only when the request carried no identity at all and the
     /// server just minted one. The client persists this and sends it as
     /// `X-Worker-UUID` on every later request.
@@ -92,28 +114,157 @@ struct TaskAssignment {
     worker_uuid: Option<Uuid>,
 }
 
-/// The task claim: a minimal message saying "I am ready for work". Everything
-/// about the assignment is the server's decision.
-async fn claim_task(State(state): State<AppState>, identity: WorkerIdentity) -> AppResult<Response> {
+#[derive(Serialize)]
+struct ExpectedData {
+    /// Named so a client that does not recognise the algorithm can say so and
+    /// run unverified rather than refusing work: an algorithm change should not
+    /// be a fleet-wide outage, and `min_magpie_version` is the lever for that.
+    algorithm: &'static str,
+    files: Vec<crate::jobs::ExpectedFile>,
+}
+
+#[derive(Serialize)]
+struct ShutdownResponse {
+    shutdown: scheduler::ShutdownDirective,
+}
+
+/// The task claim: "I am ready for work, here is what I am and what I cannot
+/// do". Everything about the assignment itself is the server's decision.
+async fn claim_task(
+    State(state): State<AppState>,
+    identity: WorkerIdentity,
+    Json(body): Json<ClaimBody>,
+) -> AppResult<Response> {
     ratelimit::check(&state.limits.worker, &identity.rate_key())?;
 
-    match scheduler::claim(&state, &identity).await? {
-        // 204 rather than an error: "no work right now" is the normal state of a
-        // quiet server, and the client just sleeps and asks again. A brand new
-        // anonymous identity minted for this request is not reported here --
-        // there is no body to carry it in, and a client that finds no work has
-        // nothing to persist yet. It tries again with no identity next time,
-        // and gets one for keeps once a task is actually available.
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
-        Some(outcome) => Ok(Json(TaskAssignment {
-            claim_token: outcome.claim_token,
-            job_id: outcome.job_id,
-            task_request: outcome.request,
-            min_magpie_version: outcome.min_magpie_version,
+    let mut unsupported_jobs = body.unsupported_jobs;
+    unsupported_jobs.truncate(MAX_UNSUPPORTED_JOBS);
+    let caps = scheduler::WorkerCapabilities {
+        magpie_version: crate::version::Version::parse_or_zero(&body.magpie_version),
+        unsupported_jobs,
+    };
+
+    match scheduler::claim(&state, &identity, &caps).await? {
+        // 204 rather than an error: "no work right now" is the normal state of
+        // a quiet server, and the client sleeps and asks again. This is not the
+        // same as a shutdown, which says "you will never be useful until
+        // something on your end changes" -- conflating them either spins a
+        // doomed client forever or tells a contributor their data is stale
+        // because the server happened to be idle.
+        //
+        // A brand new anonymous identity minted for this request is not
+        // reported here: there is no body to carry it in, and a client that
+        // finds no work has nothing to persist yet.
+        scheduler::ClaimOutcome::Idle | scheduler::ClaimOutcome::NoWorkExists => {
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        scheduler::ClaimOutcome::Shutdown(directive) => {
+            Ok(Json(ShutdownResponse { shutdown: directive }).into_response())
+        }
+        scheduler::ClaimOutcome::Task(claim) => Ok(Json(TaskAssignment {
+            claim_token: claim.claim_token,
+            job_id: claim.job_id,
+            task_request: claim.request,
+            min_magpie_version: claim.min_magpie_version,
+            expected_data: ExpectedData { algorithm: "sha256", files: claim.expected_data },
             worker_uuid: identity.newly_assigned_uuid(),
         })
         .into_response()),
     }
+}
+
+/// A file the worker could not produce the expected digest for.
+#[derive(Deserialize)]
+struct MissingFile {
+    role: String,
+    name: String,
+    expected: String,
+    /// `None` means the file was not found at all; a hex string means it was
+    /// found with different content.
+    #[serde(default)]
+    actual: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeclineBody {
+    claim_token: Uuid,
+    /// `missing_data`, `magpie_version` or `unknown_job_type`.
+    reason: String,
+    #[serde(default)]
+    missing: Vec<MissingFile>,
+}
+
+/// "I claimed this and cannot do it." Releases the claim immediately rather
+/// than waiting out the heartbeat timeout, and records what was missing.
+///
+/// The gaps are recorded for humans, not for routing: the client resends its
+/// own unsupported set with every claim, which is what makes that state
+/// self-correcting when a contributor updates their data.
+async fn decline_task(
+    State(state): State<AppState>,
+    identity: WorkerIdentity,
+    Json(body): Json<DeclineBody>,
+) -> AppResult<StatusCode> {
+    ratelimit::check(&state.limits.worker, &identity.rate_key())?;
+
+    if !matches!(
+        body.reason.as_str(),
+        "missing_data" | "magpie_version" | "unknown_job_type"
+    ) {
+        return Err(AppError::bad_request(
+            "reason must be 'missing_data', 'magpie_version' or 'unknown_job_type'",
+        ));
+    }
+
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT c.id, t.job_id
+         FROM task_claims c
+         JOIN tasks t ON t.id = c.task_id
+         WHERE c.claim_token = $1 AND c.state = 'claimed'",
+    )
+    .bind(body.claim_token)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(row) = row else {
+        // Already released, already submitted, or never existed: nothing the
+        // client can do about it either way.
+        tx.rollback().await?;
+        return Err(AppError::not_found("no open claim with that token"));
+    };
+    let claim_id: Uuid = row.get("id");
+    let job_id: Uuid = row.get("job_id");
+
+    scheduler::release_claim(&mut tx, claim_id, "declined").await?;
+
+    for file in &body.missing {
+        sqlx::query(
+            "INSERT INTO worker_data_gaps (job_id, claim_id, role, name, expected, actual)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(job_id)
+        .bind(claim_id)
+        .bind(&file.role)
+        .bind(&file.name)
+        .bind(&file.expected)
+        .bind(&file.actual)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    audit::log(
+        &mut tx,
+        "task.declined",
+        identity.user_id(),
+        identity.anon_uuid(),
+        Some("claim"),
+        Some(claim_id.to_string()),
+        Some(job_id),
+    )
+    .await?;
+    tx.commit().await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]

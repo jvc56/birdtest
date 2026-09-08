@@ -17,7 +17,7 @@ games, and submits results the server records and credits.
 | `contribute` command and task loop | Done |
 | `games` / `game_pairs` executors | Done, verified end to end |
 | `opening_rack` executor | Written; not verified end to end (needs a job whose lexicon MAGPIE has, and a full English rack enumeration is millions of tasks) |
-| `leave_generation` executor | Implemented: `config_contribute_leave_gen` fetches the previous generation's KLV via `contribute_fetch_artifact`, passes the request's forced-rack subset straight to `config_autoplay` as an in-memory rack list, runs the existing `leavegen` autoplay type for a single generation at the server's `target_rack_count`, bounded by a new `leavegen_max_games` cap (0 = unbounded, the CLI's own default, since `leavegen` otherwise stops on its rack targets rather than on any game count), and reads results out of `RackList` via the new `rack_list_get_rack_equity_json`. Neither the forced racks nor the results touch the filesystem. |
+| `leave_generation` executor | Implemented: `config_contribute_leave_gen` fetches the previous generation's KLV via `contribute_fetch_artifact`, passes the request's forced-rack subset straight to `config_autoplay` as an in-memory rack list, runs the existing `leavegen` autoplay type for a single generation at an unreachable rack target so the run ends on the new `leavegen_max_games` cap alone (0 = unbounded, the CLI's own default, since `leavegen` otherwise stops on its rack targets rather than on any game count), and reads results out of `RackList` via the new `rack_list_get_rack_equity_json`. Neither the forced racks nor the results touch the filesystem. |
 | Async GUI status surface (section 12) | Not implemented |
 | Windows WinHTTP backend | Written, not compiled or run on Windows |
 
@@ -117,7 +117,8 @@ error onto the stack. Nothing above compat needs to know.
 | Persistent worker identity | UUID assigned by the server on the first claimed task, stored on disk |
 | Authentication | `Authorization: Bearer <api-key>`, or `X-Worker-UUID` when anonymous |
 | Claim a task | `POST /api/worker/task` -> task request, or 204 when idle |
-| Version gate | Refuse the task if MAGPIE is older than the job's `min_magpie_version` |
+| Version gate | State the version on every claim; decline a job whose `min_magpie_version` this build does not meet |
+| Data verification | Hash every file in `expected_data` and decline the task if any does not match |
 | Execute | Dispatch on `job_type` to one of four handlers |
 | Heartbeat | Background thread, `POST /api/worker/heartbeat` every 30s while working |
 | Submit | `POST /api/worker/result` with the claim token |
@@ -400,23 +401,61 @@ should not silently inherit whatever a user last set for simulation.
 1. Load `ClientState` from the settings file. `uuid` may be absent -- the
    server assigns one, see step 2.
 2. `POST /api/worker/task`, identifying with the API key if set, the stored
-   `uuid` if set, or no identity header at all if neither is set yet.
-   - 204: sleep `idlewait`, repeat.
-   - 200: if the response carries a `worker_uuid` and this worker had none
-     locally, adopt it -- update `ClientState` and the request identity used
-     from here on, and append it to the settings file. Continue.
-3. **Version gate.** The response carries `min_magpie_version`. If it is present
-   and this build is older, **stop the loop and report an error**: "this job
-   requires MAGPIE >= 1.4.0; you are running 1.2.0. Update MAGPIE to continue
-   contributing." Do not submit, do not retry — the claim lapses via the
-   heartbeat timeout and another worker picks it up. A GUI shows one actionable
-   message rather than a scrolling error.
-   The same applies to a `job_type` this build does not recognise: it means the
-   server is newer than this MAGPIE, so exit the same way.
-4. Start the heartbeat thread.
-5. Dispatch on `job_type` (section 5).
-6. `POST /api/worker/result`.
-7. Stop the heartbeat. If `maxtasks` is reached, stop; otherwise repeat.
+   `uuid` if set, or no identity header at all if neither is set yet. The body
+   is **required** and carries this build's `magpie_version` plus
+   `unsupported_jobs`, the in-memory set of jobs this worker has already found
+   it cannot run. The server filters on both before it picks a job, so a worker
+   that cannot run the top-priority job still gets offered work below it.
+   - 204: sleep `idlewait`, repeat. This means "nothing right now", nothing
+     more.
+   - 200 with a `shutdown` object: every active job is out of reach until this
+     worker changes something. Print the accumulated gaps, the server's
+     message, and the remedy it names; exit cleanly. This is the opposite of a
+     204 and the two must never be conflated -- one is a quiet server, the
+     other is a worker that will never be useful as it stands.
+   - 200 with a task: if the response carries a `worker_uuid` and this worker
+     had none locally, adopt it -- update `ClientState` and the request
+     identity used from here on, and append it to the settings file. Continue.
+3. **Verify the input data.** The assignment carries `expected_data`: every
+   file this task will load, with the SHA-256 the job pins. Resolve each one
+   through `data_filepaths_get_readable_filename` -- the same lookup the
+   executor uses, so the check cannot certify a different file from the one
+   that loads -- hash it, and compare.
+   - Any file missing or mismatched: `POST /api/worker/decline` with the
+     details, add the `job_id` to the in-memory unsupported set, and claim
+     again. Do not start the heartbeat and do not run the task. Print one line
+     per newly-discovered gap, keyed by resolved path and expected digest --
+     not one per claim, or a missing lexicon becomes a log firehose.
+   - An `algorithm` this build does not know: run unverified and say so once.
+     Refusing work because the server named a newer hash would turn an
+     algorithm change into a fleet-wide outage; `min_magpie_version` is the
+     lever for that.
+4. **Version cross-check.** The server has already filtered on the version sent
+   in step 2, so an assignment whose `min_magpie_version` exceeds this build is
+   a server bug or a race with a floor that was just raised. Decline it with
+   reason `magpie_version` and carry on: it is one job this worker cannot do,
+   not a reason to end the session. The same is true of a `job_type` this build
+   does not recognise -- a client predating the `leave_generation` executor can
+   still play games all day. Exit is reserved for the case where *nothing* is
+   doable, which the server detects and sends as the `shutdown` of step 2.
+5. Start the heartbeat thread.
+6. Dispatch on `job_type` (section 5).
+7. `POST /api/worker/result`.
+8. Stop the heartbeat. If `maxtasks` is reached, stop; otherwise repeat.
+
+**The unsupported set is in memory only.** It is never written to
+`contribute.txt`. A contributor who stops and restarts has, in the case that
+matters, just updated their data -- that is what the shutdown message told them
+to do -- and a client that remembered its limitations across restarts would
+refuse work it can now do, curable only by editing a config file the user has
+to know about. Forgetting costs one wasted claim per job on the next run.
+
+**Digests are cached** by (resolved path, size, mtime, inode, ctime), with
+nanosecond timestamps where the filesystem records them, so a 15 MB lexicon is
+hashed once per run rather than once per task. Size and mtime alone collide: a
+file replaced with same-size bytes inside one mtime tick keys identically, and
+extracting an archive sets mtimes rather than letting them fall to now. A
+cached digest must never be the reason a bad file passes.
 
 **Stopping.** Cooperative. A stop request during a task lets the task finish and
 submit; a stop request while idle returns immediately. A hard interrupt simply
@@ -446,7 +485,7 @@ per-player settings, where `N` is 1 or 2:
 | `sort_strategy` | `-sN` | `equity` or `score`; null for simming players |
 | `leaves` | `-kN` | null means the lexicon default |
 | `max_iterations` | `-iN` | null for a static player |
-| `plies` | `-plN` | |
+| `num_plies` | `-plN` | |
 | `top_plays` | `-npN` | |
 | `stopping_pct` | `-scN` | |
 | `use_inference` | `-siN` | |
@@ -541,10 +580,30 @@ actually plays with is built: `use_wordmap` applies to that player's own
 `lexicon` when it overrides the job's, and two players sharing a lexicon build
 it once.
 
-Before running such a task, if `<lexicon>.wmp` is absent:
+Before running such a task, if `<lexicon>.wmp` is absent **or stale**:
 
 1. If `<lexicon>.txt` is absent, `convert dawg2text <lexicon>`.
 2. `convert text2wordmap <lexicon> -threads <n>`.
+
+**Stale means built from a different `.kwg` than the one on disk now.** A
+wordmap is derived from a lexicon and nothing else notices when the lexicon
+changes underneath it: `download_data.sh` overwrites the `.kwg` in place and
+leaves the old `.wmp` beside it, which passes every check -- the `.kwg`
+genuinely is the right lexicon, and the `.wmp` is covered by no digest at all,
+because the server never pinned a file the contributor generated locally. The
+worker then plays with a wordmap describing a lexicon that no longer exists on
+its disk.
+
+So the client writes a `<lexicon>.wmp.src` sidecar holding the SHA-256 of the
+`.kwg` the wordmap was built from, and rebuilds whenever the `.wmp` is absent,
+the sidecar is absent, or the sidecar disagrees with the current `.kwg`. A
+`.wmp` with no sidecar -- every wordmap a contributor already has -- is stale by
+that rule and is rebuilt once, which is correct: nothing recorded what it was
+built from.
+
+The sidecar is written **after** the `.wmp` is renamed into place. Written
+first, an interrupted build would leave a sidecar claiming a wordmap that does
+not exist, and the next run would trust it.
 
 Both write into `./data`, which is **assumed writable**. If it is not, that is a
 clear error and `contribute` stops — there is no fallback location. A job that
@@ -574,23 +633,60 @@ The Python client re-execs itself from a newer script the server offers. MAGPIE
 cannot responsibly do that: it is a compiled binary, and an auto-updating
 executable is a much larger security proposition.
 
-Instead the server states a minimum and the client reports clearly when it falls
-short (section 4, step 3). `GET /api/worker/client-version` changes meaning from
-"script version and download URL" to "minimum MAGPIE version", and
-`min_magpie_version` per job is the per-job form of the same thing.
+Instead the client states its version on every claim and the server filters:
+a job whose minimum this build does not meet is never offered, and a worker
+that meets no active job's minimum is told to update rather than left claiming
+work it cannot run (section 4). `GET /api/worker/client-version` changes meaning
+from "script version and download URL" to "minimum MAGPIE version", and
+`min_magpie_version` per job is the per-job form of the same thing. Falling
+short of one job's minimum is a decline, not an exit: other jobs may be well
+within reach.
 
 ---
 
 ## 10. The worker API contract
 
-Five endpoints. Authentication on all of them is either
+Six endpoints. Authentication on all of them is either
 `Authorization: Bearer <api-key>` **or** `X-Worker-UUID: <uuid>`, never both.
 
 ### `POST /api/worker/task`
 
-Empty body. `204` when there is no work -- no body, so a request that arrived
+The body is required:
+
+```json
+{ "magpie_version": "1.4.0",
+  "unsupported_jobs": ["4c7b64ad-8e5e-4db7-aeb0-afc44ee1ebf5"] }
+```
+
+Both fields are load-bearing. The version drives the per-job minimum filter --
+without it the server would have to assume one, which is a wrong answer dressed
+as a safe one -- and `unsupported_jobs` is every job this worker has found it
+cannot run, for any reason. The list is capped at 200 server-side and silently
+truncated past that; it is bounded in practice by the number of jobs a worker
+has actually been offered.
+
+`204` when there is no work right now -- no body, so a request that arrived
 with no identity is not assigned a UUID here; it tries again with no identity
-next time, and gets one for keeps once a task is actually available. `200`:
+next time, and gets one for keeps once a task is actually available.
+
+`200` with a `shutdown` object when every active job is ruled out for this
+worker:
+
+```json
+{ "shutdown": {
+    "reason": "data_out_of_date",
+    "message": "Every active job needs input data you do not have.",
+    "required_tarball_dates": ["20260101"],
+    "required_magpie_version": null,
+    "download_url": null } }
+```
+
+`reason` is `data_out_of_date`, `magpie_too_old`, or `both`. When both apply the
+message leads with the MAGPIE version, because updating MAGPIE is the remedy
+that fixes both: a release bumps `DATA_VERSION` and the contributor runs
+`download_data.sh` as part of updating.
+
+`200` with a task:
 
 ```json
 {
@@ -598,27 +694,44 @@ next time, and gets one for keeps once a task is actually available. `200`:
   "job_id": "4c7b64ad-8e5e-4db7-aeb0-afc44ee1ebf5",
   "min_magpie_version": "1.4.0",
   "worker_uuid": "6f3d7198-178a-47c8-9ccc-6aa6995a5a9c",
+  "expected_data": {
+    "algorithm": "sha256",
+    "files": [
+      { "role": "kwg", "name": "NWL23", "path": "lexica/NWL23.kwg",
+        "sha256": "3e74af98...", "bytes": 4719596, "tarball_date": "20251004" }
+    ]
+  },
   "task_request": { "job_type": "games", "...": "..." }
 }
 ```
 
-`min_magpie_version` may be `null`. `worker_uuid` is present only when the
+`expected_data` lists every file this task will load -- the deduplicated union
+over the job and its players -- with the digest the job pins. `role` and `name`
+are what the client resolves through `data_filepaths`; `path` and
+`tarball_date` are for the message it prints when something does not match. It
+is absent only for a job that pins nothing.
+
+`min_magpie_version` is always present. `worker_uuid` is present only when the
 request carried no identity at all and the server just minted one for it; the
-client persists this and sends it as `X-Worker-UUID` from then on. `task_request`
-is internally tagged by `job_type`, one of four shapes:
+client persists this and sends it as `X-Worker-UUID` from then on.
+`task_request` is internally tagged by `job_type`, one of four shapes. **No
+request carries a top-level `lexicon` except `leave_generation`**, which has one
+bot and no player object to hold it; every other job type states each player's
+lexicon on that player.
 
 ```json
 { "job_type": "opening_rack",
-  "lexicon": "NWL23", "variant": "classic",
+  "variant": "classic", "letter_distribution": "english",
   "rack": "AABCELT",
   "previous_play": null,
   "player": { "name": "static", "recorder_type": "best", "sort_strategy": "equity",
-              "leaves": null, "max_iterations": null, "plies": null,
+              "lexicon": "NWL23", "leaves": "NWL23", "win_pct_model": null,
+              "max_iterations": null, "num_plies": null,
               "top_plays": null, "stopping_pct": null, "use_inference": null,
               "time_limit_secs": null } }
 
 { "job_type": "games",
-  "lexicon": "NWL23", "variant": "classic",
+  "variant": "classic", "letter_distribution": "english",
   "seed": "1", "num_games": 10, "game_pairs": false,
   "player1": { ... }, "player2": { ... } }
 
@@ -626,30 +739,52 @@ is internally tagged by `job_type`, one of four shapes:
   "num_games": 10 }
 
 { "job_type": "leave_generation",
-  "lexicon": "NWL23", "variant": "classic",
+  "lexicon": "NWL23", "variant": "classic", "letter_distribution": "english",
   "generation": 2,
   "forced_racks": ["AA", "AB"],
   "previous_artifact_key": "leaves/<job>/generation-1.klv2",
-  "target_rack_count": 200,
   "use_wordmap": true,
   "num_games": 10000 }
 ```
 
-`target_rack_count` is the generation's **minimum rack target**: how many times
-every rack must occur before the generation closes. It is the job's
-`target_rack_count`, the same number a hand-run `leavegen` passes as one entry
-of a per-generation list like `100,200,500,1000,1000,1000` — so it is typically
-in the hundreds or thousands, and effectively never 1. The server owns the
-running per-rack totals across every task in the generation; a task cannot tell
-whether the target has been met overall, so for the client this is only an
-early-out: a task whose own forced racks all reach it before `num_games` games
-stops rather than playing games that can no longer change what it reports.
-Either way — target reached, or `num_games` exhausted — the racks that occurred
-are reported and the server folds them into its totals.
+`previous_artifact_key` is **never null**, generation 1 included: the server
+builds a zeroed KLV for it at `generation-0` when the job is created, so every
+generation fetches its leaves the same way and the client has no
+first-generation branch. There is no fallback to the lexicon's shipped leaves --
+a zeroed start and a lexicon-default start produce different, equally
+plausible-looking output, and nothing downstream would tell them apart.
+
+`num_games` is the only thing that ends a leave-generation task: play that many
+games, then report. The generation's minimum rack target is **not** sent, and
+the client must not stop early on it. Every game contributes occurrences for
+every rack it draws, not just the task's `forced_racks`, and the server folds
+all of them into its per-generation totals — so games played after the forced
+racks have filled still produce coverage the server uses. The target belongs to
+the server, which owns the running per-rack totals across every task in the
+generation and decides on its own when the generation closes.
 
 `seed` is a **decimal string**, because it is a `uint64` and JSON numbers are
 doubles. For `game_pairs`, `num_games` counts *pairs*; MAGPIE plays two games per
 pair.
+
+### `POST /api/worker/decline`
+
+```json
+{ "claim_token": "6f3d7198-178a-47c8-9ccc-6aa6995a5a9c",
+  "reason": "missing_data",
+  "missing": [ { "role": "kwg", "name": "CSW24",
+                 "expected": "3e74af98...", "actual": null } ] }
+```
+
+`204`. `reason` is `missing_data`, `magpie_version`, or `unknown_job_type`;
+`missing` is present only for the first. `actual: null` means the file was not
+found at all, and a hex string means it was found with different content.
+
+The server derives the task and job from the token, releases the claim
+immediately rather than waiting out the heartbeat timeout, and records the gap
+so an admin can see what the fleet is missing. Declining is an ordinary
+outcome, not an error: the worker adds the job to its unsupported set and
+claims again.
 
 ### `POST /api/worker/heartbeat`
 

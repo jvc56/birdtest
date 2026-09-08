@@ -40,7 +40,7 @@ pub struct JobSummary {
     pub priority: i32,
     pub allocation: Option<i32>,
     pub redundancy: i32,
-    pub min_magpie_version: Option<String>,
+    pub min_magpie_version: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub created_by: Option<String>,
     pub lexicon: Option<String>,
@@ -184,7 +184,7 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
             priority: job.priority,
             allocation: job.allocation,
             redundancy: job.redundancy,
-            min_magpie_version: job.min_magpie_version.clone(),
+            min_magpie_version: job.min_magpie_version().to_string(),
             created_at: job.created_at,
             created_by,
             lexicon,
@@ -212,26 +212,55 @@ fn status_label(job: &Job) -> &'static str {
     }
 }
 
+/// The lexicon a job is "on", for display.
+///
+/// It is no longer a single job-level setting: it lives on the player configs,
+/// and a games job may legitimately compare two different lexicons. Distinct
+/// names are joined so the dashboard says what is actually being played rather
+/// than picking one arbitrarily. Leave generation is the exception -- one bot,
+/// one lexicon, on the job config.
 async fn lexicon_and_variant(
     pool: &PgPool,
     job: &Job,
 ) -> AppResult<(Option<String>, Option<String>)> {
-    let table = match job.job_type {
-        JobType::OpeningRack => "job_opening_rack_config",
-        JobType::Games => "job_game_config",
-        JobType::GamePairs => "job_game_pair_config",
-        JobType::LeaveGeneration => "job_leave_config",
+    let query = match job.job_type {
+        JobType::OpeningRack => {
+            "SELECT DISTINCT d.name
+             FROM job_opening_rack_config c
+             JOIN player_configs pc ON pc.id = c.player_config_id
+             JOIN input_data d ON d.id = pc.kwg_id
+             WHERE c.job_id = $1"
+        }
+        JobType::Games => {
+            "SELECT DISTINCT d.name
+             FROM job_game_config c
+             JOIN player_configs pc
+               ON pc.id IN (c.player1_config_id, c.player2_config_id)
+             JOIN input_data d ON d.id = pc.kwg_id
+             WHERE c.job_id = $1"
+        }
+        JobType::GamePairs => {
+            "SELECT DISTINCT d.name
+             FROM job_game_pair_config c
+             JOIN player_configs pc
+               ON pc.id IN (c.player1_config_id, c.player2_config_id)
+             JOIN input_data d ON d.id = pc.kwg_id
+             WHERE c.job_id = $1"
+        }
+        JobType::LeaveGeneration => {
+            "SELECT DISTINCT d.name
+             FROM job_leave_config c
+             JOIN input_data d ON d.id = c.kwg_id
+             WHERE c.job_id = $1"
+        }
     };
-    let row = sqlx::query(&format!(
-        "SELECT lexicon, variant FROM {table} WHERE job_id = $1"
-    ))
-    .bind(job.id)
-    .fetch_optional(pool)
-    .await?;
-    Ok(match row {
-        Some(row) => (Some(row.get("lexicon")), Some(row.get("variant"))),
-        None => (None, None),
-    })
+    let mut names = sqlx::query_scalar::<_, String>(query)
+        .bind(job.id)
+        .fetch_all(pool)
+        .await?;
+    names.sort();
+    let lexicon = (!names.is_empty()).then(|| names.join(" vs "));
+    Ok((lexicon, Some(job.variant.clone())))
 }
 
 /// Sum the per-task aggregates for a plain `games` job. The SPRT unit is a

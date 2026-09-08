@@ -1,9 +1,9 @@
 use super::handler::*;
 use super::racks::{LetterDistribution, RackIndex};
+use super::JobData;
 use crate::error::{AppError, AppResult};
 use crate::models::job::OpeningRackConfig;
 use sqlx::{PgConnection, Row};
-use std::path::Path;
 use uuid::Uuid;
 
 pub struct OpeningRackHandler;
@@ -13,10 +13,9 @@ impl JobHandler for OpeningRackHandler {
     type Response = PositionAnalysisResponse;
     type Record = PositionAnalysisRecord;
 
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid,
-                          data_path: &Path) -> AppResult<Self::Request> {
+    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         let row = sqlx::query(
-            "SELECT r.lexicon, r.variant, r.letter_distribution, r.rack_start,
+            "SELECT r.variant, r.letter_distribution, r.rack_start,
                     r.rack_count, r.previous_play,
                     r.player_config_id, c.rack_size
              FROM opening_rack_requests r
@@ -28,8 +27,8 @@ impl JobHandler for OpeningRackHandler {
         .fetch_one(&mut *conn)
         .await?;
 
+        let job_data = super::load_job_data_for_task(&mut *conn, task_id).await?;
         let player = super::load_player_spec(conn, row.get("player_config_id")).await?;
-        let lexicon: String = row.get("lexicon");
         let rack_start: i64 = row.get("rack_start");
         let rack_count: i32 = row.get("rack_count");
         let rack_size: i32 = row.get("rack_size");
@@ -38,14 +37,8 @@ impl JobHandler for OpeningRackHandler {
         // what makes a job over millions of racks cheap to create. Expanding
         // is a handful of additions per rack, not a walk over the space.
         Ok(OpeningRackRequest {
-            racks: RackRange {
-                lexicon: lexicon.clone(),
-                rack_size,
-                start: rack_start,
-                count: rack_count,
-            }
-            .expand(data_path)?,
-            lexicon,
+            racks: RackRange { rack_size, start: rack_start, count: rack_count }
+                .expand(&job_data.letterdist),
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
             previous_play: row.get("previous_play"),
@@ -112,30 +105,26 @@ impl JobHandler for OpeningRackHandler {
 
 /// A contiguous slice of the rack space, which is what a task actually is.
 pub struct RackRange {
-    pub lexicon: String,
     pub rack_size: i32,
     pub start: i64,
     pub count: i32,
 }
 
 impl RackRange {
-    pub fn expand(&self, data_path: &Path) -> AppResult<Vec<String>> {
-        let distribution = LetterDistribution::load(data_path, &self.lexicon)?;
-        let index = RackIndex::new(&distribution, self.rack_size as usize);
-        Ok(index.racks_in_range(self.start as u64, self.count as u64))
+    /// Expands against the job's pinned letter distribution -- the same bytes
+    /// the worker is checked against, so the racks handed out and the bag they
+    /// are drawn from can never be enumerated from different alphabets.
+    pub fn expand(&self, distribution: &LetterDistribution) -> Vec<String> {
+        let index = RackIndex::new(distribution, self.rack_size as usize);
+        index.racks_in_range(self.start as u64, self.count as u64)
     }
 }
 
-/// How many distinct racks a job over this lexicon covers. Recorded at job
+/// How many distinct racks a job over this distribution covers. Recorded at job
 /// creation so the scheduler knows when the space is exhausted without
 /// re-deriving it on every claim.
-pub fn total_racks(
-    data_path: &Path,
-    letter_distribution: &str,
-    rack_size: i32,
-) -> AppResult<i64> {
-    let distribution = LetterDistribution::load(data_path, letter_distribution)?;
-    Ok(RackIndex::new(&distribution, rack_size as usize).total() as i64)
+pub fn total_racks(distribution: &LetterDistribution, rack_size: i32) -> i64 {
+    RackIndex::new(distribution, rack_size as usize).total() as i64
 }
 
 /// Claim-time task creation: the next unclaimed slice of the rack space.
@@ -147,7 +136,7 @@ pub async fn next_request(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &OpeningRackConfig,
-    data_path: &Path,
+    job_data: &JobData,
 ) -> AppResult<Option<(i64, OpeningRackRequest)>> {
     let next_start = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(seed) FROM tasks WHERE job_id = $1",
@@ -163,12 +152,11 @@ pub async fn next_request(
     }
 
     let range = RackRange {
-        lexicon: config.letter_distribution.clone(),
         rack_size: config.rack_size,
         start: next_start,
         count: config.racks_per_batch,
     };
-    let racks = range.expand(data_path)?;
+    let racks = range.expand(&job_data.letterdist);
     if racks.is_empty() {
         return Ok(None);
     }
@@ -177,9 +165,8 @@ pub async fn next_request(
     Ok(Some((
         next_start,
         OpeningRackRequest {
-            lexicon: config.lexicon.clone(),
-            variant: config.variant.clone(),
-            letter_distribution: config.letter_distribution.clone(),
+            variant: job_data.variant.clone(),
+            letter_distribution: job_data.letterdist_name.clone(),
             racks,
             previous_play: None,
             player,
@@ -193,19 +180,19 @@ pub async fn insert_range(
     conn: &mut PgConnection,
     task_id: Uuid,
     config: &OpeningRackConfig,
+    job_data: &JobData,
     start: i64,
     count: usize,
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO opening_rack_requests
-             (task_id, lexicon, variant, letter_distribution, rack_start,
+             (task_id, variant, letter_distribution, rack_start,
               rack_count, previous_play, player_config_id)
-         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)",
+         VALUES ($1, $2, $3, $4, $5, NULL, $6)",
     )
     .bind(task_id)
-    .bind(&config.lexicon)
-    .bind(&config.variant)
-    .bind(&config.letter_distribution)
+    .bind(&job_data.variant)
+    .bind(&job_data.letterdist_name)
     .bind(start)
     .bind(count as i32)
     .bind(config.player_config_id)

@@ -59,6 +59,91 @@ CREATE TABLE worker_bans (
     )
 );
 
+-- Input data
+--
+-- Must precede jobs and player_configs: both reference input_data.
+
+-- Every input data file birdtest knows about, identified by content.
+--
+-- A row is a (path, sha256) pair: the same path with different bytes is a
+-- different row, which is the entire point. `tarball_date` records the
+-- versioned tarball a row was FIRST seen in -- provenance, not membership. A
+-- file unchanged between two tarballs stays one row labelled with the older
+-- date, because it is the same bytes and a job pinning it is pinning those
+-- bytes regardless of which tarball the contributor installed.
+CREATE TABLE input_data (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- Path relative to the data root, including basename: 'lexica/NWL23.kwg'.
+    path         TEXT NOT NULL,
+    -- Derived from `path` at import and stored because dispatch and the client
+    -- protocol address files by (role, name), not by path: MAGPIE resolves a
+    -- name through its own data_paths search list.
+    role         TEXT NOT NULL CHECK (role IN ('kwg','klv','winpct','letterdist','layout')),
+    name         TEXT NOT NULL,          -- 'NWL23', 'winpct', 'english', 'standard15'
+    sha256       TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    bytes        BIGINT NOT NULL CHECK (bytes >= 0),
+    -- YYYYMMDD name of the versioned tarball this content was first imported
+    -- from. Text, not DATE: it is the artifact's name, and it appears verbatim
+    -- in the message a contributor is told to act on.
+    tarball_date TEXT NOT NULL CHECK (tarball_date ~ '^\d{8}$'),
+    -- The file's bytes, for the roles the SERVER itself reads. birdtest
+    -- enumerates rack universes and builds KLVs from the letter distribution,
+    -- so those bytes must be the pinned ones -- there is no server-side disk
+    -- copy of the data any more. Lexica stay out: a 15 MB .kwg in a row is a
+    -- different proposition and nothing server-side reads one.
+    --
+    -- The check is an equivalence, not a nullable convenience: a letterdist or
+    -- layout row without bytes cannot exist, and a kwg/klv/winpct row with
+    -- bytes cannot either. Server-side code therefore has no "fall back to the
+    -- filesystem" branch to write.
+    content      BYTEA
+                 CHECK ((role IN ('letterdist','layout')) = (content IS NOT NULL)),
+    imported_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    imported_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+    UNIQUE (path, sha256)
+);
+
+CREATE INDEX input_data_role_name_idx ON input_data (role, name);
+
+-- Staged imports. Phase 1 (a spawned background task) writes; phase 2 reads and
+-- commits. Rows here are proposals, not data -- nothing dispatch or job creation
+-- reads. birdtest runs as a single instance, so a task needs no lease and
+-- startup may fail any row still 'running'.
+CREATE TABLE input_data_imports (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tarball_date   TEXT NOT NULL CHECK (tarball_date ~ '^\d{8}$'),
+    commit_sha     TEXT NOT NULL,
+    -- NULL until the download completes: the row exists from the moment the
+    -- background task is spawned.
+    tarball_sha256 TEXT,
+    state          TEXT NOT NULL DEFAULT 'running'
+                   CHECK (state IN ('running', 'staged', 'confirmed',
+                                    'cancelled', 'failed')),
+    -- What the poller renders while state = 'running'.
+    progress_bytes   BIGINT NOT NULL DEFAULT 0,
+    progress_entries INT    NOT NULL DEFAULT 0,
+    -- Why it failed, shown verbatim to the admin.
+    error          TEXT,
+    requested_by   UUID REFERENCES users(id) ON DELETE SET NULL,
+    requested_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    confirmed_at   TIMESTAMPTZ
+);
+
+CREATE TABLE input_data_import_rows (
+    import_id  UUID NOT NULL REFERENCES input_data_imports(id) ON DELETE CASCADE,
+    path       TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    sha256     TEXT NOT NULL,
+    bytes      BIGINT NOT NULL,
+    -- 'new' | 'known' | 'collision' (same path, different sha256 already known)
+    disposition TEXT NOT NULL,
+    -- Carried from phase 1 for letterdist/layout entries so confirmation
+    -- inserts input_data.content without re-downloading the tarball.
+    content     BYTEA,
+    PRIMARY KEY (import_id, path, sha256)
+);
+
 -- Jobs
 
 CREATE TYPE job_type AS ENUM (
@@ -87,9 +172,24 @@ CREATE TABLE jobs (
     status     job_status NOT NULL DEFAULT 'inactive',
     -- SET NULL if the creating admin's account is deleted.
     created_by           UUID REFERENCES users(id) ON DELETE SET NULL,
-    -- Minimum MAGPIE version workers must have to execute tasks for this job.
-    -- NULL = no minimum enforced. Semver string, e.g. "1.4.0".
-    min_magpie_version   TEXT,
+    -- Settings every job type has, regardless of what it does. The lexicon is
+    -- NOT here: it lives on the player (player_configs.kwg_id), because MAGPIE
+    -- scopes it per player and two players may run different ones.
+    variant       TEXT NOT NULL,                            -- 'classic' | 'wordsmog'; a rules setting, not a file
+    letterdist_id UUID NOT NULL REFERENCES input_data(id),  -- one per job: MAGPIE takes one -ld for the whole game
+    layout_id     UUID NOT NULL REFERENCES input_data(id),  -- 'standard15' unless a job says otherwise
+    -- Minimum MAGPIE version workers must have to execute tasks for this job,
+    -- as sortable parts. Semver in TEXT compares lexically, where '1.10.0' <
+    -- '1.9.0' -- a bug that appears only once a minor version reaches double
+    -- digits, i.e. long after it is written.
+    --
+    -- Not nullable: every job pins input data, and a client too old to
+    -- understand expected_data contributes unverified rather than declining,
+    -- so "no floor" is not a state worth being able to express. 0.0.1 is a
+    -- placeholder for the MAGPIE release implementing the check.
+    min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 0 CHECK (min_magpie_minor >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ
@@ -114,24 +214,40 @@ CREATE TABLE player_configs (
     name             TEXT NOT NULL UNIQUE,  -- human-readable label, e.g. "simmer-NWL23-4ply"
     recorder_type    TEXT NOT NULL,         -- 'best' | 'equity' | 'all'  (-r1 / -r2)
     sort_strategy    TEXT,                  -- 'equity' | 'score' | NULL  (-s1 / -s2)
-    leaves           TEXT,                  -- leave file name; NULL = lexicon default  (-k1 / -k2)
+    -- The files this player loads, pinned by content rather than named.
+    --
+    -- kwg_id and klv_id are NOT NULL: there is no job lexicon left to fall back
+    -- to, and "NULL = the lexicon default" was exactly the implicit name-based
+    -- resolution this design removes.
+    --
+    -- winpct_id stays nullable, but NULL now means "this player never loads a
+    -- win% model" -- true of every static player, since MAGPIE only reads one
+    -- through config_load_win_pcts. Validated against the sim columns at job
+    -- creation: a simming player must have one, a static player must not.
+    kwg_id           UUID NOT NULL REFERENCES input_data(id),   -- (-l1 / -l2)
+    klv_id           UUID NOT NULL REFERENCES input_data(id),   -- (-k1 / -k2)
+    winpct_id        UUID REFERENCES input_data(id),            -- (-winpct)
+    -- The config this one was cloned from, for a data update. Ratings do NOT
+    -- carry over -- player_config_ratings is keyed by config and ratings are
+    -- only comparable on identical data -- so the UI must show where a config
+    -- with no history came from.
+    cloned_from_id   UUID REFERENCES player_configs(id),
     -- Simulation parameters (all NULL for a static player)
     max_iterations   INT,                   -- -i1 / -i2
     -- Two pairs of "how much to compute" / "how much to report". MAGPIE
     -- generates plays and plies, then displays a subset of each; birdtest
     -- stores exactly what is displayed.
-    plies              INT,                 -- plies to simulate    (-pl1 / -pl2)
+    num_plies          INT,                 -- plies to simulate    (-pl1 / -pl2)
     num_plies_recorded INT,                 -- plies to report      (shplies)
     num_plays          INT,                 -- plays to simulate    (-np1 / -np2)
     num_plays_recorded INT,                 -- plays to report      (maxnumdplays)
     stopping_pct     DOUBLE PRECISION,      -- -sc1 / -sc2 (0–100)
     use_inference    BOOLEAN,               -- -si1 / -si2
-    time_limit_secs  DOUBLE PRECISION,      -- -tl1 / -tl2
+    time_limit_secs  INT,                   -- -tl1 / -tl2
     -- The remaining MAGPIE options that can affect how a player plays.
     -- Exhaustive on purpose: anything not stated here falls back to whatever
     -- value a worker's own MAGPIE process happens to have, which can differ
     -- across workers and silently produce non-comparable data.
-    lexicon              TEXT,               -- per-player lexicon override; NULL = the job's lexicon  (-l1 / -l2)
     use_wordmap          BOOLEAN,            -- -w1 / -w2
     use_rit               BOOLEAN,           -- rack info table            (-rit1 / -rit2)
     min_play_iterations   INT,               -- -mi1 / -mi2
@@ -145,7 +261,6 @@ CREATE TABLE player_configs (
     -- than per-player. Stored here anyway (duplicated on both players'
     -- rows in a job, validated equal at job-creation time) so this table
     -- stays the single, exhaustive source of what a job asked MAGPIE for.
-    win_pct_model         TEXT,              -- win% model file; NULL = lexicon default (-winpct)
     movegen_margin         DOUBLE PRECISION, -- move-gen equity margin for 'equity' recording (-mmargin)
     created_by       UUID NOT NULL REFERENCES users(id),
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -155,13 +270,8 @@ CREATE TABLE player_configs (
 
 CREATE TABLE job_opening_rack_config (
     job_id            UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    lexicon           TEXT NOT NULL,
-    variant           TEXT NOT NULL,
-    -- The letter distribution to play with. Explicit rather than derived from
-    -- the lexicon name: MAGPIE infers one from the lexicon's prefix, and
-    -- mirroring that inference here made birdtest guess at something the job
-    -- can simply state.
-    letter_distribution TEXT NOT NULL,
+    -- lexicon, variant and letter distribution live on the job now: the first
+    -- on the player config, the other two on `jobs`.
     -- The player config used to analyze each rack (may be a simmer or static player).
     player_config_id  UUID NOT NULL REFERENCES player_configs(id),
     -- Racks handed out per task. One rack per task means one claim/submit round
@@ -176,13 +286,8 @@ CREATE TABLE job_opening_rack_config (
 
 CREATE TABLE job_game_config (
     job_id              UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    lexicon             TEXT NOT NULL,
-    variant             TEXT NOT NULL,
-    -- The letter distribution to play with. Explicit rather than derived from
-    -- the lexicon name: MAGPIE infers one from the lexicon's prefix, and
-    -- mirroring that inference here made birdtest guess at something the job
-    -- can simply state.
-    letter_distribution TEXT NOT NULL,
+    -- lexicon, variant and letter distribution live on the job now: the first
+    -- on the player configs, the other two on `jobs`.
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     games_per_batch     INT NOT NULL DEFAULT 1,
@@ -203,13 +308,8 @@ CREATE TABLE job_game_config (
 
 CREATE TABLE job_game_pair_config (
     job_id              UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    lexicon             TEXT NOT NULL,
-    variant             TEXT NOT NULL,
-    -- The letter distribution to play with. Explicit rather than derived from
-    -- the lexicon name: MAGPIE infers one from the lexicon's prefix, and
-    -- mirroring that inference here made birdtest guess at something the job
-    -- can simply state.
-    letter_distribution TEXT NOT NULL,
+    -- lexicon, variant and letter distribution live on the job now: the first
+    -- on the player configs, the other two on `jobs`.
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     pairs_per_batch     INT NOT NULL DEFAULT 1,
@@ -228,13 +328,13 @@ CREATE TABLE job_game_pair_config (
 
 CREATE TABLE job_leave_config (
     job_id         UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    lexicon        TEXT NOT NULL,
-    variant        TEXT NOT NULL,
-    -- The letter distribution to play with. Explicit rather than derived from
-    -- the lexicon name: MAGPIE infers one from the lexicon's prefix, and
-    -- mirroring that inference here made birdtest guess at something the job
-    -- can simply state.
-    letter_distribution TEXT NOT NULL,
+    -- The one place a lexicon still sits on a job: leave generation has a
+    -- single bot and no player_configs row to hold it. It needs no klv_id
+    -- (every generation's leaves come from the server-built KLV artifact, and
+    -- generation 1's is a zeroed one) and no winpct_id (the bot plays
+    -- statically). Its complete data requirement is this plus the job's
+    -- letterdist_id and layout_id.
+    kwg_id         UUID NOT NULL REFERENCES input_data(id),
     -- Games each leave-gen task plays over its forced-rack subset.
     num_iterations INT NOT NULL,
     -- How many sequential generations this job runs before it is complete.
@@ -285,7 +385,9 @@ CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 --   3. Delete the task_claim rows.
 --   4. Delete the user row (cascades to api_keys, email_confirmations, password_reset_tokens).
 
-CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned');
+-- 'declined' is distinct from 'abandoned': one is a worker saying "I cannot do
+-- this", the other is a claim that lapsed. Only the first is diagnostic.
+CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned', 'declined');
 
 CREATE TABLE task_claims (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -297,18 +399,39 @@ CREATE TABLE task_claims (
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
+    -- As reported at claim time. What the fleet is actually running, which is
+    -- the evidence for raising a job's floor.
+    magpie_version       TEXT,
     CONSTRAINT claim_has_single_owner CHECK (
         (claimed_by_user_id IS NOT NULL)::int + (claimed_by_anon_uuid IS NOT NULL)::int = 1
     )
 );
 
--- Prevent a single identity from filling more than one non-abandoned slot on the same task.
+-- Prevent a single identity from filling more than one live slot on the same
+-- task. 'declined' must be excluded alongside 'abandoned': a worker that
+-- declined a task for missing data and then fixed its data has to be able to
+-- claim that task again.
 CREATE UNIQUE INDEX task_claims_user_unique_idx
     ON task_claims (task_id, claimed_by_user_id)
-    WHERE state != 'abandoned';
+    WHERE state NOT IN ('abandoned', 'declined');
 CREATE UNIQUE INDEX task_claims_anon_unique_idx
     ON task_claims (task_id, claimed_by_anon_uuid)
-    WHERE state != 'abandoned';
+    WHERE state NOT IN ('abandoned', 'declined');
+
+-- What a worker said it was missing when it declined. The server records gaps
+-- for humans; it does not route on them (the client sends its own unsupported
+-- set with each claim, which makes that state self-correcting).
+CREATE TABLE worker_data_gaps (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id       UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    claim_id     UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
+    role         TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    expected     TEXT NOT NULL,
+    actual       TEXT,                    -- NULL = file absent
+    reported_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, role, name);
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
@@ -322,7 +445,7 @@ CREATE UNIQUE INDEX task_claims_anon_unique_idx
 -- record tables below keep that name.
 CREATE TABLE opening_rack_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-    lexicon           TEXT NOT NULL,
+    -- No lexicon column: the player config carries it.
     variant           TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
     -- Index of the first rack in this batch, and how many it covers. The final
@@ -335,7 +458,7 @@ CREATE TABLE opening_rack_requests (
 
 CREATE TABLE game_requests (
     task_id           UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-    lexicon           TEXT NOT NULL,
+    -- No lexicon column: each player config carries its own.
     variant           TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
     -- Denormalized from the job config, like everything else here, so the
@@ -356,8 +479,10 @@ CREATE TABLE leave_requests (
     generation          INT NOT NULL,
     forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (passed to MAGPIE's rack_list_create)
     num_games           INT NOT NULL,      -- denormalized from job_leave_config.num_iterations
-    previous_artifact_key TEXT,            -- combined KLV from generation - 1; NULL for generation 1
-    target_rack_count   INT NOT NULL,      -- denormalized from job_leave_config.target_rack_count
+    -- Combined KLV from the previous generation. Never NULL: generation 1 reads
+    -- the server-built zeroed KLV at generation-0, so every generation fetches
+    -- its leaves the same way and the client has no first-generation branch.
+    previous_artifact_key TEXT NOT NULL,
     use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
 );
 

@@ -1,14 +1,20 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { api } from '$lib/api';
+  import { api, type InputData } from '$lib/api';
 
   let name = '';
   let recorderType = 'best';
   let sortStrategy: string = 'equity';
-  let leaves = '';
+  // Files are picked from imported rows rather than typed: a config pins exact
+  // bytes, which is what lets a worker be checked against them.
+  let files: InputData[] = [];
+  let kwgId = '';
+  let klvId = '';
+  let winpctId = '';
   let simming = false;
   let maxIterations = 1000;
-  let plies = 2;
+  let numPlies = 2;
   let numPlays = 10;
   let numPlaysRecorded = 10;
   let numPliesRecorded = 2;
@@ -19,7 +25,6 @@
   // Exhaustive on purpose: any MAGPIE option not stated here falls back to
   // whatever a worker's own process happens to have, which can differ across
   // workers.
-  let lexicon = '';
   let useWordmap = true;
   let useRit = false;
   let minPlayIterations: number | '' = '';
@@ -29,10 +34,25 @@
   let utilityWWinpct: number | '' = '';
   let utilityWSpread: number | '' = '';
   let utilitySpreadScale: number | '' = '';
-  let winPctModel = '';
   let movegenMargin: number | '' = '';
   let error = '';
   let busy = false;
+
+  $: lexica = files.filter((f) => f.role === 'kwg');
+  $: leaves = files.filter((f) => f.role === 'klv');
+  $: winpcts = files.filter((f) => f.role === 'winpct');
+  // A simming player loads a win% model; a static one never opens it.
+  $: if (!simming) winpctId = '';
+
+  function label(file: InputData): string {
+    return `${file.name} (${file.tarball_date}, ${file.sha256.slice(0, 8)})`;
+  }
+
+  onMount(async () => {
+    files = await api.inputData();
+    kwgId = lexica[0]?.id ?? '';
+    klvId = leaves[0]?.id ?? '';
+  });
 
   async function submit() {
     busy = true;
@@ -43,16 +63,17 @@
         recorder_type: recorderType,
         // A simming player's move comes from the simulation, not a static sort.
         sort_strategy: simming ? null : sortStrategy,
-        leaves: leaves || null,
+        kwg_id: kwgId,
+        klv_id: klvId,
+        winpct_id: simming ? winpctId || null : null,
         max_iterations: simming ? maxIterations : null,
-        plies: simming ? plies : null,
+        num_plies: simming ? numPlies : null,
         num_plays: simming ? numPlays : null,
         num_plays_recorded: numPlaysRecorded,
         num_plies_recorded: simming ? numPliesRecorded : null,
         stopping_pct: simming ? stoppingPct : null,
         use_inference: simming ? useInference : null,
         time_limit_secs: simming && timeLimitSecs !== '' ? Number(timeLimitSecs) : null,
-        lexicon: lexicon || null,
         use_wordmap: useWordmap,
         use_rit: useRit,
         min_play_iterations: minPlayIterations === '' ? null : Number(minPlayIterations),
@@ -62,7 +83,6 @@
         utility_w_winpct: utilityWWinpct === '' ? null : Number(utilityWWinpct),
         utility_w_spread: utilityWSpread === '' ? null : Number(utilityWSpread),
         utility_spread_scale: utilitySpreadScale === '' ? null : Number(utilitySpreadScale),
-        win_pct_model: winPctModel || null,
         movegen_margin: movegenMargin === '' ? null : Number(movegenMargin)
       });
       goto('/admin/player-configs');
@@ -93,10 +113,34 @@
       </select>
     </div>
     <div>
-      <label class="label" for="leaves">Leaves file (-k)</label>
-      <input id="leaves" class="input" bind:value={leaves} placeholder="lexicon default" />
+      <label class="label" for="kwg">Lexicon (-l)</label>
+      <select id="kwg" class="input" bind:value={kwgId} required>
+        {#each lexica as file}<option value={file.id}>{label(file)}</option>{/each}
+      </select>
     </div>
+    <div>
+      <label class="label" for="klv">Leaves (-k)</label>
+      <select id="klv" class="input" bind:value={klvId} required>
+        {#each leaves as file}<option value={file.id}>{label(file)}</option>{/each}
+      </select>
+    </div>
+    {#if simming}
+      <div>
+        <label class="label" for="winpct">Win% model (-winpct)</label>
+        <select id="winpct" class="input" bind:value={winpctId} required>
+          <option value="">choose one</option>
+          {#each winpcts as file}<option value={file.id}>{label(file)}</option>{/each}
+        </select>
+      </div>
+    {/if}
   </div>
+  <p class="text-xs text-muted-foreground">
+    Files are pinned by content, not by name: a config names exact bytes, and a
+    worker whose copy does not match declines the task rather than contributing
+    something incomparable. New data means a new config — clone this one once
+    the newer files are imported. A static player must not name a win% model,
+    because MAGPIE never loads one for it.
+  </p>
 
   <div>
     <label class="label" for="npres">Plays to report (maxnumdplays)</label>
@@ -115,11 +159,11 @@
   {#if simming}
     <div class="grid grid-cols-2 gap-3">
       <div><label class="label" for="iters">Max iterations (-i)</label><input id="iters" type="number" class="input" bind:value={maxIterations} /></div>
-      <div><label class="label" for="plies">Plies (-pl)</label><input id="plies" type="number" class="input" bind:value={plies} /></div>
+      <div><label class="label" for="num_plies">Plies (-pl)</label><input id="num_plies" type="number" class="input" bind:value={numPlies} /></div>
       <div><label class="label" for="np">Plays to simulate (-np)</label><input id="np" type="number" class="input" bind:value={numPlays} /></div>
       <div><label class="label" for="npr">Plies to report (shplies)</label><input id="npr" type="number" class="input" bind:value={numPliesRecorded} /></div>
       <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="0.1" class="input" bind:value={stoppingPct} /></div>
-      <div><label class="label" for="tl">Time limit seconds (-tl)</label><input id="tl" type="number" step="0.1" class="input" bind:value={timeLimitSecs} /></div>
+      <div><label class="label" for="tl">Time limit seconds (-tl)</label><input id="tl" type="number" step="1" class="input" bind:value={timeLimitSecs} /></div>
       <label class="flex items-end gap-2 text-sm">
         <input type="checkbox" bind:checked={useInference} />
         Use inference (-si)
@@ -141,10 +185,6 @@
 
   {#if showAdvanced}
     <div class="grid grid-cols-2 gap-3 rounded border p-3">
-      <div>
-        <label class="label" for="lexicon">Lexicon override (-l)</label>
-        <input id="lexicon" class="input" bind:value={lexicon} placeholder="job's lexicon" />
-      </div>
       <label class="flex items-end gap-2 text-sm">
         <input type="checkbox" bind:checked={useWordmap} />
         Use wordmap (-w)
@@ -188,14 +228,6 @@
       <div>
         <label class="label" for="uspreadscale">Utility spread scale (-uspreadscale)</label>
         <input id="uspreadscale" type="number" step="0.1" class="input" bind:value={utilitySpreadScale} />
-      </div>
-      <div>
-        <label class="label" for="winpctmodel">Win% model file (-winpct)</label>
-        <input id="winpctmodel" class="input" bind:value={winPctModel} placeholder="lexicon default" />
-        <p class="mt-1 text-xs text-muted-foreground">
-          Shared across both players in a job -- a games/game_pairs job's two
-          configs must agree on this.
-        </p>
       </div>
       <div>
         <label class="label" for="mmargin">Move-gen equity margin (-mmargin)</label>

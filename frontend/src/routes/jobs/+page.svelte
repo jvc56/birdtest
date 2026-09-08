@@ -42,7 +42,17 @@
           {@const p = progress(job)}
           <tr>
             <td><a href="/jobs/{job.id}">{jobTypeLabel(job.job_type)}</a></td>
-            <td><JobStatusBadge status={job.status} /></td>
+            <td>
+              <JobStatusBadge status={job.status} />
+              {#if job.stalled}
+                <span
+                  class="ml-1 rounded bg-destructive/10 px-1.5 py-0.5 text-xs text-destructive"
+                  title="Workers are declining this job and none has completed one in 24 hours — usually data nobody has yet."
+                >
+                  stalled
+                </span>
+              {/if}
+            </td>
             <td class="tabular-nums">{job.priority}</td>
             <td class="tabular-nums">{job.allocation === null ? '—' : `${job.allocation}%`}</td>
             <td class="tabular-nums">{job.redundancy}×</td>

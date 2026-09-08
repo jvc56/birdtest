@@ -3,11 +3,11 @@
 //! four components of the new job type exist.
 
 use super::handler::*;
-use super::{game, game_pair, leave_gen, opening_rack};
+use super::{game, game_pair, leave_gen, load_job_data, opening_rack};
+use crate::artifacts::ArtifactStore;
 use crate::error::{AppError, AppResult};
 use crate::models::job::*;
 use sqlx::PgConnection;
-use std::path::Path;
 use uuid::Uuid;
 
 /// The outcome of trying to get one unit of work out of a job.
@@ -22,29 +22,27 @@ pub enum Acquired {
     JobFinished,
 }
 
-pub async fn acquire(conn: &mut PgConnection, job: &Job,
-                     data_path: &Path) -> AppResult<Acquired> {
+pub async fn acquire(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
     // A task whose claim timed out drops back to `available` regardless of the
     // job's creation strategy, so re-dispatching those comes first. For games
     // this is what keeps the seed space covered: an abandoned batch is replayed
     // rather than skipped, since nothing else would ever revisit those seeds.
     if let Some(task_id) = next_available(conn, job.id).await? {
-        let request = load_request(conn, job.job_type, task_id, data_path).await?;
+        let request = load_request(conn, job.job_type, task_id).await?;
         return Ok(Acquired::Task { task_id, request });
     }
 
     // Every job type generates its tasks at claim time; there is no
     // pre-populated strategy any more.
     match job.job_type {
-        JobType::OpeningRack => generate_opening_rack(conn, job, data_path).await,
+        JobType::OpeningRack => generate_opening_rack(conn, job).await,
         JobType::Games => generate_games(conn, job).await,
         JobType::GamePairs => generate_game_pairs(conn, job).await,
         JobType::LeaveGeneration => generate_leave_gen(conn, job).await,
     }
 }
 
-async fn generate_opening_rack(conn: &mut PgConnection, job: &Job,
-                               data_path: &Path) -> AppResult<Acquired> {
+async fn generate_opening_rack(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
     let config = sqlx::query_as::<_, OpeningRackConfig>(
         "SELECT * FROM job_opening_rack_config WHERE job_id = $1",
     )
@@ -52,15 +50,17 @@ async fn generate_opening_rack(conn: &mut PgConnection, job: &Job,
     .fetch_one(&mut *conn)
     .await?;
 
+    let job_data = load_job_data(&mut *conn, job.id).await?;
     let Some((start, request)) =
-        opening_rack::next_request(conn, job.id, &config, data_path).await?
+        opening_rack::next_request(conn, job.id, &config, &job_data).await?
     else {
         // The rack space is exhausted; nothing left to hand out.
         return Ok(Acquired::NoWork);
     };
 
     let task_id = insert_on_demand_task(conn, job.id, Some(start)).await?;
-    opening_rack::insert_range(conn, task_id, &config, start, request.racks.len()).await?;
+    opening_rack::insert_range(conn, task_id, &config, &job_data, start, request.racks.len())
+        .await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::OpeningRack(request) })
 }
 
@@ -83,22 +83,19 @@ pub async fn load_request(
     conn: &mut PgConnection,
     job_type: JobType,
     task_id: Uuid,
-    data_path: &Path,
 ) -> AppResult<TaskRequest> {
     Ok(match job_type {
         JobType::OpeningRack => TaskRequest::OpeningRack(
-            opening_rack::OpeningRackHandler::load_request(conn, task_id, data_path).await?,
+            opening_rack::OpeningRackHandler::load_request(conn, task_id).await?,
         ),
         JobType::Games => {
-            TaskRequest::Games(game::GameHandler::load_request(conn, task_id, data_path).await?)
+            TaskRequest::Games(game::GameHandler::load_request(conn, task_id).await?)
         }
         JobType::GamePairs => {
-            TaskRequest::GamePairs(
-            game_pair::GamePairHandler::load_request(conn, task_id, data_path).await?,
-        )
+            TaskRequest::GamePairs(game_pair::GamePairHandler::load_request(conn, task_id).await?)
         }
         JobType::LeaveGeneration => TaskRequest::LeaveGeneration(
-            leave_gen::LeaveGenHandler::load_request(conn, task_id, data_path).await?,
+            leave_gen::LeaveGenHandler::load_request(conn, task_id).await?,
         ),
     })
 }
@@ -109,7 +106,8 @@ async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquire
         .fetch_one(&mut *conn)
         .await?;
 
-    let (seed, request) = game::next_request(conn, job.id, &config).await?;
+    let job_data = load_job_data(&mut *conn, job.id).await?;
+    let (seed, request) = game::next_request(conn, job.id, &config, &job_data).await?;
     let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
     super::insert_game_request(conn, task_id, &request).await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::Games(request) })
@@ -122,7 +120,8 @@ async fn generate_game_pairs(conn: &mut PgConnection, job: &Job) -> AppResult<Ac
             .fetch_one(&mut *conn)
             .await?;
 
-    let (seed, request) = game_pair::next_request(conn, job.id, &config).await?;
+    let job_data = load_job_data(&mut *conn, job.id).await?;
+    let (seed, request) = game_pair::next_request(conn, job.id, &config, &job_data).await?;
     let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
     super::insert_game_request(conn, task_id, &request).await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::GamePairs(request) })
@@ -135,7 +134,8 @@ async fn generate_leave_gen(conn: &mut PgConnection, job: &Job) -> AppResult<Acq
             .fetch_one(&mut *conn)
             .await?;
 
-    match leave_gen::next_step(conn, job.id, &config).await? {
+    let job_data = load_job_data(&mut *conn, job.id).await?;
+    match leave_gen::next_step(conn, job.id, &config, &job_data).await? {
         leave_gen::LeaveGenStep::Dispatch(request) => {
             let task_id = insert_on_demand_task(conn, job.id, None).await?;
             leave_gen::insert_request(conn, task_id, &request).await?;
@@ -204,8 +204,7 @@ pub async fn store_result(
 /// No job type pre-populates *tasks* any more -- every one generates them at
 /// claim time. This is only leave generation's rack universe, which claim-time
 /// rack selection orders by.
-pub async fn initialize_job_state(conn: &mut PgConnection, job: &Job,
-                                  data_path: &Path) -> AppResult<i64> {
+pub async fn initialize_job_state(conn: &mut PgConnection, job: &Job) -> AppResult<i64> {
     match job.job_type {
         JobType::LeaveGeneration => {
             let config =
@@ -213,8 +212,28 @@ pub async fn initialize_job_state(conn: &mut PgConnection, job: &Job,
                     .bind(job.id)
                     .fetch_one(&mut *conn)
                     .await?;
-            leave_gen::seed_generation(conn, job.id, 1, &config, data_path).await
+            let job_data = load_job_data(&mut *conn, job.id).await?;
+            leave_gen::seed_generation(conn, job.id, 1, &config, &job_data.letterdist).await
         }
         JobType::OpeningRack | JobType::Games | JobType::GamePairs => Ok(0),
     }
+}
+
+/// The part of job initialization that cannot run inside the creating
+/// transaction: generation 1's zeroed KLV is a multi-megabyte build and an
+/// object-store write. Called after the transaction commits, before the job is
+/// dispatchable.
+pub async fn initialize_job_artifacts(
+    pool: &sqlx::PgPool,
+    artifacts: &ArtifactStore,
+    job: &Job,
+) -> AppResult<()> {
+    if job.job_type != JobType::LeaveGeneration {
+        return Ok(());
+    }
+    let mut conn = pool.acquire().await?;
+    let job_data = load_job_data(&mut conn, job.id).await?;
+    drop(conn);
+    leave_gen::seed_zero_generation(pool, artifacts, job.id, &job_data.letterdist).await?;
+    Ok(())
 }

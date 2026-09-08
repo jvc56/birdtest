@@ -86,7 +86,10 @@ services:
       MAIL_BACKEND: console
       MAIL_FROM: no-reply@birdtest.local
       PUBLIC_URL: http://localhost:${WEB_PORT:-5173}
-      DATA_PATH: /app/data
+      # Optional here, set in production: unauthenticated GitHub ref
+      # resolution is 60 calls an hour per IP.
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      MAGPIE_DATA_REPO: ${MAGPIE_DATA_REPO:-jvc56/MAGPIE-DATA}
       S3_BUCKET: birdtest-artifacts
       S3_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: birdtest

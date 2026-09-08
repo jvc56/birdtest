@@ -2,11 +2,10 @@
 //! strategy per job type.
 
 use crate::error::AppResult;
-use crate::models::job::PlayerConfig;
+use crate::models::job::NamedPlayerConfig;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
-use std::path::Path;
 use uuid::Uuid;
 
 /// Every job type implements this. The trait is used through static dispatch
@@ -21,12 +20,7 @@ pub trait JobHandler {
     /// Read back a stored request. A task whose claim lapsed is re-dispatched
     /// through here rather than regenerated, so the request a worker sees is
     /// always the one recorded against the task.
-    ///
-    /// `data_path` is only meaningful to opening rack analysis, which stores a
-    /// range of the rack space rather than the racks themselves and needs the
-    /// letter distribution to expand it.
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid,
-                          data_path: &Path) -> AppResult<Self::Request>;
+    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request>;
 
     /// Normalize a worker submission into its stored form.
     fn process_response(response: Self::Response) -> AppResult<Self::Record>;
@@ -50,16 +44,19 @@ pub struct PlayerSpec {
     pub name: String,
     pub recorder_type: String,
     pub sort_strategy: Option<String>,
-    pub leaves: Option<String>,
+    /// The lexicon and leaves this player loads. Required, not overrides:
+    /// every player names its own files, and there is no job-level lexicon
+    /// left to fall back to.
+    pub lexicon: String,
+    pub leaves: String,
     pub max_iterations: Option<i32>,
-    pub plies: Option<i32>,
+    pub num_plies: Option<i32>,
     pub num_plies_recorded: Option<i32>,
     pub num_plays: Option<i32>,
     pub num_plays_recorded: Option<i32>,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
-    pub time_limit_secs: Option<f64>,
-    pub lexicon: Option<String>,
+    pub time_limit_secs: Option<i32>,
     pub use_wordmap: Option<bool>,
     pub use_rit: Option<bool>,
     pub min_play_iterations: Option<i32>,
@@ -69,26 +66,28 @@ pub struct PlayerSpec {
     pub utility_w_winpct: Option<f64>,
     pub utility_w_spread: Option<f64>,
     pub utility_spread_scale: Option<f64>,
+    /// `None` for a static player, which never loads a win% model.
     pub win_pct_model: Option<String>,
     pub movegen_margin: Option<f64>,
 }
 
-impl From<PlayerConfig> for PlayerSpec {
-    fn from(c: PlayerConfig) -> Self {
+impl From<NamedPlayerConfig> for PlayerSpec {
+    fn from(named: NamedPlayerConfig) -> Self {
+        let NamedPlayerConfig { config: c, kwg_name, klv_name, winpct_name } = named;
         Self {
             name: c.name,
             recorder_type: c.recorder_type,
             sort_strategy: c.sort_strategy,
-            leaves: c.leaves,
+            lexicon: kwg_name,
+            leaves: klv_name,
             max_iterations: c.max_iterations,
-            plies: c.plies,
+            num_plies: c.num_plies,
             num_plies_recorded: c.num_plies_recorded,
             num_plays: c.num_plays,
             num_plays_recorded: c.num_plays_recorded,
             stopping_pct: c.stopping_pct,
             use_inference: c.use_inference,
             time_limit_secs: c.time_limit_secs,
-            lexicon: c.lexicon,
             use_wordmap: c.use_wordmap,
             use_rit: c.use_rit,
             min_play_iterations: c.min_play_iterations,
@@ -98,7 +97,7 @@ impl From<PlayerConfig> for PlayerSpec {
             utility_w_winpct: c.utility_w_winpct,
             utility_w_spread: c.utility_w_spread,
             utility_spread_scale: c.utility_spread_scale,
-            win_pct_model: c.win_pct_model,
+            win_pct_model: winpct_name,
             movegen_margin: c.movegen_margin,
         }
     }
@@ -108,7 +107,7 @@ impl From<PlayerConfig> for PlayerSpec {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpeningRackRequest {
-    pub lexicon: String,
+    /// No top-level lexicon: `player` carries the one it loads.
     pub variant: String,
     /// Stated by the job rather than inferred from the lexicon name.
     pub letter_distribution: String,
@@ -146,7 +145,8 @@ mod seed_as_string {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameRequest {
-    pub lexicon: String,
+    /// No top-level lexicon: each player carries the one it loads, and the two
+    /// may differ.
     pub variant: String,
     /// Stated by the job rather than inferred from the lexicon name.
     pub letter_distribution: String,
@@ -173,17 +173,17 @@ pub struct LeaveRequest {
     pub letter_distribution: String,
     pub generation: i32,
     pub forced_racks: Vec<String>,
-    /// Combined KLV from the previous generation; NULL for generation 1, where
-    /// the worker falls back to the lexicon's default leaves.
-    pub previous_artifact_key: Option<String>,
+    /// Combined KLV from the previous generation. Always present: generation 1
+    /// reads the server-built zeroed KLV stored at generation 0, so every
+    /// generation fetches its leaves the same way and the client has no
+    /// first-generation branch.
+    pub previous_artifact_key: String,
+    /// The task plays this many games and stops. The generation's rack target
+    /// is deliberately not sent: every rack a game touches counts toward the
+    /// generation's totals, not just this task's forced subset, so stopping
+    /// early at the forced racks' target would discard coverage the server
+    /// would have folded in. The target stays server-only state.
     pub num_games: i32,
-    /// This generation's minimum rack target: how many times every rack must
-    /// occur before the generation closes. The server owns the running totals
-    /// across every task in the generation, so for a worker this is only an
-    /// early-out — a task whose own forced racks all reach it before
-    /// `num_games` stops rather than playing games that can no longer change
-    /// what it reports.
-    pub target_rack_count: i32,
     /// Leave generation has one bot rather than a player pair, so its wordmap
     /// setting sits on the request instead of on a player spec.
     pub use_wordmap: bool,

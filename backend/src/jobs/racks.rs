@@ -6,7 +6,6 @@
 //! copied between the two projects unchanged.
 
 use crate::error::{AppError, AppResult};
-use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub struct Tile {
@@ -27,19 +26,13 @@ pub struct LetterDistribution {
 }
 
 impl LetterDistribution {
-    /// Loads a distribution by name -- `english`, `testdist` -- as the job
-    /// states it. Nothing is inferred from the lexicon: MAGPIE derives a
-    /// distribution from the lexicon's prefix, and mirroring that inference
-    /// here made birdtest guess at something the job can simply say.
-    pub fn load(data_path: &Path, name: &str) -> AppResult<Self> {
-        let path = data_path
-            .join("letterdistributions")
-            .join(format!("{}.csv", name.to_lowercase()));
-        let text = std::fs::read_to_string(&path).map_err(|e| {
-            AppError::bad_request(format!(
-                "no letter distribution named {name:?} at {}: {e}",
-                path.display()
-            ))
+    /// Parses a distribution from the bytes of the `input_data` row a job
+    /// pins. There is no path-taking constructor and no `DATA_PATH`: the
+    /// server computes over exactly the bytes the worker is checked against,
+    /// so the two cannot drift. `origin` names the file for error messages.
+    pub fn parse(bytes: &[u8], origin: &str) -> AppResult<Self> {
+        let text = std::str::from_utf8(bytes).map_err(|e| {
+            AppError::internal(format!("letter distribution {origin} is not UTF-8: {e}"))
         })?;
 
         let mut tiles = Vec::new();
@@ -54,12 +47,11 @@ impl LetterDistribution {
             let cols: Vec<&str> = line.split(',').collect();
             if cols.len() < 3 {
                 return Err(AppError::internal(format!(
-                    "malformed letter distribution line in {}: {line:?}",
-                    path.display()
+                    "malformed letter distribution line in {origin}: {line:?}"
                 )));
             }
             let letter = cols[0].chars().next().ok_or_else(|| {
-                AppError::internal(format!("empty letter in {}", path.display()))
+                AppError::internal(format!("empty letter in {origin}"))
             })?;
             let count: u32 = cols[2].trim().parse().map_err(|_| {
                 AppError::internal(format!("non-numeric tile count in {line:?}"))
@@ -70,7 +62,7 @@ impl LetterDistribution {
         }
 
         if tiles.is_empty() {
-            return Err(AppError::internal(format!("{} contains no tiles", path.display())));
+            return Err(AppError::internal(format!("{origin} contains no tiles")));
         }
         let machine_letters: Vec<char> = tiles.iter().map(|t| t.letter).collect();
         // Canonical rack strings are sorted, so sorting the distribution once

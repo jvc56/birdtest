@@ -1,10 +1,10 @@
 use super::handler::*;
 use super::racks::LetterDistribution;
+use super::JobData;
 use crate::artifacts::ArtifactStore;
 use crate::error::{AppError, AppResult};
 use crate::models::job::LeaveConfig;
 use sqlx::{PgConnection, Row};
-use std::path::Path;
 use uuid::Uuid;
 
 pub struct LeaveGenHandler;
@@ -18,9 +18,8 @@ pub async fn insert_request(
     sqlx::query(
         "INSERT INTO leave_requests
              (task_id, lexicon, variant, letter_distribution, generation,
-              forced_racks, num_games, previous_artifact_key,
-              target_rack_count, use_wordmap)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+              forced_racks, num_games, previous_artifact_key, use_wordmap)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(task_id)
     .bind(&req.lexicon)
@@ -30,7 +29,6 @@ pub async fn insert_request(
     .bind(&req.forced_racks)
     .bind(req.num_games)
     .bind(&req.previous_artifact_key)
-    .bind(req.target_rack_count)
     .bind(req.use_wordmap)
     .execute(conn)
     .await?;
@@ -44,11 +42,10 @@ impl JobHandler for LeaveGenHandler {
 
 
 
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid,
-                          _data_path: &Path) -> AppResult<Self::Request> {
+    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         let row = sqlx::query(
             "SELECT lexicon, variant, letter_distribution, generation, forced_racks,
-                    num_games, previous_artifact_key, target_rack_count, use_wordmap
+                    num_games, previous_artifact_key, use_wordmap
              FROM leave_requests WHERE task_id = $1",
         )
         .bind(task_id)
@@ -62,7 +59,6 @@ impl JobHandler for LeaveGenHandler {
             forced_racks: row.get("forced_racks"),
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
-            target_rack_count: row.get("target_rack_count"),
             use_wordmap: row.get("use_wordmap"),
         })
     }
@@ -148,9 +144,13 @@ pub async fn next_step(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &LeaveConfig,
+    job_data: &JobData,
 ) -> AppResult<LeaveGenStep> {
+    // Generation 0 has an artifact too -- the zeroed KLV generation 1 plays
+    // with -- so it must not count as a completed generation.
     let completed = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1",
+        "SELECT COUNT(*) FROM leave_generation_artifacts
+         WHERE job_id = $1 AND generation >= 1",
     )
     .bind(job_id)
     .fetch_one(&mut *conn)
@@ -194,28 +194,32 @@ pub async fn next_step(
         });
     }
 
-    let previous_artifact_key = if generation > 1 {
-        sqlx::query_scalar::<_, String>(
-            "SELECT artifact_key FROM leave_generation_artifacts
-             WHERE job_id = $1 AND generation = $2",
-        )
-        .bind(job_id)
-        .bind(generation - 1)
-        .fetch_optional(&mut *conn)
-        .await?
-    } else {
-        None
-    };
+    // Never optional: generation 1 reads the zeroed KLV written at generation
+    // 0 when the job was created, so every generation fetches its leaves the
+    // same way.
+    let previous_artifact_key = sqlx::query_scalar::<_, String>(
+        "SELECT artifact_key FROM leave_generation_artifacts
+         WHERE job_id = $1 AND generation = $2",
+    )
+    .bind(job_id)
+    .bind(generation - 1)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| {
+        AppError::internal(format!(
+            "leave job {job_id} has no generation-{} KLV to play generation {generation} with",
+            generation - 1
+        ))
+    })?;
 
     Ok(LeaveGenStep::Dispatch(LeaveRequest {
-        lexicon: config.lexicon.clone(),
-        variant: config.variant.clone(),
-        letter_distribution: config.letter_distribution.clone(),
+        lexicon: lexicon_name(&mut *conn, config.kwg_id).await?,
+        variant: job_data.variant.clone(),
+        letter_distribution: job_data.letterdist_name.clone(),
         generation,
         forced_racks: racks,
         previous_artifact_key,
         num_games: config.num_iterations,
-        target_rack_count: config.target_rack_count,
         use_wordmap: config.use_wordmap,
     }))
 }
@@ -229,10 +233,9 @@ pub async fn seed_generation(
     job_id: Uuid,
     generation: i32,
     config: &LeaveConfig,
-    data_path: &Path,
+    distribution: &LetterDistribution,
 ) -> AppResult<i64> {
-    let dist = LetterDistribution::load(data_path, &config.letter_distribution)?;
-    let leaves = dist.enumerate_leaves(config.max_leave_size as usize);
+    let leaves = distribution.enumerate_leaves(config.max_leave_size as usize);
     tracing::info!(job_id = %job_id, generation, leaves = leaves.len(), "seeding leave rack universe");
 
     const CHUNK: usize = 1000;
@@ -255,10 +258,10 @@ pub async fn seed_generation(
 pub async fn run_transition(
     pool: &sqlx::PgPool,
     artifacts: &ArtifactStore,
-    data_path: &Path,
     job_id: Uuid,
     generation: i32,
     config: &LeaveConfig,
+    distribution: &LetterDistribution,
 ) -> AppResult<String> {
     let rows = sqlx::query(
         "SELECT rack, occurrence_count, equity_sum
@@ -281,8 +284,7 @@ pub async fn run_transition(
         })
         .collect();
 
-    let distribution = LetterDistribution::load(data_path, &config.letter_distribution)?;
-    let klv = super::klv::build(&distribution, &mean_by_rack)?;
+    let klv = super::klv::build(distribution, &mean_by_rack)?;
 
     let key = format!("leaves/{job_id}/generation-{generation}.klv2");
     artifacts.put(&key, klv).await?;
@@ -300,7 +302,7 @@ pub async fn run_transition(
     .await?;
 
     if generation < config.generation_count {
-        seed_generation(&mut tx, job_id, generation + 1, config, data_path).await?;
+        seed_generation(&mut tx, job_id, generation + 1, config, distribution).await?;
     } else {
         sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
             .bind(job_id)
@@ -308,6 +310,51 @@ pub async fn run_transition(
             .await?;
     }
     tx.commit().await?;
+
+    Ok(key)
+}
+
+/// The lexicon name a leave job's bot plays with, from the row it pins.
+pub async fn lexicon_name(conn: &mut PgConnection, kwg_id: Uuid) -> AppResult<String> {
+    Ok(
+        sqlx::query_scalar::<_, String>("SELECT name FROM input_data WHERE id = $1")
+            .bind(kwg_id)
+            .fetch_one(conn)
+            .await?,
+    )
+}
+
+/// The zeroed KLV generation 1 plays with, stored as generation 0's artifact.
+///
+/// Generation 1 has no predecessor to learn from, and it starts from leaves
+/// worth exactly nothing rather than from whatever leaves a contributor's
+/// lexicon happens to ship. Building it here rather than letting the client
+/// zero its own means there is no first-generation branch on the client at
+/// all: every generation fetches a KLV by key and plays.
+///
+/// Called from job initialization *outside* the creating transaction -- it
+/// builds a multi-megabyte artifact and writes it to the object store.
+pub async fn seed_zero_generation(
+    pool: &sqlx::PgPool,
+    artifacts: &ArtifactStore,
+    job_id: Uuid,
+    distribution: &LetterDistribution,
+) -> AppResult<String> {
+    // Empty means "no rack has a mean equity yet", which `build` renders as
+    // 0.0 for every leave -- exactly the zeroed KLV wanted here.
+    let klv = super::klv::build(distribution, &std::collections::HashMap::new())?;
+    let key = format!("leaves/{job_id}/generation-0.klv2");
+    artifacts.put(&key, klv).await?;
+
+    sqlx::query(
+        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key)
+         VALUES ($1, 0, $2)
+         ON CONFLICT (job_id, generation) DO NOTHING",
+    )
+    .bind(job_id)
+    .bind(&key)
+    .execute(pool)
+    .await?;
 
     Ok(key)
 }

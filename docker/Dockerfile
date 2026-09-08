@@ -43,10 +43,11 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=backend-build /usr/local/bin/birdtest /usr/local/bin/birdtest
-COPY data /app/data
+# No data directory: the server reads letter distributions out of the
+# input_data row a job pins, not off its own disk.
 
 USER birdtest
-ENV DATA_PATH=/app/data BIND_ADDR=0.0.0.0:8080
+ENV BIND_ADDR=0.0.0.0:8080
 EXPOSE 8080
 
 # Migrations run inside the process, before it binds, so there is no separate
