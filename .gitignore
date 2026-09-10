@@ -19,3 +19,8 @@ __pycache__/
 
 # Local snapshots taken by scripts/dev-dump.sh
 .dev-backups/
+
+# Per-contributor working directories made by scripts/dev.py: each holds a
+# contribute.txt (with the worker identity the server assigned it), the
+# settings.txt MAGPIE writes, a log, and a symlink to the data directory.
+/.dev-workers/

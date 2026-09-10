@@ -18,11 +18,11 @@ with workers](PLAN.md#input-data-and-capability-negotiation), and what is
 
 | Path | What it is |
 |---|---|
-| `backend/` | Axum + SQLx server. Owns scheduling, validation, SPRT, Glicko and aggregation. |
+| `backend/` | Axum + SQLx server. Owns scheduling, validation, SPRT, ratings and aggregation. |
 | `frontend/` | SvelteKit SPA (dark mode only), built statically and served by Nginx in production. |
-| `worker/` | `fake_worker.py`, a test client that submits synthetic results with no MAGPIE in the loop — see [Testing without MAGPIE](#testing-without-magpie--the-fake-worker). The real contributor client is MAGPIE itself; see [Worker Client](PLAN.md#worker-client-1). |
+| `worker/` | `fake_worker.py`, a synthetic client used by the **end-to-end suite only** — see [TESTING.md](TESTING.md). Local development uses real MAGPIE; the contributor client is MAGPIE itself, see [Worker Client](PLAN.md#worker-client-1). |
 | `infra/` | Terraform: VPC, ALB, ECS Fargate, RDS Postgres, S3, SES, SSM, backups. |
-| `scripts/` | Backup, restore-drill and local snapshot scripts. See [Backups and Restore](PLAN.md#backups-and-restore) and [RUNBOOK.md](RUNBOOK.md). |
+| `scripts/` | `dev.py` (the local development command), `seed.py` (empty database → work flowing), plus backup, restore-drill and local snapshot scripts. |
 
 Tile distributions and every other input file are no longer carried in the
 repo: they are imported from a MAGPIE-DATA tarball into the `input_data` table
@@ -30,9 +30,99 @@ and pinned by SHA-256 — see [Input Data](PLAN.md#input-data-and-capability-neg
 
 ## Running locally
 
-`docker compose up` is the whole setup. Database, object storage, backend and
-frontend all run in containers, so Docker is the only thing the host needs —
-no Rust, Node, Python or Postgres install.
+One command brings up the stack, seeds it, starts real MAGPIE contributors and
+opens the site:
+
+```bash
+./scripts/dev.py
+```
+
+That is the whole setup. It waits for the backend, imports the MAGPIE-DATA
+tarball your own checkout installed, creates two player configs and an active
+game-pairs job, launches two `magpie contribute` processes, and opens
+**http://localhost:5173**.
+
+**Contributors are always real MAGPIE.** There is no fake-worker mode here.
+`worker/fake_worker.py` belongs to the end-to-end suite, where a browser
+journey needs contributions to arrive on cue at predictable values without a C
+toolchain in the loop — that is a property of an assertion harness, not of a
+place you develop. Watching synthetic numbers move a dashboard tells you
+nothing about what your change did.
+
+So this needs two things Docker cannot provide, and fails naming both when
+either is missing:
+
+| | Default | Override |
+|---|---|---|
+| A built MAGPIE binary | `../MAGPIE/bin/magpie` | `--magpie`, or `$MAGPIE_BIN` |
+| A real MAGPIE-DATA install | `../MAGPIE/data` | `--magpie-data`, or `$MAGPIE_DATA_PATH` |
+
+### Choosing how it runs
+
+Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
+
+```bash
+./scripts/dev.py --workers 6                  # six contributors instead of two
+./scripts/dev.py --workers 1 --threads 12     # one contributor, more threads each
+./scripts/dev.py --job-type games             # seed a plain games job
+./scripts/dev.py --no-browser                 # SSH sessions and CI
+./scripts/dev.py --hot-reload                 # add the Vite dev server on :5174
+./scripts/dev.py --no-up --no-seed            # attach contributors to a stack already running
+```
+
+| Flag | Default | What it changes |
+|---|---|---|
+| `-w`, `--workers` | 2 | How many `magpie contribute` processes run |
+| `--threads` | 4 | Threads inside each contributor |
+| `--max-tasks` | 0 | Tasks each contributor runs before exiting; 0 runs until stopped |
+| `--idle-wait` | 5 | Seconds a contributor waits when there is no work |
+| `--api-key` | anonymous | Contribute under an account instead of anonymously |
+| `--job-type` | `game_pairs` | `game_pairs`, `games` or `opening_rack` |
+| `--lexicon`, `--variant` | NWL23, classic | What the seeded job plays |
+| `--tarball-date` | your `DATA_VERSION` | Which MAGPIE-DATA version to import |
+| `--min-magpie-version` | your build's version | The version floor, on the server and on the job |
+| `--web-port`, `--backend-port` | 5173, 8080 | Host ports |
+| `--workdir` | `.dev-workers` | Where per-worker directories live |
+| `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker |
+| `--rebuild` | off | Rebuild images before starting |
+| `--down` | off | Stop the stack on exit instead of leaving it up |
+| `--no-seed` | off | Skip seeding (the stack already has an active job) |
+| `--no-up` | off | Assume the stack is already running |
+
+Each contributor gets its own directory under `--workdir`, holding its
+`contribute.txt`, the `settings.txt` MAGPIE writes, a `contribute.log`, and a
+symlink to your data directory. They need separate directories because
+`magpie contribute` reads and writes both files in its working directory —
+sharing one would race on them and collapse every worker onto a single
+identity. Watch one with `tail -f .dev-workers/worker-01/contribute.log`.
+
+Ctrl-C stops the contributors and leaves the stack up, so the site stays
+browsable; `--down` tears it down instead.
+
+### Seeding on its own
+
+`scripts/seed.py` is what `dev.py` calls, and it runs standalone against any
+birdtest:
+
+```bash
+./scripts/seed.py --api http://localhost:8080 --magpie-root ../MAGPIE
+```
+
+It drives the **real HTTP API** rather than writing SQL, so seeding is itself a
+smoke test of registration, confirmation, import, validation and job creation.
+Two things have no endpoint and are done directly: promoting a user to admin
+(`is_admin` is settable through no endpoint, by design) and reading the emailed
+confirmation code out of the backend's log, which is the only place the
+plaintext exists — `email_confirmations` stores a hash. Re-running is safe.
+
+The tarball date defaults to the `DATA_VERSION` in your MAGPIE checkout's
+`download_data.sh`, so the digests the server pins are the bytes your workers
+actually have. If those diverge, every worker declines every task.
+
+### Doing it by hand
+
+`docker compose up` still brings up just the stack — database, object storage,
+backend and frontend — with Docker as the only host dependency:
 
 ```bash
 docker compose up --build
@@ -41,7 +131,8 @@ docker compose up --build
 Then open **http://localhost:5173**. Nginx serves the SPA and proxies `/api` to
 the backend, exactly as the ALB does in production, so the app runs on a single
 origin locally too. The API is also exposed directly on :8080 for poking at
-with `curl`.
+with `curl`. Nothing dispatches until a job is active, which is what `seed.py`
+is for.
 
 Migrations run inside the backend process before it binds, and the artifact
 bucket is created by a one-shot `minio-init` container, so there is nothing to
@@ -54,52 +145,30 @@ edit the compose file:
 WEB_PORT=5174 POSTGRES_PORT=5433 MINIO_PORT=9002 docker compose up --build
 ```
 
-### An admin and a first job
-
 The first registered user is deliberately *not* an admin, so promotion is a
-manual step:
+manual step if you are not using `seed.py`:
 
 ```bash
-# 1. Register at http://localhost:5173/register. MAIL_BACKEND=console puts the
-#    confirmation link in the backend's log:
+# MAIL_BACKEND=console puts the confirmation link in the backend's log:
 docker compose logs -f backend
-
-# 2. Promote yourself:
 docker compose exec postgres \
   psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE username = 'you';"
 ```
 
-Then create a player config at `/admin/player-configs/new`, create a job at
-`/admin/jobs/new`, and activate it with an allocation. Nothing dispatches until
-a job is active.
-
-Opening-rack and leave-generation jobs enumerate their whole rack space at
-creation time — for a real English bag that is millions of rows. Use lexicon
-`TESTDIST` while poking at the UI; it is a deliberately tiny bag that exists
-for exactly this.
-
-### Testing without MAGPIE — the fake worker
-
-Most server behaviour is best tested without a real engine in the loop.
-Scheduling, SPRT, Glicko, redundancy and claim reclamation all want a *chosen*
-outcome and a fast one, and the adversarial paths have no real-client
-equivalent at all:
+**The version floor will stop an unreleased MAGPIE from contributing.**
+`MIN_MAGPIE_VERSION` defaults to `0.0.1` and the `contribute` branch reports
+`0.0.0`, so every task is declined with "update MAGPIE" until you lower it —
+on the server *and* on the job, which records its own floor at creation:
 
 ```bash
-docker compose --profile fake-worker up            # or, directly:
-python worker/fake_worker.py --server-url http://localhost:8080 --tasks 10
+MIN_MAGPIE_VERSION=0.0.0 docker compose up -d
 ```
 
-| Flag | What it exercises |
-|---|---|
-| `--workers N` | Concurrent claims — seed-tiling races, per-identity slot limits |
-| `--p1-win-rate 0.65` | Drives SPRT to a chosen verdict instead of waiting for chance |
-| `--mode malformed` | Submissions the server should reject with 400 |
-| `--mode stale` | A claim token that was never issued; must be ignored, not accepted |
-| `--mode abandon` | Claim and never submit, so the heartbeat timeout has to reclaim |
-| `--seed` | Makes any of the above reproducible |
+`dev.py` reads the version out of your checkout and sets both for you.
 
-Every mode is deterministic under `--seed`, so a failing CI run reproduces.
+Opening-rack and leave-generation jobs enumerate their whole rack space at
+creation time — for a real English bag that is millions of rows, and 914,624
+leaves for leave generation. Worth knowing before you create one by hand.
 
 ### Contributing with MAGPIE
 
@@ -152,7 +221,7 @@ The backend and frontend still run directly on the host if you would rather:
 You need a Postgres to point `DATABASE_URL` at — `docker compose up -d postgres
 minio minio-init` gives you one without the rest of the stack.
 
-The fake worker needs only `requests` and runs anywhere.
+`scripts/dev.py` and `scripts/seed.py` need only `requests`.
 
 ## Deploying
 

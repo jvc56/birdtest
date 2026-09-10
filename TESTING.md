@@ -266,8 +266,9 @@ becomes a version check and the probe retires.
 **This tier cannot use the synthetic fixture lexica** — nor can the dev
 environment, for the same reason. The fixture's `NWL23.kwg` is a stub; a real
 MAGPIE would load it and fail, or worse, not fail.
-Tier 6 seeds from a real MAGPIE-DATA install (`scripts/seed.py --real-data`,
-pointing at `MAGPIE_DATA_PATH`), which is also what makes it a genuine check that
+Tier 6 seeds from a real MAGPIE-DATA install (`scripts/seed.py`, whose
+`--tarball-date` defaults to the `DATA_VERSION` the checkout installed), which
+is also what makes it a genuine check that
 birdtest's pinned digests match what `download_data.sh` actually installs. If
 they diverge the client declines every task and the tier fails — surfacing the
 mismatch as a red build rather than as a dead job in production.
@@ -366,16 +367,29 @@ and job creation. The single exception is promoting a user to admin, which has
 no endpoint by design and is a direct `UPDATE`.
 
 ```
-scripts/seed.py [--api URL] [--real-data] [--job-type TYPE]
+scripts/seed.py [--api URL] [--job-type TYPE] [--tarball-date YYYYMMDD]
+                [--magpie-root PATH] [--min-magpie-version V] ...
 ```
 
-1. Register a user, read the confirmation code, confirm it.
+1. Register a user, read the confirmation code, confirm it. The code comes
+   from the backend's log, not the database: `email_confirmations` stores only
+   a hash, which is the point — a leaked dump must not hand out working
+   confirmation links.
 2. Promote to admin (SQL — `is_admin` is settable through no endpoint).
-3. Import input data and confirm the staged diff. The fixture tarball by
-   default; a real MAGPIE-DATA install under `--real-data`.
-4. Create player configs pinning those rows.
-5. Create a job of the requested type.
+3. Import input data and confirm the staged diff. The date defaults to the
+   `DATA_VERSION` in the caller's MAGPIE checkout, so the digests the server
+   pins are the bytes its workers actually have.
+4. Create player configs pinning those rows. Two static players that sort
+   differently, which is the cheapest way to get a job with real signal: they
+   choose different moves nearly every turn, so pairs diverge instead of
+   playing out identically.
+5. Create a job of the requested type, with an explicit version floor — a job
+   records the floor it was created under, so leaving it implicit lets one
+   created earlier keep declining an unreleased local build for ever.
 6. Activate it with an allocation.
+
+Re-running is safe: an unconfirmed account is confirmed, an imported tarball is
+skipped, and an active job of the same type is reused rather than duplicated.
 
 ### What tiers 2 and 3 must *not* share
 
@@ -395,12 +409,17 @@ easier in the moment.
 ## The development environment
 
 ```
-scripts/dev.py [--workers N] [--no-browser]
+scripts/dev.py [-w N] [--threads N] [--job-type TYPE] [--no-browser] ...
 ```
 
 Brings up the stack, waits for health, seeds it, starts `N` workers, and opens a
 browser. It is tier 6's setup with the assertions and the teardown removed, and
-it calls the same `seed.py --real-data`.
+it calls the same `seed.py`. `--help` lists the rest; README has the table.
+
+**Both scripts exist and are exercised.** `dev.py` has been run end to end
+against real MAGPIE contributors: results land, the pentanomial's two
+invariants hold on real games, and SPRT reads all pairs rather than a filtered
+subset.
 
 **Workers are always real `magpie contribute` clients.** There is no fake-worker
 mode. `fake_worker.py` belongs to tier 5 and nowhere else: it exists so a browser

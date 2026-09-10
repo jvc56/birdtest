@@ -1,17 +1,16 @@
-# Full local stack. `docker compose up` needs nothing on the host but Docker:
-# database, object storage, backend and frontend all run in containers. None
-# of them need MAGPIE: the backend builds its own leave-generation KLV
-# artifacts directly (see backend/src/jobs/klv.rs) instead of shelling out to
-# it, and the fake worker submits synthetic results.
+# The birdtest stack: database, object storage, backend and frontend, none of
+# which need MAGPIE — the backend builds its own leave-generation KLV artifacts
+# directly (see backend/src/jobs/klv.rs) rather than shelling out to it.
+#
+# For local development use `scripts/dev.py`, which brings this up, seeds it,
+# and runs real `magpie contribute` processes against it. There is no "worker"
+# service here: the contributor client is MAGPIE itself, running on the host.
 #
 # Optional profiles:
-#   --profile fake-worker   synthetic results, no MAGPIE — see README
 #   --profile dev           the Vite dev server with hot reload, alongside the
 #                           production-style Nginx frontend
-#
-# There is no "worker" profile: the real contributor client is MAGPIE itself,
-# via `magpie contribute` (see PLAN.md's "Worker Client") — nothing to build
-# or run here for that.
+#   --profile fake-worker   synthetic results for the **end-to-end suite**.
+#                           Not for development — see TESTING.md.
 #
 # Ports are overridable so a host that already has something on 5432 (or 9000,
 # or 5173) does not need the file edited. See .env.example.
@@ -95,6 +94,12 @@ services:
       # resolution is 60 calls an hour per IP.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       MAGPIE_DATA_REPO: ${MAGPIE_DATA_REPO:-jvc56/MAGPIE-DATA}
+      # The fleet-wide floor. Production keeps this at the oldest release that
+      # implements the contribution protocol; locally it has to match whatever
+      # your own MAGPIE build reports, which for the unreleased `contribute`
+      # branch is 0.0.0 -- scripts/dev.py reads that out of your checkout and
+      # sets this for you.
+      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.0.1}
       S3_BUCKET: birdtest-artifacts
       S3_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: birdtest
@@ -141,10 +146,11 @@ services:
       - "${DEV_PORT:-5174}:5173"
 
   # --- profile: fake-worker -------------------------------------------------
-  # Synthetic results, no MAGPIE. This is what most server-side testing wants:
-  # scheduling, SPRT, Glicko, redundancy and reclamation are all faster and more
-  # deterministic without a real engine in the loop, and the adversarial modes
-  # have no real-client equivalent at all.
+  # Synthetic results, for the end-to-end suite only. A browser journey needs
+  # contributions to arrive on cue at predictable values, and needs to run on
+  # every pull request without a C toolchain — both properties of an assertion
+  # harness rather than of a place to develop. Local development and the MAGPIE
+  # smoke tier both use a real engine; see TESTING.md.
   fake-worker:
     profiles: [fake-worker]
     build:

@@ -848,9 +848,13 @@ async fn create_job(
 /// MAGPIE has one value for these for the whole run, not one per player, even
 /// though they live on `player_configs` (so that table stays the exhaustive
 /// source of what a job asked for -- see the migration comment on
-/// `win_pct_model`/`movegen_margin`). A `games`/`game_pairs` job whose two
+/// `winpct_id`/`movegen_margin`). A `games`/`game_pairs` job whose two
 /// player configs disagree on one of these can't be honored, so job creation
 /// rejects it here rather than leaving one worker's value to win silently.
+///
+/// The win% model is compared by `input_data` id rather than by name: the id
+/// is what pins the bytes, and two rows can share a name across tarball
+/// versions while holding different content.
 async fn validate_shared_player_options(
     conn: &mut sqlx::PgConnection,
     player1_config_id: Uuid,
@@ -860,7 +864,7 @@ async fn validate_shared_player_options(
         return Ok(());
     }
     let row = sqlx::query(
-        "SELECT p1.win_pct_model AS p1_win_pct_model, p2.win_pct_model AS p2_win_pct_model,
+        "SELECT p1.winpct_id AS p1_winpct_id, p2.winpct_id AS p2_winpct_id,
                 p1.movegen_margin AS p1_movegen_margin, p2.movegen_margin AS p2_movegen_margin
          FROM player_configs p1, player_configs p2
          WHERE p1.id = $1 AND p2.id = $2",
@@ -872,11 +876,11 @@ async fn validate_shared_player_options(
     .ok_or_else(|| AppError::bad_request("player config not found"))?;
 
     use sqlx::Row;
-    let p1_win_pct_model: Option<String> = row.get("p1_win_pct_model");
-    let p2_win_pct_model: Option<String> = row.get("p2_win_pct_model");
-    if p1_win_pct_model != p2_win_pct_model {
+    let p1_winpct_id: Option<Uuid> = row.get("p1_winpct_id");
+    let p2_winpct_id: Option<Uuid> = row.get("p2_winpct_id");
+    if p1_winpct_id != p2_winpct_id {
         return Err(AppError::bad_request(
-            "player configs disagree on win_pct_model, which MAGPIE cannot vary per player",
+            "player configs disagree on the win% model, which MAGPIE cannot vary per player",
         ));
     }
     let p1_movegen_margin: Option<f64> = row.get("p1_movegen_margin");
