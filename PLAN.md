@@ -269,10 +269,23 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
      in as context so a password derived from either is rejected. Scored
      server-side; the client shows the same feedback but is not trusted.
 
-   A username or email already taken returns `409` naming which one. This does
-   reveal that an account exists, unlike login — the alternative is refusing to
-   tell someone why their registration failed, and the address is already
-   discoverable by attempting registration either way.
+   A **taken username** returns `409` naming it. The user has to choose another
+   one to get anywhere, and `GET /api/users` publishes the whole list anyway, so
+   there is nothing here to protect.
+
+   A **taken email** does not. Saying "that address is already registered" would
+   make this endpoint an oracle for whether a given person has an account —
+   something login and password reset both go out of their way not to reveal,
+   and which registration should not undo. The caller gets byte-for-byte what a
+   new registration gets, no account is created, and a notice goes to the
+   address's owner telling them someone tried and pointing them at login and
+   password reset. A real person who has forgotten they signed up still finds
+   out; someone probing the address learns nothing.
+
+   The password is hashed **before** this branch, not after, so both paths pay
+   the same Argon2 cost. Returning an identical body and then answering tens of
+   milliseconds sooner would hand back the answer through timing, which is the
+   flaw the branch exists to avoid.
 3. Password is hashed with Argon2 and stored. A confirmation code is generated, hashed with SHA-256, and stored in `email_confirmations` with a **24-hour** expiry. The raw code is emailed via SES.
 4. The frontend redirects to `/register/check-email` — a static holding page instructing the user to check their inbox. No session is created yet.
 5. The user clicks the confirmation link in the email, which lands on `/confirm-email?code=<raw-code>`. The page auto-submits the code to `POST /api/auth/confirm-email`.
@@ -298,7 +311,15 @@ Email is confirmed before the first login. Logging in without a confirmed email 
 
 1. User clicks "Forgot password?" on `/login` and is taken to `/reset-password`.
 2. User enters their email address and submits. The server always returns `200` regardless of whether the email is registered — no account enumeration.
-3. If the email matches a confirmed account, the server generates a reset token, hashes it with SHA-256, stores it in `password_reset_tokens` with a **30-minute** expiry, and emails the raw token link via SES. Reset tokens are short-lived where confirmation codes are not: a reset link is a live credential for taking over an account, and a confirmation code is not.
+3. If the email matches a confirmed account, the server generates a reset token, hashes it with SHA-256, stores it in `password_reset_tokens` with a **30-minute** expiry, and emails the raw token link. Reset tokens are short-lived where confirmation codes are not: a reset link is a live credential for taking over an account, and a confirmation code is not.
+
+   **The mail is sent off the request path.** Awaiting a provider round trip here
+   and returning immediately for an unknown address would answer the question by
+   timing — hundreds of milliseconds against a sub-millisecond index miss is not
+   a subtle signal — which would undo the identical body the endpoint is careful
+   to return. Spawning also keeps a slow or failing mail provider out of the
+   caller's latency; a send that fails is logged and nothing else, since the
+   caller was told the same thing either way.
 4. The user clicks the link, landing on `/reset-password/confirm?token=<raw-token>`. The page shows a new-password form.
 5. On submit, `POST /api/auth/reset-password/confirm` re-scores the new password, validates the token (hash match, not expired, not already used), sets `used_at`, hashes and stores the new password, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
 
@@ -2789,10 +2810,17 @@ In-memory token buckets, per process, reset on restart.
 | Endpoint | Limit | Keyed on |
 |---|---|---|
 | `POST /api/auth/register` | 10 / hour | Client IP |
+| `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
 | `POST /api/worker/{task,result,heartbeat,decline,artifact}` | 1 / second, **burst 5** | Worker identity (`u:<user-id>` or `a:<uuid>`) |
 
 The burst matters: a task costs at least two requests, so a strict one-per-second
 limit with no burst would throttle a well-behaved client.
+
+Password reset is checked twice, and both halves are load-bearing. Without a
+limit it is an unauthenticated endpoint that sends mail to any address it is
+given: a way to probe which addresses have accounts, and a way to bury a known
+contributor in reset emails at the operator's expense. Limiting by IP alone
+stops neither, because IPs are cheap.
 
 #### Health and startup
 

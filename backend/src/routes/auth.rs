@@ -86,26 +86,59 @@ async fn register(
         return Err(err);
     }
 
-    let taken = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT CASE WHEN username = $1 THEN 'username' ELSE 'email' END
-         FROM users WHERE username = $1 OR email = $2 LIMIT 1",
+    let taken = sqlx::query_as::<_, (bool, bool)>(
+        "SELECT EXISTS (SELECT 1 FROM users WHERE username = $1),
+                EXISTS (SELECT 1 FROM users WHERE email = $2)",
     )
     .bind(&username)
     .bind(&email)
-    .fetch_optional(&state.pool)
-    .await?
-    .flatten();
+    .fetch_one(&state.pool)
+    .await?;
+    let (username_taken, email_taken) = taken;
 
-    if let Some(field) = taken {
-        let message = if field == "username" {
-            "that username is taken"
-        } else {
-            "that email address is already registered"
-        };
-        return Err(AppError::conflict("registration details are invalid").with_field(field, message));
+    // Hashed before the collision branch, not after, so both paths pay the same
+    // Argon2 cost. Returning an identical body for a taken address and then
+    // answering in tens of milliseconds less would give the answer back through
+    // timing, which is exactly the flaw this branch exists to avoid.
+    let password_hash = api_key::hash_password(&body.password)?;
+
+    // A taken username is reported plainly: the user has to choose another one
+    // to get anywhere, and `GET /api/users` publishes the whole list anyway, so
+    // there is nothing here to protect.
+    if username_taken {
+        return Err(AppError::conflict("registration details are invalid")
+            .with_field("username", "that username is taken"));
     }
 
-    let password_hash = api_key::hash_password(&body.password)?;
+    // A taken *email* is not reported. Answering "that address is already
+    // registered" turns this endpoint into an oracle for whether a given person
+    // has an account -- something login and password reset both go out of their
+    // way not to reveal, and which registration should not undo. The caller sees
+    // exactly what a new registration sees; the address owner is told someone
+    // tried, so a real person who has forgotten they signed up still finds out.
+    if email_taken {
+        state
+            .mailer
+            .send(
+                &email,
+                "Someone tried to register with your email address",
+                &format!(
+                    "Someone tried to create a birdtest account with this \
+                     address, but it already has one.\n\n\
+                     If that was you, sign in at {url}/login, or reset your \
+                     password at {url}/reset-password if you have forgotten \
+                     it.\n\n\
+                     If it was not you, no account was created and nothing \
+                     has changed.\n",
+                    url = state.cfg.public_url
+                ),
+            )
+            .await?;
+        return Ok((
+            StatusCode::CREATED,
+            Json(MessageBody { message: "check your email to confirm" }),
+        ));
+    }
     let raw_code = api_key::generate_code();
 
     let mut tx = state.pool.begin().await?;
@@ -257,9 +290,16 @@ struct ResetRequestBody {
 
 async fn request_password_reset(
     State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Json(body): Json<ResetRequestBody>,
 ) -> AppResult<Json<MessageBody>> {
     let email = body.email.trim().to_lowercase();
+
+    // Checked against the caller and against the address they named. Both
+    // halves are load-bearing: the first bounds bulk probing, the second stops
+    // one address being buried in reset mail from many sources.
+    ratelimit::check(&state.limits.reset, &format!("ip:{}", addr.ip()))?;
+    ratelimit::check(&state.limits.reset, &format!("em:{email}"))?;
     let user = sqlx::query_as::<_, (Uuid,)>(
         "SELECT id FROM users WHERE email = $1 AND email_confirmed_at IS NOT NULL",
     )
@@ -283,14 +323,31 @@ async fn request_password_reset(
         let encoded_token = utf8_percent_encode(&raw_token, NON_ALPHANUMERIC);
         let link =
             format!("{}/reset-password/confirm?token={encoded_token}", state.cfg.public_url);
-        state
-            .mailer
-            .send(
-                &email,
-                "Reset your birdtest password",
-                &format!("Reset your password (valid for {RESET_TTL_MINUTES} minutes):\n{link}\n"),
-            )
-            .await?;
+
+        // Sent off the request path, which is what makes the identical body
+        // below actually mean something. Awaiting an SES round trip here and
+        // returning immediately when the address is unknown answers the
+        // question by timing: hundreds of milliseconds against a sub-millisecond
+        // index miss is not a subtle signal. Spawning also keeps a slow or
+        // failing mail provider out of the caller's latency.
+        let mailer = state.mailer.clone();
+        tokio::spawn(async move {
+            if let Err(err) = mailer
+                .send(
+                    &email,
+                    "Reset your birdtest password",
+                    &format!(
+                        "Reset your password (valid for {RESET_TTL_MINUTES} minutes):\n{link}\n"
+                    ),
+                )
+                .await
+            {
+                // Nothing to report to the caller -- they were told the same
+                // thing either way -- so this is the only record that the mail
+                // did not go out.
+                tracing::error!(error = %err.message, "password reset email failed to send");
+            }
+        });
     }
 
     // Always 200, whether or not the address is registered — otherwise this

@@ -16,6 +16,15 @@ pub struct RateLimiters {
     pub register: Arc<Keyed>,
     /// 1 request per second per worker identity, applied to task/result/heartbeat.
     pub worker: Arc<Keyed>,
+    /// 5 password-reset requests per hour, checked twice: once against the
+    /// caller's IP and once against the address they asked for.
+    ///
+    /// The per-address half is the one that matters. Without it this is an
+    /// unauthenticated endpoint that sends mail to any address it is given, so
+    /// it is both a way to probe which addresses have accounts and a way to
+    /// bury a known contributor in reset emails at the operator's expense.
+    /// Limiting by IP alone stops neither, since IPs are cheap.
+    pub reset: Arc<Keyed>,
 }
 
 impl RateLimiters {
@@ -23,9 +32,11 @@ impl RateLimiters {
         let per_hour = Quota::per_hour(NonZeroU32::new(10).unwrap());
         let per_second = Quota::per_second(NonZeroU32::new(1).unwrap())
             .allow_burst(NonZeroU32::new(5).unwrap());
+        let resets_per_hour = Quota::per_hour(NonZeroU32::new(5).unwrap());
         Self {
             register: Arc::new(RateLimiter::keyed(per_hour)),
             worker: Arc::new(RateLimiter::keyed(per_second)),
+            reset: Arc::new(RateLimiter::keyed(resets_per_hour)),
         }
     }
 }
