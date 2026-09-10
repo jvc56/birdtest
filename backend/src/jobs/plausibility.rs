@@ -368,3 +368,30 @@ mod tests {
         assert!(check_rack_occurrences(&[occurrence("AEINRST", 0)]).is_err());
     }
 }
+
+#[cfg(test)]
+mod fixture_tests {
+    use super::super::handler::PositionAnalysisResponse;
+
+    /// A real `fake_worker.py` opening-rack submission, captured verbatim.
+    ///
+    /// The fake worker previously read a `position` field the request does not
+    /// have and answered with a bare `{"moves": [...]}`, which no opening-rack
+    /// job could ever accept. Pinning one of its submissions here means the two
+    /// sides cannot drift apart again without a test failing.
+    const OPENING_RACK_SUBMISSION: &str = include_str!("testdata/fake_worker_opening_rack.json");
+
+    #[test]
+    fn the_fake_worker_speaks_the_opening_rack_response_shape() {
+        let response: PositionAnalysisResponse =
+            serde_json::from_str(OPENING_RACK_SUBMISSION).expect("should deserialize");
+        assert_eq!(response.racks.len(), 2);
+        assert_eq!(response.racks[0].rack, "AEINRST");
+        assert!(!response.racks[0].moves.is_empty());
+        // And it must satisfy the plausibility rules it will be checked against.
+        for analysis in &response.racks {
+            super::check_rack(&analysis.rack, "fixture").unwrap();
+            super::check_moves(&analysis.moves, None, "fixture").unwrap();
+        }
+    }
+}

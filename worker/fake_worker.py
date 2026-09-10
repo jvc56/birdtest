@@ -225,28 +225,37 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
         return result
 
     if job_type == "opening_rack":
-        rack = request["position"].split()[1].rstrip("/")
-        count = rng.randint(2, 6)
-        moves = []
-        equity = rng.uniform(20.0, 45.0)
-        for i in range(count):
-            equity -= rng.uniform(0.5, 4.0)
-            moves.append(
-                {
-                    "move": f"8{chr(ord('D') + i)} {rack[: rng.randint(2, len(rack))]}",
-                    "score": rng.randint(12, 90),
-                    "equity": round(equity, 3),
-                    "plies": [
-                        {
-                            "ply": p,
-                            "bingo_percentage": round(rng.uniform(0, 25), 3),
-                            "average_score": round(rng.uniform(25, 45), 3),
-                        }
-                        for p in range(2)
-                    ],
-                }
-            )
-        return {"moves": moves}
+        # One analysis per rack in the batch, keyed by the rack itself: the
+        # request carries `racks` (the server batches them, since the rack space
+        # runs to millions) and the response is matched up rack by rack.
+        analyses = []
+        for rack in request["racks"]:
+            count = rng.randint(2, 6)
+            moves = []
+            # Ranked best-first, so equity descends down the list.
+            equity = rng.uniform(20.0, 45.0)
+            for i in range(count):
+                equity -= rng.uniform(0.5, 4.0)
+                # A play uses at least one tile; a one-tile rack is legal, so
+                # the lower bound cannot assume two.
+                tiles = rng.randint(1, len(rack))
+                moves.append(
+                    {
+                        "move": f"8{chr(ord('D') + i)} {rack[:tiles]}",
+                        "score": rng.randint(12, 90),
+                        "equity": round(equity, 3),
+                        "plies": [
+                            {
+                                "ply": p,
+                                "bingo_percentage": round(rng.uniform(0, 25), 3),
+                                "average_score": round(rng.uniform(25, 45), 3),
+                            }
+                            for p in range(2)
+                        ],
+                    }
+                )
+            analyses.append({"rack": rack, "moves": moves})
+        return {"racks": analyses}
 
     if job_type == "leave_generation":
         return {

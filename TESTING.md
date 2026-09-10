@@ -38,7 +38,7 @@ tier that is not run by default.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 57 | `#[cfg(test)]` in `inputdata`, `backups`, `jobs::klv`, `jobs::racks`, `jobs::plausibility`, `version`, `compat`, `stats::sprt`, `stats::bradley_terry` |
+| 1 Unit | 58 | `#[cfg(test)]` in `inputdata`, `backups`, `jobs::klv`, `jobs::racks`, `jobs::plausibility`, `version`, `compat`, `stats::sprt`, `stats::bradley_terry` |
 | 2 Integration | **0** | — |
 | 3 API | **0** | — |
 | 4 Contract | 5 | `routes::worker::contract_fixtures` |
@@ -84,6 +84,12 @@ What belongs here:
 - `compat.rs`'s ported lexicon/leaves/distribution rules against its
   known-good/known-bad table. **An uncovered combination must be rejected, not
   guessed** — the table is the artifact worth maintaining.
+- That `fake_worker.py`'s submissions still deserialize into the response types
+  the server expects, against a captured sample rather than by inspection. The
+  fake worker is the only client below tier 6, so a shape drift there is
+  invisible until a job of that type is actually run — which is how its
+  opening-rack submission came to answer with a field the server had never
+  accepted.
 - The submission plausibility rules: that each rejects its impossibility (a
   negative standard deviation, a play scoring below zero, an eight-tile rack, a
   rack listed twice in one leave submission) **and** that ordinary results pass.
