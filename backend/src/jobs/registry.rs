@@ -166,6 +166,28 @@ async fn insert_on_demand_task(
     .await?)
 }
 
+/// Checks a batch against the size the task was dispatched with.
+///
+/// Lives here rather than in `process_response` because it needs the request,
+/// which the pure validation step does not have. It is the one submission-time
+/// check that can catch a worker reporting work it did not do: the batch size
+/// was fixed when the task was handed out, so a result of any other size is
+/// answering a question nobody asked.
+async fn check_batch_size(
+    conn: &mut PgConnection,
+    job: &Job,
+    task_id: Uuid,
+    reported_games: i32,
+) -> AppResult<()> {
+    super::plausibility::check_against_task(
+        conn,
+        job,
+        task_id,
+        &super::plausibility::Reported { games: Some(reported_games) },
+    )
+    .await
+}
+
 /// Validate, normalize and store a worker submission.
 pub async fn store_result(
     conn: &mut PgConnection,
@@ -186,10 +208,12 @@ pub async fn store_result(
         }
         JobType::Games => {
             let record = game::GameHandler::process_response(decode(payload)?)?;
+            check_batch_size(conn, job, task_id, record.all_games.games).await?;
             game::GameHandler::insert_record(conn, task_id, claim_id, &record).await
         }
         JobType::GamePairs => {
             let record = game_pair::GamePairHandler::process_response(decode(payload)?)?;
+            check_batch_size(conn, job, task_id, record.all_games.games).await?;
             game_pair::GamePairHandler::insert_record(conn, task_id, claim_id, &record).await
         }
         JobType::LeaveGeneration => {

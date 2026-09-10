@@ -61,6 +61,10 @@ impl JobHandler for OpeningRackHandler {
                     analysis.rack
                 )));
             }
+            super::plausibility::check_rack(&analysis.rack, "opening rack")?;
+            // `RackAnalysis` carries no generated-move count, so there is
+            // nothing to check the list length against here.
+            super::plausibility::check_moves(&analysis.moves, None, "opening rack")?;
             racks.push(PositionAnalysis::opening_rack(
                 analysis.rack.clone(),
                 analysis.moves,

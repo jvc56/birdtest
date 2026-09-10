@@ -23,6 +23,7 @@ impl JobHandler for GamePairHandler {
 
     fn process_response(response: Self::Response) -> AppResult<Self::Record> {
         super::game::validate_aggregate(&response.all_games, "all_games")?;
+        super::plausibility::check_game_aggregate(&response.all_games, "all_games")?;
 
         // Every pair is two games, so an odd total means the worker ran
         // something other than what was asked for.
@@ -66,6 +67,7 @@ impl JobHandler for GamePairHandler {
         let divergent = response.divergent_games;
         if let Some(divergent) = divergent.as_ref() {
             super::game::validate_aggregate(divergent, "divergent_games")?;
+            super::plausibility::check_game_aggregate(divergent, "divergent_games")?;
             if divergent.games % 2 != 0 || divergent.games > response.all_games.games {
                 return Err(AppError::bad_request(
                     "divergent_games must be even and no larger than the total games played",

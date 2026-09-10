@@ -68,6 +68,7 @@ impl JobHandler for LeaveGenHandler {
         if response.racks.is_empty() {
             return Err(AppError::bad_request("leave result carried no rack occurrences"));
         }
+        super::plausibility::check_rack_occurrences(&response.racks)?;
         Ok(LeaveRecord { racks: response.racks })
     }
 

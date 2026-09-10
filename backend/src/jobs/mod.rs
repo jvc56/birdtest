@@ -4,6 +4,7 @@ pub mod handler;
 pub mod klv;
 pub mod leave_gen;
 pub mod opening_rack;
+pub mod plausibility;
 pub mod racks;
 pub mod registry;
 

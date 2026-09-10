@@ -43,6 +43,12 @@ pub(super) fn validate_positions(
                 "a captured position must carry at least one ranked move",
             ));
         }
+        super::plausibility::check_rack(&position.rack, "captured position")?;
+        super::plausibility::check_moves(
+            &position.moves,
+            Some(position.num_moves),
+            "captured position",
+        )?;
         out.push(PositionAnalysis {
             rack: position.rack,
             position: Some(position.position),
@@ -79,6 +85,7 @@ impl JobHandler for GameHandler {
 
     fn process_response(response: Self::Response) -> AppResult<Self::Record> {
         validate_aggregate(&response.all_games, "all_games")?;
+        super::plausibility::check_game_aggregate(&response.all_games, "all_games")?;
         if response.all_games.games == 0 {
             return Err(AppError::bad_request("a games result must contain at least one game"));
         }

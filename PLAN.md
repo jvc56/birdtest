@@ -94,9 +94,70 @@ Workers are the clients that perform tasks and submit results. Two types are sup
 
 #### Worker Integrity and Anomaly Detection
 
-- **Chi-square testing per worker** — statistical test that flags workers submitting results that deviate significantly from the population. Detects buggy or malicious clients without needing to trust any individual submission.
-- **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID.
-- **Redundant task execution** — each job specifies a redundancy value X; X independent workers must each complete the task. All X results are stored independently. No consensus or agreement check is performed at submission time — reconciliation is a downstream analysis question deferred past v1. The only active integrity mechanism at submission time is chi-square anomaly detection per worker.
+- **Plausibility checks at submission time** — every submission is checked against what is *possible*, not against what is usual: a negative standard deviation, a play scoring negative points, a rack with eight tiles, a batch reporting a different number of games than the task dispatched. Implemented in [`backend/src/jobs/plausibility.rs`](backend/src/jobs/plausibility.rs). This is the only active integrity mechanism at submission time, and the rest of this section explains why it is the only one that can be.
+- **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID. Applied by an admin; nothing bans automatically.
+- **Redundant task execution** — each job specifies a redundancy value X; X independent workers must each complete the task. All X results are stored independently. No consensus or agreement check is performed at submission time — reconciliation is a downstream analysis question deferred past v1.
+
+#### Why impossibility, and not per-worker anomaly detection
+
+The obvious design — the one fishnet uses — is a per-worker statistical test
+against the population: flag the worker whose results deviate, without needing
+to trust any individual submission. **That does not transfer to birdtest**, and
+building it would be worse than building nothing.
+
+It works for fishnet because chess analysis is **replicated**: two honest
+clients at the same depth on the same position return the same evaluation, so
+disagreement is proof. birdtest has no ground truth to compare against. Workers
+are handed *different* seeds — that is how the seed space tiles without gaps or
+overlaps — so no two workers ever play the same games. The only cross-worker
+statistic available is the win rate, and that is precisely what SPRT is
+measuring. A test on it cannot separate "this worker is broken" from "these
+seeds favoured player 2", so it would flag honest contributors at its own alpha
+rate while an attacker biasing results by a percent passed straight through.
+Two further problems compound it: opening-rack analysis by a simming player is
+non-deterministic by construction, so honest repeat runs disagree; and anonymous
+identities are free, so a per-worker score is defeated by requesting a new UUID.
+
+What is left is the failure that actually happens: a **broken client**. Those do
+not produce subtly shifted distributions — they produce garbage. So the checks
+that ship are hard rules with no false-positive rate to trade against, and every
+one of them rejects an arithmetic or physical impossibility:
+
+| Check | Why it cannot be a false positive |
+|---|---|
+| Score means and standard deviations are finite | `NaN`/`Inf` is what an uninitialised or corrupted buffer serialises to |
+| A standard deviation is not negative | Arithmetically impossible; the number did not come from a variance calculation |
+| Mean scores lie within generous absolute bounds | A word game cannot average a negative or four-figure score |
+| A play scores between 0 and 2,000 | A pass scores 0 and the theoretical maximum play is a little over 1,700 |
+| Win percentages and blended utilities are inside their ranges | A probability is bounded by definition |
+| A rack has 1–7 tiles | More tiles than a rack holds cannot be dealt |
+| `num_moves` is at least the number of moves reported | A worker cannot report more moves than it says it generated |
+| A leave submission lists no rack twice | Occurrences are **summed** on receipt, so a duplicate silently inflates a generation's coverage |
+| A batch reports exactly the games the task dispatched | The size was fixed when the task was handed out |
+
+The pentanomial cross-check ([MAGPIE reports the
+pentanomial](#magpie-reports-the-pentanomial)) belongs to the same family and is
+the sharpest instance of it: the two views of a batch are individually plausible
+and only wrong *in relation to each other*.
+
+Two rules were considered and deliberately left out, because they cannot meet
+the no-false-positives bar:
+
+- **A minimum time per batch.** Elapsed time is measured server-side, from
+  `claimed_at`, so no client clock is involved — but the bound would have to
+  encode a maximum plausible throughput, and that depends on the contributor's
+  hardware, thread count and whether a wordmap is loaded. There is no
+  hardware-independent figure, so any threshold risks banning a fast honest
+  worker.
+- **Identical submissions across different seeds.** Tempting, but two different
+  seeds producing the same aggregate is ordinary for a small batch — a one-game
+  batch has three possible results.
+
+The natural next step, when a job first runs at redundancy > 1, is **cross-checking
+replicated tasks**: at that point N workers do run the same seed with the same
+configs, `game_results` already stores each claim's row separately, and games are
+deterministic, so disagreement becomes proof rather than evidence. That is where
+detection with real teeth lives, and it needs no population statistics at all.
 
 ---
 
@@ -1507,6 +1568,20 @@ move — the moves arrive ranked best-first, so an empty list means nothing was
 analysed and there is no best move to record.
 
 **Leave generation.** At least one rack occurrence.
+
+**On top of all of the above, the plausibility rules** in
+[`plausibility.rs`](backend/src/jobs/plausibility.rs) — finite score moments, a
+non-negative standard deviation, bounded play scores and probabilities, racks of
+1–7 tiles, no rack listed twice in one leave submission — reject impossibilities
+rather than oddities. See [Why impossibility, and not per-worker anomaly
+detection](#why-impossibility-and-not-per-worker-anomaly-detection) for the
+reasoning and the full table.
+
+One of them cannot run in the pure validation step, because it needs the
+request: **a batch must report exactly the games the task dispatched**
+(`num_games`, doubled for pairs). It runs in `store_result`, where the task id
+is in hand, and it is the only submission-time check that catches a worker
+reporting work it did not do.
 
 #### How much of an analysis is stored
 
@@ -3354,6 +3429,7 @@ birdtest/
 │       ├── jobs/                   # job type system
 │       │   ├── mod.rs              # shared request/record helpers
 │       │   ├── handler.rs          # JobHandler trait plus wire types
+│       │   ├── plausibility.rs    # impossibility checks on submissions
 │       │   ├── registry.rs         # JobType dispatch (exhaustive matches)
 │       │   ├── racks.rs            # letter distributions, rack/leave enumeration, CGP
 │       │   ├── opening_rack.rs
