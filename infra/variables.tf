@@ -41,6 +41,120 @@ variable "db_allocated_storage" {
   default = 20
 }
 
+variable "db_backup_retention_days" {
+  description = "Length of the RDS point-in-time recovery window, in days."
+  type        = number
+  default     = 30
+}
+
+variable "db_multi_az" {
+  description = <<-EOT
+    Run the database as a Multi-AZ pair. This is availability, not backup: it
+    survives an instance or AZ failure without a restore, and replicates a
+    mistaken DELETE just as fast as a healthy write. It roughly doubles the
+    instance cost, which is why it is opt-in.
+  EOT
+  type        = bool
+  default     = false
+}
+
+variable "dr_region" {
+  description = <<-EOT
+    Second region that artifacts and backups are replicated into. Only has to
+    differ from `region`; nothing is served from it.
+  EOT
+  type        = string
+  default     = "us-west-2"
+}
+
+variable "backup_schedule" {
+  description = "EventBridge Scheduler expression for the nightly logical dump."
+  type        = string
+  default     = "cron(0 3 * * ? *)"
+}
+
+variable "backup_restore_drill_schedule" {
+  description = "Schedule for the automated restore drill (PLAN.md, "Drills")."
+  type        = string
+  default     = "cron(0 5 1 * ? *)"
+}
+
+variable "backup_retention_days" {
+  description = "How long a nightly dump is kept before expiry."
+  type        = number
+  default     = 365
+}
+
+variable "backup_object_lock_days" {
+  description = <<-EOT
+    Governance-mode Object Lock retention on each backup object. An object
+    cannot be deleted or overwritten within this window without the explicit
+    s3:BypassGovernanceRetention permission, which is what makes the backups
+    resistant to a compromised credential rather than merely versioned.
+    Object Lock can only be enabled when the bucket is created.
+  EOT
+  type        = number
+  default     = 30
+}
+
+variable "backup_image" {
+  description = <<-EOT
+    Image the backup task runs. The official Postgres image, pinned to the
+    same major version as the RDS instance: pg_dump refuses to dump a server
+    newer than itself, so this and `aws_db_instance.main.engine_version` move
+    together.
+  EOT
+  type        = string
+  default     = "public.ecr.aws/docker/library/postgres:16"
+}
+
+variable "backup_task_cpu" {
+  type    = number
+  default = 1024
+}
+
+variable "backup_task_memory" {
+  type    = number
+  default = 4096
+}
+
+variable "backup_ephemeral_storage_gib" {
+  description = <<-EOT
+    Scratch space for the dump before it is uploaded. Must exceed the
+    compressed dump size; the results tables compress well, but
+    position_analysis_moves is the table that will outgrow a default.
+  EOT
+  type        = number
+  default     = 100
+}
+
+variable "backup_dump_jobs" {
+  description = "pg_dump -j. Parallelism is what makes a large dump finish."
+  type        = number
+  default     = 4
+}
+
+variable "restore_drill_enabled" {
+  description = <<-EOT
+    Run the monthly restore drill. It restores the newest dump into a second
+    database on the production instance, which needs storage headroom for a
+    transient second copy of the corpus; turn it off if that becomes tight and
+    run scripts/restore-drill.sh against a scratch instance instead.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "alert_email" {
+  description = <<-EOT
+    Where backup failure and staleness alarms are delivered. No default on
+    purpose: an unmonitored backup is the failure mode this whole design
+    exists to avoid, so `terraform apply` should refuse to run without it.
+    SNS sends a subscription confirmation that has to be accepted once.
+  EOT
+  type        = string
+}
+
 variable "task_cpu" {
   type    = number
   default = 1024

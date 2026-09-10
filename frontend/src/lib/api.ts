@@ -248,6 +248,40 @@ export interface FleetVersion {
   claims: number;
 }
 
+/** One run of scripts/backup.sh, as recorded in the `backups` table. */
+export interface BackupRun {
+  id: string;
+  kind: string;
+  /** S3 key prefix, or a snapshot identifier. */
+  location: string | null;
+  started_at: string;
+  finished_at: string;
+  duration_seconds: number;
+  dump_bytes: number | null;
+  sha256: string | null;
+  ok: boolean;
+  total_rows: number;
+}
+
+export interface BackupStatus {
+  last_success_at: string | null;
+  last_success_age_seconds: number | null;
+  /** No successful backup inside the alarm window — including never having had one. */
+  stale: boolean;
+  recent: BackupRun[];
+}
+
+/** Per generation, what rebuilding a leave job's KLV from the database found. */
+export interface ArtifactRebuild {
+  generation: number;
+  artifact_key: string;
+  stored_sha256: string;
+  rebuilt_sha256: string;
+  matches: boolean;
+  object_present: boolean;
+  rewritten: boolean;
+}
+
 export interface ApiKey {
   id: string;
   label: string | null;
@@ -317,8 +351,11 @@ export const api = {
     post<{ inserted: number }>(`/api/admin/input-data/imports/${id}/confirm`),
   jobDataGaps: (id: string) => get<DataGap[]>(`/api/admin/jobs/${id}/data-gaps`),
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
+  backups: () => get<BackupStatus>('/api/admin/backups'),
+  rebuildArtifacts: (id: string, force = false) =>
+    post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>
-    post<{ job: JobListItem; prepopulated: number }>('/api/admin/jobs', body),
+    post<{ job: JobListItem; initialized: number }>('/api/admin/jobs', body),
   activateJob: (id: string, allocation: number) =>
     post<JobListItem>(`/api/admin/jobs/${id}/activate`, { allocation }),
   deactivateJob: (id: string) => post<JobListItem>(`/api/admin/jobs/${id}/deactivate`),

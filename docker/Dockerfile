@@ -3,9 +3,9 @@
 # Backend and fake-worker. Neither needs MAGPIE: the backend builds its own
 # leave-generation KLV artifacts directly (see backend/src/jobs/klv.rs)
 # instead of shelling out to `magpie convert csv2klv`, and the fake worker
-# submits synthetic results. The real contributor client is MAGPIE itself,
-# via `magpie contribute` — see MAGPIE-CLIENT.md. Nothing in this repo builds
-# or ships a MAGPIE binary.
+# submits synthetic results. The real contributor client is MAGPIE itself, via
+# `magpie contribute` — see PLAN.md's "Worker Client". Nothing in this repo
+# builds or ships a MAGPIE binary.
 #
 # Build with `--target backend` or `--target fake-worker`.
 

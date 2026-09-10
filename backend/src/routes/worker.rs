@@ -446,3 +446,175 @@ async fn finish_if_done(state: &AppState, job: &Job, stats: &jobstats::JobStats)
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+
+/// The worker API is a cross-repo boundary: birdtest serves it and MAGPIE's
+/// `contribute` command speaks it, released independently. `contract-fixtures/`
+/// holds one committed example of each message either side has to produce or
+/// read; these tests are what make those files load-bearing on this side, so a
+/// field renamed here fails a test rather than a contributor's run.
+///
+/// Client → server messages are checked by parsing the fixture into the type
+/// that actually handles the request. Server → client messages are checked by
+/// key structure rather than byte equality: fields are still free to move
+/// before the first release, so pinning exact bytes would make every additive
+/// change a fixture edit, but a *renamed* or *dropped* field is exactly what
+/// this needs to catch.
+#[cfg(test)]
+mod contract_fixtures {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// The set of keys at every level, as a comparable tree. Values are
+    /// ignored; only shape matters.
+    fn shape(v: &Value) -> Value {
+        match v {
+            Value::Object(map) => Value::Object(
+                map.iter().map(|(k, v)| (k.clone(), shape(v))).collect(),
+            ),
+            // An array's elements must agree, so the first one stands for
+            // all. An array of scalars pins nothing whether it is empty or
+            // not, since a scalar carries no field names -- and that
+            // distinction is load-bearing here: a `magpie_too_old` shutdown
+            // legitimately has an empty `required_tarball_dates` where a
+            // `data_out_of_date` one does not.
+            Value::Array(items) => match items.first() {
+                Some(first) if first.is_object() || first.is_array() => json!([shape(first)]),
+                _ => json!([]),
+            },
+            _ => Value::Null,
+        }
+    }
+
+    fn assert_same_shape(fixture: &Value, produced: &Value, what: &str) {
+        assert_eq!(
+            shape(fixture),
+            shape(produced),
+            "{what}: contract-fixtures/ and the wire type disagree on field names.\n\
+             Update both repositories together, or the fixture is now a lie."
+        );
+    }
+
+    #[test]
+    fn claim_request_parses_as_a_claim_body() {
+        let body: ClaimBody =
+            serde_json::from_str(include_str!("../../../contract-fixtures/claim-request.json"))
+                .expect("claim-request.json no longer parses as ClaimBody");
+        assert_eq!(body.magpie_version, "1.4.0");
+        assert_eq!(body.unsupported_jobs.len(), 1);
+    }
+
+    #[test]
+    fn decline_parses_as_a_decline_body() {
+        let body: DeclineBody = serde_json::from_str(include_str!(
+            "../../../contract-fixtures/decline-missing-data.json"
+        ))
+        .expect("decline-missing-data.json no longer parses as DeclineBody");
+        assert_eq!(body.reason, "missing_data");
+        // One file absent entirely and one present with the wrong bytes: the
+        // two cases `actual` exists to tell apart.
+        assert_eq!(body.missing.len(), 2);
+        assert!(body.missing.iter().any(|m| m.actual.is_none()));
+        assert!(body.missing.iter().any(|m| m.actual.is_some()));
+    }
+
+    #[test]
+    fn assignments_carry_a_task_request_this_build_understands() {
+        for (name, fixture) in [
+            ("games", include_str!("../../../contract-fixtures/assignment-games.json")),
+            (
+                "leave-generation",
+                include_str!("../../../contract-fixtures/assignment-leave-generation.json"),
+            ),
+        ] {
+            let value: Value = serde_json::from_str(fixture).unwrap();
+            let request: TaskRequest =
+                serde_json::from_value(value["task_request"].clone())
+                    .unwrap_or_else(|e| panic!("assignment-{name}.json task_request: {e}"));
+            // Round-trips: the client reads what the server would have written.
+            assert_same_shape(
+                &value["task_request"],
+                &serde_json::to_value(&request).unwrap(),
+                &format!("assignment-{name} task_request"),
+            );
+        }
+    }
+
+    #[test]
+    fn the_assignment_envelope_matches_what_the_server_sends() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../contract-fixtures/assignment-games.json"))
+                .unwrap();
+        let request: TaskRequest =
+            serde_json::from_value(fixture["task_request"].clone()).unwrap();
+
+        let produced = serde_json::to_value(TaskAssignment {
+            claim_token: Uuid::nil(),
+            job_id: Uuid::nil(),
+            task_request: request,
+            min_magpie_version: "1.4.0".into(),
+            expected_data: ExpectedData {
+                algorithm: "sha256",
+                files: vec![crate::jobs::ExpectedFile {
+                    role: "kwg".into(),
+                    name: "NWL23".into(),
+                    path: "lexica/NWL23.kwg".into(),
+                    sha256: "3e74af98".into(),
+                    bytes: 4_719_596,
+                    tarball_date: "20251004".into(),
+                }],
+            },
+            // Absent from the fixture: it is sent only to a worker that
+            // arrived with no identity at all, which this one did not.
+            worker_uuid: None,
+        })
+        .unwrap();
+
+        assert_same_shape(&fixture, &produced, "assignment envelope");
+    }
+
+    #[test]
+    fn every_shutdown_reason_matches_what_the_server_sends() {
+        for (reason, fixture) in [
+            (
+                "data_out_of_date",
+                include_str!("../../../contract-fixtures/shutdown-data-out-of-date.json"),
+            ),
+            (
+                "magpie_too_old",
+                include_str!("../../../contract-fixtures/shutdown-magpie-too-old.json"),
+            ),
+            ("both", include_str!("../../../contract-fixtures/shutdown-both.json")),
+        ] {
+            let value: Value = serde_json::from_str(fixture).unwrap();
+            assert_eq!(
+                value["shutdown"]["reason"], reason,
+                "shutdown fixture for {reason} names a different reason"
+            );
+
+            let produced = serde_json::to_value(ShutdownResponse {
+                shutdown: scheduler::ShutdownDirective {
+                    reason: reason.into(),
+                    message: "…".into(),
+                    required_tarball_dates: vec!["20260101".into()],
+                    required_magpie_version: Some("1.6.0".into()),
+                    download_url: Some("https://github.com/jvc56/MAGPIE".into()),
+                },
+            })
+            .unwrap();
+            assert_same_shape(&value, &produced, &format!("shutdown ({reason})"));
+        }
+
+        // "both" leads with the MAGPIE version, because updating MAGPIE is the
+        // remedy that fixes both: a release bumps DATA_VERSION and the
+        // contributor runs download_data.sh as part of updating.
+        let both: Value =
+            serde_json::from_str(include_str!("../../../contract-fixtures/shutdown-both.json"))
+                .unwrap();
+        assert!(
+            !both["shutdown"]["required_magpie_version"].is_null(),
+            "the `both` shutdown must name a MAGPIE version to lead with"
+        );
+    }
+}

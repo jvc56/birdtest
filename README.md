@@ -6,11 +6,12 @@ contribute` claims tasks, executes them locally, and submits results. The site
 aggregates everything onto a live dashboard.
 
 [PLAN.md](PLAN.md) is the design document — architecture, schema, API surface
-and rationale all live there. This file is how to run it.
-[MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) specifies the `contribute` command
-contributors run, so contributing needs MAGPIE and nothing else.
-[GAME-POSITION-CAPTURE.md](GAME-POSITION-CAPTURE.md) proposes keeping the
-position analyses workers already produce while playing games.
+and rationale all live there, including the
+[Worker Client](PLAN.md#worker-client-1) specification for the `contribute`
+command contributors run, how [input data is pinned by content and negotiated
+with workers](PLAN.md#input-data-and-capability-negotiation), and what is
+[backed up and why](PLAN.md#backups-and-restore). This file is how to run it,
+and [RUNBOOK.md](RUNBOOK.md) is the recovery procedure itself.
 
 ## Layout
 
@@ -18,9 +19,13 @@ position analyses workers already produce while playing games.
 |---|---|
 | `backend/` | Axum + SQLx server. Owns scheduling, validation, SPRT, Glicko and aggregation. |
 | `frontend/` | SvelteKit SPA (dark mode only), built statically and served by Nginx in production. |
-| `worker/` | `fake_worker.py`, a test client that submits synthetic results with no MAGPIE in the loop — see [Testing without MAGPIE](#testing-without-magpie--the-fake-worker). The real contributor client is MAGPIE itself; see [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md). |
-| `data/letterdistributions/` | Tile distributions, mirroring MAGPIE-DATA's layout. Used to enumerate racks and leaves. |
-| `infra/` | Terraform: VPC, ALB, ECS Fargate, RDS Postgres, S3, SES, SSM. |
+| `worker/` | `fake_worker.py`, a test client that submits synthetic results with no MAGPIE in the loop — see [Testing without MAGPIE](#testing-without-magpie--the-fake-worker). The real contributor client is MAGPIE itself; see [Worker Client](PLAN.md#worker-client-1). |
+| `infra/` | Terraform: VPC, ALB, ECS Fargate, RDS Postgres, S3, SES, SSM, backups. |
+| `scripts/` | Backup, restore-drill and local snapshot scripts. See [Backups and Restore](PLAN.md#backups-and-restore) and [RUNBOOK.md](RUNBOOK.md). |
+
+Tile distributions and every other input file are no longer carried in the
+repo: they are imported from a MAGPIE-DATA tarball into the `input_data` table
+and pinned by SHA-256 — see [Input Data](PLAN.md#input-data-and-capability-negotiation).
 
 ## Running locally
 
@@ -111,7 +116,7 @@ key stays out of shell history and `ps` output. Wordmaps (`.wmp`) make game
 play dramatically faster, so MAGPIE always wants one for a lexicon it's
 contributing with; it derives the word list and the wordmap from the `.kwg` it
 already has on first use, in about 1.3 seconds per lexicon, and never
-transmits either. See [MAGPIE-CLIENT.md](MAGPIE-CLIENT.md) for the full
+transmits either. See [Worker Client](PLAN.md#worker-client-1) for the full
 protocol.
 
 ### Frontend hot reload
@@ -160,6 +165,55 @@ aws ssm put-parameter --name /birdtest/SESSION_SIGNING_KEY --type SecureString -
   --value "$(openssl rand -hex 32)"
 ```
 
+`alert_email` has no default: `terraform apply` refuses to run without
+somewhere to send backup failures, because an unmonitored backup is the failure
+mode the whole design exists to avoid. SNS emails a subscription confirmation
+that has to be accepted once.
+
 The backend has no MAGPIE dependency at all: leave-generation aggregation
-builds its KLV artifact directly (`backend/src/jobs/klv.rs`), so the image
-needs only `data/` on board.
+builds its KLV artifact directly (`backend/src/jobs/klv.rs`), and it reads
+letter distributions out of the `input_data` row a job pins rather than off
+disk, so the image carries nothing but its own compiled binary.
+
+## Backups
+
+Two mechanisms, covering different failures — see
+[Backups and Restore](PLAN.md#backups-and-restore) for which answers which:
+
+- **RDS point-in-time recovery**, 30 days. The fast path for instance failure
+  or a bad migration.
+- **A nightly `pg_dump`** to an encrypted, versioned, Object-Locked and
+  cross-region-replicated bucket, run by a scheduled Fargate task
+  (`scripts/backup.sh`). This is the one that can be restored selectively,
+  read on a laptop, or carried out of the account.
+
+Health is on `/admin/backups`, and two alarms cover the rest: a task that
+exits non-zero, and no successful backup in 36 hours. A restore drill runs
+monthly, restoring the newest dump into a throwaway database and verifying it
+(`scripts/restore-drill.sh`) — the only check that catches a dump that has been
+silently producing unusable output.
+
+Recovering from anything is [RUNBOOK.md](RUNBOOK.md).
+
+### Locally
+
+```bash
+./scripts/dev-dump.sh before-experiment      # database + artifact bucket
+./scripts/dev-restore.sh .dev-backups/before-experiment
+```
+
+`dev-restore.sh` also takes a production dump directory, and scrubs it on the
+way in (`scripts/scrub.sql`: emails become `@example.invalid`, every password
+becomes `birdtest-local`, credentials and tokens are truncated). Restoring
+production data locally without that is a disclosure risk, not a shortcut.
+
+After any schema change, prove a dump still round-trips:
+
+```bash
+docker compose up -d postgres backend
+./scripts/restore-roundtrip.sh
+```
+
+It seeds a row in every table a result touches, dumps, restores into a fresh
+database, and checks row counts, referential integrity, the denormalized task
+counters, and that `BYTEA` and `DOUBLE PRECISION` columns survived intact.

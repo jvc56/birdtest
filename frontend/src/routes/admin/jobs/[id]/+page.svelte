@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { api, type DataGap, type JobStats } from '$lib/api';
+  import { api, type ArtifactRebuild, type DataGap, type JobStats } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { jobTypeLabel, sprtLabel, duration } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
@@ -17,6 +17,7 @@
   let allocation = 100;
   let error = '';
   let notice = '';
+  let rebuild: ArtifactRebuild[] | null = null;
 
   async function reload() {
     stats = await api.job(jobId);
@@ -36,6 +37,24 @@
       await action();
       notice = message;
       await reload();
+    } catch (e) {
+      error = (e as Error).message;
+    }
+  }
+
+  // Leave-generation KLVs are derivable from the results they were built from,
+  // so a lost object is repairable without a restore. Rebuilding also answers
+  // whether each object still holds the bytes recorded when the generation
+  // closed. See PLAN.md, "Artifacts: back up, or rebuild?".
+  async function rebuildArtifacts() {
+    error = '';
+    notice = '';
+    rebuild = null;
+    try {
+      rebuild = await api.rebuildArtifacts(jobId);
+      const missing = rebuild.filter((r) => r.rewritten).length;
+      const drifted = rebuild.filter((r) => !r.matches).length;
+      notice = `Checked ${rebuild.length} generations: ${missing} restored, ${drifted} differing from the recorded hash.`;
     } catch (e) {
       error = (e as Error).message;
     }
@@ -98,12 +117,49 @@
         >
           Purge results
         </button>
+        {#if stats.job.job_type === 'leave_generation'}
+          <button class="btn-secondary" on:click={rebuildArtifacts}>Check artifacts</button>
+        {/if}
         <button class="btn-destructive" on:click={remove}>Delete job</button>
       </div>
       <p class="text-xs text-muted-foreground">
         Active jobs in a priority tier must allocate 100% between them; activation is rejected if
         this job's share would push the tier over.
       </p>
+
+      {#if rebuild}
+        <div class="overflow-x-auto">
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Generation</th>
+                <th>Object</th>
+                <th>Hash</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each rebuild as row}
+                <tr>
+                  <td class="tabular-nums">{row.generation}</td>
+                  <td class={row.object_present ? '' : 'text-destructive'}>
+                    {row.object_present ? 'present' : 'missing'}
+                  </td>
+                  <td class={row.matches ? '' : 'text-destructive'} title={row.stored_sha256}>
+                    {row.matches ? 'matches' : 'differs from the recorded hash'}
+                  </td>
+                  <td>{row.rewritten ? 'rewritten' : 'left alone'}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
+        <p class="text-xs text-muted-foreground">
+          A missing object is rebuilt from the job's rack progress. A differing hash is not: the
+          results have almost certainly moved on since the generation closed, and rewriting on that
+          basis would replace the KLV workers actually played with by one they never saw.
+        </p>
+      {/if}
     </div>
 
     <div class="card space-y-3">

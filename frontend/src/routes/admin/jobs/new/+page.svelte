@@ -49,6 +49,10 @@
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
+  function firstOfRole(role: string): string {
+    return files.find((f) => f.role === role)?.id ?? '';
+  }
+
   onMount(async () => {
     [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
     if (configs.length) {
@@ -56,9 +60,12 @@
       player1 = configs[0].id;
       player2 = configs[configs.length - 1].id;
     }
-    letterdistId = letterdists[0]?.id ?? '';
-    layoutId = layouts[0]?.id ?? '';
-    leaveKwgId = lexica[0]?.id ?? '';
+    // Filtered from `files` here rather than read off the `$:` arrays above:
+    // those are recomputed on the update cycle, not on assignment, so they
+    // would still be empty on the next line and every default would be ''.
+    letterdistId = firstOfRole('letterdist');
+    layoutId = firstOfRole('layout');
+    leaveKwgId = firstOfRole('kwg');
     serverFloor = (await api.clientVersion()).min_magpie_version;
     minMagpieVersion = serverFloor;
   });

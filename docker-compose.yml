@@ -10,8 +10,8 @@
 #                           production-style Nginx frontend
 #
 # There is no "worker" profile: the real contributor client is MAGPIE itself,
-# via `magpie contribute` (see MAGPIE-CLIENT.md) — nothing to build or run
-# here for that.
+# via `magpie contribute` (see PLAN.md's "Worker Client") — nothing to build
+# or run here for that.
 #
 # Ports are overridable so a host that already has something on 5432 (or 9000,
 # or 5173) does not need the file edited. See .env.example.
@@ -62,6 +62,11 @@ services:
           echo 'waiting for minio...'; sleep 1;
         done
         mc mb --ignore-existing local/birdtest-artifacts
+        # Where scripts/backup.sh writes when it is pointed at the local stack
+        # (AWS_S3_ENDPOINT=http://minio:9000). Production's backup bucket is a
+        # separate bucket for the same reason: see PLAN.md, "Where the dump
+        # runs, and where it lands".
+        mc mb --ignore-existing local/birdtest-backups
     restart: on-failure
 
   backend:

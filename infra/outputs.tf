@@ -24,3 +24,22 @@ output "ses_dkim_tokens" {
   description = "Add these as CNAME records to finish SES domain verification."
   value       = aws_sesv2_email_identity.domain.dkim_signing_attributes[0].tokens
 }
+
+output "backups_bucket" {
+  description = "Where nightly logical dumps land. Restores read from here."
+  value       = aws_s3_bucket.backups.bucket
+}
+
+output "backups_dr_bucket" {
+  description = "Cross-region replica of the above. What a region loss restores from."
+  value       = aws_s3_bucket.backups_dr.bucket
+}
+
+output "artifacts_dr_bucket" {
+  value = aws_s3_bucket.artifacts_dr.bucket
+}
+
+output "backup_task_definition" {
+  description = "Run a backup on demand: aws ecs run-task --task-definition <this>."
+  value       = aws_ecs_task_definition.backup.family
+}

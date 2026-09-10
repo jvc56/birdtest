@@ -1,5 +1,6 @@
 use crate::audit;
 use crate::auth::{csrf, AdminUser};
+use crate::backups::{self, BackupStatus};
 use crate::error::{AppError, AppResult};
 use crate::jobs::registry;
 use crate::models::job::{Job, JobStatus, JobType, PlayerConfig};
@@ -32,6 +33,8 @@ pub fn router() -> Router<AppState> {
         .route("/input-data/imports/:id", get(get_import))
         .route("/input-data/imports/:id/confirm", post(confirm_import))
         .route("/jobs/:id/data-gaps", get(job_data_gaps))
+        .route("/jobs/:id/rebuild-artifacts", post(rebuild_artifacts))
+        .route("/backups", get(backups))
         .route("/fleet", get(fleet))
 }
 
@@ -1192,6 +1195,69 @@ async fn complete_job(
     Ok(Json(job))
 }
 
+/// What a job is about to lose, as a single line for `audit_log.reason`.
+///
+/// Counted inside the same transaction as the deletion that follows, so it
+/// describes exactly what that statement removes. Cheap relative to the delete
+/// itself, and the only record of the job's size that survives it.
+async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<String> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT
+             (SELECT count(*) FROM tasks WHERE job_id = $1)                        AS tasks,
+             (SELECT count(*) FROM task_claims c JOIN tasks t ON t.id = c.task_id
+               WHERE t.job_id = $1)                                                AS claims,
+             (SELECT count(*) FROM game_results r JOIN tasks t ON t.id = r.task_id
+               WHERE t.job_id = $1)                                                AS game_results,
+             (SELECT count(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id
+               WHERE t.job_id = $1)                                                AS leave_records,
+             (SELECT count(*) FROM position_analysis_records r JOIN tasks t ON t.id = r.task_id
+               WHERE t.job_id = $1)                                                AS positions,
+             (SELECT count(*) FROM leave_rack_progress WHERE job_id = $1)          AS rack_progress,
+             (SELECT count(*) FROM leave_generation_artifacts WHERE job_id = $1)   AS artifacts,
+             (SELECT count(*) FROM player_config_ratings WHERE job_id = $1)        AS ratings",
+    )
+    .bind(job_id)
+    .fetch_one(conn)
+    .await?;
+
+    Ok(format!(
+        "tasks={} claims={} game_results={} leave_records={} positions={} \
+rack_progress={} artifacts={} ratings={}",
+        row.get::<i64, _>("tasks"),
+        row.get::<i64, _>("claims"),
+        row.get::<i64, _>("game_results"),
+        row.get::<i64, _>("leave_records"),
+        row.get::<i64, _>("positions"),
+        row.get::<i64, _>("rack_progress"),
+        row.get::<i64, _>("artifacts"),
+        row.get::<i64, _>("ratings"),
+    ))
+}
+
+/// The same, for an account deletion: claims and results are removed with the
+/// user, and nothing else records how much work that was.
+async fn user_census(conn: &mut sqlx::PgConnection, user_id: Uuid) -> AppResult<String> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT
+             (SELECT count(*) FROM task_claims WHERE claimed_by_user_id = $1)      AS claims,
+             (SELECT count(*) FROM task_claims c
+               WHERE c.claimed_by_user_id = $1 AND c.state = 'completed')          AS accepted,
+             (SELECT count(*) FROM api_keys WHERE user_id = $1)                    AS api_keys",
+    )
+    .bind(user_id)
+    .fetch_one(conn)
+    .await?;
+
+    Ok(format!(
+        "claims={} accepted={} api_keys={}",
+        row.get::<i64, _>("claims"),
+        row.get::<i64, _>("accepted"),
+        row.get::<i64, _>("api_keys"),
+    ))
+}
+
 #[derive(Serialize)]
 struct PurgeResult {
     tasks_reset: u64,
@@ -1212,6 +1278,20 @@ async fn purge_job(
 
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
+
+    // Written before anything is deleted: after this transaction commits, this
+    // row is the only surviving description of what the job held.
+    let census = job_census(&mut tx, id).await?;
+    audit::log_detail(
+        &mut tx,
+        "job.purged.census",
+        admin.0.id,
+        "job",
+        id.to_string(),
+        Some(id),
+        census,
+    )
+    .await?;
 
     // Records and claims cascade from tasks; leave-gen progress and ratings are
     // keyed on the job directly.
@@ -1275,8 +1355,10 @@ async fn delete_job(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
-    // The audit row is written first: `audit_log.job_id` references `jobs`, so
-    // it has to exist while the job still does.
+    // The audit rows are written first: `audit_log.job_id` references `jobs`,
+    // so they have to exist while the job still does. The census is what a
+    // restore is scoped against if this delete turns out to be a mistake.
+    let census = job_census(&mut tx, id).await?;
     audit::log(
         &mut tx,
         "job.deleted",
@@ -1285,6 +1367,16 @@ async fn delete_job(
         Some("job"),
         Some(id.to_string()),
         None,
+    )
+    .await?;
+    audit::log_detail(
+        &mut tx,
+        "job.deleted.census",
+        admin.0.id,
+        "job",
+        id.to_string(),
+        None,
+        census,
     )
     .await?;
 
@@ -1297,6 +1389,92 @@ async fn delete_job(
     }
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Backups and artifacts
+// ---------------------------------------------------------------------------
+
+/// Recent backup runs and how stale the newest good one is.
+///
+/// Read-only, and read from this server's own database rather than from the
+/// backup bucket: the backend deliberately holds no credentials for it, so a
+/// compromised backend cannot read or replace backups (PLAN.md, "Making backups visible").
+async fn backups(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> AppResult<Json<BackupStatus>> {
+    Ok(Json(backups::status(&state.pool).await?))
+}
+
+#[derive(Deserialize)]
+struct RebuildQuery {
+    /// Rewrite an object whose bytes no longer hash to what was recorded.
+    /// Off by default; see `leave_gen::rebuild_artifacts` for why a mismatch
+    /// is not on its own a reason to overwrite.
+    #[serde(default)]
+    force: bool,
+}
+
+/// Recompute a leave-generation job's KLVs from `leave_rack_progress` and
+/// report, per generation, whether the object is still present and still
+/// hashes to what was recorded when the generation closed.
+///
+/// This is the repair path for an artifact store that has lost an object — the
+/// bytes are derivable, so losing them is recoverable without a restore.
+async fn rebuild_artifacts(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    Query(query): Query<RebuildQuery>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> AppResult<Json<Vec<crate::jobs::leave_gen::ArtifactRebuild>>> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    let mut conn = state.pool.acquire().await?;
+    let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::not_found("no such job"))?;
+    if job.job_type != JobType::LeaveGeneration {
+        return Err(AppError::bad_request(
+            "only leave generation jobs have artifacts to rebuild",
+        ));
+    }
+    let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
+    drop(conn);
+
+    let report = crate::jobs::leave_gen::rebuild_artifacts(
+        &state.pool,
+        &state.artifacts,
+        job.id,
+        &job_data.letterdist,
+        query.force,
+    )
+    .await?;
+
+    let rewritten = report.iter().filter(|r| r.rewritten).count();
+    let mismatched = report.iter().filter(|r| !r.matches).count();
+    let mut conn = state.pool.acquire().await?;
+    audit::log_detail(
+        &mut conn,
+        "job.artifacts_rebuilt",
+        admin.0.id,
+        "job",
+        job.id.to_string(),
+        Some(job.id),
+        format!(
+            "generations={} rewritten={rewritten} mismatched={mismatched} force={}",
+            report.len(),
+            query.force
+        ),
+    )
+    .await?;
+
+    Ok(Json(report))
 }
 
 // ---------------------------------------------------------------------------
@@ -1321,6 +1499,18 @@ async fn delete_user(
     }
 
     let mut tx = state.pool.begin().await?;
+
+    let census = user_census(&mut tx, id).await?;
+    audit::log_detail(
+        &mut tx,
+        "user.deleted.census",
+        admin.0.id,
+        "user",
+        id.to_string(),
+        None,
+        census,
+    )
+    .await?;
 
     // 1. Roll back the counters every one of this user's claims contributed.
     sqlx::query(

@@ -20,10 +20,14 @@ pub struct Config {
     pub heartbeat_timeout: Duration,
     pub s3_bucket: String,
     pub s3_endpoint: Option<String>,
-    /// The oldest MAGPIE that may contribute at all, reported by
-    /// `GET /api/worker/client-version`. Jobs may require newer. Purely
-    /// informational metadata for workers -- the backend itself has no
-    /// MAGPIE dependency; leave-generation aggregation builds its KLV
+    /// The oldest MAGPIE that may contribute at all. Enforced, not advisory:
+    /// a client below it is offered nothing and told to update, without any
+    /// job being consulted (`scheduler::claim`), and it is the default floor
+    /// stamped onto a new job when an admin does not raise it. Also reported
+    /// by `GET /api/worker/client-version` so a client can check itself.
+    ///
+    /// This is a floor on the *contributor's* build. The backend itself has no
+    /// MAGPIE dependency -- leave-generation aggregation builds its KLV
     /// artifact directly (see `jobs::klv`).
     pub min_magpie_version: String,
     pub magpie_download_url: String,

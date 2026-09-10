@@ -1,5 +1,6 @@
 mod artifacts;
 mod audit;
+mod backups;
 mod auth;
 mod compat;
 mod config;

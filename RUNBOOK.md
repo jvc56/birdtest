@@ -1,0 +1,312 @@
+# birdtest — Recovery Runbook
+
+Copy-pasteable procedures for the scenarios in
+[PLAN.md's Backups and Restore](PLAN.md#backups-and-restore). That section
+explains why; this one is what to type at 2am. Read the whole procedure before starting any of it.
+
+Placeholders throughout: `$REGION` (default `us-east-1`), `$CLUSTER`
+(`birdtest`), `$BUCKET` (the `backups_bucket` Terraform output).
+
+---
+
+## 0. Before anything: what is the damage?
+
+```bash
+# What the admin actions did, and how big the thing they destroyed was.
+psql "$DATABASE_URL" -c "
+  SELECT created_at, action, target_id, reason
+  FROM audit_log
+  WHERE action LIKE '%.census' OR action IN ('job.deleted','job.purged','user.deleted')
+  ORDER BY created_at DESC LIMIT 20"
+```
+
+Every destructive admin endpoint writes a `*.census` row *before* it destroys
+anything, so `reason` holds the row counts that were about to be lost. That is
+the scope of the restore.
+
+```bash
+# What is restorable, and how old it is.
+aws s3 ls "s3://$BUCKET/pg/" | grep manifest | tail -5
+psql "$DATABASE_URL" -c "SELECT finished_at, ok, dump_bytes, s3_key FROM backups ORDER BY finished_at DESC LIMIT 5"
+```
+
+The same information is on `/admin/backups` if the site is up.
+
+---
+
+## 1. Full restore, point in time (instance failure, bad migration, dropped schema)
+
+Loses at most ~5 minutes. Takes under an hour.
+
+```bash
+# 1. STOP WRITES. Workers submitting into a database about to be replaced have
+#    their results silently discarded.
+aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 0 --region "$REGION"
+
+# 2. Pick the restore point: the latest possible instant before the damage.
+aws rds describe-db-instances --db-instance-identifier birdtest --region "$REGION" \
+  --query 'DBInstances[0].LatestRestorableTime'
+
+# 3. Restore to a NEW instance. The original is left untouched until the
+#    restore is confirmed good.
+STAMP=$(date -u +%Y%m%d%H%M)
+aws rds restore-db-instance-to-point-in-time --region "$REGION" \
+  --source-db-instance-identifier birdtest \
+  --target-db-instance-identifier "birdtest-restore-$STAMP" \
+  --restore-time '2026-09-07T02:55:00Z' \
+  --db-subnet-group-name birdtest-db \
+  --vpc-security-group-ids "$(terraform -chdir=infra output -raw db_security_group_id 2>/dev/null || echo sg-XXXX)" \
+  --no-publicly-accessible \
+  --db-instance-class db.t4g.micro
+
+aws rds wait db-instance-available --region "$REGION" \
+  --db-instance-identifier "birdtest-restore-$STAMP"
+```
+
+A restored instance does **not** inherit the source's backup settings. Fix that
+before it becomes the production database:
+
+```bash
+aws rds modify-db-instance --region "$REGION" \
+  --db-instance-identifier "birdtest-restore-$STAMP" \
+  --backup-retention-period 30 --deletion-protection --apply-immediately
+```
+
+Repoint the application. The master password is managed by RDS, so read it
+from Secrets Manager rather than inventing one:
+
+```bash
+ENDPOINT=$(aws rds describe-db-instances --region "$REGION" \
+  --db-instance-identifier "birdtest-restore-$STAMP" \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+
+SECRET_ARN=$(aws rds describe-db-instances --region "$REGION" \
+  --db-instance-identifier "birdtest-restore-$STAMP" \
+  --query 'DBInstances[0].MasterUserSecret.SecretArn' --output text)
+
+PASSWORD=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" \
+  --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+
+aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
+  --value "postgres://birdtest:$PASSWORD@$ENDPOINT:5432/birdtest"
+
+# Tasks read SSM at start, so this is the whole deploy.
+aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
+```
+
+Then run §4 (verification). Only once it passes, rename or retire the damaged
+instance — never before.
+
+---
+
+## 2. Selective restore (a mistaken purge or delete)
+
+The database must **not** be rolled back: everything else has moved on. The
+shape is always the same — restore a copy somewhere else, copy the missing rows
+across, repair the counters, recompute the derived state.
+
+### 2.1 Get a copy of the old data
+
+Either a PITR instance from just before the mistake (fresher, §1 steps 2–3 with
+a `-scratch-` identifier and no repointing), or the latest nightly dump:
+
+```bash
+STAMP=2026-09-07T03-00-00Z
+aws s3 cp "s3://$BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
+createdb -h "$SCRATCH_HOST" -U birdtest birdtest_scratch
+pg_restore -h "$SCRATCH_HOST" -U birdtest -d birdtest_scratch -j4 \
+  --no-owner --no-privileges --exit-on-error /tmp/dump
+```
+
+For a dump small enough, the scratch database can be the local docker compose
+stack: `./scripts/dev-restore.sh /tmp/dump` (which scrubs on the way in).
+
+### 2.2 Copy the rows back, in dependency order
+
+Dump only the job's rows from the scratch copy and load them into production.
+`ON CONFLICT DO NOTHING` throughout, so a partial re-run is safe:
+
+```bash
+JOB=00000000-0000-0000-0000-000000000000
+
+psql "$SCRATCH_URL" -v job="$JOB" -At <<'SQL' > /tmp/restore.sql
+\set ON_ERROR_STOP on
+-- Order matters: tasks, then claims, then everything hanging off a claim.
+COPY (SELECT * FROM tasks WHERE job_id = :'job') TO STDOUT;
+SQL
+```
+
+In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
+
+| Order | Table | Filter |
+|---|---|---|
+| 1 | `tasks` | `job_id = :job` |
+| 2 | `opening_rack_requests` / `game_requests` / `leave_requests` | `task_id IN (...)` |
+| 3 | `task_claims` | `task_id IN (...)` |
+| 4 | `game_results`, `leave_records` | `task_id IN (...)` |
+| 5 | `position_analysis_records` → `_moves` → `_plies` | `task_id IN (...)`, then by parent id |
+| 6 | `leave_rack_progress`, `leave_generation_artifacts` | `job_id = :job` |
+| 7 | `player_config_ratings` | `job_id = :job` |
+
+`position_analysis_records.id` and `_moves.id` are `BIGSERIAL`. Restoring them
+with their original ids preserves the parent-child links; afterwards the
+sequences must be moved past what was inserted, or the next insert collides:
+
+```sql
+SELECT setval('position_analysis_records_id_seq', (SELECT max(id) FROM position_analysis_records));
+SELECT setval('position_analysis_moves_id_seq',   (SELECT max(id) FROM position_analysis_moves));
+SELECT setval('position_analysis_plies_id_seq',   (SELECT max(id) FROM position_analysis_plies));
+```
+
+### 2.3 Repair the counters
+
+This is the step a naive row copy gets wrong, and the one that makes the
+scheduler dispatch work that is already done. Run it against production after
+the copy, in one transaction:
+
+```sql
+BEGIN;
+
+UPDATE tasks t
+   SET accepted_count     = actual.accepted,
+       active_claim_count = actual.active
+  FROM (
+    SELECT t2.id,
+           count(*) FILTER (WHERE c.state = 'completed')::int AS accepted,
+           count(*) FILTER (WHERE c.state = 'claimed')::int   AS active
+      FROM tasks t2
+      LEFT JOIN task_claims c ON c.task_id = t2.id
+     WHERE t2.job_id = :'job'
+     GROUP BY t2.id
+  ) actual
+ WHERE t.id = actual.id;
+
+-- State and completed_at follow from the counters and the job's redundancy,
+-- exactly as the submit path computes them.
+UPDATE tasks t
+   SET state = CASE
+         WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
+         WHEN t.accepted_count + t.active_claim_count >= j.redundancy THEN 'claimed'::task_state
+         ELSE 'available'::task_state
+       END,
+       completed_at = CASE WHEN t.accepted_count >= j.redundancy
+                           THEN COALESCE(t.completed_at, now()) ELSE NULL END
+  FROM jobs j
+ WHERE j.id = t.job_id AND t.job_id = :'job';
+
+COMMIT;
+```
+
+### 2.4 Recompute derived state
+
+- **Glicko** (`player_config_ratings`, game-pairs jobs): ratings are applied
+  per submission and cannot be reconstructed by copying rows alone. Either
+  restore the `player_config_ratings` rows from the scratch copy as they stood
+  (correct if nothing was submitted since), or accept the ratings as they are
+  and note the discontinuity.
+- **SPRT**: computed from `game_results` on read, so it corrects itself once
+  the results are back.
+- **Leave-generation artifacts**: if any object is missing, use
+  `POST /api/admin/jobs/:id/rebuild-artifacts` (the "Check artifacts" button on
+  the admin job page) rather than restoring bytes — see §3.
+
+---
+
+## 3. A missing or altered artifact
+
+KLVs are derivable from `leave_rack_progress`, so they need no backup:
+
+- **Missing object.** Admin → the job → **Check artifacts**. Every generation
+  whose object is gone is rebuilt from the database and rewritten; every
+  generation that is present is left alone.
+- **Object present but the hash differs** from what was recorded when the
+  generation closed. This is *not* automatically overwritten, and usually
+  should not be: the results have moved on since the generation closed, so a
+  rebuild legitimately produces different bytes, and rewriting would replace
+  the KLV that workers actually played with. Investigate before forcing
+  (`?force=true`).
+- **Corrupted object with a known-good older version.** The bucket is
+  versioned; restore that specific object version rather than rolling the
+  bucket back:
+
+```bash
+aws s3api list-object-versions --bucket "$ARTIFACTS_BUCKET" --prefix "leaves/$JOB/"
+aws s3api copy-object --bucket "$ARTIFACTS_BUCKET" \
+  --copy-source "$ARTIFACTS_BUCKET/leaves/$JOB/generation-3.klv2?versionId=$VERSION" \
+  --key "leaves/$JOB/generation-3.klv2"
+```
+
+Never restore the artifact bucket wholesale to an older point: the bucket is
+allowed to be newer than the database, never older (PLAN.md, "Artifacts: back up, or rebuild?").
+
+---
+
+## 4. Verifying a restore
+
+Do not declare it finished because the page loads.
+
+```bash
+# 1. Row counts, against the manifest of the dump that was restored.
+aws s3 cp "s3://$BUCKET/pg/$STAMP.manifest.json" - | python3 -m json.tool | head -40
+```
+
+```sql
+-- 2. Referential sanity.
+SELECT count(*) AS jobs_missing_data FROM jobs j
+ WHERE NOT EXISTS (SELECT 1 FROM input_data d WHERE d.id = j.letterdist_id)
+    OR NOT EXISTS (SELECT 1 FROM input_data d WHERE d.id = j.layout_id);
+
+SELECT count(*) AS inputs_missing_content FROM input_data
+ WHERE role IN ('letterdist','layout') AND content IS NULL;
+
+-- 3. Counter sanity. Must be zero.
+SELECT count(*) AS counter_disagreements
+  FROM tasks t
+  JOIN LATERAL (
+    SELECT count(*) FILTER (WHERE c.state = 'completed') AS accepted,
+           count(*) FILTER (WHERE c.state = 'claimed')   AS active
+      FROM task_claims c WHERE c.task_id = t.id
+  ) actual ON true
+ WHERE t.accepted_count <> actual.accepted OR t.active_claim_count <> actual.active;
+```
+
+```bash
+# 4. Functional smoke: claim, execute and submit one task against the restored
+#    stack. This exercises dispatch, the artifact fetch and the result write.
+python worker/fake_worker.py --server-url https://<host> --tasks 1
+```
+
+In-flight claims need no action. Claims open at the restore point are reclaimed
+by the heartbeat timeout, and a worker submitting against a claim the restored
+database never issued is rejected the same way any stale claim is.
+
+---
+
+## 5. Region loss
+
+1. `terraform apply` in the DR region: `terraform apply -var region=$DR_REGION -var dr_region=$REGION`.
+2. Set the two SSM parameters by hand — Terraform manages their names, never
+   their values. `SESSION_SIGNING_KEY` may be a fresh `openssl rand -hex 32`;
+   every session cookie is invalidated, which costs a round of logins.
+3. Restore the database from the replicated dump in
+   `birdtest-backups-dr-<account>` (§2.1's `pg_restore`, into the new instance).
+4. Artifacts are already in `birdtest-artifacts-dr-<account>`; sync them into
+   the new region's artifact bucket, or point `S3_BUCKET` at the replica.
+5. Re-verify the SES domain identity and add the DKIM CNAMEs — account mail is
+   dead until this is done, which means no confirmations and no password
+   resets.
+6. Point DNS at the new ALB.
+7. Run §4.
+
+---
+
+## 6. Testing this runbook
+
+- `./scripts/restore-roundtrip.sh` — proves a dump of the current schema
+  restores byte-identically into an empty database. Run it after any schema
+  change.
+- `scripts/restore-drill.sh` runs monthly in production and restores the newest
+  dump into a throwaway database. A failure means the backups are not
+  restorable and is the loudest alarm in the system.
+- Twice a year, do §5 by hand into a scratch account or region. The manual
+  drill exists to find the steps that live only in someone's head.

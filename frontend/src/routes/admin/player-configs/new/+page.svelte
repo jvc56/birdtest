@@ -48,10 +48,17 @@
     return `${file.name} (${file.tarball_date}, ${file.sha256.slice(0, 8)})`;
   }
 
+  function firstOfRole(role: string): string {
+    return files.find((f) => f.role === role)?.id ?? '';
+  }
+
   onMount(async () => {
     files = await api.inputData();
-    kwgId = lexica[0]?.id ?? '';
-    klvId = leaves[0]?.id ?? '';
+    // Filtered from `files` here rather than read off the `$:` arrays above:
+    // those are recomputed on the update cycle, not on assignment, so they
+    // would still be empty on the next line and every default would be ''.
+    kwgId = firstOfRole('kwg');
+    klvId = firstOfRole('klv');
   });
 
   async function submit() {
@@ -200,7 +207,7 @@
       <div>
         <label class="label" for="threshold">Threshold (-th)</label>
         <select id="threshold" class="input" bind:value={threshold}>
-          <option value="">lexicon default</option>
+          <option value="">MAGPIE default</option>
           <option value="none">none</option>
           <option value="gk16">gk16</option>
         </select>
@@ -208,7 +215,7 @@
       <div>
         <label class="label" for="samplingrule">Sampling rule (-sa)</label>
         <select id="samplingrule" class="input" bind:value={samplingRule}>
-          <option value="">lexicon default</option>
+          <option value="">MAGPIE default</option>
           <option value="round_robin">round_robin</option>
           <option value="top_two_ids">top_two_ids</option>
         </select>

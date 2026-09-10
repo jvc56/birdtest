@@ -4,6 +4,7 @@ use super::JobData;
 use crate::artifacts::ArtifactStore;
 use crate::error::{AppError, AppResult};
 use crate::models::job::LeaveConfig;
+use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
@@ -263,41 +264,34 @@ pub async fn run_transition(
     config: &LeaveConfig,
     distribution: &LetterDistribution,
 ) -> AppResult<String> {
-    let rows = sqlx::query(
-        "SELECT rack, occurrence_count, equity_sum
-         FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = $2 AND occurrence_count > 0
-         ORDER BY rack",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .fetch_all(pool)
-    .await?;
-
-    let mean_by_rack: std::collections::HashMap<String, f64> = rows
-        .iter()
-        .map(|row| {
-            let rack: String = row.get("rack");
-            let count: i64 = row.get("occurrence_count");
-            let equity_sum: f64 = row.get("equity_sum");
-            (rack, equity_sum / count as f64)
-        })
-        .collect();
+    // Shared with `rebuild_artifacts` rather than written twice: a rebuild is
+    // only meaningful if it folds the rows exactly as the original write did,
+    // and two copies of this would be free to drift into producing different
+    // bytes for the same generation.
+    let mean_by_rack = generation_means(pool, job_id, generation).await?;
 
     let klv = super::klv::build(distribution, &mean_by_rack)?;
 
+    // Hashed as written, not read back: the object store holds the only copy
+    // of these bytes, and this is what a later rebuild is compared against.
+    let sha256 = hex::encode(Sha256::digest(&klv));
     let key = format!("leaves/{job_id}/generation-{generation}.klv2");
     artifacts.put(&key, klv).await?;
 
     let mut tx = pool.begin().await?;
+    // DO NOTHING keeps the FIRST hash. A restore that replays this transition
+    // against fewer results writes the same key with different bytes; keeping
+    // the original hash is what makes that visible afterwards instead of
+    // quietly agreeing with whatever landed last.
     sqlx::query(
-        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key)
-         VALUES ($1, $2, $3)
+        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (job_id, generation) DO NOTHING",
     )
     .bind(job_id)
     .bind(generation)
     .bind(&key)
+    .bind(&sha256)
     .execute(&mut *tx)
     .await?;
 
@@ -343,18 +337,134 @@ pub async fn seed_zero_generation(
     // Empty means "no rack has a mean equity yet", which `build` renders as
     // 0.0 for every leave -- exactly the zeroed KLV wanted here.
     let klv = super::klv::build(distribution, &std::collections::HashMap::new())?;
+    let sha256 = hex::encode(Sha256::digest(&klv));
     let key = format!("leaves/{job_id}/generation-0.klv2");
     artifacts.put(&key, klv).await?;
 
     sqlx::query(
-        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key)
-         VALUES ($1, 0, $2)
+        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
+         VALUES ($1, 0, $2, $3)
          ON CONFLICT (job_id, generation) DO NOTHING",
     )
     .bind(job_id)
     .bind(&key)
+    .bind(&sha256)
     .execute(pool)
     .await?;
 
     Ok(key)
+}
+
+/// What rebuilding one generation's KLV from the database found.
+#[derive(Debug, serde::Serialize)]
+pub struct ArtifactRebuild {
+    pub generation: i32,
+    pub artifact_key: String,
+    pub stored_sha256: String,
+    pub rebuilt_sha256: String,
+    pub matches: bool,
+    pub object_present: bool,
+    pub rewritten: bool,
+}
+
+/// Recompute every generation's KLV from the database and report what it found.
+///
+/// The KLVs are the only application state outside Postgres, and they are pure
+/// functions of state that is still in it: `leave_rack_progress` rows are never
+/// deleted per generation, so every generation's inputs remain available for the
+/// life of the job. That is what makes rebuilding an alternative to backing them
+/// up -- see PLAN.md, "Artifacts: back up, or rebuild?".
+///
+/// Two things this deliberately does *not* do:
+///
+/// - **It does not overwrite an object that is present but differs.** A hash
+///   mismatch means the stored bytes are not what this code would produce now,
+///   and that is evidence to look at rather than a fault to paper over: it is
+///   equally consistent with a corrupted object and with a legitimate change to
+///   `klv::build`. Rewriting on sight would destroy the only copy of whichever
+///   one it was. `force` is the deliberate override.
+/// - **It does not rebuild generation 0 from `leave_rack_progress`.** Generation
+///   0 is the zeroed KLV every job starts from, not a fold of any results, and
+///   there are no progress rows behind it. It is rebuilt the way
+///   `seed_zero_generation` built it, from an empty map.
+pub async fn rebuild_artifacts(
+    pool: &sqlx::PgPool,
+    artifacts: &ArtifactStore,
+    job_id: Uuid,
+    distribution: &LetterDistribution,
+    force: bool,
+) -> AppResult<Vec<ArtifactRebuild>> {
+    let rows = sqlx::query(
+        "SELECT generation, artifact_key, sha256
+         FROM leave_generation_artifacts
+         WHERE job_id = $1
+         ORDER BY generation",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut report = Vec::with_capacity(rows.len());
+    for row in rows {
+        let generation: i32 = row.get("generation");
+        let artifact_key: String = row.get("artifact_key");
+        let stored_sha256: String = row.get("sha256");
+
+        let mean_by_rack = if generation == 0 {
+            std::collections::HashMap::new()
+        } else {
+            generation_means(pool, job_id, generation).await?
+        };
+        let klv = super::klv::build(distribution, &mean_by_rack)?;
+        let rebuilt_sha256 = hex::encode(Sha256::digest(&klv));
+
+        let object_present = artifacts.exists(&artifact_key).await?;
+        let matches = rebuilt_sha256 == stored_sha256;
+        // A missing object has no bytes to lose, so restoring it needs no
+        // permission. Replacing one that is present does.
+        let rewritten = !object_present || force;
+        if rewritten {
+            artifacts.put(&artifact_key, klv).await?;
+        }
+
+        report.push(ArtifactRebuild {
+            generation,
+            artifact_key,
+            stored_sha256,
+            rebuilt_sha256,
+            matches,
+            object_present,
+            rewritten,
+        });
+    }
+    Ok(report)
+}
+
+/// Per-rack mean equity for one generation: the same fold `run_transition`
+/// performs, which is what makes a rebuild reproduce the original bytes.
+async fn generation_means(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    generation: i32,
+) -> AppResult<std::collections::HashMap<String, f64>> {
+    let rows = sqlx::query(
+        "SELECT rack, occurrence_count, equity_sum
+         FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = $2 AND occurrence_count > 0
+         ORDER BY rack",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let rack: String = row.get("rack");
+            let count: i64 = row.get("occurrence_count");
+            let equity_sum: f64 = row.get("equity_sum");
+            (rack, equity_sum / count as f64)
+        })
+        .collect())
 }

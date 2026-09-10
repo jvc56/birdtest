@@ -662,6 +662,14 @@ CREATE TABLE leave_generation_artifacts (
     job_id        UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     generation    INT NOT NULL,
     artifact_key  TEXT NOT NULL,
+    -- SHA-256 of the KLV bytes as first written. The object store holds the
+    -- only copy of these bytes, and an artifact is the one piece of state that
+    -- can be silently overwritten -- by a restore that replays a generation
+    -- transition against fewer results, or by a rebuild under a changed
+    -- klv::build. Recording the hash is what turns that from invisible into a
+    -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
+    -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
+    sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, generation)
 );
@@ -680,6 +688,44 @@ CREATE TABLE player_config_ratings (
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (player_config_id, job_id)
 );
+
+-- Backups
+--
+-- Written by scripts/backup.sh (and the restore drill), never by the server:
+-- the backend reads this table for the admin dashboard and has no ability to
+-- perform or delete a backup. See PLAN.md, "Making backups visible".
+--
+-- Insert-only, failures included: a run that broke leaves an ok = false row,
+-- so the admin page shows a failure rather than a gap that reads as "nothing
+-- happened". Nothing in the request path reads this table.
+--
+-- Restoring the database restores its own backup history, which is
+-- momentarily confusing and harmless: the rows describe backups that do still
+-- exist in the bucket.
+CREATE TABLE backups (
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    kind           TEXT NOT NULL CHECK (kind IN ('pg_dump', 'rds_snapshot')),
+    -- Key prefix within the backup bucket ('pg/2026-09-07T03-00-00Z'), NULL
+    -- for a snapshot; snapshot_id is the mirror of it. Exactly one is set.
+    s3_key         TEXT,
+    snapshot_id    TEXT,
+    started_at     TIMESTAMPTZ NOT NULL,
+    finished_at    TIMESTAMPTZ NOT NULL,
+    dump_bytes     BIGINT CHECK (dump_bytes >= 0),
+    -- Per-table exact counts at dump time. What a restore is verified against
+    -- (PLAN.md, "Verifying a restore"), and what makes a silently truncated dump
+    -- detectable without restoring it.
+    row_counts     JSONB NOT NULL,
+    sha256         TEXT CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    ok             BOOLEAN NOT NULL,
+    CONSTRAINT backups_has_single_location CHECK (
+        (s3_key IS NOT NULL)::int + (snapshot_id IS NOT NULL)::int = 1
+    )
+);
+
+-- The admin page asks for the most recent runs, and the staleness figure asks
+-- for the most recent successful one.
+CREATE INDEX backups_finished_idx ON backups (finished_at DESC);
 
 -- Audit log
 

@@ -230,9 +230,6 @@ resource "aws_ecs_task_definition" "main" {
         { name = "PUBLIC_URL", value = var.public_url },
         { name = "S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
         { name = "AWS_REGION", value = var.region },
-        { name = "DATA_PATH", value = "/app/data" },
-        # Leave-generation aggregation shells out to this once per generation.
-        { name = "MAGPIE_BIN", value = "/usr/local/bin/magpie" },
         { name = "RUST_LOG", value = "birdtest=info,tower_http=info" }
       ]
       # Pulled from SSM at task start, so the values never appear in the task

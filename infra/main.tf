@@ -12,6 +12,13 @@ provider "aws" {
   region = var.region
 }
 
+# Replication target for the artifact and backup buckets. Nothing is served
+# from this region; it exists so that losing the primary one is survivable.
+provider "aws" {
+  alias  = "dr"
+  region = var.dr_region
+}
+
 data "aws_caller_identity" "current" {}
 
 locals {

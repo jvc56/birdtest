@@ -32,6 +32,27 @@ impl ArtifactStore {
         Ok(key.to_string())
     }
 
+    /// Whether the object is still there. Used by the artifact rebuild path,
+    /// which has to distinguish "the bytes changed" from "the object is gone"
+    /// — a database restored to before an object was written is the second
+    /// case, and only that one is a reason to write.
+    pub async fn exists(&self, key: &str) -> AppResult<bool> {
+        match self
+            .client
+            .head_object()
+            .bucket(&self.cfg.s3_bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) => match e.into_service_error() {
+                aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_) => Ok(false),
+                other => Err(AppError::internal(format!("S3 head {key} failed: {other}"))),
+            },
+        }
+    }
+
     pub async fn get(&self, key: &str) -> AppResult<Vec<u8>> {
         let object = self
             .client

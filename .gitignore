@@ -16,3 +16,6 @@ __pycache__/
 .terraform/
 *.tfstate
 *.tfstate.*
+
+# Local snapshots taken by scripts/dev-dump.sh
+.dev-backups/
