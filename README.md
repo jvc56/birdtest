@@ -11,7 +11,8 @@ and rationale all live there, including the
 command contributors run, how [input data is pinned by content and negotiated
 with workers](PLAN.md#input-data-and-capability-negotiation), and what is
 [backed up and why](PLAN.md#backups-and-restore). This file is how to run it,
-and [RUNBOOK.md](RUNBOOK.md) is the recovery procedure itself.
+[TESTING.md](TESTING.md) is what is guaranteed and how it is checked, and
+[RUNBOOK.md](RUNBOOK.md) is the recovery procedure itself.
 
 ## Layout
 
