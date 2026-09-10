@@ -189,58 +189,215 @@ SPRT is evaluated inline on every result submission (no background sweep). The s
 #### How the LLR is computed
 
 The hypotheses are stated in Elo: H0 says the difference is `elo_low`, H1 says
-it is `elo_high`. Each unit's score is 1 for a win, 0.5 for a draw, 0 for a
-loss, and the test uses the normal approximation fishtest uses — treat the
-sample as draws from a distribution with unknown mean and compare the
+it is `elo_high`. The test uses the normal approximation fishtest uses — treat
+the sample as draws from a distribution with unknown mean and compare the
 likelihood of the observed mean under the two hypothesised means:
 
 ```
 expected_score(elo) = 1 / (1 + 10^(-elo/400))
 
-mean            = (wins + 0.5·draws) / n
-second_moment   = (wins + 0.25·draws) / n
-variance        = second_moment - mean²
-llr             = n · (µ₁ - µ₀) · (mean - (µ₀ + µ₁)/2) / variance
+llr = n · (µ₁ - µ₀) · (mean - (µ₀ + µ₁)/2) / variance
 ```
 
 where `µ₀ = expected_score(elo_low)` and `µ₁ = expected_score(elo_high)`. The
 acceptance bounds are `ln(β / (1-α))` and `ln((1-β) / α)`.
 
-**The LLR is 0 for a degenerate sample** — no units yet, or zero observed
-variance, which is what a run of identical results produces before the first
-divergent one. The test has not begun to discriminate, and reporting 0 rather
-than dividing by zero is what keeps the dashboard honest about that.
+What differs between the two job types is **what one observation is**, and that
+choice is the whole statistical content of the test:
 
-**`units_completed` is deliberately not `wins + losses + draws`.** For a plain
-`games` job they are the same number. For `game_pairs` they are not: `min_pairs`
-and `max_pairs` gate on *pairs played*, while the tally driving the LLR counts
-games within the divergent subset, which is smaller and different. Conflating
-them either ends the job early or never ends it.
+| Job type | Unit | Score | n |
+|---|---|---|---|
+| `games` | one game | 1 / 0.5 / 0 | games played |
+| `game_pairs` | one **pair** | `i / 4` for pentanomial bucket `i` | pairs played |
+
+For a plain `games` job the sample is per-game, with
+`mean = (wins + 0.5·draws)/n` and `second_moment = (wins + 0.25·draws)/n`.
+
+#### The pentanomial, and why pairs are the unit
+
+A `game_pairs` task plays each seed twice with the players swapped. The two
+games of a pair **share a seed**, so they are not independent of each other —
+counting them as two observations overstates how much evidence there is. The
+pair is the independent unit, and its outcome is one of five: player 1 lost
+both, lost one and drew one, split, won one and drew one, or won both. MAGPIE
+reports those five counts directly (see [MAGPIE reports the
+pentanomial](#magpie-reports-the-pentanomial)), indexed by player 1's half-point
+score across the pair, and the sample's mean and variance are taken over pair
+scores of `i/4`. That puts the mean on the same per-game scale
+`expected_score(elo)` expects while `n` honestly counts pairs.
+
+**Every completed pair is in the sample, including the pairs whose two games
+played identically.** Those are guaranteed 1-1 ties: they score exactly 0.5,
+they contribute nothing to the variance, and they pull the variance *down*.
+That is precisely where paired play's variance reduction comes from — not from
+discarding them.
+
+Testing only the pairs that *did* diverge is the trap, and it is not a small
+one. Filtering does not flip the direction, since the identical pairs sit
+exactly at even and both views land on the same side of it, but it destroys the
+magnitude and with it the test's purpose. Take 20,000 games split 9,950-10,050,
+of which only 100 diverged and one player took 99 of them:
+
+| Sample | Score rate | Implied difference |
+|---|---|---|
+| Every pair (10,000 of them) | 0.4975 | about **-1.7 Elo** |
+| The 50 divergent pairs alone | 0.01 | about **-800 Elo** |
+
+Same games. A test fed the second number crosses any boundary it is given,
+almost immediately, on a hundredth of the evidence — so an SPRT configured to
+resolve ±10 Elo stops being able to resolve anything at all, and reports every
+difference as decisive. The divergent counts are still collected and still
+shown, as a **diagnostic** of how often two configs differ at all. Nothing is
+tested on them.
+
+**The LLR is 0 for a degenerate sample** — no observations yet, or zero observed
+variance, which is what a run in which every pair split produces. The test has
+not begun to discriminate, and reporting 0 rather than dividing by zero is what
+keeps the dashboard honest about that.
+
+**The sample size and the progress count are the same number.** `min_pairs` and
+`max_pairs` gate on pairs played, and the pentanomial's sample is pairs played,
+so the two cannot drift apart. (They could, and did, when the LLR ran over a
+filtered subset of games while the gates counted pairs — a job would then either
+end early or never end.)
 
 The status is one of `running`, `passed`, `failed`, `terminated_at_max`. Below
 `min_units` the LLR is computed and reported but never acted on — except that
 the hard cap still applies, so a job whose `max_units` is below its `min_units`
 terminates rather than running forever.
 
-#### Glicko-2 specifics
+### Ratings
 
-Standard Glicko-2 with `τ = 0.5`, an internal scale factor of 173.7175, and the
-volatility iteration converging to 1e-6. A new rating is 1500 / 350 / 0.06,
-except the **static bot, which is seeded at 2000** — identified as the player
-config whose `max_iterations` is NULL, since a config with no simulation
-parameters is by definition static.
+Ratings are **siloed from job control flow entirely**. Nothing in the rating
+system is read while dispatching, claiming, validating or completing a task, and
+no job decision reads a rating. The coupling runs one way: a fit reads finished
+`game_results` and writes a snapshot. SPRT stays where it belongs, on the job
+config tables — it is a per-job **stopping rule**, not a measurement, and
+`elo_low`/`elo_high` are hypotheses about one comparison rather than anyone's
+rating.
 
-Each accepted submission is applied as **one rating period** containing that
-submission's divergent games, not as a sequence of single-game updates:
-applying the single-game form repeatedly would shrink the rating deviation once
-per game and overstate confidence. `games_played` on the rating row counts
-*pairs*, matching how the thresholds and the dashboard talk about progress.
+Everything below lives in four `rating_*` tables and one module. See
+[Rating pools](#rating-pools) for the schema and the fit.
 
-A submission with no divergent games moves nothing and is skipped.
+#### Nothing is incremental, and nothing is frozen
 
-For game pair jobs, both SPRT and Glicko are computed over the **divergent** pairs only — those whose two games did not play identically — since an identical pair is a guaranteed tie that moves neither the LLR nor a rating. The job's `min_pairs` and `max_pairs` still count every pair played.
+Elo and Glicko are **sequential filters**, built for humans whose strength
+drifts over time: they nudge a rating per result because history is stale and
+cannot be refit. Every design choice in Glicko-2 — the volatility parameter, RD
+growth during inactivity, rating periods — is machinery for tracking a moving
+target.
 
-For all game pair jobs, Glicko ratings are automatically computed after every game pair result, applied as a single Glicko-2 rating period per submission rather than game by game, which is the algorithm's native form. Ratings are keyed by `(player_config_id, job_id)` — each job maintains its own independent rating table for the player configs involved. The static bot is seeded at 2000; all other player configs start at the Glicko default of 1500. The dashboard displays the current Glicko snapshot for each player config in the job. The dashboard also displays estimated time to completion for active jobs based on current throughput and SPRT progress.
+A player config is a frozen set of MAGPIE flags, immutable once any job
+references it. **Its strength is a constant.** There is no drift to track, so
+the filter buys nothing while costing path dependence, and the question "should
+a bot's rating be fixed once it is established?" has no good answer because
+*establishing* one incrementally is the wrong move to begin with.
+
+What birdtest actually has is a static tournament: N configs and a matrix of
+pairwise results. The right tool is a **batch maximum-likelihood fit** over the
+whole matrix at once — Bradley-Terry, solved by minorization-maximization,
+anchored on one config at a fixed rating. Every rating is a joint solution to the
+entire graph, recomputed from scratch whenever the pool or the evidence changes.
+Three properties follow, and they are the reasons for the choice:
+
+- **Order independence.** Ratings do not depend on the sequence results arrived
+  in.
+- **Add and remove are free.** Changing membership is a refit, not a surgical
+  undo of one player's historical updates. Correct by construction.
+- **One anchor is enough.** Ratings are identifiable only up to an additive
+  constant, so exactly one config is pinned — the static bot at 2000, identified
+  as the config whose `max_iterations` is NULL. No other rating is ever frozen.
+
+MM is used rather than a gradient method because each step is a closed-form
+ratio with no step size to tune, it cannot overshoot, and it converges
+monotonically. For a pool of any plausible size it lands in microseconds, which
+is what makes "refit everything on every change" affordable rather than
+aspirational.
+
+#### Non-transitivity is displayed, not solved
+
+An adversarial config can beat some opponents and lose to others in a cycle: A
+beats B, B beats C, C beats A. **No scalar rating system can represent that** —
+it is not a flaw in Bradley-Terry but a fact about collapsing a tournament graph
+onto one axis. Modelling it properly (Blade-Chest, disc decomposition) costs the
+single number a leaderboard is made of, so birdtest does not attempt it.
+
+What the batch fit buys is that the failure becomes **visible and localized**.
+The fit returns the best scalar approximation, and the *residuals* — actual
+score versus model-predicted score for each head-to-head — say exactly where the
+model is lying. A rock-paper-scissors triangle shows up as three large,
+sign-flipped residuals and as ratings that collapse toward each other. An
+incremental filter cannot show this at all; it just oscillates quietly. The
+ratings page therefore carries the scalar rating as the headline and the residual
+table beside it, and says so when the residuals are large enough that the
+ranking should not be read as one.
+
+#### What counts as evidence
+
+Only `game_pairs` jobs, and only those matching the pool's scope, with **both**
+configs in the pool.
+
+Plain `games` jobs are excluded deliberately. `-gp` plays both orderings of every
+seed, so a pair is **side-balanced by construction**; an unpaired job is not, and
+going first in a word game is worth real Elo. Pooling unbalanced results would
+bias every rating toward whoever happened to start more often. Including them
+would require an explicit side-advantage term in the model, which is not worth
+the complexity while every rating-relevant job is paired anyway.
+
+A pool is scoped by `(variant, letter distribution, layout)` because a rating is
+only meaningful against fixed conditions: pooling a wordsmog job with a classic
+one, or two different letter distributions, produces a number describing no game
+anyone played. Lexicon is deliberately *not* part of the scope — it lives on the
+player config, and two configs on different lexicons playing each other is a
+meaningful comparison.
+
+#### Membership is an admin decision
+
+Not every player config belongs in a rating. An admin adds and removes configs
+from a pool, and **either change refits the whole pool**, because a config's
+games are evidence for everyone else's rating too. Removing a config removes its
+games as evidence, which moves every other number — that is correct, not a bug,
+and it is why this cannot be a targeted per-row delete. Removal is soft: the
+membership row goes, the results stay in `game_results`, so re-adding costs
+nothing but a recompute.
+
+The anchor cannot be removed while it is the anchor; the pool would lose its
+scale.
+
+#### Two things the fit has to handle honestly
+
+- **Separation.** A config that has never lost sends the unregularised maximum
+  likelihood to infinity, and that is not an edge case — it is what a strong new
+  bot's first job looks like. The fit adds a small prior (virtual drawn games
+  against a player of the anchor's strength), which keeps every rating finite and
+  pulls the barely-observed toward the anchor, where a wide standard error then
+  says how little the number is worth.
+- **Connectivity.** If two configs only ever played each other and neither
+  connects to the anchor's component, their ratings are unidentifiable — the fit
+  would otherwise return a confident number produced entirely by the prior. Each
+  rating carries `connected_to_anchor`, and the page shows an unconnected config
+  as **unrated** rather than as a plausible-looking 1500.
+
+Standard errors come from the diagonal of the Fisher information. They ignore
+off-diagonal terms, so they under-state the true uncertainty, but they are more
+than good enough for the distinction the page needs to draw: 1700 ± 15 and
+1700 ± 200 must not look alike.
+
+#### When a fit runs
+
+On membership change and on demand, immediately; on new evidence, from a periodic
+sweep (two minutes) rather than a hook on result submission. A fit is global to a
+pool, an active job submits results far faster than any rating needs to move, and
+— unlike SPRT — nothing blocks on the answer. The sweep compares the pool's
+current pair count against the last run's `pairs_used`, so no dirty flag is
+needed anywhere.
+
+Runs are **snapshotted, not mutated**: one `rating_runs` row per fit with its
+provenance (trigger, iterations, convergence, evidence consumed) and one
+`player_config_ratings` row per config per run. That is what makes "why did this
+rating change?" answerable and gives the ratings page a time axis for free. A run
+that did not converge is stored and displayed, flagged — hiding it would leave
+the page silently stale.
 
 ---
 
@@ -368,7 +525,7 @@ Shows all jobs with: job type, status, priority, allocation, and a completion co
 **Games / Game pairs**
 
 - SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `terminated at max games`.
-- Current Glicko snapshot (game pairs only): rating and rating deviation for each player config.
+- The pentanomial (game pairs only): the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
 - Running result counts and percentages: wins / losses / draws for player 1.
 
 **Opening rack analysis**
@@ -394,7 +551,7 @@ JobStats {
                        min_magpie_version, created_at, created_by, lexicon, variant }
   tasks_total, tasks_completed, tasks_available, tasks_claimed, results_accepted
   games?:            { unit: "game" | "pair", wins, losses, draws,
-                       units_completed, divergent_pairs?, min_units, max_units,
+                       units_completed, pentanomial?, divergent_pairs?, min_units, max_units,
                        win_pct, loss_pct, draw_pct,
                        sprt: { llr, lower_bound, upper_bound, status } }
   opening_racks?:    { racks_analyzed, racks_total, average_best_equity,
@@ -536,12 +693,13 @@ what the workers are checked against.
 | Anonymous workers identified by UUID | Enables per-worker contribution tracking and result filtering without requiring account creation |
 | No pre-aggregation for dashboard v1 | Simple stats don't require it; avoids premature optimization |
 | AWS throughout | Learning goals; avoids future migration pain; production-grade from day one |
-| Glicko instead of ELO | Glicko models rating uncertainty via rating deviation; static bot seeded at 2000 |
+| Batch Bradley-Terry instead of incremental Elo/Glicko | Player configs have fixed strength, so there is no drift for a sequential filter to track; a batch fit is order-independent and makes add/remove a refit rather than an unwind |
 | Named `player_configs` table | Reusable across jobs; maps directly to MAGPIE per-player arguments (`-r1`/`-r2`, `-s1`/`-s2`, etc.); **immutable once created** — no update endpoint exists; deletion only if no job references the config |
 | Frontend dark mode only | Single theme simplifies the component library configuration; no light/dark toggle in v1 |
 | Deficit-based job selection | Deterministic; guarantees long-run allocation accuracy regardless of claim timing; no randomness means reproducible behavior and no starvation |
 | Seed gap of batch size | Prevents two tasks from covering overlapping game seeds; `next_seed = MAX(seed) + batch_size` so seeds tile without gaps or overlaps |
-| Glicko ratings keyed by (player_config, job) | Each job is an independent experiment; pooling ratings across jobs would conflate different experimental conditions |
+| Ratings pooled across jobs, scoped by (variant, letterdist, layout) | A rating is only comparable under fixed conditions, but it is not a property of one job; pooling is what lets a config's whole record produce one number |
+| Only paired jobs feed ratings | `-gp` swaps seats on every seed, so a pair is side-balanced; unpaired games would need an explicit side-advantage term to avoid biasing every rating |
 | Two finish conditions for SPRT jobs | `min_games`/`min_pairs` prevents early false-positive termination; `max_games`/`max_pairs` bounds compute cost |
 | Jobs created inactive | Allocation is set at activation time, not creation, so the admin reviews the full active job set and assigns percentages as a single deliberate act |
 | API keys active/inactive toggle | Lets contributors rotate or temporarily suspend a key without losing it; only active keys accepted for auth |
@@ -1315,10 +1473,9 @@ The mirror of the claim, and the only place results enter the system.
 4. Mark the claim `completed`, increment `accepted_count`, decrement
    `active_claim_count`, and recompute the task's state against the job's
    `redundancy`, stamping `completed_at` when it reaches it.
-5. For game pairs only, apply the submission's divergent games to both players'
-   Glicko ratings — inside the same transaction, so a rating can never reflect a
-   result that was rolled back.
-6. Log `result.submitted`, commit.
+5. Log `result.submitted`, commit. Ratings are deliberately **not** touched
+   here: a fit is global to a rating pool and nothing in this path depends on
+   it, so it runs on a periodic sweep instead.
 7. **After** the commit: recompute job stats, evaluate the finish conditions, and
    push the stats to the job's SSE subscribers.
 
@@ -1329,10 +1486,13 @@ submission written straight into the largest tables in the schema.
 
 **Games and game pairs.** `wins + losses + ties == games`, all non-negative, on
 every aggregate. A `games` result must contain at least one game. A `game_pairs`
-result must additionally carry `divergent_games`, whose own counts must be
-consistent, whose `games` must be even, and must not exceed the total. A plain
-`games` result carrying a divergent aggregate has it ignored rather than stored,
-since a job that does not play pairs has no divergent subset to mean anything.
+result must additionally carry a `pentanomial` whose five counts are
+non-negative and agree with the game aggregate on both the pair count and player
+1's half-points — the cross-check described under [MAGPIE reports the
+pentanomial](#magpie-reports-the-pentanomial). `divergent_games` is optional; when
+present its own counts must be consistent, its `games` even, and no larger than
+the total. A plain `games` result carrying either has it ignored rather than
+stored, since a job that does not play pairs has no pairs to describe.
 
 **Captured positions**, when present:
 
@@ -1401,12 +1561,12 @@ Some request types are shared across job types:
 
 ### Task Response Types
 
-A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit the aggregate MAGPIE's autoplay reports for a batch (`{games, wins, losses, ties, score means and standard deviations}`), with game pairs adding a second aggregate over the divergent pairs. Autoplay does not emit individual games, and nothing downstream needs them: SPRT and the dashboard both work off counts.
+A task response is what the worker submits after completing a task. It is validated on receipt and then transformed into a task record for storage. Response types may differ from their corresponding request types (e.g., a single seed request may yield a batch of game results). Response and record types are shared across job types where the stored shape is identical regardless of how the task was generated — games and game pairs both submit the aggregate MAGPIE's autoplay reports for a batch (`{games, wins, losses, ties, score means and standard deviations}`), with game pairs adding the pentanomial over every completed pair and a second aggregate over the divergent ones. Autoplay does not emit individual games, and nothing downstream needs them: SPRT and the dashboard both work off counts.
 
 | Type | Used by |
 |---|---|
 | `PositionAnalysisResponse` | Opening rack analysis — one entry per rack in the batch |
-| `GameResultsResponse` | Games, game pairs — one aggregate per batch, plus a divergent-pairs aggregate for game pairs |
+| `GameResultsResponse` | Games, game pairs — one aggregate per batch, plus the pentanomial and a divergent-pairs aggregate for game pairs |
 | `LeaveResponse` | Leave generation |
 
 ### Task Record Types
@@ -1470,9 +1630,7 @@ SPRT and finish-condition checks run during result submission, not at claim time
 
 Same as games, except the batch size is `pairs_per_batch` from the job config. Each task seed is spaced `pairs_per_batch` apart: `SELECT COALESCE(MAX(seed) + $pairs_per_batch, 1) FROM tasks WHERE job_id = $job_id`. The job type sets MAGPIE's `-gp` flag, so both orderings of each seed are played in a single invocation.
 
-Results are a `GameResultsResponse` — the same type games use — carrying two aggregates: every game played, and the **divergent** subset. A pair whose two games played identically is a guaranteed tie carrying no information, so excluding those is the variance reduction that pairing exists to provide, and the divergent aggregate is what SPRT and Glicko are computed from. Progress, by contrast, is measured in pairs played, because that is the unit `min_pairs` and `max_pairs` bound.
-
-This treats the two games of a divergent pair as independent observations. They are not quite — they share a seed — so the LLR is slightly optimistic. Correcting it would require per-pair outcomes, which MAGPIE does not report.
+Results are a `GameResultsResponse` — the same type games use — carrying the aggregate over every game played, the **pentanomial** over every completed pair, and the divergent subset. SPRT runs on the pentanomial: the pair is the independent unit (the two games share a seed), and it is also the unit `min_pairs` and `max_pairs` bound, so the sample size and the progress count are the same number. The divergent aggregate is stored and displayed as a diagnostic of how often the two configs differ, and nothing is tested on it — see [The pentanomial, and why pairs are the unit](#the-pentanomial-and-why-pairs-are-the-unit).
 
 ---
 
@@ -1492,7 +1650,7 @@ At claim time:
 
 **Worker behaviour**: The worker downloads the previous generation's combined leave file through `GET /api/worker/artifact` — including generation 1, which fetches the server-built *zeroed* KLV stored as generation 0, so there is no first-generation branch and no fallback to the lexicon's shipped leaves. It hands the request's `forced_racks` to `leavegen` as an **in-memory rack list**, plays `num_games` games, and reads the rack-equity table out of `RackList`, submitting it as an inline `{rack, count, mean}` list in the `LeaveResponse`.
 
-Neither the forced racks nor the results touch the filesystem: they arrive in the task's JSON request and go back in its JSON response. (The `-forceracksfile` / `-writerackequitycsv` round trip through scratch files that an earlier design used is gone — see [Leave generation on the client](#leave-generation-on-the-client).)
+Neither the forced racks nor the results touch the filesystem: they arrive in the task's JSON request and go back in its JSON response. (There is no `-forceracksfile` / `-writerackequitycsv` round trip through scratch files — see [Leave generation on the client](#leave-generation-on-the-client).)
 
 The reported list covers **every rack that occurred during the batch, forced or not**, since racks the games happen to draw naturally also count toward that rack's occurrence target. It therefore scales with distinct racks drawn per batch — potentially thousands of rows, not just `racks_per_task` — but that is still an ordinary-sized POST body (tens to low hundreds of KB), not something warranting object storage.
 
@@ -1710,6 +1868,7 @@ carries:
 ```json
 {
   "all_games": { "...": "..." },
+  "pentanomial": [12, 3, 140, 5, 40],
   "divergent_games": { "...": "..." },
   "positions": [
     { "game_index": 0, "turn_number": 3,
@@ -1890,15 +2049,11 @@ code branches on platform but because the vendored source itself has a
 under this rule. `src/util/json` wraps it in an `ErrorStack`-aware API and is the
 only file that includes `cjson.h`.
 
-Two things this design **does not need**, despite an earlier draft calling for
-them:
-
-- **No `src/compat/crandom.h`.** The worker UUID is minted by the server, not
-  generated locally, so a client never needs a secure random source at all.
-- **No `src/compat/csleep.h`.** `src/compat/ctime.h` already has a portable
-  blocking sleep, `ctime_nap(double seconds)`, used elsewhere in MAGPIE. The task
-  loop's poll and backoff waits call it directly rather than introducing a second
-  sleep abstraction.
+HTTP is the only addition compat needs. The worker UUID is minted by the server
+rather than generated locally, so the client never needs a random source of its
+own; and the task loop's poll and backoff waits call `ctime_nap(double seconds)`,
+the portable blocking sleep `src/compat/ctime.h` already exposes and MAGPIE
+already uses elsewhere, rather than introducing a second sleep abstraction.
 
 **The WASM build compiles everything.** `Makefile-wasm` compiles every `.c` under
 `src`'s subdirectories, so every new file must compile under Emscripten.
@@ -2179,7 +2334,7 @@ configs agree on them before the job is created.
   for pairs. Read counts and score moments out of the `GameData` the autoplay
   recorder already maintains: `total_games`, `p0_wins`, `p0_losses`, `p0_ties`,
   and the score `Stat` means and standard deviations. For pairs, read the
-  divergent `GameData` as well. When the job sets `capture_positions`, also
+  pentanomial and the divergent `GameData` as well. When the job sets `capture_positions`, also
   serialize the positions recorder's output (see
   [Position Capture From Games](#position-capture-from-games)).
 
@@ -2200,18 +2355,40 @@ trip through the filesystem for data that never needed to leave the process — 
 it made the task depend on a writable data directory for a reason unrelated to the
 lexicon data.
 
-#### Result granularity: nothing new is needed
+#### MAGPIE reports the pentanomial
 
-An earlier draft called for a per-game autoplay recorder. That was wrong, and the
-question is settled in both directions:
+No per-game autoplay recorder is needed, but a paired run does need one thing
+autoplay did not report:
 
 - **`games` jobs.** SPRT consumes wins, losses and draws, which is exactly what
   autoplay already reports. Nothing downstream ever needed individual games.
-- **`game_pairs` jobs.** In `-gp` mode MAGPIE reports a second `GameData` over
-  the **divergent** pairs — those whose two games did not play identically. A
-  pair that played identically is a guaranteed tie carrying no information, so
-  excluding those is the variance reduction pairing exists to provide. That is
-  precisely the signal SPRT wants.
+- **`game_pairs` jobs.** The pair is the unit, so the counts have to be per
+  pair. MAGPIE's `-gp` mode gains a **pentanomial**: five counts indexed by
+  player 1's half-point score across the pair, emitted in the contribution JSON
+  as `pentanomial` alongside `all_games`. It is accumulated in the game recorder
+  at the one point both games of a pair are final, consolidated across worker
+  threads like every other recorder statistic.
+
+This is a small change, and it is one MAGPIE has to make rather than something
+birdtest can derive: the two aggregates alone cannot reconstruct the split, since
+a 2-0 pair and two divergent 1-1 pairs are indistinguishable in them. Making it
+now is also the cheapest it will ever be — `contribute` is on the unreleased
+`birdtest-contribute` branch, so no deployed worker speaks the old shape.
+
+The divergent aggregate stays, and is still reported and stored. What changed is
+its status: it is a **diagnostic** of how often two configs differ at all, not
+the sample anything is tested on. Testing on it conditions the sample on its own
+outcome — see [The pentanomial, and why pairs are the
+unit](#the-pentanomial-and-why-pairs-are-the-unit).
+
+**The two views cross-check each other.** The pentanomial and the game aggregate
+describe the same games, so they must agree on both the pair count
+(`sum(buckets) * 2 == games`) and player 1's total half-points
+(`Σ i·bucket[i] == 2·wins + ties`). Both are enforced at submission *and* as
+`CHECK` constraints on `game_results`, because a miscounting client produces
+numbers that are individually plausible and only wrong in relation to each
+other — exactly the failure that would otherwise silently bias every rating pool
+the job feeds.
 
 Verified against `main` at `e4eda01`, 20 pairs, seed 50, NWL23:
 
@@ -2227,7 +2404,8 @@ The last row is correct rather than a bug: move *record* type governs what is
 recorded, not which move is played, and static play forces `MOVE_RECORD_BEST`.
 
 birdtest matches this: `game_records` is gone, replaced by `game_results` storing
-the two aggregates, with pairs SPRT and Glicko computed from the divergent counts.
+the two aggregates plus the pentanomial, with pairs SPRT computed from the
+pentanomial and the divergent counts kept only as a diagnostic.
 
 ### Wordmap provisioning
 
@@ -2468,6 +2646,7 @@ shape.
   "positions": [ ] }
 
 { "all_games": { "...": "as above" },
+  "pentanomial": [12, 3, 140, 5, 40],
   "divergent_games": { "...": "same shape, the divergent subset" } }
 
 { "racks": [ { "rack": "AA", "count": 30, "mean": 1.5 } ] }
@@ -2476,8 +2655,10 @@ shape.
 Server-side validation, so the client must satisfy it:
 
 - `wins + losses + ties == games`, all non-negative.
-- `game_pairs`: `games` is even and non-zero, `divergent_games` is required, its
-  own counts are consistent, and `divergent_games.games` is even and `<= games`.
+- `game_pairs`: `games` is even and non-zero; `pentanomial` is required and must
+  agree with the aggregate on the pair count and on player 1's half-points;
+  `divergent_games`, if present, has consistent counts with `games` even and
+  `<= games`.
 - `moves` and `racks` must be non-empty.
 - `positions` is present only when the job set `capture_positions`, and each entry
   must fall inside the task's own games — see
@@ -2729,8 +2910,7 @@ happens to be slow to fill would run forever: holding its claim, missing no
 heartbeat, never submitting.
 
 It would be tempting to also stop early once the task's *own* forced racks have each
-occurred some target number of times, and an earlier draft did exactly that. It is
-wrong. A game contributes an occurrence for *every* rack it draws, not only the
+occurred some target number of times. That is wrong. A game contributes an occurrence for *every* rack it draws, not only the
 forced subset, and the server's upsert into `leave_rack_progress` does not filter
 against `forced_racks`. Games played after the forced racks are "done" still produce
 coverage the server uses, and stopping early throws it away. The generation's rack
@@ -2922,6 +3102,10 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
 | `GET` | `/api/admin/fleet` | What the field is running, from `task_claims.magpie_version`. |
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
+| `POST` | `/api/admin/rating-pools` | Create a rating pool: name, scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
+| `POST` | `/api/admin/rating-pools/:id/members` | Add a player config to the pool and refit it. Returns the new run id. |
+| `DELETE` | `/api/admin/rating-pools/:id/members/:config_id` | Remove a config and refit. Refused for the pool's anchor, which every other rating is measured against. |
+| `POST` | `/api/admin/rating-pools/:id/recompute` | Force a refit without changing membership. |
 | `POST` | `/api/admin/jobs/:id/rebuild-artifacts` | Leave-generation jobs only. Recompute each generation's KLV from `leave_rack_progress` and report whether the stored object is still present and still matches its recorded hash. Rewrites only missing objects unless `?force=true`. |
 
 #### Admin API semantics
@@ -3017,6 +3201,9 @@ do not exist.
 | `GET` | `/api/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so an offline download never buffers a whole job in memory. The source table follows the job type: position analyses, game results, or leave-rack progress. |
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated), paginated. |
+| `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
+| `GET` | `/api/rating-pools/:id` | Latest fit for one pool: run provenance, every member's rating with uncertainty, and the residuals. |
+| `GET` | `/api/rating-pools/:id/history` | Every stored run's ratings, oldest first — the history chart's series. |
 
 **Rack lookup** canonicalizes the query before matching: uppercased, whitespace
 trimmed, letters sorted. A rack is a multiset of tiles, so `AEINRST` and
@@ -3040,6 +3227,8 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 | `/jobs/[id]` | Job detail — job-type-specific stats and per-worker contribution table. Live-updated via SSE. |
 | `/users` | Registered user list — all user accounts with contribution stats. |
 | `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by tasks completed. |
+| `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
+| `/ratings/[id]` | [The ratings page](#the-ratings-page) — ratings with uncertainty, history, and residuals. Admin controls for membership appear inline for admins. |
 
 ### Auth Routes
 
@@ -3079,6 +3268,39 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | `/admin/backups` | Recent backup runs and the staleness of the newest successful one. |
 
 ---
+
+### The ratings page
+
+`/ratings/[id]` is where a pool's fit is read. Four panels, each answering a
+different question, and the design choices in them are load-bearing:
+
+**Ratings, as a dot plot with error bars.** Deliberately not a bar chart: a bar
+encodes magnitude from zero, and Elo has no meaningful zero — the scale is
+anchored wherever the pool's anchor was pinned, so bar length would imply a ratio
+that does not exist. A dot on a common scale encodes position, which is what a
+rating is. The error bar matters as much as the dot, because a config with two
+hundred pairs and one with two million otherwise produce identical-looking
+numbers and only the interval says which to believe. A config with no path to the
+anchor is listed beneath the chart as **unrated** rather than drawn at a number.
+
+**A table of every config**, since the chart caps what it draws and the table
+must not. This is also the accessible view of the same data.
+
+**Rating history**, one line per config, from the run snapshots. The categorical
+palette is a fixed list rather than a generator, so past six configs the page
+shows the top six by rating and says how many it left out — inventing a seventh
+hue nobody can distinguish would be worse than omitting it. Every line is
+directly labelled at its right end, so identity never depends on colour alone.
+
+**Where the model disagrees with the games.** The residual table: actual score
+versus predicted, per head-to-head, largest disagreement first. This is the panel
+that makes non-transitivity visible instead of letting it quietly distort the
+ranking, and when enough head-to-heads are badly mispredicted the page says
+outright that the ratings should be read as a summary rather than a ranking.
+
+Admin controls live inline on this page rather than under `/admin`, because
+adding or removing a config is an act whose consequence — every other rating
+moving — is only legible next to the ratings themselves.
 
 ## Directory Structure
 
@@ -3124,11 +3346,11 @@ birdtest/
 │       ├── audit.rs                # append-only audit log writes
 │       ├── scheduler.rs            # job selection, lazy reclamation, task claiming
 │       ├── jobstats.rs             # aggregate job stats (REST + SSE payload)
-│       ├── ratings.rs              # Glicko bookkeeping for game-pair jobs
+│       ├── ratings.rs              # rating pools: evidence, fits, snapshots
 │       ├── stats/
 │       │   ├── mod.rs
 │       │   ├── sprt.rs             # SPRT LLR and boundaries
-│       │   └── glicko.rs           # Glicko-2 rating update
+│       │   └── bradley_terry.rs    # batch anchored rating fit (MM)
 │       ├── jobs/                   # job type system
 │       │   ├── mod.rs              # shared request/record helpers
 │       │   ├── handler.rs          # JobHandler trait plus wire types
@@ -3148,6 +3370,7 @@ birdtest/
 │       │   ├── auth.rs             # /api/auth/*
 │       │   ├── account.rs          # /api/me/*
 │       │   ├── admin.rs            # /api/admin/*
+│       │   ├── ratings.rs          # /api/rating-pools/* (public reads, admin writes)
 │       │   └── public.rs           # /api/jobs/*, /api/users, /api/workers
 │       └── sse.rs                  # SSE broadcaster (job result push)
 │
@@ -3171,6 +3394,9 @@ birdtest/
 │       │       ├── Pagination.svelte
 │       │       ├── ProgressBar.svelte
 │       │       ├── OutcomeChart.svelte   # LayerCake: win/loss/draw over time
+│       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: Elo has no zero)
+│       │       ├── RatingHistoryChart.svelte  # rating over time, one line per config
+│       │       ├── ResidualMatrix.svelte # actual vs predicted per head-to-head
 │       │       ├── Bars.svelte           # LayerCake mark layer
 │       │       └── AxisY.svelte          # LayerCake axis layer
 │       └── routes/
@@ -3180,6 +3406,10 @@ birdtest/
 │           │   ├── +page.svelte                    # /jobs
 │           │   └── [id]/
 │           │       └── +page.svelte                # /jobs/[id]
+│           ├── ratings/
+│           │   ├── +page.svelte                    # /ratings
+│           │   └── [id]/
+│           │       └── +page.svelte                # /ratings/[id]
 │           ├── users/
 │           │   └── +page.svelte                    # /users
 │           ├── workers/
@@ -3862,13 +4092,12 @@ CREATE TABLE position_analysis_plies (
 );
 CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
--- Shared by games and game pairs: one row per accepted task, holding the aggregate
--- MAGPIE's autoplay reports. Autoplay does not emit individual games -- it reports
--- counts and score moments for a batch, and in `-gp` mode a second such summary
--- covering only the *divergent* pairs: those whose two games did not play
--- identically. A pair that played identically is a guaranteed tie carrying no
--- information, so excluding those is the variance reduction pairing exists to
--- provide, and the divergent aggregate is what SPRT and Glicko are computed from.
+-- Shared by games and game pairs: one row per accepted task, holding the
+-- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games
+-- -- it reports counts and score moments for a batch, and in `-gp` mode also
+-- the pentanomial: how many completed pairs ended in each of the five possible
+-- pair outcomes. The pentanomial is what SPRT and the rating fits read; the
+-- divergent summary alongside it is a diagnostic only.
 CREATE TABLE game_results (
     task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -3884,7 +4113,41 @@ CREATE TABLE game_results (
     p2_score_sd       DOUBLE PRECISION NOT NULL,
     CONSTRAINT game_results_counts_sum CHECK (wins + losses + ties = games),
 
-    -- The divergent subset. NULL for `games` jobs, which do not play pairs.
+    -- The pentanomial: how many completed pairs ended in each of the five
+    -- outcomes, indexed by player 1's half-point score across the pair, so
+    -- pent_0 is "player 1 lost both games" and pent_4 is "won both". NULL for
+    -- `games` jobs, which do not play pairs.
+    --
+    -- This -- not the divergent subset below -- is what SPRT and the ratings
+    -- read. The pair is the independent unit of a paired run, and *every* pair
+    -- belongs in the sample: a pair whose two games played identically is a
+    -- guaranteed 1-1 tie, lands in pent_2, and is exactly the observation that
+    -- says "these two are hard to tell apart". Dropping those conditions the
+    -- sample on its own outcome and inflates the apparent difference without
+    -- bound.
+    pent_0            INT CHECK (pent_0 >= 0),
+    pent_1            INT CHECK (pent_1 >= 0),
+    pent_2            INT CHECK (pent_2 >= 0),
+    pent_3            INT CHECK (pent_3 >= 0),
+    pent_4            INT CHECK (pent_4 >= 0),
+    CONSTRAINT game_results_pentanomial_all_or_nothing CHECK (
+        (pent_0 IS NULL AND pent_1 IS NULL AND pent_2 IS NULL
+             AND pent_3 IS NULL AND pent_4 IS NULL)
+        OR (pent_0 IS NOT NULL AND pent_1 IS NOT NULL AND pent_2 IS NOT NULL
+             AND pent_3 IS NOT NULL AND pent_4 IS NOT NULL
+             -- The pentanomial and the game counts are two views of the same
+             -- games, so they must agree on both the count and the outcome:
+             -- one pair per two games, and the same half-point total for
+             -- player 1 either way. A worker that miscounts fails here rather
+             -- than silently biasing a rating pool.
+             AND (pent_0 + pent_1 + pent_2 + pent_3 + pent_4) * 2 = games
+             AND pent_1 + 2 * pent_2 + 3 * pent_3 + 4 * pent_4 = 2 * wins + ties)
+    ),
+
+    -- The divergent subset: pairs whose two games did not play identically.
+    -- Kept as a *diagnostic* -- it says how often two configs actually differ,
+    -- which is worth showing -- and deliberately not used as a statistical
+    -- sample. NULL for `games` jobs.
     divergent_games   INT CHECK (divergent_games >= 0),
     divergent_wins    INT CHECK (divergent_wins >= 0),
     divergent_losses  INT CHECK (divergent_losses >= 0),
@@ -3930,19 +4193,99 @@ CREATE TABLE leave_generation_artifacts (
     PRIMARY KEY (job_id, generation)
 );
 
--- Glicko ratings per (player_config, job) pair
--- Used by game_pairs jobs. Each job maintains its own independent rating context for every player config involved.
--- The static bot is seeded at 2000; all other player configs start at the Glicko default of 1500.
+-- Ratings
+--
+-- Ratings are siloed from job control flow entirely: nothing below is read
+-- while dispatching, claiming, validating or completing a task, and nothing
+-- above (jobs, the two game config tables, game_results) mentions a rating.
+-- The coupling runs one way -- the fit reads finished game_results -- so a
+-- rating can never affect whether a job stops. SPRT stays on the job config
+-- tables where it belongs: it is a per-job stopping rule, not a measurement.
 
-CREATE TABLE player_config_ratings (
+-- A rating pool is a set of player configs whose ratings are comparable, plus
+-- the game conditions that make them so.
+--
+-- Scoped by (variant, letterdist, layout) because a rating is only meaningful
+-- against fixed conditions: pooling a wordsmog job with a classic one, or two
+-- different letter distributions, produces a number describing no game anyone
+-- played. Only game_pairs jobs matching a pool's scope are eligible evidence
+-- for it. (Lexicon is deliberately *not* part of the scope: it lives on the
+-- player config, and two configs on different lexicons playing each other is a
+-- meaningful comparison.)
+CREATE TABLE rating_pools (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          TEXT NOT NULL UNIQUE,
+    variant       TEXT NOT NULL,
+    letterdist_id UUID NOT NULL REFERENCES input_data(id),
+    layout_id     UUID NOT NULL REFERENCES input_data(id),
+    -- The fixed point every other rating is measured against. Ratings are only
+    -- identifiable up to an additive constant, so exactly one player config
+    -- must be pinned; the static bot at 2000 is the convention.
+    anchor_player_config_id UUID NOT NULL REFERENCES player_configs(id),
+    anchor_rating DOUBLE PRECISION NOT NULL DEFAULT 2000,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (variant, letterdist_id, layout_id, name)
+);
+
+-- Which player configs are rated in a pool. Membership is the admin's lever:
+-- not every player config belongs in a rating, and a config that is added or
+-- removed causes the whole pool to be refit rather than patched, since a batch
+-- fit has no per-player history to unwind.
+--
+-- Removal is soft (the row goes, the games stay in game_results), so
+-- re-adding a config costs nothing but a recompute. Note that removing a
+-- config also removes its games as *evidence*, which moves everyone else's
+-- rating -- that is correct, not a bug, and the reason a removal triggers a
+-- full refit.
+CREATE TABLE rating_pool_members (
+    pool_id          UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
     player_config_id UUID NOT NULL REFERENCES player_configs(id),
-    job_id           UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    rating           DOUBLE PRECISION NOT NULL DEFAULT 1500,
-    rating_deviation DOUBLE PRECISION NOT NULL DEFAULT 350,  -- RD; shrinks as more pairs are played
-    volatility       DOUBLE PRECISION NOT NULL DEFAULT 0.06, -- Glicko-2 σ
-    games_played     INT NOT NULL DEFAULT 0,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (player_config_id, job_id)
+    added_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    added_by         UUID REFERENCES users(id) ON DELETE SET NULL,
+    PRIMARY KEY (pool_id, player_config_id)
+);
+
+-- One fit. Ratings are snapshotted per run rather than mutated in place, which
+-- is what makes "why did this rating change?" answerable and gives the ratings
+-- page a time axis at no extra cost.
+CREATE TABLE rating_runs (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
+    computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Why this run happened: 'membership' (an admin added or removed a config),
+    -- 'evidence' (new results arrived), or 'manual'.
+    trigger       TEXT NOT NULL,
+    method        TEXT NOT NULL DEFAULT 'bradley_terry_mm',
+    -- Fit provenance. A run that did not converge is still stored and still
+    -- displayed, flagged: hiding it would leave the page silently stale.
+    iterations    INT NOT NULL,
+    converged     BOOLEAN NOT NULL,
+    -- How much evidence went in, so a run can be compared to its predecessor
+    -- without re-reading game_results.
+    pairs_used    BIGINT NOT NULL,
+    jobs_used     INT NOT NULL
+);
+
+CREATE INDEX rating_runs_pool_idx ON rating_runs (pool_id, computed_at DESC);
+
+-- The ratings themselves: one row per player config per run. This is the only
+-- table in the schema that holds a rating.
+CREATE TABLE player_config_ratings (
+    run_id           UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
+    player_config_id UUID NOT NULL REFERENCES player_configs(id),
+    rating           DOUBLE PRECISION NOT NULL,
+    -- Approximate Elo standard error. Wide bars are the honest signal that a
+    -- config has barely played, or has only played opponents far from its own
+    -- strength; the page shows them next to the rating for that reason.
+    stderr           DOUBLE PRECISION NOT NULL,
+    pairs_played     BIGINT NOT NULL,
+    -- FALSE when no chain of games connects this config to the pool's anchor.
+    -- Ratings are identifiable only relative to the anchor, so such a config's
+    -- number comes from the fit's prior alone and means nothing; it is shown as
+    -- unrated rather than as a confident 1500.
+    connected_to_anchor BOOLEAN NOT NULL,
+    is_anchor        BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (run_id, player_config_id)
 );
 
 -- Backups
@@ -4079,10 +4422,13 @@ what makes selective restore worth building rather than only whole-database
 rollback:
 
 - **Irreplaceable.** `game_results`, `position_analysis_records` / `_moves` /
-  `_plies`, `leave_rack_progress`, `leave_records`, `player_config_ratings`,
-  `task_claims`, `audit_log`. This is donated compute. A contributor is not going
-  to run the same 40,000 game pairs again because we lost them, and the Glicko and
-  SPRT state derived from them cannot be recomputed from anything else.
+  `_plies`, `leave_rack_progress`, `leave_records`, `rating_pools`,
+  `rating_pool_members`, `task_claims`, `audit_log`. This is donated compute. A
+  contributor is not going to run the same 40,000 game pairs again because we
+  lost them, and the SPRT state derived from them cannot be recomputed from
+  anything else. Rating *runs* are the exception in the other direction: they are
+  a pure function of pool membership and `game_results`, so a lost snapshot is
+  one recompute away — which is exactly the property batch fitting buys.
 - **Irreplaceable and sensitive.** `users` (email, argon2 hash), `api_keys` (key
   hashes), `worker_bans`, `anonymous_workers`. Losing these logs the whole fleet
   out; leaking them is a disclosure incident. This is what makes backup encryption
@@ -4359,7 +4705,8 @@ the denormalized counters — which is the part a naive row copy gets wrong.
 redundancy. `purge_job` deletes tasks precisely so they regenerate cleanly; a
 restore that puts claims back without their counters leaves the scheduler
 dispatching work that is already done. Finally, recompute what is not a simple copy:
-Glicko ratings and the job's SPRT verdict.
+the job's SPRT verdict, and the rating pools (a refit, from data that is already
+there).
 
 Two ways to package that: a documented runbook plus SQL snippets (no code, no
 maintenance, fully general, but every use is bespoke and under time pressure), or a

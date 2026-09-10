@@ -1,2 +1,2 @@
-pub mod glicko;
+pub mod bradley_terry;
 pub mod sprt;

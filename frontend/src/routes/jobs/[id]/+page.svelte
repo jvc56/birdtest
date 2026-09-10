@@ -127,36 +127,55 @@
           {stats.games.losses.toLocaleString()} L ({stats.games.loss_pct.toFixed(1)}%) ·
           {stats.games.draws.toLocaleString()} D ({stats.games.draw_pct.toFixed(1)}%)
         </p>
-        {#if stats.games.divergent_pairs !== undefined}
-          <p class="text-xs text-muted-foreground">
-            Counted over {stats.games.divergent_pairs.toLocaleString()} divergent pairs of
-            {stats.games.units_completed.toLocaleString()} played. Pairs whose two games play
-            identically are guaranteed ties and carry no signal, so they are excluded.
-          </p>
+        {#if stats.games.pentanomial}
+          <div class="space-y-1">
+            <p class="text-xs text-muted-foreground">
+              The test runs on all {stats.games.units_completed.toLocaleString()} pairs, scored by
+              player 1's result across the pair. Pairs whose two games played identically are 1-1
+              ties — they stay in the sample, where they are what makes a paired run
+              lower-variance than an unpaired one.
+            </p>
+            <table class="table text-xs">
+              <thead>
+                <tr>
+                  <th>Pair outcome</th>
+                  <th class="text-right">Pairs</th>
+                  <th class="text-right">Share</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each ['P1 lost both', 'Lost one, drew one', 'Split 1-1', 'Won one, drew one', 'P1 won both'] as label, i}
+                  <tr>
+                    <td>{label}</td>
+                    <td class="text-right tabular-nums"
+                      >{stats.games.pentanomial[i].toLocaleString()}</td
+                    >
+                    <td class="text-right tabular-nums">
+                      {stats.games.units_completed
+                        ? ((100 * stats.games.pentanomial[i]) / stats.games.units_completed).toFixed(
+                            1
+                          )
+                        : '0.0'}%
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+            {#if stats.games.divergent_pairs !== undefined}
+              <p class="text-xs text-muted-foreground">
+                {stats.games.divergent_pairs.toLocaleString()} of {stats.games.units_completed.toLocaleString()}
+                pairs diverged — a diagnostic of how often these two configs differ at all, not
+                part of the test.
+              </p>
+            {/if}
+          </div>
         {/if}
       </div>
     {/if}
 
-    {#if stats.ratings.length}
-      <div class="card">
-        <h2 class="mb-3 text-lg font-medium">Glicko snapshot</h2>
-        <table class="table">
-          <thead>
-            <tr><th>Player config</th><th class="text-right">Rating</th><th class="text-right">RD</th><th class="text-right">Pairs</th></tr>
-          </thead>
-          <tbody>
-            {#each stats.ratings as rating}
-              <tr>
-                <td>{rating.name}</td>
-                <td class="text-right tabular-nums">{rating.rating.toFixed(1)}</td>
-                <td class="text-right tabular-nums">±{rating.rating_deviation.toFixed(1)}</td>
-                <td class="text-right tabular-nums">{rating.games_played.toLocaleString()}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    {/if}
+    <!-- Ratings are pool-scoped and live on /ratings: a rating is a statement
+         about a player config across every pair it has played, not something
+         one job owns. -->
 
     {#if stats.opening_racks}
       <div class="card space-y-4">

@@ -236,12 +236,15 @@ pub(crate) async fn insert_game_results(
 ) -> AppResult<()> {
     let all = &record.all_games;
     let divergent = record.divergent_games.as_ref();
+    let pentanomial = record.pentanomial.as_ref();
+    let bucket = |i: usize| pentanomial.map(|p| p[i] as i32);
     sqlx::query(
         "INSERT INTO game_results
              (task_claim_id, task_id, games, wins, losses, ties,
               p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
+              pent_0, pent_1, pent_2, pent_3, pent_4,
               divergent_games, divergent_wins, divergent_losses, divergent_ties)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
     )
     .bind(claim_id)
     .bind(task_id)
@@ -253,6 +256,11 @@ pub(crate) async fn insert_game_results(
     .bind(all.p1_score_sd)
     .bind(all.p2_score_mean)
     .bind(all.p2_score_sd)
+    .bind(bucket(0))
+    .bind(bucket(1))
+    .bind(bucket(2))
+    .bind(bucket(3))
+    .bind(bucket(4))
     .bind(divergent.map(|d| d.games))
     .bind(divergent.map(|d| d.wins))
     .bind(divergent.map(|d| d.losses))

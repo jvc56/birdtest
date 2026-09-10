@@ -9,6 +9,7 @@
 
   const links = [
     { href: '/jobs', label: 'Jobs' },
+    { href: '/ratings', label: 'Ratings' },
     { href: '/workers', label: 'Contributors' },
     { href: '/users', label: 'Users' }
   ];

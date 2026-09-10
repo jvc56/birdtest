@@ -4,7 +4,7 @@
 
 use crate::error::AppResult;
 use crate::models::job::{GameConfig, GamePairConfig, Job, JobType, LeaveConfig, SprtParams};
-use crate::stats::sprt::{self, SprtResult, Tally};
+use crate::stats::sprt::{self, Pentanomial, Sample, SprtResult, Tally};
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
@@ -25,7 +25,6 @@ pub struct JobStats {
     pub leave_generation: Option<LeaveGenStats>,
     /// Empty for every job type but game pairs. Always serialized, so the
     /// client can read `.length` without a presence check.
-    pub ratings: Vec<RatingSnapshot>,
     pub workers: Vec<WorkerContribution>,
     /// Estimated seconds to completion from recent throughput, or `None` when
     /// there is not enough recent activity to extrapolate.
@@ -57,8 +56,12 @@ pub struct GameStats {
     /// Games for a `games` job, pairs for a `game_pairs` job — the unit the
     /// job's min/max thresholds are stated in.
     pub units_completed: u64,
-    /// Game pairs only: how many of those pairs diverged and so contributed to
-    /// the tally above.
+    /// Game pairs only: the five pair-outcome counts the LLR is computed from,
+    /// indexed by player 1's half-point score across the pair.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pentanomial: Option<[u64; 5]>,
+    /// Game pairs only: how many pairs diverged. A diagnostic — how often the
+    /// two configs actually differ — and not part of the test.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub divergent_pairs: Option<u64>,
     pub min_units: i32,
@@ -97,15 +100,6 @@ pub struct LeaveGenStats {
     /// single worker's heartbeat.
     pub min_rack: Option<String>,
     pub min_rack_count: Option<i64>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct RatingSnapshot {
-    pub player_config_id: Uuid,
-    pub name: String,
-    pub rating: f64,
-    pub rating_deviation: f64,
-    pub games_played: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,11 +159,6 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
         _ => None,
     };
 
-    let ratings = match job.job_type {
-        JobType::GamePairs => rating_snapshots(pool, job.id).await?,
-        _ => Vec::new(),
-    };
-
     let tasks_total: i64 = counts.get("total");
     let tasks_completed: i64 = counts.get("completed");
     let results_accepted: i64 = counts.get("accepted");
@@ -198,7 +187,6 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
         games,
         opening_racks,
         leave_generation,
-        ratings,
         workers: worker_contributions(pool, job.id).await?,
         eta_seconds,
     })
@@ -289,21 +277,24 @@ async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
         draws: row.get::<i64, _>("ties") as u64,
     };
     let games = row.get::<i64, _>("games") as u64;
-    Ok(build_game_stats("game", tally, games, &SprtParams::from(&config)))
+    let sample = Sample::from_games(&tally);
+    Ok(build_game_stats("game", tally, sample, games, None, None, &SprtParams::from(&config)))
 }
 
-/// A game-pairs job reports two numbers that mean different things.
+/// A game-pairs job is evaluated on the **pentanomial**: every completed pair,
+/// bucketed by player 1's half-point score across it.
 ///
-/// Progress is measured in **pairs played** — two games each — because that is
-/// what `min_pairs` and `max_pairs` bound. The LLR, though, is computed over the
-/// **divergent** games only: a pair whose two games played identically is a
-/// guaranteed tie carrying no information, and excluding those is the variance
-/// reduction that pairing exists to provide.
+/// The pair is the independent observation — its two games share a seed, so
+/// they are not independent of each other — and the unit `min_pairs` and
+/// `max_pairs` bound, so the sample size and the progress count are the same
+/// number. Pairs that played identically are 1-1 ties in bucket 2: they stay in
+/// the sample, where they pull the variance down. That is where paired play's
+/// variance reduction comes from, and it is lost entirely if the sample is
+/// filtered to the pairs that diverged, which conditions on the outcome and
+/// makes a tiny difference look decisive.
 ///
-/// This does treat the two games of a divergent pair as independent
-/// observations. They are not quite — they share a seed — so the LLR is
-/// slightly optimistic. Correcting it would need per-pair outcomes, which
-/// MAGPIE does not report.
+/// The per-game win/loss/tie tally is still reported for display, and the
+/// divergent counts alongside it as a diagnostic. Neither drives the test.
 async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
     let config =
         sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
@@ -313,10 +304,15 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
 
     let row = sqlx::query(
         "SELECT COALESCE(SUM(r.games), 0)::bigint            AS games,
-                COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games,
-                COALESCE(SUM(r.divergent_wins), 0)::bigint   AS wins,
-                COALESCE(SUM(r.divergent_losses), 0)::bigint AS losses,
-                COALESCE(SUM(r.divergent_ties), 0)::bigint   AS ties
+                COALESCE(SUM(r.wins), 0)::bigint             AS wins,
+                COALESCE(SUM(r.losses), 0)::bigint           AS losses,
+                COALESCE(SUM(r.ties), 0)::bigint             AS ties,
+                COALESCE(SUM(r.pent_0), 0)::bigint           AS pent_0,
+                COALESCE(SUM(r.pent_1), 0)::bigint           AS pent_1,
+                COALESCE(SUM(r.pent_2), 0)::bigint           AS pent_2,
+                COALESCE(SUM(r.pent_3), 0)::bigint           AS pent_3,
+                COALESCE(SUM(r.pent_4), 0)::bigint           AS pent_4,
+                COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games
          FROM game_results r JOIN tasks t ON t.id = r.task_id
          WHERE t.job_id = $1",
     )
@@ -329,24 +325,49 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
         losses: row.get::<i64, _>("losses") as u64,
         draws: row.get::<i64, _>("ties") as u64,
     };
-    let pairs_played = row.get::<i64, _>("games") as u64 / 2;
-    let mut stats = build_game_stats("pair", tally, pairs_played, &SprtParams::from(&config));
-    stats.divergent_pairs = Some(row.get::<i64, _>("divergent_games") as u64 / 2);
-    Ok(stats)
+    let mut counts = [0u64; 5];
+    for (i, slot) in counts.iter_mut().enumerate() {
+        *slot = row.get::<i64, _>(format!("pent_{i}").as_str()) as u64;
+    }
+    let pentanomial = Pentanomial { counts };
+    // Pairs played is the sample size and the progress count at once, so these
+    // cannot drift apart the way a filtered sample and a full progress count
+    // could.
+    let pairs_played = pentanomial.pairs();
+    let sample = Sample::from_pentanomial(&pentanomial);
+    Ok(build_game_stats(
+        "pair",
+        tally,
+        sample,
+        pairs_played,
+        Some(counts),
+        Some(row.get::<i64, _>("divergent_games") as u64 / 2),
+        &SprtParams::from(&config),
+    ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_game_stats(
     unit: &'static str,
     tally: Tally,
+    sample: Sample,
     units_completed: u64,
+    pentanomial: Option<[u64; 5]>,
+    divergent_pairs: Option<u64>,
     params: &SprtParams,
 ) -> GameStats {
-    // Percentages describe the tally the LLR is computed from, which for pairs
-    // is the divergent subset rather than every game played.
+    // Percentages describe every game played, for both job types: the sample
+    // the LLR runs on is now the same games, viewed as pairs.
     let total = tally.total();
-    let pct = |n: u64| if total == 0 { 0.0 } else { 100.0 * n as f64 / total as f64 };
+    let pct = |n: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            100.0 * n as f64 / total as f64
+        }
+    };
     let sprt = sprt::evaluate(
-        &tally,
+        &sample,
         units_completed,
         params.min_units as u64,
         params.max_units as u64,
@@ -361,7 +382,8 @@ fn build_game_stats(
         losses: tally.losses,
         draws: tally.draws,
         units_completed,
-        divergent_pairs: None,
+        pentanomial,
+        divergent_pairs,
         min_units: params.min_units,
         max_units: params.max_units,
         win_pct: pct(tally.wins),
@@ -425,10 +447,11 @@ async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRac
 }
 
 async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats> {
-    let config = sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
-        .bind(job_id)
-        .fetch_one(pool)
-        .await?;
+    let config =
+        sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
 
     let completed = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1",
@@ -468,30 +491,6 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
         min_rack: min.as_ref().map(|r| r.get("rack")),
         min_rack_count: min.as_ref().map(|r| r.get("occurrence_count")),
     })
-}
-
-async fn rating_snapshots(pool: &PgPool, job_id: Uuid) -> AppResult<Vec<RatingSnapshot>> {
-    let rows = sqlx::query(
-        "SELECT r.player_config_id, p.name, r.rating, r.rating_deviation, r.games_played
-         FROM player_config_ratings r
-         JOIN player_configs p ON p.id = r.player_config_id
-         WHERE r.job_id = $1
-         ORDER BY r.rating DESC",
-    )
-    .bind(job_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .into_iter()
-        .map(|r| RatingSnapshot {
-            player_config_id: r.get("player_config_id"),
-            name: r.get("name"),
-            rating: r.get("rating"),
-            rating_deviation: r.get("rating_deviation"),
-            games_played: r.get("games_played"),
-        })
-        .collect())
 }
 
 pub async fn worker_contributions(

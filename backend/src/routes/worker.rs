@@ -3,9 +3,8 @@ use crate::auth::WorkerIdentity;
 use crate::error::{AppError, AppResult};
 use crate::jobs::handler::TaskRequest;
 use crate::jobstats;
-use crate::models::job::{GamePairConfig, Job, JobType};
+use crate::models::job::{Job, JobType};
 use crate::ratelimit;
-use crate::ratings;
 use crate::scheduler;
 use crate::state::AppState;
 use axum::extract::{Query, State};
@@ -367,15 +366,10 @@ async fn submit_result(
     .execute(&mut *tx)
     .await?;
 
-    if job.job_type == JobType::GamePairs {
-        let config = sqlx::query_as::<_, GamePairConfig>(
-            "SELECT * FROM job_game_pair_config WHERE job_id = $1",
-        )
-        .bind(job_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        ratings::apply_claim(&mut tx, job_id, claim_id, &config).await?;
-    }
+    // Ratings are deliberately not touched here. A fit is global to a rating
+    // pool and nothing in the submission path depends on it, so it runs on a
+    // periodic sweep (see ratings::recompute_stale) rather than inside every
+    // result transaction.
 
     audit::log(
         &mut tx,

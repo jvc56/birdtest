@@ -87,6 +87,7 @@ impl JobHandler for GameHandler {
         let positions = validate_positions(response.positions, response.all_games.games)?;
         Ok(GameResultsRecord {
             all_games: response.all_games,
+            pentanomial: None,
             divergent_games: None,
             positions,
         })

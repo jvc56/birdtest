@@ -228,9 +228,9 @@ CREATE TABLE player_configs (
     klv_id           UUID NOT NULL REFERENCES input_data(id),   -- (-k1 / -k2)
     winpct_id        UUID REFERENCES input_data(id),            -- (-winpct)
     -- The config this one was cloned from, for a data update. Ratings do NOT
-    -- carry over -- player_config_ratings is keyed by config and ratings are
-    -- only comparable on identical data -- so the UI must show where a config
-    -- with no history came from.
+    -- carry over -- a clone is a new player config, so it enters a rating pool
+    -- with no games and no rating until it plays -- so the UI must show where a
+    -- config with no history came from.
     cloned_from_id   UUID REFERENCES player_configs(id),
     -- Simulation parameters (all NULL for a static player)
     max_iterations   INT,                   -- -i1 / -i2
@@ -628,7 +628,41 @@ CREATE TABLE game_results (
     p2_score_sd       DOUBLE PRECISION NOT NULL,
     CONSTRAINT game_results_counts_sum CHECK (wins + losses + ties = games),
 
-    -- The divergent subset. NULL for `games` jobs, which do not play pairs.
+    -- The pentanomial: how many completed pairs ended in each of the five
+    -- outcomes, indexed by player 1's half-point score across the pair, so
+    -- pent_0 is "player 1 lost both games" and pent_4 is "won both". NULL for
+    -- `games` jobs, which do not play pairs.
+    --
+    -- This -- not the divergent subset below -- is what SPRT and the ratings
+    -- read. The pair is the independent unit of a paired run, and *every* pair
+    -- belongs in the sample: a pair whose two games played identically is a
+    -- guaranteed 1-1 tie, lands in pent_2, and is exactly the observation that
+    -- says "these two are hard to tell apart". Dropping those conditions the
+    -- sample on its own outcome and inflates the apparent difference without
+    -- bound.
+    pent_0            INT CHECK (pent_0 >= 0),
+    pent_1            INT CHECK (pent_1 >= 0),
+    pent_2            INT CHECK (pent_2 >= 0),
+    pent_3            INT CHECK (pent_3 >= 0),
+    pent_4            INT CHECK (pent_4 >= 0),
+    CONSTRAINT game_results_pentanomial_all_or_nothing CHECK (
+        (pent_0 IS NULL AND pent_1 IS NULL AND pent_2 IS NULL
+             AND pent_3 IS NULL AND pent_4 IS NULL)
+        OR (pent_0 IS NOT NULL AND pent_1 IS NOT NULL AND pent_2 IS NOT NULL
+             AND pent_3 IS NOT NULL AND pent_4 IS NOT NULL
+             -- The pentanomial and the game counts are two views of the same
+             -- games, so they must agree on both the count and the outcome:
+             -- one pair per two games, and the same half-point total for
+             -- player 1 either way. A worker that miscounts fails here rather
+             -- than silently biasing a rating pool.
+             AND (pent_0 + pent_1 + pent_2 + pent_3 + pent_4) * 2 = games
+             AND pent_1 + 2 * pent_2 + 3 * pent_3 + 4 * pent_4 = 2 * wins + ties)
+    ),
+
+    -- The divergent subset: pairs whose two games did not play identically.
+    -- Kept as a *diagnostic* -- it says how often two configs actually differ,
+    -- which is worth showing -- and deliberately not used as a statistical
+    -- sample. NULL for `games` jobs.
     divergent_games   INT CHECK (divergent_games >= 0),
     divergent_wins    INT CHECK (divergent_wins >= 0),
     divergent_losses  INT CHECK (divergent_losses >= 0),
@@ -674,19 +708,99 @@ CREATE TABLE leave_generation_artifacts (
     PRIMARY KEY (job_id, generation)
 );
 
--- Glicko ratings per (player_config, job) pair
--- Used by game_pairs jobs. Each job maintains its own independent rating context for every player config involved.
--- The static bot is seeded at 2000; all other player configs start at the Glicko default of 1500.
+-- Ratings
+--
+-- Ratings are siloed from job control flow entirely: nothing below is read
+-- while dispatching, claiming, validating or completing a task, and nothing
+-- above (jobs, the two game config tables, game_results) mentions a rating.
+-- The coupling runs one way -- the fit reads finished game_results -- so a
+-- rating can never affect whether a job stops. SPRT stays on the job config
+-- tables where it belongs: it is a per-job stopping rule, not a measurement.
 
-CREATE TABLE player_config_ratings (
+-- A rating pool is a set of player configs whose ratings are comparable, plus
+-- the game conditions that make them so.
+--
+-- Scoped by (variant, letterdist, layout) because a rating is only meaningful
+-- against fixed conditions: pooling a wordsmog job with a classic one, or two
+-- different letter distributions, produces a number describing no game anyone
+-- played. Only game_pairs jobs matching a pool's scope are eligible evidence
+-- for it. (Lexicon is deliberately *not* part of the scope: it lives on the
+-- player config, and two configs on different lexicons playing each other is a
+-- meaningful comparison.)
+CREATE TABLE rating_pools (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name          TEXT NOT NULL UNIQUE,
+    variant       TEXT NOT NULL,
+    letterdist_id UUID NOT NULL REFERENCES input_data(id),
+    layout_id     UUID NOT NULL REFERENCES input_data(id),
+    -- The fixed point every other rating is measured against. Ratings are only
+    -- identifiable up to an additive constant, so exactly one player config
+    -- must be pinned; the static bot at 2000 is the convention.
+    anchor_player_config_id UUID NOT NULL REFERENCES player_configs(id),
+    anchor_rating DOUBLE PRECISION NOT NULL DEFAULT 2000,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (variant, letterdist_id, layout_id, name)
+);
+
+-- Which player configs are rated in a pool. Membership is the admin's lever:
+-- not every player config belongs in a rating, and a config that is added or
+-- removed causes the whole pool to be refit rather than patched, since a batch
+-- fit has no per-player history to unwind.
+--
+-- Removal is soft (the row goes, the games stay in game_results), so
+-- re-adding a config costs nothing but a recompute. Note that removing a
+-- config also removes its games as *evidence*, which moves everyone else's
+-- rating -- that is correct, not a bug, and the reason a removal triggers a
+-- full refit.
+CREATE TABLE rating_pool_members (
+    pool_id          UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
     player_config_id UUID NOT NULL REFERENCES player_configs(id),
-    job_id           UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    rating           DOUBLE PRECISION NOT NULL DEFAULT 1500,
-    rating_deviation DOUBLE PRECISION NOT NULL DEFAULT 350,  -- RD; shrinks as more pairs are played
-    volatility       DOUBLE PRECISION NOT NULL DEFAULT 0.06, -- Glicko-2 σ
-    games_played     INT NOT NULL DEFAULT 0,
-    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (player_config_id, job_id)
+    added_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    added_by         UUID REFERENCES users(id) ON DELETE SET NULL,
+    PRIMARY KEY (pool_id, player_config_id)
+);
+
+-- One fit. Ratings are snapshotted per run rather than mutated in place, which
+-- is what makes "why did this rating change?" answerable and gives the ratings
+-- page a time axis at no extra cost.
+CREATE TABLE rating_runs (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
+    computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Why this run happened: 'membership' (an admin added or removed a config),
+    -- 'evidence' (new results arrived), or 'manual'.
+    trigger       TEXT NOT NULL,
+    method        TEXT NOT NULL DEFAULT 'bradley_terry_mm',
+    -- Fit provenance. A run that did not converge is still stored and still
+    -- displayed, flagged: hiding it would leave the page silently stale.
+    iterations    INT NOT NULL,
+    converged     BOOLEAN NOT NULL,
+    -- How much evidence went in, so a run can be compared to its predecessor
+    -- without re-reading game_results.
+    pairs_used    BIGINT NOT NULL,
+    jobs_used     INT NOT NULL
+);
+
+CREATE INDEX rating_runs_pool_idx ON rating_runs (pool_id, computed_at DESC);
+
+-- The ratings themselves: one row per player config per run. This is the only
+-- table in the schema that holds a rating.
+CREATE TABLE player_config_ratings (
+    run_id           UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
+    player_config_id UUID NOT NULL REFERENCES player_configs(id),
+    rating           DOUBLE PRECISION NOT NULL,
+    -- Approximate Elo standard error. Wide bars are the honest signal that a
+    -- config has barely played, or has only played opponents far from its own
+    -- strength; the page shows them next to the rating for that reason.
+    stderr           DOUBLE PRECISION NOT NULL,
+    pairs_played     BIGINT NOT NULL,
+    -- FALSE when no chain of games connects this config to the pool's anchor.
+    -- Ratings are identifiable only relative to the anchor, so such a config's
+    -- number comes from the fit's prior alone and means nothing; it is shown as
+    -- unrated rather than as a confident 1500.
+    connected_to_anchor BOOLEAN NOT NULL,
+    is_anchor        BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (run_id, player_config_id)
 );
 
 -- Backups

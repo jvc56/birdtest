@@ -5,11 +5,17 @@
 guarantee and how we check it**: six tiers, what each one is allowed to touch,
 and the shared machinery underneath them.
 
-The organising idea is that **the development environment and the end-to-end
-suite are the same thing**. E2E brings up the stack, seeds it, runs workers,
-drives a browser, asserts, and tears down. The dev environment does all of that
-except the last two steps. Building them as one code path means the dev
-environment cannot rot — every E2E run exercises it.
+The organising idea is that **the development environment and the automated
+tiers above it are one code path**. A tier brings up the stack, seeds it, runs
+workers, asserts, and tears down; the dev environment does all of that except
+the last two steps. Sharing the bring-up means the dev environment cannot rot —
+every tier-5 and tier-6 run exercises it.
+
+The one thing the dev environment does *not* share is the worker. **A real
+`magpie contribute` is the only worker outside tier 5.** `fake_worker.py` is a
+tier-5 instrument — it makes browser journeys deterministic without a C
+toolchain — and tier 6 and `dev.py` both refuse it, so nothing you develop
+against or ship on is validated by synthetic results.
 
 ---
 
@@ -32,7 +38,7 @@ tier that is not run by default.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 26 | `#[cfg(test)]` in `inputdata`, `backups`, `jobs::klv`, `jobs::racks`, `version`, `compat` |
+| 1 Unit | 46 | `#[cfg(test)]` in `inputdata`, `backups`, `jobs::klv`, `jobs::racks`, `version`, `compat`, `stats::sprt`, `stats::bradley_terry` |
 | 2 Integration | **0** | — |
 | 3 API | **0** | — |
 | 4 Contract | 5 | `routes::worker::contract_fixtures` |
@@ -61,8 +67,13 @@ What belongs here:
 - SPRT log-likelihood ratio and boundary computation, against hand-computed
   values rather than "it runs". (`testdist.csv` in
   `backend/src/jobs/testdata/` is the existing precedent for compiled-in
-  fixture bytes.)
-- The Glicko-2 rating-period update.
+  fixture bytes.) Including the property that makes the pentanomial the right
+  sample: the pair view and the per-game view must agree on the mean, and
+  filtering to divergent pairs must be shown to break that.
+- The Bradley-Terry rating fit: that the anchor holds, that the scale matches
+  the Elo formula, that the result is order-independent, that an undefeated or
+  unplayed config stays finite and is flagged rather than guessed, and that a
+  non-transitive cycle flattens the ratings while showing up in the residuals.
 - `version::Version` ordering — specifically that `1.9.0 < 1.10.0`, the trap the
   three integer columns exist to avoid.
 - Rack unranking and the `total_racks` dynamic-programming count, including that
@@ -186,7 +197,10 @@ and read by its tests, this tier pins one side of a two-sided contract.
 ## 5. End-to-end
 
 Playwright against the full stack in Docker, with `fake_worker.py` supplying
-contributions. Journeys, not assertions per field — anything that can be checked
+contributions — **the only tier that uses it**, and the reason it exists.
+A browser journey needs contributions to arrive on cue and land at predictable
+values; a real MAGPIE would supply neither, and would put a C build in the way
+of a suite that runs on every pull request. Journeys, not assertions per field — anything that can be checked
 at tier 3 belongs at tier 3, because a failure there names the cause and a
 failure here names a symptom.
 
@@ -238,8 +252,9 @@ what it can do: that `contribute` is a registered command, and that it accepts
 the current required claim body. When production versions become real, this
 becomes a version check and the probe retires.
 
-**This tier cannot use the synthetic fixture lexica.** The fixture's
-`NWL23.kwg` is a stub; a real MAGPIE would load it and fail, or worse, not fail.
+**This tier cannot use the synthetic fixture lexica** — nor can the dev
+environment, for the same reason. The fixture's `NWL23.kwg` is a stub; a real
+MAGPIE would load it and fail, or worse, not fail.
 Tier 6 seeds from a real MAGPIE-DATA install (`scripts/seed.py --real-data`,
 pointing at `MAGPIE_DATA_PATH`), which is also what makes it a genuine check that
 birdtest's pinned digests match what `download_data.sh` actually installs. If
@@ -264,7 +279,9 @@ seeded stack, asserting the results land and are credited.
 ## The shared substrate
 
 Tiers 5 and 6 and the dev environment all need the same thing: an empty database
-turned into a state where work can flow. That chain is six steps and three of
+turned into a state where work can flow. They diverge only on which data seeds
+it — the fixture tarball for tier 5, a real MAGPIE-DATA install for tier 6 and
+`dev.py`, because a real worker cannot be fed stubs. That chain is six steps and three of
 them did not exist a month ago, which is why it belongs in code rather than in
 prose.
 
@@ -320,8 +337,9 @@ completely unusable as a per-test fixture. The tiny bag makes the same code path
 run in milliseconds while exercising every part of it.
 
 **State this loudly wherever the fixture is used: `NWL23.kwg` is not NWL23.**
-Any code that actually loads it is broken by construction. That is tier 6's
-problem and only tier 6's, which is why tier 6 uses real data instead.
+Any code that actually loads it is broken by construction. That is why the two
+contexts with a real worker in them — tier 6 and `dev.py` — seed from real data
+instead, and why the fixture is confined to tier 5 and below.
 
 Serving it needs one small change to the backend: [`inputdata.rs`](backend/src/inputdata.rs)
 hardcodes `api.github.com` and `raw.githubusercontent.com`, and
@@ -366,17 +384,30 @@ easier in the moment.
 ## The development environment
 
 ```
-scripts/dev.py [--workers N] [--magpie] [--no-browser]
+scripts/dev.py [--workers N] [--no-browser]
 ```
 
 Brings up the stack, waits for health, seeds it, starts `N` workers, and opens a
-browser. It is tier 5's setup with the assertions and the teardown removed, and
-it calls the same `seed.py`.
+browser. It is tier 6's setup with the assertions and the teardown removed, and
+it calls the same `seed.py --real-data`.
 
-**Workers are `fake_worker.py` by default.** `--magpie` swaps in real
-`magpie contribute` clients. The default matters: birdtest's whole stack
-currently needs Docker and nothing else, and making the common path require a C
-build would give that up for a convenience.
+**Workers are always real `magpie contribute` clients.** There is no fake-worker
+mode. `fake_worker.py` belongs to tier 5 and nowhere else: it exists so a browser
+journey can have contributions arriving under it without a C toolchain in the
+loop, and that is a property of an assertion harness, not of a place you develop.
+Developing against synthetic results means the behaviour you watch in the UI is
+one nobody's MAGPIE will ever produce — the numbers move, the dashboard fills,
+and none of it is evidence. The cost is real and accepted: `dev.py` requires a
+built MAGPIE (`MAGPIE_BIN`) and a real MAGPIE-DATA install (`MAGPIE_DATA_PATH`),
+so bringing up birdtest is no longer a Docker-only operation, and it fails with a
+message naming both when either is missing.
+
+**Which means `dev.py` seeds from real data, not the fixture.** A real MAGPIE
+cannot be fed the fixture's stub lexica, for exactly the reason tier 6 cannot —
+so the dev environment inherits tier 6's data requirements wholesale, including
+the leave-generation cost noted above. `scripts/dev.py --job-type` passes through
+to the seed; prefer a `games` or `game_pairs` job for day-to-day work and reach
+for `leave_generation` deliberately.
 
 `--no-browser` for SSH sessions and CI.
 
@@ -415,7 +446,7 @@ slower and more environment-sensitive than a pull request should wait on.
 | 6 | `#[ignore]`, marked with a reason | `cargo test -- --ignored` |
 
 Environment variables: `TEST_DATABASE_URL` (tiers 2–3), `MAGPIE_BIN` and
-`MAGPIE_DATA_PATH` (tier 6).
+`MAGPIE_DATA_PATH` (tier 6 and `scripts/dev.py`, required by both).
 
 **A test that needs a service it cannot find fails; it does not skip.** The one
 exception is tier 6, which is excluded from the default run by `#[ignore]` — but

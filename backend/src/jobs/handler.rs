@@ -298,10 +298,22 @@ pub struct CapturedPosition {
 pub struct GameResultsResponse {
     /// Every game the task played. For game pairs that is two per pair.
     pub all_games: GameAggregate,
+    /// Completed pairs bucketed by player 1's half-point score across the
+    /// pair: index 0 is "lost both", 2 is "split", 4 is "won both". Required
+    /// for game pairs, absent for plain games.
+    ///
+    /// This is the sample a paired job is evaluated on. The pair is the
+    /// independent unit — the two games share a seed — and every pair counts,
+    /// including the identically-played ones, which are 1-1 ties in bucket 2.
+    #[serde(default)]
+    pub pentanomial: Option<[i64; 5]>,
     /// The divergent subset: pairs whose two games did not play identically.
-    /// Required for game pairs, absent for plain games. Pairs that played
-    /// identically are guaranteed ties carrying no information, so the
-    /// divergent subset is where a pairs job's signal lives.
+    /// Optional for game pairs, absent for plain games.
+    ///
+    /// A diagnostic only — it says how often two configs actually differ.
+    /// Deliberately not a statistical sample: selecting the pairs that produced
+    /// a result conditions on the outcome, which makes a hairline difference
+    /// look enormous.
     #[serde(default)]
     pub divergent_games: Option<GameAggregate>,
     /// Empty unless the job asked for capture, which keeps every existing
@@ -372,6 +384,8 @@ pub struct PositionAnalysisRecord {
 #[derive(Debug, Clone)]
 pub struct GameResultsRecord {
     pub all_games: GameAggregate,
+    /// See [`GameResultsResponse::pentanomial`]. `None` for plain games jobs.
+    pub pentanomial: Option<[i64; 5]>,
     pub divergent_games: Option<GameAggregate>,
     pub positions: Vec<PositionAnalysis>,
 }

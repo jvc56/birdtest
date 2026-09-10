@@ -28,6 +28,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::trace::TraceLayer;
 
+/// How often to look for rating pools whose evidence has grown. Ratings are a
+/// summary, not a control signal, so minutes of staleness cost nothing while
+/// per-submission refits would be pure waste.
+const RATING_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Local development reads `.env`; in ECS the same variables arrive from the
@@ -72,13 +77,38 @@ async fn main() -> Result<()> {
         Err(err) => tracing::error!(error = %err.message, "could not reap orphaned imports"),
     }
 
+    // Rating fits run on a periodic sweep rather than on result submission: a
+    // fit is global to a pool, an active job submits results far faster than
+    // any rating needs to move, and nothing in the submission path waits on the
+    // answer. SPRT, which *does* gate job completion, stays inline.
+    {
+        let db = state.pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RATING_SWEEP_INTERVAL);
+            // A missed tick under load should not queue up a burst of refits.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match ratings::recompute_stale(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(pools = n, "refit rating pools"),
+                    Err(err) => {
+                        tracing::error!(error = %err.message, "rating sweep failed")
+                    }
+                }
+            }
+        });
+    }
+
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .nest("/api/worker", routes::worker::router())
         .nest("/api/auth", routes::auth::router())
         .merge(routes::account::router())
         .nest("/api/admin", routes::admin::router())
+        .nest("/api/admin", routes::ratings::admin_router())
         .nest("/api", routes::public::router())
+        .nest("/api", routes::ratings::public_router())
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 

@@ -94,13 +94,21 @@ export interface SprtResult {
 
 export interface GameStats {
   unit: 'game' | 'pair';
-  /** Counts over the tally the LLR is computed from — for pairs, the divergent subset. */
+  /** Per-game counts over every game played, for both job types. */
   wins: number;
   losses: number;
   draws: number;
   /** Games for a `games` job, pairs for a `game_pairs` job. */
   units_completed: number;
-  /** Game pairs only: how many pairs diverged and so carried any signal. */
+  /**
+   * Game pairs only: the five pair outcomes the LLR is computed from, indexed
+   * by player 1's half-point score across the pair (0 = lost both, 4 = won
+   * both). Every completed pair is in here, including the ones that played
+   * identically — they are 1-1 ties in bucket 2, and they are what makes a
+   * paired run lower-variance than an unpaired one.
+   */
+  pentanomial?: [number, number, number, number, number];
+  /** Game pairs only: how many pairs diverged. A diagnostic, not the sample. */
   divergent_pairs?: number;
   min_units: number;
   max_units: number;
@@ -147,13 +155,6 @@ export interface JobStats {
     min_rack: string | null;
     min_rack_count: number | null;
   };
-  ratings: {
-    player_config_id: string;
-    name: string;
-    rating: number;
-    rating_deviation: number;
-    games_played: number;
-  }[];
   workers: {
     user_id: string | null;
     anon_uuid: string | null;
@@ -173,7 +174,7 @@ export interface PlayerConfig {
   klv_id: string;
   /** Null for a static player, which never loads a win% model. */
   winpct_id: string | null;
-  /** Set when this config was cloned onto newer data; ratings do not carry over. */
+  /** Set when this config was cloned onto newer data; a clone starts unrated. */
   cloned_from_id: string | null;
   max_iterations: number | null;
   num_plies: number | null;
@@ -331,6 +332,10 @@ export const api = {
         Object.entries(params).map(([k, v]) => [k, String(v)])
       )}`
     ),
+  ratingPools: () => get<RatingPoolListItem[]>('/api/rating-pools'),
+  ratingPool: (id: string) => get<RatingPoolDetail>(`/api/rating-pools/${id}`),
+  ratingHistory: (id: string) => get<RatingHistoryPoint[]>(`/api/rating-pools/${id}/history`),
+
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
   workers: (page = 0) => get<Page<Record<string, unknown>>>(`/api/workers?page=${page}`),
 
@@ -342,6 +347,23 @@ export const api = {
   createPlayerConfig: (body: Record<string, unknown>) =>
     post<PlayerConfig>('/api/admin/player-configs', body),
   deletePlayerConfig: (id: string) => del<void>(`/api/admin/player-configs/${id}`),
+
+  // Admin: rating pools. Membership is an admin decision because not every
+  // player config belongs in a rating, and every change refits the whole pool.
+  createRatingPool: (body: {
+    name: string;
+    variant: string;
+    letterdist_id: string;
+    layout_id: string;
+    anchor_player_config_id: string;
+    anchor_rating?: number;
+  }) => post<{ id: string }>('/api/admin/rating-pools', body),
+  addRatingPoolMember: (poolId: string, player_config_id: string) =>
+    post<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/members`, { player_config_id }),
+  removeRatingPoolMember: (poolId: string, configId: string) =>
+    del<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/members/${configId}`),
+  recomputeRatingPool: (poolId: string) =>
+    post<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/recompute`),
   inputData: () => get<InputData[]>('/api/admin/input-data'),
   deleteInputData: (id: string) => del<void>(`/api/admin/input-data/${id}`),
   startImport: (body: { tarball_date: string; git_ref?: string }) =>
@@ -373,3 +395,75 @@ export const api = {
       )}`
     )
 };
+
+
+// --- Ratings ---------------------------------------------------------------
+//
+// Ratings are pool-scoped, not job-scoped: a rating is a statement about a
+// player config across every game pair it has played under one set of
+// conditions, so it does not belong to any single job.
+
+export interface RatingPoolListItem {
+  id: string;
+  name: string;
+  variant: string;
+  letter_distribution: string;
+  layout: string;
+  members: number;
+  last_computed_at: string | null;
+}
+
+export interface RatingRow {
+  player_config_id: string;
+  name: string;
+  rating: number;
+  /** Approximate Elo standard error. Wide bars mean "barely measured". */
+  stderr: number;
+  pairs_played: number;
+  /**
+   * False when no chain of games links this config to the pool's anchor. Its
+   * rating is then an artefact of the fit's prior and must be shown as unrated
+   * rather than as a number.
+   */
+  connected_to_anchor: boolean;
+  is_anchor: boolean;
+}
+
+export interface RatingResidual {
+  row: string;
+  col: string;
+  pairs: number;
+  actual: number;
+  predicted: number;
+}
+
+export interface RatingRun {
+  id: string;
+  computed_at: string;
+  trigger: string;
+  iterations: number;
+  converged: boolean;
+  pairs_used: number;
+  jobs_used: number;
+}
+
+export interface RatingPoolDetail {
+  id: string;
+  name: string;
+  variant: string;
+  letter_distribution: string;
+  layout: string;
+  anchor_player_config_id: string;
+  anchor_rating: number;
+  run: RatingRun | null;
+  ratings: RatingRow[];
+  residuals: RatingResidual[];
+}
+
+export interface RatingHistoryPoint {
+  computed_at: string;
+  player_config_id: string;
+  name: string;
+  rating: number;
+  stderr: number;
+}

@@ -65,6 +65,16 @@ class Stats:
 # ---------------------------------------------------------------------------
 
 
+def _game_outcome(rng: random.Random, p1_win_probability: float) -> int:
+    """One game's result for player 1, in half-points: 2 win, 1 tie, 0 loss."""
+    roll = rng.random()
+    if roll < p1_win_probability:
+        return 2
+    if roll < p1_win_probability + 0.02:
+        return 1  # draws are rare but must be exercised
+    return 0
+
+
 def _aggregate(rng: random.Random, games: int, p1_win_probability: float) -> dict:
     """One synthetic `autoplay` summary — the shape MAGPIE actually reports.
 
@@ -74,13 +84,10 @@ def _aggregate(rng: random.Random, games: int, p1_win_probability: float) -> dic
     """
     wins = losses = ties = 0
     for _ in range(games):
-        roll = rng.random()
-        if roll < p1_win_probability:
-            wins += 1
-        elif roll < p1_win_probability + 0.02:
-            ties += 1  # draws are rare but must be exercised
-        else:
-            losses += 1
+        outcome = _game_outcome(rng, p1_win_probability)
+        wins += outcome == 2
+        ties += outcome == 1
+        losses += outcome == 0
 
     return {
         "games": games,
@@ -154,24 +161,67 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
         return result
 
     if job_type == "game_pairs":
-        # Two games per pair. Pairs whose games played identically are
-        # guaranteed ties and are excluded from the divergent subset, which is
-        # what the server computes the LLR from — so the divergent count is a
-        # fraction of the total, and the outcomes live there.
-        games = request["num_games"] * 2
-        divergent = max(2, (int(games * rng.uniform(0.5, 1.0)) // 2) * 2)
-        identical_pairs = (games - divergent) // 2
-        divergent_agg = _aggregate(rng, divergent, p1_win_probability)
+        # Built one pair at a time, because the pair is the unit the server
+        # evaluates: it scores the pentanomial, five counts indexed by player
+        # 1's half-point total across the pair.
+        #
+        # A pair whose two games played identically is a guaranteed 1-1 split
+        # (the same game from both seats), so it lands in bucket 2 and stays in
+        # the sample. Those pairs are what make paired play worth doing — they
+        # pull the variance down — and dropping them, as the divergent-only
+        # view does, would make a hairline difference look enormous.
+        pairs = request["num_games"]
+        divergence_rate = rng.uniform(0.2, 0.9)
+        pentanomial = [0, 0, 0, 0, 0]
+        wins = losses = ties = 0
+        divergent_games = divergent_wins = divergent_losses = divergent_ties = 0
+
+        for _ in range(pairs):
+            if rng.random() < divergence_rate:
+                # Divergent: the two games are played out independently.
+                outcomes = [_game_outcome(rng, p1_win_probability) for _ in range(2)]
+                divergent_games += 2
+                for outcome in outcomes:
+                    divergent_wins += outcome == 2
+                    divergent_ties += outcome == 1
+                    divergent_losses += outcome == 0
+            else:
+                # Identical: player 1 takes one seat's win and the other's loss.
+                outcomes = [2, 0]
+
+            for outcome in outcomes:
+                wins += outcome == 2
+                ties += outcome == 1
+                losses += outcome == 0
+            pentanomial[sum(outcomes)] += 1
+
         all_games = {
-            **divergent_agg,
-            "games": games,
-            # Each identical pair contributes one win to each side: the same
-            # game played from both seats.
-            "wins": divergent_agg["wins"] + identical_pairs,
-            "losses": divergent_agg["losses"] + identical_pairs,
+            "games": pairs * 2,
+            "wins": wins,
+            "losses": losses,
+            "ties": ties,
+            "p1_score_mean": round(rng.uniform(400, 460), 6),
+            "p1_score_sd": round(rng.uniform(45, 70), 6),
+            "p2_score_mean": round(rng.uniform(400, 460), 6),
+            "p2_score_sd": round(rng.uniform(45, 70), 6),
         }
-        result = {"all_games": all_games, "divergent_games": divergent_agg}
-        _add_captured_positions(result, request, rng, games)
+        result = {
+            "all_games": all_games,
+            "pentanomial": pentanomial,
+            # Still reported, still stored, purely as a diagnostic: it says how
+            # often the two configs actually differ. Nothing is tested on it.
+            "divergent_games": {
+                "games": divergent_games,
+                "wins": divergent_wins,
+                "losses": divergent_losses,
+                "ties": divergent_ties,
+                "p1_score_mean": all_games["p1_score_mean"],
+                "p1_score_sd": all_games["p1_score_sd"],
+                "p2_score_mean": all_games["p2_score_mean"],
+                "p2_score_sd": all_games["p2_score_sd"],
+            },
+        }
+        _add_captured_positions(result, request, rng, pairs * 2)
         return result
 
     if job_type == "opening_rack":

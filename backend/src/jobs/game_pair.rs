@@ -1,6 +1,7 @@
 use super::handler::*;
 use super::JobData;
 use crate::error::{AppError, AppResult};
+use crate::stats::sprt::Pentanomial;
 use crate::models::job::GamePairConfig;
 use sqlx::PgConnection;
 use uuid::Uuid;
@@ -31,23 +32,53 @@ impl JobHandler for GamePairHandler {
             ));
         }
 
-        // The divergent subset is where a pairs job's signal lives, so a result
-        // without it cannot be evaluated.
-        let divergent = response.divergent_games.ok_or_else(|| {
-            AppError::bad_request("a game_pairs result must report divergent_games")
-        })?;
-        super::game::validate_aggregate(&divergent, "divergent_games")?;
-        if divergent.games % 2 != 0 || divergent.games > response.all_games.games {
+        // The pentanomial is what the job is actually evaluated on, so a result
+        // without it cannot be scored at all.
+        let pentanomial = response
+            .pentanomial
+            .ok_or_else(|| AppError::bad_request("a game_pairs result must report a pentanomial"))?;
+        if pentanomial.iter().any(|&count| count < 0) {
+            return Err(AppError::bad_request("pentanomial counts must be non-negative"));
+        }
+
+        // The pentanomial and the game aggregate describe the same games from
+        // two directions, so they have to agree on both. Checking here rather
+        // than trusting the worker is what stops a miscounting client from
+        // quietly biasing every rating pool its jobs feed: the numbers are
+        // individually plausible and only inconsistent with each other.
+        let counts = Pentanomial { counts: std::array::from_fn(|i| pentanomial[i] as u64) };
+        if counts.pairs() * 2 != response.all_games.games as u64 {
             return Err(AppError::bad_request(
-                "divergent_games must be even and no larger than the total games played",
+                "pentanomial pair count must be exactly half the games played",
             ));
+        }
+        let expected_half_points =
+            2 * response.all_games.wins as u64 + response.all_games.ties as u64;
+        if counts.half_points() != expected_half_points {
+            return Err(AppError::bad_request(
+                "pentanomial disagrees with the game counts about player 1's score",
+            ));
+        }
+
+        // The divergent subset is a diagnostic rather than a sample, so it is
+        // still validated, still stored, and no longer required: a client that
+        // reports the pentanomial has already said everything the test needs.
+        let divergent = response.divergent_games;
+        if let Some(divergent) = divergent.as_ref() {
+            super::game::validate_aggregate(divergent, "divergent_games")?;
+            if divergent.games % 2 != 0 || divergent.games > response.all_games.games {
+                return Err(AppError::bad_request(
+                    "divergent_games must be even and no larger than the total games played",
+                ));
+            }
         }
 
         let positions =
             super::game::validate_positions(response.positions, response.all_games.games)?;
         Ok(GameResultsRecord {
             all_games: response.all_games,
-            divergent_games: Some(divergent),
+            pentanomial: Some(pentanomial),
+            divergent_games: divergent,
             positions,
         })
     }
