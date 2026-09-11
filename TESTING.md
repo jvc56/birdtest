@@ -6,10 +6,15 @@ guarantee and how we check it**: seven tiers, what each one is allowed to touch,
 the shared machinery underneath them, and an enumerated list of every test worth
 writing.
 
-The lists below are meant to be **worked through**, not read for flavour. Every
-entry has an id (`U-SPRT-3`, `I-CLAIM-7`, …) so progress can be tracked, and is
-phrased as a claim a test either proves or fails to prove. An entry says what to
-set up and what to assert; it does not say how to write Rust.
+The lists below are meant to be **worked through**, not read for flavour. There
+are 242 entries. Each has an id (`U-RACK-3`, `I-SCHED-13`, …) so progress can be
+tracked, and is phrased as a claim a test either proves or fails to prove. An
+entry says what to set up and what to assert; it does not say how to write Rust.
+
+Two pieces of infrastructure have to exist before most of them can be written,
+and neither does yet: the [tier-2 harness](#2-integration) (155 entries depend on
+it) and a [file mail backend](#reading-confirmation-codes) (2 depend on it).
+Both are specified below, decisions included.
 
 The organising idea is that **the development environment and the automated
 tiers above it are one code path**. A tier brings up the stack, seeds it, runs
@@ -358,29 +363,100 @@ Real Postgres, migrations applied, **no HTTP layer**. This is where birdtest's
 genuinely hard logic lives, because most of it is SQL and concurrency rather
 than Rust.
 
-**Harness**: each test creates a uniquely named throwaway database on the server
-in `TEST_DATABASE_URL` (defaulting to the compose Postgres), runs
-`sqlx::migrate!`, and drops it at the end. Per-test databases rather than a
-shared one because `cargo test` runs in parallel threads and these tests are
-about contention — a shared database would make them interfere in ways that look
-like the bugs they exist to find. Not `testcontainers` initially: the compose
-Postgres is already running for development, and a container per test costs
-seconds where a `CREATE DATABASE` costs milliseconds. Revisit if isolation
-starts to bite.
+**Build the harness first.** It is the dependency for tiers 2 and 3 — 155 of the
+entries in this document cannot be written without it — and it is not yet
+written. Three decisions, settled below, because each has an obvious-looking
+answer that is wrong here.
 
-**Build this harness first.** It is the dependency for tiers 2 and 3, and every
-entry below assumes it:
+### Isolation: `CREATE DATABASE … TEMPLATE`
+
+Each test gets its own database, cloned from a single pre-migrated template:
 
 ```rust
-let db = TestDb::new().await;          // create, migrate, return a pool
+let db = TestDb::new().await;   // CREATE DATABASE <unique> TEMPLATE birdtest_test_template
+                                // ... test body ...
+                                // Drop on Drop
+```
+
+Measured against the compose Postgres (35 tables, an 877-line migration):
+
+| | Per test | Supports concurrency tests? |
+|---|---|---|
+| Transaction per test, rolled back | ~1 ms | **No** |
+| `CREATE DATABASE` + run migrations | ~360 ms | Yes |
+| **`CREATE DATABASE … TEMPLATE`** | **~125 ms** | **Yes** |
+
+**Transaction-per-test is the usual advice and it is wrong for this suite.** A
+rolled-back transaction is invisible to a second connection, so the tests that
+matter most cannot be written in it at all: `I-SCHED-13` (concurrent claimers
+racing the `(job_id, seed)` unique index), `I-LEAVE-2` (concurrent upserts
+summing occurrences), and `I-SUBMIT-3` (counter updates under contention). And
+`I-AUDIT-2` asserts that a log written inside a rolled-back transaction does not
+persist, which is incoherent if the test is itself that transaction.
+
+The template is built once, before any test runs, behind a `OnceCell`. Two
+constraints that will otherwise cost an afternoon:
+
+- **Nothing may hold a connection to the template.** Postgres refuses
+  `CREATE DATABASE … TEMPLATE` while one is open, so the pool used to build it
+  must be closed before any test clones it.
+- **Template creation must be serialized.** `cargo test` runs in parallel
+  threads; two racing to build it will collide.
+
+Not `testcontainers`: the compose Postgres is already running for development,
+and a container per test costs seconds where a clone costs 125 ms. Revisit if
+isolation starts to bite.
+
+Do **not** add a second, faster isolation mode for the read-only tests. Two
+modes is a decision to re-make at every new test, in exchange for 100 ms.
+
+### State: builders that are deliberately dumber than the application
+
+```rust
 let admin = db.user().admin().create().await;
 let ld    = db.input_data().letterdist("english").create().await;
 let cfg   = db.player_config().static_equity().create().await;
 let job   = db.job().game_pairs(cfg_a, cfg_b).active(100).create().await;
 ```
 
-Builders with sane defaults and per-field overrides, **not** a shared fixture
-scenario — see [What tiers 2 and 3 must not share](#what-tiers-2-and-3-must-not-share).
+Typed builders with defaults and per-field overrides, for about **ten
+entities** — user, api_key, input_data, player_config, job plus its four config
+rows, task, task_claim, game_result, rating_pool. Not all 35 tables; anything
+else a test needs, it inserts inline. Raw helper functions would work but put
+six required columns at every call site and make a schema change touch every
+test.
+
+**The rule that matters: a builder writes SQL directly and validates nothing.**
+Roughly half the entries below need a state the application would refuse to
+create, and a builder that enforces invariants makes exactly those unwritable:
+
+- `I-SCHED-14` — a task already at `redundancy` active claims
+- `I-SCHED-12` — a claim exactly one second past its timeout
+- `I-JOB-7` — an allocation outside 0–100
+- `I-SUBMIT-2` — a `game_results` row whose pentanomial contradicts its counts
+
+This is the same boundary as [What tiers 2 and 3 must not
+share](#what-tiers-2-and-3-must-not-share), one level down: the fixture must be
+able to express what the system forbids, or the tests that prove the system
+forbids it cannot exist.
+
+Two approaches that look tempting and are not: building state by calling the
+application's own functions is circular — it uses the thing under test to set up
+the test — and building it over the HTTP API makes precise states unreachable,
+which is the whole point of not sharing the seed.
+
+### Time: an explicit column, not an injected clock
+
+Many entries need "N seconds ago". Timeouts are computed from `TIMESTAMPTZ`
+columns, so the builder takes an explicit `claimed_at` and the test passes
+`now() - interval '10 minutes'`. Cheaper than a clock abstraction, and it
+exercises the real SQL rather than a test double of it.
+
+### Order to build in
+
+Ninety tier-2 entries cannot land at once. Harness, then `I-SCHED-*` — the largest
+group, the hardest logic, and the part that breaks silently. Then `I-JOB-*`,
+where the `win_pct_model` bug lived. Then the rest by group, cheapest first.
 
 ### `I-SCHED-*` — scheduler (`scheduler.rs`)
 
@@ -821,12 +897,49 @@ because the built artifact is what ships.
 - `E-9` The password reset flow end to end.
 - `E-10` A page renders correctly at phone width — one journey, not all of them.
 
-**Open question — reading confirmation codes.** `MAIL_BACKEND=console` writes
-codes and reset links to the backend's stdout. `scripts/seed.py` scrapes
-`docker compose logs`, which works but is awkward from a browser test. A
-`MAIL_BACKEND=file` writing one message per file into a shared volume would make
-`E-2` and `E-9` deterministic and is probably worth adding before this tier is
-written.
+### Reading confirmation codes
+
+Two journeys need to read an emailed code. This is the one piece of tier-5
+infrastructure that does not exist yet, and it should be built before the tier
+is written.
+
+**First, shrink the problem.** Only `E-2` (register → confirm → log in) and
+`E-9` (password reset) need a code at all. The other eight need a *confirmed
+admin*, which `scripts/seed.py` already produces — so the Playwright fixture
+seeds that user and those journeys start at login. That turns "how does the
+browser read mail" into a question about two tests rather than ten.
+
+**Then add `MAIL_BACKEND=file`.** One message per file in a bind-mounted
+directory, named by timestamp and sanitised recipient:
+
+```
+$MAIL_OUTBOX_DIR/20260910-191500-e2e-<uuid>-at-example-invalid.txt
+```
+
+A journey registers `e2e-<uuid>@example.invalid` and reads the file matching its
+own address. **Naming by recipient is the point**, not a convenience: it is what
+makes parallel journeys safe, and it is exactly what the log-scraping approach
+cannot do, since the log is one stream with no key tying a code to the
+registration that caused it.
+
+`MAIL_BACKEND` is already a config enum with a `Console` arm of about six lines,
+so this is one more arm rather than a new concept — and once it exists,
+`scripts/seed.py` should use it too and drop its `docker compose logs` scraping.
+The hack disappears rather than being reimplemented in a second place.
+
+What was considered and rejected:
+
+| Approach | Why not |
+|---|---|
+| **Mailpit / MailHog** container with an HTTP API | The one that looks best and is not. birdtest sends through the **SES SDK, not SMTP** ([email.rs](backend/src/email.rs)), so this needs an SMTP backend that production never executes — the E2E tier would be exercising a path that does not ship, which is backwards for the tier whose job is testing what does. |
+| A **test-only endpoint** returning the latest code, env-gated | A permanent auth-bypass endpoint. One misconfiguration and anyone can confirm any account. |
+| **Scraping `docker compose logs`** from Playwright | Zero code change, and what `seed.py` does today. Cannot tell which code belongs to which registration when journeys run in parallel, and needs Docker daemon access from wherever Playwright runs. |
+| **Reading the database** | Impossible, deliberately: `email_confirmations` stores only a hash, so a leaked dump cannot hand out working confirmation links. |
+| A **fixed code** under a test flag | Weakens a real security property in a way that can leak into another environment. |
+
+The cost to accept: a third mail backend is a third thing to keep working. It is
+small, but it belongs in `docker-compose.yml` and `.env.example` so it does not
+become folklore.
 
 ---
 
@@ -1034,7 +1147,9 @@ scripts/seed.py [--api URL] [--job-type TYPE] [--tarball-date YYYYMMDD]
 1. Register a user, read the confirmation code, confirm it. The code comes
    from the backend's log, not the database: `email_confirmations` stores only
    a hash, which is the point — a leaked dump must not hand out working
-   confirmation links.
+   confirmation links. (Log scraping is a stopgap. Once `MAIL_BACKEND=file`
+   exists for tier 5, this reads the outbox file for its own address instead —
+   see [Reading confirmation codes](#reading-confirmation-codes).)
 2. Promote to admin (SQL — `is_admin` is settable through no endpoint).
 3. Import input data and confirm the staged diff. The date defaults to the
    `DATA_VERSION` in the caller's MAGPIE checkout, so the digests the server
