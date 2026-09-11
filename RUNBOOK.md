@@ -146,7 +146,14 @@ In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
 | 4 | `game_results`, `leave_records` | `task_id IN (...)` |
 | 5 | `position_analysis_records` → `_moves` → `_plies` | `task_id IN (...)`, then by parent id |
 | 6 | `leave_rack_progress`, `leave_generation_artifacts` | `job_id = :job` |
-| 7 | `player_config_ratings` | `job_id = :job` |
+
+Ratings are not in this list: they belong to rating pools rather than jobs, and
+are recomputed from `game_results` (see §2.4).
+
+Reset the job's dispatch counter afterwards, or the scheduler treats the
+restored job as owing it nothing: `UPDATE jobs SET claims_issued = (SELECT
+count(*) FROM task_claims c JOIN tasks t ON t.id = c.task_id WHERE t.job_id =
+:'job') WHERE id = :'job';`
 
 `position_analysis_records.id` and `_moves.id` are `BIGSERIAL`. Restoring them
 with their original ids preserves the parent-child links; afterwards the
@@ -199,11 +206,11 @@ COMMIT;
 
 ### 2.4 Recompute derived state
 
-- **Glicko** (`player_config_ratings`, game-pairs jobs): ratings are applied
-  per submission and cannot be reconstructed by copying rows alone. Either
-  restore the `player_config_ratings` rows from the scratch copy as they stood
-  (correct if nothing was submitted since), or accept the ratings as they are
-  and note the discontinuity.
+- **Ratings** (`rating_runs` / `player_config_ratings`): a batch fit over
+  each pool's `game_results`, never applied per submission. Once the results
+  are back the two-minute sweep notices the pool's evidence changed and refits
+  it; `POST /api/admin/rating-pools/:id/recompute` does it immediately. Nothing
+  to copy.
 - **SPRT**: computed from `game_results` on read, so it corrects itself once
   the results are back.
 - **Leave-generation artifacts**: if any object is missing, use
@@ -270,11 +277,16 @@ SELECT count(*) AS counter_disagreements
  WHERE t.accepted_count <> actual.accepted OR t.active_claim_count <> actual.active;
 ```
 
-```bash
-# 4. Functional smoke: claim, execute and submit one task against the restored
-#    stack. This exercises dispatch, the artifact fetch and the result write.
-python worker/fake_worker.py --server-url https://<host> --tasks 1
-```
+4. **Functional smoke**: run one real task against the restored stack with
+   MAGPIE, from a machine with the pinned data installed -- a `contribute.txt`
+   with `server https://<host>` and `maxtasks 1`, then `magpie contribute`.
+   This exercises dispatch, data verification, the artifact fetch and the
+   result write, and the result it submits is a genuine one.
+
+   **Never use `worker/fake_worker.py` for this.** It submits invented
+   results, the server records them as real contributions to real jobs, and
+   they skew SPRT verdicts and rating fits until someone finds and deletes
+   them. It is test tooling for disposable stacks only.
 
 In-flight claims need no action. Claims open at the restore point are reclaimed
 by the heartbeat timeout, and a worker submitting against a claim the restored

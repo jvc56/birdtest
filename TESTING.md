@@ -11,10 +11,11 @@ are 242 entries. Each has an id (`U-RACK-3`, `I-SCHED-13`, …) so progress can 
 tracked, and is phrased as a claim a test either proves or fails to prove. An
 entry says what to set up and what to assert; it does not say how to write Rust.
 
-Two pieces of infrastructure have to exist before most of them can be written,
-and neither does yet: the [tier-2 harness](#2-integration) (155 entries depend on
-it) and a [file mail backend](#reading-confirmation-codes) (2 depend on it).
-Both are specified below, decisions included.
+Two pieces of infrastructure have to exist before most of them can be written.
+The [tier-2 harness](#2-integration) (155 entries depend on it) now does:
+`backend/tests/common/mod.rs` clones a template database per test and provides
+the SQL builders described below. The [file mail
+backend](#reading-confirmation-codes) (2 depend on it) does not yet.
 
 The organising idea is that **the development environment and the automated
 tiers above it are one code path**. A tier brings up the stack, seeds it, runs
@@ -55,11 +56,11 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 58 | `#[cfg(test)]` in `inputdata`, `backups`, `jobs::klv`, `jobs::racks`, `jobs::plausibility`, `version`, `compat`, `stats::sprt`, `stats::bradley_terry` |
+| 1 Unit | 72 | `#[cfg(test)]` in `inputdata`, `backups`, `jobs::klv`, `jobs::racks`, `jobs::plausibility`, `version`, `compat`, `config`, `clientip`, `sse`, `routes::admin`, `stats::sprt`, `stats::bradley_terry` |
 | 1F Frontend unit | **0** | — (no runner yet) |
-| 2 Integration | **0** | — |
-| 3 API | **0** | — |
-| 4 Contract | 5 | `routes::worker::contract_fixtures` |
+| 2 Integration | **0** | — (the harness exists; see tier 3) |
+| 3 API | 12 | `backend/tests/worker_api.rs`, `backend/tests/admin_api.rs` — each names the bug it would have caught |
+| 4 Contract | 6 | `routes::worker::contract_fixtures`; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | **0** | — |
 | 6 MAGPIE smoke | 2 (`#[ignore]`) | `jobs::klv` round-trips |
 

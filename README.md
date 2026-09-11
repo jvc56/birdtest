@@ -166,9 +166,11 @@ MIN_MAGPIE_VERSION=0.0.0 docker compose up -d
 
 `dev.py` reads the version out of your checkout and sets both for you.
 
-Opening-rack and leave-generation jobs enumerate their whole rack space at
-creation time — for a real English bag that is millions of rows, and 914,624
-leaves for leave generation. Worth knowing before you create one by hand.
+Leave-generation jobs enumerate their whole leave universe at creation time —
+914,624 rows for a real English bag at the default `max_leave_size` of 6 —
+and build a zeroed KLV of it. Worth knowing before you create one by hand.
+Opening-rack jobs only *count* their rack space (3,199,724 racks for English)
+and address it by range, so they are cheap to create.
 
 ### Contributing with MAGPIE
 
@@ -188,6 +190,19 @@ contributing with; it derives the word list and the wordmap from the `.kwg` it
 already has on first use, in about 1.3 seconds per lexicon, and never
 transmits either. See [Worker Client](PLAN.md#worker-client-1) for the full
 protocol.
+
+### Running the tests
+
+```bash
+cd backend && cargo test --lib --bins     # unit and contract tests; no services
+cd backend && TEST_DATABASE_URL=postgres://birdtest:birdtest@localhost:5432/birdtest \
+  cargo test                              # plus the integration tests in backend/tests/
+cd frontend && npm run check
+```
+
+The integration tests clone a template database per test on the server
+`TEST_DATABASE_URL` points at (any database there will do; they never write to
+it), so the compose Postgres is enough. They fail rather than skip without it.
 
 ### Frontend hot reload
 
@@ -234,6 +249,12 @@ aws ssm put-parameter --name /birdtest/DATABASE_URL --type SecureString --overwr
 aws ssm put-parameter --name /birdtest/SESSION_SIGNING_KEY --type SecureString --overwrite \
   --value "$(openssl rand -hex 32)"
 ```
+
+`acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
+redirects — because the backend sets `Secure` cookies, which a browser will not
+keep over plain HTTP. Raise `min_magpie_version` to the first MAGPIE release that
+speaks the contribution protocol before launch; the unreleased branch reports
+`0.0.0`.
 
 `alert_email` has no default: `terraform apply` refuses to run without
 somewhere to send backup failures, because an unmonitored backup is the failure

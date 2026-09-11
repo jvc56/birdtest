@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """Synthetic birdtest worker — speaks the worker API without running MAGPIE.
 
-This exists so server-side behaviour can be tested at speed and on purpose.
+**Test tooling only.** The one production client is MAGPIE itself (`magpie
+contribute`). This script submits *invented* results, and the server cannot
+tell them from real ones: pointed at a production server, every result it
+submits is recorded as a genuine contribution, feeds SPRT verdicts and rating
+fits, and has to be found and deleted by hand. Never run it against anything
+but a disposable test stack.
+
+It exists so server-side behaviour can be tested at speed and on purpose.
 Real games take real time and produce results nobody chose; almost every
 interesting server property is about something else:
 
   * scheduling — priority tiers, deficit-based allocation, redundancy
   * the claim lifecycle — heartbeat timeouts, stale tokens, reclamation
-  * SPRT and Glicko — which need a *chosen* win rate to reach a known verdict
-  * anomaly detection — which needs a client that misbehaves deliberately
-
-None of those want a real engine in the loop. MAGPIE itself (`magpie
-contribute`) is the client that does; this is its counterpart for everything
-else.
+  * SPRT and ratings — which need a *chosen* win rate to reach a known verdict
+  * submission validation and the plausibility checks — which need a client
+    that misbehaves deliberately
 
 Every mode is deterministic under `--seed`, so a failing CI run reproduces.
 """
