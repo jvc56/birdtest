@@ -109,7 +109,13 @@ async fn build_matrix(
                 COALESCE(SUM(r.pent_2), 0)::bigint AS pent_2,
                 COALESCE(SUM(r.pent_3), 0)::bigint AS pent_3,
                 COALESCE(SUM(r.pent_4), 0)::bigint AS pent_4
-         FROM game_results r
+         -- One result per task: with redundancy > 1 the other accepted
+         -- claims replayed the same seeded games, and counting them would
+         -- multiply a job's weight in the fit by its redundancy.
+         FROM (SELECT DISTINCT ON (task_id) *
+               FROM game_results
+               WHERE pent_0 IS NOT NULL
+               ORDER BY task_id, submitted_at, task_claim_id) r
          JOIN tasks t                ON t.id = r.task_id
          JOIN jobs j                 ON j.id = t.job_id
          JOIN job_game_pair_config c ON c.job_id = j.id

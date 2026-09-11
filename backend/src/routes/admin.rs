@@ -70,6 +70,8 @@ async fn list_input_data(
                   + (SELECT COUNT(*) FROM player_configs pc
                       WHERE pc.kwg_id = d.id OR pc.klv_id = d.id OR pc.winpct_id = d.id)
                   + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = d.id)
+                  + (SELECT COUNT(*) FROM rating_pools rp
+                      WHERE rp.letterdist_id = d.id OR rp.layout_id = d.id)
                     AS references
              FROM input_data d
              ORDER BY d.tarball_date DESC, d.role, d.name",
@@ -98,16 +100,17 @@ async fn delete_input_data(
                   WHERE j.letterdist_id = $1 OR j.layout_id = $1)
               + (SELECT COUNT(*) FROM player_configs pc
                   WHERE pc.kwg_id = $1 OR pc.klv_id = $1 OR pc.winpct_id = $1)
-              + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = $1)",
+              + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = $1)
+              + (SELECT COUNT(*) FROM rating_pools rp
+                  WHERE rp.letterdist_id = $1 OR rp.layout_id = $1)",
     )
     .bind(id)
     .fetch_one(&state.pool)
     .await?;
     if uses > 0 {
         return Err(AppError::conflict(format!(
-            "this file is pinned by {uses} job{} or player config{}",
-            if uses == 1 { "" } else { "s" },
-            if uses == 1 { "" } else { "s" }
+            "this file is pinned by {uses} job{s}, player config{s} or rating pool{s}",
+            s = if uses == 1 { "" } else { "s" },
         )));
     }
 
@@ -488,6 +491,8 @@ async fn create_player_config(
 ) -> AppResult<(StatusCode, Json<PlayerConfig>)> {
     csrf::verify(&method, &headers, &jar)?;
 
+    validate_player_config_body(&body)?;
+
     if !matches!(body.recorder_type.as_str(), "best" | "equity" | "all") {
         return Err(AppError::bad_request("recorder_type must be 'best', 'equity' or 'all'"));
     }
@@ -526,6 +531,14 @@ async fn create_player_config(
         || body.num_plies.is_some()
         || body.num_plays.is_some()
         || body.stopping_pct.is_some();
+    // MAGPIE decides per player whether to simulate on plies alone (autoplay
+    // reads `sim_args->num_plies > 0`). A config with simulation settings but
+    // no plies would be treated as a simmer here -- made to name a win%
+    // model, rated as one -- and play statically on every worker.
+    if simming && !body.num_plies.is_some_and(|plies| plies >= 1) {
+        return Err(AppError::bad_request("player config is invalid")
+            .with_field("num_plies", "a simming player must simulate at least 1 ply"));
+    }
     match (simming, &winpct) {
         (true, None) => {
             return Err(AppError::bad_request(
@@ -589,6 +602,59 @@ async fn create_player_config(
     Ok((StatusCode::CREATED, Json(config)))
 }
 
+/// Numbers MAGPIE would refuse, or silently read as "use your own default".
+///
+/// MAGPIE validates these too, but only on a contributor's machine, after a
+/// job has been built on the config and dispatched: every worker would fail
+/// the task, and the job would sit there producing nothing. Refusing at
+/// creation puts the error in front of the admin who can fix it.
+fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
+    let mut err = AppError::bad_request("player config is invalid");
+    if body.name.trim().is_empty() {
+        err = err.with_field("name", "must not be empty");
+    }
+    let positive = [
+        ("max_iterations", body.max_iterations),
+        ("num_plays", body.num_plays),
+        ("num_plays_recorded", body.num_plays_recorded),
+        ("num_plies_recorded", body.num_plies_recorded),
+        ("min_play_iterations", body.min_play_iterations),
+    ];
+    for (field, value) in positive {
+        if value.is_some_and(|v| v < 1) {
+            err = err.with_field(field, "must be at least 1");
+        }
+    }
+    if body.num_plies.is_some_and(|v| v < 0) {
+        err = err.with_field("num_plies", "must not be negative");
+    }
+    if body.time_limit_secs.is_some_and(|v| v < 0) {
+        err = err.with_field("time_limit_secs", "must not be negative");
+    }
+    if body.stopping_pct.is_some_and(|v| !(v > 0.0 && v < 100.0)) {
+        err = err.with_field("stopping_pct", "must be strictly between 0 and 100");
+    }
+    let non_negative = [
+        ("inference_margin", body.inference_margin),
+        ("movegen_margin", body.movegen_margin),
+        ("utility_w_winpct", body.utility_w_winpct),
+        ("utility_w_spread", body.utility_w_spread),
+    ];
+    for (field, value) in non_negative {
+        if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
+            err = err.with_field(field, "must be a finite, non-negative number");
+        }
+    }
+    if body.utility_spread_scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+        err = err.with_field("utility_spread_scale", "must be a finite, positive number");
+    }
+    if err.fields.is_empty() {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
 /// Player configs are immutable, so there is no update endpoint; deletion is
 /// only allowed while nothing references the config.
 async fn delete_player_config(
@@ -608,6 +674,10 @@ async fn delete_player_config(
                  WHERE player1_config_id = $1 OR player2_config_id = $1
              UNION ALL SELECT 1 FROM job_game_pair_config
                  WHERE player1_config_id = $1 OR player2_config_id = $1
+             UNION ALL SELECT 1 FROM rating_pools WHERE anchor_player_config_id = $1
+             UNION ALL SELECT 1 FROM rating_pool_members WHERE player_config_id = $1
+             UNION ALL SELECT 1 FROM player_config_ratings WHERE player_config_id = $1
+             UNION ALL SELECT 1 FROM player_configs WHERE cloned_from_id = $1
          )",
     )
     .bind(id)
@@ -615,7 +685,9 @@ async fn delete_player_config(
     .await?;
 
     if referenced {
-        return Err(AppError::conflict("a job references this player config"));
+        return Err(AppError::conflict(
+            "a job, a rating pool, a rating history or a clone references this player config",
+        ));
     }
 
     let deleted = sqlx::query("DELETE FROM player_configs WHERE id = $1")
@@ -791,6 +863,8 @@ async fn create_job(
 ) -> AppResult<(StatusCode, Json<CreatedJob>)> {
     csrf::verify(&method, &headers, &jar)?;
 
+    validate_job_body(&body)?;
+
     let letterdist_name = require_role(&state.pool, body.letterdist_id, "letterdist").await?;
     require_role(&state.pool, body.layout_id, "layout").await?;
 
@@ -843,6 +917,114 @@ async fn create_job(
     registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
 
     Ok((StatusCode::CREATED, Json(CreatedJob { job, initialized })))
+}
+
+/// The largest opening-rack batch accepted. A task's racks are expanded into
+/// its request and every rack comes back analysed in one submission, so this
+/// bounds both; 500 is the default.
+const MAX_RACKS_PER_BATCH: i32 = 10_000;
+
+/// Settings the schema cannot express and no worker or test could run with.
+///
+/// Each of these used to be accepted and fail later, far from the admin who
+/// typed it: a `games_per_batch` of 0 makes every claim generate the seed the
+/// previous claim already took, so the job retries a unique-index violation
+/// forever and dispatches nothing; an `elo_low` above `elo_high` inverts the
+/// LLR's sign, so SPRT confidently accepts the wrong hypothesis; an `alpha` of
+/// 0 or 1 puts a logarithm of zero or infinity in the bounds. Every problem is
+/// reported at once, like registration does.
+fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
+    let mut err = AppError::bad_request("job settings are invalid");
+    if body.redundancy < 1 {
+        err = err.with_field("redundancy", "must be at least 1");
+    }
+    if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
+        err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
+    }
+
+    let sprt = |mut err: AppError,
+                unit: &str,
+                batch: i32,
+                min_units: i32,
+                max_units: i32,
+                alpha: f64,
+                beta: f64,
+                elo_low: f64,
+                elo_high: f64| {
+        if batch < 1 {
+            err = err.with_field(format!("{unit}s_per_batch"), "must be at least 1");
+        }
+        if min_units < 0 {
+            err = err.with_field(format!("min_{unit}s"), "must not be negative");
+        }
+        if max_units < 1 {
+            err = err.with_field(format!("max_{unit}s"), "must be at least 1");
+        }
+        for (field, value) in [("sprt_alpha", alpha), ("sprt_beta", beta)] {
+            if !(value > 0.0 && value < 1.0) {
+                err = err.with_field(field, "must be strictly between 0 and 1");
+            }
+        }
+        if alpha + beta >= 1.0 {
+            err = err.with_field("sprt_beta", "sprt_alpha + sprt_beta must be below 1");
+        }
+        if !(elo_low.is_finite() && elo_high.is_finite() && elo_low < elo_high) {
+            err = err.with_field("elo_high", "must be a finite number greater than elo_low");
+        }
+        err
+    };
+
+    err = match &body.config {
+        JobTypeConfig::OpeningRack { racks_per_batch, rack_size, .. } => {
+            if !(1..=MAX_RACKS_PER_BATCH).contains(racks_per_batch) {
+                err = err.with_field(
+                    "racks_per_batch",
+                    format!("must be between 1 and {MAX_RACKS_PER_BATCH}"),
+                );
+            }
+            if !(1..=7).contains(rack_size) {
+                err = err.with_field("rack_size", "must be between 1 and 7");
+            }
+            err
+        }
+        JobTypeConfig::Game {
+            games_per_batch, min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high, ..
+        } => sprt(
+            err, "game", *games_per_batch, *min_games, *max_games, *sprt_alpha, *sprt_beta,
+            *elo_low, *elo_high,
+        ),
+        JobTypeConfig::GamePair {
+            pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high, ..
+        } => sprt(
+            err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, *sprt_alpha, *sprt_beta,
+            *elo_low, *elo_high,
+        ),
+        JobTypeConfig::Leave {
+            num_iterations, generation_count, target_rack_count, racks_per_task,
+            max_leave_size, ..
+        } => {
+            for (field, value) in [
+                ("num_iterations", *num_iterations),
+                ("generation_count", *generation_count),
+                ("target_rack_count", *target_rack_count),
+                ("racks_per_task", *racks_per_task),
+            ] {
+                if value < 1 {
+                    err = err.with_field(field, "must be at least 1");
+                }
+            }
+            if !(1..=6).contains(max_leave_size) {
+                err = err.with_field("max_leave_size", "must be between 1 and 6");
+            }
+            err
+        }
+    };
+
+    if err.fields.is_empty() {
+        Ok(())
+    } else {
+        Err(err)
+    }
 }
 
 /// MAGPIE has one value for these for the whole run, not one per player, even
@@ -1112,11 +1294,30 @@ async fn activate_job(
         return Err(AppError::bad_request("allocation must be between 0 and 100"));
     }
 
+    // A leave-generation job cannot dispatch without its generation-0 KLV.
+    // Creation writes it after committing, so a failed object-store write
+    // there leaves a job that exists without one; activating it as-is would
+    // make every claim against it fail. Built here, outside the transaction,
+    // for the same reason creation builds it outside its own.
+    let unlocked = crate::jobstats::load_job(&state.pool, id).await?;
+    if !registry::job_artifacts_ready(&state.pool, &unlocked).await? {
+        registry::initialize_job_artifacts(&state.pool, &state.artifacts, &unlocked).await?;
+    }
+
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
     if job.status == JobStatus::Completed {
         return Err(AppError::conflict("a completed job cannot be reactivated"));
     }
+
+    // Serializes activations within one priority tier. The row lock above
+    // covers only this job, so two jobs activated at once in the same tier
+    // would each read the other's allocation as absent and together exceed
+    // 100%.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate_tier'), $1)")
+        .bind(job.priority)
+        .execute(&mut *tx)
+        .await?;
 
     let tier_total = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT SUM(allocation) FROM jobs
@@ -1145,7 +1346,15 @@ async fn activate_job(
     .fetch_one(&mut *tx)
     .await?;
 
-    audit::log_status_change(&mut tx, "job.activated", admin.0.id, id, "inactive", "active").await?;
+    audit::log_status_change(
+        &mut tx,
+        "job.activated",
+        admin.0.id,
+        id,
+        status_name(job.status),
+        "active",
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(updated))
 }
@@ -1161,16 +1370,29 @@ async fn deactivate_job(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
+    let before = load_job_for_update(&mut tx, id).await?;
+    // Completion is final. Flipping a completed job to inactive would be a
+    // way around that rule: activation only refuses jobs that are *currently*
+    // completed, so deactivate-then-activate would restart it.
+    if before.status == JobStatus::Completed {
+        return Err(AppError::conflict("a completed job cannot be deactivated"));
+    }
     let job = sqlx::query_as::<_, Job>(
         "UPDATE jobs SET status = 'inactive', deactivated_at = now() WHERE id = $1 RETURNING *",
     )
     .bind(id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::not_found("no such job"))?;
+    .fetch_one(&mut *tx)
+    .await?;
 
-    audit::log_status_change(&mut tx, "job.deactivated", admin.0.id, id, "active", "inactive")
-        .await?;
+    audit::log_status_change(
+        &mut tx,
+        "job.deactivated",
+        admin.0.id,
+        id,
+        status_name(before.status),
+        "inactive",
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(job))
 }
@@ -1186,15 +1408,22 @@ async fn complete_job(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
+    let before = load_job_for_update(&mut tx, id).await?;
     let job =
         sqlx::query_as::<_, Job>("UPDATE jobs SET status = 'completed' WHERE id = $1 RETURNING *")
             .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or_else(|| AppError::not_found("no such job"))?;
+            .fetch_one(&mut *tx)
+            .await?;
 
-    audit::log_status_change(&mut tx, "job.completed", admin.0.id, id, "active", "completed")
-        .await?;
+    audit::log_status_change(
+        &mut tx,
+        "job.completed",
+        admin.0.id,
+        id,
+        status_name(before.status),
+        "completed",
+    )
+    .await?;
     tx.commit().await?;
     Ok(Json(job))
 }
@@ -1218,8 +1447,7 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
              (SELECT count(*) FROM position_analysis_records r JOIN tasks t ON t.id = r.task_id
                WHERE t.job_id = $1)                                                AS positions,
              (SELECT count(*) FROM leave_rack_progress WHERE job_id = $1)          AS rack_progress,
-             (SELECT count(*) FROM leave_generation_artifacts WHERE job_id = $1)   AS artifacts,
-             (SELECT count(*) FROM player_config_ratings WHERE job_id = $1)        AS ratings",
+             (SELECT count(*) FROM leave_generation_artifacts WHERE job_id = $1)   AS artifacts",
     )
     .bind(job_id)
     .fetch_one(conn)
@@ -1227,7 +1455,7 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
 
     Ok(format!(
         "tasks={} claims={} game_results={} leave_records={} positions={} \
-rack_progress={} artifacts={} ratings={}",
+rack_progress={} artifacts={}",
         row.get::<i64, _>("tasks"),
         row.get::<i64, _>("claims"),
         row.get::<i64, _>("game_results"),
@@ -1235,7 +1463,6 @@ rack_progress={} artifacts={} ratings={}",
         row.get::<i64, _>("positions"),
         row.get::<i64, _>("rack_progress"),
         row.get::<i64, _>("artifacts"),
-        row.get::<i64, _>("ratings"),
     ))
 }
 
@@ -1297,13 +1524,17 @@ async fn purge_job(
     )
     .await?;
 
-    // Records and claims cascade from tasks; leave-gen progress and ratings are
-    // keyed on the job directly.
+    // Records and claims cascade from tasks; leave-gen progress is keyed on
+    // the job directly. Ratings are not touched: they belong to rating pools,
+    // not jobs, and are a pure function of the results that remain -- the
+    // periodic sweep notices the pool's evidence shrank and refits it.
     sqlx::query("DELETE FROM task_claims c USING tasks t WHERE c.task_id = t.id AND t.job_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    sqlx::query("DELETE FROM player_config_ratings WHERE job_id = $1")
+    // The deficit counter counts the claims just deleted. Left alone, a
+    // purged job would restart owing the scheduler every claim it ever had.
+    sqlx::query("UPDATE jobs SET claims_issued = 0 WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -1713,10 +1944,105 @@ async fn audit_log(
     Ok(Json(super::Page { items: rows, total, page: query.page.max(0), per_page: limit }))
 }
 
+fn status_name(status: JobStatus) -> &'static str {
+    match status {
+        JobStatus::Active => "active",
+        JobStatus::Inactive => "inactive",
+        JobStatus::Completed => "completed",
+    }
+}
+
 async fn load_job_for_update(conn: &mut sqlx::PgConnection, id: Uuid) -> AppResult<Job> {
     sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1 FOR UPDATE")
         .bind(id)
         .fetch_optional(conn)
         .await?
         .ok_or_else(|| AppError::not_found("no such job"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn body(config: serde_json::Value) -> CreateJobBody {
+        let mut value = serde_json::json!({
+            "variant": "classic",
+            "letterdist_id": Uuid::nil(),
+            "layout_id": Uuid::nil(),
+        });
+        value.as_object_mut().unwrap().extend(config.as_object().unwrap().clone());
+        serde_json::from_value(value).expect("a well-formed body")
+    }
+
+    fn game_pairs(overrides: serde_json::Value) -> CreateJobBody {
+        let mut config = serde_json::json!({
+            "job_type": "game_pairs",
+            "player1_config_id": Uuid::nil(),
+            "player2_config_id": Uuid::nil(),
+            "min_pairs": 100,
+            "max_pairs": 1000,
+        });
+        config.as_object_mut().unwrap().extend(overrides.as_object().unwrap().clone());
+        body(config)
+    }
+
+    fn fields(result: AppResult<()>) -> Vec<String> {
+        result.expect_err("should be rejected").fields.into_iter().map(|(f, _)| f).collect()
+    }
+
+    #[test]
+    fn ordinary_settings_are_accepted() {
+        assert!(validate_job_body(&game_pairs(serde_json::json!({}))).is_ok());
+    }
+
+    /// A batch of zero makes every claim regenerate the seed the last claim
+    /// took; the job would retry a unique violation forever.
+    #[test]
+    fn a_zero_batch_is_rejected() {
+        assert_eq!(
+            fields(validate_job_body(&game_pairs(serde_json::json!({ "pairs_per_batch": 0 })))),
+            ["pairs_per_batch"]
+        );
+    }
+
+    /// Inverted hypotheses flip the LLR's sign: SPRT would accept the wrong one.
+    #[test]
+    fn inverted_elo_hypotheses_are_rejected() {
+        assert_eq!(
+            fields(validate_job_body(&game_pairs(
+                serde_json::json!({ "elo_low": 10.0, "elo_high": -10.0 })
+            ))),
+            ["elo_high"]
+        );
+    }
+
+    #[test]
+    fn degenerate_error_rates_are_rejected_and_every_problem_is_reported() {
+        let got = fields(validate_job_body(&game_pairs(serde_json::json!({
+            "sprt_alpha": 0.0, "sprt_beta": 1.0, "max_pairs": 0, "redundancy": 0
+        }))));
+        for expected in ["sprt_alpha", "sprt_beta", "max_pairs", "redundancy"] {
+            assert!(got.iter().any(|f| f == expected), "missing {expected} in {got:?}");
+        }
+    }
+
+    #[test]
+    fn leave_generation_bounds_are_enforced() {
+        let leave = body(serde_json::json!({
+            "job_type": "leave_generation",
+            "kwg_id": Uuid::nil(),
+            "num_iterations": 0,
+            "target_rack_count": 10,
+            "racks_per_task": 10,
+            "max_leave_size": 7,
+        }));
+        assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "max_leave_size"]);
+    }
+
+    #[test]
+    fn an_unknown_variant_is_rejected() {
+        let mut job = game_pairs(serde_json::json!({}));
+        job.variant = "scrabble-but-different".into();
+        assert_eq!(fields(validate_job_body(&job)), ["variant"]);
+    }
 }

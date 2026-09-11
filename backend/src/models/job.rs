@@ -41,6 +41,9 @@ pub struct Job {
     pub min_magpie_major: i32,
     pub min_magpie_minor: i32,
     pub min_magpie_patch: i32,
+    /// Every claim ever issued for this job; the scheduler's deficit
+    /// numerator. See `scheduler::candidate_jobs`.
+    pub claims_issued: i64,
     pub created_at: DateTime<Utc>,
     pub activated_at: Option<DateTime<Utc>>,
     pub deactivated_at: Option<DateTime<Utc>>,
@@ -95,7 +98,8 @@ pub struct PlayerConfig {
     /// so this table is the exhaustive source of what a job asked for; a
     /// job's two player configs must agree on it (validated at creation).
     pub movegen_margin: Option<f64>,
-    pub created_by: Uuid,
+    /// `None` once the admin who created it has been deleted.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 

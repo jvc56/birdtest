@@ -51,6 +51,7 @@
     "job_type": "games",
     "variant": "classic",
     "letter_distribution": "english",
+    "board_layout": "standard15",
     "seed": "1",
     "num_games": 10,
     "game_pairs": false,

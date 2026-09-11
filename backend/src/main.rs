@@ -1,32 +1,8 @@
-mod artifacts;
-mod audit;
-mod backups;
-mod auth;
-mod compat;
-mod config;
-mod db;
-mod email;
-mod error;
-mod jobs;
-mod jobstats;
-mod models;
-mod ratelimit;
-mod ratings;
-mod routes;
-mod scheduler;
-mod sse;
-mod state;
-mod inputdata;
-mod stats;
-mod version;
-
 use anyhow::Result;
-use axum::routing::get;
-use axum::Router;
-use state::AppState;
+use birdtest::state::AppState;
+use birdtest::{artifacts, config, db, email, inputdata, ratelimit, ratings, sse};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
 
 /// How often to look for rating pools whose evidence has grown. Ratings are a
 /// summary, not a control signal, so minutes of staleness cost nothing while
@@ -100,23 +76,13 @@ async fn main() -> Result<()> {
         });
     }
 
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .nest("/api/worker", routes::worker::router())
-        .nest("/api/auth", routes::auth::router())
-        .merge(routes::account::router())
-        .nest("/api/admin", routes::admin::router())
-        .nest("/api/admin", routes::ratings::admin_router())
-        .nest("/api", routes::public::router())
-        .nest("/api", routes::ratings::public_router())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = birdtest::app(state);
 
     let addr: SocketAddr = cfg.bind_addr.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "birdtest listening");
 
-    // `ConnectInfo` is what per-IP registration rate limiting keys on.
+    // `ConnectInfo` is the peer address `clientip` falls back to.
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }

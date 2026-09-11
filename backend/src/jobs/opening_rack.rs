@@ -15,7 +15,7 @@ impl JobHandler for OpeningRackHandler {
 
     async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         let row = sqlx::query(
-            "SELECT r.variant, r.letter_distribution, r.rack_start,
+            "SELECT r.variant, r.letter_distribution, r.board_layout, r.rack_start,
                     r.rack_count, r.previous_play,
                     r.player_config_id, c.rack_size
              FROM opening_rack_requests r
@@ -41,6 +41,7 @@ impl JobHandler for OpeningRackHandler {
                 .expand(&job_data.letterdist),
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
+            board_layout: row.get("board_layout"),
             previous_play: row.get("previous_play"),
             player,
         })
@@ -171,6 +172,7 @@ pub async fn next_request(
         OpeningRackRequest {
             variant: job_data.variant.clone(),
             letter_distribution: job_data.letterdist_name.clone(),
+            board_layout: job_data.layout_name.clone(),
             racks,
             previous_play: None,
             player,
@@ -190,13 +192,14 @@ pub async fn insert_range(
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO opening_rack_requests
-             (task_id, variant, letter_distribution, rack_start,
+             (task_id, variant, letter_distribution, board_layout, rack_start,
               rack_count, previous_play, player_config_id)
-         VALUES ($1, $2, $3, $4, $5, NULL, $6)",
+         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)",
     )
     .bind(task_id)
     .bind(&job_data.variant)
     .bind(&job_data.letterdist_name)
+    .bind(&job_data.layout_name)
     .bind(start)
     .bind(count as i32)
     .bind(config.player_config_id)

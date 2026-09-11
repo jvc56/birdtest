@@ -18,14 +18,15 @@ pub async fn insert_request(
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO leave_requests
-             (task_id, lexicon, variant, letter_distribution, generation,
+             (task_id, lexicon, variant, letter_distribution, board_layout, generation,
               forced_racks, num_games, previous_artifact_key, use_wordmap)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(task_id)
     .bind(&req.lexicon)
     .bind(&req.variant)
     .bind(&req.letter_distribution)
+    .bind(&req.board_layout)
     .bind(req.generation)
     .bind(&req.forced_racks)
     .bind(req.num_games)
@@ -45,7 +46,7 @@ impl JobHandler for LeaveGenHandler {
 
     async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         let row = sqlx::query(
-            "SELECT lexicon, variant, letter_distribution, generation, forced_racks,
+            "SELECT lexicon, variant, letter_distribution, board_layout, generation, forced_racks,
                     num_games, previous_artifact_key, use_wordmap
              FROM leave_requests WHERE task_id = $1",
         )
@@ -56,6 +57,7 @@ impl JobHandler for LeaveGenHandler {
             lexicon: row.get("lexicon"),
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
+            board_layout: row.get("board_layout"),
             generation: row.get("generation"),
             forced_racks: row.get("forced_racks"),
             num_games: row.get("num_games"),
@@ -136,8 +138,15 @@ pub enum LeaveGenStep {
     Transition { generation: i32 },
     /// All configured generations are complete.
     Finished,
-    /// Racks remain below target but every one of them is already out with a
-    /// worker — nothing to hand out right now.
+    /// Every rack has reached target, but claims for this generation are still
+    /// in flight -- their results may yet land, so the generation cannot be
+    /// closed. Nothing to hand out right now.
+    ///
+    /// Racks below target are *not* excluded while a worker is out with them:
+    /// concurrent claims can be handed overlapping forced-rack subsets. That
+    /// costs duplicate coverage rather than correctness (occurrences past the
+    /// target still count), and is recorded in AUDIT_FINDINGS.md as a
+    /// throughput trade-off to revisit.
     NoWorkYet,
 }
 
@@ -218,6 +227,7 @@ pub async fn next_step(
         lexicon: lexicon_name(&mut *conn, config.kwg_id).await?,
         variant: job_data.variant.clone(),
         letter_distribution: job_data.letterdist_name.clone(),
+        board_layout: job_data.layout_name.clone(),
         generation,
         forced_racks: racks,
         previous_artifact_key,

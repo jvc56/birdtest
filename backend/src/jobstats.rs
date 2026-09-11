@@ -9,6 +9,23 @@ use serde::Serialize;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// One `game_results` row per task of job `$1`: the first accepted.
+///
+/// With redundancy above 1 a task has one row per accepted claim, and since
+/// games are seeded and deterministic those rows describe the *same* games.
+/// Summing all of them would count every game `redundancy` times -- SPRT would
+/// see `redundancy` times the evidence it has and stop early on noise, and
+/// `min`/`max` gates would trip at a fraction of the games they name. Which
+/// copy is used is arbitrary but fixed; reconciling copies that disagree is a
+/// cross-check this read deliberately does not attempt (PLAN.md, "Worker
+/// Integrity").
+pub const FIRST_GAME_RESULT_PER_TASK: &str = "
+    SELECT DISTINCT ON (r.task_id) r.*
+    FROM game_results r
+    JOIN tasks t ON t.id = r.task_id
+    WHERE t.job_id = $1
+    ORDER BY r.task_id, r.submitted_at, r.task_claim_id";
+
 #[derive(Debug, Serialize)]
 pub struct JobStats {
     pub job: JobSummary,
@@ -23,8 +40,9 @@ pub struct JobStats {
     pub opening_racks: Option<OpeningRackStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leave_generation: Option<LeaveGenStats>,
-    /// Empty for every job type but game pairs. Always serialized, so the
-    /// client can read `.length` without a presence check.
+    /// Every worker with an accepted result for this job, most productive
+    /// first. Always serialized, so the client can read `.length` without a
+    /// presence check.
     pub workers: Vec<WorkerContribution>,
     /// Estimated seconds to completion from recent throughput, or `None` when
     /// there is not enough recent activity to extrapolate.
@@ -143,11 +161,7 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
 
     let (lexicon, variant) = lexicon_and_variant(pool, job).await?;
 
-    let games = match job.job_type {
-        JobType::Games => Some(game_stats(pool, job).await?),
-        JobType::GamePairs => Some(game_pair_stats(pool, job).await?),
-        _ => None,
-    };
+    let games = game_stats(pool, job).await?;
 
     let opening_racks = match job.job_type {
         JobType::OpeningRack => Some(opening_rack_stats(pool, job.id).await?),
@@ -251,22 +265,35 @@ async fn lexicon_and_variant(
     Ok((lexicon, Some(job.variant.clone())))
 }
 
+/// The SPRT-relevant statistics for a games or game-pairs job, and `None` for
+/// every other job type.
+///
+/// This is also what the submission path evaluates the finish conditions on,
+/// which is why it is separate from [`compute`]: deciding whether a job is done
+/// needs these aggregates and nothing else.
+pub async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<Option<GameStats>> {
+    Ok(match job.job_type {
+        JobType::Games => Some(plain_game_stats(pool, job).await?),
+        JobType::GamePairs => Some(game_pair_stats(pool, job).await?),
+        JobType::OpeningRack | JobType::LeaveGeneration => None,
+    })
+}
+
 /// Sum the per-task aggregates for a plain `games` job. The SPRT unit is a
 /// game, so the tally and the unit count are the same number.
-async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
+async fn plain_game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
         .bind(job.id)
         .fetch_one(pool)
         .await?;
 
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT COALESCE(SUM(r.games), 0)::bigint  AS games,
                 COALESCE(SUM(r.wins), 0)::bigint   AS wins,
                 COALESCE(SUM(r.losses), 0)::bigint AS losses,
                 COALESCE(SUM(r.ties), 0)::bigint   AS ties
-         FROM game_results r JOIN tasks t ON t.id = r.task_id
-         WHERE t.job_id = $1",
-    )
+         FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
+    ))
     .bind(job.id)
     .fetch_one(pool)
     .await?;
@@ -302,7 +329,7 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
             .fetch_one(pool)
             .await?;
 
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT COALESCE(SUM(r.games), 0)::bigint            AS games,
                 COALESCE(SUM(r.wins), 0)::bigint             AS wins,
                 COALESCE(SUM(r.losses), 0)::bigint           AS losses,
@@ -313,9 +340,8 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
                 COALESCE(SUM(r.pent_3), 0)::bigint           AS pent_3,
                 COALESCE(SUM(r.pent_4), 0)::bigint           AS pent_4,
                 COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games
-         FROM game_results r JOIN tasks t ON t.id = r.task_id
-         WHERE t.job_id = $1",
-    )
+         FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
+    ))
     .bind(job.id)
     .fetch_one(pool)
     .await?;
@@ -453,8 +479,11 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
             .fetch_one(pool)
             .await?;
 
+    // Generation 0 is the zeroed KLV generation 1 plays with, not a completed
+    // generation; counting it would report generation 2 while generation 1 is
+    // still running.
     let completed = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1",
+        "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1 AND generation >= 1",
     )
     .bind(job_id)
     .fetch_one(pool)

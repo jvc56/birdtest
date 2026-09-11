@@ -1,8 +1,9 @@
 use crate::auth::{api_key, csrf, session};
+use crate::clientip::ClientIp;
 use crate::error::{AppError, AppResult};
 use crate::ratelimit;
 use crate::state::AppState;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::post;
 use axum::{Json, Router};
@@ -10,7 +11,6 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{Duration, Utc};
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
 use uuid::Uuid;
 
 pub fn router() -> Router<AppState> {
@@ -61,10 +61,10 @@ struct MessageBody {
 
 async fn register(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ClientIp(ip): ClientIp,
     Json(body): Json<RegisterBody>,
 ) -> AppResult<(StatusCode, Json<MessageBody>)> {
-    ratelimit::check(&state.limits.register, &addr.ip().to_string())?;
+    ratelimit::check(&state.limits.register, &ip.to_string())?;
 
     let username = body.username.trim().to_string();
     let email = body.email.trim().to_lowercase();
@@ -204,9 +204,19 @@ struct LoginResponse {
 
 async fn login(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     jar: CookieJar,
     Json(body): Json<LoginBody>,
 ) -> AppResult<(CookieJar, Json<LoginResponse>)> {
+    // Both halves, like password reset: per IP bounds one guesser, per
+    // username bounds many guessers aimed at one account. Checked before the
+    // lookup, so a limited attempt costs no Argon2 verify.
+    ratelimit::check(&state.limits.login, &format!("ip:{ip}"))?;
+    ratelimit::check(
+        &state.limits.login,
+        &format!("user:{}", body.username.trim().to_lowercase()),
+    )?;
+
     let row = sqlx::query_as::<_, (Uuid, String, String, bool, Option<chrono::DateTime<Utc>>)>(
         "SELECT id, username, password_hash, is_admin, email_confirmed_at
          FROM users WHERE username = $1",
@@ -290,7 +300,7 @@ struct ResetRequestBody {
 
 async fn request_password_reset(
     State(state): State<AppState>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ClientIp(ip): ClientIp,
     Json(body): Json<ResetRequestBody>,
 ) -> AppResult<Json<MessageBody>> {
     let email = body.email.trim().to_lowercase();
@@ -298,7 +308,7 @@ async fn request_password_reset(
     // Checked against the caller and against the address they named. Both
     // halves are load-bearing: the first bounds bulk probing, the second stops
     // one address being buried in reset mail from many sources.
-    ratelimit::check(&state.limits.reset, &format!("ip:{}", addr.ip()))?;
+    ratelimit::check(&state.limits.reset, &format!("ip:{ip}"))?;
     ratelimit::check(&state.limits.reset, &format!("em:{email}"))?;
     let user = sqlx::query_as::<_, (Uuid,)>(
         "SELECT id FROM users WHERE email = $1 AND email_confirmed_at IS NOT NULL",

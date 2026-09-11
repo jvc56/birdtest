@@ -140,6 +140,7 @@ pub async fn next_request(
         GameRequest {
             variant: job_data.variant.clone(),
             letter_distribution: job_data.letterdist_name.clone(),
+            board_layout: job_data.layout_name.clone(),
             seed: next_seed as u64,
             num_games: config.games_per_batch,
             game_pairs: false,
@@ -155,7 +156,7 @@ pub(super) async fn load_game_request_row(
     task_id: Uuid,
 ) -> AppResult<sqlx::postgres::PgRow> {
     Ok(sqlx::query(
-        "SELECT variant, letter_distribution, seed, num_games,
+        "SELECT variant, letter_distribution, board_layout, seed, num_games,
                 player1_config_id, player2_config_id, capture_positions
          FROM game_requests WHERE task_id = $1",
     )

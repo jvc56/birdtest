@@ -52,7 +52,9 @@ CREATE TABLE worker_bans (
     user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
     anon_uuid   UUID REFERENCES anonymous_workers(uuid) ON DELETE CASCADE,
     reason      TEXT,
-    banned_by   UUID NOT NULL REFERENCES users(id),
+    -- SET NULL, like jobs.created_by: deleting the admin who issued a ban must
+    -- neither fail nor lift the ban.
+    banned_by   UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT ban_has_single_target CHECK (
         (user_id IS NOT NULL)::int + (anon_uuid IS NOT NULL)::int = 1
@@ -190,6 +192,12 @@ CREATE TABLE jobs (
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 0 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    -- Every claim ever issued for this job, abandoned and declined ones
+    -- included: the deficit the scheduler orders on. Kept as a counter rather
+    -- than counted, because counting task_claims on every claim request costs
+    -- time proportional to the job's whole history. Only ever incremented,
+    -- except by a purge, which deletes the claims it counts.
+    claims_issued   BIGINT NOT NULL DEFAULT 0 CHECK (claims_issued >= 0),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ
@@ -262,7 +270,8 @@ CREATE TABLE player_configs (
     -- rows in a job, validated equal at job-creation time) so this table
     -- stays the single, exhaustive source of what a job asked MAGPIE for.
     movegen_margin         DOUBLE PRECISION, -- move-gen equity margin for 'equity' recording (-mmargin)
-    created_by       UUID NOT NULL REFERENCES users(id),
+    -- SET NULL, like jobs.created_by: a config outlives the admin who made it.
+    created_by       UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -448,6 +457,10 @@ CREATE TABLE opening_rack_requests (
     -- No lexicon column: the player config carries it.
     variant           TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
+    -- The job's pinned layout, by name. Stated on the request for the same
+    -- reason the distribution is: a worker must play on the board the job
+    -- pins, not on whatever board its own settings last loaded.
+    board_layout      TEXT NOT NULL,
     -- Index of the first rack in this batch, and how many it covers. The final
     -- batch of a job may be short.
     rack_start        BIGINT NOT NULL CHECK (rack_start >= 0),
@@ -461,6 +474,7 @@ CREATE TABLE game_requests (
     -- No lexicon column: each player config carries its own.
     variant           TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
+    board_layout      TEXT NOT NULL,
     -- Denormalized from the job config, like everything else here, so the
     -- request a re-dispatched task replays is exactly the one it was given.
     capture_positions BOOLEAN NOT NULL DEFAULT FALSE,
@@ -476,6 +490,7 @@ CREATE TABLE leave_requests (
     lexicon             TEXT NOT NULL,
     variant             TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
+    board_layout        TEXT NOT NULL,
     generation          INT NOT NULL,
     forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (passed to MAGPIE's rack_list_create)
     num_games           INT NOT NULL,      -- denormalized from job_leave_config.num_iterations
@@ -606,13 +621,18 @@ CREATE TABLE position_analysis_plies (
 );
 CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
--- Shared by games and game pairs: one row per accepted task, holding the aggregate
--- MAGPIE's autoplay reports. Autoplay does not emit individual games -- it reports
--- counts and score moments for a batch, and in `-gp` mode a second such summary
--- covering only the *divergent* pairs: those whose two games did not play
--- identically. A pair that played identically is a guaranteed tie carrying no
--- information, so excluding those is the variance reduction pairing exists to
--- provide, and the divergent aggregate is what SPRT and Glicko are computed from.
+-- Shared by games and game pairs: one row per accepted claim, holding the
+-- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games
+-- -- it reports counts and score moments for a batch, and in `-gp` mode also
+-- the pentanomial: how many completed pairs ended in each of the five possible
+-- pair outcomes. The pentanomial is what SPRT and the rating fits read; the
+-- divergent summary alongside it is a diagnostic only.
+--
+-- With redundancy > 1 a task has several rows here, one per accepted claim,
+-- and because games are seeded and deterministic they describe the *same*
+-- games. Every aggregate that treats rows as observations (SPRT, progress,
+-- ratings) therefore reads one row per task -- the first accepted -- or it
+-- would count each game `redundancy` times.
 CREATE TABLE game_results (
     task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -843,15 +863,21 @@ CREATE INDEX backups_finished_idx ON backups (finished_at DESC);
 
 -- Audit log
 
+-- No foreign keys, deliberately. The log is append-only and has to outlive
+-- what it describes: the census rows written by delete_job and delete_user
+-- exist precisely to be read after the job or user is gone. A foreign key
+-- here either blocks those deletions outright (NO ACTION -- every job has a
+-- job.created row, every user a user.registered row) or rewrites history
+-- (SET NULL / CASCADE).
 CREATE TABLE audit_log (
     id              BIGSERIAL PRIMARY KEY,
     action          TEXT NOT NULL,
-    actor_user_id   UUID REFERENCES users(id),
-    actor_anon_uuid UUID REFERENCES anonymous_workers(uuid),
+    actor_user_id   UUID,
+    actor_anon_uuid UUID,
     target_type     TEXT,
     target_id       TEXT,
     -- Typed extra-context columns (replace JSONB metadata)
-    job_id          UUID REFERENCES jobs(id),      -- task/result events
+    job_id          UUID,                           -- task/result events
     reason          TEXT,                           -- ban events, etc.
     old_status      TEXT,                           -- status-change events
     new_status      TEXT,
@@ -866,7 +892,9 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
 CREATE INDEX        tasks_job_idx             ON tasks (job_id);
-CREATE INDEX        game_results_task_idx     ON game_results (task_id);
+-- (task_id, submitted_at) rather than task_id alone: the per-task "first
+-- accepted result" read that every aggregate uses orders on both.
+CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);
 CREATE INDEX        leave_records_task_idx    ON leave_records (task_id);
 CREATE INDEX        position_records_task_idx ON position_analysis_records (task_id);
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);

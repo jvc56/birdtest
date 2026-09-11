@@ -36,6 +36,7 @@
     "lexicon": "NWL23",
     "variant": "classic",
     "letter_distribution": "english",
+    "board_layout": "standard15",
     "generation": 1,
     "forced_racks": ["AA", "AB"],
     "previous_artifact_key": "leaves/9c2f1a48-5f3b-4c2a-8a7d-1b0e3f7c9d20/generation-0.klv2",

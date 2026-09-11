@@ -119,6 +119,7 @@ pub async fn next_request(
         GameRequest {
             variant: job_data.variant.clone(),
             letter_distribution: job_data.letterdist_name.clone(),
+            board_layout: job_data.layout_name.clone(),
             seed: next_seed as u64,
             num_games: config.pairs_per_batch,
             game_pairs: true,

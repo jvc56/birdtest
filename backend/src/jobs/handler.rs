@@ -111,6 +111,10 @@ pub struct OpeningRackRequest {
     pub variant: String,
     /// Stated by the job rather than inferred from the lexicon name.
     pub letter_distribution: String,
+    /// The board the job pins, by name. Stated for the same reason as the
+    /// distribution: the worker must play on the layout whose digest it just
+    /// verified, not on whatever its own settings last loaded.
+    pub board_layout: String,
     /// A batch of racks. An opening rack is by definition the start of the
     /// game, so only the letters cross the wire -- MAGPIE assumes the empty
     /// starting board.
@@ -150,6 +154,8 @@ pub struct GameRequest {
     pub variant: String,
     /// Stated by the job rather than inferred from the lexicon name.
     pub letter_distribution: String,
+    /// See [`OpeningRackRequest::board_layout`].
+    pub board_layout: String,
     /// uint64 at the application layer; stored as a signed BIGINT.
     #[serde(with = "seed_as_string")]
     pub seed: u64,
@@ -171,6 +177,8 @@ pub struct LeaveRequest {
     pub variant: String,
     /// Stated by the job rather than inferred from the lexicon name.
     pub letter_distribution: String,
+    /// See [`OpeningRackRequest::board_layout`].
+    pub board_layout: String,
     pub generation: i32,
     pub forced_racks: Vec<String>,
     /// Combined KLV from the previous generation. Always present: generation 1

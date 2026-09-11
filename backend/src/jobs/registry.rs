@@ -5,6 +5,7 @@
 use super::handler::*;
 use super::{game, game_pair, leave_gen, load_job_data, opening_rack};
 use crate::artifacts::ArtifactStore;
+use crate::auth::WorkerIdentity;
 use crate::error::{AppError, AppResult};
 use crate::models::job::*;
 use sqlx::PgConnection;
@@ -22,12 +23,17 @@ pub enum Acquired {
     JobFinished,
 }
 
-pub async fn acquire(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
-    // A task whose claim timed out drops back to `available` regardless of the
-    // job's creation strategy, so re-dispatching those comes first. For games
-    // this is what keeps the seed space covered: an abandoned batch is replayed
-    // rather than skipped, since nothing else would ever revisit those seeds.
-    if let Some(task_id) = next_available(conn, job.id).await? {
+pub async fn acquire(
+    conn: &mut PgConnection,
+    job: &Job,
+    identity: &WorkerIdentity,
+) -> AppResult<Acquired> {
+    // A task whose claim timed out drops back to `available`, and so does a
+    // task with redundancy left to fill, so re-dispatching those comes first.
+    // For games this is what keeps the seed space covered: an abandoned batch
+    // is replayed rather than skipped, since nothing else would ever revisit
+    // those seeds.
+    if let Some(task_id) = next_available(conn, job.id, identity).await? {
         let request = load_request(conn, job.job_type, task_id).await?;
         return Ok(Acquired::Task { task_id, request });
     }
@@ -64,17 +70,37 @@ async fn generate_opening_rack(conn: &mut PgConnection, job: &Job) -> AppResult<
     Ok(Acquired::Task { task_id, request: TaskRequest::OpeningRack(request) })
 }
 
-/// Pre-populated jobs draw from the pool with `FOR UPDATE SKIP LOCKED`, which is
-/// what lets many workers claim concurrently without serializing on a lock.
-async fn next_available(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Option<Uuid>> {
+/// An available task this worker may take, locked with `FOR UPDATE SKIP LOCKED`
+/// so concurrent claimers never serialize on one row.
+///
+/// Excludes tasks this identity already holds a slot on, live or completed.
+/// With redundancy above 1 a task stays `available` after its first claim, and
+/// the per-identity unique index refuses a second slot for the same worker --
+/// correctly, since redundancy means *independent* workers. Without this
+/// filter the oldest such task would be selected again on every attempt, the
+/// insert would fail every time, and the worker would get nothing at all until
+/// someone else filled the slot.
+async fn next_available(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    identity: &WorkerIdentity,
+) -> AppResult<Option<Uuid>> {
     Ok(sqlx::query_scalar::<_, Uuid>(
-        "SELECT id FROM tasks
-         WHERE job_id = $1 AND state = 'available'
-         ORDER BY created_at
-         FOR UPDATE SKIP LOCKED
+        "SELECT t.id FROM tasks t
+         WHERE t.job_id = $1 AND t.state = 'available'
+           AND NOT EXISTS (
+               SELECT 1 FROM task_claims c
+               WHERE c.task_id = t.id
+                 AND c.state NOT IN ('abandoned', 'declined')
+                 AND (c.claimed_by_user_id = $2 OR c.claimed_by_anon_uuid = $3)
+           )
+         ORDER BY t.created_at
+         FOR UPDATE OF t SKIP LOCKED
          LIMIT 1",
     )
     .bind(job_id)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
     .fetch_optional(conn)
     .await?)
 }
@@ -245,8 +271,8 @@ pub async fn initialize_job_state(conn: &mut PgConnection, job: &Job) -> AppResu
 
 /// The part of job initialization that cannot run inside the creating
 /// transaction: generation 1's zeroed KLV is a multi-megabyte build and an
-/// object-store write. Called after the transaction commits, before the job is
-/// dispatchable.
+/// object-store write. Called after the transaction commits, and again at
+/// activation if it has not happened yet. Idempotent.
 pub async fn initialize_job_artifacts(
     pool: &sqlx::PgPool,
     artifacts: &ArtifactStore,
@@ -260,4 +286,19 @@ pub async fn initialize_job_artifacts(
     drop(conn);
     leave_gen::seed_zero_generation(pool, artifacts, job.id, &job_data.letterdist).await?;
     Ok(())
+}
+
+/// Whether a job has everything `initialize_job_artifacts` writes. Only leave
+/// generation writes anything.
+pub async fn job_artifacts_ready(pool: &sqlx::PgPool, job: &Job) -> AppResult<bool> {
+    if job.job_type != JobType::LeaveGeneration {
+        return Ok(true);
+    }
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM leave_generation_artifacts
+                        WHERE job_id = $1 AND generation = 0)",
+    )
+    .bind(job.id)
+    .fetch_one(pool)
+    .await?)
 }

@@ -14,8 +14,16 @@ type Keyed = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 pub struct RateLimiters {
     /// 10 registrations per hour per IP.
     pub register: Arc<Keyed>,
-    /// 1 request per second per worker identity, applied to task/result/heartbeat.
+    /// 1 request per second per worker identity, burst 5, applied to every
+    /// worker endpoint.
     pub worker: Arc<Keyed>,
+    /// Worker requests that carry no identity at all, keyed by client IP.
+    ///
+    /// More generous than `worker`, because it is shared: several brand-new
+    /// contributors behind one NAT all land in the same bucket until each is
+    /// issued a UUID. It exists at all because without it, omitting the
+    /// identity header would be a way around the per-identity limit.
+    pub unregistered_worker: Arc<Keyed>,
     /// 5 password-reset requests per hour, checked twice: once against the
     /// caller's IP and once against the address they asked for.
     ///
@@ -25,6 +33,11 @@ pub struct RateLimiters {
     /// bury a known contributor in reset emails at the operator's expense.
     /// Limiting by IP alone stops neither, since IPs are cheap.
     pub reset: Arc<Keyed>,
+    /// 10 login attempts per minute, checked against the caller's IP and,
+    /// separately, the username tried. Each attempt costs an Argon2 verify, so
+    /// an unlimited login endpoint is both an online password-guessing oracle
+    /// and a cheap way to pin the server's CPU.
+    pub login: Arc<Keyed>,
 }
 
 impl RateLimiters {
@@ -32,11 +45,16 @@ impl RateLimiters {
         let per_hour = Quota::per_hour(NonZeroU32::new(10).unwrap());
         let per_second = Quota::per_second(NonZeroU32::new(1).unwrap())
             .allow_burst(NonZeroU32::new(5).unwrap());
+        let unregistered = Quota::per_second(NonZeroU32::new(5).unwrap())
+            .allow_burst(NonZeroU32::new(30).unwrap());
         let resets_per_hour = Quota::per_hour(NonZeroU32::new(5).unwrap());
+        let logins_per_minute = Quota::per_minute(NonZeroU32::new(10).unwrap());
         Self {
             register: Arc::new(RateLimiter::keyed(per_hour)),
             worker: Arc::new(RateLimiter::keyed(per_second)),
+            unregistered_worker: Arc::new(RateLimiter::keyed(unregistered)),
             reset: Arc::new(RateLimiter::keyed(resets_per_hour)),
+            login: Arc::new(RateLimiter::keyed(logins_per_minute)),
         }
     }
 }

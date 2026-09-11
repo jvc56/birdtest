@@ -69,8 +69,14 @@ async fn list_jobs(
                 (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id) AS tasks_total,
                 (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id AND t.state = 'completed')
                     AS tasks_completed,
-                (SELECT COALESCE(SUM(r.games), 0) FROM game_results r
-                 JOIN tasks t ON t.id = r.task_id WHERE t.job_id = j.id) AS game_rows,
+                -- One result per task, as everywhere games are counted: with
+                -- redundancy > 1 the other rows replay the same games.
+                (SELECT COALESCE(SUM(g.games), 0)::bigint FROM (
+                     SELECT DISTINCT ON (r.task_id) r.games
+                     FROM game_results r JOIN tasks t ON t.id = r.task_id
+                     WHERE t.job_id = j.id
+                     ORDER BY r.task_id, r.submitted_at, r.task_claim_id
+                 ) g) AS game_rows,
                 gc.max_games, pc.max_pairs,
                 -- Stalled: at least one decline and no submission in the last
                 -- 24 hours, with nothing currently claimed. Long enough not to
