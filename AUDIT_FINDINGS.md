@@ -22,7 +22,8 @@ decisions:
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
 audit left open, the options offered, the option chosen, and what was
-implemented. Section H lists what implementing those decisions turned up.
+implemented. Section H lists what implementing those decisions turned up, and
+section I the follow-ups worth deciding next.
 
 ## Verification
 
@@ -784,3 +785,60 @@ What the numbers say:
 - **H2. `infra/variables.tf` did not parse.** A description contained unescaped double quotes, so `terraform init` failed before anything else could run. Fixed; CI now validates.
 - **H3. Leave-generation work outlasted the load balancer.** Creating an English leave-generation job writes 3.2 million rows inside the request, and a generation transition runs inside a worker's claim request. The ALB's default idle timeout is 60 seconds. When a proxy gives up, axum drops the handler future, which would roll back a creation part-way, or abandon a transition part-way on every attempt, so a generation whose transition outlasts the timeout would never close. Fixes: seeding uses `COPY` (37 seconds for an English job on this machine, against 54 with batched `INSERT`s); the transition runs on its own task, awaited, so a dropped request cannot cancel it; and the ALB's `idle_timeout` is 300 seconds (MAGPIE's own request timeout is 120). SSE streams send keep-alives every 15 seconds, so the longer timeout does not change them.
 - **H4. Captured in-game positions were not in simulation order.** The positions recorder read `sim_results_get_simmed_play(i)`, which is move-list (equity) order, and attached each play's simulation statistics. The "top N" stored for a simming player was the top N by static equity, not by simulation. It now reads the sorted display copies, as MAGPIE's own output does, through the writer F6 shares.
+
+## I. Worth deciding next
+
+Not blocking, but each is a decision rather than a bug, and the evidence for it
+is above.
+
+### I1. The generation-transition race (follow-up to F10)
+
+F10's option A stopped concurrent claims being handed the same racks. As noted
+when it was chosen, it does nothing for the transition itself:
+
+- a claim still being issued is invisible to another claim's in-flight check, so a generation can close while a task for it is going out, and that task's results are ignored;
+- two claims arriving together can both run the transition.
+
+Both produce the right KLV, but with full racks (F1) a transition now costs about
+15 seconds on the dev database: streaming 3.2 million rows, deriving leave
+values, and copying the universe, which took about a minute on the F16 test
+database. A duplicate wastes all of that.
+
+- **A. Add F10's option C:** a per-job advisory lock taken around the in-flight check and the transition, so only one runs and no claim for the closing generation can be issued meanwhile.
+  - *For:* closes both races; small change.
+  - *Against:* claims for that job wait on the lock while a transition runs; claims for other jobs are unaffected.
+- **B. Keep it.**
+  - *For:* no work.
+  - *Against:* occasional duplicated transitions and discarded task results as leave generation scales.
+
+**Recommendation:** A, before running multi-generation English jobs.
+
+### I2. The two expensive stats reads (follow-up to F16)
+
+F16's measurements put the per-submission SPRT aggregates at about 50 ms for
+400,000 games or pairs, which is fine. Two reads are not:
+
+- the **job list** recomputes one-result-per-task game totals for every listed job on every page view: 2.2 s at the test volume, growing with total results across all jobs;
+- **opening-rack stats** count distinct analysed racks on the detail page and every SSE push: 2.1 s at a million racks, about 7 s projected for a full English job.
+
+- **A. Running totals for just those two:** a per-job `units_completed` for games and pairs (maintained in the submit transaction, on the first accepted result per task) and a per-job analysed-rack count for opening-rack jobs. Purge and restore would reset or recompute them (RUNBOOK §2.3).
+  - *For:* both reads become constant-time; SPRT keeps reading the source rows.
+  - *Against:* two denormalized counters to keep correct.
+- **B. Debounce SSE stat pushes per job**, and cache the job list briefly (single instance, so in-process).
+  - *For:* no schema change.
+  - *Against:* the first view after the cache expires still pays the full cost, and stats lag by a few seconds.
+- **C. Both.**
+- **D. Keep as is** until opening-rack jobs run at full size.
+
+**Recommendation:** A now, adding B once opening-rack jobs run at scale.
+
+### I3. Re-measure the universe copy on the production instance
+
+Copying 3.2 million leave rows to the next generation took 56–66 seconds on the
+F16 test database (the local compose Postgres at default settings, 2.7 GB of
+data), against a whole transition of about 15 seconds on the smaller dev
+database. The production instance class (`db_instance_class`) is not
+benchmarked. Measure it before running multi-generation English jobs. If it is
+slow there too, the copy can be avoided: treat a missing row as zero
+occurrences, and select a generation's racks by anti-joining the previous
+generation's rows instead of copying them.
