@@ -100,6 +100,10 @@ services:
       # branch is 0.0.0 -- scripts/dev.py reads that out of your checkout and
       # sets this for you.
       MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.0.1}
+      # Nginx appends the client address to X-Forwarded-For, and the per-IP
+      # rate limits key on it. Requests to :8080 directly carry no header and
+      # fall back to the peer address.
+      TRUSTED_PROXY_HOPS: "1"
       S3_BUCKET: birdtest-artifacts
       S3_ENDPOINT: http://minio:9000
       AWS_ACCESS_KEY_ID: birdtest

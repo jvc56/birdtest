@@ -166,9 +166,45 @@ variable "task_memory" {
 }
 
 variable "desired_count" {
-  description = "Number of ECS tasks. Task scheduling is coordinated through Postgres, so more than one is safe; see the primary/secondary split under Possible Future Improvements before scaling far."
+  description = <<-EOT
+    Number of ECS tasks. Must be 1. Claiming is coordinated through Postgres,
+    but three things are not: input-data imports run as an in-process task that
+    a starting instance marks failed if it finds one running, rate limits are
+    in-memory per process, and SSE subscribers only hear submissions made to
+    their own instance. See PLAN.md's primary/secondary split before raising it.
+  EOT
   type        = number
   default     = 1
+
+  validation {
+    condition     = var.desired_count <= 1
+    error_message = "birdtest runs as a single instance; see the variable description."
+  }
+}
+
+variable "acm_certificate_arn" {
+  description = <<-EOT
+    ACM certificate for the public hostname, in `region`. Required: the backend
+    sets Secure cookies, which a browser will not keep over plain HTTP, so the
+    site cannot be served without TLS.
+  EOT
+  type        = string
+}
+
+variable "min_magpie_version" {
+  description = <<-EOT
+    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). Raise to the
+    first MAGPIE release that implements the contribution protocol before
+    launch: a build reporting a lower version is offered nothing.
+  EOT
+  type        = string
+  default     = "0.0.1"
+}
+
+variable "github_token_parameter_arn" {
+  description = "Optional SSM SecureString parameter ARN holding a GitHub token for input-data imports. Empty for none."
+  type        = string
+  default     = ""
 }
 
 variable "mail_from_address" {
