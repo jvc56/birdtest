@@ -157,7 +157,8 @@ export interface JobStats {
   };
   workers: {
     user_id: string | null;
-    anon_uuid: string | null;
+    /** An anonymous worker's public pseudonym; its UUID is never published. */
+    anon_id: string | null;
     username: string | null;
     tasks_completed: number;
   }[];
@@ -180,7 +181,7 @@ export interface PlayerConfig {
   num_plies: number | null;
   num_plies_recorded: number | null;
   num_plays: number | null;
-  num_plays_recorded: number | null;
+  num_plays_recorded: number;
   stopping_pct: number | null;
   use_inference: boolean | null;
   time_limit_secs: number | null;
@@ -308,6 +309,7 @@ export const api = {
   login: (body: { username: string; password: string }) =>
     post<{ username: string; is_admin: boolean }>('/api/auth/login', body),
   logout: () => post<void>('/api/auth/logout'),
+  signOutEverywhere: () => post<void>('/api/auth/sign-out-everywhere'),
   confirmEmail: (code: string) => post<{ message: string }>('/api/auth/confirm-email', { code }),
   requestPasswordReset: (email: string) =>
     post<{ message: string }>('/api/auth/reset-password/request', { email }),
@@ -385,6 +387,9 @@ export const api = {
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),
+  /** Like `workers`, plus anonymous workers' UUIDs, which a ban needs. */
+  adminWorkers: (page = 0) =>
+    get<Page<Record<string, unknown>>>(`/api/admin/workers?page=${page}`),
   banWorker: (body: { user_id?: string; anon_uuid?: string; reason?: string }) =>
     post<{ id: string }>('/api/admin/workers/ban', body),
   unbanWorker: (id: string) => del<void>(`/api/admin/workers/ban/${id}`),

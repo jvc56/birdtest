@@ -94,9 +94,7 @@ impl JobHandler for OpeningRackHandler {
         .bind(task_id)
         .fetch_one(&mut *conn)
         .await?;
-        // Absent means the config asked for no truncation.
-        let num_plays_recorded: i32 =
-            row.get::<Option<i32>, _>("num_plays_recorded").unwrap_or(i32::MAX);
+        let num_plays_recorded: i32 = row.get("num_plays_recorded");
 
         // An opening rack is unique per (claim, rack), so a conflict here would
         // be a duplicate within one submission rather than a redundant claim.

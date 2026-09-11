@@ -81,7 +81,7 @@ pub struct PlayerConfig {
     pub num_plies_recorded: Option<i32>,
     /// Plays to simulate, and how many of them to report back.
     pub num_plays: Option<i32>,
-    pub num_plays_recorded: Option<i32>,
+    pub num_plays_recorded: i32,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,
@@ -156,7 +156,6 @@ pub struct LeaveConfig {
     pub generation_count: i32,
     pub target_rack_count: i32,
     pub racks_per_task: i32,
-    pub max_leave_size: i32,
     pub use_wordmap: bool,
 }
 

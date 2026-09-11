@@ -152,7 +152,7 @@ impl TestDb {
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
-            min_magpie_version: "0.0.1".into(),
+            min_magpie_version: "0.1.0".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
             magpie_data_repo: "example/data".into(),
             github_token: None,
@@ -213,8 +213,9 @@ impl TestDb {
         let kwg = self.input_data("kwg", &format!("NWL{name}")).await;
         let klv = self.input_data("klv", &format!("NWL{name}")).await;
         sqlx::query_scalar(
-            "INSERT INTO player_configs (name, recorder_type, sort_strategy, kwg_id, klv_id, created_by)
-             VALUES ($1, 'best', 'equity', $2, $3, $4) RETURNING id",
+            "INSERT INTO player_configs
+                 (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plays_recorded, created_by)
+             VALUES ($1, 'best', 'equity', $2, $3, 10, $4) RETURNING id",
         )
         .bind(name)
         .bind(kwg)
@@ -246,7 +247,7 @@ impl TestDb {
         job
     }
 
-    /// A `jobs` row and nothing else: active, allocation 50, floor 0.0.1.
+    /// A `jobs` row and nothing else: active, allocation 50, floor 0.1.0.
     pub async fn bare_job(&self, job_type: &str, redundancy: i32, created_by: Uuid) -> Uuid {
         let ld = self.input_data("letterdist", "english").await;
         let layout = self.input_data("layout", "standard15").await;
@@ -317,7 +318,7 @@ pub fn post_json(path: &str, headers: &[(&str, &str)], body: serde_json::Value) 
 /// Headers for an admin session: the session cookie plus the CSRF double-submit
 /// pair.
 pub fn admin_headers(cfg: &Config, user_id: Uuid) -> Vec<(String, String)> {
-    let token = birdtest::auth::session::issue(cfg, user_id, "admin", true).unwrap();
+    let token = birdtest::auth::session::issue(cfg, user_id, "admin", true, 0).unwrap();
     vec![
         ("cookie".into(), format!("birdtest_session={token}; birdtest_csrf=testcsrf")),
         ("x-csrf-token".into(), "testcsrf".into()),
@@ -336,4 +337,12 @@ pub fn games_result(games: i32, wins: i32) -> serde_json::Value {
             "p2_score_mean": 410.0, "p2_score_sd": 58.0
         }
     })
+}
+
+pub fn get_request(path: &str, headers: &[(String, String)]) -> Request<Body> {
+    let mut builder = Request::get(path);
+    for (name, value) in headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder.body(Body::empty()).unwrap()
 }

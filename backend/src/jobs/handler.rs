@@ -53,7 +53,7 @@ pub struct PlayerSpec {
     pub num_plies: Option<i32>,
     pub num_plies_recorded: Option<i32>,
     pub num_plays: Option<i32>,
-    pub num_plays_recorded: Option<i32>,
+    pub num_plays_recorded: i32,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,

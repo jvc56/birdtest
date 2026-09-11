@@ -230,6 +230,15 @@ impl RackIndex {
         Some(rack)
     }
 
+    /// The racks at raw enumeration indices `[start, start + count)`, without
+    /// scattering, stopping at the end of the space. For walking the whole
+    /// space in bounded chunks.
+    pub fn racks_in_enumeration_range(&self, start: u64, count: u64) -> Vec<String> {
+        (start..start.saturating_add(count))
+            .map_while(|index| self.rack_at_enumeration_index(index))
+            .collect()
+    }
+
     /// The racks in `[start, start + count)`, stopping at the end of the space.
     /// The final batch of a job comes up short this way.
     pub fn racks_in_range(&self, start: u64, count: u64) -> Vec<String> {

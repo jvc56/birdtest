@@ -34,13 +34,17 @@ impl FromRequestParts<AppState> for CurrentUser {
             .ok_or_else(|| AppError::unauthorized("not signed in"))?;
         let claims = session::verify(&state.cfg, &token)?;
 
+        // A deleted account, or a token from before the account's last
+        // password reset or "sign out everywhere", matches no row.
         let row = sqlx::query_as::<_, (Uuid, String, String, bool)>(
-            "SELECT id, username, email, is_admin FROM users WHERE id = $1",
+            "SELECT id, username, email, is_admin FROM users
+             WHERE id = $1 AND deleted_at IS NULL AND session_generation = $2",
         )
         .bind(claims.user_id)
+        .bind(claims.generation)
         .fetch_optional(&state.pool)
         .await?
-        .ok_or_else(|| AppError::unauthorized("account no longer exists"))?;
+        .ok_or_else(|| AppError::unauthorized("session is no longer valid; sign in again"))?;
 
         Ok(CurrentUser { id: row.0, username: row.1, email: row.2, is_admin: row.3 })
     }
@@ -63,6 +67,16 @@ impl FromRequestParts<AppState> for AdminUser {
         }
         Ok(AdminUser(user))
     }
+}
+
+/// The public name for an anonymous worker: the first 16 hex characters of the
+/// SHA-256 of its UUID's text. The UUID is the worker's only credential, so
+/// public endpoints publish this instead; it is stable, and cannot be turned
+/// back into the UUID. SQL computes the same value as
+/// `left(encode(sha256(convert_to(uuid::text, 'UTF8')), 'hex'), 16)`.
+pub fn public_anon_id(uuid: Uuid) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(uuid.to_string().as_bytes()))[..16].to_string()
 }
 
 /// Who is asking for work.

@@ -103,6 +103,9 @@ async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
 /// `worker_bans.banned_by` all referenced `users` with no ON DELETE clause, so
 /// a user who had registered (and so has a `user.registered` row), created a
 /// config or issued a ban could not be deleted.
+///
+/// F8: deletion now anonymizes. Personal data and credentials go; the row,
+/// and with it every claim and result, stays.
 #[tokio::test]
 async fn a_user_with_history_can_be_deleted() {
     let db = TestDb::new().await;
@@ -125,6 +128,12 @@ async fn a_user_with_history_can_be_deleted() {
         .execute(&db.pool)
         .await
         .unwrap();
+    sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, 'hash')")
+        .bind(doomed)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let doomed_session = admin_headers(&state.cfg, doomed);
     let admin = db.user("root", true).await;
 
     let headers = admin_headers(&state.cfg, admin);
@@ -132,13 +141,37 @@ async fn a_user_with_history_can_be_deleted() {
         send(&app, request("DELETE", &format!("/api/admin/users/{doomed}"), &headers)).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
+    let (username, email, is_admin, deleted): (String, String, bool, bool) = sqlx::query_as(
+        "SELECT username, email, is_admin, deleted_at IS NOT NULL FROM users WHERE id = $1",
+    )
+    .bind(doomed)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(deleted, "the row stays, marked deleted");
+    assert!(!username.contains("doomed") && !email.contains("doomed"), "{username} {email}");
+    assert!(!is_admin);
+    let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
+        .bind(doomed)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(keys, 0, "API keys are credentials and go");
+    let (status, _) = send(&app, get_request("/api/me", &doomed_session)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "the deleted account's sessions are revoked");
+    let (_, users) = send(&app, get_request("/api/users", &[])).await;
+    assert!(!users.to_string().contains(&doomed.to_string()), "hidden from the public list");
+    let (status, _) =
+        send(&app, request("DELETE", &format!("/api/admin/users/{doomed}"), &headers)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "deleting twice finds nothing");
+
     let created_by: Option<Uuid> =
         sqlx::query_scalar("SELECT created_by FROM player_configs WHERE id = $1")
             .bind(config)
             .fetch_one(&db.pool)
             .await
             .unwrap();
-    assert_eq!(created_by, None, "the config outlives its creator");
+    assert_eq!(created_by, Some(doomed), "the config outlives its creator, credited to the tombstone");
     let still_banned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM worker_bans WHERE user_id = $1")
         .bind(banned)
         .fetch_one(&db.pool)

@@ -78,9 +78,15 @@ resource "aws_security_group" "service" {
 resource "aws_lb" "main" {
   name               = local.name
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
-  tags               = local.tags
+  # Not the 60-second default. Creating a leave-generation job writes every
+  # full rack (3.2 million rows for English) inside the request, and a
+  # generation transition runs inside a worker's claim request; both take tens
+  # of seconds on a small instance. MAGPIE's own request timeout is 120s.
+  # SSE streams are unaffected: they send keep-alives.
+  idle_timeout    = 300
+  security_groups = [aws_security_group.alb.id]
+  subnets         = aws_subnet.public[*].id
+  tags            = local.tags
 }
 
 resource "aws_lb_target_group" "backend" {
@@ -243,9 +249,9 @@ resource "aws_ecs_task_definition" "main" {
 
   container_definitions = jsonencode([
     {
-      name      = "backend"
-      image     = var.backend_image
-      essential = true
+      name         = "backend"
+      image        = var.backend_image
+      essential    = true
       portMappings = [{ containerPort = 8080, protocol = "tcp" }]
       environment = [
         { name = "BIND_ADDR", value = "0.0.0.0:8080" },
@@ -286,9 +292,9 @@ resource "aws_ecs_task_definition" "main" {
       }
     },
     {
-      name      = "frontend"
-      image     = var.frontend_image
-      essential = true
+      name         = "frontend"
+      image        = var.frontend_image
+      essential    = true
       portMappings = [{ containerPort = 80, protocol = "tcp" }]
       logConfiguration = {
         logDriver = "awslogs"

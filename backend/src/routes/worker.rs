@@ -249,14 +249,18 @@ async fn decline_task(
          FROM task_claims c
          JOIN tasks t ON t.id = c.task_id
          WHERE c.claim_token = $1 AND c.state = 'claimed'
+           AND c.claimed_by_user_id IS NOT DISTINCT FROM $2
+           AND c.claimed_by_anon_uuid IS NOT DISTINCT FROM $3
          FOR UPDATE OF c",
     )
     .bind(body.claim_token)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
-        // Already released, already submitted, or never existed: nothing the
-        // client can do about it either way.
+        // Already released, already submitted, never existed, or claimed by
+        // a different identity: nothing the client can do about it either way.
         tx.rollback().await?;
         return Err(AppError::not_found("no open claim with that token"));
     };
@@ -312,9 +316,13 @@ async fn heartbeat(
 
     sqlx::query(
         "UPDATE task_claims SET last_heartbeat_at = now()
-         WHERE claim_token = $1 AND state = 'claimed'",
+         WHERE claim_token = $1 AND state = 'claimed'
+           AND claimed_by_user_id IS NOT DISTINCT FROM $2
+           AND claimed_by_anon_uuid IS NOT DISTINCT FROM $3",
     )
     .bind(body.claim_token)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
     .execute(&state.pool)
     .await?;
 
@@ -355,12 +363,20 @@ async fn submit_result(
         "SELECT c.id, c.task_id, t.job_id
          FROM task_claims c JOIN tasks t ON t.id = c.task_id
          WHERE c.claim_token = $1 AND c.state = 'claimed'
+           AND c.claimed_by_user_id IS NOT DISTINCT FROM $2
+           AND c.claimed_by_anon_uuid IS NOT DISTINCT FROM $3
          FOR UPDATE OF c",
     )
     .bind(body.claim_token)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
     .fetch_optional(&mut *tx)
     .await?;
 
+    // A token is bound to the identity it was issued to (the checks above), so
+    // a ban or an audit row means what it says: a token handed to another
+    // identity is treated exactly like an unknown one.
+    //
     // A stale token means the claim timed out and was reclaimed, or this
     // result was already accepted. The work is reassigned or done, and the
     // worker has nothing useful to do with an error.

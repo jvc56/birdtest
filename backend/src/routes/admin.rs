@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/purge", post(purge_job))
         .route("/jobs/:id", delete(delete_job))
         .route("/users/:id", delete(delete_user))
+        .route("/workers", get(super::public::list_workers_admin))
         .route("/workers/ban", post(ban_worker))
         .route("/workers/ban/:id", delete(unban_worker))
         .route("/audit-log", get(audit_log))
@@ -455,7 +456,8 @@ struct CreatePlayerConfigBody {
     num_plies: Option<i32>,
     num_plies_recorded: Option<i32>,
     num_plays: Option<i32>,
-    num_plays_recorded: Option<i32>,
+    /// Required: how many ranked moves per position are reported and kept.
+    num_plays_recorded: i32,
     stopping_pct: Option<f64>,
     use_inference: Option<bool>,
     time_limit_secs: Option<i32>,
@@ -616,7 +618,6 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     let positive = [
         ("max_iterations", body.max_iterations),
         ("num_plays", body.num_plays),
-        ("num_plays_recorded", body.num_plays_recorded),
         ("num_plies_recorded", body.num_plies_recorded),
         ("min_play_iterations", body.min_play_iterations),
     ];
@@ -624,6 +625,9 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
         if value.is_some_and(|v| v < 1) {
             err = err.with_field(field, "must be at least 1");
         }
+    }
+    if body.num_plays_recorded < 1 {
+        err = err.with_field("num_plays_recorded", "must be at least 1");
     }
     if body.num_plies.is_some_and(|v| v < 0) {
         err = err.with_field("num_plies", "must not be negative");
@@ -811,8 +815,6 @@ enum JobTypeConfig {
         generation_count: i32,
         target_rack_count: i32,
         racks_per_task: i32,
-        #[serde(default = "default_max_leave_size")]
-        max_leave_size: i32,
         /// Whether the leave-generating bot plays with a wordmap. Defaults on:
         /// leave generation is the most game-heavy job type there is, and a
         /// wordmap is a large speedup. Workers build one on demand.
@@ -829,9 +831,6 @@ fn default_elo_low() -> f64 {
 }
 fn default_elo_high() -> f64 {
     10.0
-}
-fn default_max_leave_size() -> i32 {
-    6
 }
 fn default_true() -> bool {
     true
@@ -1000,8 +999,7 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             *elo_low, *elo_high,
         ),
         JobTypeConfig::Leave {
-            num_iterations, generation_count, target_rack_count, racks_per_task,
-            max_leave_size, ..
+            num_iterations, generation_count, target_rack_count, racks_per_task, ..
         } => {
             for (field, value) in [
                 ("num_iterations", *num_iterations),
@@ -1012,9 +1010,6 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
                 if value < 1 {
                     err = err.with_field(field, "must be at least 1");
                 }
-            }
-            if !(1..=6).contains(max_leave_size) {
-                err = err.with_field("max_leave_size", "must be between 1 and 6");
             }
             err
         }
@@ -1227,8 +1222,7 @@ async fn insert_job_config(
             JobType::LeaveGeneration,
             JobTypeConfig::Leave {
                 kwg_id, num_iterations,
-                generation_count, target_rack_count, racks_per_task, max_leave_size,
-                use_wordmap,
+                generation_count, target_rack_count, racks_per_task, use_wordmap,
             },
         ) => {
             let lexicon: (String, String) = sqlx::query_as(
@@ -1255,13 +1249,12 @@ async fn insert_job_config(
             sqlx::query(
                 "INSERT INTO job_leave_config
                      (job_id, kwg_id, num_iterations,
-                      generation_count, target_rack_count, racks_per_task,
-                      max_leave_size, use_wordmap)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                      generation_count, target_rack_count, racks_per_task, use_wordmap)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
             )
             .bind(job.id).bind(kwg_id)
             .bind(num_iterations).bind(generation_count).bind(target_rack_count)
-            .bind(racks_per_task).bind(max_leave_size).bind(use_wordmap)
+            .bind(racks_per_task).bind(use_wordmap)
             .execute(conn)
             .await?;
         }
@@ -1716,9 +1709,14 @@ async fn rebuild_artifacts(
 // Users and bans
 // ---------------------------------------------------------------------------
 
-/// Account deletion is done at the application layer, not by `ON DELETE
-/// CASCADE`: the denormalized task counters have to be decremented and tasks may
-/// revert from completed to available, which a DB-level cascade cannot do.
+/// Account deletion anonymizes the account rather than removing it
+/// (AUDIT_FINDINGS.md F8). Personal data goes: the username and email become
+/// tombstones, the password becomes unusable, API keys, confirmation codes and
+/// reset tokens are deleted, and every session is revoked. Contributions stay:
+/// the account's claims and results are kept under the tombstone, and no
+/// counter is rolled back, so no donated compute is lost -- including captured
+/// positions other redundant claims deduplicated against. Open claims are left
+/// to time out; nothing can submit for them once the keys are gone.
 async fn delete_user(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1747,50 +1745,28 @@ async fn delete_user(
     )
     .await?;
 
-    // 1. Roll back the counters every one of this user's claims contributed.
-    sqlx::query(
-        "WITH mine AS (
-             SELECT task_id,
-                    COUNT(*) FILTER (WHERE state = 'completed')::int AS accepted,
-                    COUNT(*) FILTER (WHERE state = 'claimed')::int   AS active
-             FROM task_claims WHERE claimed_by_user_id = $1
-             GROUP BY task_id
-         )
-         UPDATE tasks t
-         SET accepted_count = GREATEST(t.accepted_count - mine.accepted, 0),
-             active_claim_count = GREATEST(t.active_claim_count - mine.active, 0),
-             state = CASE
-                 WHEN GREATEST(t.accepted_count - mine.accepted, 0) >= j.redundancy
-                     THEN 'completed'::task_state
-                 WHEN GREATEST(t.accepted_count - mine.accepted, 0)
-                      + GREATEST(t.active_claim_count - mine.active, 0) >= j.redundancy
-                     THEN 'claimed'::task_state
-                 ELSE 'available'::task_state
-             END,
-             completed_at = CASE
-                 WHEN GREATEST(t.accepted_count - mine.accepted, 0) >= j.redundancy
-                     THEN t.completed_at ELSE NULL
-             END
-         FROM mine, jobs j
-         WHERE t.id = mine.task_id AND j.id = t.job_id",
+    let anonymized = sqlx::query(
+        "UPDATE users SET
+             username = 'deleted-' || id::text,
+             email = id::text || '@deleted.invalid',
+             password_hash = '!',
+             email_confirmed_at = NULL,
+             is_admin = false,
+             session_generation = session_generation + 1,
+             deleted_at = now()
+         WHERE id = $1 AND deleted_at IS NULL",
     )
     .bind(id)
     .execute(&mut *tx)
     .await?;
-
-    // 2-3. Task records cascade from the claim rows.
-    sqlx::query("DELETE FROM task_claims WHERE claimed_by_user_id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-
-    // 4. The user row, cascading to api_keys, confirmations and reset tokens.
-    let deleted = sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-    if deleted.rows_affected() == 0 {
+    if anonymized.rows_affected() == 0 {
         return Err(AppError::not_found("no such user"));
+    }
+    for table in ["api_keys", "email_confirmations", "password_reset_tokens"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
     }
 
     audit::log(
@@ -2033,10 +2009,9 @@ mod tests {
             "kwg_id": Uuid::nil(),
             "num_iterations": 0,
             "target_rack_count": 10,
-            "racks_per_task": 10,
-            "max_leave_size": 7,
+            "racks_per_task": 0,
         }));
-        assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "max_leave_size"]);
+        assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "racks_per_task"]);
     }
 
     #[test]

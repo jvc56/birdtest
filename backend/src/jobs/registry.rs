@@ -12,6 +12,9 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 /// The outcome of trying to get one unit of work out of a job.
+// One value per claim attempt, moved straight to the caller and never stored,
+// so the size of the `Task` variant costs nothing worth a box.
+#[allow(clippy::large_enum_variant)]
 pub enum Acquired {
     Task { task_id: Uuid, request: TaskRequest },
     /// This job has nothing to hand out right now; try the next one.
@@ -257,13 +260,8 @@ pub async fn store_result(
 pub async fn initialize_job_state(conn: &mut PgConnection, job: &Job) -> AppResult<i64> {
     match job.job_type {
         JobType::LeaveGeneration => {
-            let config =
-                sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
-                    .bind(job.id)
-                    .fetch_one(&mut *conn)
-                    .await?;
             let job_data = load_job_data(&mut *conn, job.id).await?;
-            leave_gen::seed_generation(conn, job.id, 1, &config, &job_data.letterdist).await
+            leave_gen::seed_generation(conn, job.id, 1, &job_data.letterdist).await
         }
         JobType::OpeningRack | JobType::Games | JobType::GamePairs => Ok(0),
     }

@@ -376,9 +376,22 @@ async fn try_claim_from_job(
             // Builds a multi-megabyte KLV and uploads it to the object store,
             // so it must not hold the claim transaction open.
             let _ = tx.rollback().await;
-            run_leave_generation_transition(state, job, generation)
-                .await
-                .map_err(JobClaimError::Fatal)?;
+            // On its own task, awaited: a transition takes tens of seconds, and
+            // if the worker or a load balancer gives up on this request the
+            // handler future is dropped. Run inline, that would abandon the
+            // transition part-way every time, and a generation whose
+            // transition outlasts the timeout would never close.
+            let (state, job) = (state.clone(), job.clone());
+            tokio::spawn(async move {
+                run_leave_generation_transition(&state, &job, generation).await
+            })
+            .await
+            .map_err(|e| {
+                JobClaimError::Fatal(crate::error::AppError::internal(format!(
+                    "leave generation transition panicked: {e}"
+                )))
+            })?
+            .map_err(JobClaimError::Fatal)?;
             Err(JobClaimError::Retry)
         }
         Acquired::Task { task_id, request } => {

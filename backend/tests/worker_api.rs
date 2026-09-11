@@ -217,11 +217,14 @@ async fn a_job_that_cannot_dispatch_does_not_block_the_others() {
 async fn a_stale_unsupported_entry_does_not_change_the_shutdown_reason() {
     let db = TestDb::new().await;
     let job = db.games_job(1, 2).await;
-    sqlx::query("UPDATE jobs SET min_magpie_major = 2 WHERE id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE jobs SET min_magpie_major = 2, min_magpie_minor = 0, min_magpie_patch = 0
+         WHERE id = $1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     let admin = db.user("admin", true).await;
     let finished = db.bare_job("games", 1, admin).await;
     sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
@@ -235,7 +238,7 @@ async fn a_stale_unsupported_entry_does_not_change_the_shutdown_reason() {
         send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[finished]))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["shutdown"]["reason"], "magpie_too_old", "{body}");
-    assert_eq!(body["shutdown"]["required_magpie_version"], "2.0.1");
+    assert_eq!(body["shutdown"]["required_magpie_version"], "2.0.0");
 }
 
 /// The deficit the scheduler orders on is a counter now; it must move with
@@ -286,4 +289,96 @@ async fn every_claim_advances_the_dispatch_counter() {
     .await
     .unwrap();
     assert_eq!(active, 1);
+}
+
+/// F13: a claim token worked for any registered identity, so a banned worker
+/// could hand its tokens to another, and a result was audit-logged under
+/// whoever submitted it. The token is now bound to the identity it was issued
+/// to; any other identity is treated as holding an unknown token.
+#[tokio::test]
+async fn a_claim_token_works_only_for_the_identity_it_was_issued_to() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    db.games_job(1, 2).await;
+
+    let (owner_claim, owner) = first_claim(&app).await;
+    let (_, other) = first_claim(&app).await;
+    assert_ne!(owner, other);
+    let token = owner_claim["claim_token"].as_str().unwrap();
+
+    let heartbeat_at = || async {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT last_heartbeat_at FROM task_claims WHERE claim_token = $1::uuid",
+        )
+        .bind(token)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    let before = heartbeat_at().await;
+    let (status, _) = send(
+        &app,
+        post_json("/api/worker/heartbeat", &[("x-worker-uuid", &other)], json!({ "claim_token": token })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(heartbeat_at().await, before, "another identity's heartbeat keeps nothing alive");
+
+    let (status, _) = send(
+        &app,
+        post_json(
+            "/api/worker/decline",
+            &[("x-worker-uuid", &other)],
+            json!({ "claim_token": token, "reason": "missing_data" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "another identity cannot decline it");
+
+    let (status, body) = submit_as(&app, &other, token, games_result(2, 1)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["accepted"], false, "another identity cannot submit for it");
+
+    let (status, body) = submit_as(&app, &owner, token, games_result(2, 1)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["accepted"], true, "the owner still can: {body}");
+}
+
+/// F5: public endpoints published anonymous workers' UUIDs, which are their
+/// only credential. They now publish a derived pseudonym, and only the admin
+/// listing carries the UUID.
+#[tokio::test]
+async fn public_endpoints_name_anonymous_workers_by_pseudonym_only() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let job = db.games_job(1, 2).await;
+
+    let (claim, uuid) = first_claim(&app).await;
+    let token = claim["claim_token"].as_str().unwrap();
+    let (_, body) = submit_as(&app, &uuid, token, games_result(2, 1)).await;
+    assert_eq!(body["accepted"], true, "{body}");
+    let expected = birdtest::auth::public_anon_id(uuid.parse().unwrap());
+
+    let public = [
+        "/api/workers".to_string(),
+        format!("/api/jobs/{job}"),
+        format!("/api/jobs/{job}/results"),
+        format!("/api/jobs/{job}/results?worker={expected}"),
+    ];
+    for path in &public {
+        let (status, body) = send(&app, get_request(path, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        let text = body.to_string();
+        assert!(!text.contains(&uuid), "{path} publishes the worker's UUID: {text}");
+        assert!(text.contains(&expected), "{path} does not name the worker by pseudonym: {text}");
+    }
+
+    let admin = db.user("root", true).await;
+    let (status, body) =
+        send(&app, get_request("/api/admin/workers", &admin_headers(&state.cfg, admin))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"][0]["anon_uuid"], uuid, "the admin listing carries the UUID to ban");
+    let (status, _) = send(&app, get_request("/api/admin/workers", &[])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }

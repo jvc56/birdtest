@@ -7,6 +7,15 @@ CREATE TABLE users (
     password_hash        TEXT NOT NULL,
     email_confirmed_at   TIMESTAMPTZ,
     is_admin             BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Embedded in every session token and compared on every request. Bumped by
+    -- a password reset, "sign out everywhere" and account deletion, which is
+    -- what revokes every session minted before.
+    session_generation   INT NOT NULL DEFAULT 0,
+    -- Set when an admin deletes the account. Deletion anonymizes rather than
+    -- removes the row: username, email and password are replaced by
+    -- tombstones and API keys are deleted, but the account's claims and
+    -- results stay, so no donated compute is lost.
+    deleted_at           TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -187,11 +196,11 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.0.1 is a
-    -- placeholder for the MAGPIE release implementing the check.
+    -- so "no floor" is not a state worth being able to express. 0.1.0 is the
+    -- first MAGPIE version that implements the protocol correctly.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 0 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -248,7 +257,9 @@ CREATE TABLE player_configs (
     num_plies          INT,                 -- plies to simulate    (-pl1 / -pl2)
     num_plies_recorded INT,                 -- plies to report      (shplies)
     num_plays          INT,                 -- plays to simulate    (-np1 / -np2)
-    num_plays_recorded INT,                 -- plays to report      (maxnumdplays)
+    -- plays to report (maxnumdplays). Required: "keep everything" is unbounded
+    -- per position, and the worker and the server must agree on the number.
+    num_plays_recorded INT NOT NULL CHECK (num_plays_recorded >= 1),
     stopping_pct     DOUBLE PRECISION,      -- -sc1 / -sc2 (0–100)
     use_inference    BOOLEAN,               -- -si1 / -si2
     time_limit_secs  INT,                   -- -tl1 / -tl2
@@ -352,8 +363,6 @@ CREATE TABLE job_leave_config (
     target_rack_count INT NOT NULL CHECK (target_rack_count >= 1),
     -- Size of the forced-rack subset handed to a single task.
     racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
-    -- Largest leave size enumerated into the rack universe (leaves are 1..N tiles).
-    max_leave_size    INT NOT NULL DEFAULT 6 CHECK (max_leave_size BETWEEN 1 AND 6),
     -- Whether the leave-generating bot plays with a wordmap. Sent to the worker,
     -- which builds one from its .kwg if it does not already have it. A player
     -- setting like any other -- workers assume nothing about wordmaps.
@@ -501,9 +510,11 @@ CREATE TABLE leave_requests (
     use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
 );
 
--- Live per-rack occurrence progress for the in-progress generation of a leave-gen job.
--- Upserted transactionally on every accepted leave task result; drives both generation-transition
--- detection (all racks >= target) and the live dashboard figure.
+-- Live per-rack occurrence progress for each generation of a leave-gen job, one row per
+-- full 7-tile rack the distribution can draw (3,199,724 for English), seeded at zero when
+-- the generation opens. Updated transactionally on every accepted leave task result; drives
+-- both generation-transition detection (all racks >= target) and the live dashboard figure.
+-- Leave values are derived from these full-rack means as MAGPIE's rack_list_write_to_klv does.
 CREATE TABLE leave_rack_progress (
     job_id           UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     generation       INT NOT NULL,

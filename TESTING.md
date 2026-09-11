@@ -576,12 +576,18 @@ job creation touches needs one caller here.
 
 ### `I-LEAVE-*` — leave generation (`jobs/leave_gen.rs`)
 
-- `I-LEAVE-1` `seed_generation` inserts one `leave_rack_progress` row per leave
-  for the pinned distribution, and the count matches `enumerate_leaves`.
-- `I-LEAVE-2` The bulk upsert **sums** occurrences and accumulates equity under
-  concurrent submissions from several workers.
-- `I-LEAVE-3` Rack selection picks the racks furthest below target, and returns
-  nothing once all are at target with no claim in flight.
+- `I-LEAVE-1` `seed_generation` inserts one `leave_rack_progress` row per full
+  7-tile rack for the pinned distribution, the count matches
+  `enumerate_racks(7)`, and a claim's forced racks are full racks.
+  *(Covered: `leave_gen::the_universe_and_the_forced_racks_are_full_racks`.)*
+- `I-LEAVE-2` The bulk update **sums** occurrences and accumulates equity under
+  concurrent submissions from several workers, and a rack outside the universe
+  creates no row. *(Single-submission half covered:
+  `leave_gen::a_result_folds_into_the_generation_and_creates_no_rows`.)*
+- `I-LEAVE-3` Rack selection picks the racks furthest below target, skips racks
+  an open claim is already forcing, and returns nothing once all are at target
+  with no claim in flight. *(Skipping covered:
+  `leave_gen::racks_out_with_an_open_claim_are_not_handed_out_again`.)*
 - `I-LEAVE-4` Generation transition folds progress into a KLV, uploads it,
   records the digest, and marks the generation complete.
 - `I-LEAVE-5` `ON CONFLICT DO NOTHING` on the artifact row keeps the **first**
@@ -958,14 +964,11 @@ silently mean nothing was exercised. This follows the precedent already set by
 `../../MAGPIE/data`), `#[ignore]` by default, and an `assert!` naming the remedy
 when the binary is absent.
 
-**Correctness is established by capability probe, not by version.** `contribute`
-lives on the unreleased `birdtest-contribute` branch, so there is no version
-string that discriminates — it reports `0.0.0`, below the shipped
-`MIN_MAGPIE_VERSION` default of `0.0.1`, which is why this tier must set the
-floor explicitly. The probe asks the binary what it can do: that `contribute` is
-a registered command, and that it accepts the current required claim body. When
-production versions become real, this becomes a version check and the probe
-retires.
+**Correctness is established by version and capability probe.**
+`birdtest-contribute` reports `0.1.0`, the shipped `MIN_MAGPIE_VERSION` default,
+and a checkout from before the audit's fixes reports `0.0.0` and is refused. The
+probe additionally asks the binary what it can do: that `contribute` is a
+registered command, and that it accepts the current required claim body.
 
 **This tier cannot use the synthetic fixture lexica** — nor can the dev
 environment, for the same reason. The fixture's `NWL23.kwg` is a stub; a real
@@ -995,8 +998,16 @@ surfacing the mismatch as a red build rather than as a dead job in production.
 - `M-9` Two contributors run concurrently without duplicate seeds — the
   concurrency check from `I-SCHED-13`, against the real client.
 
+`scripts/e2e_magpie.py` implements `M-1` to `M-4` (with `M-3` run for a static
+and a simming player, asserting the simulated statistics are stored) and checks
+that leave generation writes nothing into MAGPIE's data directory. CI runs it
+nightly (`.github/workflows/nightly.yml`); locally, bring up the stack and run it
+with `--magpie` and `--magpie-root`. `M-2`'s invariants are enforced by the
+server's plausibility checks on every accepted pair result, so a clean run
+covers them.
+
 That makes a leave-generation smoke expensive here: real English means the
-914,624-leave universe above at job creation. Two ways out, in preference order:
+3,199,724-rack universe above at job creation. Two ways out, in preference order:
 keep tier 6's leave-generation case to a single generation and accept a slow
 nightly job, or place the tiny fixture distribution on MAGPIE's own `-path`
 search list so both sides load the same small bag — which is exactly the trick
@@ -1115,9 +1126,9 @@ creation:
 | Real `english` | **914,624** | 3,199,724 |
 | A 6-tile fixture bag | **431** | 149 |
 
-`seed_generation` inserts one `leave_rack_progress` row per leave and
-`klv::build` constructs a trie over all of them, before the job is usable. On
-real English that is nearly a million rows per leave-generation job created —
+`seed_generation` inserts one `leave_rack_progress` row per full rack and
+`klv::build` constructs a trie over every leave, before the job is usable. On
+real English that is 3.2 million rows per leave-generation job created —
 fine in production, where a job is created once and runs for weeks, and
 completely unusable as a per-test fixture. The tiny bag makes the same code path
 run in milliseconds while exercising every part of it.
@@ -1226,14 +1237,23 @@ GitHub Actions.
 
 **Per pull request**, in order, so the cheap thing fails first:
 
-1. `cargo clippy --all-targets -D warnings`, `cargo test` (tiers 1 and 4),
+1. `cargo clippy --all-targets -- -D warnings`, `cargo test` (tiers 1 and 4),
    `npm run check` and `npm test` (tier 1F). No services needed.
 2. Tiers 2 and 3 against a Postgres service container.
 3. Tier 5: compose up, seed, Playwright.
+4. `terraform fmt -check` and `terraform validate` (no AWS credentials).
+5. MAGPIE's half of the contract: check out MAGPIE `birdtest-contribute`, copy
+   this branch's `contract-fixtures/` over its `test/birdtest_contract/`, and run
+   `magpie_test contribute`. A fixture changed here and not in MAGPIE fails
+   here.
+
+Implemented in `.github/workflows/ci.yml`: 1 (without `npm test`, which has no
+tests yet), 2, 4, 5, and the image builds. Tier 5 is not.
 
 **Nightly**:
 
-- Tier 6, with a built MAGPIE and a real `download_data.sh` install.
+- Tier 6, with a built MAGPIE and a real `download_data.sh` install
+  (`.github/workflows/nightly.yml`, running `scripts/e2e_magpie.py`).
 - A migration replay from an empty database.
 - `scripts/restore-roundtrip.sh` — dump, drop, restore, verify.
 

@@ -72,23 +72,25 @@ aws rds modify-db-instance --region "$REGION" \
   --backup-retention-period 30 --deletion-protection --apply-immediately
 ```
 
-Repoint the application. The master password is managed by RDS, so read it
-from Secrets Manager rather than inventing one:
+Repoint the application. The master password is set by hand and lives only in
+the `DATABASE_URL` parameter, so keep it and swap the host. A PITR copy keeps
+the password the source had at the restore point; if it was rotated after that
+point, set it on the new instance first (see "Rotating the database password"):
 
 ```bash
 ENDPOINT=$(aws rds describe-db-instances --region "$REGION" \
   --db-instance-identifier "birdtest-restore-$STAMP" \
   --query 'DBInstances[0].Endpoint.Address' --output text)
 
-SECRET_ARN=$(aws rds describe-db-instances --region "$REGION" \
-  --db-instance-identifier "birdtest-restore-$STAMP" \
-  --query 'DBInstances[0].MasterUserSecret.SecretArn' --output text)
-
-PASSWORD=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" \
-  --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+OLD_URL=$(aws ssm get-parameter --region "$REGION" --name /birdtest/DATABASE_URL \
+  --with-decryption --query Parameter.Value --output text)
+NEW_URL=$(python3 -c 'import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+print(p._replace(netloc=p.netloc.rsplit("@", 1)[0] + "@" + sys.argv[2] + ":5432").geturl())' \
+  "$OLD_URL" "$ENDPOINT")
 
 aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
-  --value "postgres://birdtest:$PASSWORD@$ENDPOINT:5432/birdtest"
+  --value "$NEW_URL"
 
 # Tasks read SSM at start, so this is the whole deploy.
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
@@ -322,3 +324,32 @@ database never issued is rejected the same way any stale claim is.
   restorable and is the loudest alarm in the system.
 - Twice a year, do §5 by hand into a scratch account or region. The manual
   drill exists to find the steps that live only in someone's head.
+
+---
+
+## Rotating the database password
+
+The master password is set by hand (`infra/rds.tf` sets a placeholder
+`password`, so RDS does not manage it) and lives only inside
+`/birdtest/DATABASE_URL`. Rotation is
+this, in order; the service fails new connections between the first and last
+step, so do it in a quiet moment:
+
+```bash
+DB_PASSWORD=$(openssl rand -hex 24)
+aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
+  --master-user-password "$DB_PASSWORD" --apply-immediately
+aws rds wait db-instance-available --region "$REGION" --db-instance-identifier birdtest
+
+OLD_URL=$(aws ssm get-parameter --region "$REGION" --name /birdtest/DATABASE_URL \
+  --with-decryption --query Parameter.Value --output text)
+NEW_URL=$(python3 -c 'import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+print(p._replace(netloc="birdtest:" + sys.argv[2] + "@" + p.netloc.rsplit("@", 1)[1]).geturl())' \
+  "$OLD_URL" "$DB_PASSWORD")
+aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
+  --value "$NEW_URL"
+
+# Tasks read SSM at start; the backup and restore-drill tasks read it per run.
+aws ecs update-service --region "$REGION" --cluster "$CLUSTER" --service birdtest --force-new-deployment
+```

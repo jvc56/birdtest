@@ -74,7 +74,7 @@ variable "backup_schedule" {
 }
 
 variable "backup_restore_drill_schedule" {
-  description = "Schedule for the automated restore drill (PLAN.md, "Drills")."
+  description = "Schedule for the automated restore drill (PLAN.md, \"Drills\")."
   type        = string
   default     = "cron(0 5 1 * ? *)"
 }
@@ -193,12 +193,13 @@ variable "acm_certificate_arn" {
 
 variable "min_magpie_version" {
   description = <<-EOT
-    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). Raise to the
-    first MAGPIE release that implements the contribution protocol before
-    launch: a build reporting a lower version is offered nothing.
+    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.1.0 is the
+    first MAGPIE version that implements the contribution protocol correctly;
+    a build reporting a lower version is offered nothing. Raise it whenever a
+    MAGPIE release changes results.
   EOT
   type        = string
-  default     = "0.0.1"
+  default     = "0.1.0"
 }
 
 variable "github_token_parameter_arn" {

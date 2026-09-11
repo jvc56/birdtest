@@ -1,4 +1,4 @@
-use crate::auth::{api_key, csrf, session};
+use crate::auth::{api_key, csrf, session, CurrentUser};
 use crate::clientip::ClientIp;
 use crate::error::{AppError, AppResult};
 use crate::ratelimit;
@@ -18,6 +18,7 @@ pub fn router() -> Router<AppState> {
         .route("/register", post(register))
         .route("/login", post(login))
         .route("/logout", post(logout))
+        .route("/sign-out-everywhere", post(sign_out_everywhere))
         .route("/confirm-email", post(confirm_email))
         .route("/reset-password/request", post(request_password_reset))
         .route("/reset-password/confirm", post(confirm_password_reset))
@@ -217,9 +218,9 @@ async fn login(
         &format!("user:{}", body.username.trim().to_lowercase()),
     )?;
 
-    let row = sqlx::query_as::<_, (Uuid, String, String, bool, Option<chrono::DateTime<Utc>>)>(
-        "SELECT id, username, password_hash, is_admin, email_confirmed_at
-         FROM users WHERE username = $1",
+    let row = sqlx::query_as::<_, (Uuid, String, String, bool, Option<chrono::DateTime<Utc>>, i32)>(
+        "SELECT id, username, password_hash, is_admin, email_confirmed_at, session_generation
+         FROM users WHERE username = $1 AND deleted_at IS NULL",
     )
     .bind(body.username.trim())
     .fetch_optional(&state.pool)
@@ -228,7 +229,7 @@ async fn login(
     // Identical response whether the username is unknown or the password is
     // wrong, so the endpoint cannot be used to enumerate accounts.
     let invalid = || AppError::unauthorized("incorrect username or password");
-    let Some((id, username, password_hash, is_admin, confirmed_at)) = row else {
+    let Some((id, username, password_hash, is_admin, confirmed_at, generation)) = row else {
         return Err(invalid());
     };
     if !api_key::verify_password(&body.password, &password_hash) {
@@ -240,7 +241,7 @@ async fn login(
         ));
     }
 
-    let token = session::issue(&state.cfg, id, &username, is_admin)?;
+    let token = session::issue(&state.cfg, id, &username, is_admin, generation)?;
     let jar = jar
         .add(session_cookie(&state, token))
         .add(csrf_cookie(&state, csrf::generate_token()));
@@ -259,6 +260,38 @@ async fn logout(
         .remove(Cookie::from(session::SESSION_COOKIE))
         .remove(Cookie::from(csrf::CSRF_COOKIE));
     let _ = state;
+    Ok((jar, StatusCode::NO_CONTENT))
+}
+
+/// Revokes every session this account has, including the caller's: bumping
+/// the generation makes every token minted before it fail `CurrentUser`.
+async fn sign_out_everywhere(
+    State(state): State<AppState>,
+    user: CurrentUser,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> AppResult<(CookieJar, StatusCode)> {
+    csrf::verify(&method, &headers, &jar)?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("UPDATE users SET session_generation = session_generation + 1 WHERE id = $1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+    crate::audit::log(
+        &mut tx,
+        "user.signed_out_everywhere",
+        Some(user.id),
+        None,
+        Some("user"),
+        Some(user.id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
+    let jar = jar
+        .remove(Cookie::from(session::SESSION_COOKIE))
+        .remove(Cookie::from(csrf::CSRF_COOKIE));
     Ok((jar, StatusCode::NO_CONTENT))
 }
 
@@ -311,7 +344,8 @@ async fn request_password_reset(
     ratelimit::check(&state.limits.reset, &format!("ip:{ip}"))?;
     ratelimit::check(&state.limits.reset, &format!("em:{email}"))?;
     let user = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM users WHERE email = $1 AND email_confirmed_at IS NOT NULL",
+        "SELECT id FROM users
+         WHERE email = $1 AND email_confirmed_at IS NOT NULL AND deleted_at IS NULL",
     )
     .bind(&email)
     .fetch_optional(&state.pool)
@@ -394,7 +428,13 @@ async fn confirm_password_reset(
     .await?
     .ok_or_else(|| AppError::bad_request("that reset link is invalid or has expired"))?;
 
-    sqlx::query("UPDATE users SET password_hash = $1 WHERE id = $2")
+    // The generation bump signs out every existing session, an attacker's
+    // included: resetting a password is what someone does when they suspect
+    // another person has access.
+    sqlx::query(
+        "UPDATE users SET password_hash = $1, session_generation = session_generation + 1
+         WHERE id = $2 AND deleted_at IS NULL",
+    )
         .bind(api_key::hash_password(&body.password)?)
         .bind(user_id)
         .execute(&mut *tx)
@@ -411,8 +451,8 @@ async fn confirm_password_reset(
     .await?;
     tx.commit().await?;
 
-    // Dropping the caller's session cookie is the visible half of "invalidate
-    // existing sessions"; the reset itself makes the old password useless.
+    // Every session was revoked above; dropping the cookie just tidies the
+    // caller's browser.
     let jar = jar.remove(Cookie::from(session::SESSION_COOKIE));
     Ok((jar, Json(MessageBody { message: "password updated" })))
 }

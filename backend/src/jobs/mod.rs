@@ -188,15 +188,15 @@ pub(crate) async fn insert_position_analyses(
         // moves are already there too.
         let Some(record_id) = record_id else { continue };
 
-        // `top_moves` is i32::MAX when the config keeps everything; clamp the
-        // cast rather than trusting it to fit a usize on every platform.
+        // `top_moves` is the config's num_plays_recorded, at least 1 by
+        // constraint; clamped anyway rather than trusting the cast.
         let kept: Vec<_> = position.moves.iter().take(top_moves.max(0) as usize).collect();
         if kept.is_empty() {
             continue;
         }
 
         // Chunked because Postgres caps a statement at 65,535 bind parameters,
-        // and a config that keeps every move can report more moves than one
+        // and a large num_plays_recorded can keep more moves than one
         // statement can carry.
         let mut move_ids: Vec<i64> = Vec::with_capacity(kept.len());
         for (chunk_index, chunk) in kept.chunks(MOVE_ROWS_PER_STATEMENT).enumerate() {
@@ -299,19 +299,17 @@ pub(crate) async fn insert_game_results(
 
     // Deterministic games mean redundant claims replay identical positions, so
     // the first accepted claim records them and the rest are no-ops.
-    // How many ranked moves to keep: the player config's num_plays_recorded,
-    // which is also what told the worker how many to report.
-    let top_moves = sqlx::query_scalar::<_, Option<i32>>(
-        "SELECT COALESCE(p1.num_plays_recorded, p2.num_plays_recorded)
+    // How many ranked moves to keep: player 1's num_plays_recorded, which is
+    // also the one MAGPIE reads to decide how many to report.
+    let top_moves = sqlx::query_scalar::<_, i32>(
+        "SELECT p1.num_plays_recorded
          FROM game_requests r
          JOIN player_configs p1 ON p1.id = r.player1_config_id
-         JOIN player_configs p2 ON p2.id = r.player2_config_id
          WHERE r.task_id = $1",
     )
     .bind(task_id)
     .fetch_one(&mut *conn)
-    .await?
-    .unwrap_or(i32::MAX);
+    .await?;
 
     insert_position_analyses(conn, task_id, claim_id, &record.positions, top_moves, true).await
 }

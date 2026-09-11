@@ -123,7 +123,9 @@ pub struct LeaveGenStats {
 #[derive(Debug, Serialize)]
 pub struct WorkerContribution {
     pub user_id: Option<Uuid>,
-    pub anon_uuid: Option<Uuid>,
+    /// An anonymous worker's public name, never its UUID (the UUID is its
+    /// credential); see `auth::public_anon_id`.
+    pub anon_id: Option<String>,
     pub username: Option<String>,
     pub tasks_completed: i64,
 }
@@ -528,7 +530,7 @@ pub async fn worker_contributions(
 ) -> AppResult<Vec<WorkerContribution>> {
     let rows = sqlx::query(
         "SELECT c.claimed_by_user_id AS user_id,
-                c.claimed_by_anon_uuid AS anon_uuid,
+                left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
                 COUNT(*)::bigint AS tasks_completed
          FROM task_claims c
@@ -546,7 +548,7 @@ pub async fn worker_contributions(
         .into_iter()
         .map(|r| WorkerContribution {
             user_id: r.get("user_id"),
-            anon_uuid: r.get("anon_uuid"),
+            anon_id: r.get("anon_id"),
             username: r.get("username"),
             tasks_completed: r.get("tasks_completed"),
         })

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { workerLabel } from '$lib/format';
 
-  export let workers: { username: string | null; anon_uuid: string | null; tasks_completed: number }[];
+  export let workers: { username: string | null; anon_id: string | null; tasks_completed: number }[];
 </script>
 
 <table class="table">

@@ -31,9 +31,17 @@ resource "aws_db_instance" "main" {
 
   db_name  = var.project
   username = var.project
-  # Rotated out of band; Terraform never sees the value. The full DATABASE_URL
-  # (credentials included) lives in the SSM parameter declared in ssm.tf.
-  manage_master_user_password = true
+  # The master password is set by hand, not managed by RDS: RDS-managed
+  # passwords rotate every 7 days, and the tasks read a fixed DATABASE_URL from
+  # SSM, so the first rotation would lock the service out (AUDIT_FINDINGS.md
+  # F2). The instance is created with this placeholder, which the first deploy
+  # replaces immediately (README.md, "Deploying"); ignore_changes keeps
+  # Terraform from reverting it. The real password lives only in the
+  # DATABASE_URL SSM parameter declared in ssm.tf. The instance is reachable
+  # only from the ECS tasks' security group in the meantime. (Setting
+  # `password` at all is what turns RDS-managed passwords off; the provider
+  # refuses `manage_master_user_password` alongside it, even as false.)
+  password = "placeholder-replace-on-first-deploy"
 
   db_subnet_group_name   = aws_db_subnet_group.main.name
   vpc_security_group_ids = [aws_security_group.db.id]
@@ -51,6 +59,10 @@ resource "aws_db_instance" "main" {
   skip_final_snapshot       = false
   final_snapshot_identifier = "${local.name}-final"
   deletion_protection       = true
+
+  lifecycle {
+    ignore_changes = [password]
+  }
 
   tags = local.tags
 }

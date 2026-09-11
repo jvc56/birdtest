@@ -135,7 +135,7 @@ impl Config {
             other => anyhow::bail!("SECURE_COOKIES must be 'true' or 'false', got {other:?}"),
         };
 
-        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.0.1");
+        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.0");
         if crate::version::Version::parse_or_zero(&min_magpie_version)
             == crate::version::Version::ZERO
             && min_magpie_version.trim() != "0.0.0"
@@ -155,10 +155,10 @@ impl Config {
             heartbeat_timeout: Duration::from_secs(parsed("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            // A placeholder for the MAGPIE release that implements the
-            // expected_data check, to be raised to that release's real number
-            // before launch. Not 0.0.0: every job pins data now, and a floor of
-            // zero would admit a client that cannot verify it.
+            // 0.1.0 is the first MAGPIE version that speaks the contribution
+            // protocol correctly (AUDIT_FINDINGS.md F3). Builds reporting 0.0.0
+            // predate the audit's fixes -- ambient simulation settings, an
+            // unapplied distribution and layout -- and must be refused.
             min_magpie_version,
             magpie_download_url: var_or(
                 "MAGPIE_DOWNLOAD_URL",
