@@ -1,0 +1,26 @@
+# Rust
+/backend/target/
+# Node
+node_modules/
+/frontend/.svelte-kit/
+/frontend/build/
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+# Env
+.env
+.env.local
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+
+# Local snapshots taken by scripts/dev-dump.sh
+.dev-backups/
+
+# Per-contributor working directories made by scripts/dev.py: each holds a
+# contribute.txt (with the worker identity the server assigned it), the
+# settings.txt MAGPIE writes, a log, and a symlink to the data directory.
+/.dev-workers/
