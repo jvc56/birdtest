@@ -21,22 +21,23 @@ decisions:
 |---|---|---|
 | **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **24** (21 in A.1, J3, K-D1, K-D2) |
 | **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **18** (16 in A.2, J1, J2) |
-| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised seven; K-D5, K-D7 and K-D11 are decided and K-D11 resolves K-D6 and K-D10, none built yet, leaving K-D8, K-D9 and I3 open. | **10 decided, 3 open** |
+| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised seven, K-D5 to K-D11, and all are now decided though none is yet built. | **17 decided, 0 open** |
 
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
 audit left open, the options offered, the option chosen, and what was
 implemented. Section H lists what implementing those decisions turned up, and
 section I the follow-ups worth deciding next. Section J is the second pass:
-the status of section I (I1 and I2 implemented, I3 still open), the
+the status of section I (I1 and I2 implemented, I3 then still open), the
 discrepancies it found, and its verification. **Section K is the third pass**,
 which found and fixed two more races in leave generation, a scheduler contention
 bug, and a missing submission check. **K.6 is the current list of open
-questions** — K-D5 to K-D11. **K-D5, K-D7 and K-D11 are decided and not yet
-built**; K-D6 and K-D10 are resolved by K-D11, which deletes the fields they
-were about, and survive only as tombstones. **K-D8 and K-D9 are still open**,
-with options and a recommendation each. It
-supersedes I3, whose suggested fix does not work (K-D9). The Verification
+questions** — K-D5 to K-D11, **all now decided and none yet built**. K-D6 and
+K-D10 are resolved by K-D11, which deletes the fields they were about, and
+survive only as tombstones; K-D9 absorbs section I's I3. Each records the
+options it was chosen from, so a decision can be revisited without
+re-deriving it. It
+absorbs I3, whose suggested fix does not work (K-D9). The Verification
 section just below describes the first pass; J.6 and then K.7 supersede it for
 current numbers.
 
@@ -847,20 +848,12 @@ F16's measurements put the per-submission SPRT aggregates at about 50 ms for
 
 **Recommendation:** A now, adding B once opening-rack jobs run at scale.
 
-### I3. Re-measure the universe copy on the production instance
+### I3. *(absorbed into K-D9)*
 
-> **Superseded in part by K-D9.** The measurement is still wanted. The fallback
-> this section proposes — treat a missing row as zero and anti-join instead of
-> copying — does not work, for the reason given in K-D9, and is withdrawn.
-
-Copying 3.2 million leave rows to the next generation took 56–66 seconds on the
-F16 test database (the local compose Postgres at default settings, 2.7 GB of
-data), against a whole transition of about 15 seconds on the smaller dev
-database. The production instance class (`db_instance_class`) is not
-benchmarked. Measure it before running multi-generation English jobs. If it is
-slow there too, the copy can be avoided: treat a missing row as zero
-occurrences, and select a generation's racks by anti-joining the previous
-generation's rows instead of copying them.
+Re-measuring the universe copy on the production instance class. **K-D9 carries
+it**, along with the numbers, the script and the reason it matters — and
+withdraws the fallback this section proposed (treat a missing row as zero and
+anti-join instead of copying), which does not work.
 
 ---
 
@@ -880,7 +873,7 @@ generation's rows instead of copying them.
 |---|---|---|---|
 | I1 | A, extended | A per-job advisory lock (`leave_gen::lock_claim_decisions`, `pg_advisory_xact_lock`) held for every leave-generation claim decision. A `leave_generation_transitions` row (key: job, generation) is **committed** by the claim that finds a generation complete, so exactly one request runs the transition; the rest get 204. A transition not finished after 30 minutes is taken over and `attempts` records it. A transition that fails hands ownership back at once by backdating `started_at`. The lock is not held across the transition, which would hold a transaction open across an S3 upload. The lock alone (option A as written) would not have stopped a second transition, because the transition runs after the claim transaction commits; the committed row is what does. | I-LEAVE-11 to 14 |
 | I2 | A only | `jobs.games_completed` (games and game pairs) and `jobs.racks_analyzed`, incremented in the submit transaction on a task's first accepted result. The job list and opening-rack stats read them, purge zeroes them, and RUNBOOK §2.3 recomputes them after a partial restore. SPRT still reads `game_results`, so a drifted counter cannot stop a job. Debouncing (option B) is not implemented and is recorded under PLAN.md's future improvements. | I-STATS-5, 5b, 5c, 5d |
-| I3 | **Open** | `scripts/leave-gen-bench.sh` times the universe copy and the ordered stream against any database, inside a rolled-back transaction. It has not been run against the production instance class, which needs production access. | — |
+| I3 | **Open at the time**; now absorbed into K-D9 | `scripts/leave-gen-bench.sh` times the universe copy and the ordered stream against any database, inside a rolled-back transaction. It had not been run against the production instance class, which needs production access. | — |
 
 I1 and I2 were implemented in the working tree before this pass began, and nothing records who chose the options. They are recorded here as implemented and verified, not as decisions this pass made.
 
@@ -947,8 +940,9 @@ None new. One note that becomes a blocker for any existing database:
 - The tree was clean and everything in it passed as found: clippy, 82 unit
   tests (3 ignored), 30 integration tests, `npm run check`.
 - Section I's open item, **I3** (benchmark the universe copy on the production
-  instance class), is still open. It needs production access, which this pass
-  did not have. `scripts/leave-gen-bench.sh` is still the tool for it.
+  instance class), was still open at the start of this pass and needs production
+  access, which this pass did not have. It is now absorbed into **K-D9**, which
+  carries the measurement along with the decision it feeds.
 
 ### K.1 Race conditions found and fixed
 
@@ -1056,8 +1050,8 @@ that changed a conclusion the pass had already written down, the correction is
 stated rather than quietly swapped, since the point of this file is to be
 second-guessable.
 
-Carried forward from section I: **I3** is still open, and K-D9 replaces its
-suggested fix, which does not work.
+Section I's **I3** is absorbed into **K-D9**, which carries its measurement and
+withdraws its suggested fix.
 
 #### K-D5. `GET /api/jobs/:id/results/stream` is public, unauthenticated and unbounded
 
@@ -1363,6 +1357,9 @@ backgrounded parts with an `as_of` so the dashboard is not silently stale.
 is both a place to put it and a precedent for how its failures should be
 handled (K5: log and skip, never abort the sweep).
 
+*The decision for this item is at the end, after the two sub-questions, since it
+depends on both.*
+
 Two things were listed as needing settling first. The first — do K-D6's query
 rewrite before caching over it — **is moot**: K-D11 deleted the query rather
 than rewriting it, so there is no longer an expensive cold path to cache over.
@@ -1448,7 +1445,40 @@ single-instance-dependent; an in-process stats cache would make four.
 the cold-start penalty, and it is the only option that does not spend more of
 the single-instance budget on a feature that is explicitly not load-bearing.
 
-#### K-D9. The leave-generation universe copy (supersedes I3's suggested fix)
+##### Decision (K-D8, covering both sub-questions)
+
+**Two things now, and the cache itself deferred behind a stated trigger.**
+
+Now, because both are worth doing on their own merits and neither depends on the
+deferred part:
+
+1. **Cap `worker_contributions`** at a top *N* (50, matching the API's default
+   page size) plus a count of the remainder. It currently returns every worker
+   with an accepted result and has no `LIMIT`, so it is an unbounded payload
+   independently of how long its query takes — and a top-*N* leaderboard is the
+   better rendering anyway.
+2. **Log the duration of `jobstats::compute`.** One line, and it is what turns
+   the deferred question into an evidence-based one rather than a guess. This is
+   K-D8.1's option C.
+
+**Deferred, with the trigger stated so it is not "someday":** build the
+background refresh when `jobstats::compute` is observed exceeding **one second**
+on a real job. That is roughly three times the worst case measured after K-D11
+and still well short of what reads as broken, so it leaves room without letting
+the problem arrive in production first.
+
+**And when it is built**, the shape is already decided so the trigger does not
+reopen the design: option **B shaped like D** — refresh only jobs under
+attention, and mark the backgrounded parts with an `as_of` rather than letting
+the dashboard be silently stale — with the cache **in Postgres** rather than in
+process (K-D8.2's option B), so it survives a restart and adds nothing to the
+single-instance list.
+
+Option A of K-D8.1 — drop the item outright — is not taken: the remaining reads
+still grow with a job's history, only more slowly, so dropping it would defer
+the question rather than answer it.
+
+#### K-D9. The leave-generation universe copy (absorbs I3)
 
 **What it is.** When a generation closes, `copy_universe` inserts one row per
 rack into the next generation — 3,199,724 rows for English, since F1 made the
@@ -1552,6 +1582,29 @@ it happens. **A is measurement-dependent**, so rather than guessing, extend
 the same run; it currently times only the SQL copy. Then A answers itself, and
 answers it for the production instance class rather than for a laptop — which is
 a better use of I3's benchmark than running it and still having to guess.
+
+**Decision: B and D now; A settled by measurement; C, E and F not adopted.**
+
+- **B — seed generation N+1's universe when generation N opens**, not when it
+  closes. Unconditional: it is right however fast the copy turns out to be.
+- **D — take it out of the transition's transaction**, so a failed copy costs a
+  retry of the copy rather than a re-derive and a re-upload. Also
+  unconditional, and it is what removes problem 4, the wedged retry loop.
+- **A — decided by the benchmark, not by argument.** Extend
+  `scripts/leave-gen-bench.sh` to time generate-versus-copy in one run on one
+  database, then take whichever wins. **This absorbs I3**, which asked for the
+  same measurement against the production instance class; the extension is what
+  makes running it answer a question rather than produce a number.
+- **C — overlap the copy with the derivation — is not adopted**, because B makes
+  it pointless: moving the work off the critical path entirely is strictly
+  better than running it alongside other critical-path work.
+- **E — stop retaining every generation's rows — is not adopted.** It does not
+  fix the copy time, and it reverses "Artifacts: back up, or rebuild?". Revisit
+  only if storage or vacuum pressure becomes the binding constraint, which is a
+  different problem from the one this item is about.
+- **F** is a framing note and needs no action: the copy is tens of seconds and
+  driving 3.2 million racks to target is the job. Worth remembering if any of
+  the above starts looking like a priority.
 
 #### K-D10. *(resolved — the opening-rack aggregates count claims, not racks)*
 
