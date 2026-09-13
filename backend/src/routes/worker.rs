@@ -3,11 +3,10 @@ use crate::auth::WorkerIdentity;
 use crate::error::{AppError, AppResult};
 use crate::jobs::handler::TaskRequest;
 use crate::jobstats;
-use crate::models::job::{Job, JobType};
-use crate::ratelimit;
+use crate::models::job::{Job, JobStatus, JobType};
 use crate::scheduler;
 use crate::state::AppState;
-use axum::extract::{Query, State};
+use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -16,13 +15,26 @@ use serde::{Deserialize, Serialize};
 use sqlx::Row;
 use uuid::Uuid;
 
+/// The largest result body `/api/worker/result` accepts.
+///
+/// Axum's default is 2 MB, which a `games_per_batch` of a few hundred with
+/// `capture_positions` on already exceeds: every position of every game is
+/// captured, at a few KB each. A body over the limit is refused before it is
+/// parsed, so this is also the bound on how much memory one submission can
+/// make the server allocate. Batch size is the admin's lever for staying under
+/// it; see PLAN.md, "What bounds a submission?".
+pub const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/client-version", get(client_version))
         .route("/task", post(claim_task))
         .route("/decline", post(decline_task))
         .route("/heartbeat", post(heartbeat))
-        .route("/result", post(submit_result))
+        .route(
+            "/result",
+            post(submit_result).layer(DefaultBodyLimit::max(MAX_RESULT_BYTES)),
+        )
         .route("/artifact", get(artifact))
 }
 
@@ -37,7 +49,8 @@ struct ClientVersion {
     download_url: String,
 }
 
-/// Version negotiation, replacing the self-update the Python client used.
+/// Version negotiation. MAGPIE is the only production client and cannot
+/// replace itself, so this reports a floor rather than offering an update.
 async fn client_version(State(state): State<AppState>) -> Json<ClientVersion> {
     Json(ClientVersion {
         min_magpie_version: state.cfg.min_magpie_version.clone(),
@@ -57,7 +70,8 @@ async fn artifact(
     identity: WorkerIdentity,
     Query(query): Query<ArtifactQuery>,
 ) -> AppResult<Response> {
-    ratelimit::check(&state.limits.worker, &identity.rate_key())?;
+    identity.check_rate_limit(&state)?;
+    identity.require_registered()?;
 
     // Only keys the server itself minted are reachable; an arbitrary key would
     // turn this into a read primitive for the whole bucket.
@@ -134,7 +148,7 @@ async fn claim_task(
     identity: WorkerIdentity,
     Json(body): Json<ClaimBody>,
 ) -> AppResult<Response> {
-    ratelimit::check(&state.limits.worker, &identity.rate_key())?;
+    identity.check_rate_limit(&state)?;
 
     let mut unsupported_jobs = body.unsupported_jobs;
     unsupported_jobs.truncate(MAX_UNSUPPORTED_JOBS);
@@ -151,9 +165,9 @@ async fn claim_task(
         // doomed client forever or tells a contributor their data is stale
         // because the server happened to be idle.
         //
-        // A brand new anonymous identity minted for this request is not
-        // reported here: there is no body to carry it in, and a client that
-        // finds no work has nothing to persist yet.
+        // A request that arrived with no identity is not assigned one here:
+        // there is no body to carry it in, and nothing was written for it. It
+        // is issued one with its first task.
         scheduler::ClaimOutcome::Idle | scheduler::ClaimOutcome::NoWorkExists => {
             Ok(StatusCode::NO_CONTENT.into_response())
         }
@@ -193,6 +207,17 @@ struct DeclineBody {
     missing: Vec<MissingFile>,
 }
 
+/// A task loads at most a handful of files, so an honest decline names a
+/// handful. Past this the list is truncated: every entry is a row in
+/// `worker_data_gaps`, and an unbounded list is an unbounded write.
+const MAX_MISSING_FILES: usize = 32;
+/// Role, name and digest are all short; anything longer is not one of them.
+const MAX_GAP_FIELD_CHARS: usize = 128;
+
+fn bounded(text: &str) -> String {
+    text.chars().take(MAX_GAP_FIELD_CHARS).collect()
+}
+
 /// "I claimed this and cannot do it." Releases the claim immediately rather
 /// than waiting out the heartbeat timeout, and records what was missing.
 ///
@@ -204,7 +229,8 @@ async fn decline_task(
     identity: WorkerIdentity,
     Json(body): Json<DeclineBody>,
 ) -> AppResult<StatusCode> {
-    ratelimit::check(&state.limits.worker, &identity.rate_key())?;
+    identity.check_rate_limit(&state)?;
+    identity.require_registered()?;
 
     if !matches!(
         body.reason.as_str(),
@@ -216,18 +242,25 @@ async fn decline_task(
     }
 
     let mut tx = state.pool.begin().await?;
+    // Locked, so a timeout reclaiming this claim concurrently cannot release
+    // it a second time.
     let row = sqlx::query(
         "SELECT c.id, t.job_id
          FROM task_claims c
          JOIN tasks t ON t.id = c.task_id
-         WHERE c.claim_token = $1 AND c.state = 'claimed'",
+         WHERE c.claim_token = $1 AND c.state = 'claimed'
+           AND c.claimed_by_user_id IS NOT DISTINCT FROM $2
+           AND c.claimed_by_anon_uuid IS NOT DISTINCT FROM $3
+         FOR UPDATE OF c",
     )
     .bind(body.claim_token)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
-        // Already released, already submitted, or never existed: nothing the
-        // client can do about it either way.
+        // Already released, already submitted, never existed, or claimed by
+        // a different identity: nothing the client can do about it either way.
         tx.rollback().await?;
         return Err(AppError::not_found("no open claim with that token"));
     };
@@ -236,29 +269,36 @@ async fn decline_task(
 
     scheduler::release_claim(&mut tx, claim_id, "declined").await?;
 
-    for file in &body.missing {
+    for file in body.missing.iter().take(MAX_MISSING_FILES) {
         sqlx::query(
             "INSERT INTO worker_data_gaps (job_id, claim_id, role, name, expected, actual)
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(job_id)
         .bind(claim_id)
-        .bind(&file.role)
-        .bind(&file.name)
-        .bind(&file.expected)
-        .bind(&file.actual)
+        .bind(bounded(&file.role))
+        .bind(bounded(&file.name))
+        .bind(bounded(&file.expected))
+        .bind(file.actual.as_deref().map(bounded))
         .execute(&mut *tx)
         .await?;
     }
 
-    audit::log(
+    // The reason is recorded, not just validated. `worker_data_gaps` says what
+    // was missing when a decline named files, but nothing said *why* a claim
+    // came back, so a worker that declined and a worker that vanished were
+    // indistinguishable afterwards -- and a client failing a task locally is
+    // invisible to the server entirely. It goes on the audit row rather than on
+    // `task_claims` because it describes an event rather than state.
+    audit::log_worker_detail(
         &mut tx,
         "task.declined",
         identity.user_id(),
         identity.anon_uuid(),
-        Some("claim"),
-        Some(claim_id.to_string()),
+        "claim",
+        claim_id.to_string(),
         Some(job_id),
+        body.reason.clone(),
     )
     .await?;
     tx.commit().await?;
@@ -278,13 +318,18 @@ async fn heartbeat(
     identity: WorkerIdentity,
     Json(body): Json<HeartbeatBody>,
 ) -> AppResult<StatusCode> {
-    ratelimit::check(&state.limits.worker, &identity.rate_key())?;
+    identity.check_rate_limit(&state)?;
+    identity.require_registered()?;
 
     sqlx::query(
         "UPDATE task_claims SET last_heartbeat_at = now()
-         WHERE claim_token = $1 AND state = 'claimed'",
+         WHERE claim_token = $1 AND state = 'claimed'
+           AND claimed_by_user_id IS NOT DISTINCT FROM $2
+           AND claimed_by_anon_uuid IS NOT DISTINCT FROM $3",
     )
     .bind(body.claim_token)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
     .execute(&state.pool)
     .await?;
 
@@ -309,21 +354,41 @@ async fn submit_result(
     identity: WorkerIdentity,
     Json(body): Json<ResultBody>,
 ) -> AppResult<Json<ResultAck>> {
-    ratelimit::check(&state.limits.worker, &identity.rate_key())?;
+    identity.check_rate_limit(&state)?;
+    identity.require_registered()?;
 
+    let mut tx = state.pool.begin().await?;
+
+    // The claim is looked up and locked inside the transaction that completes
+    // it. Looked up outside it, a timeout could reclaim the claim between the
+    // lookup and the write -- the claim would then be marked both abandoned and
+    // completed, the task's live-claim counter decremented twice, and a task
+    // another worker had just been handed would read as unclaimed. The same
+    // lock is what makes a retried submission of an already-accepted result a
+    // clean `accepted: false` instead of a duplicate-key error.
     let claim = sqlx::query(
         "SELECT c.id, c.task_id, t.job_id
          FROM task_claims c JOIN tasks t ON t.id = c.task_id
-         WHERE c.claim_token = $1 AND c.state = 'claimed'",
+         WHERE c.claim_token = $1 AND c.state = 'claimed'
+           AND c.claimed_by_user_id IS NOT DISTINCT FROM $2
+           AND c.claimed_by_anon_uuid IS NOT DISTINCT FROM $3
+         FOR UPDATE OF c",
     )
     .bind(body.claim_token)
-    .fetch_optional(&state.pool)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
+    .fetch_optional(&mut *tx)
     .await?;
 
-    // A stale token means the claim timed out and was reclaimed. The plan calls
-    // for silently ignoring it: the work is already reassigned, and the worker
-    // has nothing useful to do with an error.
+    // A token is bound to the identity it was issued to (the checks above), so
+    // a ban or an audit row means what it says: a token handed to another
+    // identity is treated exactly like an unknown one.
+    //
+    // A stale token means the claim timed out and was reclaimed, or this
+    // result was already accepted. The work is reassigned or done, and the
+    // worker has nothing useful to do with an error.
     let Some(claim) = claim else {
+        tx.rollback().await?;
         tracing::debug!(claim_token = %body.claim_token, "ignoring result for stale claim");
         return Ok(Json(ResultAck { accepted: false }));
     };
@@ -332,9 +397,24 @@ async fn submit_result(
     let task_id: Uuid = claim.get("task_id");
     let job_id: Uuid = claim.get("job_id");
 
-    let job = jobstats::load_job(&state.pool, job_id).await?;
+    // Submissions for the same task serialize here, on the task row, before
+    // anything is stored. Redundant claims of one task hold different claim
+    // rows, so the lock above does not order them, and what a submission
+    // stores depends on what the task's earlier submissions stored: only the
+    // first accepted result adds to the job's running progress totals
+    // (`registry::store_result`). Without this, two submissions arriving
+    // together each saw only their own uncommitted rows and both counted. The
+    // task row is locked by the update below anyway; taking it first keeps the
+    // order every path uses -- claim, then task, then job.
+    sqlx::query("SELECT 1 FROM tasks WHERE id = $1 FOR UPDATE")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
 
-    let mut tx = state.pool.begin().await?;
+    let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     crate::jobs::registry::store_result(&mut tx, &job, task_id, claim_id, body.result).await?;
 
@@ -384,50 +464,29 @@ async fn submit_result(
 
     tx.commit().await?;
 
-    // SPRT and the finish conditions are evaluated inline on every submission —
-    // there is no background sweep.
-    let stats = jobstats::compute(&state.pool, &job).await?;
-    finish_if_done(&state, &job, &stats).await?;
-
-    if let Ok(payload) = serde_json::to_string(&stats) {
-        state.sse.publish(job_id, payload);
+    // The result is committed; nothing below can un-accept it. Failing the
+    // request now would tell the worker to retry a submission that already
+    // landed, so a failure here is logged and the next submission's check
+    // picks the job up.
+    if let Err(err) = after_submission(&state, job_id).await {
+        tracing::error!(job_id = %job_id, error = %err.message, "post-submission bookkeeping failed");
     }
 
     Ok(Json(ResultAck { accepted: true }))
 }
 
-/// Auto-complete on either finish condition: SPRT significance (only after
-/// `min_units`) or the hard cap.
-async fn finish_if_done(state: &AppState, job: &Job, stats: &jobstats::JobStats) -> AppResult<()> {
-    let should_finish = match &stats.games {
-        Some(games) => games.sprt.status.is_finished(),
-        None => match job.job_type {
-            JobType::OpeningRack => {
-                // Tasks are generated on demand, so "all tasks complete" is not
-                // enough -- it is trivially true before anything is dispatched.
-                // The job is done once the rack space is exhausted as well.
-                let exhausted = sqlx::query_scalar::<_, bool>(
-                    "SELECT COALESCE(MAX(t.seed) + c.racks_per_batch, 0) >= c.total_racks
-                     FROM job_opening_rack_config c
-                     LEFT JOIN tasks t ON t.job_id = c.job_id
-                     WHERE c.job_id = $1
-                     GROUP BY c.racks_per_batch, c.total_racks",
-                )
-                .bind(job.id)
-                .fetch_optional(&state.pool)
-                .await?
-                .unwrap_or(false);
-                exhausted
-                    && stats.tasks_total > 0
-                    && stats.tasks_completed >= stats.tasks_total
-            }
-            // Leave generation completes in `run_transition` once the final
-            // generation is aggregated.
-            _ => false,
-        },
-    };
+/// Evaluates the job's finish conditions, then pushes live stats if anyone is
+/// watching.
+///
+/// SPRT and the finish conditions are evaluated inline on every submission --
+/// there is no background sweep -- but only the part of the stats the decision
+/// needs is computed for it. The full payload, which for an opening-rack job
+/// aggregates over every analysed position, is built only when the job has a
+/// dashboard subscriber.
+async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
+    let mut job = jobstats::load_job(&state.pool, job_id).await?;
 
-    if should_finish {
+    if job.status == JobStatus::Active && finish_condition_met(state, &job).await? {
         let updated = sqlx::query(
             "UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'",
         )
@@ -436,9 +495,51 @@ async fn finish_if_done(state: &AppState, job: &Job, stats: &jobstats::JobStats)
         .await?;
         if updated.rows_affected() > 0 {
             tracing::info!(job_id = %job.id, "job auto-completed");
+            // So the pushed payload says `completed` rather than the status
+            // this request started with.
+            job = jobstats::load_job(&state.pool, job_id).await?;
+        }
+    }
+
+    if state.sse.has_subscribers(job_id) {
+        let stats = jobstats::compute(&state.pool, &job).await?;
+        if let Ok(payload) = serde_json::to_string(&stats) {
+            state.sse.publish(job_id, payload);
         }
     }
     Ok(())
+}
+
+/// Either finish condition: SPRT significance (only after `min_units`) or the
+/// hard cap for game jobs; an exhausted and fully completed rack space for
+/// opening racks.
+async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<bool> {
+    Ok(match job.job_type {
+        JobType::Games | JobType::GamePairs => jobstats::game_stats(&state.pool, job)
+            .await?
+            .is_some_and(|games| games.sprt.status.is_finished()),
+        JobType::OpeningRack => {
+            // Tasks are generated on demand, so "all tasks complete" is not
+            // enough -- it is trivially true before anything is dispatched.
+            // The job is done once the rack space is exhausted as well.
+            sqlx::query_scalar::<_, bool>(
+                "SELECT COALESCE(MAX(t.seed) + c.racks_per_batch, 0) >= c.total_racks
+                        AND COUNT(t.id) > 0
+                        AND COUNT(t.id) FILTER (WHERE t.state <> 'completed') = 0
+                 FROM job_opening_rack_config c
+                 LEFT JOIN tasks t ON t.job_id = c.job_id
+                 WHERE c.job_id = $1
+                 GROUP BY c.racks_per_batch, c.total_racks",
+            )
+            .bind(job.id)
+            .fetch_optional(&state.pool)
+            .await?
+            .unwrap_or(false)
+        }
+        // Leave generation completes in `run_transition` once the final
+        // generation is aggregated.
+        JobType::LeaveGeneration => false,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +618,10 @@ mod contract_fixtures {
     fn assignments_carry_a_task_request_this_build_understands() {
         for (name, fixture) in [
             ("games", include_str!("../../../contract-fixtures/assignment-games.json")),
+            (
+                "opening-rack",
+                include_str!("../../../contract-fixtures/assignment-opening-rack.json"),
+            ),
             (
                 "leave-generation",
                 include_str!("../../../contract-fixtures/assignment-leave-generation.json"),
@@ -610,5 +715,12 @@ mod contract_fixtures {
             !both["shutdown"]["required_magpie_version"].is_null(),
             "the `both` shutdown must name a MAGPIE version to lead with"
         );
+    }
+
+    #[test]
+    fn decline_gap_fields_are_bounded() {
+        let long = "x".repeat(10_000);
+        assert_eq!(bounded(&long).chars().count(), MAX_GAP_FIELD_CHARS);
+        assert_eq!(bounded("kwg"), "kwg");
     }
 }

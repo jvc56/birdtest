@@ -10,7 +10,7 @@
   let notice = '';
 
   onMount(async () => {
-    workers = await api.workers(0);
+    workers = await api.adminWorkers(0);
   });
 
   /** A user id and an anonymous UUID are both UUIDs, so which field to send is

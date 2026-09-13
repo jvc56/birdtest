@@ -2,10 +2,12 @@
 
 export function workerLabel(worker: {
   username?: string | null;
-  anon_uuid?: string | null;
+  anon_id?: string | null;
 }): string {
   if (worker.username) return worker.username;
-  if (worker.anon_uuid) return `Anonymous · ${worker.anon_uuid.slice(0, 8)}`;
+  // A pseudonym derived from the anonymous worker's UUID, never the UUID
+  // itself, which is the worker's credential.
+  if (worker.anon_id) return `Anonymous · ${worker.anon_id.slice(0, 8)}`;
   return 'Unknown';
 }
 

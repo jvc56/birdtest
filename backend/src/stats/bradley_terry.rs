@@ -67,6 +67,10 @@ impl Matrix {
         self.n
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn get(&self, i: usize, j: usize) -> Head2Head {
         self.cells[i * self.n + j]
     }

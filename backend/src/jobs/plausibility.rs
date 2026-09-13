@@ -175,6 +175,16 @@ pub fn check_rack_occurrences(racks: &[RackOccurrence]) -> AppResult<()> {
     let mut seen = std::collections::HashSet::with_capacity(racks.len());
     for occurrence in racks {
         check_rack(&occurrence.rack, "leave result")?;
+        // Leave generation observes full racks only. Anything shorter would
+        // name no row of the generation's rack universe.
+        let tiles = occurrence.rack.chars().count();
+        if tiles != MAX_RACK_TILES {
+            return Err(AppError::bad_request(format!(
+                "leave result: rack {:?} has {tiles} tiles; leave generation reports full \
+                 racks of {MAX_RACK_TILES}",
+                occurrence.rack
+            )));
+        }
         if occurrence.count < 1 {
             return Err(AppError::bad_request(format!(
                 "leave result: rack {:?} reports {} occurrences; a rack that did not occur \
@@ -361,6 +371,12 @@ mod tests {
         assert!(
             check_rack_occurrences(&[occurrence("AEINRST", 3), occurrence("AEINRST", 1)]).is_err()
         );
+    }
+
+    #[test]
+    fn leave_results_report_full_racks_only() {
+        assert!(check_rack_occurrences(&[occurrence("AEINRS", 3)]).is_err());
+        assert!(check_rack_occurrences(&[occurrence("?", 3)]).is_err());
     }
 
     #[test]

@@ -151,7 +151,7 @@
 
   <div>
     <label class="label" for="npres">Plays to report (maxnumdplays)</label>
-    <input id="npres" type="number" class="input" bind:value={numPlaysRecorded} />
+    <input id="npres" type="number" min="1" required class="input" bind:value={numPlaysRecorded} />
     <p class="mt-1 text-xs text-muted-foreground">
       How many ranked plays birdtest stores per analysed position. Separate from
       how many are generated or simulated.

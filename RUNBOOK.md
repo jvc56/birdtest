@@ -72,23 +72,25 @@ aws rds modify-db-instance --region "$REGION" \
   --backup-retention-period 30 --deletion-protection --apply-immediately
 ```
 
-Repoint the application. The master password is managed by RDS, so read it
-from Secrets Manager rather than inventing one:
+Repoint the application. The master password is set by hand and lives only in
+the `DATABASE_URL` parameter, so keep it and swap the host. A PITR copy keeps
+the password the source had at the restore point; if it was rotated after that
+point, set it on the new instance first (see "Rotating the database password"):
 
 ```bash
 ENDPOINT=$(aws rds describe-db-instances --region "$REGION" \
   --db-instance-identifier "birdtest-restore-$STAMP" \
   --query 'DBInstances[0].Endpoint.Address' --output text)
 
-SECRET_ARN=$(aws rds describe-db-instances --region "$REGION" \
-  --db-instance-identifier "birdtest-restore-$STAMP" \
-  --query 'DBInstances[0].MasterUserSecret.SecretArn' --output text)
-
-PASSWORD=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ARN" \
-  --query SecretString --output text | python3 -c 'import json,sys; print(json.load(sys.stdin)["password"])')
+OLD_URL=$(aws ssm get-parameter --region "$REGION" --name /birdtest/DATABASE_URL \
+  --with-decryption --query Parameter.Value --output text)
+NEW_URL=$(python3 -c 'import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+print(p._replace(netloc=p.netloc.rsplit("@", 1)[0] + "@" + sys.argv[2] + ":5432").geturl())' \
+  "$OLD_URL" "$ENDPOINT")
 
 aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
-  --value "postgres://birdtest:$PASSWORD@$ENDPOINT:5432/birdtest"
+  --value "$NEW_URL"
 
 # Tasks read SSM at start, so this is the whole deploy.
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
@@ -145,8 +147,18 @@ In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
 | 3 | `task_claims` | `task_id IN (...)` |
 | 4 | `game_results`, `leave_records` | `task_id IN (...)` |
 | 5 | `position_analysis_records` → `_moves` → `_plies` | `task_id IN (...)`, then by parent id |
-| 6 | `leave_rack_progress`, `leave_generation_artifacts` | `job_id = :job` |
-| 7 | `player_config_ratings` | `job_id = :job` |
+| 6 | `leave_rack_progress`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
+
+Ratings are not in this list: they belong to rating pools rather than jobs, and
+are recomputed from `game_results` (see §2.4).
+
+`leave_generation_transitions` is in that list for a reason: a generation's
+artifact row without its transition row would leave the next claim free to
+re-run a transition that already happened, and a transition row without its
+artifact row would stall the job until the takeover timeout. Copy both or
+neither.
+
+The job's three counters are repaired in §2.3 with the rest.
 
 `position_analysis_records.id` and `_moves.id` are `BIGSERIAL`. Restoring them
 with their original ids preserves the parent-child links; afterwards the
@@ -194,16 +206,50 @@ UPDATE tasks t
   FROM jobs j
  WHERE j.id = t.job_id AND t.job_id = :'job';
 
+-- The job's own counters. claims_issued is the scheduler's deficit numerator,
+-- so a restored job that keeps a zero here is dispatched ahead of everything
+-- else until it catches up. games_completed and racks_analyzed are the
+-- dashboard's progress totals; they are maintained one task at a time in the
+-- submit path, so a row copy leaves them describing the results the job had
+-- before. Each is recomputed here exactly as the read it replaced computed it:
+-- one result per task, because redundant claims replay the same work.
+UPDATE jobs j
+   SET claims_issued = (SELECT count(*) FROM task_claims c
+                          JOIN tasks t ON t.id = c.task_id
+                         WHERE t.job_id = j.id),
+       games_completed = (SELECT COALESCE(sum(g.games), 0) FROM (
+                            SELECT DISTINCT ON (r.task_id) r.games
+                              FROM game_results r JOIN tasks t ON t.id = r.task_id
+                             WHERE t.job_id = j.id
+                             ORDER BY r.task_id, r.submitted_at, r.task_claim_id
+                          ) g),
+       racks_analyzed = (SELECT count(DISTINCT p.rack)
+                           FROM position_analysis_records p
+                           JOIN tasks t ON t.id = p.task_id
+                          WHERE t.job_id = j.id)
+ WHERE j.id = :'job';
+
 COMMIT;
 ```
 
+`racks_analyzed` is meaningful only for an opening-rack job and
+`games_completed` only for a games or game-pairs job; the statement above leaves
+each at 0 for the job types that do not use it, which is what they hold anyway.
+
 ### 2.4 Recompute derived state
 
-- **Glicko** (`player_config_ratings`, game-pairs jobs): ratings are applied
-  per submission and cannot be reconstructed by copying rows alone. Either
-  restore the `player_config_ratings` rows from the scratch copy as they stood
-  (correct if nothing was submitted since), or accept the ratings as they are
-  and note the discontinuity.
+- **Job exports** (`job_exports`): derived data, and the one thing here that a
+  partial restore can make actively misleading — a row still saying `ready`
+  describes results the restore may not have brought back, and hands an admin a
+  stable-looking artifact of something else. Delete the job's rows
+  (`DELETE FROM job_exports WHERE job_id = :'job'`) and re-export if anyone
+  wants one; the objects behind them expire from the bucket on their own.
+
+- **Ratings** (`rating_runs` / `player_config_ratings`): a batch fit over
+  each pool's `game_results`, never applied per submission. Once the results
+  are back the two-minute sweep notices the pool's evidence changed and refits
+  it; `POST /api/admin/rating-pools/:id/recompute` does it immediately. Nothing
+  to copy.
 - **SPRT**: computed from `game_results` on read, so it corrects itself once
   the results are back.
 - **Leave-generation artifacts**: if any object is missing, use
@@ -270,11 +316,16 @@ SELECT count(*) AS counter_disagreements
  WHERE t.accepted_count <> actual.accepted OR t.active_claim_count <> actual.active;
 ```
 
-```bash
-# 4. Functional smoke: claim, execute and submit one task against the restored
-#    stack. This exercises dispatch, the artifact fetch and the result write.
-python worker/fake_worker.py --server-url https://<host> --tasks 1
-```
+4. **Functional smoke**: run one real task against the restored stack with
+   MAGPIE, from a machine with the pinned data installed -- a `contribute.txt`
+   with `server https://<host>` and `maxtasks 1`, then `magpie contribute`.
+   This exercises dispatch, data verification, the artifact fetch and the
+   result write, and the result it submits is a genuine one.
+
+   **Never use `worker/fake_worker.py` for this.** It submits invented
+   results, the server records them as real contributions to real jobs, and
+   they skew SPRT verdicts and rating fits until someone finds and deletes
+   them. It is test tooling for disposable stacks only.
 
 In-flight claims need no action. Claims open at the restore point are reclaimed
 by the heartbeat timeout, and a worker submitting against a claim the restored
@@ -310,3 +361,32 @@ database never issued is rejected the same way any stale claim is.
   restorable and is the loudest alarm in the system.
 - Twice a year, do §5 by hand into a scratch account or region. The manual
   drill exists to find the steps that live only in someone's head.
+
+---
+
+## Rotating the database password
+
+The master password is set by hand (`infra/rds.tf` sets a placeholder
+`password`, so RDS does not manage it) and lives only inside
+`/birdtest/DATABASE_URL`. Rotation is
+this, in order; the service fails new connections between the first and last
+step, so do it in a quiet moment:
+
+```bash
+DB_PASSWORD=$(openssl rand -hex 24)
+aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
+  --master-user-password "$DB_PASSWORD" --apply-immediately
+aws rds wait db-instance-available --region "$REGION" --db-instance-identifier birdtest
+
+OLD_URL=$(aws ssm get-parameter --region "$REGION" --name /birdtest/DATABASE_URL \
+  --with-decryption --query Parameter.Value --output text)
+NEW_URL=$(python3 -c 'import sys, urllib.parse as u
+p = u.urlsplit(sys.argv[1])
+print(p._replace(netloc="birdtest:" + sys.argv[2] + "@" + p.netloc.rsplit("@", 1)[1]).geturl())' \
+  "$OLD_URL" "$DB_PASSWORD")
+aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
+  --value "$NEW_URL"
+
+# Tasks read SSM at start; the backup and restore-drill tasks read it per run.
+aws ecs update-service --region "$REGION" --cluster "$CLUSTER" --service birdtest --force-new-deployment
+```

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type ApiKey } from '$lib/api';
+  import { goto } from '$app/navigation';
   import { session } from '$lib/auth';
   import { datetime } from '$lib/format';
 
@@ -32,6 +33,19 @@
     await load();
   }
 
+  let signOutError = '';
+  async function signOutEverywhere() {
+    if (!confirm('Sign out of every browser and device, including this one?')) return;
+    signOutError = '';
+    try {
+      await api.signOutEverywhere();
+      session.set(null);
+      await goto('/login');
+    } catch (e) {
+      signOutError = (e as Error).message;
+    }
+  }
+
   async function revoke(key: ApiKey) {
     if (!confirm('Permanently revoke this key? Workers using it will stop being authenticated.'))
       return;
@@ -53,6 +67,18 @@
         <dd class="tabular-nums">{$session?.tasks_completed.toLocaleString()}</dd>
       </div>
     </dl>
+  </div>
+
+  <div class="card space-y-3">
+    <div>
+      <h2 class="text-lg font-medium">Sessions</h2>
+      <p class="text-sm text-muted-foreground">
+        Signs out every browser and device signed in to this account, including this one. A
+        password reset does the same.
+      </p>
+    </div>
+    <button class="btn-secondary" on:click={signOutEverywhere}>Sign out everywhere</button>
+    {#if signOutError}<p class="field-error">{signOutError}</p>{/if}
   </div>
 
   <div class="card space-y-4">

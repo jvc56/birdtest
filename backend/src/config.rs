@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use std::time::Duration;
 
 /// Runtime configuration.
 ///
 /// In development every value comes from the environment (`.env` is loaded on
 /// startup). In ECS the same variables are populated by the task definition,
-/// which pulls the secret-valued ones from SSM Parameter Store — so the process
-/// only ever reads environment variables and there is no separate SSM code path.
+/// which pulls the secret-valued ones from SSM Parameter Store and Secrets
+/// Manager — so the process only ever reads environment variables and there is
+/// no separate secrets code path.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
@@ -38,6 +40,11 @@ pub struct Config {
     /// Optional in development, set in production: unauthenticated GitHub ref
     /// resolution is 60 calls an hour per IP.
     pub github_token: Option<String>,
+    /// How many reverse proxies sit in front of this process and append to
+    /// `X-Forwarded-For`. 0 trusts nothing and keys per-IP limits on the TCP
+    /// peer; 1 is right behind the ALB and behind the local Nginx. See
+    /// `clientip`.
+    pub trusted_proxy_hops: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +63,51 @@ fn var(key: &str) -> Option<String> {
 
 fn var_or(key: &str, default: &str) -> String {
     var(key).unwrap_or_else(|| default.to_string())
+}
+
+/// A numeric setting that is wrong fails startup rather than silently becoming
+/// the default: a heartbeat timeout typed as `5m` would otherwise run the whole
+/// deployment on 300 seconds with nothing to say so.
+fn parsed<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
+    match var(key) {
+        None => Ok(default),
+        Some(raw) => raw
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("{key} must be a whole number, got {raw:?}")),
+    }
+}
+
+/// `DATABASE_URL` if it is set; otherwise one assembled from `DB_HOST`,
+/// `DB_PORT`, `DB_NAME`, `DB_USER` and `DB_PASSWORD`.
+///
+/// The parts exist for the deployment. RDS manages the master password in
+/// Secrets Manager and rotates it (every seven days by default), so a
+/// hand-written `DATABASE_URL` in SSM goes stale by itself. ECS can inject the
+/// password straight from the managed secret, and the host is a Terraform
+/// output, so neither needs to be copied anywhere by hand. The password is
+/// percent-encoded: a generated one can contain `@`, `/` or `:`.
+fn resolve_database_url(get: impl Fn(&str) -> Option<String>) -> Result<String> {
+    if let Some(url) = get("DATABASE_URL") {
+        return Ok(url);
+    }
+    let required = |key: &str| {
+        get(key).with_context(|| format!("DATABASE_URL is not set, so {key} is required"))
+    };
+    let host = required("DB_HOST")?;
+    let name = required("DB_NAME")?;
+    let user = required("DB_USER")?;
+    let password = required("DB_PASSWORD")?;
+    let port = get("DB_PORT").unwrap_or_else(|| "5432".to_string());
+    let mut url = format!(
+        "postgres://{}:{}@{host}:{port}/{name}",
+        utf8_percent_encode(&user, NON_ALPHANUMERIC),
+        utf8_percent_encode(&password, NON_ALPHANUMERIC),
+    );
+    if let Some(sslmode) = get("DB_SSLMODE") {
+        url.push_str(&format!("?sslmode={sslmode}"));
+    }
+    Ok(url)
 }
 
 impl Config {
@@ -77,33 +129,90 @@ impl Config {
             other => anyhow::bail!("unknown MAIL_BACKEND {other:?} (expected 'console' or 'ses')"),
         };
 
+        let secure_cookies = match var_or("SECURE_COOKIES", "false").as_str() {
+            "true" => true,
+            "false" => false,
+            other => anyhow::bail!("SECURE_COOKIES must be 'true' or 'false', got {other:?}"),
+        };
+
+        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.0");
+        if crate::version::Version::parse_or_zero(&min_magpie_version)
+            == crate::version::Version::ZERO
+            && min_magpie_version.trim() != "0.0.0"
+        {
+            anyhow::bail!("MIN_MAGPIE_VERSION {min_magpie_version:?} is not a version");
+        }
+
         Ok(Self {
-            database_url: var("DATABASE_URL").context("DATABASE_URL is required")?,
+            database_url: resolve_database_url(var)?,
             bind_addr: var_or("BIND_ADDR", "0.0.0.0:8080"),
             session_signing_key,
-            session_ttl: Duration::from_secs(
-                var_or("SESSION_TTL_SECONDS", "604800").parse().unwrap_or(604_800),
-            ),
-            secure_cookies: var_or("SECURE_COOKIES", "false") == "true",
+            session_ttl: Duration::from_secs(parsed("SESSION_TTL_SECONDS", 604_800)?),
+            secure_cookies,
             mail_backend,
             mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
             public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
-            heartbeat_timeout: Duration::from_secs(
-                var_or("HEARTBEAT_TIMEOUT_SECONDS", "300").parse().unwrap_or(300),
-            ),
+            heartbeat_timeout: Duration::from_secs(parsed("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            // A placeholder for the MAGPIE release that implements the
-            // expected_data check, to be raised to that release's real number
-            // before launch. Not 0.0.0: every job pins data now, and a floor of
-            // zero would admit a client that cannot verify it.
-            min_magpie_version: var_or("MIN_MAGPIE_VERSION", "0.0.1"),
+            // 0.1.0 is the first MAGPIE version that speaks the contribution
+            // protocol correctly. Builds reporting 0.0.0
+            // predate the audit's fixes -- ambient simulation settings, an
+            // unapplied distribution and layout -- and must be refused.
+            min_magpie_version,
             magpie_download_url: var_or(
                 "MAGPIE_DOWNLOAD_URL",
                 "https://github.com/jvc56/MAGPIE",
             ),
             magpie_data_repo: var_or("MAGPIE_DATA_REPO", "jvc56/MAGPIE-DATA"),
             github_token: var("GITHUB_TOKEN"),
+            trusted_proxy_hops: parsed("TRUSTED_PROXY_HOPS", 0)?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn env(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |key| map.get(key).cloned()
+    }
+
+    #[test]
+    fn database_url_wins_when_set() {
+        let url = resolve_database_url(env(&[
+            ("DATABASE_URL", "postgres://a:b@c/d"),
+            ("DB_HOST", "ignored"),
+        ]))
+        .unwrap();
+        assert_eq!(url, "postgres://a:b@c/d");
+    }
+
+    /// RDS-generated passwords contain URL metacharacters; unencoded, `@`
+    /// would be read as the end of the userinfo and the host would be garbage.
+    #[test]
+    fn database_parts_are_assembled_with_the_password_encoded() {
+        let url = resolve_database_url(env(&[
+            ("DB_HOST", "db.internal"),
+            ("DB_NAME", "birdtest"),
+            ("DB_USER", "birdtest"),
+            ("DB_PASSWORD", "p@ss/w:rd"),
+            ("DB_SSLMODE", "require"),
+        ]))
+        .unwrap();
+        assert_eq!(
+            url,
+            "postgres://birdtest:p%40ss%2Fw%3Ard@db.internal:5432/birdtest?sslmode=require"
+        );
+    }
+
+    #[test]
+    fn a_missing_part_names_itself() {
+        let err = resolve_database_url(env(&[("DB_HOST", "h"), ("DB_NAME", "n")])).unwrap_err();
+        assert!(err.to_string().contains("DB_USER"), "{err}");
     }
 }

@@ -155,10 +155,11 @@ docker compose exec postgres \
   psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE username = 'you';"
 ```
 
-**The version floor will stop an unreleased MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.0.1` and the `contribute` branch reports
-`0.0.0`, so every task is declined with "update MAGPIE" until you lower it —
-on the server *and* on the job, which records its own floor at creation:
+**The version floor stops an old MAGPIE from contributing.**
+`MIN_MAGPIE_VERSION` defaults to `0.1.0`, which `birdtest-contribute` reports.
+A checkout from before that reports `0.0.0`, and every task is declined with
+"update MAGPIE" until you update it or lower the floor — on the server *and*
+on the job, which records its own floor at creation:
 
 ```bash
 MIN_MAGPIE_VERSION=0.0.0 docker compose up -d
@@ -166,9 +167,11 @@ MIN_MAGPIE_VERSION=0.0.0 docker compose up -d
 
 `dev.py` reads the version out of your checkout and sets both for you.
 
-Opening-rack and leave-generation jobs enumerate their whole rack space at
-creation time — for a real English bag that is millions of rows, and 914,624
-leaves for leave generation. Worth knowing before you create one by hand.
+Leave-generation jobs write one progress row per full 7-tile rack at creation
+time — 3,199,724 rows for a real English bag, copied again for every later
+generation — and build a zeroed KLV. Worth knowing before you create one by hand.
+Opening-rack jobs only *count* their rack space (3,199,724 racks for English)
+and address it by range, so they are cheap to create.
 
 ### Contributing with MAGPIE
 
@@ -188,6 +191,19 @@ contributing with; it derives the word list and the wordmap from the `.kwg` it
 already has on first use, in about 1.3 seconds per lexicon, and never
 transmits either. See [Worker Client](PLAN.md#worker-client-1) for the full
 protocol.
+
+### Running the tests
+
+```bash
+cd backend && cargo test --lib --bins     # unit and contract tests; no services
+cd backend && TEST_DATABASE_URL=postgres://birdtest:birdtest@localhost:5432/birdtest \
+  cargo test                              # plus the integration tests in backend/tests/
+cd frontend && npm run check
+```
+
+The integration tests clone a template database per test on the server
+`TEST_DATABASE_URL` points at (any database there will do; they never write to
+it), so the compose Postgres is enough. They fail rather than skip without it.
 
 ### Frontend hot reload
 
@@ -226,14 +242,37 @@ minio minio-init` gives you one without the rest of the stack.
 ## Deploying
 
 `infra/` is a complete Terraform description of the AWS side. Two values must
-be set out of band before the first deploy — Terraform manages the parameter
-*names* but never their values:
+be set out of band right after the first `terraform apply` — Terraform manages
+the parameter *names* but never their values.
+
+The database master password is set by hand, not managed by RDS (RDS rotation
+would break the fixed `DATABASE_URL`). Terraform creates the instance with a
+placeholder; replace it, then write the URL:
 
 ```bash
-aws ssm put-parameter --name /birdtest/DATABASE_URL --type SecureString --overwrite --value '...'
+DB_INSTANCE=birdtest   # the RDS identifier Terraform created
+DB_PASSWORD=$(openssl rand -hex 24)   # hex: nothing to percent-encode in a URL
+aws rds modify-db-instance --db-instance-identifier "$DB_INSTANCE" \
+  --master-user-password "$DB_PASSWORD" --apply-immediately
+aws rds wait db-instance-available --db-instance-identifier "$DB_INSTANCE"
+ENDPOINT=$(aws rds describe-db-instances --db-instance-identifier "$DB_INSTANCE" \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+
+aws ssm put-parameter --name /birdtest/DATABASE_URL --type SecureString --overwrite \
+  --value "postgres://birdtest:$DB_PASSWORD@$ENDPOINT:5432/birdtest"
 aws ssm put-parameter --name /birdtest/SESSION_SIGNING_KEY --type SecureString --overwrite \
   --value "$(openssl rand -hex 32)"
 ```
+
+To rotate the password later, run the same `modify-db-instance` and
+`put-parameter` pair, then force a new ECS deployment so tasks re-read SSM
+(RUNBOOK.md, "Rotating the database password").
+
+`acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
+redirects — because the backend sets `Secure` cookies, which a browser will not
+keep over plain HTTP. `min_magpie_version` defaults to `0.1.0`, the first MAGPIE
+version that speaks the contribution protocol correctly; raise it whenever a
+MAGPIE release changes results.
 
 `alert_email` has no default: `terraform apply` refuses to run without
 somewhere to send backup failures, because an unmonitored backup is the failure

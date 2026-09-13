@@ -31,10 +31,17 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "artifacts" {
 }
 
 # --- Lifecycle -------------------------------------------------------------
-# Objects here are only ever added, never deleted (a purged job orphans its
-# artifacts rather than removing them -- see PLAN.md, "Artifacts: back up, or rebuild?"), so the only
-# thing to expire is the noncurrent versions left behind when a generation is
-# rebuilt or overwritten.
+# Two kinds of object live here, and they have opposite lifecycles.
+#
+# The leave-generation KLVs are only ever added, never deleted (a purged job
+# orphans its artifacts rather than removing them -- see PLAN.md, "Artifacts:
+# back up, or rebuild?"), so the only thing to expire for them is the noncurrent
+# versions left behind when a generation is rebuilt or overwritten.
+#
+# Job exports, under `exports/`, are the opposite: derived data, regenerable
+# from the database on demand, built for one admin download. They are deleted
+# when their job is purged, and expire on their own if nobody gets to them --
+# keeping them forever would grow the bucket without bound for no benefit.
 
 resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
   bucket = aws_s3_bucket.artifacts.id
@@ -46,6 +53,23 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
 
     noncurrent_version_expiration {
       noncurrent_days = 90
+    }
+  }
+
+  rule {
+    id     = "expire-job-exports"
+    status = "Enabled"
+
+    filter {
+      prefix = "exports/"
+    }
+
+    expiration {
+      days = 30
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 1
     }
   }
 
@@ -152,9 +176,19 @@ resource "aws_s3_bucket_replication_configuration" "artifacts" {
   bucket = aws_s3_bucket.artifacts.id
 
   rule {
-    id     = "all-artifacts"
+    id     = "leave-generation-artifacts"
     status = "Enabled"
-    filter {}
+
+    # Everything except job exports. The KLVs are replicated because losing one
+    # costs a rebuild that needs the database; an export is regenerable from a
+    # completed job on demand, is deleted with its job and expires on its own,
+    # so replicating it would pay cross-region storage for a copy nobody would
+    # ever restore from. `prefix = ""` with an exclusion is not expressible, so
+    # the filter names what is replicated rather than what is not: exports live
+    # under `exports/` and KLVs under `leaves/`.
+    filter {
+      prefix = "leaves/"
+    }
 
     # A delete in the primary must not propagate: the artifact store is the
     # store that is allowed to be *newer* than the database (PLAN.md's "Backups and Restore"

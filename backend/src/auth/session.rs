@@ -12,12 +12,15 @@ pub const SESSION_COOKIE: &str = "birdtest_session";
 
 /// What a decoded session cookie tells us about the caller.
 ///
-/// Only the subject is consumed: username and admin status are re-read from the
-/// database on every request so a deleted or demoted account cannot keep acting
-/// on a token minted before the change.
+/// Only the subject and the session generation are consumed: username and admin
+/// status are re-read from the database on every request so a deleted or
+/// demoted account cannot keep acting on a token minted before the change, and
+/// the generation is compared with the account's so a password reset or "sign
+/// out everywhere" revokes every earlier token.
 #[derive(Debug, Clone)]
 pub struct SessionClaims {
     pub user_id: Uuid,
+    pub generation: i32,
 }
 
 fn key(cfg: &Config) -> SymmetricKey<V4> {
@@ -25,7 +28,13 @@ fn key(cfg: &Config) -> SymmetricKey<V4> {
         .expect("a 32-byte key is always valid for v4.local")
 }
 
-pub fn issue(cfg: &Config, user_id: Uuid, username: &str, is_admin: bool) -> AppResult<String> {
+pub fn issue(
+    cfg: &Config,
+    user_id: Uuid,
+    username: &str,
+    is_admin: bool,
+    generation: i32,
+) -> AppResult<String> {
     let now = Utc::now();
     let expiry = now + ChronoDuration::from_std(cfg.session_ttl).unwrap_or(ChronoDuration::days(7));
 
@@ -36,6 +45,7 @@ pub fn issue(cfg: &Config, user_id: Uuid, username: &str, is_admin: bool) -> App
         .and_then(|_| claims.expiration(&expiry.to_rfc3339()))
         .and_then(|_| claims.add_additional("username", username.to_string()))
         .and_then(|_| claims.add_additional("is_admin", is_admin))
+        .and_then(|_| claims.add_additional("gen", generation))
         .map_err(|e| AppError::internal(e.to_string()))?;
 
     local::encrypt(&key(cfg), &claims, None, None)
@@ -57,5 +67,9 @@ pub fn verify(cfg: &Config, token: &str) -> AppResult<SessionClaims> {
         .and_then(|v| v.as_str().map(str::to_owned))
         .and_then(|v| Uuid::parse_str(&v).ok())
         .ok_or_else(|| AppError::unauthorized("session has no subject"))?;
-    Ok(SessionClaims { user_id })
+    let generation = get("gen")
+        .and_then(|v| v.as_i64())
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or_else(|| AppError::unauthorized("session has no generation; sign in again"))?;
+    Ok(SessionClaims { user_id, generation })
 }

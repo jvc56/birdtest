@@ -3,6 +3,7 @@ use crate::jobstats::{self, JobStats};
 use crate::models::job::{Job, JobType};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -20,7 +21,6 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id", get(job_detail))
         .route("/jobs/:id/results", get(job_results))
         .route("/jobs/:id/stream", get(job_stream))
-        .route("/jobs/:id/results/stream", get(job_results_stream))
         .route("/users", get(list_users))
         .route("/workers", get(list_workers))
 }
@@ -69,8 +69,13 @@ async fn list_jobs(
                 (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id) AS tasks_total,
                 (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id AND t.state = 'completed')
                     AS tasks_completed,
-                (SELECT COALESCE(SUM(r.games), 0) FROM game_results r
-                 JOIN tasks t ON t.id = r.task_id WHERE t.job_id = j.id) AS game_rows,
+                -- The running total the submit path maintains, one result per
+                -- task, rather than the aggregate over every result row this
+                -- used to compute: it grew with the job's whole history, for
+                -- every job on the page, on every page view -- see PLAN.md on
+                -- what these reads cost. The dashboard's own counts still come
+                -- from the rows.
+                j.games_completed AS game_rows,
                 gc.max_games, pc.max_pairs,
                 -- Stalled: at least one decline and no submission in the last
                 -- 24 hours, with nothing currently claimed. Long enough not to
@@ -178,7 +183,7 @@ async fn job_results(
             let rows = sqlx::query(
                 "SELECT r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
                         m.equity AS best_equity, r.num_moves, r.submitted_at,
-                        u.username, c.claimed_by_anon_uuid
+                        u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
                  FROM position_analysis_records r
                  JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
@@ -187,7 +192,8 @@ async fn job_results(
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE t.job_id = $1
                    AND ($2::text IS NULL
-                        OR u.username = $2 OR c.claimed_by_anon_uuid::text = $2)
+                        OR u.username = $2
+                        OR left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) = $2)
                  ORDER BY r.submitted_at DESC, r.rack ASC
                  LIMIT $3 OFFSET $4",
             )
@@ -209,7 +215,7 @@ async fn job_results(
                         "num_moves": r.get::<i32, _>("num_moves"),
                         "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
                         "username": r.get::<Option<String>, _>("username"),
-                        "anon_uuid": r.get::<Option<Uuid>, _>("claimed_by_anon_uuid"),
+                        "anon_id": r.get::<Option<String>, _>("anon_id"),
                     })
                 })
                 .collect()
@@ -220,14 +226,15 @@ async fn job_results(
                         r.p1_score_mean, r.p1_score_sd, r.p2_score_mean, r.p2_score_sd,
                         r.divergent_games, r.divergent_wins, r.divergent_losses,
                         r.divergent_ties, r.submitted_at,
-                        t.seed, u.username, c.claimed_by_anon_uuid
+                        t.seed, u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
                  FROM game_results r
                  JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE t.job_id = $1
                    AND ($2::text IS NULL
-                        OR u.username = $2 OR c.claimed_by_anon_uuid::text = $2)
+                        OR u.username = $2
+                        OR left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) = $2)
                  ORDER BY r.submitted_at DESC
                  LIMIT $3 OFFSET $4",
             )
@@ -257,7 +264,7 @@ async fn job_results(
                         "divergent_ties": r.get::<Option<i32>, _>("divergent_ties"),
                         "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
                         "username": r.get::<Option<String>, _>("username"),
-                        "anon_uuid": r.get::<Option<Uuid>, _>("claimed_by_anon_uuid"),
+                        "anon_id": r.get::<Option<String>, _>("anon_id"),
                     })
                 })
                 .collect()
@@ -358,14 +365,47 @@ async fn job_stream(
 
 /// Newline-delimited JSON of every record for the job, streamed straight from a
 /// cursor so an offline analysis download never buffers the whole job in memory.
-async fn job_results_stream(
+///
+/// **Admin-only, and capped.** It was public, unpaginated and unmetered, which
+/// made one HTTP request enough to start a scan of tens of millions of rows —
+/// and the resource it consumes is not CPU but a pool connection, held for as
+/// long as the caller keeps reading, out of twenty. Bulk reads are an admin
+/// operation now; the public gets `GET /api/jobs/:id/results`, which is
+/// paginated. For a completed job this defers to the export, which is the same
+/// corpus read once rather than once per caller.
+pub(super) async fn job_results_stream(
     State(state): State<AppState>,
+    _admin: crate::auth::AdminUser,
     Path(id): Path<Uuid>,
-) -> AppResult<impl IntoResponse> {
+) -> AppResult<axum::response::Response> {
     let job = load_job(&state, id).await?;
-    let pool = state.pool.clone();
 
+    // A completed job's results are immutable, so an export of them is a stable
+    // artifact: read it instead of re-scanning. The redirect is what puts the
+    // cheap path in front of a caller without them having to know about it.
+    if job.status == crate::models::job::JobStatus::Completed {
+        if let Some((_, key)) = crate::exports::newest_ready(&state.pool, id).await? {
+            let url = state
+                .artifacts
+                .presigned_get(&key, crate::exports::DOWNLOAD_URL_TTL)
+                .await?;
+            return Ok((StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, url)])
+                .into_response());
+        }
+    }
+
+    // Held for the life of the stream, and released when the response body is
+    // dropped — which covers a caller that disconnects half way as well as one
+    // that reads to the end.
+    let permit = state
+        .result_streams
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::rate_limited(30))?;
+
+    let pool = state.pool.clone();
     let stream = async_stream::stream! {
+        let _permit = permit;
         let query = match job.job_type {
             JobType::OpeningRack =>
                 "SELECT to_jsonb(r) AS row FROM position_analysis_records r
@@ -395,7 +435,8 @@ async fn job_results_stream(
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
         axum::body::Body::from_stream(stream),
-    ))
+    )
+        .into_response())
 }
 
 #[derive(Serialize)]
@@ -419,6 +460,7 @@ async fn list_users(
                 (SELECT COUNT(*) FROM task_claims c
                  WHERE c.claimed_by_user_id = u.id AND c.state = 'completed') AS tasks_completed
          FROM users u
+         WHERE u.deleted_at IS NULL
          ORDER BY tasks_completed DESC, u.created_at ASC
          LIMIT $1 OFFSET $2",
     )
@@ -427,7 +469,7 @@ async fn list_users(
     .fetch_all(&state.pool)
     .await?;
 
-    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users")
+    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")
         .fetch_one(&state.pool)
         .await?;
 
@@ -449,8 +491,12 @@ async fn list_users(
 }
 
 #[derive(Serialize)]
-struct WorkerListItem {
+pub(super) struct WorkerListItem {
     user_id: Option<Uuid>,
+    /// An anonymous worker's public name; see `auth::public_anon_id`.
+    anon_id: Option<String>,
+    /// The anonymous worker's UUID, which is its credential: admin listing only.
+    #[serde(skip_serializing_if = "Option::is_none")]
     anon_uuid: Option<Uuid>,
     username: Option<String>,
     tasks_completed: i64,
@@ -461,19 +507,37 @@ async fn list_workers(
     State(state): State<AppState>,
     Query(query): Query<PageQuery>,
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
+    worker_page(&state, query, false).await
+}
+
+/// The same list with anonymous workers' real UUIDs, which banning one needs.
+pub(super) async fn list_workers_admin(
+    State(state): State<AppState>,
+    _admin: crate::auth::AdminUser,
+    Query(query): Query<PageQuery>,
+) -> AppResult<Json<super::Page<WorkerListItem>>> {
+    worker_page(&state, query, true).await
+}
+
+async fn worker_page(
+    state: &AppState,
+    query: PageQuery,
+    with_credentials: bool,
+) -> AppResult<Json<super::Page<WorkerListItem>>> {
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
     let rows = sqlx::query(
         "SELECT c.claimed_by_user_id AS user_id,
                 c.claimed_by_anon_uuid AS anon_uuid,
+                left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
                 COUNT(*)::bigint AS tasks_completed,
                 MAX(c.completed_at) AS last_seen_at
          FROM task_claims c
          LEFT JOIN users u ON u.id = c.claimed_by_user_id
          WHERE c.state = 'completed'
-         GROUP BY 1, 2, 3
-         ORDER BY 4 DESC
+         GROUP BY c.claimed_by_user_id, c.claimed_by_anon_uuid, u.username
+         ORDER BY tasks_completed DESC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
@@ -495,7 +559,8 @@ async fn list_workers(
             .into_iter()
             .map(|r| WorkerListItem {
                 user_id: r.get("user_id"),
-                anon_uuid: r.get("anon_uuid"),
+                anon_id: r.get("anon_id"),
+                anon_uuid: if with_credentials { r.get("anon_uuid") } else { None },
                 username: r.get("username"),
                 tasks_completed: r.get("tasks_completed"),
                 last_seen_at: r.get("last_seen_at"),

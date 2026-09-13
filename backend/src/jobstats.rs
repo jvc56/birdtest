@@ -9,6 +9,23 @@ use serde::Serialize;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+/// One `game_results` row per task of job `$1`: the first accepted.
+///
+/// With redundancy above 1 a task has one row per accepted claim, and since
+/// games are seeded and deterministic those rows describe the *same* games.
+/// Summing all of them would count every game `redundancy` times -- SPRT would
+/// see `redundancy` times the evidence it has and stop early on noise, and
+/// `min`/`max` gates would trip at a fraction of the games they name. Which
+/// copy is used is arbitrary but fixed; reconciling copies that disagree is a
+/// cross-check this read deliberately does not attempt (PLAN.md, "Worker
+/// Integrity").
+pub const FIRST_GAME_RESULT_PER_TASK: &str = "
+    SELECT DISTINCT ON (r.task_id) r.*
+    FROM game_results r
+    JOIN tasks t ON t.id = r.task_id
+    WHERE t.job_id = $1
+    ORDER BY r.task_id, r.submitted_at, r.task_claim_id";
+
 #[derive(Debug, Serialize)]
 pub struct JobStats {
     pub job: JobSummary,
@@ -23,9 +40,14 @@ pub struct JobStats {
     pub opening_racks: Option<OpeningRackStats>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub leave_generation: Option<LeaveGenStats>,
-    /// Empty for every job type but game pairs. Always serialized, so the
-    /// client can read `.length` without a presence check.
+    /// The most productive workers on this job, at most
+    /// [`MAX_WORKER_CONTRIBUTIONS`] of them. Always serialized, so the client
+    /// can read `.length` without a presence check.
     pub workers: Vec<WorkerContribution>,
+    /// Contributors beyond the ones listed. A job can have thousands, and the
+    /// page renders a table; the list is capped so the payload does not grow
+    /// without bound, and this is what the page says instead.
+    pub other_workers: i64,
     /// Estimated seconds to completion from recent throughput, or `None` when
     /// there is not enough recent activity to extrapolate.
     pub eta_seconds: Option<f64>,
@@ -72,20 +94,26 @@ pub struct GameStats {
     pub sprt: SprtResult,
 }
 
+/// Progress, and nothing else.
+///
+/// This used to also carry the average best equity and a breakdown of what the
+/// best opening play was (placement, exchange or pass). Both aggregated over
+/// every stored move row of the job, which was the most expensive read in the
+/// whole payload and grew without bound; and both counted per *claim* while
+/// `racks_analyzed` counts per task, so at `redundancy > 1` the page showed a
+/// move-type total of twice the racks it was displayed beside.
+///
+/// Nothing is lost from storage: every ranked move is still there, the results
+/// listing still returns the best move, score and equity per rack, `?rack=`
+/// still returns a rack's full ranked list, and an admin export is the path for
+/// analysing the corpus properly. Summarising millions of racks in two numbers
+/// on a progress panel was not where that analysis belonged.
 #[derive(Debug, Serialize)]
 pub struct OpeningRackStats {
     /// Distinct racks with at least one accepted analysis.
     pub racks_analyzed: i64,
     /// Size of the rack space; the denominator for progress.
     pub racks_total: i64,
-    pub average_best_equity: Option<f64>,
-    pub best_move_types: Vec<MoveTypeCount>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct MoveTypeCount {
-    pub move_type: String,
-    pub count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,7 +133,9 @@ pub struct LeaveGenStats {
 #[derive(Debug, Serialize)]
 pub struct WorkerContribution {
     pub user_id: Option<Uuid>,
-    pub anon_uuid: Option<Uuid>,
+    /// An anonymous worker's public name, never its UUID (the UUID is its
+    /// credential); see `auth::public_anon_id`.
+    pub anon_id: Option<String>,
     pub username: Option<String>,
     pub tasks_completed: i64,
 }
@@ -117,7 +147,31 @@ pub async fn load_job(pool: &PgPool, job_id: Uuid) -> AppResult<Job> {
         .await?)
 }
 
+/// How long `compute` may take before it is worth saying so.
+///
+/// Every read here is display-only -- nothing in the claim path reads a
+/// statistic -- so the cost is bounded by a job's history rather than by
+/// anything urgent. The reads that still grow do so slowly (contributions with
+/// claims, leave progress with generations, task counts with tasks), and the
+/// decision on whether to move them to a background refresh is meant to be
+/// made on evidence rather than guessed. This log line is that evidence: when
+/// it starts appearing for real jobs, the refresh is worth building.
+const SLOW_STATS_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
+    let started = std::time::Instant::now();
+    let stats = compute_inner(pool, job).await;
+    let elapsed = started.elapsed();
+    if elapsed >= SLOW_STATS_THRESHOLD {
+        tracing::warn!(
+            job_id = %job.id, job_type = ?job.job_type, elapsed_ms = elapsed.as_millis(),
+            "job stats took over a second to compute"
+        );
+    }
+    stats
+}
+
+async fn compute_inner(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
     let counts = sqlx::query(
         "SELECT
              COUNT(*)                                            AS total,
@@ -143,11 +197,7 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
 
     let (lexicon, variant) = lexicon_and_variant(pool, job).await?;
 
-    let games = match job.job_type {
-        JobType::Games => Some(game_stats(pool, job).await?),
-        JobType::GamePairs => Some(game_pair_stats(pool, job).await?),
-        _ => None,
-    };
+    let games = game_stats(pool, job).await?;
 
     let opening_racks = match job.job_type {
         JobType::OpeningRack => Some(opening_rack_stats(pool, job.id).await?),
@@ -164,6 +214,7 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
     let results_accepted: i64 = counts.get("accepted");
 
     let eta_seconds = estimate_eta(pool, job, &games, tasks_total, tasks_completed).await?;
+    let (workers, other_workers) = worker_contributions(pool, job.id).await?;
 
     Ok(JobStats {
         job: JobSummary {
@@ -187,7 +238,8 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
         games,
         opening_racks,
         leave_generation,
-        workers: worker_contributions(pool, job.id).await?,
+        workers,
+        other_workers,
         eta_seconds,
     })
 }
@@ -251,22 +303,35 @@ async fn lexicon_and_variant(
     Ok((lexicon, Some(job.variant.clone())))
 }
 
+/// The SPRT-relevant statistics for a games or game-pairs job, and `None` for
+/// every other job type.
+///
+/// This is also what the submission path evaluates the finish conditions on,
+/// which is why it is separate from [`compute`]: deciding whether a job is done
+/// needs these aggregates and nothing else.
+pub async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<Option<GameStats>> {
+    Ok(match job.job_type {
+        JobType::Games => Some(plain_game_stats(pool, job).await?),
+        JobType::GamePairs => Some(game_pair_stats(pool, job).await?),
+        JobType::OpeningRack | JobType::LeaveGeneration => None,
+    })
+}
+
 /// Sum the per-task aggregates for a plain `games` job. The SPRT unit is a
 /// game, so the tally and the unit count are the same number.
-async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
+async fn plain_game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
         .bind(job.id)
         .fetch_one(pool)
         .await?;
 
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT COALESCE(SUM(r.games), 0)::bigint  AS games,
                 COALESCE(SUM(r.wins), 0)::bigint   AS wins,
                 COALESCE(SUM(r.losses), 0)::bigint AS losses,
                 COALESCE(SUM(r.ties), 0)::bigint   AS ties
-         FROM game_results r JOIN tasks t ON t.id = r.task_id
-         WHERE t.job_id = $1",
-    )
+         FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
+    ))
     .bind(job.id)
     .fetch_one(pool)
     .await?;
@@ -302,7 +367,7 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
             .fetch_one(pool)
             .await?;
 
-    let row = sqlx::query(
+    let row = sqlx::query(&format!(
         "SELECT COALESCE(SUM(r.games), 0)::bigint            AS games,
                 COALESCE(SUM(r.wins), 0)::bigint             AS wins,
                 COALESCE(SUM(r.losses), 0)::bigint           AS losses,
@@ -313,9 +378,8 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
                 COALESCE(SUM(r.pent_3), 0)::bigint           AS pent_3,
                 COALESCE(SUM(r.pent_4), 0)::bigint           AS pent_4,
                 COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games
-         FROM game_results r JOIN tasks t ON t.id = r.task_id
-         WHERE t.job_id = $1",
-    )
+         FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
+    ))
     .bind(job.id)
     .fetch_one(pool)
     .await?;
@@ -394,19 +458,15 @@ fn build_game_stats(
 }
 
 async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRackStats> {
-    // Best move, score and equity are not duplicated onto the record: they are
-    // the rank 1 row in position_analysis_moves, which a partial index makes
-    // cheap to reach.
-    let row = sqlx::query(
-        "SELECT COUNT(DISTINCT r.rack)::bigint AS analyzed, AVG(m.equity) AS avg_equity
-         FROM position_analysis_records r
-         JOIN tasks t ON t.id = r.task_id
-         LEFT JOIN position_analysis_moves m ON m.record_id = r.id AND m.rank = 1
-         WHERE t.job_id = $1",
-    )
-    .bind(job_id)
-    .fetch_one(pool)
-    .await?;
+    // Two single-row reads, constant time at any job size. `racks_analyzed` is
+    // `jobs.racks_analyzed`, maintained one task at a time in the submit
+    // transaction; the aggregates that used to sit beside it here scanned the
+    // job's whole history on every detail view and every live push.
+    let racks_analyzed =
+        sqlx::query_scalar::<_, i64>("SELECT racks_analyzed FROM jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(pool)
+            .await?;
 
     let racks_total = sqlx::query_scalar::<_, i64>(
         "SELECT total_racks FROM job_opening_rack_config WHERE job_id = $1",
@@ -416,34 +476,7 @@ async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRac
     .await?
     .unwrap_or(0);
 
-    // MAGPIE renders a pass as "(Pass)" and an exchange as "(exch ABC)";
-    // anything else is a placement like "8G WUZ". Matching on a leading "ex"
-    // silently classified every exchange as a placement.
-    let types = sqlx::query(
-        "SELECT CASE
-                    WHEN m.move ILIKE '(exch%' THEN 'exchange'
-                    WHEN m.move ILIKE '(pass%' THEN 'pass'
-                    ELSE 'placement'
-                END AS move_type,
-                COUNT(*)::bigint AS count
-         FROM position_analysis_moves m
-         JOIN tasks t ON t.id = m.task_id
-         WHERE t.job_id = $1 AND m.rank = 1
-         GROUP BY 1 ORDER BY 2 DESC",
-    )
-    .bind(job_id)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(OpeningRackStats {
-        racks_analyzed: row.get("analyzed"),
-        racks_total,
-        average_best_equity: row.get("avg_equity"),
-        best_move_types: types
-            .into_iter()
-            .map(|r| MoveTypeCount { move_type: r.get("move_type"), count: r.get("count") })
-            .collect(),
-    })
+    Ok(OpeningRackStats { racks_analyzed, racks_total })
 }
 
 async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats> {
@@ -453,8 +486,11 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
             .fetch_one(pool)
             .await?;
 
+    // Generation 0 is the zeroed KLV generation 1 plays with, not a completed
+    // generation; counting it would report generation 2 while generation 1 is
+    // still running.
     let completed = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1",
+        "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1 AND generation >= 1",
     )
     .bind(job_id)
     .fetch_one(pool)
@@ -493,13 +529,24 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
     })
 }
 
+/// How many contributors the job stats name individually.
+///
+/// The list used to be every worker with an accepted result, unbounded: a
+/// popular job has thousands, and all of them were serialized into every detail
+/// view and every live push. Matches the API's default page size, which is the
+/// size a table on a page is built for.
+pub const MAX_WORKER_CONTRIBUTIONS: i64 = 50;
+
+/// The top contributors, and how many more there are.
 pub async fn worker_contributions(
     pool: &PgPool,
     job_id: Uuid,
-) -> AppResult<Vec<WorkerContribution>> {
+) -> AppResult<(Vec<WorkerContribution>, i64)> {
+    // One more than the cap, so "are there others" needs no second query when
+    // the job has few contributors -- which is the common case.
     let rows = sqlx::query(
         "SELECT c.claimed_by_user_id AS user_id,
-                c.claimed_by_anon_uuid AS anon_uuid,
+                left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
                 COUNT(*)::bigint AS tasks_completed
          FROM task_claims c
@@ -507,21 +554,44 @@ pub async fn worker_contributions(
          LEFT JOIN users u ON u.id = c.claimed_by_user_id
          WHERE t.job_id = $1 AND c.state = 'completed'
          GROUP BY 1, 2, 3
-         ORDER BY 4 DESC",
+         ORDER BY 4 DESC
+         LIMIT $2",
     )
     .bind(job_id)
+    .bind(MAX_WORKER_CONTRIBUTIONS + 1)
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| WorkerContribution {
-            user_id: r.get("user_id"),
-            anon_uuid: r.get("anon_uuid"),
-            username: r.get("username"),
-            tasks_completed: r.get("tasks_completed"),
-        })
-        .collect())
+    // Only when the cap was actually reached is a full count worth paying for.
+    let other_workers = if rows.len() as i64 > MAX_WORKER_CONTRIBUTIONS {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM (
+                 SELECT 1 FROM task_claims c
+                 JOIN tasks t ON t.id = c.task_id
+                 WHERE t.job_id = $1 AND c.state = 'completed'
+                 GROUP BY c.claimed_by_user_id, c.claimed_by_anon_uuid
+             ) w",
+        )
+        .bind(job_id)
+        .fetch_one(pool)
+        .await?
+            - MAX_WORKER_CONTRIBUTIONS
+    } else {
+        0
+    };
+
+    Ok((
+        rows.into_iter()
+            .take(MAX_WORKER_CONTRIBUTIONS as usize)
+            .map(|r| WorkerContribution {
+                user_id: r.get("user_id"),
+                anon_id: r.get("anon_id"),
+                username: r.get("username"),
+                tasks_completed: r.get("tasks_completed"),
+            })
+            .collect(),
+        other_workers,
+    ))
 }
 
 /// Throughput over the last hour, extrapolated to whatever is left. For SPRT

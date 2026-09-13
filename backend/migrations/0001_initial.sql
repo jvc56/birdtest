@@ -7,6 +7,15 @@ CREATE TABLE users (
     password_hash        TEXT NOT NULL,
     email_confirmed_at   TIMESTAMPTZ,
     is_admin             BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Embedded in every session token and compared on every request. Bumped by
+    -- a password reset, "sign out everywhere" and account deletion, which is
+    -- what revokes every session minted before.
+    session_generation   INT NOT NULL DEFAULT 0,
+    -- Set when an admin deletes the account. Deletion anonymizes rather than
+    -- removes the row: username, email and password are replaced by
+    -- tombstones and API keys are deleted, but the account's claims and
+    -- results stay, so no donated compute is lost.
+    deleted_at           TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -52,7 +61,9 @@ CREATE TABLE worker_bans (
     user_id     UUID REFERENCES users(id) ON DELETE CASCADE,
     anon_uuid   UUID REFERENCES anonymous_workers(uuid) ON DELETE CASCADE,
     reason      TEXT,
-    banned_by   UUID NOT NULL REFERENCES users(id),
+    -- SET NULL, like jobs.created_by: deleting the admin who issued a ban must
+    -- neither fail nor lift the ban.
+    banned_by   UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT ban_has_single_target CHECK (
         (user_id IS NOT NULL)::int + (anon_uuid IS NOT NULL)::int = 1
@@ -185,11 +196,36 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.0.1 is a
-    -- placeholder for the MAGPIE release implementing the check.
+    -- so "no floor" is not a state worth being able to express. 0.1.0 is the
+    -- first MAGPIE version that implements the protocol correctly.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 0 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
+    -- Every claim ever issued for this job, abandoned and declined ones
+    -- included: the deficit the scheduler orders on. Kept as a counter rather
+    -- than counted, because counting task_claims on every claim request costs
+    -- time proportional to the job's whole history. Only ever incremented,
+    -- except by a purge, which deletes the claims it counts.
+    claims_issued   BIGINT NOT NULL DEFAULT 0 CHECK (claims_issued >= 0),
+    -- Progress totals the dashboard reads, maintained in the submit transaction
+    -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
+    -- incremented
+    -- once per task, on its FIRST accepted result, because that is the row the
+    -- reads they replace selected: with redundancy > 1 the later claims of a
+    -- task replay the same deterministic work, and summing all of them would
+    -- multiply every total by the redundancy.
+    --
+    -- games_completed counts GAMES for both games and game_pairs; a pairs job's
+    -- unit count is half of it, exactly as the read derived it. racks_analyzed
+    -- counts distinct opening racks with an accepted analysis, which is a plain
+    -- sum because each task covers its own disjoint slice of the rack space.
+    --
+    -- Neither is authoritative for anything that decides: SPRT still reads
+    -- game_results, so a drifted counter shows a wrong number on a page and
+    -- cannot stop a job early. A purge zeroes them; a partial restore
+    -- recomputes them (RUNBOOK 2.3).
+    games_completed BIGINT NOT NULL DEFAULT 0 CHECK (games_completed >= 0),
+    racks_analyzed  BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ
@@ -240,7 +276,9 @@ CREATE TABLE player_configs (
     num_plies          INT,                 -- plies to simulate    (-pl1 / -pl2)
     num_plies_recorded INT,                 -- plies to report      (shplies)
     num_plays          INT,                 -- plays to simulate    (-np1 / -np2)
-    num_plays_recorded INT,                 -- plays to report      (maxnumdplays)
+    -- plays to report (maxnumdplays). Required: "keep everything" is unbounded
+    -- per position, and the worker and the server must agree on the number.
+    num_plays_recorded INT NOT NULL CHECK (num_plays_recorded >= 1),
     stopping_pct     DOUBLE PRECISION,      -- -sc1 / -sc2 (0–100)
     use_inference    BOOLEAN,               -- -si1 / -si2
     time_limit_secs  INT,                   -- -tl1 / -tl2
@@ -262,7 +300,8 @@ CREATE TABLE player_configs (
     -- rows in a job, validated equal at job-creation time) so this table
     -- stays the single, exhaustive source of what a job asked MAGPIE for.
     movegen_margin         DOUBLE PRECISION, -- move-gen equity margin for 'equity' recording (-mmargin)
-    created_by       UUID NOT NULL REFERENCES users(id),
+    -- SET NULL, like jobs.created_by: a config outlives the admin who made it.
+    created_by       UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -343,13 +382,44 @@ CREATE TABLE job_leave_config (
     target_rack_count INT NOT NULL CHECK (target_rack_count >= 1),
     -- Size of the forced-rack subset handed to a single task.
     racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
-    -- Largest leave size enumerated into the rack universe (leaves are 1..N tiles).
-    max_leave_size    INT NOT NULL DEFAULT 6 CHECK (max_leave_size BETWEEN 1 AND 6),
     -- Whether the leave-generating bot plays with a wordmap. Sent to the worker,
     -- which builds one from its .kwg if it does not already have it. A player
     -- setting like any other -- workers assume nothing about wordmaps.
     use_wordmap       BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+-- Exports
+--
+-- A completed job's results, as one gzipped NDJSON object in the artifact
+-- store. Only completed jobs can be exported, and that is what makes the
+-- artifact worth having: a completed job's results are immutable, so an export
+-- is built once and reused, where an export of an active job would be stale as
+-- it was written.
+--
+-- Shaped like input_data_imports, and for the same reason: a long operation an
+-- admin starts, polls, and then acts on. birdtest runs as a single instance, so
+-- the task needs no lease and startup may fail any row still 'running'.
+CREATE TABLE job_exports (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id        UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    state         TEXT NOT NULL DEFAULT 'running'
+                  CHECK (state IN ('running', 'ready', 'failed')),
+    -- NULL until the upload completes: the row exists from the moment the
+    -- background task is spawned.
+    artifact_key  TEXT,
+    bytes         BIGINT,
+    sha256        TEXT,
+    -- Rows written. Recorded so a later mismatch against the job is visible
+    -- rather than silent -- the same reason the KLV artifacts carry a digest.
+    row_count     BIGINT,
+    error         TEXT,
+    requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at  TIMESTAMPTZ
+);
+
+-- The newest ready export for a job, which is what a download resolves to.
+CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
 
 -- Tasks
 
@@ -377,13 +447,14 @@ CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
 --
--- Account deletion is handled at the application layer (not via ON DELETE CASCADE) because
--- task counters (accepted_count, active_claim_count) must be decremented and tasks may need
--- to revert from completed → available. The deletion sequence is:
---   1. For each active/completed claim: update task counters.
---   2. Delete all task records (game_results, etc.) linked to those claims.
---   3. Delete the task_claim rows.
---   4. Delete the user row (cascades to api_keys, email_confirmations, password_reset_tokens).
+-- claimed_by_user_id carries no ON DELETE clause because a user row is never
+-- deleted: account deletion anonymizes it in place (users.deleted_at, and a
+-- tombstone username and email) and leaves these rows exactly where they are.
+-- Removing them instead would take with them the captured in-game positions
+-- keyed to those claims -- including the ones other redundant claims
+-- deduplicated against, which nothing else holds -- and leave-generation
+-- occurrences that were folded into per-rack totals and cannot be subtracted
+-- back out. See routes::admin::delete_user.
 
 -- 'declined' is distinct from 'abandoned': one is a worker saying "I cannot do
 -- this", the other is a claim that lapsed. Only the first is diagnostic.
@@ -448,6 +519,10 @@ CREATE TABLE opening_rack_requests (
     -- No lexicon column: the player config carries it.
     variant           TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
+    -- The job's pinned layout, by name. Stated on the request for the same
+    -- reason the distribution is: a worker must play on the board the job
+    -- pins, not on whatever board its own settings last loaded.
+    board_layout      TEXT NOT NULL,
     -- Index of the first rack in this batch, and how many it covers. The final
     -- batch of a job may be short.
     rack_start        BIGINT NOT NULL CHECK (rack_start >= 0),
@@ -461,6 +536,7 @@ CREATE TABLE game_requests (
     -- No lexicon column: each player config carries its own.
     variant           TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
+    board_layout      TEXT NOT NULL,
     -- Denormalized from the job config, like everything else here, so the
     -- request a re-dispatched task replays is exactly the one it was given.
     capture_positions BOOLEAN NOT NULL DEFAULT FALSE,
@@ -476,6 +552,7 @@ CREATE TABLE leave_requests (
     lexicon             TEXT NOT NULL,
     variant             TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
+    board_layout        TEXT NOT NULL,
     generation          INT NOT NULL,
     forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (passed to MAGPIE's rack_list_create)
     num_games           INT NOT NULL,      -- denormalized from job_leave_config.num_iterations
@@ -486,9 +563,11 @@ CREATE TABLE leave_requests (
     use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
 );
 
--- Live per-rack occurrence progress for the in-progress generation of a leave-gen job.
--- Upserted transactionally on every accepted leave task result; drives both generation-transition
--- detection (all racks >= target) and the live dashboard figure.
+-- Live per-rack occurrence progress for each generation of a leave-gen job, one row per
+-- full 7-tile rack the distribution can draw (3,199,724 for English), seeded at zero when
+-- the generation opens. Updated transactionally on every accepted leave task result; drives
+-- both generation-transition detection (all racks >= target) and the live dashboard figure.
+-- Leave values are derived from these full-rack means as MAGPIE's rack_list_write_to_klv does.
 CREATE TABLE leave_rack_progress (
     job_id           UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     generation       INT NOT NULL,
@@ -570,7 +649,10 @@ CREATE INDEX position_analysis_records_task_idx
 CREATE TABLE position_analysis_moves (
     id              BIGSERIAL PRIMARY KEY,
     record_id       BIGINT NOT NULL REFERENCES position_analysis_records(id) ON DELETE CASCADE,
-    -- Denormalized so job-wide aggregates need not join through the record.
+    -- A second cascade path: moves already go with their record, which goes
+    -- with its task, but deleting a task reaches these directly too. It was
+    -- added to let job-wide aggregates skip the record join; there are no such
+    -- aggregates now, and it is kept for the cascade rather than for reads.
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
@@ -585,14 +667,15 @@ CREATE TABLE position_analysis_moves (
     -- static player, same as win_percentage.
     blended_utility DOUBLE PRECISION
 );
+-- Every read of a best move goes through its record: the results listing joins
+-- `record_id` and filters `rank = 1`, and a rack lookup reads a record's whole
+-- ranked list. There is deliberately no job-wide index on `(task_id) WHERE
+-- rank = 1`: one existed for a dashboard aggregate over every best move of a
+-- job, that aggregate is gone (the panel shows progress only), and the index
+-- cost maintenance on every move insert into a table that runs to tens of
+-- millions of rows.
 CREATE INDEX position_analysis_moves_record_idx
     ON position_analysis_moves (record_id, rank);
--- The dashboard's aggregates are all over best moves, which are read from here
--- rather than duplicated onto the record. A partial index keeps that a scan of
--- one row per position rather than of every stored move.
-CREATE INDEX position_analysis_moves_best_idx
-    ON position_analysis_moves (task_id) INCLUDE (move, equity)
-    WHERE rank = 1;
 
 -- Per-ply simulation stats for each candidate move. Only populated for simming
 -- player configs; a static player has no per-ply statistics to record.
@@ -606,13 +689,18 @@ CREATE TABLE position_analysis_plies (
 );
 CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
--- Shared by games and game pairs: one row per accepted task, holding the aggregate
--- MAGPIE's autoplay reports. Autoplay does not emit individual games -- it reports
--- counts and score moments for a batch, and in `-gp` mode a second such summary
--- covering only the *divergent* pairs: those whose two games did not play
--- identically. A pair that played identically is a guaranteed tie carrying no
--- information, so excluding those is the variance reduction pairing exists to
--- provide, and the divergent aggregate is what SPRT and Glicko are computed from.
+-- Shared by games and game pairs: one row per accepted claim, holding the
+-- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games
+-- -- it reports counts and score moments for a batch, and in `-gp` mode also
+-- the pentanomial: how many completed pairs ended in each of the five possible
+-- pair outcomes. The pentanomial is what SPRT and the rating fits read; the
+-- divergent summary alongside it is a diagnostic only.
+--
+-- With redundancy > 1 a task has several rows here, one per accepted claim,
+-- and because games are seeded and deterministic they describe the *same*
+-- games. Every aggregate that treats rows as observations (SPRT, progress,
+-- ratings) therefore reads one row per task -- the first accepted -- or it
+-- would count each game `redundancy` times.
 CREATE TABLE game_results (
     task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -705,6 +793,36 @@ CREATE TABLE leave_generation_artifacts (
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, generation)
+);
+
+-- One row per generation transition that has been *started*, claimed by the
+-- worker request that found the generation complete.
+--
+-- A transition folds millions of leave_rack_progress rows into a KLV and
+-- uploads it, which takes tens of seconds and cannot run inside the claim
+-- transaction, since a proxy timeout would abandon it part-way. That leaves a
+-- window in which a second claim would find the
+-- same "every rack at target, nothing in flight" state and start the same
+-- transition again, duplicating all of it. The primary key is what makes that
+-- impossible: the deciding claim transaction commits this row under the job's
+-- advisory lock, and any other claim that sees a live row is told there is no
+-- work yet instead.
+--
+-- `started_at` exists for the crash case. If the process dies mid-transition
+-- the row stays behind with no artifact to show for it, and the job would stall
+-- forever on a transition nobody is running; a claim that finds a row older
+-- than the takeover timeout with no artifact restarts it (see
+-- leave_gen::next_step). `completed_at` is set when the artifact row is
+-- written, so a stalled or repeated transition is a query rather than a guess.
+CREATE TABLE leave_generation_transitions (
+    job_id       UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation   INT NOT NULL,
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    -- How many times this generation's transition has been started. Above 1
+    -- means a takeover happened, which is worth seeing.
+    attempts     INT NOT NULL DEFAULT 1 CHECK (attempts >= 1),
     PRIMARY KEY (job_id, generation)
 );
 
@@ -843,15 +961,21 @@ CREATE INDEX backups_finished_idx ON backups (finished_at DESC);
 
 -- Audit log
 
+-- No foreign keys, deliberately. The log is append-only and has to outlive
+-- what it describes: the census rows written by delete_job and delete_user
+-- exist precisely to be read after the job or user is gone. A foreign key
+-- here either blocks those deletions outright (NO ACTION -- every job has a
+-- job.created row, every user a user.registered row) or rewrites history
+-- (SET NULL / CASCADE).
 CREATE TABLE audit_log (
     id              BIGSERIAL PRIMARY KEY,
     action          TEXT NOT NULL,
-    actor_user_id   UUID REFERENCES users(id),
-    actor_anon_uuid UUID REFERENCES anonymous_workers(uuid),
+    actor_user_id   UUID,
+    actor_anon_uuid UUID,
     target_type     TEXT,
     target_id       TEXT,
     -- Typed extra-context columns (replace JSONB metadata)
-    job_id          UUID REFERENCES jobs(id),      -- task/result events
+    job_id          UUID,                           -- task/result events
     reason          TEXT,                           -- ban events, etc.
     old_status      TEXT,                           -- status-change events
     new_status      TEXT,
@@ -866,7 +990,9 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
 CREATE INDEX        tasks_job_idx             ON tasks (job_id);
-CREATE INDEX        game_results_task_idx     ON game_results (task_id);
+-- (task_id, submitted_at) rather than task_id alone: the per-task "first
+-- accepted result" read that every aggregate uses orders on both.
+CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);
 CREATE INDEX        leave_records_task_idx    ON leave_records (task_id);
 CREATE INDEX        position_records_task_idx ON position_analysis_records (task_id);
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);

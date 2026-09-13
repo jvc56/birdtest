@@ -78,9 +78,15 @@ resource "aws_security_group" "service" {
 resource "aws_lb" "main" {
   name               = local.name
   load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets            = aws_subnet.public[*].id
-  tags               = local.tags
+  # Not the 60-second default. Creating a leave-generation job writes every
+  # full rack (3.2 million rows for English) inside the request, and a
+  # generation transition runs inside a worker's claim request; both take tens
+  # of seconds on a small instance. MAGPIE's own request timeout is 120s.
+  # SSE streams are unaffected: they send keep-alives.
+  idle_timeout    = 300
+  security_groups = [aws_security_group.alb.id]
+  subnets         = aws_subnet.public[*].id
+  tags            = local.tags
 }
 
 resource "aws_lb_target_group" "backend" {
@@ -113,10 +119,31 @@ resource "aws_lb_target_group" "frontend" {
   tags = local.tags
 }
 
+# Plain HTTP only redirects. The backend runs with SECURE_COOKIES=true, and a
+# browser discards a Secure cookie set over http, so serving the app on port 80
+# would make signing in silently impossible -- and would send session cookies
+# and API keys in the clear if it did not.
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = 80
   protocol          = "HTTP"
+
+  default_action {
+    type = "redirect"
+    redirect {
+      port        = "443"
+      protocol    = "HTTPS"
+      status_code = "HTTP_301"
+    }
+  }
+}
+
+resource "aws_lb_listener" "https" {
+  load_balancer_arn = aws_lb.main.arn
+  port              = 443
+  protocol          = "HTTPS"
+  ssl_policy        = "ELBSecurityPolicy-TLS13-1-2-2021-06"
+  certificate_arn   = var.acm_certificate_arn
 
   default_action {
     type             = "forward"
@@ -127,7 +154,7 @@ resource "aws_lb_listener" "http" {
 # Everything under /api (and the health check) goes to the backend; every other
 # path is the SPA, served by Nginx.
 resource "aws_lb_listener_rule" "api" {
-  listener_arn = aws_lb_listener.http.arn
+  listener_arn = aws_lb_listener.https.arn
   priority     = 100
 
   action {
@@ -168,8 +195,12 @@ resource "aws_iam_role_policy_attachment" "execution" {
 # The execution role needs to read the SSM parameters injected as `secrets`.
 data "aws_iam_policy_document" "execution_ssm" {
   statement {
-    actions   = ["ssm:GetParameters"]
-    resources = [aws_ssm_parameter.database_url.arn, aws_ssm_parameter.session_signing_key.arn]
+    actions = ["ssm:GetParameters"]
+    resources = compact([
+      aws_ssm_parameter.database_url.arn,
+      aws_ssm_parameter.session_signing_key.arn,
+      var.github_token_parameter_arn,
+    ])
   }
 }
 
@@ -218,9 +249,9 @@ resource "aws_ecs_task_definition" "main" {
 
   container_definitions = jsonencode([
     {
-      name      = "backend"
-      image     = var.backend_image
-      essential = true
+      name         = "backend"
+      image        = var.backend_image
+      essential    = true
       portMappings = [{ containerPort = 8080, protocol = "tcp" }]
       environment = [
         { name = "BIND_ADDR", value = "0.0.0.0:8080" },
@@ -230,14 +261,27 @@ resource "aws_ecs_task_definition" "main" {
         { name = "PUBLIC_URL", value = var.public_url },
         { name = "S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
         { name = "AWS_REGION", value = var.region },
-        { name = "RUST_LOG", value = "birdtest=info,tower_http=info" }
+        { name = "RUST_LOG", value = "birdtest=info,tower_http=info" },
+        # The ALB appends the client address to X-Forwarded-For; per-IP rate
+        # limits (registration, login, password reset) key on it. Without this
+        # they key on the ALB's own address, one bucket for the whole site.
+        { name = "TRUSTED_PROXY_HOPS", value = "1" },
+        # The fleet-wide MAGPIE floor, and the default floor for new jobs.
+        { name = "MIN_MAGPIE_VERSION", value = var.min_magpie_version }
       ]
       # Pulled from SSM at task start, so the values never appear in the task
       # definition or in Terraform state.
-      secrets = [
-        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn },
-        { name = "SESSION_SIGNING_KEY", valueFrom = aws_ssm_parameter.session_signing_key.arn }
-      ]
+      secrets = concat(
+        [
+          { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn },
+          { name = "SESSION_SIGNING_KEY", valueFrom = aws_ssm_parameter.session_signing_key.arn }
+        ],
+        # Optional: unauthenticated GitHub ref resolution for input-data
+        # imports is 60 calls an hour per IP.
+        var.github_token_parameter_arn == "" ? [] : [
+          { name = "GITHUB_TOKEN", valueFrom = var.github_token_parameter_arn }
+        ]
+      )
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -248,9 +292,9 @@ resource "aws_ecs_task_definition" "main" {
       }
     },
     {
-      name      = "frontend"
-      image     = var.frontend_image
-      essential = true
+      name         = "frontend"
+      image        = var.frontend_image
+      essential    = true
       portMappings = [{ containerPort = 80, protocol = "tcp" }]
       logConfiguration = {
         logDriver = "awslogs"
@@ -291,6 +335,6 @@ resource "aws_ecs_service" "main" {
     container_port   = 80
   }
 
-  depends_on = [aws_lb_listener.http]
+  depends_on = [aws_lb_listener.https]
   tags       = local.tags
 }

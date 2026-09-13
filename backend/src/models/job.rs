@@ -41,6 +41,15 @@ pub struct Job {
     pub min_magpie_major: i32,
     pub min_magpie_minor: i32,
     pub min_magpie_patch: i32,
+    /// Every claim ever issued for this job; the scheduler's deficit
+    /// numerator. See `scheduler::candidate_jobs`.
+    pub claims_issued: i64,
+    /// Games recorded by the first accepted result of each task; the dashboard's
+    /// progress numerator, maintained in the submit transaction rather than
+    /// summed on read. A pairs job's unit count is half of it.
+    pub games_completed: i64,
+    /// Distinct opening racks with an accepted analysis, on the same terms.
+    pub racks_analyzed: i64,
     pub created_at: DateTime<Utc>,
     pub activated_at: Option<DateTime<Utc>>,
     pub deactivated_at: Option<DateTime<Utc>>,
@@ -78,7 +87,7 @@ pub struct PlayerConfig {
     pub num_plies_recorded: Option<i32>,
     /// Plays to simulate, and how many of them to report back.
     pub num_plays: Option<i32>,
-    pub num_plays_recorded: Option<i32>,
+    pub num_plays_recorded: i32,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,
@@ -95,7 +104,8 @@ pub struct PlayerConfig {
     /// so this table is the exhaustive source of what a job asked for; a
     /// job's two player configs must agree on it (validated at creation).
     pub movegen_margin: Option<f64>,
-    pub created_by: Uuid,
+    /// `None` once the admin who created it has been deleted.
+    pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -152,7 +162,6 @@ pub struct LeaveConfig {
     pub generation_count: i32,
     pub target_rack_count: i32,
     pub racks_per_task: i32,
-    pub max_leave_size: i32,
     pub use_wordmap: bool,
 }
 

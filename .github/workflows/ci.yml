@@ -1,0 +1,119 @@
+# Per pull request, cheapest first (TESTING.md, "Per pull request"): the
+# backend's lint, unit, contract and integration tests against a Postgres
+# service, the frontend's type check and build, both images the deployment
+# runs, the Terraform, and MAGPIE's half of the contract fixtures.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: birdtest
+          POSTGRES_PASSWORD: birdtest
+          POSTGRES_DB: birdtest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U birdtest -d birdtest"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      # The integration tests clone a template database per test on this
+      # server; they fail rather than skip without it.
+      TEST_DATABASE_URL: postgres://birdtest:birdtest@localhost:5432/birdtest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+
+  images:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Backend image
+        run: docker build -f docker/Dockerfile --target backend -t birdtest-backend .
+      - name: Frontend image
+        run: docker build -t birdtest-frontend frontend
+
+  # Formatting and validation need no AWS credentials: `init -backend=false`
+  # fetches the providers and nothing else. This is what caught a string with
+  # unescaped quotes in variables.tf that made every `terraform init` fail.
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
+  # MAGPIE's half of the contract. Each repository
+  # tests against its own copy of the fixtures, so a fixture changed here and
+  # not copied to MAGPIE would pass both suites while breaking the protocol.
+  # This runs MAGPIE's contribute tests against *this* branch's fixtures.
+  # It does not catch a MAGPIE-side change; the nightly end-to-end job does.
+  magpie-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: jvc56/MAGPIE
+          ref: birdtest-contribute
+          path: magpie
+      - name: Use this branch's contract fixtures
+        run: cp contract-fixtures/*.json magpie/test/birdtest_contract/
+      - name: Cache MAGPIE data
+        id: magpie-data
+        uses: actions/cache@v4
+        with:
+          path: |
+            magpie/data/*
+            magpie/testdata/*
+          key: magpie-data-${{ hashFiles('magpie/download_data.sh', 'magpie/convert_lexica.sh') }}
+      - name: Download MAGPIE data
+        if: steps.magpie-data.outputs.cache-hit != 'true'
+        working-directory: magpie
+        run: ./download_data.sh && ./convert_lexica.sh
+      - name: Build and run MAGPIE's contribute tests
+        working-directory: magpie
+        run: make magpie_test && ./bin/magpie_test contribute

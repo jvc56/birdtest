@@ -10,10 +10,48 @@ pub mod registry;
 
 use crate::error::AppResult;
 use crate::models::job::NamedPlayerConfig;
-use handler::{GameRequest, GameResultsRecord, PlayerSpec, PositionAnalysis};
+use handler::{GameRequest, GameResultsRecord, PlayerSpec, PlyStats, PositionAnalysis};
 use racks::LetterDistribution;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
+
+/// The advisory-lock namespace for dispatch decisions. Postgres advisory locks
+/// are a single flat 64-bit space shared by every user of them, so the
+/// two-argument form's first key is a namespace and the second identifies the
+/// job.
+const DISPATCH_LOCK_NAMESPACE: i32 = 1;
+
+/// Serialize one job's dispatch decisions against each other, for the rest of
+/// the caller's transaction.
+///
+/// Every job type needs this, for the same reason: what to hand out next is
+/// decided from reads that a concurrent claim's uncommitted writes are
+/// invisible to.
+///
+/// - **Games, game pairs and opening racks** pick the next seed with
+///   `MAX(seed)`, so two overlapping claims compute the same one. The
+///   `(job_id, seed)` unique index catches that, but only by failing the loser,
+///   and `scheduler::claim` gives up after three attempts -- so past three-way
+///   contention on one job a worker is told `204` while work exists. The lock
+///   costs nothing that was not already being paid: `issue_claim` bumps
+///   `jobs.claims_issued`, which takes the job's row lock until commit, so
+///   claims against one job already serialize. This only moves the start of
+///   that window earlier, turning a lost race into a short wait.
+/// - **Leave generation** additionally decides which racks are still out and
+///   whether the generation can close; see `leave_gen::next_step`.
+///
+/// Per job, so claims for other jobs are unaffected, and transaction-scoped, so
+/// it is released on commit, on rollback, and on a dropped connection.
+/// `hashtext` may collide, which costs two unrelated jobs a little
+/// serialization and nothing else.
+pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(DISPATCH_LOCK_NAMESPACE)
+        .bind(job_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
 
 pub(crate) async fn load_player_spec(
     conn: &mut PgConnection,
@@ -35,17 +73,25 @@ pub(crate) async fn load_player_spec(
 /// The server enumerates rack universes and builds KLVs from that
 /// distribution, so it must be the pinned bytes rather than a file on the
 /// server's disk. There is no server-side copy of the data to disagree with.
-pub(crate) struct JobData {
+pub struct JobData {
     pub variant: String,
     pub letterdist_name: String,
     pub letterdist: LetterDistribution,
+    /// The pinned board layout's name, which is what the worker's request
+    /// states. The bytes stay on the row: nothing server-side reads a layout.
+    pub layout_name: String,
 }
 
-pub(crate) async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<JobData> {
+/// The job settings every request and every rack enumeration is built from.
+/// `pub` rather than crate-private so a test can make one claim decision the
+/// way the claim path makes it.
+pub async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<JobData> {
     let row = sqlx::query(
-        "SELECT j.variant, ld.name AS ld_name, ld.content AS ld_content
+        "SELECT j.variant, ld.name AS ld_name, ld.content AS ld_content,
+                layout.name AS layout_name
          FROM jobs j
          JOIN input_data ld ON ld.id = j.letterdist_id
+         JOIN input_data layout ON layout.id = j.layout_id
          WHERE j.id = $1",
     )
     .bind(job_id)
@@ -61,6 +107,7 @@ pub(crate) async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppR
         variant: row.get("variant"),
         letterdist: LetterDistribution::parse(&content, &letterdist_name)?,
         letterdist_name,
+        layout_name: row.get("layout_name"),
     })
 }
 
@@ -96,8 +143,9 @@ pub(crate) async fn insert_game_request(
     sqlx::query(
         "INSERT INTO game_requests
              (task_id, variant, seed, num_games, player1_config_id,
-              player2_config_id, capture_positions, letter_distribution)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+              player2_config_id, capture_positions, letter_distribution,
+              board_layout)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(task_id)
     .bind(&req.variant)
@@ -107,6 +155,7 @@ pub(crate) async fn insert_game_request(
     .bind(p2)
     .bind(req.capture_positions)
     .bind(&req.letter_distribution)
+    .bind(&req.board_layout)
     .execute(conn)
     .await?;
     Ok(())
@@ -127,6 +176,7 @@ pub(crate) async fn load_game_request(
         game_pairs,
         capture_positions: row.get("capture_positions"),
         letter_distribution: row.get("letter_distribution"),
+        board_layout: row.get("board_layout"),
         player1,
         player2,
     })
@@ -179,55 +229,74 @@ pub(crate) async fn insert_position_analyses(
         // moves are already there too.
         let Some(record_id) = record_id else { continue };
 
-        let kept: Vec<_> = position.moves.iter().take(top_moves as usize).collect();
+        // `top_moves` is the config's num_plays_recorded, at least 1 by
+        // constraint; clamped anyway rather than trusting the cast.
+        let kept: Vec<_> = position.moves.iter().take(top_moves.max(0) as usize).collect();
         if kept.is_empty() {
             continue;
         }
-        let mut builder = sqlx::QueryBuilder::new(
-            "INSERT INTO position_analysis_moves
-                 (record_id, task_id, rank, move, score, equity, win_percentage,
-                  blended_utility) ",
-        );
-        builder.push_values(kept.iter().enumerate(), |mut b, (index, entry)| {
-            b.push_bind(record_id)
-                .push_bind(task_id)
-                .push_bind((index + 1) as i16)
-                .push_bind(entry.play.clone())
-                .push_bind(entry.score)
-                .push_bind(entry.equity)
-                // NULL for a static player, which simulates nothing.
-                .push_bind(entry.win_percentage)
-                .push_bind(entry.blended_utility);
-        });
-        // Returned in insertion order, so the ids line up with `kept` and the
-        // per-ply rows can be attached without looking each move back up.
-        builder.push(" RETURNING id");
-        let move_ids: Vec<i64> = builder
-            .build_query_scalar()
-            .fetch_all(&mut *conn)
-            .await?;
 
-        for (move_id, entry) in move_ids.iter().zip(kept.iter()) {
-            // Only a simming player produces per-ply statistics; for a static
-            // player this is empty and nothing is written.
-            for ply in &entry.plies {
-                sqlx::query(
-                    "INSERT INTO position_analysis_plies
-                         (move_id, ply, bingo_percentage, average_score)
-                     VALUES ($1, $2, $3, $4)
-                     ON CONFLICT (move_id, ply) DO NOTHING",
-                )
-                .bind(move_id)
-                .bind(ply.ply)
-                .bind(ply.bingo_percentage)
-                .bind(ply.average_score)
-                .execute(&mut *conn)
-                .await?;
-            }
+        // Chunked because Postgres caps a statement at 65,535 bind parameters,
+        // and a large num_plays_recorded can keep more moves than one
+        // statement can carry.
+        let mut move_ids: Vec<i64> = Vec::with_capacity(kept.len());
+        for (chunk_index, chunk) in kept.chunks(MOVE_ROWS_PER_STATEMENT).enumerate() {
+            let rank_offset = chunk_index * MOVE_ROWS_PER_STATEMENT;
+            let mut builder = sqlx::QueryBuilder::new(
+                "INSERT INTO position_analysis_moves
+                     (record_id, task_id, rank, move, score, equity, win_percentage,
+                      blended_utility) ",
+            );
+            builder.push_values(chunk.iter().enumerate(), |mut b, (index, entry)| {
+                b.push_bind(record_id)
+                    .push_bind(task_id)
+                    .push_bind((rank_offset + index + 1) as i16)
+                    .push_bind(entry.play.clone())
+                    .push_bind(entry.score)
+                    .push_bind(entry.equity)
+                    // NULL for a static player, which simulates nothing.
+                    .push_bind(entry.win_percentage)
+                    .push_bind(entry.blended_utility);
+            });
+            // Returned in insertion order, so the ids line up with `kept` and
+            // the per-ply rows can be attached without looking each move up.
+            builder.push(" RETURNING id");
+            let ids: Vec<i64> = builder.build_query_scalar().fetch_all(&mut *conn).await?;
+            move_ids.extend(ids);
+        }
+
+        // Only a simming player produces per-ply statistics; for a static
+        // player this is empty and nothing is written. One statement per
+        // position rather than one per ply: a simmed opening-rack batch is
+        // racks x moves x plies rows, and a round trip each was the slowest
+        // part of accepting it.
+        let plies: Vec<(i64, &PlyStats)> = move_ids
+            .iter()
+            .zip(kept.iter())
+            .flat_map(|(move_id, entry)| entry.plies.iter().map(move |ply| (*move_id, ply)))
+            .collect();
+        for chunk in plies.chunks(PLY_ROWS_PER_STATEMENT) {
+            let mut builder = sqlx::QueryBuilder::new(
+                "INSERT INTO position_analysis_plies
+                     (move_id, ply, bingo_percentage, average_score) ",
+            );
+            builder.push_values(chunk.iter(), |mut b, (move_id, ply)| {
+                b.push_bind(*move_id)
+                    .push_bind(ply.ply)
+                    .push_bind(ply.bingo_percentage)
+                    .push_bind(ply.average_score);
+            });
+            builder.push(" ON CONFLICT (move_id, ply) DO NOTHING");
+            builder.build().execute(&mut *conn).await?;
         }
     }
     Ok(())
 }
+
+/// Rows per multi-row insert, keeping each statement well under Postgres's
+/// 65,535-parameter ceiling (8 and 4 binds per row respectively).
+const MOVE_ROWS_PER_STATEMENT: usize = 4_000;
+const PLY_ROWS_PER_STATEMENT: usize = 8_000;
 
 pub(crate) async fn insert_game_results(
     conn: &mut PgConnection,
@@ -271,19 +340,17 @@ pub(crate) async fn insert_game_results(
 
     // Deterministic games mean redundant claims replay identical positions, so
     // the first accepted claim records them and the rest are no-ops.
-    // How many ranked moves to keep: the player config's num_plays_recorded,
-    // which is also what told the worker how many to report.
-    let top_moves = sqlx::query_scalar::<_, Option<i32>>(
-        "SELECT COALESCE(p1.num_plays_recorded, p2.num_plays_recorded)
+    // How many ranked moves to keep: player 1's num_plays_recorded, which is
+    // also the one MAGPIE reads to decide how many to report.
+    let top_moves = sqlx::query_scalar::<_, i32>(
+        "SELECT p1.num_plays_recorded
          FROM game_requests r
          JOIN player_configs p1 ON p1.id = r.player1_config_id
-         JOIN player_configs p2 ON p2.id = r.player2_config_id
          WHERE r.task_id = $1",
     )
     .bind(task_id)
     .fetch_one(&mut *conn)
-    .await?
-    .unwrap_or(i32::MAX);
+    .await?;
 
     insert_position_analyses(conn, task_id, claim_id, &record.positions, top_moves, true).await
 }

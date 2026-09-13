@@ -1,37 +1,18 @@
-mod artifacts;
-mod audit;
-mod backups;
-mod auth;
-mod compat;
-mod config;
-mod db;
-mod email;
-mod error;
-mod jobs;
-mod jobstats;
-mod models;
-mod ratelimit;
-mod ratings;
-mod routes;
-mod scheduler;
-mod sse;
-mod state;
-mod inputdata;
-mod stats;
-mod version;
-
 use anyhow::Result;
-use axum::routing::get;
-use axum::Router;
-use state::AppState;
+use birdtest::state::AppState;
+use birdtest::{artifacts, config, db, email, inputdata, ratelimit, ratings, sse};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower_http::trace::TraceLayer;
 
 /// How often to look for rating pools whose evidence has grown. Ratings are a
 /// summary, not a control signal, so minutes of staleness cost nothing while
 /// per-submission refits would be pure waste.
 const RATING_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How often to drop rate-limit buckets that have gone idle. The buckets
+/// themselves refill in seconds to an hour, so this only decides how long an
+/// unused entry lingers in memory, not how anyone is limited.
+const RATE_LIMIT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -61,6 +42,9 @@ async fn main() -> Result<()> {
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,
+        result_streams: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            birdtest::state::MAX_CONCURRENT_RESULT_STREAMS,
+        )),
         http: reqwest::Client::builder()
             .user_agent("birdtest")
             .connect_timeout(std::time::Duration::from_secs(30))
@@ -75,6 +59,11 @@ async fn main() -> Result<()> {
         Ok(0) => {}
         Ok(n) => tracing::warn!(count = n, "failed input data imports left running by a restart"),
         Err(err) => tracing::error!(error = %err.message, "could not reap orphaned imports"),
+    }
+    match birdtest::exports::fail_orphaned(&state.pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "failed job exports left running by a restart"),
+        Err(err) => tracing::error!(error = %err.message, "could not reap orphaned exports"),
     }
 
     // Rating fits run on a periodic sweep rather than on result submission: a
@@ -100,23 +89,65 @@ async fn main() -> Result<()> {
         });
     }
 
-    let app = Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .nest("/api/worker", routes::worker::router())
-        .nest("/api/auth", routes::auth::router())
-        .merge(routes::account::router())
-        .nest("/api/admin", routes::admin::router())
-        .nest("/api/admin", routes::ratings::admin_router())
-        .nest("/api", routes::public::router())
-        .nest("/api", routes::ratings::public_router())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    // Keyed rate limiters hold one entry per key seen, and the keys are
+    // outside input; without this the map only ever grows.
+    {
+        let limits = state.limits.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RATE_LIMIT_SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                limits.retain_recent();
+            }
+        });
+    }
+
+    let app = birdtest::app(state);
 
     let addr: SocketAddr = cfg.bind_addr.parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "birdtest listening");
 
-    // `ConnectInfo` is what per-IP registration rate limiting keys on.
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    // `ConnectInfo` is the peer address `clientip` falls back to.
+    //
+    // Shut down gracefully on the signals a container runtime actually sends.
+    // Without this, a deployment or a `docker stop` drops every in-flight
+    // request: a worker that has just uploaded a completed batch loses it and
+    // its retry is answered `accepted: false`, because the claim it was for is
+    // still `claimed` and stays that way until the heartbeat timeout. Letting
+    // open requests finish costs a few seconds of a rollout.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            // ECS stops a task with SIGTERM and only escalates to SIGKILL after
+            // the stop timeout, so this is the signal that matters in
+            // production.
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(%err, "could not listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = interrupt => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutting down; letting in-flight requests finish");
 }

@@ -15,7 +15,7 @@ impl JobHandler for OpeningRackHandler {
 
     async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         let row = sqlx::query(
-            "SELECT r.variant, r.letter_distribution, r.rack_start,
+            "SELECT r.variant, r.letter_distribution, r.board_layout, r.rack_start,
                     r.rack_count, r.previous_play,
                     r.player_config_id, c.rack_size
              FROM opening_rack_requests r
@@ -41,6 +41,7 @@ impl JobHandler for OpeningRackHandler {
                 .expand(&job_data.letterdist),
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
+            board_layout: row.get("board_layout"),
             previous_play: row.get("previous_play"),
             player,
         })
@@ -93,9 +94,7 @@ impl JobHandler for OpeningRackHandler {
         .bind(task_id)
         .fetch_one(&mut *conn)
         .await?;
-        // Absent means the config asked for no truncation.
-        let num_plays_recorded: i32 =
-            row.get::<Option<i32>, _>("num_plays_recorded").unwrap_or(i32::MAX);
+        let num_plays_recorded: i32 = row.get("num_plays_recorded");
 
         // An opening rack is unique per (claim, rack), so a conflict here would
         // be a duplicate within one submission rather than a redundant claim.
@@ -105,6 +104,68 @@ impl JobHandler for OpeningRackHandler {
 
         Ok(())
     }
+}
+
+/// Checks an opening-rack submission against the racks the task dispatched.
+///
+/// The counterpart of the batch-size rule game jobs get
+/// ([`super::plausibility::check_against_task`]), and the same rule: what was
+/// asked for was fixed when the task was handed out, so an answer to anything
+/// else is answering a question nobody asked. It is stronger here because the
+/// request names the racks rather than just how many, so the whole set can be
+/// compared rather than its size.
+///
+/// Without it a submission was unchecked input in both directions. Too few
+/// racks and the task still completed, leaving a hole in the rack space that
+/// nothing revisits -- the job's own finish condition only asks whether every
+/// task completed. Too many, or racks from nowhere, and they were stored as
+/// analyses of this job and added to `jobs.racks_analyzed`, the progress
+/// counter the dashboard reads.
+///
+/// Expanding the range costs what dispatching it cost: a handful of additions
+/// per rack, against a batch capped at 10,000.
+pub async fn check_batch_against_task(
+    conn: &mut PgConnection,
+    task_id: Uuid,
+    reported: &[String],
+) -> AppResult<()> {
+    let row = sqlx::query(
+        "SELECT r.rack_start, r.rack_count, c.rack_size
+         FROM opening_rack_requests r
+         JOIN tasks t ON t.id = r.task_id
+         JOIN job_opening_rack_config c ON c.job_id = t.job_id
+         WHERE r.task_id = $1",
+    )
+    .bind(task_id)
+    .fetch_one(&mut *conn)
+    .await?;
+
+    let job_data = super::load_job_data_for_task(&mut *conn, task_id).await?;
+    let expected = RackRange {
+        rack_size: row.get("rack_size"),
+        start: row.get("rack_start"),
+        count: row.get("rack_count"),
+    }
+    .expand(&job_data.letterdist);
+
+    if reported.len() != expected.len() {
+        return Err(AppError::bad_request(format!(
+            "result analyses {} racks but this task dispatched {}",
+            reported.len(),
+            expected.len()
+        )));
+    }
+    // Order is not part of the contract, only the set. Duplicates within the
+    // submission are already refused by the unique index on
+    // (task_claim_id, rack), so equal sizes plus containment is equality.
+    let dispatched: std::collections::HashSet<&str> =
+        expected.iter().map(String::as_str).collect();
+    if let Some(stray) = reported.iter().find(|rack| !dispatched.contains(rack.as_str())) {
+        return Err(AppError::bad_request(format!(
+            "result analyses rack {stray:?}, which this task did not dispatch"
+        )));
+    }
+    Ok(())
 }
 
 /// A contiguous slice of the rack space, which is what a task actually is.
@@ -171,6 +232,7 @@ pub async fn next_request(
         OpeningRackRequest {
             variant: job_data.variant.clone(),
             letter_distribution: job_data.letterdist_name.clone(),
+            board_layout: job_data.layout_name.clone(),
             racks,
             previous_play: None,
             player,
@@ -190,13 +252,14 @@ pub async fn insert_range(
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO opening_rack_requests
-             (task_id, variant, letter_distribution, rack_start,
+             (task_id, variant, letter_distribution, board_layout, rack_start,
               rack_count, previous_play, player_config_id)
-         VALUES ($1, $2, $3, $4, $5, NULL, $6)",
+         VALUES ($1, $2, $3, $4, $5, $6, NULL, $7)",
     )
     .bind(task_id)
     .bind(&job_data.variant)
     .bind(&job_data.letterdist_name)
+    .bind(&job_data.layout_name)
     .bind(start)
     .bind(count as i32)
     .bind(config.player_config_id)

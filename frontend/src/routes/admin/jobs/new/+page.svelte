@@ -44,7 +44,6 @@
   let generationCount = 1;
   let targetRackCount = 500;
   let racksPerTask = 50;
-  let maxLeaveSize = 6;
   let leaveUseWordmap = true;
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
@@ -109,7 +108,6 @@
           generation_count: generationCount,
           target_rack_count: targetRackCount,
           racks_per_task: racksPerTask,
-          max_leave_size: maxLeaveSize,
           use_wordmap: leaveUseWordmap
         };
     }
@@ -256,7 +254,7 @@
         <input id="gens" type="number" min="1" class="input" bind:value={generationCount} />
       </div>
     </div>
-    <div class="grid grid-cols-3 gap-3">
+    <div class="grid grid-cols-2 gap-3">
       <div>
         <label class="label" for="target">Occurrences per rack</label>
         <input id="target" type="number" min="1" class="input" bind:value={targetRackCount} />
@@ -264,10 +262,6 @@
       <div>
         <label class="label" for="rpt">Racks per task</label>
         <input id="rpt" type="number" min="1" class="input" bind:value={racksPerTask} />
-      </div>
-      <div>
-        <label class="label" for="mls">Max leave size</label>
-        <input id="mls" type="number" min="1" max="6" class="input" bind:value={maxLeaveSize} />
       </div>
     </div>
     <label class="flex items-center gap-2">

@@ -35,14 +35,16 @@ use super::racks::LetterDistribution;
 use crate::error::{AppError, AppResult};
 use std::collections::{HashMap, VecDeque};
 
-/// MAGPIE's `RACK_SIZE - 1`. `RACK_SIZE` is fixed at 7 across this whole
-/// system (both MAGPIE's own build and birdtest's schema assume it), so a
-/// KLV's leave domain -- unlike `job_leave_config.max_leave_size`, which only
-/// bounds what a job actually *observes* -- is always every leave of 1..=6
-/// tiles. `klv_write_to_csv`/`klv_create_empty` in MAGPIE hardcode this same
-/// bound; matching it here is what keeps a birdtest-built KLV byte-for-byte
+/// MAGPIE's `RACK_SIZE`, fixed at 7 across this whole system (both MAGPIE's
+/// own build and birdtest's schema assume it). Leave generation tracks full
+/// racks of exactly this many tiles, as MAGPIE's `RackList` does.
+pub const RACK_SIZE: usize = 7;
+
+/// MAGPIE's `RACK_SIZE - 1`. A KLV's leave domain is always every leave of
+/// 1..=6 tiles; `klv_write_to_csv`/`klv_create_empty` in MAGPIE hardcode this
+/// same bound, and matching it is what keeps a birdtest-built KLV
 /// interchangeable with one MAGPIE would have built for the same data.
-pub const MAX_LEAVE_SIZE: usize = 6;
+pub const MAX_LEAVE_SIZE: usize = RACK_SIZE - 1;
 
 // --- KWG node bit layout (src/def/kwg_defs.h) -------------------------------
 // tile:8 (bits 24-31) | accepts:1 (bit 23) | is_end:1 (bit 22) | arc_index:22 (bits 0-21)
@@ -226,16 +228,15 @@ fn serialize(nodes: &[u32], leave_values: &[f32]) -> Vec<u8> {
     out
 }
 
-/// Builds a complete KLV2 file: every leave of 1..=[`MAX_LEAVE_SIZE`] tiles
-/// drawable from `distribution`, valued from `mean_by_rack` where present and
-/// zero everywhere else -- exactly `magpie convert csv2klv`'s behavior for a
-/// leaves CSV that doesn't mention every leave (`job_leave_config`'s own
-/// `max_leave_size` is typically smaller than 6, so most of the domain is
-/// zero by design, not by omission).
-pub fn build(
-    distribution: &LetterDistribution,
-    mean_by_rack: &HashMap<String, f64>,
-) -> AppResult<Vec<u8>> {
+/// The leave domain laid out as a KWG: the node array, and each enumerated
+/// leave's word index (`word_indices[i]` is the index of `leaves[i]`).
+struct Layout {
+    nodes: Vec<u32>,
+    leaves: Vec<String>,
+    word_indices: Vec<u32>,
+}
+
+fn layout(distribution: &LetterDistribution) -> AppResult<Layout> {
     let leaves = distribution.enumerate_leaves(MAX_LEAVE_SIZE);
 
     let mut arena: Vec<TrieNode> = vec![TrieNode { tile: 0, accepts: false, children: Vec::new() }];
@@ -257,15 +258,250 @@ pub fn build(
 
     let (nodes, root) = flatten(&arena)?;
     let counts = compute_counts(&nodes);
+    let word_indices = leaf_letters
+        .iter()
+        .map(|letters| word_index_for(&nodes, &counts, root, letters))
+        .collect();
+    Ok(Layout { nodes, leaves, word_indices })
+}
 
-    let mut leave_values = vec![0.0f32; leaves.len()];
-    for (rack, letters) in leaves.iter().zip(leaf_letters.iter()) {
-        let index = word_index_for(&nodes, &counts, root, letters) as usize;
-        let mean = mean_by_rack.get(rack).copied().unwrap_or(0.0);
-        leave_values[index] = mean_to_equity_f32(mean);
+/// Builds a complete KLV2 file: every leave of 1..=[`MAX_LEAVE_SIZE`] tiles
+/// drawable from `distribution`, valued from `value_by_leave` where present
+/// and zero everywhere else -- exactly `magpie convert csv2klv`'s behavior for
+/// a leaves CSV that doesn't mention every leave. Leave generation itself goes
+/// through [`FullRackLeaves`]; this is the zeroed generation-0 KLV (an empty
+/// map) and the format tests.
+pub fn build(
+    distribution: &LetterDistribution,
+    value_by_leave: &HashMap<String, f64>,
+) -> AppResult<Vec<u8>> {
+    let layout = layout(distribution)?;
+    let mut leave_values = vec![0.0f32; layout.leaves.len()];
+    for (leave, &index) in layout.leaves.iter().zip(layout.word_indices.iter()) {
+        let value = value_by_leave.get(leave).copied().unwrap_or(0.0);
+        leave_values[index as usize] = mean_to_equity_f32(value);
+    }
+    Ok(serialize(&layout.nodes, &leave_values))
+}
+
+/// A leave packed into an integer: the tile index (in `distribution.tiles`
+/// order, plus one) of each letter, six bits per letter. Distinct leaves get
+/// distinct keys because letters are always packed in ascending tile order.
+fn pack_letter(key: u64, position: usize, tile: usize) -> u64 {
+    key | ((tile as u64 + 1) << (6 * position))
+}
+
+/// A multiply-mix hasher for [`pack_letter`] keys. Deriving a generation's
+/// leaves looks up hundreds of millions of these, where the standard
+/// SipHash's DoS resistance buys nothing (every key is server-generated) and
+/// costs several times the time.
+#[derive(Default)]
+struct PackedLeaveHasher(u64);
+
+impl std::hash::Hasher for PackedLeaveHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(self.0 ^ b as u64);
+        }
+    }
+    fn write_u64(&mut self, x: u64) {
+        let mixed = (x ^ (x >> 29)).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed ^ (mixed >> 32);
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type PackedLeaveMap = HashMap<u64, u32, std::hash::BuildHasherDefault<PackedLeaveHasher>>;
+
+/// Derives a generation's leave values from full-rack results, and builds the
+/// KLV from them: a port of MAGPIE's `rack_list_write_to_klv` and
+/// `generate_leaves` (`src/impl/rack_list.c`).
+///
+/// MAGPIE's leave generation observes full 7-tile racks, never leaves. Each
+/// full rack `R` has a mean equity `m(R)` (0 if it never occurred) and a
+/// weight `combos(R)`, the number of ways to draw it from a full bag:
+/// the product over letters of `C(dist[l], R[l])`. Then:
+///
+/// - `average` is the combos-weighted mean of `m(R)` over every full rack.
+/// - Every proper, non-empty sub-multiset `L` of `R` receives `m(R)` with
+///   weight `C(dist[l] - L[l], R[l] - L[l])` multiplied over letters: the ways
+///   to draw the rest of `R` once `L` is held.
+/// - A leave's value is its weighted mean minus `average`, or 0 if no rack
+///   contributed to it.
+///
+/// Racks are fed one at a time ([`Self::add_rack`]) so a generation's millions
+/// of rows can be streamed rather than held in memory.
+pub struct FullRackLeaves {
+    layout: Layout,
+    tile_by_letter: HashMap<char, usize>,
+    tile_counts: Vec<u32>,
+    /// `binomial[n][k]` for every `n` up to the largest tile count and `k` up
+    /// to [`RACK_SIZE`].
+    binomial: Vec<[u64; RACK_SIZE + 1]>,
+    word_index_by_key: PackedLeaveMap,
+    equity_sum: Vec<f64>,
+    count_sum: Vec<u64>,
+    weighted_sum: f64,
+    combos_sum: u64,
+    racks_added: u64,
+}
+
+impl FullRackLeaves {
+    pub fn new(distribution: &LetterDistribution) -> AppResult<Self> {
+        if distribution.tiles.len() > 63 {
+            return Err(AppError::internal(format!(
+                "a distribution of {} letters is too large to pack leaves for",
+                distribution.tiles.len()
+            )));
+        }
+        let layout = layout(distribution)?;
+        let tile_by_letter: HashMap<char, usize> =
+            distribution.tiles.iter().enumerate().map(|(i, t)| (t.letter, i)).collect();
+        let tile_counts: Vec<u32> = distribution.tiles.iter().map(|t| t.count).collect();
+
+        let max_count = tile_counts.iter().copied().max().unwrap_or(0) as usize;
+        let mut binomial = vec![[0u64; RACK_SIZE + 1]; max_count + 1];
+        for n in 0..=max_count {
+            binomial[n][0] = 1;
+            for k in 1..=RACK_SIZE.min(n) {
+                binomial[n][k] = binomial[n - 1][k - 1] + binomial[n - 1][k];
+            }
+        }
+
+        let mut word_index_by_key =
+            PackedLeaveMap::with_capacity_and_hasher(layout.leaves.len(), Default::default());
+        for (leave, &index) in layout.leaves.iter().zip(layout.word_indices.iter()) {
+            let mut key = 0;
+            for (position, letter) in leave.chars().enumerate() {
+                key = pack_letter(key, position, tile_by_letter[&letter]);
+            }
+            word_index_by_key.insert(key, index);
+        }
+
+        let number_of_leaves = layout.leaves.len();
+        Ok(Self {
+            layout,
+            tile_by_letter,
+            tile_counts,
+            binomial,
+            word_index_by_key,
+            equity_sum: vec![0.0; number_of_leaves],
+            count_sum: vec![0; number_of_leaves],
+            weighted_sum: 0.0,
+            combos_sum: 0,
+            racks_added: 0,
+        })
     }
 
-    Ok(serialize(&nodes, &leave_values))
+    /// Adds one full rack's results. `mean` is 0 for a rack that never
+    /// occurred, as in MAGPIE, where such a rack still counts toward the
+    /// average.
+    pub fn add_rack(&mut self, rack: &str, mean: f64) -> AppResult<()> {
+        // (tile index, how many of it), in ascending tile order.
+        let mut groups: Vec<(usize, u32)> = Vec::with_capacity(RACK_SIZE);
+        let mut tiles = 0;
+        let mut letters: Vec<usize> = Vec::with_capacity(RACK_SIZE);
+        for letter in rack.chars() {
+            let tile = *self.tile_by_letter.get(&letter).ok_or_else(|| {
+                AppError::internal(format!("rack {rack:?} has a letter {letter:?} not in the distribution"))
+            })?;
+            letters.push(tile);
+            tiles += 1;
+        }
+        if tiles != RACK_SIZE {
+            return Err(AppError::internal(format!(
+                "rack {rack:?} has {tiles} tiles; leave generation tracks full racks of {RACK_SIZE}"
+            )));
+        }
+        letters.sort_unstable();
+        for tile in letters {
+            match groups.last_mut() {
+                Some((last, n)) if *last == tile => *n += 1,
+                _ => groups.push((tile, 1)),
+            }
+        }
+
+        let mut combos: u64 = 1;
+        for &(tile, n) in &groups {
+            let available = self.tile_counts[tile];
+            if n > available {
+                return Err(AppError::internal(format!(
+                    "rack {rack:?} holds more of a letter than the bag has"
+                )));
+            }
+            combos *= self.binomial[available as usize][n as usize];
+        }
+        self.weighted_sum += mean * combos as f64;
+        self.combos_sum += combos;
+        self.racks_added += 1;
+
+        self.generate_leaves(&groups, 0, 0, 0, 1, mean);
+        Ok(())
+    }
+
+    /// `generate_leaves`: every sub-multiset of `groups`, choosing how many of
+    /// each letter the leave keeps. `count` accumulates the ways to draw what
+    /// the leave does not keep.
+    fn generate_leaves(
+        &mut self,
+        groups: &[(usize, u32)],
+        group: usize,
+        key: u64,
+        leave_size: usize,
+        count: u64,
+        mean: f64,
+    ) {
+        if group == groups.len() {
+            if leave_size > 0 && leave_size < RACK_SIZE {
+                let index = self.word_index_by_key[&key] as usize;
+                self.count_sum[index] += count;
+                self.equity_sum[index] += mean * count as f64;
+            }
+            return;
+        }
+        let (tile, n) = groups[group];
+        let available = self.tile_counts[tile];
+        let mut key = key;
+        for kept in 0..=n {
+            if kept > 0 {
+                key = pack_letter(key, leave_size + kept as usize - 1, tile);
+            }
+            let ways = self.binomial[(available - kept) as usize][(n - kept) as usize];
+            self.generate_leaves(groups, group + 1, key, leave_size + kept as usize, count * ways, mean);
+        }
+    }
+
+    /// How many racks have been added; a complete generation adds every full
+    /// rack the distribution can draw.
+    pub fn racks_added(&self) -> u64 {
+        self.racks_added
+    }
+
+    /// Each leave's value in enumeration order, keyed like [`build`]'s map.
+    fn leave_values(&self) -> impl Iterator<Item = (&str, u32, f64)> + '_ {
+        let average =
+            if self.combos_sum > 0 { self.weighted_sum / self.combos_sum as f64 } else { 0.0 };
+        self.layout.leaves.iter().zip(self.layout.word_indices.iter()).map(move |(leave, &index)| {
+            let i = index as usize;
+            let value = if self.count_sum[i] > 0 {
+                self.equity_sum[i] / self.count_sum[i] as f64 - average
+            } else {
+                0.0
+            };
+            (leave.as_str(), index, value)
+        })
+    }
+
+    /// The KLV2 file for the racks added so far.
+    pub fn build(&self) -> Vec<u8> {
+        let mut leave_values = vec![0.0f32; self.layout.leaves.len()];
+        for (_, index, value) in self.leave_values() {
+            leave_values[index as usize] = mean_to_equity_f32(value);
+        }
+        serialize(&self.layout.nodes, &leave_values)
+    }
 }
 
 #[cfg(test)]
@@ -343,10 +579,148 @@ mod tests {
         let bytes = build(&dist, &HashMap::new()).unwrap();
         let kwg_size = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
         let values_start = 4 + kwg_size * 4 + 4;
-        for chunk in bytes[values_start..].chunks_exact(4) {
-            let v = f32::from_le_bytes(chunk.try_into().unwrap());
+        let (values, _) = bytes[values_start..].as_chunks::<4>();
+        for chunk in values {
+            let v = f32::from_le_bytes(*chunk);
             assert_eq!(v, 0.0);
         }
+    }
+
+    /// A direct, slow statement of `rack_list_write_to_klv`'s definition,
+    /// independent of the recursive enumeration and packed keys above: for
+    /// every leave, scan every full rack containing it.
+    fn reference_leave_values(
+        dist: &LetterDistribution,
+        mean_by_rack: &HashMap<String, f64>,
+    ) -> HashMap<String, f64> {
+        fn counts(dist: &LetterDistribution, s: &str) -> Vec<u32> {
+            dist.tiles
+                .iter()
+                .map(|t| s.chars().filter(|&c| c == t.letter).count() as u32)
+                .collect()
+        }
+        fn choose(n: u32, k: u32) -> f64 {
+            if k > n {
+                return 0.0;
+            }
+            (0..k).fold(1.0, |acc, i| acc * (n - i) as f64 / (i + 1) as f64)
+        }
+        let bag: Vec<u32> = dist.tiles.iter().map(|t| t.count).collect();
+        let racks = dist.enumerate_racks(RACK_SIZE);
+        let combos = |r: &[u32]| r.iter().zip(&bag).map(|(&n, &d)| choose(d, n)).product::<f64>();
+        let (mut weighted, mut total) = (0.0, 0.0);
+        for rack in &racks {
+            let c = combos(&counts(dist, rack));
+            weighted += mean_by_rack.get(rack).copied().unwrap_or(0.0) * c;
+            total += c;
+        }
+        let average = weighted / total;
+
+        let mut out = HashMap::new();
+        for leave in dist.enumerate_leaves(MAX_LEAVE_SIZE) {
+            let l = counts(dist, &leave);
+            let (mut sum, mut count) = (0.0, 0.0);
+            for rack in &racks {
+                let r = counts(dist, rack);
+                if r.iter().zip(&l).any(|(&rn, &ln)| ln > rn) {
+                    continue;
+                }
+                let ways: f64 = (0..r.len()).map(|i| choose(bag[i] - l[i], r[i] - l[i])).product();
+                sum += mean_by_rack.get(rack).copied().unwrap_or(0.0) * ways;
+                count += ways;
+            }
+            out.insert(leave, if count > 0.0 { sum / count - average } else { 0.0 });
+        }
+        out
+    }
+
+    fn racks_dist() -> LetterDistribution {
+        // Enough tiles for 7-tile racks, with repeats, a blank, and a letter
+        // too scarce to fill most leaves.
+        LetterDistribution::from_tiles_for_test(vec![
+            Tile { letter: '?', count: 1 },
+            Tile { letter: 'A', count: 4 },
+            Tile { letter: 'B', count: 3 },
+            Tile { letter: 'C', count: 2 },
+            Tile { letter: 'D', count: 1 },
+        ])
+    }
+
+    #[test]
+    fn full_rack_derivation_matches_the_definition() {
+        let dist = racks_dist();
+        let racks = dist.enumerate_racks(RACK_SIZE);
+        // Distinct, irregular means, with some racks left unobserved (mean 0)
+        // so they still count toward the average, as in MAGPIE.
+        let mut mean_by_rack = HashMap::new();
+        for (i, rack) in racks.iter().enumerate() {
+            if i % 5 != 3 {
+                mean_by_rack.insert(rack.clone(), ((i * 37) % 101) as f64 * 0.25 - 12.0);
+            }
+        }
+
+        let mut derived = FullRackLeaves::new(&dist).unwrap();
+        for rack in &racks {
+            // Racks arrive in any order and in any letter order.
+            let shuffled: String = rack.chars().rev().collect();
+            derived.add_rack(&shuffled, mean_by_rack.get(rack).copied().unwrap_or(0.0)).unwrap();
+        }
+        assert_eq!(derived.racks_added(), racks.len() as u64);
+
+        let expected = reference_leave_values(&dist, &mean_by_rack);
+        let mut compared = 0;
+        for (leave, _, value) in derived.leave_values() {
+            let want = expected[leave];
+            assert!((value - want).abs() < 1e-9, "leave {leave:?}: derived {value}, expected {want}");
+            compared += 1;
+        }
+        assert_eq!(compared, expected.len());
+
+        // And the file carries exactly those values at their word indices.
+        assert_eq!(derived.build(), build(&dist, &expected).unwrap());
+    }
+
+    #[test]
+    fn full_rack_derivation_refuses_racks_that_are_not_full() {
+        let mut derived = FullRackLeaves::new(&racks_dist()).unwrap();
+        assert!(derived.add_rack("AAB", 1.0).is_err());
+        assert!(derived.add_rack("AAAAABB?", 1.0).is_err());
+        assert!(derived.add_rack("DDAAABB", 1.0).is_err(), "only one D in the bag");
+        assert!(derived.add_rack("AAAABBZ", 1.0).is_err(), "Z is not in the distribution");
+    }
+
+    #[test]
+    fn identical_rack_means_give_zero_leaves() {
+        // Every rack worth the same: no leave is better than average.
+        let dist = racks_dist();
+        let mut derived = FullRackLeaves::new(&dist).unwrap();
+        for rack in dist.enumerate_racks(RACK_SIZE) {
+            derived.add_rack(&rack, 7.5).unwrap();
+        }
+        assert!(derived.leave_values().all(|(_, _, v)| v.abs() < 1e-9));
+    }
+
+    /// How long a real generation's derivation takes: every English full rack.
+    /// Ignored (needs MAGPIE-DATA's english.csv, and wants `--release`):
+    ///   cargo test --release --lib derives_every_english_rack -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn derives_every_english_rack() {
+        let magpie_data = std::env::var("MAGPIE_DATA_PATH")
+            .unwrap_or_else(|_| "../../MAGPIE/data".to_string());
+        let bytes = std::fs::read(format!("{magpie_data}/letterdistributions/english.csv")).unwrap();
+        let dist = LetterDistribution::parse(&bytes, "english").unwrap();
+        let racks = dist.enumerate_racks(RACK_SIZE);
+        assert_eq!(racks.len(), 3_199_724);
+
+        let started = std::time::Instant::now();
+        let mut derived = FullRackLeaves::new(&dist).unwrap();
+        for (i, rack) in racks.iter().enumerate() {
+            derived.add_rack(rack, (i % 97) as f64 - 48.0).unwrap();
+        }
+        let bytes = derived.build();
+        println!("derived {} leaves from {} racks in {:?}", derived.layout.leaves.len(), racks.len(), started.elapsed());
+        assert!(!bytes.is_empty());
     }
 
     /// Cross-validates against a real MAGPIE binary rather than trusting this

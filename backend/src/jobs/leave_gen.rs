@@ -1,5 +1,6 @@
 use super::handler::*;
-use super::racks::LetterDistribution;
+use super::klv::{FullRackLeaves, RACK_SIZE};
+use super::racks::{LetterDistribution, RackIndex};
 use super::JobData;
 use crate::artifacts::ArtifactStore;
 use crate::error::{AppError, AppResult};
@@ -18,14 +19,15 @@ pub async fn insert_request(
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO leave_requests
-             (task_id, lexicon, variant, letter_distribution, generation,
+             (task_id, lexicon, variant, letter_distribution, board_layout, generation,
               forced_racks, num_games, previous_artifact_key, use_wordmap)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(task_id)
     .bind(&req.lexicon)
     .bind(&req.variant)
     .bind(&req.letter_distribution)
+    .bind(&req.board_layout)
     .bind(req.generation)
     .bind(&req.forced_racks)
     .bind(req.num_games)
@@ -41,11 +43,9 @@ impl JobHandler for LeaveGenHandler {
     type Response = LeaveResponse;
     type Record = LeaveRecord;
 
-
-
     async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         let row = sqlx::query(
-            "SELECT lexicon, variant, letter_distribution, generation, forced_racks,
+            "SELECT lexicon, variant, letter_distribution, board_layout, generation, forced_racks,
                     num_games, previous_artifact_key, use_wordmap
              FROM leave_requests WHERE task_id = $1",
         )
@@ -56,6 +56,7 @@ impl JobHandler for LeaveGenHandler {
             lexicon: row.get("lexicon"),
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
+            board_layout: row.get("board_layout"),
             generation: row.get("generation"),
             forced_racks: row.get("forced_racks"),
             num_games: row.get("num_games"),
@@ -99,31 +100,102 @@ impl JobHandler for LeaveGenHandler {
         .execute(&mut *conn)
         .await?;
 
-        // A single submission can carry thousands of racks, so the progress
-        // upsert is issued as multi-row statements rather than row-by-row.
-        const CHUNK: usize = 1000;
-        for chunk in record.racks.chunks(CHUNK) {
-            let mut builder = sqlx::QueryBuilder::new(
-                "INSERT INTO leave_rack_progress
-                     (job_id, generation, rack, occurrence_count, equity_sum) ",
+        // A result for a generation that has already been aggregated is
+        // credited to the worker -- it did the work, and the claim completes
+        // normally -- but must not be folded in. The
+        // generation's KLV is already built and uploaded, so nothing will ever
+        // read these occurrences; adding them would only make the rows disagree
+        // with the artifact built from them, which is the one signal reserved
+        // for a corrupted or stale object (see `rebuild_artifacts`).
+        //
+        // Defence in depth, not a path the claim flow takes: a generation
+        // closes only when none of its claims is still `claimed`, a claim that
+        // times out is abandoned (and its submission refused before reaching
+        // here), and a reopened task is reissued only while its own generation
+        // is current. What remains is state the flow never writes -- a
+        // partial restore, a hand edit -- and folding into a built
+        // generation is the one outcome worth guarding against there.
+        let closed = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM leave_generation_artifacts
+                            WHERE job_id = $1 AND generation = $2)",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .fetch_one(&mut *conn)
+        .await?;
+        if closed {
+            tracing::warn!(
+                job_id = %job_id, generation, task_id = %task_id,
+                racks = record.racks.len(),
+                "discarding a leave result for a generation that has already closed"
             );
-            builder.push_values(chunk.iter(), |mut b, occ| {
-                b.push_bind(job_id)
-                    .push_bind(generation)
-                    .push_bind(occ.rack.clone())
-                    .push_bind(occ.count)
-                    .push_bind(occ.mean * occ.count as f64);
-            });
-            builder.push(
-                " ON CONFLICT (job_id, generation, rack) DO UPDATE SET
-                     occurrence_count = leave_rack_progress.occurrence_count + excluded.occurrence_count,
-                     equity_sum       = leave_rack_progress.equity_sum + excluded.equity_sum,
-                     updated_at       = now()",
-            );
-            builder.build().execute(&mut *conn).await?;
+            return Ok(());
         }
+
+        // One statement per submission, however many racks it carries. An
+        // UPDATE rather than an upsert: the generation's universe is every
+        // full rack, seeded up front, so a rack with no row is not a rack of
+        // this distribution and must not create one.
+        let racks: Vec<&str> = record.racks.iter().map(|o| o.rack.as_str()).collect();
+        let counts: Vec<i64> = record.racks.iter().map(|o| o.count).collect();
+        let sums: Vec<f64> = record.racks.iter().map(|o| o.mean * o.count as f64).collect();
+        sqlx::query(
+            "UPDATE leave_rack_progress p SET
+                 occurrence_count = p.occurrence_count + u.count,
+                 equity_sum       = p.equity_sum + u.equity_sum,
+                 updated_at       = now()
+             FROM UNNEST($3::text[], $4::bigint[], $5::float8[]) AS u(rack, count, equity_sum)
+             WHERE p.job_id = $1 AND p.generation = $2 AND p.rack = u.rack",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .bind(&racks)
+        .bind(&counts)
+        .bind(&sums)
+        .execute(&mut *conn)
+        .await?;
         Ok(())
     }
+}
+
+/// How long a started transition may go without finishing before another claim
+/// takes it over.
+///
+/// Only reached if the process died mid-transition: a live transition holds no
+/// lock and leaves no heartbeat, so its row is the only evidence it exists, and
+/// without a timeout a crash would stall the job permanently. Far longer than a
+/// transition takes (about 15 seconds on the dev database, about a minute on the
+/// largest measured one) so a slow one is never taken over
+/// while it is still working -- a duplicate is exactly what the row exists to
+/// prevent.
+const TRANSITION_TAKEOVER_AFTER: &str = "30 minutes";
+
+/// Serialize this job's claim decisions against each other.
+///
+/// Every read `next_step` makes -- which racks are below target, which are out
+/// with an open claim, whether any claim for the generation is still in flight
+/// -- is invisible to a *concurrent* claim transaction until that transaction
+/// commits. Two consequences:
+///
+/// - a claim still being issued is not counted as in flight, so the generation
+///   it belongs to could be closed while its task was going out, and the work
+///   that task did would land in a generation whose KLV was already built;
+/// - two claims could both find the generation complete and both start its
+///   transition.
+///
+/// The lock is taken per job, so claims for other jobs are unaffected, and it is
+/// transaction-scoped: it is released when the claim transaction commits or
+/// rolls back, whichever happens, and a dropped connection releases it too.
+/// It is *not* held across the transition itself -- that would hold a Postgres
+/// transaction open across an S3 upload -- so what stops a second transition is
+/// the `leave_generation_transitions` row this lock makes it safe to test and
+/// write.
+///
+/// It is [`super::lock_job_dispatch`], which every job type now takes for the
+/// same underlying reason; leave generation just has the most to lose by not
+/// holding it.
+pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<()> {
+    super::lock_job_dispatch(conn, job_id).await
 }
 
 /// What the scheduler should do next for a leave-generation job.
@@ -134,20 +206,61 @@ pub enum LeaveGenStep {
     /// the generation must be aggregated before any more work exists. Done
     /// outside the claim transaction because it uploads to S3.
     Transition { generation: i32 },
+    /// A transition for this generation is already running (or, past the
+    /// takeover timeout, was running when the process died and has just been
+    /// taken over by this caller). Distinct from `Transition` only in who is
+    /// responsible for it.
+    TransitionInProgress { generation: i32 },
     /// All configured generations are complete.
     Finished,
-    /// Racks remain below target but every one of them is already out with a
-    /// worker — nothing to hand out right now.
+    /// Every rack below target is already out with an open claim for this
+    /// generation (or every rack has reached target and claims are still in
+    /// flight). Their results may yet land, so the generation cannot be
+    /// closed, and handing the same racks out again would only duplicate
+    /// coverage. Nothing to hand out right now.
     NoWorkYet,
 }
 
-/// Claim-time rack selection: the racks furthest from this generation's target.
-pub async fn next_step(
+/// Whether `generation`'s transition is owned by a request that is still
+/// working on it.
+///
+/// Distinct from asking whether the generation has closed: between the claim
+/// that commits the `leave_generation_transitions` row and the transition's own
+/// commit, the artifact row does not exist yet, so `current_generation` still
+/// names the closing generation and nothing else marks it as off limits. That
+/// window is tens of seconds -- streaming millions of rows, deriving leave
+/// values, uploading the KLV -- and anything dispatched inside it plays racks
+/// whose totals the transition is in the middle of reading.
+///
+/// A row past the takeover timeout is deliberately *not* counted: that is a
+/// transition whose process died, and `next_step` exists to take it over. Using
+/// the same bound as the takeover keeps the two decisions from disagreeing,
+/// which would stall the job permanently.
+pub async fn transition_in_progress(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS (
+             SELECT 1 FROM leave_generation_transitions
+             WHERE job_id = $1 AND generation = $2 AND completed_at IS NULL
+               AND started_at >= now() - interval '{TRANSITION_TAKEOVER_AFTER}'
+         )"
+    ))
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// The generation claims are currently for: one past the last completed, or
+/// `None` once every configured generation is complete.
+pub async fn current_generation(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &LeaveConfig,
-    job_data: &JobData,
-) -> AppResult<LeaveGenStep> {
+) -> AppResult<Option<i32>> {
     // Generation 0 has an artifact too -- the zeroed KLV generation 1 plays
     // with -- so it must not count as a completed generation.
     let completed = sqlx::query_scalar::<_, i64>(
@@ -157,16 +270,36 @@ pub async fn next_step(
     .bind(job_id)
     .fetch_one(&mut *conn)
     .await?;
+    Ok((completed < config.generation_count as i64).then_some(completed as i32 + 1))
+}
 
-    if completed >= config.generation_count as i64 {
+/// Claim-time rack selection: the racks furthest from this generation's target
+/// that no open claim is already playing.
+pub async fn next_step(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    config: &LeaveConfig,
+    job_data: &JobData,
+) -> AppResult<LeaveGenStep> {
+    let Some(generation) = current_generation(&mut *conn, job_id, config).await? else {
         return Ok(LeaveGenStep::Finished);
-    }
-    let generation = completed as i32 + 1;
+    };
 
+    // Racks named by an open claim are skipped: two concurrent claims would
+    // otherwise both be handed the same lowest-count racks. The anti-join is
+    // over this job's open claims only, a few hundred racks each.
     let racks = sqlx::query_scalar::<_, String>(
-        "SELECT rack FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = $2 AND occurrence_count < $3
-         ORDER BY occurrence_count ASC, rack ASC
+        "WITH out_now AS (
+             SELECT DISTINCT unnest(r.forced_racks) AS rack
+             FROM task_claims c
+             JOIN tasks t ON t.id = c.task_id
+             JOIN leave_requests r ON r.task_id = c.task_id
+             WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'
+         )
+         SELECT p.rack FROM leave_rack_progress p
+         WHERE p.job_id = $1 AND p.generation = $2 AND p.occurrence_count < $3
+           AND NOT EXISTS (SELECT 1 FROM out_now o WHERE o.rack = p.rack)
+         ORDER BY p.occurrence_count ASC, p.rack ASC
          LIMIT $4",
     )
     .bind(job_id)
@@ -189,10 +322,50 @@ pub async fn next_step(
         .fetch_one(&mut *conn)
         .await?;
 
-        return Ok(if in_flight > 0 {
-            LeaveGenStep::NoWorkYet
-        } else {
-            LeaveGenStep::Transition { generation }
+        if in_flight > 0 {
+            return Ok(LeaveGenStep::NoWorkYet);
+        }
+
+        // The generation is complete. Whoever writes this row owns its
+        // transition; everyone else waits. Safe to test and write without
+        // re-reading because `lock_claim_decisions` holds the job's lock for
+        // the rest of this transaction, so no other claim is between its own
+        // test and its own write.
+        //
+        // A row whose transition never finished is taken over rather than
+        // trusted forever -- see TRANSITION_TAKEOVER_AFTER. Taking over bumps
+        // `attempts`, which is the only place a crash mid-transition is
+        // recorded.
+        let claimed = sqlx::query_scalar::<_, bool>(&format!(
+            "INSERT INTO leave_generation_transitions (job_id, generation)
+             VALUES ($1, $2)
+             ON CONFLICT (job_id, generation) DO UPDATE
+                 SET started_at = now(), attempts = leave_generation_transitions.attempts + 1
+                 WHERE leave_generation_transitions.completed_at IS NULL
+                   AND leave_generation_transitions.started_at
+                       < now() - interval '{TRANSITION_TAKEOVER_AFTER}'
+             RETURNING attempts > 1"
+        ))
+        .bind(job_id)
+        .bind(generation)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        return Ok(match claimed {
+            Some(taken_over) => {
+                if taken_over {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        generation,
+                        "restarting a generation transition that was started but never finished"
+                    );
+                }
+                LeaveGenStep::Transition { generation }
+            }
+            // Someone else owns it. `completed_at` set with no artifact row is
+            // not a state the transition writes -- both happen in one
+            // transaction -- so this is always a transition still in progress.
+            None => LeaveGenStep::TransitionInProgress { generation },
         });
     }
 
@@ -218,6 +391,7 @@ pub async fn next_step(
         lexicon: lexicon_name(&mut *conn, config.kwg_id).await?,
         variant: job_data.variant.clone(),
         letter_distribution: job_data.letterdist_name.clone(),
+        board_layout: job_data.layout_name.clone(),
         generation,
         forced_racks: racks,
         previous_artifact_key,
@@ -226,37 +400,86 @@ pub async fn next_step(
     }))
 }
 
-/// Write the rack universe for `generation` at zero occurrences. "Racks with no
-/// row yet count as 0" needs a known universe to draw from, and materializing it
-/// once per generation is what lets claim-time selection be a single indexed
-/// `ORDER BY occurrence_count` query.
+/// Write a generation's rack universe at zero occurrences: every full rack the
+/// distribution can draw (3,199,724 for English). "Racks with no row yet count
+/// as 0" needs a known universe to draw from, and materializing it is what lets
+/// claim-time selection be a single indexed `ORDER BY occurrence_count` query.
+///
+/// Generation 1's is written when the job is created; later generations get
+/// theirs from [`ensure_universe`] when the claim path first asks for work in
+/// them. Both go through here, so there is one implementation of what a
+/// generation's universe *is*, derived from the pinned letter distribution
+/// rather than from the previous generation's rows.
 pub async fn seed_generation(
     conn: &mut PgConnection,
     job_id: Uuid,
     generation: i32,
-    config: &LeaveConfig,
     distribution: &LetterDistribution,
 ) -> AppResult<i64> {
-    let leaves = distribution.enumerate_leaves(config.max_leave_size as usize);
-    tracing::info!(job_id = %job_id, generation, leaves = leaves.len(), "seeding leave rack universe");
+    let index = RackIndex::new(distribution, RACK_SIZE);
+    let total = index.total();
 
-    const CHUNK: usize = 1000;
-    for chunk in leaves.chunks(CHUNK) {
-        let mut builder = sqlx::QueryBuilder::new(
-            "INSERT INTO leave_rack_progress (job_id, generation, rack) ",
-        );
-        builder.push_values(chunk.iter(), |mut b, rack| {
-            b.push_bind(job_id).push_bind(generation).push_bind(rack.clone());
-        });
-        builder.push(" ON CONFLICT (job_id, generation, rack) DO NOTHING");
-        builder.build().execute(&mut *conn).await?;
+    // Idempotent: a universe already seeded (a retried creation, or a purge
+    // that kept it) is left as it is.
+    let seeded: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress WHERE job_id = $1 AND generation = $2)",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?;
+    if seeded {
+        return Ok(total as i64);
     }
-    Ok(leaves.len() as i64)
+    tracing::info!(job_id = %job_id, generation, racks = total, "seeding full-rack universe");
+
+    // COPY rather than INSERT: millions of rows, inside the request that
+    // creates the job, which a load balancer's idle timeout bounds. Racks are
+    // unranked in chunks so they are never all in memory together. Rack
+    // strings are letters and `?`, which need no escaping in COPY's text
+    // format.
+    const CHUNK: u64 = 50_000;
+    let mut copy = conn
+        .copy_in_raw("COPY leave_rack_progress (job_id, generation, rack) FROM STDIN")
+        .await?;
+    let mut start = 0;
+    while start < total {
+        let mut rows = String::with_capacity(CHUNK as usize * 48);
+        for rack in index.racks_in_enumeration_range(start, CHUNK) {
+            rows.push_str(&format!("{job_id}\t{generation}\t{rack}\n"));
+        }
+        copy.send(rows.into_bytes()).await?;
+        start += CHUNK;
+    }
+    copy.finish().await?;
+    Ok(total as i64)
 }
 
-/// Close out a generation: fold `leave_rack_progress` into per-rack mean
-/// equities, build the generation's KLV directly (see `klv.rs`), store the
-/// artifact, and seed the next generation's rack universe.
+/// Make sure `generation`'s rack universe exists, seeding it if it does not.
+///
+/// Generation 1's is written when the job is created; every later one is
+/// written here, the first time a claim asks for work in that generation, and
+/// not by the transition that closed the generation before it. That keeps the
+/// millions of rows off the transition's critical path -- a claim that arrives
+/// to find the universe missing pays for it once, while a transition that
+/// wrote it made every worker on the job wait, every time.
+///
+/// Idempotent and cheap when there is nothing to do: [`seed_generation`]
+/// returns on an `EXISTS` check, which is one index probe.
+pub async fn ensure_universe(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    distribution: &LetterDistribution,
+) -> AppResult<()> {
+    seed_generation(conn, job_id, generation, distribution).await?;
+    Ok(())
+}
+
+/// Close out a generation: derive leave values from `leave_rack_progress`'s
+/// full-rack means as MAGPIE does (see `klv::FullRackLeaves`), build the
+/// generation's KLV, store the artifact, and seed the next generation's rack
+/// universe.
 pub async fn run_transition(
     pool: &sqlx::PgPool,
     artifacts: &ArtifactStore,
@@ -269,17 +492,69 @@ pub async fn run_transition(
     // only meaningful if it folds the rows exactly as the original write did,
     // and two copies of this would be free to drift into producing different
     // bytes for the same generation.
-    let mean_by_rack = generation_means(pool, job_id, generation).await?;
-
-    let klv = super::klv::build(distribution, &mean_by_rack)?;
+    let klv = generation_klv(pool, job_id, generation, distribution).await?;
 
     // Hashed as written, not read back: the object store holds the only copy
     // of these bytes, and this is what a later rebuild is compared against.
     let sha256 = hex::encode(Sha256::digest(&klv));
     let key = format!("leaves/{job_id}/generation-{generation}.klv2");
     artifacts.put(&key, klv).await?;
+    close_generation(pool, job_id, generation, &key, &sha256, config).await?;
+    Ok(key)
+}
 
+/// The second half of [`run_transition`]: everything that has to happen in one
+/// transaction once the KLV is in the object store.
+///
+/// Separate so it can be exercised without an object store, and because the
+/// ownership check below is the only thing standing between a concurrent purge
+/// and a job that believes a generation it no longer has results for is closed.
+pub async fn close_generation(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    generation: i32,
+    key: &str,
+    sha256: &str,
+    config: &LeaveConfig,
+) -> AppResult<()> {
     let mut tx = pool.begin().await?;
+    // Claiming ownership back, and the one place this transition can find out
+    // it no longer has any. A purge deletes the transitions row along with the
+    // artifacts and progress rows and reseeds generation 1 -- all while a
+    // transition spawned before it may still be streaming. Writing the artifact
+    // anyway would hand the purged job a generation-1 KLV derived from results
+    // it no longer has, and copy a freshly zeroed universe into generation 2.
+    // The row this request committed when it took the transition is the
+    // evidence that the job is still the one it started on, so the close is
+    // conditional on it.
+    //
+    // The uploaded object is left behind in that case: it is keyed by job and
+    // generation, so a later transition of the same generation overwrites it,
+    // and nothing reads a key no `leave_generation_artifacts` row names
+    // (`/api/worker/artifact` checks).
+    let still_ours = sqlx::query(
+        "UPDATE leave_generation_transitions SET completed_at = now()
+         WHERE job_id = $1 AND generation = $2 AND completed_at IS NULL",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if !still_ours {
+        tx.rollback().await?;
+        return Err(AppError::internal(format!(
+            "leave job {job_id} generation {generation} was purged or closed by someone else \
+             while its transition ran; the KLV built for it was discarded"
+        )));
+    }
+
+    // In the same transaction as the close above: the pair is what "this
+    // generation is closed" means, and a claim that saw one without the other
+    // would either start a finished transition again or wait on a transition
+    // that is over.
+    //
     // DO NOTHING keeps the FIRST hash. A restore that replays this transition
     // against fewer results writes the same key with different bytes; keeping
     // the original hash is what makes that visible afterwards instead of
@@ -291,14 +566,12 @@ pub async fn run_transition(
     )
     .bind(job_id)
     .bind(generation)
-    .bind(&key)
-    .bind(&sha256)
+    .bind(key)
+    .bind(sha256)
     .execute(&mut *tx)
     .await?;
 
-    if generation < config.generation_count {
-        seed_generation(&mut tx, job_id, generation + 1, config, distribution).await?;
-    } else {
+    if generation >= config.generation_count {
         sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
             .bind(job_id)
             .execute(&mut *tx)
@@ -306,7 +579,15 @@ pub async fn run_transition(
     }
     tx.commit().await?;
 
-    Ok(key)
+    // The next generation's universe is NOT written here. It is seeded when
+    // that generation opens -- see `ensure_universe`, called from the claim
+    // path -- for two reasons. It is millions of rows (3.2 million for
+    // English), which inside this transaction made closing a generation a
+    // minute-long write that every worker on the job waited out, and which the
+    // transition then had to redo in full if anything failed, because the close
+    // and the copy stood or fell together. Seeded at the other end it happens
+    // while workers are busy, and a failure costs a retry of the seeding alone.
+    Ok(())
 }
 
 /// The lexicon name a leave job's bot plays with, from the row it pins.
@@ -411,12 +692,11 @@ pub async fn rebuild_artifacts(
         let artifact_key: String = row.get("artifact_key");
         let stored_sha256: String = row.get("sha256");
 
-        let mean_by_rack = if generation == 0 {
-            std::collections::HashMap::new()
+        let klv = if generation == 0 {
+            super::klv::build(distribution, &std::collections::HashMap::new())?
         } else {
-            generation_means(pool, job_id, generation).await?
+            generation_klv(pool, job_id, generation, distribution).await?
         };
-        let klv = super::klv::build(distribution, &mean_by_rack)?;
         let rebuilt_sha256 = hex::encode(Sha256::digest(&klv));
 
         let object_present = artifacts.exists(&artifact_key).await?;
@@ -441,31 +721,71 @@ pub async fn rebuild_artifacts(
     Ok(report)
 }
 
-/// Per-rack mean equity for one generation: the same fold `run_transition`
-/// performs, which is what makes a rebuild reproduce the original bytes.
-async fn generation_means(
+/// One generation's KLV from its full-rack results: the same derivation
+/// `run_transition` performs, which is what makes a rebuild reproduce the
+/// original bytes. Rows are streamed; a generation has millions of them.
+async fn generation_klv(
     pool: &sqlx::PgPool,
     job_id: Uuid,
     generation: i32,
-) -> AppResult<std::collections::HashMap<String, f64>> {
-    let rows = sqlx::query(
+    distribution: &LetterDistribution,
+) -> AppResult<Vec<u8>> {
+    use futures::TryStreamExt;
+
+    let owned = distribution.clone();
+    let mut leaves = tokio::task::spawn_blocking(move || FullRackLeaves::new(&owned))
+        .await
+        .map_err(|e| AppError::internal(format!("leave derivation panicked: {e}")))??;
+    let mut rows = sqlx::query(
         "SELECT rack, occurrence_count, equity_sum
          FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = $2 AND occurrence_count > 0
+         WHERE job_id = $1 AND generation = $2
          ORDER BY rack",
     )
     .bind(job_id)
     .bind(generation)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows
-        .iter()
-        .map(|row| {
-            let rack: String = row.get("rack");
+    .fetch(pool);
+    // The derivation is CPU-bound -- about 13 seconds for English in a
+    // release build -- so racks are folded on a blocking thread in chunks,
+    // never on the async executor, and never all held in memory at once.
+    const CHUNK: usize = 50_000;
+    let mut chunk: Vec<(String, f64)> = Vec::with_capacity(CHUNK);
+    loop {
+        let row = rows.try_next().await?;
+        if let Some(row) = &row {
             let count: i64 = row.get("occurrence_count");
             let equity_sum: f64 = row.get("equity_sum");
-            (rack, equity_sum / count as f64)
-        })
-        .collect())
+            // A rack that never occurred has mean 0 and still counts toward
+            // the average, as in MAGPIE's rack list.
+            let mean = if count > 0 { equity_sum / count as f64 } else { 0.0 };
+            chunk.push((row.get("rack"), mean));
+        }
+        if chunk.len() == CHUNK || (row.is_none() && !chunk.is_empty()) {
+            let batch = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK));
+            leaves = tokio::task::spawn_blocking(move || -> AppResult<FullRackLeaves> {
+                for (rack, mean) in &batch {
+                    leaves.add_rack(rack, *mean)?;
+                }
+                Ok(leaves)
+            })
+            .await
+            .map_err(|e| AppError::internal(format!("leave derivation panicked: {e}")))??;
+        }
+        if row.is_none() {
+            break;
+        }
+    }
+    drop(rows);
+
+    let expected = RackIndex::new(distribution, RACK_SIZE).total();
+    if leaves.racks_added() != expected {
+        return Err(AppError::internal(format!(
+            "leave job {job_id} generation {generation} has {} progress rows, but the \
+             distribution draws {expected} full racks",
+            leaves.racks_added()
+        )));
+    }
+    tokio::task::spawn_blocking(move || leaves.build())
+        .await
+        .map_err(|e| AppError::internal(format!("KLV build panicked: {e}")))
 }

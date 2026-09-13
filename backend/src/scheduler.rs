@@ -64,11 +64,15 @@ pub struct ShutdownDirective {
 /// Active jobs in the top priority tier, ordered by how far behind their
 /// allocation share they are.
 ///
-/// `tasks_dispatched` counts every claim ever issued, abandoned ones included:
-/// a claim consumed dispatch capacity the moment it was inserted, so the count
-/// only ever goes up. Filtering out abandoned claims would let a job with flaky
-/// workers quietly accumulate more than its share and would make the deficit
-/// non-monotonic, which is the opposite of what this scheduler needs.
+/// The deficit is `jobs.claims_issued / allocation`. That counter counts every
+/// claim ever issued, abandoned and declined ones included: a claim consumed
+/// dispatch capacity the moment it was inserted, so the count only ever goes up.
+/// Filtering out abandoned claims would let a job with flaky workers quietly
+/// accumulate more than its share and would make the deficit non-monotonic,
+/// which is the opposite of what this scheduler needs. It is a counter rather
+/// than a `COUNT(*)` over `task_claims` because this query runs on every claim
+/// request, and a count grows with the whole history of every candidate job.
+///
 /// Both capability filters live in the `eligible_jobs` CTE and the priority is
 /// computed over its output, so "filter before MIN(priority)" is structural
 /// rather than remembered. Applying either filter afterwards would pick the top
@@ -88,10 +92,7 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
          FROM eligible_jobs e
          WHERE e.priority = (SELECT MIN(priority) FROM eligible_jobs)
          ORDER BY
-           (SELECT COUNT(*) FROM task_claims tc
-            JOIN tasks t ON t.id = tc.task_id
-            WHERE t.job_id = e.id)::float
-           / NULLIF(e.allocation, 0) ASC,
+           e.claims_issued::float / NULLIF(e.allocation, 0) ASC NULLS LAST,
            e.created_at ASC",
     )
     .bind(caps.magpie_version.major)
@@ -113,20 +114,25 @@ async fn shutdown_or_idle(
     state: &AppState,
     caps: &WorkerCapabilities,
 ) -> AppResult<ClaimOutcome> {
+    // An axis counts as blocking only for *active* jobs it actually rules out.
+    // The unsupported set is client-supplied and may name jobs that have since
+    // completed or been deactivated; its mere non-emptiness says nothing about
+    // why the active jobs are out of reach.
     let row = sqlx::query(
         "SELECT COUNT(*) AS total,
                 COUNT(*) FILTER (
                     WHERE (min_magpie_major, min_magpie_minor, min_magpie_patch) > ($1, $2, $3)
                 ) AS too_new,
-                MIN(format('%s.%s.%s', min_magpie_major, min_magpie_minor, min_magpie_patch))
-                    FILTER (
-                        WHERE (min_magpie_major, min_magpie_minor, min_magpie_patch) > ($1, $2, $3)
-                    ) AS lowest_floor
+                COUNT(*) FILTER (
+                    WHERE (min_magpie_major, min_magpie_minor, min_magpie_patch) <= ($1, $2, $3)
+                      AND id = ANY($4)
+                ) AS data_blocked
          FROM jobs WHERE status = 'active'",
     )
     .bind(caps.magpie_version.major)
     .bind(caps.magpie_version.minor)
     .bind(caps.magpie_version.patch)
+    .bind(&caps.unsupported_jobs)
     .fetch_one(&state.pool)
     .await?;
 
@@ -134,22 +140,40 @@ async fn shutdown_or_idle(
     if total == 0 {
         return Ok(ClaimOutcome::NoWorkExists);
     }
-    let too_new: i64 = row.get("too_new");
-    let version_blocked = too_new > 0;
-    let data_blocked = !caps.unsupported_jobs.is_empty();
+    let version_blocked = row.get::<i64, _>("too_new") > 0;
+    let data_blocked = row.get::<i64, _>("data_blocked") > 0;
     if !version_blocked && !data_blocked {
         // Active jobs exist and nothing rules them out; they simply had no
         // task to hand out this instant.
         return Ok(ClaimOutcome::Idle);
     }
 
-    let required_magpie_version: Option<String> = row.get("lowest_floor");
+    // The smallest upgrade that would unblock anything, ordered numerically:
+    // a MIN over the formatted text would put "0.10.0" before "0.9.0".
+    let required_magpie_version: Option<String> = if version_blocked {
+        sqlx::query_scalar::<_, String>(
+            "SELECT format('%s.%s.%s', min_magpie_major, min_magpie_minor, min_magpie_patch)
+             FROM jobs
+             WHERE status = 'active'
+               AND (min_magpie_major, min_magpie_minor, min_magpie_patch) > ($1, $2, $3)
+             ORDER BY min_magpie_major, min_magpie_minor, min_magpie_patch
+             LIMIT 1",
+        )
+        .bind(caps.magpie_version.major)
+        .bind(caps.magpie_version.minor)
+        .bind(caps.magpie_version.patch)
+        .fetch_optional(&state.pool)
+        .await?
+    } else {
+        None
+    };
+
     let tarball_dates = if data_blocked {
         sqlx::query_scalar::<_, String>(
             "SELECT DISTINCT d.tarball_date
              FROM jobs j
              JOIN input_data d ON d.id IN (j.letterdist_id, j.layout_id)
-             WHERE j.id = ANY($1)
+             WHERE j.id = ANY($1) AND j.status = 'active'
              ORDER BY d.tarball_date DESC",
         )
         .bind(&caps.unsupported_jobs)
@@ -189,13 +213,19 @@ async fn shutdown_or_idle(
         message,
         required_tarball_dates: tarball_dates,
         download_url: version_blocked.then(|| state.cfg.magpie_download_url.clone()),
-        required_magpie_version: version_blocked.then_some(required_magpie_version).flatten(),
+        required_magpie_version,
     }))
 }
 
 /// Lazy timeout reclamation, run at claim time rather than by a background
 /// process. Each timed-out claim flips to `abandoned`, the task's
 /// `active_claim_count` drops, and a task that was at capacity reopens.
+///
+/// Safe against a submission for the same claim racing it: the submit path
+/// holds the claim row locked from its lookup to its commit, and this
+/// statement re-checks `state = 'claimed'` after waiting on that lock, so a
+/// claim is either abandoned here or completed there -- never both, which is
+/// what would decrement the task's counter twice.
 pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> AppResult<u64> {
     let result = sqlx::query(
         "WITH expired AS (
@@ -214,32 +244,24 @@ pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> 
          UPDATE tasks t
          SET active_claim_count = GREATEST(t.active_claim_count - counts.n, 0),
              state = CASE
-                 WHEN t.accepted_count >= $3 THEN 'completed'::task_state
-                 WHEN t.accepted_count + GREATEST(t.active_claim_count - counts.n, 0) >= $3
+                 WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
+                 WHEN t.accepted_count + GREATEST(t.active_claim_count - counts.n, 0) >= j.redundancy
                      THEN 'claimed'::task_state
                  ELSE 'available'::task_state
              END
-         FROM counts
-         WHERE t.id = counts.task_id",
+         FROM counts, jobs j
+         WHERE t.id = counts.task_id AND j.id = t.job_id",
     )
     .bind(job_id)
     .bind(timeout_secs)
-    .bind(job_redundancy(pool, job_id).await?)
     .execute(pool)
     .await?;
 
     Ok(result.rows_affected())
 }
 
-async fn job_redundancy(pool: &PgPool, job_id: Uuid) -> AppResult<i32> {
-    Ok(sqlx::query_scalar::<_, i32>("SELECT redundancy FROM jobs WHERE id = $1")
-        .bind(job_id)
-        .fetch_one(pool)
-        .await?)
-}
-
 /// Walk the priority tier in deficit order and hand out the first available unit
-/// of work. Returns `None` when no active job has anything to dispatch.
+/// of work.
 pub async fn claim(
     state: &AppState,
     identity: &WorkerIdentity,
@@ -274,7 +296,16 @@ pub async fn claim(
 
         let mut retry_outer = false;
         for job in &jobs {
-            reclaim_expired(&state.pool, job.id, timeout_secs).await?;
+            // One job that cannot dispatch -- a leave-generation job whose
+            // generation-0 artifact never got written, a config row a bad
+            // restore left out -- must not take every other job down with it.
+            // Failing the whole claim here would answer every worker with a
+            // 500 for as long as that job sits at the top of the tier, and
+            // every client retries 500s. It is logged loudly and skipped.
+            if let Err(err) = reclaim_expired(&state.pool, job.id, timeout_secs).await {
+                tracing::error!(job_id = %job.id, error = %err.message, "reclaiming expired claims failed; skipping job");
+                continue;
+            }
 
             match try_claim_from_job(state, identity, job, caps).await {
                 Ok(Some(outcome)) => return Ok(ClaimOutcome::Task(Box::new(outcome))),
@@ -283,7 +314,10 @@ pub async fn claim(
                     retry_outer = true;
                     break;
                 }
-                Err(JobClaimError::Fatal(err)) => return Err(err),
+                Err(JobClaimError::Fatal(err)) => {
+                    tracing::error!(job_id = %job.id, error = %err.message, "claiming from job failed; skipping job");
+                    continue;
+                }
             }
         }
 
@@ -310,11 +344,11 @@ async fn try_claim_from_job(
 ) -> Result<Option<TaskClaim>, JobClaimError> {
     let mut tx = state.pool.begin().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
 
-    let acquired = match registry::acquire(&mut tx, job).await {
+    let acquired = match registry::acquire(&mut tx, job, identity).await {
         Ok(acquired) => acquired,
         Err(err) => {
             let _ = tx.rollback().await;
-            return Err(if is_unique_violation(&err) {
+            return Err(if err.is_unique_violation() {
                 JobClaimError::Retry
             } else {
                 JobClaimError::Fatal(err)
@@ -329,7 +363,9 @@ async fn try_claim_from_job(
         }
         Acquired::JobFinished => {
             let _ = tx.rollback().await;
-            sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+            // Guarded on `active`: an admin may have deactivated the job
+            // between selection and here, and that decision stands.
+            sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
                 .bind(job.id)
                 .execute(&state.pool)
                 .await
@@ -337,86 +373,133 @@ async fn try_claim_from_job(
             Ok(None)
         }
         Acquired::NeedsGenerationTransition { generation } => {
-            // Uploads to S3 and shells out to MAGPIE, so it must not hold the
-            // claim transaction open.
-            let _ = tx.rollback().await;
-            run_leave_generation_transition(state, job, generation)
-                .await
-                .map_err(JobClaimError::Fatal)?;
+            // Committed, not rolled back, and this is load-bearing: the only
+            // thing this transaction wrote is the
+            // `leave_generation_transitions` row saying this request owns the
+            // transition, and a rollback would throw that away -- leaving every
+            // claim that arrives while the transition runs free to start
+            // another one. Committing also releases the
+            // job's advisory lock, which the transition must not hold: it
+            // builds a multi-megabyte KLV and uploads it to the object store,
+            // and no claim transaction may stay open across that.
+            tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+            // On its own task, awaited: a transition takes tens of seconds, and
+            // if the worker or a load balancer gives up on this request the
+            // handler future is dropped. Run inline, that would abandon the
+            // transition part-way every time, and a generation whose
+            // transition outlasts the timeout would never close.
+            let (state, job) = (state.clone(), job.clone());
+            tokio::spawn(async move {
+                run_leave_generation_transition(&state, &job, generation).await
+            })
+            .await
+            .map_err(|e| {
+                JobClaimError::Fatal(crate::error::AppError::internal(format!(
+                    "leave generation transition panicked: {e}"
+                )))
+            })?
+            .map_err(JobClaimError::Fatal)?;
             Err(JobClaimError::Retry)
         }
         Acquired::Task { task_id, request } => {
-            let claim_token = Uuid::new_v4();
-            let insert = sqlx::query(
-                "INSERT INTO task_claims
-                     (task_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
-                      magpie_version)
-                 VALUES ($1, $2, $3, $4, $5)",
-            )
-            .bind(task_id)
-            .bind(claim_token)
-            .bind(identity.user_id())
-            .bind(identity.anon_uuid())
-            .bind(caps.magpie_version.to_string())
-            .execute(&mut *tx)
-            .await;
-
-            if let Err(err) = insert {
-                let _ = tx.rollback().await;
-                let err: AppError = err.into();
-                // The per-identity partial unique index rejects a second slot on
-                // the same task. That is not a failure — this worker already
-                // holds a slot here, so re-run selection and land somewhere else.
-                return if is_unique_violation(&err) {
-                    Err(JobClaimError::Retry)
-                } else {
-                    Err(JobClaimError::Fatal(err))
-                };
+            match issue_claim(&mut tx, identity, job, caps, task_id).await {
+                Ok(claim_token) => {
+                    let expected = expected_data(&mut tx, job)
+                        .await
+                        .map_err(JobClaimError::Fatal)?;
+                    tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+                    Ok(Some(TaskClaim {
+                        job_id: job.id,
+                        claim_token,
+                        request,
+                        min_magpie_version: job.min_magpie_version().to_string(),
+                        expected_data: expected,
+                    }))
+                }
+                Err(err) => {
+                    let _ = tx.rollback().await;
+                    // The per-identity partial unique index rejects a second
+                    // slot on the same task. That is not a failure -- this
+                    // worker already holds a slot there -- so re-run selection.
+                    Err(if err.is_unique_violation() {
+                        JobClaimError::Retry
+                    } else {
+                        JobClaimError::Fatal(err)
+                    })
+                }
             }
-
-            sqlx::query(
-                "UPDATE tasks t
-                 SET active_claim_count = t.active_claim_count + 1,
-                     state = CASE
-                         WHEN t.accepted_count + t.active_claim_count + 1 >= j.redundancy
-                             THEN 'claimed'::task_state
-                         ELSE 'available'::task_state
-                     END
-                 FROM jobs j
-                 WHERE t.id = $1 AND j.id = t.job_id",
-            )
-            .bind(task_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| JobClaimError::Fatal(e.into()))?;
-
-            crate::audit::log(
-                &mut tx,
-                "task.claimed",
-                identity.user_id(),
-                identity.anon_uuid(),
-                Some("task"),
-                Some(task_id.to_string()),
-                Some(job.id),
-            )
-            .await
-            .map_err(JobClaimError::Fatal)?;
-
-            let expected = expected_data(&mut tx, job)
-                .await
-                .map_err(JobClaimError::Fatal)?;
-
-            tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
-
-            Ok(Some(TaskClaim {
-                job_id: job.id,
-                claim_token,
-                request,
-                min_magpie_version: job.min_magpie_version().to_string(),
-                expected_data: expected,
-            }))
         }
     }
+}
+
+/// Everything a claim writes, inside the claim transaction.
+async fn issue_claim(
+    tx: &mut sqlx::PgTransaction<'_>,
+    identity: &WorkerIdentity,
+    job: &Job,
+    caps: &WorkerCapabilities,
+    task_id: Uuid,
+) -> AppResult<Uuid> {
+    // A worker that arrived with no identity becomes a real one only now,
+    // when there is a task to attach it to and a response body to return its
+    // UUID in.
+    if let Some(uuid) = identity.newly_assigned_uuid() {
+        sqlx::query("INSERT INTO anonymous_workers (uuid) VALUES ($1) ON CONFLICT DO NOTHING")
+            .bind(uuid)
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    let claim_token = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO task_claims
+             (task_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
+              magpie_version)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(task_id)
+    .bind(claim_token)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
+    .bind(caps.magpie_version.to_string())
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE tasks t
+         SET active_claim_count = t.active_claim_count + 1,
+             state = CASE
+                 WHEN t.accepted_count + t.active_claim_count + 1 >= j.redundancy
+                     THEN 'claimed'::task_state
+                 ELSE 'available'::task_state
+             END
+         FROM jobs j
+         WHERE t.id = $1 AND j.id = t.job_id",
+    )
+    .bind(task_id)
+    .execute(&mut **tx)
+    .await?;
+
+    crate::audit::log(
+        tx,
+        "task.claimed",
+        identity.user_id(),
+        identity.anon_uuid(),
+        Some("task"),
+        Some(task_id.to_string()),
+        Some(job.id),
+    )
+    .await?;
+
+    // Last, because it locks the job row: claims against the same job
+    // serialize on it until commit, so it should be held for as little of the
+    // transaction as possible.
+    sqlx::query("UPDATE jobs SET claims_issued = claims_issued + 1 WHERE id = $1")
+        .bind(job.id)
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(claim_token)
 }
 
 /// Release a claim that ended in something other than a submission.
@@ -426,16 +509,26 @@ async fn try_claim_from_job(
 /// writing it twice is how the counter drifts. A drifting counter makes the
 /// scheduler believe a job is saturated and dispatch quietly stops, days later
 /// and nowhere near the cause.
+///
+/// Acts only on a claim that is still `claimed`, and returns whether it did:
+/// releasing a claim twice would decrement the counter twice.
 pub async fn release_claim(
     tx: &mut sqlx::PgTransaction<'_>,
     claim_id: Uuid,
     terminal_state: &str,
-) -> AppResult<()> {
-    sqlx::query("UPDATE task_claims SET state = $2::claim_state WHERE id = $1")
-        .bind(claim_id)
-        .bind(terminal_state)
-        .execute(&mut **tx)
-        .await?;
+) -> AppResult<bool> {
+    let released = sqlx::query(
+        "UPDATE task_claims SET state = $2::claim_state WHERE id = $1 AND state = 'claimed'",
+    )
+    .bind(claim_id)
+    .bind(terminal_state)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if !released {
+        return Ok(false);
+    }
 
     sqlx::query(
         "UPDATE tasks t
@@ -453,7 +546,7 @@ pub async fn release_claim(
     .execute(&mut **tx)
     .await?;
 
-    Ok(())
+    Ok(true)
 }
 
 async fn run_leave_generation_transition(
@@ -473,7 +566,15 @@ async fn run_leave_generation_transition(
     let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
     drop(conn);
 
-    let key = leave_gen::run_transition(
+    // This request owns the transition: `next_step` wrote the
+    // `leave_generation_transitions` row that stops any other claim starting the
+    // same one. If it fails, ownership has to go back, or the generation would
+    // sit untouched until the takeover timeout expired -- a transient object
+    // store error would cost half an hour of idle workers. Backdating
+    // `started_at` hands it to the next claim through the same takeover path,
+    // which keeps the attempt count and says in the log that a transition was
+    // started and did not finish.
+    let result = leave_gen::run_transition(
         &state.pool,
         &state.artifacts,
         job.id,
@@ -481,11 +582,31 @@ async fn run_leave_generation_transition(
         &config,
         &job_data.letterdist,
     )
-    .await?;
+    .await;
+
+    let key = match result {
+        Ok(key) => key,
+        Err(err) => {
+            // The original failure is what the caller needs to see, so a
+            // failure to hand ownership back is logged rather than returned in
+            // its place; the takeover timeout still covers it.
+            if let Err(release) = sqlx::query(
+                "UPDATE leave_generation_transitions SET started_at = to_timestamp(0)
+                 WHERE job_id = $1 AND generation = $2 AND completed_at IS NULL",
+            )
+            .bind(job.id)
+            .bind(generation)
+            .execute(&state.pool)
+            .await
+            {
+                tracing::error!(
+                    job_id = %job.id, generation, error = %release,
+                    "could not release a failed generation transition"
+                );
+            }
+            return Err(err);
+        }
+    };
     tracing::info!(job_id = %job.id, generation, artifact_key = %key, "leave generation complete");
     Ok(())
-}
-
-fn is_unique_violation(err: &AppError) -> bool {
-    err.message.contains("duplicate key value violates unique constraint")
 }

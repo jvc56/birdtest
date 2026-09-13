@@ -256,6 +256,7 @@ def player_config(client: Client, name: str, sort_strategy: str, data: dict) -> 
                 "sort_strategy": sort_strategy,
                 "kwg_id": data["kwg"],
                 "klv_id": data["klv"],
+                "num_plays_recorded": 10,
             },
         ),
         f"create player config {name}",
@@ -278,8 +279,8 @@ def job_config(job_type: str, players: list, args) -> dict:
                 "max_pairs": args.max_units}
     if job_type == "leave_generation":
         raise SeedError(
-            "leave_generation enumerates its whole leave universe at creation time — "
-            "914,624 rows for real English — which is not something to do by default. "
+            "leave_generation enumerates every full rack at creation time — "
+            "3,199,724 rows per generation for real English — which is not something to do by default. "
             "Create one from /admin/jobs/new when you actually want it."
         )
     raise SeedError(f"unknown job type {job_type!r}")
@@ -315,9 +316,9 @@ def create_job(client: Client, args, data: dict, players: list) -> str:
         **job_config(args.job_type, players, args),
     }
     # A job records its own floor at creation, defaulting to the server-wide
-    # one. Left implicit, a job created while the server still had the shipped
-    # 0.0.1 default keeps rejecting an unreleased local build for ever, even
-    # after the server floor is lowered -- so dev passes it explicitly.
+    # one. Left implicit, a job created while the server had a higher floor
+    # keeps rejecting an older local build for ever, even after the server
+    # floor is lowered -- so dev passes it explicitly.
     if args.min_magpie_version:
         body["min_magpie_version"] = args.min_magpie_version
     created = client.json(client.post("/api/admin/jobs", body), "create job")
