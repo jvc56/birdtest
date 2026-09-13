@@ -1,6 +1,6 @@
 //! Leave generation against a real database: the full-rack universe, forced
 //! racks that are full racks, submissions folding into it, and claim-time
-//! selection skipping racks already out (AUDIT_FINDINGS.md F1, F10).
+//! selection skipping racks already out.
 
 mod common;
 
@@ -87,7 +87,7 @@ async fn the_universe_and_the_forced_racks_are_full_racks() {
     assert!(racks.iter().all(|r| r.chars().count() == 7), "{racks:?}");
 }
 
-/// F10: two workers claiming at once were both handed the same lowest-count
+/// Bug: two workers claiming at once were both handed the same lowest-count
 /// racks.
 #[tokio::test]
 async fn racks_out_with_an_open_claim_are_not_handed_out_again() {
@@ -180,4 +180,305 @@ async fn a_leave_result_of_partial_racks_is_rejected() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// Bug: a leave task whose claim timed out went back to `available`, and every
+/// claim re-dispatched available tasks before reaching the leave-generation
+/// path -- so before the job's claim lock was taken, and whatever generation the
+/// task belonged to. A task from a generation that had since closed was handed
+/// out again: the worker played a finished generation with an outdated KLV,
+/// and the result could only be discarded. A reopened task is now reissued only
+/// while its own generation is the current one, and under the lock.
+#[tokio::test]
+async fn a_reclaimed_task_is_reissued_only_while_its_generation_is_open() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let expire_all = || async {
+        sqlx::query("UPDATE task_claims SET claimed_at = now() - interval '1 hour'")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        birdtest::scheduler::reclaim_expired(&db.pool, job, 300.0).await.unwrap()
+    };
+
+    let (status, first) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(expire_all().await, 1);
+
+    // While generation 1 is open, the reopened task is what the next worker
+    // gets: the same racks, not a fresh task beside it.
+    let (status, again) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(forced_racks(&again), forced_racks(&first));
+    assert_eq!(expire_all().await, 1);
+
+    // Generation 1 closes, and generation 2's universe exists.
+    sqlx::query(
+        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
+         VALUES ($1, 1, 'leaves/test/generation-1.klv2', repeat('1', 64))",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO leave_rack_progress (job_id, generation, rack)
+         SELECT job_id, 2, rack FROM leave_rack_progress WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let (status, next) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{next}");
+    assert_eq!(
+        next["task_request"]["generation"],
+        json!(2),
+        "a closed generation's task must not be handed out again: {next}"
+    );
+}
+
+/// The generation whose KLV is already built must not take more results.
+///
+/// The claim flow no longer produces this state (a generation closes only with
+/// nothing in flight, and closed generations' tasks are not reissued), so the
+/// test forces it by hand, as a partial restore could. The submission is
+/// accepted -- the worker did the work, and failing it would only make it
+/// retry -- but folding it in would leave the rows disagreeing with the
+/// artifact built from them, which is the signal reserved for a corrupted
+/// object.
+#[tokio::test]
+async fn a_result_for_a_closed_generation_is_credited_but_not_folded() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (_, body) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    let uuid = body["worker_uuid"].as_str().unwrap().to_string();
+    let token = body["claim_token"].as_str().unwrap().to_string();
+    let racks = forced_racks(&body);
+
+    // Generation 1 closes while the task is out, as a transition started just
+    // before the claim committed would have closed it.
+    sqlx::query(
+        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
+         VALUES ($1, 1, 'leaves/test/generation-1.klv2', repeat('1', 64))",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": token, "result": { "racks": [
+                { "rack": racks[0], "count": 3, "mean": 10.0 }
+            ]}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], json!(true), "the worker is not told to retry");
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT occurrence_count FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = 1 AND rack = $2",
+    )
+    .bind(job)
+    .bind(&racks[0])
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 0, "a closed generation's totals are frozen");
+
+    let credited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id
+         WHERE t.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(credited, 1, "the claim is still recorded as completed work");
+}
+
+/// One transition per generation, however many claims find it complete.
+///
+/// The transition runs outside the claim transaction, so without the marker row
+/// every claim arriving during it would start another one -- each streaming
+/// every rack of the generation and uploading a KLV.
+#[tokio::test]
+async fn only_one_claim_starts_a_generations_transition() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+
+    // Every rack at target and nothing in flight: the generation is complete.
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = 1000
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::Transition), "{step:?}");
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::InProgress), "a second claim waits instead: {step:?}");
+
+    let (attempts, completed): (i32, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT attempts, completed_at FROM leave_generation_transitions
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((attempts, completed), (1, None));
+}
+
+/// A transition the process died in the middle of is taken over, or the job
+/// would wait on a transition nobody is running.
+#[tokio::test]
+async fn a_transition_that_never_finished_is_taken_over() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = 1000
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(next_step(&db, job).await, Step::Transition));
+    sqlx::query(
+        "UPDATE leave_generation_transitions SET started_at = now() - interval '2 hours'
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::Transition), "past the takeover timeout: {step:?}");
+    let attempts: i32 = sqlx::query_scalar(
+        "SELECT attempts FROM leave_generation_transitions WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2, "a takeover is recorded rather than silent");
+
+    // A finished transition is never restarted, timeout or not.
+    sqlx::query(
+        "UPDATE leave_generation_transitions
+         SET completed_at = now(), started_at = now() - interval '2 hours'
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::InProgress), "{step:?}");
+}
+
+/// What `next_step` decided, without the request payloads.
+#[derive(Debug)]
+enum Step {
+    Transition,
+    InProgress,
+    Other,
+}
+
+/// One claim decision for a leave job, through the same path a worker's request
+/// takes: the job's advisory lock, then `next_step`, in one transaction.
+async fn next_step(db: &TestDb, job: Uuid) -> Step {
+    use birdtest::jobs::leave_gen::{self, LeaveGenStep};
+    let mut tx = db.pool.begin().await.unwrap();
+    let job_row = sqlx::query_as::<_, birdtest::models::job::Job>("SELECT * FROM jobs WHERE id = $1")
+        .bind(job)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    let config = sqlx::query_as::<_, birdtest::models::job::LeaveConfig>(
+        "SELECT * FROM job_leave_config WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let job_data = birdtest::jobs::load_job_data(&mut tx, job_row.id).await.unwrap();
+    leave_gen::lock_claim_decisions(&mut tx, job).await.unwrap();
+    let step = leave_gen::next_step(&mut tx, job, &config, &job_data).await.unwrap();
+    let step = match step {
+        LeaveGenStep::Transition { .. } => Step::Transition,
+        LeaveGenStep::TransitionInProgress { .. } => Step::InProgress,
+        _ => Step::Other,
+    };
+    tx.commit().await.unwrap();
+    step
+}
+
+/// The marker row that says who owns a transition has to *commit*, or it
+/// stops nobody.
+///
+/// The claim transaction that decides a generation is complete writes nothing
+/// else, and the transition runs after it ends -- so rolling it back, as the
+/// path once did, would leave every claim arriving during the transition free
+/// to start another one. Driven through the HTTP claim to exercise the real
+/// commit: the transition itself then fails here (the test config points the
+/// object store at a closed port), which also exercises the failure path handing
+/// ownership straight back rather than waiting out the takeover timeout.
+#[tokio::test]
+async fn the_transition_owner_is_committed_before_the_transition_runs() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = 1000
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // 204: the upload cannot succeed against a closed port, and a job that
+    // cannot dispatch is logged and skipped rather than failing the claim.
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let row: Option<(i32, Option<chrono::DateTime<chrono::Utc>>, bool)> = sqlx::query_as(
+        "SELECT attempts, completed_at, started_at <= to_timestamp(0)
+         FROM leave_generation_transitions WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_optional(&db.pool)
+    .await
+    .unwrap();
+    let (attempts, completed_at, released) = row.expect("the owner row survives the claim");
+    assert_eq!((attempts, completed_at), (1, None));
+    assert!(released, "a failed transition hands ownership back immediately");
+
+    // And the next claim decision picks it up rather than waiting out the
+    // takeover timeout.
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::Transition), "{step:?}");
 }

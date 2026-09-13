@@ -44,6 +44,12 @@ pub struct Job {
     /// Every claim ever issued for this job; the scheduler's deficit
     /// numerator. See `scheduler::candidate_jobs`.
     pub claims_issued: i64,
+    /// Games recorded by the first accepted result of each task; the dashboard's
+    /// progress numerator, maintained in the submit transaction rather than
+    /// summed on read. A pairs job's unit count is half of it.
+    pub games_completed: i64,
+    /// Distinct opening racks with an accepted analysis, on the same terms.
+    pub racks_analyzed: i64,
     pub created_at: DateTime<Utc>,
     pub activated_at: Option<DateTime<Utc>>,
     pub deactivated_at: Option<DateTime<Utc>>,

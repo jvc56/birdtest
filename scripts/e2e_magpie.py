@@ -7,9 +7,9 @@ MAGPIE submits are accepted and stored the way the server reads them back:
 - `games` and `game_pairs`: games counted, a pentanomial for pairs.
 - `opening_rack`, static: a best move per rack.
 - `opening_rack`, simming: the simulated statistics (win%, per-ply stats) are
-  stored, not just move, score and equity (AUDIT_FINDINGS.md F6).
+  stored, not just move, score and equity.
 - `leave_generation`: full-rack occurrences fold into the generation's
-  progress (F1), and nothing is written into MAGPIE's data directory (F9).
+  progress, and nothing is written into MAGPIE's data directory.
 
 Expects the compose stack (`postgres`, `minio`, `backend`) to be up, with
 MAIL_BACKEND=console, and a built MAGPIE whose `data/` is a real

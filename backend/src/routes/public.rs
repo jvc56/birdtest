@@ -69,14 +69,13 @@ async fn list_jobs(
                 (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id) AS tasks_total,
                 (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id AND t.state = 'completed')
                     AS tasks_completed,
-                -- One result per task, as everywhere games are counted: with
-                -- redundancy > 1 the other rows replay the same games.
-                (SELECT COALESCE(SUM(g.games), 0)::bigint FROM (
-                     SELECT DISTINCT ON (r.task_id) r.games
-                     FROM game_results r JOIN tasks t ON t.id = r.task_id
-                     WHERE t.job_id = j.id
-                     ORDER BY r.task_id, r.submitted_at, r.task_claim_id
-                 ) g) AS game_rows,
+                -- The running total the submit path maintains, one result per
+                -- task, rather than the aggregate over every result row this
+                -- used to compute: it grew with the job's whole history, for
+                -- every job on the page, on every page view -- see PLAN.md on
+                -- what these reads cost. The dashboard's own counts still come
+                -- from the rows.
+                j.games_completed AS game_rows,
                 gc.max_games, pc.max_pairs,
                 -- Stalled: at least one decline and no submission in the last
                 -- 24 hours, with nothing currently claimed. Long enough not to

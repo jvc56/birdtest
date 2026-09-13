@@ -1,4 +1,5 @@
-//! Sessions against a real database (AUDIT_FINDINGS.md F11).
+//! Sessions against a real database: revocation through
+//! `users.session_generation`.
 
 mod common;
 
@@ -6,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::*;
 
-/// F11: sessions were stateless and outlived a password reset for up to their
+/// Bug: sessions were stateless and outlived a password reset for up to their
 /// full TTL. Every token now carries the account's session generation.
 #[tokio::test]
 async fn bumping_the_session_generation_revokes_earlier_sessions() {
@@ -57,7 +58,7 @@ async fn signing_out_everywhere_revokes_the_callers_own_session_too() {
     assert_eq!(status, StatusCode::OK);
 }
 
-/// F7: `num_plays_recorded` was optional, and "unset" meant 10 moves to MAGPIE
+/// Bug: `num_plays_recorded` was optional, and "unset" meant 10 moves to MAGPIE
 /// but "everything" to the server. It is now required and at least 1.
 #[tokio::test]
 async fn a_player_config_must_say_how_many_plays_to_report() {

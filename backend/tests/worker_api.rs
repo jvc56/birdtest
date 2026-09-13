@@ -189,6 +189,129 @@ async fn redundant_results_for_one_task_count_once() {
     let games = birdtest::jobstats::game_stats(&db.pool, &job_row).await.unwrap().unwrap();
     assert_eq!(games.units_completed, 2, "two games were played, not four");
     assert_eq!(games.wins, 2);
+
+    // The job list reads a running total instead of re-deriving this on
+    // every page view, and it has to answer 2 for the same reason.
+    assert_eq!(job_row.games_completed, 2, "the running total counts one result per task");
+    let (_, list) = send(&app, get_request("/api/jobs", &[])).await;
+    assert_eq!(list["items"][0]["units_completed"], json!(2));
+}
+
+/// Bug: the running total decided "first accepted result for this task" by
+/// counting the task's result rows, before the task row was locked. Two
+/// submissions for a redundancy-2 task's two slots, arriving together, each
+/// counted only their own uncommitted rows, both concluded they were first, and
+/// the job list showed every such batch twice. Submissions for one task now
+/// serialize on the task row before anything is stored.
+///
+/// Deterministic rather than timing-dependent: an outside transaction holds the
+/// job row, so both submissions get as far as they can and wait on a lock
+/// before either commits -- the exact interleaving that double-counted.
+#[tokio::test]
+async fn concurrent_redundant_results_count_once() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (a, uuid_a) = first_claim(&app).await;
+    let (b, uuid_b) = first_claim(&app).await;
+    assert_eq!(a["task_request"]["seed"], b["task_request"]["seed"], "same task, two slots");
+    let token_a = a["claim_token"].as_str().unwrap();
+    let token_b = b["claim_token"].as_str().unwrap();
+
+    let mut blocker = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE")
+        .bind(job)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let release = async {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            if waiting >= 2 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "both submissions should block");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        blocker.commit().await.unwrap();
+    };
+
+    let ((status_a, body_a), (status_b, body_b), ()) = tokio::join!(
+        submit_as(&app, &uuid_a, token_a, games_result(2, 2)),
+        submit_as(&app, &uuid_b, token_b, games_result(2, 2)),
+        release,
+    );
+    assert_eq!((status_a, status_b), (StatusCode::OK, StatusCode::OK), "{body_a} {body_b}");
+    assert_eq!((&body_a["accepted"], &body_b["accepted"]), (&json!(true), &json!(true)));
+
+    let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(job_row.games_completed, 2, "two games were played, not four");
+}
+
+/// The opening-rack detail page reads a running count of analysed racks
+/// rather than counting distinct racks over every stored analysis, which at a
+/// million racks took seconds on every view and every live push.
+#[tokio::test]
+async fn analysed_racks_are_counted_once_per_task_as_they_arrive() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("solver", admin).await;
+    let job = db.bare_job("opening_rack", 2, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 2, 7, 100)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (a, uuid_a) = first_claim(&app).await;
+    let (b, uuid_b) = first_claim(&app).await;
+    let racks: Vec<String> = a["task_request"]["racks"]
+        .as_array()
+        .expect("an opening-rack assignment carries racks")
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(racks.len(), 2);
+
+    let result = json!({ "racks": racks.iter().map(|rack| json!({
+        "rack": rack,
+        "num_moves": 1,
+        "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
+    })).collect::<Vec<_>>() });
+
+    // Both slots of the one task, so a second accepted result must not count
+    // the same racks again.
+    for uuid in [&uuid_a, &uuid_b] {
+        let token = if uuid == &uuid_a {
+            a["claim_token"].as_str().unwrap()
+        } else {
+            b["claim_token"].as_str().unwrap()
+        };
+        let (status, body) = submit_as(&app, uuid, token, result.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(job_row.racks_analyzed, 2);
+    let stats = birdtest::jobstats::compute(&db.pool, &job_row).await.unwrap();
+    let racks = stats.opening_racks.expect("an opening-rack job reports rack stats");
+    assert_eq!(racks.racks_analyzed, 2, "two racks were analysed, by two workers");
+    assert_eq!(racks.average_best_equity, Some(32.5));
 }
 
 /// Bug: any error claiming from one job failed the whole claim, so a single
@@ -291,7 +414,7 @@ async fn every_claim_advances_the_dispatch_counter() {
     assert_eq!(active, 1);
 }
 
-/// F13: a claim token worked for any registered identity, so a banned worker
+/// Bug: a claim token worked for any registered identity, so a banned worker
 /// could hand its tokens to another, and a result was audit-logged under
 /// whoever submitted it. The token is now bound to the identity it was issued
 /// to; any other identity is treated as holding an unknown token.
@@ -344,7 +467,7 @@ async fn a_claim_token_works_only_for_the_identity_it_was_issued_to() {
     assert_eq!(body["accepted"], true, "the owner still can: {body}");
 }
 
-/// F5: public endpoints published anonymous workers' UUIDs, which are their
+/// Bug: public endpoints published anonymous workers' UUIDs, which are their
 /// only credential. They now publish a derived pseudonym, and only the admin
 /// listing carries the UUID.
 #[tokio::test]

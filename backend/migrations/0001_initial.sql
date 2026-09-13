@@ -207,6 +207,25 @@ CREATE TABLE jobs (
     -- time proportional to the job's whole history. Only ever incremented,
     -- except by a purge, which deletes the claims it counts.
     claims_issued   BIGINT NOT NULL DEFAULT 0 CHECK (claims_issued >= 0),
+    -- Progress totals the dashboard reads, maintained in the submit transaction
+    -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
+    -- incremented
+    -- once per task, on its FIRST accepted result, because that is the row the
+    -- reads they replace selected: with redundancy > 1 the later claims of a
+    -- task replay the same deterministic work, and summing all of them would
+    -- multiply every total by the redundancy.
+    --
+    -- games_completed counts GAMES for both games and game_pairs; a pairs job's
+    -- unit count is half of it, exactly as the read derived it. racks_analyzed
+    -- counts distinct opening racks with an accepted analysis, which is a plain
+    -- sum because each task covers its own disjoint slice of the rack space.
+    --
+    -- Neither is authoritative for anything that decides: SPRT still reads
+    -- game_results, so a drifted counter shows a wrong number on a page and
+    -- cannot stop a job early. A purge zeroes them; a partial restore
+    -- recomputes them (RUNBOOK 2.3).
+    games_completed BIGINT NOT NULL DEFAULT 0 CHECK (games_completed >= 0),
+    racks_analyzed  BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ
@@ -736,6 +755,36 @@ CREATE TABLE leave_generation_artifacts (
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
     completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (job_id, generation)
+);
+
+-- One row per generation transition that has been *started*, claimed by the
+-- worker request that found the generation complete.
+--
+-- A transition folds millions of leave_rack_progress rows into a KLV and
+-- uploads it, which takes tens of seconds and cannot run inside the claim
+-- transaction, since a proxy timeout would abandon it part-way. That leaves a
+-- window in which a second claim would find the
+-- same "every rack at target, nothing in flight" state and start the same
+-- transition again, duplicating all of it. The primary key is what makes that
+-- impossible: the deciding claim transaction commits this row under the job's
+-- advisory lock, and any other claim that sees a live row is told there is no
+-- work yet instead.
+--
+-- `started_at` exists for the crash case. If the process dies mid-transition
+-- the row stays behind with no artifact to show for it, and the job would stall
+-- forever on a transition nobody is running; a claim that finds a row older
+-- than the takeover timeout with no artifact restarts it (see
+-- leave_gen::next_step). `completed_at` is set when the artifact row is
+-- written, so a stalled or repeated transition is a query rather than a guess.
+CREATE TABLE leave_generation_transitions (
+    job_id       UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation   INT NOT NULL,
+    started_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at TIMESTAMPTZ,
+    -- How many times this generation's transition has been started. Above 1
+    -- means a takeover happened, which is worth seeing.
+    attempts     INT NOT NULL DEFAULT 1 CHECK (attempts >= 1),
     PRIMARY KEY (job_id, generation)
 );
 

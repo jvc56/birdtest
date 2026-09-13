@@ -1525,17 +1525,28 @@ async fn purge_job(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    // The deficit counter counts the claims just deleted. Left alone, a
-    // purged job would restart owing the scheduler every claim it ever had.
-    sqlx::query("UPDATE jobs SET claims_issued = 0 WHERE id = $1")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    // Every counter on the job describes rows this purge is deleting. Left
+    // alone, a purged job would restart owing the scheduler every claim it ever
+    // had, and reporting progress it no longer has any results for.
+    sqlx::query(
+        "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0
+         WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM leave_generation_artifacts WHERE job_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // Deleted with the artifacts they produced: a surviving completed row for
+    // generation 1 would tell the next claim that its transition is someone
+    // else's business, and the job would never close a generation again.
+    sqlx::query("DELETE FROM leave_generation_transitions WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -1710,7 +1721,7 @@ async fn rebuild_artifacts(
 // ---------------------------------------------------------------------------
 
 /// Account deletion anonymizes the account rather than removing it
-/// (AUDIT_FINDINGS.md F8). Personal data goes: the username and email become
+/// Personal data goes: the username and email become
 /// tombstones, the password becomes unusable, API keys, confirmation codes and
 /// reset tokens are deleted, and every session is revoked. Contributions stay:
 /// the account's claims and results are kept under the tombstone, and no

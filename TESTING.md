@@ -7,7 +7,7 @@ the shared machinery underneath them, and an enumerated list of every test worth
 writing.
 
 The lists below are meant to be **worked through**, not read for flavour. There
-are 242 entries. Each has an id (`U-RACK-3`, `I-SCHED-13`, …) so progress can be
+are 250 entries. Each has an id (`U-RACK-3`, `I-SCHED-13`, …) so progress can be
 tracked, and is phrased as a claim a test either proves or fails to prove. An
 entry says what to set up and what to assert; it does not say how to write Rust.
 
@@ -58,8 +58,8 @@ at tier 5 names a symptom.
 |---|---|---|
 | 1 Unit | 72 | `#[cfg(test)]` in `inputdata`, `backups`, `jobs::klv`, `jobs::racks`, `jobs::plausibility`, `version`, `compat`, `config`, `clientip`, `sse`, `routes::admin`, `stats::sprt`, `stats::bradley_terry` |
 | 1F Frontend unit | **0** | — (no runner yet) |
-| 2 Integration | **0** | — (the harness exists; see tier 3) |
-| 3 API | 12 | `backend/tests/worker_api.rs`, `backend/tests/admin_api.rs` — each names the bug it would have caught |
+| 2 Integration | 2 | `backend/tests/leave_gen.rs` — the claim decisions that never reach HTTP |
+| 3 API | 26 | `backend/tests/worker_api.rs` (12), `admin_api.rs` (4), `leave_gen.rs` (7), `auth_api.rs` (3) — each names the bug or decision it pins |
 | 4 Contract | 6 | `routes::worker::contract_fixtures`; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | **0** | — |
 | 6 MAGPIE smoke | 2 (`#[ignore]`) | `jobs::klv` round-trips |
@@ -603,6 +603,32 @@ job creation touches needs one caller here.
   and finishes after the last.
 - `I-LEAVE-10` The task's `num_games` is the only termination condition — the
   rack target is not sent to the worker.
+- `I-LEAVE-11` **One transition per generation.** With every rack at target and
+  no claim in flight, the first claim decision starts the transition and every
+  later one is told there is no work yet, rather than starting a second fold of
+  millions of rows. *(Covered:
+  `leave_gen::only_one_claim_starts_a_generations_transition`.)*
+- `I-LEAVE-12` **A transition that never finished is taken over**, once past the
+  takeover timeout, and the takeover is recorded in `attempts`; a *completed*
+  transition is never restarted however old it is. *(Covered:
+  `leave_gen::a_transition_that_never_finished_is_taken_over`.)*
+- `I-LEAVE-13` **The transition owner's row is committed** before the transition
+  runs -- the claim transaction that decides a generation is complete commits
+  rather than rolls back, or the row that stops a second transition would be
+  discarded -- and a transition that *fails* hands ownership back immediately
+  instead of waiting out the takeover timeout. *(Covered:
+  `leave_gen::the_transition_owner_is_committed_before_the_transition_runs`.)*
+- `I-LEAVE-14` **A result for a closed generation is credited but not folded**:
+  the claim completes and the `leave_records` row is written, and the closed
+  generation's `occurrence_count` does not move — so a rebuild of that
+  generation still reproduces the artifact's digest. *(Covered:
+  `leave_gen::a_result_for_a_closed_generation_is_credited_but_not_folded`.)*
+- `I-LEAVE-15` **A reopened task is reissued only while its generation is
+  current.** A task whose claim timed out is handed to the next worker (same
+  racks, not a new task beside it) while its generation is open; once that
+  generation has closed, the next claim gets a task for the new generation
+  instead. *(Covered:
+  `leave_gen::a_reclaimed_task_is_reissued_only_while_its_generation_is_open`.)*
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -639,8 +665,20 @@ permanent.
 - `I-STATS-3` `divergent_pairs` is reported and is not what SPRT consumed.
 - `I-STATS-4` A job with no results reports zeros and an LLR of 0, not an error
   or a NaN.
-- `I-STATS-5` Opening-rack stats count distinct analysed racks against
-  `total_racks`.
+- `I-STATS-5` Opening-rack stats count analysed racks against `total_racks`, from
+  the running `jobs.racks_analyzed` total, and count a task's racks **once** even
+  when two redundant claims of it are accepted. *(Covered:
+  `worker_api::analysed_racks_are_counted_once_per_task_as_they_arrive`.)*
+- `I-STATS-5b` The job list's `units_completed` reads the same kind of running
+  total and agrees with `game_stats` on a redundancy-2 job. *(Covered:
+  `worker_api::redundant_results_for_one_task_count_once`.)*
+- `I-STATS-5d` **Concurrent submissions for one task count once.** Two
+  redundant claims of a task submitting at the same moment (each blocked,
+  before commit, on a lock the other holds) still add the task's games to the
+  running total once. *(Covered:
+  `worker_api::concurrent_redundant_results_count_once`.)*
+- `I-STATS-5c` A purge zeroes both running totals. *(Covered:
+  `admin_api::a_job_can_be_purged_and_its_dispatch_counter_resets`.)*
 - `I-STATS-6` Leave-generation stats report racks at target against the
   universe, and the current generation.
 - `I-STATS-7` `worker_contributions` attributes tasks to the right identity and

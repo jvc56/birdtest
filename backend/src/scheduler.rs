@@ -373,9 +373,16 @@ async fn try_claim_from_job(
             Ok(None)
         }
         Acquired::NeedsGenerationTransition { generation } => {
-            // Builds a multi-megabyte KLV and uploads it to the object store,
-            // so it must not hold the claim transaction open.
-            let _ = tx.rollback().await;
+            // Committed, not rolled back, and this is load-bearing: the only
+            // thing this transaction wrote is the
+            // `leave_generation_transitions` row saying this request owns the
+            // transition, and a rollback would throw that away -- leaving every
+            // claim that arrives while the transition runs free to start
+            // another one. Committing also releases the
+            // job's advisory lock, which the transition must not hold: it
+            // builds a multi-megabyte KLV and uploads it to the object store,
+            // and no claim transaction may stay open across that.
+            tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
             // On its own task, awaited: a transition takes tens of seconds, and
             // if the worker or a load balancer gives up on this request the
             // handler future is dropped. Run inline, that would abandon the
@@ -559,7 +566,15 @@ async fn run_leave_generation_transition(
     let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
     drop(conn);
 
-    let key = leave_gen::run_transition(
+    // This request owns the transition: `next_step` wrote the
+    // `leave_generation_transitions` row that stops any other claim starting the
+    // same one. If it fails, ownership has to go back, or the generation would
+    // sit untouched until the takeover timeout expired -- a transient object
+    // store error would cost half an hour of idle workers. Backdating
+    // `started_at` hands it to the next claim through the same takeover path,
+    // which keeps the attempt count and says in the log that a transition was
+    // started and did not finish.
+    let result = leave_gen::run_transition(
         &state.pool,
         &state.artifacts,
         job.id,
@@ -567,7 +582,31 @@ async fn run_leave_generation_transition(
         &config,
         &job_data.letterdist,
     )
-    .await?;
+    .await;
+
+    let key = match result {
+        Ok(key) => key,
+        Err(err) => {
+            // The original failure is what the caller needs to see, so a
+            // failure to hand ownership back is logged rather than returned in
+            // its place; the takeover timeout still covers it.
+            if let Err(release) = sqlx::query(
+                "UPDATE leave_generation_transitions SET started_at = to_timestamp(0)
+                 WHERE job_id = $1 AND generation = $2 AND completed_at IS NULL",
+            )
+            .bind(job.id)
+            .bind(generation)
+            .execute(&state.pool)
+            .await
+            {
+                tracing::error!(
+                    job_id = %job.id, generation, error = %release,
+                    "could not release a failed generation transition"
+                );
+            }
+            return Err(err);
+        }
+    };
     tracing::info!(job_id = %job.id, generation, artifact_key = %key, "leave generation complete");
     Ok(())
 }

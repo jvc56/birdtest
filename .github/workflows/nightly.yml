@@ -1,7 +1,7 @@
 # Tier 6 (TESTING.md): the real stack against a real MAGPIE `contribute`.
 # Every contract bug the audit found in MAGPIE was invisible to both
 # repositories' unit tests and obvious the first time a real task ran
-# (AUDIT_FINDINGS.md F14). This runs one small job of every type and asserts
+# This runs one small job of every type and asserts
 # the results land.
 name: Nightly MAGPIE end-to-end
 

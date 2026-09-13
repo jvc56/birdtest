@@ -44,7 +44,10 @@ pub struct JobData {
     pub layout_name: String,
 }
 
-pub(crate) async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<JobData> {
+/// The job settings every request and every rack enumeration is built from.
+/// `pub` rather than crate-private so a test can make one claim decision the
+/// way the claim path makes it.
+pub async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<JobData> {
     let row = sqlx::query(
         "SELECT j.variant, ld.name AS ld_name, ld.content AS ld_content,
                 layout.name AS layout_name

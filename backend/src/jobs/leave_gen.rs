@@ -100,6 +100,38 @@ impl JobHandler for LeaveGenHandler {
         .execute(&mut *conn)
         .await?;
 
+        // A result for a generation that has already been aggregated is
+        // credited to the worker -- it did the work, and the claim completes
+        // normally -- but must not be folded in. The
+        // generation's KLV is already built and uploaded, so nothing will ever
+        // read these occurrences; adding them would only make the rows disagree
+        // with the artifact built from them, which is the one signal reserved
+        // for a corrupted or stale object (see `rebuild_artifacts`).
+        //
+        // Defence in depth, not a path the claim flow takes: a generation
+        // closes only when none of its claims is still `claimed`, a claim that
+        // times out is abandoned (and its submission refused before reaching
+        // here), and a reopened task is reissued only while its own generation
+        // is current. What remains is state the flow never writes -- a
+        // partial restore, a hand edit -- and folding into a built
+        // generation is the one outcome worth guarding against there.
+        let closed = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM leave_generation_artifacts
+                            WHERE job_id = $1 AND generation = $2)",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .fetch_one(&mut *conn)
+        .await?;
+        if closed {
+            tracing::warn!(
+                job_id = %job_id, generation, task_id = %task_id,
+                racks = record.racks.len(),
+                "discarding a leave result for a generation that has already closed"
+            );
+            return Ok(());
+        }
+
         // One statement per submission, however many racks it carries. An
         // UPDATE rather than an upsert: the generation's universe is every
         // full rack, seeded up front, so a rack with no row is not a rack of
@@ -126,6 +158,56 @@ impl JobHandler for LeaveGenHandler {
     }
 }
 
+/// The advisory-lock namespace for leave-generation claim decisions. Postgres
+/// advisory locks are a single flat 64-bit space shared by every user of them,
+/// so the two-argument form's first key is used as a namespace and the second
+/// identifies the job.
+const CLAIM_LOCK_NAMESPACE: i32 = 1;
+
+/// How long a started transition may go without finishing before another claim
+/// takes it over.
+///
+/// Only reached if the process died mid-transition: a live transition holds no
+/// lock and leaves no heartbeat, so its row is the only evidence it exists, and
+/// without a timeout a crash would stall the job permanently. Far longer than a
+/// transition takes (about 15 seconds on the dev database, about a minute on the
+/// largest measured one) so a slow one is never taken over
+/// while it is still working -- a duplicate is exactly what the row exists to
+/// prevent.
+const TRANSITION_TAKEOVER_AFTER: &str = "30 minutes";
+
+/// Serialize this job's claim decisions against each other.
+///
+/// Every read `next_step` makes -- which racks are below target, which are out
+/// with an open claim, whether any claim for the generation is still in flight
+/// -- is invisible to a *concurrent* claim transaction until that transaction
+/// commits. Two consequences:
+///
+/// - a claim still being issued is not counted as in flight, so the generation
+///   it belongs to could be closed while its task was going out, and the work
+///   that task did would land in a generation whose KLV was already built;
+/// - two claims could both find the generation complete and both start its
+///   transition.
+///
+/// The lock is taken per job, so claims for other jobs are unaffected, and it is
+/// transaction-scoped: it is released when the claim transaction commits or
+/// rolls back, whichever happens, and a dropped connection releases it too.
+/// It is *not* held across the transition itself -- that would hold a Postgres
+/// transaction open across an S3 upload -- so what stops a second transition is
+/// the `leave_generation_transitions` row this lock makes it safe to test and
+/// write.
+///
+/// `hashtext` may collide, which costs two unrelated jobs a little
+/// serialization and nothing else.
+pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(CLAIM_LOCK_NAMESPACE)
+        .bind(job_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// What the scheduler should do next for a leave-generation job.
 pub enum LeaveGenStep {
     /// Dispatch this forced-rack partition.
@@ -134,6 +216,11 @@ pub enum LeaveGenStep {
     /// the generation must be aggregated before any more work exists. Done
     /// outside the claim transaction because it uploads to S3.
     Transition { generation: i32 },
+    /// A transition for this generation is already running (or, past the
+    /// takeover timeout, was running when the process died and has just been
+    /// taken over by this caller). Distinct from `Transition` only in who is
+    /// responsible for it.
+    TransitionInProgress { generation: i32 },
     /// All configured generations are complete.
     Finished,
     /// Every rack below target is already out with an open claim for this
@@ -144,14 +231,13 @@ pub enum LeaveGenStep {
     NoWorkYet,
 }
 
-/// Claim-time rack selection: the racks furthest from this generation's target
-/// that no open claim is already playing.
-pub async fn next_step(
+/// The generation claims are currently for: one past the last completed, or
+/// `None` once every configured generation is complete.
+pub async fn current_generation(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &LeaveConfig,
-    job_data: &JobData,
-) -> AppResult<LeaveGenStep> {
+) -> AppResult<Option<i32>> {
     // Generation 0 has an artifact too -- the zeroed KLV generation 1 plays
     // with -- so it must not count as a completed generation.
     let completed = sqlx::query_scalar::<_, i64>(
@@ -161,11 +247,20 @@ pub async fn next_step(
     .bind(job_id)
     .fetch_one(&mut *conn)
     .await?;
+    Ok((completed < config.generation_count as i64).then_some(completed as i32 + 1))
+}
 
-    if completed >= config.generation_count as i64 {
+/// Claim-time rack selection: the racks furthest from this generation's target
+/// that no open claim is already playing.
+pub async fn next_step(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    config: &LeaveConfig,
+    job_data: &JobData,
+) -> AppResult<LeaveGenStep> {
+    let Some(generation) = current_generation(&mut *conn, job_id, config).await? else {
         return Ok(LeaveGenStep::Finished);
-    }
-    let generation = completed as i32 + 1;
+    };
 
     // Racks named by an open claim are skipped: two concurrent claims would
     // otherwise both be handed the same lowest-count racks. The anti-join is
@@ -204,10 +299,50 @@ pub async fn next_step(
         .fetch_one(&mut *conn)
         .await?;
 
-        return Ok(if in_flight > 0 {
-            LeaveGenStep::NoWorkYet
-        } else {
-            LeaveGenStep::Transition { generation }
+        if in_flight > 0 {
+            return Ok(LeaveGenStep::NoWorkYet);
+        }
+
+        // The generation is complete. Whoever writes this row owns its
+        // transition; everyone else waits. Safe to test and write without
+        // re-reading because `lock_claim_decisions` holds the job's lock for
+        // the rest of this transaction, so no other claim is between its own
+        // test and its own write.
+        //
+        // A row whose transition never finished is taken over rather than
+        // trusted forever -- see TRANSITION_TAKEOVER_AFTER. Taking over bumps
+        // `attempts`, which is the only place a crash mid-transition is
+        // recorded.
+        let claimed = sqlx::query_scalar::<_, bool>(&format!(
+            "INSERT INTO leave_generation_transitions (job_id, generation)
+             VALUES ($1, $2)
+             ON CONFLICT (job_id, generation) DO UPDATE
+                 SET started_at = now(), attempts = leave_generation_transitions.attempts + 1
+                 WHERE leave_generation_transitions.completed_at IS NULL
+                   AND leave_generation_transitions.started_at
+                       < now() - interval '{TRANSITION_TAKEOVER_AFTER}'
+             RETURNING attempts > 1"
+        ))
+        .bind(job_id)
+        .bind(generation)
+        .fetch_optional(&mut *conn)
+        .await?;
+
+        return Ok(match claimed {
+            Some(taken_over) => {
+                if taken_over {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        generation,
+                        "restarting a generation transition that was started but never finished"
+                    );
+                }
+                LeaveGenStep::Transition { generation }
+            }
+            // Someone else owns it. `completed_at` set with no artifact row is
+            // not a state the transition writes -- both happen in one
+            // transaction -- so this is always a transition still in progress.
+            None => LeaveGenStep::TransitionInProgress { generation },
         });
     }
 
@@ -346,6 +481,19 @@ pub async fn run_transition(
     .bind(generation)
     .bind(&key)
     .bind(&sha256)
+    .execute(&mut *tx)
+    .await?;
+
+    // In the same transaction as the artifact row: the pair is what "this
+    // generation is closed" means, and a claim that saw one without the other
+    // would either start a finished transition again or wait on a transition
+    // that is over.
+    sqlx::query(
+        "UPDATE leave_generation_transitions SET completed_at = now()
+         WHERE job_id = $1 AND generation = $2",
+    )
+    .bind(job_id)
+    .bind(generation)
     .execute(&mut *tx)
     .await?;
 

@@ -390,6 +390,20 @@ async fn submit_result(
     let task_id: Uuid = claim.get("task_id");
     let job_id: Uuid = claim.get("job_id");
 
+    // Submissions for the same task serialize here, on the task row, before
+    // anything is stored. Redundant claims of one task hold different claim
+    // rows, so the lock above does not order them, and what a submission
+    // stores depends on what the task's earlier submissions stored: only the
+    // first accepted result adds to the job's running progress totals
+    // (`registry::store_result`). Without this, two submissions arriving
+    // together each saw only their own uncommitted rows and both counted. The
+    // task row is locked by the update below anyway; taking it first keeps the
+    // order every path uses -- claim, then task, then job.
+    sqlx::query("SELECT 1 FROM tasks WHERE id = $1 FOR UPDATE")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+
     let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(job_id)
         .fetch_one(&mut *tx)

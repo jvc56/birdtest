@@ -156,7 +156,7 @@ impl Config {
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
             // 0.1.0 is the first MAGPIE version that speaks the contribution
-            // protocol correctly (AUDIT_FINDINGS.md F3). Builds reporting 0.0.0
+            // protocol correctly. Builds reporting 0.0.0
             // predate the audit's fixes -- ambient simulation settings, an
             // unapplied distribution and layout -- and must be refused.
             min_magpie_version,

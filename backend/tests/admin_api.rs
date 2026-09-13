@@ -89,14 +89,18 @@ async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["tasks_reset"], 1);
 
-    let (tasks, issued): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM tasks WHERE job_id = $1), claims_issued FROM jobs WHERE id = $1",
+    // The progress totals describe results this purge deleted, so they go
+    // back to zero with the dispatch counter.
+    let (tasks, issued, games, racks): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM tasks WHERE job_id = $1),
+                claims_issued, games_completed, racks_analyzed
+         FROM jobs WHERE id = $1",
     )
     .bind(job)
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!((tasks, issued), (0, 0));
+    assert_eq!((tasks, issued, games, racks), (0, 0, 0, 0));
 }
 
 /// Bug: `audit_log.actor_user_id`, `player_configs.created_by` and
@@ -104,7 +108,8 @@ async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
 /// a user who had registered (and so has a `user.registered` row), created a
 /// config or issued a ban could not be deleted.
 ///
-/// F8: deletion now anonymizes. Personal data and credentials go; the row,
+/// Deletion anonymizes rather than removing. Personal data and credentials go;
+/// the row,
 /// and with it every claim and result, stays.
 #[tokio::test]
 async fn a_user_with_history_can_be_deleted() {

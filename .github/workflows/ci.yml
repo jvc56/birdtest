@@ -86,7 +86,7 @@ jobs:
       - run: terraform init -backend=false -input=false
       - run: terraform validate
 
-  # MAGPIE's half of the contract (AUDIT_FINDINGS.md F15). Each repository
+  # MAGPIE's half of the contract. Each repository
   # tests against its own copy of the fixtures, so a fixture changed here and
   # not copied to MAGPIE would pass both suites while breaking the protocol.
   # This runs MAGPIE's contribute tests against *this* branch's fixtures.

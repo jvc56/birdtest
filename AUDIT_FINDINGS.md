@@ -1,8 +1,8 @@
 # birdtest audit — findings
 
-**Date:** 2026-09-11.
-**Branches:** birdtest `audit/birdtest-2026-09-11` (off `main` at `baa4094`). MAGPIE
-`birdtest-contribute`, committed directly on that branch as instructed.
+**Dates:** 2026-09-11 (first pass, sections A–I); 2026-09-13 (second pass, section J).
+**Branches:** birdtest `audit/birdtest-2026-09-11` (off `main` at `baa4094`), used by both passes. MAGPIE
+`birdtest-contribute`, committed directly on that branch as instructed (the second pass needed no MAGPIE changes).
 
 This is the record of every decision the audit made, complete enough to
 second-guess each one without reading the diffs. Where this file and PLAN.md
@@ -15,15 +15,18 @@ decisions:
 
 | Decision | Meaning | Count |
 |---|---|---|
-| **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **21** |
-| **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **16** |
-| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). | **5** |
+| **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **22** (21 in A.1, J3) |
+| **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **18** (16 in A.2, J1, J2) |
+| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones. | **5** |
 
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
 audit left open, the options offered, the option chosen, and what was
 implemented. Section H lists what implementing those decisions turned up, and
-section I the follow-ups worth deciding next.
+section I the follow-ups worth deciding next. Section J is the second pass:
+the status of section I (I1 and I2 implemented, I3 still open), the
+discrepancies it found, and its verification. The Verification section just
+below describes the first pass; J.6 supersedes it for current numbers.
 
 ## Verification
 
@@ -842,3 +845,72 @@ benchmarked. Measure it before running multi-generation English jobs. If it is
 slow there too, the copy can be avoided: treat a missing row as zero
 occurrences, and select a generation's racks by anti-joining the previous
 generation's rows instead of copying them.
+
+---
+
+## J. Second pass (2026-09-13)
+
+### J.0 Starting state, and what this pass did with it
+
+- **Branch.** This pass continued on `audit/birdtest-2026-09-11` instead of creating another branch. That branch was already made off `main` (at `baa4094`) for this audit and holds the first pass (3 commits, pushed). A new branch off `main` would have either dropped that work or duplicated it.
+- **Uncommitted work was already in the tree.** It implemented I1 and I2 (J.1). It also removed every citation of this file and its decision IDs (`F8`, `AUDIT_FINDINGS.md F10`, …) from code, comments, workflows and PLAN.md, and staged this file for deletion.
+  - **Kept:** the removal of citations from code. A comment should explain itself, not point at an audit record that will go stale.
+  - **Reverted:** the deletion. The audit brief requires this file as the record of every decision. **Flag for a human:** if the deletion was intentional (the record meant to live in the pull request instead), drop the file at merge.
+- Nothing uncommitted was discarded. It was reviewed and run (clippy and every test passed as found), and two bugs in it were fixed (J1, J2).
+
+### J.1 Section I: status
+
+| # | Chosen | What is implemented | Tests |
+|---|---|---|---|
+| I1 | A, extended | A per-job advisory lock (`leave_gen::lock_claim_decisions`, `pg_advisory_xact_lock`) held for every leave-generation claim decision. A `leave_generation_transitions` row (key: job, generation) is **committed** by the claim that finds a generation complete, so exactly one request runs the transition; the rest get 204. A transition not finished after 30 minutes is taken over and `attempts` records it. A transition that fails hands ownership back at once by backdating `started_at`. The lock is not held across the transition, which would hold a transaction open across an S3 upload. The lock alone (option A as written) would not have stopped a second transition, because the transition runs after the claim transaction commits; the committed row is what does. | I-LEAVE-11 to 14 |
+| I2 | A only | `jobs.games_completed` (games and game pairs) and `jobs.racks_analyzed`, incremented in the submit transaction on a task's first accepted result. The job list and opening-rack stats read them, purge zeroes them, and RUNBOOK §2.3 recomputes them after a partial restore. SPRT still reads `game_results`, so a drifted counter cannot stop a job. Debouncing (option B) is not implemented and is recorded under PLAN.md's future improvements. | I-STATS-5, 5b, 5c, 5d |
+| I3 | **Open** | `scripts/leave-gen-bench.sh` times the universe copy and the ordered stream against any database, inside a rolled-back transaction. It has not been run against the production instance class, which needs production access. | — |
+
+I1 and I2 were implemented in the working tree before this pass began, and nothing records who chose the options. They are recorded here as implemented and verified, not as decisions this pass made.
+
+### J.2 Discrepancies found this pass
+
+| # | What the code did | What PLAN.md says | Decision | Reasoning |
+|---|---|---|---|---|
+| J1 | `registry::count_first_result` decided "first accepted result for this task" by counting the task's result rows, before anything locked the task row. Two redundant claims submitting together each counted only their own uncommitted rows, both concluded they were first, and the job's `games_completed` doubled (reproduced: 4 instead of 2). Its doc comment said the shared transaction made this safe. | Running totals are incremented "once per task, on its FIRST accepted result". | **Code updated** | A real race, and PLAN.md states the intent. `submit_result` now locks the task row (`SELECT … FOR UPDATE`) right after the claim row, before `store_result`, so submissions for one task serialize and the count sees earlier ones as committed. The lock order (claim, then task, then job) is the one the claim, decline and reclaim paths already use, so no deadlock cycle is introduced. Test: `worker_api::concurrent_redundant_results_count_once`. It is deterministic: an outside transaction holds the job row until both submissions are waiting on a lock. It failed before the fix and passes after. |
+| J2 | `registry::acquire` re-dispatched `available` tasks for every job type before the type-specific path. For leave generation that was: **(a)** before `lock_claim_decisions`, so a reissued claim was invisible to a concurrent claim's in-flight check, the race I1 closed for new tasks left open for reissued ones; **(b)** for any generation, so once a generation closed, its reclaimed tasks were handed out again. The worker played them with an outdated KLV, the result could only be discarded, and the racks could overlap a fresh task's. | Leave claim step 2: "The whole of step 2 runs under a per-job advisory lock (… taken before anything is read …)". Request Handling: a task with capacity left "is re-dispatched before anything new is generated", stated for all job types. | **Code updated**; PLAN.md amended to match | The lock section states the invariant the rest of leave generation depends on. The generic re-dispatch rule predates generations and did not consider them. Leave jobs now reissue inside `generate_leave_gen`, after the lock, and only tasks whose `leave_requests.generation` is current: `next_available` gained a generation filter, and `leave_gen::current_generation` was extracted from `next_step`. PLAN.md step 2 gained a paragraph saying so. Test: `leave_gen::a_reclaimed_task_is_reissued_only_while_its_generation_is_open`. It failed before the fix (a generation-1 task handed out after generation 1 closed) and passes after. **Side effect**, also in PLAN.md: a task left over from a closed generation stays `available` and is never dispatched, so a leave job's task counts in the job list can include a few that never complete. |
+| J3 | A timed-out claim is abandoned, and its late submission is refused (`c.state = 'claimed'` in `submit_result`). A generation closes only when none of its claims is still `claimed`. | "The lock above makes that rare rather than impossible: a claim that times out is reissued, and the original worker can still submit after its generation has closed." The leave fold's code comment and its test's docstring said the same. | **PLAN.md updated**, and both comments | The code was right; the scenario cannot happen. After J2 the closed-generation guard in `LeaveGenHandler::insert_record` cannot be reached through the claim flow. It is kept as a cheap guard against state the flow never writes (a partial restore, a hand edit), and its comment now says so. |
+
+Also: `scripts/e2e_magpie.py` still cited `F1` and `F9`, and those citations were removed like the rest.
+
+### J.3 Python worker as a production client
+
+Every mention was re-checked:
+
+- README, TESTING.md, RUNBOOK.md, PLAN.md;
+- `docker-compose.yml`, `docker/Dockerfile`, `.env.example`;
+- `scripts/dev.py`, the plausibility tests, and `worker/fake_worker.py` itself.
+
+All of them describe `fake_worker.py` as end-to-end-suite tooling, and MAGPIE as the only production client. Nothing under `infra/` references the fake worker. **No corrections were needed this pass.** Section C lists the first pass's corrections.
+
+### J.4 MAGPIE `birdtest-contribute`
+
+Verified this pass; **no changes needed, and none were made.**
+
+- The local branch is at `62fb6f37`, even with `origin/birdtest-contribute`, with a clean tree.
+- The contract fixtures present in both repositories (`assignment-games.json`, `assignment-leave-generation.json`) are byte-identical.
+- `make magpie_test` (the dev build, with ASan and UBSan) builds, and `magpie_test contribute` passes.
+- Nothing this pass or the uncommitted work changed touches the wire format: J1, J2 and I1/I2 are all internal to the server.
+- End-to-end with a real MAGPIE: see J.6.
+
+### J.5 Deployment blockers
+
+None new. One note that becomes a blocker for any existing database:
+
+- **Migration checksum.** The uncommitted work added `jobs.games_completed`, `jobs.racks_analyzed` and `leave_generation_transitions` by editing `0001_initial.sql` in place, per the pre-release convention. **A database built from the earlier `0001`, including a local compose volume, will refuse to migrate.** No deployed database exists, so this is the F4 situation again: reset the local database (README, "After a schema change"). This pass did **not** reset the local compose database, because doing so deletes local data.
+
+### J.6 Verification (this pass)
+
+- `cargo clippy --locked --all-targets -- -D warnings`: clean.
+- `cargo test`: 82 unit tests (3 ignored, as before) and 30 integration tests against a real Postgres (admin 4, auth 3, leave generation 9, worker 12). Both new tests were run against the code before their fixes and failed as described in J1 and J2.
+- Frontend `npm run check`: 0 errors, 0 warnings.
+- MAGPIE `magpie_test contribute`: passes.
+- End-to-end with a real MAGPIE (`scripts/e2e_magpie.py`): **passes.** Run against this branch's backend in an isolated compose project (`COMPOSE_PROJECT_NAME=birdtest-e2e`, separate ports and volumes, so the local `birdtest` stack and its data were untouched), with a release build of MAGPIE `birdtest-contribute` at `62fb6f37`, NWL23, data-20251004.
+  - Every job type got 2 accepted claims: games, game pairs, opening rack (static and simming), and leave generation. The English leave-generation job took 33.9 s to create.
+  - **Not covered by this run:** a real generation transition. The script does not force one, so the commit-before-transition path (I1) is verified by the integration tests (I-LEAVE-11 to 14) and not yet against a real object store upload. The first pass's hand-forced transition predates I1. The nightly workflow is the next place it would run.
+  - The isolated project was torn down afterwards.

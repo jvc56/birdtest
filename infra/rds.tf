@@ -33,8 +33,8 @@ resource "aws_db_instance" "main" {
   username = var.project
   # The master password is set by hand, not managed by RDS: RDS-managed
   # passwords rotate every 7 days, and the tasks read a fixed DATABASE_URL from
-  # SSM, so the first rotation would lock the service out (AUDIT_FINDINGS.md
-  # F2). The instance is created with this placeholder, which the first deploy
+  # SSM, so the first rotation would lock the service out. The instance is
+  # created with this placeholder, which the first deploy
   # replaces immediately (README.md, "Deploying"); ignore_changes keeps
   # Terraform from reverting it. The real password lives only in the
   # DATABASE_URL SSM parameter declared in ssm.tf. The instance is reachable

@@ -147,15 +147,18 @@ In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
 | 3 | `task_claims` | `task_id IN (...)` |
 | 4 | `game_results`, `leave_records` | `task_id IN (...)` |
 | 5 | `position_analysis_records` → `_moves` → `_plies` | `task_id IN (...)`, then by parent id |
-| 6 | `leave_rack_progress`, `leave_generation_artifacts` | `job_id = :job` |
+| 6 | `leave_rack_progress`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
 are recomputed from `game_results` (see §2.4).
 
-Reset the job's dispatch counter afterwards, or the scheduler treats the
-restored job as owing it nothing: `UPDATE jobs SET claims_issued = (SELECT
-count(*) FROM task_claims c JOIN tasks t ON t.id = c.task_id WHERE t.job_id =
-:'job') WHERE id = :'job';`
+`leave_generation_transitions` is in that list for a reason: a generation's
+artifact row without its transition row would leave the next claim free to
+re-run a transition that already happened, and a transition row without its
+artifact row would stall the job until the takeover timeout. Copy both or
+neither.
+
+The job's three counters are repaired in §2.3 with the rest.
 
 `position_analysis_records.id` and `_moves.id` are `BIGSERIAL`. Restoring them
 with their original ids preserves the parent-child links; afterwards the
@@ -203,8 +206,35 @@ UPDATE tasks t
   FROM jobs j
  WHERE j.id = t.job_id AND t.job_id = :'job';
 
+-- The job's own counters. claims_issued is the scheduler's deficit numerator,
+-- so a restored job that keeps a zero here is dispatched ahead of everything
+-- else until it catches up. games_completed and racks_analyzed are the
+-- dashboard's progress totals; they are maintained one task at a time in the
+-- submit path, so a row copy leaves them describing the results the job had
+-- before. Each is recomputed here exactly as the read it replaced computed it:
+-- one result per task, because redundant claims replay the same work.
+UPDATE jobs j
+   SET claims_issued = (SELECT count(*) FROM task_claims c
+                          JOIN tasks t ON t.id = c.task_id
+                         WHERE t.job_id = j.id),
+       games_completed = (SELECT COALESCE(sum(g.games), 0) FROM (
+                            SELECT DISTINCT ON (r.task_id) r.games
+                              FROM game_results r JOIN tasks t ON t.id = r.task_id
+                             WHERE t.job_id = j.id
+                             ORDER BY r.task_id, r.submitted_at, r.task_claim_id
+                          ) g),
+       racks_analyzed = (SELECT count(DISTINCT p.rack)
+                           FROM position_analysis_records p
+                           JOIN tasks t ON t.id = p.task_id
+                          WHERE t.job_id = j.id)
+ WHERE j.id = :'job';
+
 COMMIT;
 ```
+
+`racks_analyzed` is meaningful only for an opening-rack job and
+`games_completed` only for a games or game-pairs job; the statement above leaves
+each at 0 for the job types that do not use it, which is what they hold anyway.
 
 ### 2.4 Recompute derived state
 

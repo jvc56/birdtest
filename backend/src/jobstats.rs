@@ -425,8 +425,23 @@ async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRac
     // Best move, score and equity are not duplicated onto the record: they are
     // the rank 1 row in position_analysis_moves, which a partial index makes
     // cheap to reach.
+    //
+    // The rack count is deliberately not `COUNT(DISTINCT r.rack)` over those
+    // rows: at a million racks that scan took about 2 seconds, and it ran on
+    // every detail view and every live push (PLAN.md, "What these reads
+    // cost"). It is
+    // `jobs.racks_analyzed`, maintained one task at a time in the submit
+    // transaction. The average equity still reads the rows -- it is a mean over
+    // every analysis, which no counter can stand in for.
+    let racks_analyzed = sqlx::query_scalar::<_, i64>(
+        "SELECT racks_analyzed FROM jobs WHERE id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await?;
+
     let row = sqlx::query(
-        "SELECT COUNT(DISTINCT r.rack)::bigint AS analyzed, AVG(m.equity) AS avg_equity
+        "SELECT AVG(m.equity) AS avg_equity
          FROM position_analysis_records r
          JOIN tasks t ON t.id = r.task_id
          LEFT JOIN position_analysis_moves m ON m.record_id = r.id AND m.rank = 1
@@ -464,7 +479,7 @@ async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRac
     .await?;
 
     Ok(OpeningRackStats {
-        racks_analyzed: row.get("analyzed"),
+        racks_analyzed,
         racks_total,
         average_best_equity: row.get("avg_equity"),
         best_move_types: types
