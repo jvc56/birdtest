@@ -158,12 +158,6 @@ impl JobHandler for LeaveGenHandler {
     }
 }
 
-/// The advisory-lock namespace for leave-generation claim decisions. Postgres
-/// advisory locks are a single flat 64-bit space shared by every user of them,
-/// so the two-argument form's first key is used as a namespace and the second
-/// identifies the job.
-const CLAIM_LOCK_NAMESPACE: i32 = 1;
-
 /// How long a started transition may go without finishing before another claim
 /// takes it over.
 ///
@@ -197,15 +191,11 @@ const TRANSITION_TAKEOVER_AFTER: &str = "30 minutes";
 /// the `leave_generation_transitions` row this lock makes it safe to test and
 /// write.
 ///
-/// `hashtext` may collide, which costs two unrelated jobs a little
-/// serialization and nothing else.
+/// It is [`super::lock_job_dispatch`], which every job type now takes for the
+/// same underlying reason; leave generation just has the most to lose by not
+/// holding it.
 pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<()> {
-    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
-        .bind(CLAIM_LOCK_NAMESPACE)
-        .bind(job_id)
-        .execute(conn)
-        .await?;
-    Ok(())
+    super::lock_job_dispatch(conn, job_id).await
 }
 
 /// What the scheduler should do next for a leave-generation job.
@@ -229,6 +219,39 @@ pub enum LeaveGenStep {
     /// closed, and handing the same racks out again would only duplicate
     /// coverage. Nothing to hand out right now.
     NoWorkYet,
+}
+
+/// Whether `generation`'s transition is owned by a request that is still
+/// working on it.
+///
+/// Distinct from asking whether the generation has closed: between the claim
+/// that commits the `leave_generation_transitions` row and the transition's own
+/// commit, the artifact row does not exist yet, so `current_generation` still
+/// names the closing generation and nothing else marks it as off limits. That
+/// window is tens of seconds -- streaming millions of rows, deriving leave
+/// values, uploading the KLV -- and anything dispatched inside it plays racks
+/// whose totals the transition is in the middle of reading.
+///
+/// A row past the takeover timeout is deliberately *not* counted: that is a
+/// transition whose process died, and `next_step` exists to take it over. Using
+/// the same bound as the takeover keeps the two decisions from disagreeing,
+/// which would stall the job permanently.
+pub async fn transition_in_progress(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS (
+             SELECT 1 FROM leave_generation_transitions
+             WHERE job_id = $1 AND generation = $2 AND completed_at IS NULL
+               AND started_at >= now() - interval '{TRANSITION_TAKEOVER_AFTER}'
+         )"
+    ))
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?)
 }
 
 /// The generation claims are currently for: one past the last completed, or
@@ -466,8 +489,62 @@ pub async fn run_transition(
     let sha256 = hex::encode(Sha256::digest(&klv));
     let key = format!("leaves/{job_id}/generation-{generation}.klv2");
     artifacts.put(&key, klv).await?;
+    close_generation(pool, job_id, generation, &key, &sha256, config).await?;
+    Ok(key)
+}
 
+/// The second half of [`run_transition`]: everything that has to happen in one
+/// transaction once the KLV is in the object store.
+///
+/// Separate so it can be exercised without an object store, and because the
+/// ownership check below is the only thing standing between a concurrent purge
+/// and a job that believes a generation it no longer has results for is closed.
+pub async fn close_generation(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    generation: i32,
+    key: &str,
+    sha256: &str,
+    config: &LeaveConfig,
+) -> AppResult<()> {
     let mut tx = pool.begin().await?;
+    // Claiming ownership back, and the one place this transition can find out
+    // it no longer has any. A purge deletes the transitions row along with the
+    // artifacts and progress rows and reseeds generation 1 -- all while a
+    // transition spawned before it may still be streaming. Writing the artifact
+    // anyway would hand the purged job a generation-1 KLV derived from results
+    // it no longer has, and copy a freshly zeroed universe into generation 2.
+    // The row this request committed when it took the transition is the
+    // evidence that the job is still the one it started on, so the close is
+    // conditional on it.
+    //
+    // The uploaded object is left behind in that case: it is keyed by job and
+    // generation, so a later transition of the same generation overwrites it,
+    // and nothing reads a key no `leave_generation_artifacts` row names
+    // (`/api/worker/artifact` checks).
+    let still_ours = sqlx::query(
+        "UPDATE leave_generation_transitions SET completed_at = now()
+         WHERE job_id = $1 AND generation = $2 AND completed_at IS NULL",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected()
+        > 0;
+    if !still_ours {
+        tx.rollback().await?;
+        return Err(AppError::internal(format!(
+            "leave job {job_id} generation {generation} was purged or closed by someone else \
+             while its transition ran; the KLV built for it was discarded"
+        )));
+    }
+
+    // In the same transaction as the close above: the pair is what "this
+    // generation is closed" means, and a claim that saw one without the other
+    // would either start a finished transition again or wait on a transition
+    // that is over.
+    //
     // DO NOTHING keeps the FIRST hash. A restore that replays this transition
     // against fewer results writes the same key with different bytes; keeping
     // the original hash is what makes that visible afterwards instead of
@@ -479,21 +556,8 @@ pub async fn run_transition(
     )
     .bind(job_id)
     .bind(generation)
-    .bind(&key)
-    .bind(&sha256)
-    .execute(&mut *tx)
-    .await?;
-
-    // In the same transaction as the artifact row: the pair is what "this
-    // generation is closed" means, and a claim that saw one without the other
-    // would either start a finished transition again or wait on a transition
-    // that is over.
-    sqlx::query(
-        "UPDATE leave_generation_transitions SET completed_at = now()
-         WHERE job_id = $1 AND generation = $2",
-    )
-    .bind(job_id)
-    .bind(generation)
+    .bind(key)
+    .bind(sha256)
     .execute(&mut *tx)
     .await?;
 
@@ -507,7 +571,7 @@ pub async fn run_transition(
     }
     tx.commit().await?;
 
-    Ok(key)
+    Ok(())
 }
 
 /// The lexicon name a leave job's bot plays with, from the row it pins.

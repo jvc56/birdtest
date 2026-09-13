@@ -15,6 +15,7 @@ other then fails a test rather than a contributor's run.
 |---|---|---|
 | `claim-request.json` | client → server | The required claim body: version and unsupported set |
 | `assignment-games.json` | server → client | A games assignment with `expected_data`, two lexicons |
+| `assignment-opening-rack.json` | server → client | A rack batch for a simming player: the one job type whose request carries `racks` and a single `player` |
 | `assignment-leave-generation.json` | server → client | Generation 1, reading the server-built zeroed KLV |
 | `decline-missing-data.json` | client → server | A decline naming a missing file and a mismatched one |
 | `shutdown-data-out-of-date.json` | server → client | Every job unreachable because the data is stale |

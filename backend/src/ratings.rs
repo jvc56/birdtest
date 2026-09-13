@@ -222,27 +222,46 @@ pub async fn recompute(db: &PgPool, pool_id: Uuid, trigger: Trigger) -> AppResul
 /// is global to a pool, an active job submits thousands of results an hour, and
 /// unlike SPRT nothing blocks on the answer. Comparing the pair count against
 /// the last run's `pairs_used` avoids needing a dirty flag anywhere.
+///
+/// One pool's failure does not stop the others. A fit can fail on state an
+/// admin can reach -- a pool whose anchor is no longer a member is the obvious
+/// one -- and propagating that ended the whole sweep at the first such pool, so
+/// every pool ordered after it silently stopped being refit for as long as the
+/// misconfiguration lasted. Each pool is logged and skipped instead, and the
+/// count returned is of the fits that actually ran.
 pub async fn recompute_stale(db: &PgPool) -> AppResult<usize> {
     let pool_ids =
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM rating_pools").fetch_all(db).await?;
 
     let mut recomputed = 0;
     for pool_id in pool_ids {
-        let mut conn = db.acquire().await?;
-        let (_, _, pairs_used, _) = build_matrix(&mut conn, pool_id).await?;
-        let last: Option<i64> = sqlx::query_scalar(
-            "SELECT pairs_used FROM rating_runs
-             WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
-        )
-        .bind(pool_id)
-        .fetch_optional(&mut *conn)
-        .await?;
-        drop(conn);
-
-        if last != Some(pairs_used as i64) {
-            recompute(db, pool_id, Trigger::Evidence).await?;
-            recomputed += 1;
+        match recompute_if_stale(db, pool_id).await {
+            Ok(true) => recomputed += 1,
+            Ok(false) => {}
+            Err(err) => tracing::error!(
+                %pool_id, error = %err.message, "refitting a rating pool failed; skipping it"
+            ),
         }
     }
     Ok(recomputed)
+}
+
+/// Whether this pool's evidence has grown since its last run, and a refit if so.
+async fn recompute_if_stale(db: &PgPool, pool_id: Uuid) -> AppResult<bool> {
+    let mut conn = db.acquire().await?;
+    let (_, _, pairs_used, _) = build_matrix(&mut conn, pool_id).await?;
+    let last: Option<i64> = sqlx::query_scalar(
+        "SELECT pairs_used FROM rating_runs
+         WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
+    )
+    .bind(pool_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    drop(conn);
+
+    if last == Some(pairs_used as i64) {
+        return Ok(false);
+    }
+    recompute(db, pool_id, Trigger::Evidence).await?;
+    Ok(true)
 }

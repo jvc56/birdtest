@@ -9,6 +9,11 @@ use std::sync::Arc;
 /// per-submission refits would be pure waste.
 const RATING_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How often to drop rate-limit buckets that have gone idle. The buckets
+/// themselves refill in seconds to an hour, so this only decides how long an
+/// unused entry lingers in memory, not how anyone is limited.
+const RATE_LIMIT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Local development reads `.env`; in ECS the same variables arrive from the
@@ -76,6 +81,20 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Keyed rate limiters hold one entry per key seen, and the keys are
+    // outside input; without this the map only ever grows.
+    {
+        let limits = state.limits.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RATE_LIMIT_SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                limits.retain_recent();
+            }
+        });
+    }
+
     let app = birdtest::app(state);
 
     let addr: SocketAddr = cfg.bind_addr.parse()?;
@@ -83,6 +102,44 @@ async fn main() -> Result<()> {
     tracing::info!(%addr, "birdtest listening");
 
     // `ConnectInfo` is the peer address `clientip` falls back to.
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    //
+    // Shut down gracefully on the signals a container runtime actually sends.
+    // Without this, a deployment or a `docker stop` drops every in-flight
+    // request: a worker that has just uploaded a completed batch loses it and
+    // its retry is answered `accepted: false`, because the claim it was for is
+    // still `claimed` and stays that way until the heartbeat timeout. Letting
+    // open requests finish costs a few seconds of a rollout.
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            // ECS stops a task with SIGTERM and only escalates to SIGKILL after
+            // the stop timeout, so this is the signal that matters in
+            // production.
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(err) => {
+                tracing::error!(%err, "could not listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = interrupt => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutting down; letting in-flight requests finish");
 }

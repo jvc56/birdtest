@@ -414,13 +414,14 @@ CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
 --
--- Account deletion is handled at the application layer (not via ON DELETE CASCADE) because
--- task counters (accepted_count, active_claim_count) must be decremented and tasks may need
--- to revert from completed → available. The deletion sequence is:
---   1. For each active/completed claim: update task counters.
---   2. Delete all task records (game_results, etc.) linked to those claims.
---   3. Delete the task_claim rows.
---   4. Delete the user row (cascades to api_keys, email_confirmations, password_reset_tokens).
+-- claimed_by_user_id carries no ON DELETE clause because a user row is never
+-- deleted: account deletion anonymizes it in place (users.deleted_at, and a
+-- tombstone username and email) and leaves these rows exactly where they are.
+-- Removing them instead would take with them the captured in-game positions
+-- keyed to those claims -- including the ones other redundant claims
+-- deduplicated against, which nothing else holds -- and leave-generation
+-- occurrences that were folded into per-rack totals and cannot be subtracted
+-- back out. See routes::admin::delete_user.
 
 -- 'declined' is distinct from 'abandoned': one is a worker saying "I cannot do
 -- this", the other is a claim that lapsed. Only the first is diagnostic.

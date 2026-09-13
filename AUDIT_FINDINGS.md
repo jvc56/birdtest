@@ -1,8 +1,12 @@
 # birdtest audit — findings
 
-**Dates:** 2026-09-11 (first pass, sections A–I); 2026-09-13 (second pass, section J).
-**Branches:** birdtest `audit/birdtest-2026-09-11` (off `main` at `baa4094`), used by both passes. MAGPIE
-`birdtest-contribute`, committed directly on that branch as instructed (the second pass needed no MAGPIE changes).
+**Dates:** 2026-09-11 (first pass, sections A–I); 2026-09-13 (second pass,
+section J; third pass, section K).
+**Branches:** birdtest `audit/birdtest-2026-09-11` (off `main` at `baa4094`) for
+the first two passes, then `audit/birdtest-2026-09-13` off that for the third —
+see K.0 for why it is not off bare `main`. MAGPIE `birdtest-contribute`,
+committed directly on that branch as instructed (the second pass needed no
+MAGPIE changes; the third made one, K.5).
 
 This is the record of every decision the audit made, complete enough to
 second-guess each one without reading the diffs. Where this file and PLAN.md
@@ -15,9 +19,9 @@ decisions:
 
 | Decision | Meaning | Count |
 |---|---|---|
-| **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **22** (21 in A.1, J3) |
+| **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **24** (21 in A.1, J3, K-D1, K-D2) |
 | **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **18** (16 in A.2, J1, J2) |
-| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones. | **5** |
+| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third found one, still open (K-D5). | **5, plus 1 still open** |
 
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
@@ -25,8 +29,11 @@ audit left open, the options offered, the option chosen, and what was
 implemented. Section H lists what implementing those decisions turned up, and
 section I the follow-ups worth deciding next. Section J is the second pass:
 the status of section I (I1 and I2 implemented, I3 still open), the
-discrepancies it found, and its verification. The Verification section just
-below describes the first pass; J.6 supersedes it for current numbers.
+discrepancies it found, and its verification. **Section K is the third pass**,
+which found and fixed two more races in leave generation, a scheduler contention
+bug, and a missing submission check; K.6 carries the questions still open. The
+Verification section just below describes the first pass; J.6 and then K.7
+supersede it for current numbers.
 
 ## Verification
 
@@ -914,3 +921,193 @@ None new. One note that becomes a blocker for any existing database:
   - Every job type got 2 accepted claims: games, game pairs, opening rack (static and simming), and leave generation. The English leave-generation job took 33.9 s to create.
   - **Not covered by this run:** a real generation transition. The script does not force one, so the commit-before-transition path (I1) is verified by the integration tests (I-LEAVE-11 to 14) and not yet against a real object store upload. The first pass's hand-forced transition predates I1. The nightly workflow is the next place it would run.
   - The isolated project was torn down afterwards.
+
+---
+
+## K. Third pass (2026-09-13)
+
+### K.0 Starting state, and the branch
+
+- **Branch: `audit/birdtest-2026-09-13`**, cut from `audit/birdtest-2026-09-11`
+  at `f873986` rather than from `main`. That branch is itself off `main` (at
+  `baa4094`) and carries the first two passes, none of which is merged yet.
+  Branching from bare `main` would have either discarded that work or
+  duplicated it, so the lineage to `main` is preserved and the date in the name
+  is this pass's. **If the intent was a branch literally off `main`, this is the
+  one thing to correct at merge time.**
+- The tree was clean and everything in it passed as found: clippy, 82 unit
+  tests (3 ignored), 30 integration tests, `npm run check`.
+- Section I's open item, **I3** (benchmark the universe copy on the production
+  instance class), is still open. It needs production access, which this pass
+  did not have. `scripts/leave-gen-bench.sh` is still the tool for it.
+
+### K.1 Race conditions found and fixed
+
+Both are in leave generation, and both are in the window the second pass's I1
+work opened rather than closed: I1 made exactly one request run a generation's
+transition, but nothing said what the *rest* of the job may do while it runs.
+
+| # | The race | Fix | Test |
+|---|---|---|---|
+| **K1** | A task left `available` by a lapsed claim was **reissued during its generation's transition**. A generation does not read as closed until the transition commits its artifact row, so for the tens of seconds a transition takes (streaming millions of rows, deriving leave values, uploading the KLV) `current_generation` still named the closing generation — and `registry::acquire`'s reissue step runs before `next_step`, which is the only thing that knew a transition was running. The worker played the task and its occurrences were folded into the very rows `generation_klv` was streaming, so the uploaded KLV no longer reproduced from the database. A hash mismatch is the one signal `rebuild_artifacts` reserves for a corrupted object, so this would have shown up later as a false corruption report, with no way to tell it from a real one. | `leave_gen::transition_in_progress`, checked under the claim lock before the reissue. A row past the takeover timeout deliberately does not count, so a transition whose process died is still taken over rather than stalling the job forever — the same bound `next_step` takes over on, so the two decisions cannot disagree. | `leave_gen::no_task_is_issued_while_a_generations_transition_runs`. Fails before the fix (200 with a generation-1 task), passes after. |
+| **K2** | A **purge racing a running transition**. Purge deletes the `leave_generation_transitions` row, the artifacts, the progress rows, and reseeds generation 1 — all while a transition spawned before it may still be streaming. The transition then wrote a generation-1 artifact derived from results the job no longer had, and copied the freshly zeroed universe into generation 2, so the purged job believed generation 1 was done and would never redo its work. | `run_transition`'s closing transaction was split out as `leave_gen::close_generation`, and setting `completed_at` is now conditional on the row this request committed still being there and still open. If it is gone, nothing is written and the call fails loudly. The uploaded object is left behind: it is keyed by job and generation, a later transition overwrites it, and `/api/worker/artifact` serves no key no `leave_generation_artifacts` row names. | `leave_gen::a_transition_whose_job_was_purged_meanwhile_closes_nothing`. Fails before the fix, passes after. |
+
+A third concurrency problem, **K3**, is a throughput failure rather than a
+correctness one and is listed below with the other bugs.
+
+**Checked and found sound**, so nothing was changed: the claim/submit lock order
+(claim row, then task row, then job row, on every path that takes more than one);
+`reclaim_expired` against a concurrent submission (the submit path holds the
+claim row from lookup to commit and the reclaim re-checks `state = 'claimed'`
+after waiting on it); `release_claim`'s single-decrement guard; `JobFinished`
+guarded on `status = 'active'`; the tier-activation advisory lock; `next_available`'s
+`FOR UPDATE SKIP LOCKED`; and `count_first_result`, whose correctness rests on
+the task-row lock the second pass added (J1).
+
+### K.2 Other bugs and oversights fixed
+
+| # | What was wrong | Fix | Test |
+|---|---|---|---|
+| **K3** | **Concurrent claims against one job collided on the seed cursor and the losers were told there was no work.** The next seed is `MAX(seed)`, invisible to a concurrent claim's uncommitted task, so overlapping claims all compute the same one; the `(job_id, seed)` unique index catches it only by failing the loser, and `scheduler::claim` gives up after three attempts. Past three-way contention on one job — which the deficit scheduler actively produces, since it points every worker at the most-behind job — a worker got `204` while work existed. | The per-job advisory lock leave generation already used, generalised as `jobs::lock_job_dispatch` and taken by all four generators. It costs nothing that was not already being paid: `issue_claim` bumps `jobs.claims_issued`, holding that job's row lock until commit, so claims against one job already serialize. It only moves the start of that window earlier, turning a lost race into a short wait. | `worker_api::concurrent_claims_tile_the_seed_space_instead_of_colliding` (8 concurrent claims). Fails before the fix — a worker gets `204` — passes after. |
+| **K4** | **An opening-rack submission was never checked against the task it answered.** Every other job type has that rule. Too few racks and the task still *completed*, leaving a hole in the rack space nothing revisits, because the job's finish condition only asks whether every task completed. Racks from nowhere were stored as analyses of this job and added to `jobs.racks_analyzed`, the progress counter the dashboard reads. | `opening_rack::check_batch_against_task`, called from `store_result` alongside the game batch-size check. The request names the racks rather than only how many, so the set is compared rather than the size; order is not part of the contract. The range is re-expanded from `rack_start`/`rack_count`, which costs what dispatching it cost. | `worker_api::an_opening_rack_result_must_answer_the_racks_it_was_given`. Fails before the fix (`accepted: true` for a one-rack answer to a three-rack task), passes after. |
+| **K5** | **One bad rating pool silenced the whole rating sweep.** `recompute_stale` propagated the first pool's error, so every pool ordered after it stopped being refit — silently, for as long as the misconfiguration lasted. A pool whose anchor is no longer a member is an admin-reachable way to produce exactly that. | Each pool is logged and skipped; the returned count is of the fits that actually ran. | — (the failure needs a hand-built pool; the change is a `match` around one call) |
+| **K6** | **The rate-limit bucket maps grew without bound.** `governor`'s keyed limiters keep one entry per key forever, and every key is outside input: a worker UUID, a client address, a username typed at the login form, an address typed into password reset. Memory growth driven by unauthenticated input rather than by how many contributors there are. | `RateLimiters::retain_recent`, swept every ten minutes. Forgetting a full bucket changes no decision — the next request rebuilds it full. | — |
+| **K7** | **No graceful shutdown.** `axum::serve` ran without `with_graceful_shutdown`, so a deployment or `docker stop` dropped everything in flight. A worker that had just uploaded a completed batch lost it: the claim stays `claimed` until the heartbeat timeout, so its retry is answered `accepted: false`. | `SIGTERM` (what ECS sends before escalating at the stop timeout) and `SIGINT` stop accepting connections and let in-flight requests finish. | — |
+| **K8** | **Lifting a ban wrote no audit row**, while applying one did. A ban applied and then quietly removed is exactly the sequence an audit log exists to make visible, and the ban row is gone by the time anyone looks. | `worker.unbanned`, in the same transaction as the delete, naming the identity rather than the ban row. PLAN.md's audit table gained it, and `user.signed_out_everywhere`, which the code already wrote and the table had never listed. | — |
+
+### K.3 Discrepancies between code and PLAN.md
+
+| # | What the code does | What PLAN.md said | Decision | Reasoning |
+|---|---|---|---|---|
+| K-D1 | Account deletion anonymizes the user row and leaves `task_claims` exactly where they are. | The shipped migration's `task_claims` comment — reproduced verbatim in PLAN.md's schema block — still described the pre-F8 sequence: update task counters, delete the task records, delete the claim rows, delete the user row. | **PLAN.md updated** (and the migration comment it is copied from) | The comment describes code that no longer exists, in the two places a reader would most trust it. F8 chose anonymization and gave the reasons; the comment now gives them where the foreign key is declared. No behaviour change. |
+| K-D2 | `scripts/restore-roundtrip.sh` seeds the round-trip database with plain SQL. | Phase 4: the round trip "seeds with `fake_worker.py`". | **PLAN.md updated** | The code wins, and it is also right: what the round trip tests is `pg_dump`/`pg_restore`, and going through the worker API would add a client to the failure surface without adding a row shape. Also a Python-worker correction — see K.4. |
+| K-D3 | The claim path takes a per-job advisory lock for every job type (K3), and leave generation refuses to reissue during a transition (K1). | The lock was described as leave-generation-only; the reissue rule said nothing about transitions. | **PLAN.md updated to match the code change** | These are this pass's own fixes, not pre-existing disagreements. Recorded here so the sections stay in step. |
+| K-D4 | Opening-rack submissions are checked against the dispatched rack set (K4). | The submission section said only a *game* batch is checked against its task, and the impossibility table listed only the game rule. | **PLAN.md updated to match the code change** | As K-D3. PLAN.md's own framing — "the only submission-time check that catches a worker reporting work it did not do" — was what made the gap visible. |
+| K-D5 | `GET /api/jobs/:id/results/stream` streams a job's entire result table to anyone, unauthenticated and unpaginated. | PLAN.md describes it as the offline-analysis download, with no access note. | **Left unresolved — needs human input** | See K.6. |
+
+**Count for this pass: 2 code-wins (PLAN.md updated), 0 plan-wins (code updated
+for a discrepancy), 1 unresolved.** K-D3 and K-D4 are documentation following
+this pass's own fixes rather than discrepancies that existed beforehand. The
+running total across all three passes is in the table at the top of this file,
+plus these.
+
+### K.4 Python worker as a production client
+
+Every reference was re-checked across `README.md`, `TESTING.md`, `RUNBOOK.md`,
+`PLAN.md`, `docker-compose.yml`, `docker/Dockerfile`, `.env.example`,
+`scripts/`, `infra/` and `worker/fake_worker.py` itself.
+
+**One correction, K-D2 above**: PLAN.md said the restore round trip seeds with
+`fake_worker.py`. It does not — it writes the rows directly in SQL — and the
+sentence was the last place in the repository still giving `fake_worker.py` a
+job outside tier 5. Everything else already says MAGPIE is the only production
+client; nothing in the backend special-cases the fake worker.
+
+Separately, `fake_worker.py` was checked against K4's new rule: it answers with
+one analysis per rack in `request["racks"]`, so it satisfies the check, as does
+MAGPIE's opening-rack executor.
+
+### K.5 MAGPIE `birdtest-contribute`
+
+Branch: **`birdtest-contribute`**, committed directly on it as instructed. One
+commit, `cac07a8a`, on top of `62fb6f37`.
+
+**The gap.** Opening racks are the one job type whose request carries `racks`
+and a single `player` rather than a player pair — and **no contract fixture
+covered it on either side**. `contract-fixtures/` had `assignment-games.json`
+and `assignment-leave-generation.json` and nothing else, so birdtest's
+`assignments_carry_a_task_request_this_build_understands` and MAGPIE's
+`test_contract_fixtures_carry_every_key_contribute_reads` both skipped the
+shape. Renaming `racks` or `player` on either side would have passed both test
+suites and broken every opening-rack contributor — the same failure as the
+`plies` / `top_plays` mismatch (C7) that motivated the fixtures in the first
+place.
+
+| Change | Where | Why birdtest needs it |
+|---|---|---|
+| `contract-fixtures/assignment-opening-rack.json` — a simming player, so the win% model the executor loads itself is covered too | both repositories | Closes the gap above. Verified by deliberately renaming `racks` in MAGPIE's copy: `test_contract_fixtures_carry_every_key_contribute_reads` fails with the name it could not find. |
+| The fixture added to birdtest's round-trip test | `backend/src/routes/worker.rs` | Parses it into the real `TaskRequest` and compares field structure, so the server's half is pinned as well. |
+| Opening-rack assertions in `test_contract_fixtures_carry_every_key_contribute_reads` | MAGPIE `test/contribute_test.c` | Asserts the request keys, a non-empty `racks`, and the full player key set — the executor applies the player exactly as the games executor applies `player1`. |
+
+**Verified, no changes needed:** `magpie_test contribute` passes (dev build,
+ASan/UBSan). The contract fixtures present in both repositories are
+byte-identical. `contribute.c` reads everything birdtest sends and nothing it
+does not — the shutdown directive, `worker_uuid`, `min_magpie_version`, the
+`expected_data` files, and the artifact key (validated before use). Nothing in
+this pass's birdtest changes touches the wire format: K1, K2, K3, K5–K8 are
+internal to the server, and K4 tightens a check on a payload MAGPIE already
+produces correctly.
+
+### K.6 Worth deciding next
+
+Carried forward: **I3** (benchmark the universe copy on the production instance
+class) is still open and still needs production access.
+
+New, and each a decision rather than a bug:
+
+#### K-D5. `GET /api/jobs/:id/results/stream` is public, unauthenticated and unbounded
+
+It streams every row of a job's result table as newline-delimited JSON, straight
+from a cursor. That is the point — it is the offline-analysis download, and the
+streaming is what keeps the server's memory flat. But it is reachable by anyone,
+it has no pagination or rate limit, and for a full English opening-rack job it is
+tens of millions of rows. One caller can hold a database connection open for the
+length of that scan, and *n* callers can hold *n* of them, which is a denial of
+service that costs the attacker one HTTP request.
+
+- **A. Rate limit it** per IP, like the auth endpoints, and cap concurrent streams.
+  - *For:* keeps it public, which matches the "crowdsourced, open data" intent; small change.
+  - *Against:* an attacker with a few addresses still occupies the pool.
+- **B. Require an account.** Any signed-in user may stream; anonymous callers get the paginated endpoint.
+  - *For:* attaches a cost and an identity to the expensive read.
+  - *Against:* the data is meant to be open, and registration is a real barrier for a researcher who only wants the numbers.
+- **C. Make it an admin-triggered export** to the artifact bucket, with a signed URL.
+  - *For:* the read happens once per export rather than once per caller, and object storage is what serves large files.
+  - *Against:* the most work, and the download is no longer live.
+- **D. Keep it.** Document that it is an unmetered public endpoint.
+
+**Recommendation: A now, C if the corpus becomes something people actually
+download.** Left unresolved because it is an access-policy decision about how
+open the data is meant to be, which is not the audit's to make.
+
+#### K-D6. Two smaller ones, recorded rather than fixed
+
+- **`jobstats::opening_rack_stats` still averages over every stored move row.**
+  I2 replaced the distinct-rack `COUNT` with a counter but left
+  `AVG(m.equity)` scanning the job's whole history, on the detail page and every
+  SSE push. F16 measured the sibling query at 2.1 s for a million racks. A
+  running sum and count alongside `racks_analyzed` would make it constant-time,
+  but it is a third denormalized counter to keep correct through purge and
+  restore — the trade-off I2 already weighed, on a read nobody has complained
+  about yet.
+- **MAGPIE leaves a locally-failed task's claim to time out** rather than
+  declining it, so the task is not reissued for the heartbeat timeout (five
+  minutes by default). Declining would release it at once, but
+  `contribute_decline_task` also calls `remember_unsupported`, which would
+  blacklist the whole job for what may be a transient failure. Separating "give
+  this task back" from "I cannot run this job" is the real fix and is a protocol
+  change on both sides, so it is flagged rather than made.
+
+### K.7 Verification (this pass)
+
+- `cargo clippy --locked --all-targets -- -D warnings`: clean.
+- `cargo test --locked`: **82 unit and contract tests** (3 ignored, as before)
+  and **32 integration tests** against a real Postgres 16 — admin 4, auth 3,
+  leave generation 11, worker 14. The four new tests were each run against the
+  code *before* their fix and observed to fail in the way described, then
+  against the code after and observed to pass.
+- Frontend `npm run check`: 0 errors, 0 warnings.
+- MAGPIE `birdtest-contribute`: `make magpie_test` builds (dev build, `-Werror`,
+  ASan, UBSan) and `./bin/magpie_test contribute` passes. The new contract
+  assertion was verified to fail on a deliberately renamed key.
+- **Not run this pass:** Terraform `fmt`/`validate` (no Terraform binary on this
+  machine; CI runs both and nothing here touched `infra/`), the Docker image
+  builds, and `scripts/e2e_magpie.py` against a live stack. Nothing in this pass
+  changes the wire format, the images or the infrastructure; the four behaviour
+  changes that could affect a real run (K1–K4) are covered by integration tests
+  driving the real router against a real database.
+- **Migration checksum, again.** K-D1 edits a comment in `0001_initial.sql`
+  in place, per the pre-release convention. A database built from the earlier
+  `0001` — including any local compose volume — will refuse to migrate. No
+  deployed database exists; reset locally (README, "After a schema change").
+  This is the same situation J.5 recorded, now for one more edit.

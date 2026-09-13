@@ -57,6 +57,29 @@ impl RateLimiters {
             login: Arc::new(RateLimiter::keyed(logins_per_minute)),
         }
     }
+
+    /// Drop the buckets that have been full (and so idle) long enough to be
+    /// indistinguishable from a caller that has never been seen.
+    ///
+    /// `governor`'s keyed limiters keep one entry per key forever otherwise,
+    /// and every key here comes from the outside: a worker UUID, a client
+    /// address, a username tried at the login form, an address typed into
+    /// password reset. A long-running process accumulates one entry per
+    /// distinct value anyone has ever sent it, which is unbounded memory growth
+    /// driven by unauthenticated input rather than by how many contributors
+    /// there actually are. Forgetting a full bucket changes no decision: the
+    /// next request rebuilds it full.
+    pub fn retain_recent(&self) {
+        for limiter in [
+            &self.register,
+            &self.worker,
+            &self.unregistered_worker,
+            &self.reset,
+            &self.login,
+        ] {
+            limiter.retain_recent();
+        }
+    }
 }
 
 impl Default for RateLimiters {

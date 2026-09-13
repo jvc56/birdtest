@@ -57,6 +57,10 @@ pub async fn acquire(
 }
 
 async fn generate_opening_rack(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
+    // Before the range is read: `next_request` addresses the next slice with
+    // `MAX(seed)`, which a concurrent claim's uncommitted task is invisible to.
+    super::lock_job_dispatch(&mut *conn, job.id).await?;
+
     let config = sqlx::query_as::<_, OpeningRackConfig>(
         "SELECT * FROM job_opening_rack_config WHERE job_id = $1",
     )
@@ -144,6 +148,9 @@ pub async fn load_request(
 }
 
 async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
+    // See `generate_opening_rack`: the seed cursor is `MAX(seed)`.
+    super::lock_job_dispatch(&mut *conn, job.id).await?;
+
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
         .bind(job.id)
         .fetch_one(&mut *conn)
@@ -157,6 +164,9 @@ async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquire
 }
 
 async fn generate_game_pairs(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
+    // See `generate_opening_rack`: the seed cursor is `MAX(seed)`.
+    super::lock_job_dispatch(&mut *conn, job.id).await?;
+
     let config =
         sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
             .bind(job.id)
@@ -196,6 +206,20 @@ async fn generate_leave_gen(
     let Some(generation) = leave_gen::current_generation(&mut *conn, job.id, &config).await? else {
         return Ok(Acquired::JobFinished);
     };
+
+    // While this generation's transition is running there is nothing to hand
+    // out for it, and that has to be checked before the reissue below rather
+    // than only in `next_step`. The generation does not read as closed until
+    // the transition commits its artifact row, so without this a task left
+    // `available` by a lapsed claim would be reissued mid-transition: the
+    // worker would play it and fold its occurrences into the very rows the
+    // transition is streaming, so the KLV it uploaded would no longer be
+    // reproducible from the database -- and a hash mismatch is the one signal
+    // `rebuild_artifacts` reserves for a corrupted object.
+    if leave_gen::transition_in_progress(&mut *conn, job.id, generation).await? {
+        return Ok(Acquired::NoWork);
+    }
+
     if let Some(task_id) = next_available(&mut *conn, job.id, identity, Some(generation)).await? {
         let request = load_request(conn, job.job_type, task_id).await?;
         return Ok(Acquired::Task { task_id, request });
@@ -275,6 +299,9 @@ pub async fn store_result(
     match job.job_type {
         JobType::OpeningRack => {
             let record = opening_rack::OpeningRackHandler::process_response(decode(payload)?)?;
+            let racks: Vec<String> =
+                record.positions.iter().map(|p| p.rack.clone()).collect();
+            opening_rack::check_batch_against_task(conn, task_id, &racks).await?;
             opening_rack::OpeningRackHandler::insert_record(conn, task_id, claim_id, &record)
                 .await?;
             // One row per rack, and the unique index on (task_claim_id, rack)

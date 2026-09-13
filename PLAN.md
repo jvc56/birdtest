@@ -131,6 +131,7 @@ one of them rejects an arithmetic or physical impossibility:
 | `num_moves` is at least the number of moves reported | A worker cannot report more moves than it says it generated |
 | A leave submission lists no rack twice | Occurrences are **summed** on receipt, so a duplicate silently inflates a generation's coverage |
 | A batch reports exactly the games the task dispatched | The size was fixed when the task was handed out |
+| An opening-rack batch analyses exactly the racks the task dispatched | The racks themselves were named when the task was handed out |
 
 The pentanomial cross-check ([MAGPIE reports the
 pentanomial](#magpie-reports-the-pentanomial)) belongs to the same family and is
@@ -450,6 +451,12 @@ pool, an active job submits results far faster than any rating needs to move, an
 — unlike SPRT — nothing blocks on the answer. The sweep compares the pool's
 current pair count against the last run's `pairs_used`, so no dirty flag is
 needed anywhere.
+
+**One pool's failure does not stop the others.** A fit can fail on state an
+admin can reach — a pool whose anchor is no longer a member is the obvious one
+— and propagating that ended the whole sweep at the first such pool, so every
+pool ordered after it silently stopped being refit for as long as the
+misconfiguration lasted. Each pool is logged and skipped instead.
 
 Runs are **snapshotted, not mutated**: one `rating_runs` row per fit with its
 provenance (trigger, iterations, convergence, evidence consumed) and one
@@ -1561,12 +1568,26 @@ Then, up to **three attempts**:
    `500` for as long as it stays there, and every client retries those.
 3. If no candidate produced work and nothing asked for a restart, return `Idle`.
 
+**Acquiring a task takes the job's dispatch lock first**
+(`pg_advisory_xact_lock`, per job, held for the rest of the claim
+transaction). Every job type decides what to hand out next from reads a
+concurrent claim's uncommitted writes are invisible to: games, game pairs and
+opening racks address the next slice with `MAX(seed)`, and leave generation
+additionally decides which racks are still out and whether the generation can
+close. The lock costs nothing that was not already being paid — issuing a
+claim bumps `jobs.claims_issued`, which holds that job's row lock until
+commit, so claims against one job already serialize — and it turns a lost race
+into a short wait. It is per job, so claims against other jobs are unaffected.
+
 **Two things legitimately restart an attempt**, and both are ordinary rather than
 exceptional:
 
 - A **lost race on `(job_id, seed)`**, when two workers generate the same
   on-demand task simultaneously. One insert wins; the loser retries and lands on
-  the next seed.
+  the next seed. The dispatch lock makes this rare rather than impossible — a
+  purge running between the cursor read and the insert can still produce it —
+  and it was the common case before that lock existed, where past three-way
+  contention on one job a worker was answered `204` while work existed.
 - A **lost race on the per-identity partial unique index**, which rejects a second
   concurrent slot on the same task by the same worker. That is not a failure —
   this worker already holds a slot here — so it re-runs selection and lands
@@ -1657,7 +1678,8 @@ stored, since a job that does not play pairs has no pairs to describe.
 
 **Opening racks.** At least one rack, and every rack must carry at least one
 move — the moves arrive ranked best-first, so an empty list means nothing was
-analysed and there is no best move to record.
+analysed and there is no best move to record. The submission must also name
+**exactly the racks the task dispatched**, as a set; see below.
 
 **Leave generation.** At least one rack occurrence.
 
@@ -1669,11 +1691,23 @@ rather than oddities. See [Why impossibility, and not per-worker anomaly
 detection](#why-impossibility-and-not-per-worker-anomaly-detection) for the
 reasoning and the full table.
 
-One of them cannot run in the pure validation step, because it needs the
-request: **a batch must report exactly the games the task dispatched**
-(`num_games`, doubled for pairs). It runs in `store_result`, where the task id
-is in hand, and it is the only submission-time check that catches a worker
-reporting work it did not do.
+Two of them cannot run in the pure validation step, because they need the
+request. They run in `store_result`, where the task id is in hand, and they are
+the only submission-time checks that catch a worker reporting work it did not
+do:
+
+- **A game batch must report exactly the games the task dispatched**
+  (`num_games`, doubled for pairs).
+- **An opening-rack batch must analyse exactly the racks the task dispatched.**
+  The request names the racks rather than only how many, so the whole set is
+  compared rather than its size; order is not part of the contract. The range is
+  re-expanded from `rack_start`/`rack_count` against the job's pinned
+  distribution, which costs what dispatching it cost. This matters in both
+  directions: too few racks and the task still *completes*, leaving a hole in
+  the space nothing revisits, because the job's finish condition only asks
+  whether every task completed; racks from nowhere are stored as analyses of
+  this job and added to `jobs.racks_analyzed`, the progress counter the
+  dashboard reads.
 
 #### How much of an analysis is stored
 
@@ -1830,7 +1864,7 @@ At claim time:
 
    **The whole of step 2 runs under a per-job advisory lock** (`pg_advisory_xact_lock`, taken before anything is read and released when the claim transaction ends). Without it every read here is made against a view of the job that a concurrent claim may be in the middle of changing, and two races follow: a claim still being issued is not yet visible as in flight, so a generation could be closed while a task for it was going out — work that lands in a generation whose KLV is already built — and two claims could both find the generation complete and both start its transition, each streaming millions of rows and uploading a KLV. The lock is per job, so claims for other jobs never wait on it, and it is *not* held across the transition itself: a transaction held open across an S3 upload is what step 2 of the transition exists to avoid.
 
-   **Reopened tasks are reissued here, not before.** For every other job type a task whose claim timed out is re-dispatched before anything new is generated. For leave generation that happens only after the lock is taken and the current generation determined, and only for a task whose `leave_requests.generation` is that generation; step 2 runs when there is none. Reissued before the lock, a claim would be invisible to the in-flight check exactly as a new one was. Reissued for any generation, a task from a generation that has since closed would be handed out again, played with an outdated KLV, and its result discarded. A task left over from a closed generation stays `available` and is never dispatched again, so the job list's task counts for a leave job can show a few such tasks as never completed.
+   **Reopened tasks are reissued here, not before.** For every other job type a task whose claim timed out is re-dispatched before anything new is generated. For leave generation that happens only after the lock is taken and the current generation determined, and only for a task whose `leave_requests.generation` is that generation *and* only while no transition for that generation is running; step 2 runs when there is none. The transition check is separate from the generation check and both are needed: a generation does not read as *closed* until its transition commits the artifact row, so throughout the tens of seconds a transition takes, the current generation is still the closing one and a reopened task of it would otherwise be handed straight back out — its occurrences folded into the very rows the transition is streaming, leaving the uploaded KLV irreproducible from the database. A transition past the takeover timeout does not count, or a job whose transition process died would stall forever instead of being taken over. Reissued before the lock, a claim would be invisible to the in-flight check exactly as a new one was. Reissued for any generation, a task from a generation that has since closed would be handed out again, played with an outdated KLV, and its result discarded. A task left over from a closed generation stays `available` and is never dispatched again, so the job list's task counts for a leave job can show a few such tasks as never completed.
 3. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, NULL, 'available') RETURNING id`, claimed in the same transaction.
 4. `INSERT INTO leave_requests (task_id, lexicon, variant, letter_distribution, board_layout, generation, forced_racks, num_games, previous_artifact_key, use_wordmap)` — `forced_racks` is the chosen rack subset (see Schema); `previous_artifact_key` is the prior generation's combined KLV, which for generation 1 is the server-built zeroed KLV stored at generation 0, so it is never NULL.
 5. `INSERT INTO task_claims (...)`.
@@ -1848,7 +1882,7 @@ The reported list covers **every rack that occurred during the batch, forced or 
 
 **Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server derives every leave's value from that generation's full-rack means and builds the generation's KLV artifact directly in Rust (`backend/src/jobs/klv.rs`), uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete.
 
-The transition takes tens of seconds and runs *outside* the claim transaction, on its own task so that a worker or proxy giving up on the request cannot cancel it part-way. That leaves the deciding claim holding no lock while it works, so ownership is recorded instead: the claim transaction that finds the generation complete inserts `leave_generation_transitions (job_id, generation)` and **commits** — its only write is that row, and committing is both what makes the row visible to everyone else and what releases the job's advisory lock before the upload starts. The row's primary key is what means every other claim arriving meanwhile is told there is no work yet rather than starting the same transition again. `completed_at` is set in the same transaction as the artifact row. A transition that never finishes — the process died, or the object store refused the upload — is taken over by a later claim once `started_at` is older than the takeover timeout (30 minutes, far longer than any measured transition), and `attempts` records that it happened; a failure the server survives hands ownership back immediately instead of waiting out the timeout.
+The transition takes tens of seconds and runs *outside* the claim transaction, on its own task so that a worker or proxy giving up on the request cannot cancel it part-way. That leaves the deciding claim holding no lock while it works, so ownership is recorded instead: the claim transaction that finds the generation complete inserts `leave_generation_transitions (job_id, generation)` and **commits** — its only write is that row, and committing is both what makes the row visible to everyone else and what releases the job's advisory lock before the upload starts. The row's primary key is what means every other claim arriving meanwhile is told there is no work yet rather than starting the same transition again. `completed_at` is set in the same transaction as the artifact row, and setting it is **conditional on the row still being there and still open** — that is how a transition finds out it no longer owns anything. A purge deletes the transitions row along with the artifacts and progress rows and reseeds generation 1, so a transition spawned before it would otherwise hand the purged job a generation-1 KLV derived from results it no longer has, and copy a freshly zeroed universe into generation 2. When the close is refused nothing is written and the uploaded object is left behind; it is keyed by job and generation, so a later transition of the same generation overwrites it, and `GET /api/worker/artifact` serves no key that no `leave_generation_artifacts` row names. A transition that never finishes — the process died, or the object store refused the upload — is taken over by a later claim once `started_at` is older than the takeover timeout (30 minutes, far longer than any measured transition), and `attempts` records that it happened; a failure the server survives hands ownership back immediately instead of waiting out the timeout.
 
 The derivation is a port of MAGPIE's `rack_list_write_to_klv` (`klv::FullRackLeaves`). Each full rack `R` has a mean `m(R)` — `equity_sum / occurrence_count`, or 0 if it never occurred — and a weight, the ways to draw it from a full bag (the product over letters of `C(dist, R)`). The average is the weighted mean of `m(R)` over every full rack. Every proper, non-empty sub-multiset `L` of `R` receives `m(R)` weighted by the ways to draw the rest of `R` once `L` is held (the product of `C(dist − L, R − L)`), and a leave's value is its weighted mean minus the average, or 0 if nothing contributed. A unit test pins the port against a direct, brute-force statement of that definition. Rows are streamed and the arithmetic runs on blocking threads; English takes about 13 seconds in a release build.
 
@@ -2941,8 +2975,12 @@ boundary** between two independently released programs:
   `config_contribute_*` functions and birdtest's `routes/worker.rs` agreeing.
   [`contract-fixtures/`](contract-fixtures/) is the cheap version of fixing
   that: one committed example of each message either side has to produce or
-  read — an assignment carrying `expected_data`, a claim carrying
+  read — an assignment of each of the three request shapes (games, opening
+  racks, leave generation) carrying `expected_data`, a claim carrying
   `unsupported_jobs` and `magpie_version`, a decline, and each shutdown reason.
+  Opening racks earn their own fixture because theirs is the one request that
+  carries `racks` and a single `player` rather than a player pair, so nothing
+  else pins those two names.
 
   birdtest's half is enforced (`routes::worker::contract_fixtures` parses every
   fixture against the real wire types, comparing field structure rather than
@@ -3231,6 +3269,14 @@ given: a way to probe which addresses have accounts, and a way to bury a known
 contributor in reset emails at the operator's expense. Limiting by IP alone
 stops neither, because IPs are cheap.
 
+Every key here comes from outside — a worker UUID, a client address, a username
+typed at the login form, an address typed into password reset — and a keyed
+bucket map keeps one entry per key it has ever seen. That is unbounded memory
+growth driven by unauthenticated input rather than by how many contributors
+there are, so a background sweep drops buckets that have gone idle (ten
+minutes, against buckets that refill in seconds to an hour). Forgetting a full
+bucket changes no decision: the next request rebuilds it full.
+
 #### Health and startup
 
 `GET /health` returns `200 ok` and is what the container healthcheck and the ALB
@@ -3239,6 +3285,13 @@ use. On startup the process, in order: loads config from the environment
 migrations before binding** so a container never serves traffic against an
 out-of-date schema, fails any input-data import left `running` by a previous
 process, and only then listens.
+
+On the way out it **shuts down gracefully**: `SIGTERM` (what ECS sends before it
+escalates to `SIGKILL` at the stop timeout) and `SIGINT` stop it accepting new
+connections and let in-flight requests finish. Without that, a deployment drops
+whatever is in flight — and a worker that has just uploaded a completed batch
+loses it, because the claim it was for is still `claimed` and stays that way
+until the heartbeat timeout, so the retry is answered `accepted: false`.
 
 #### Audit actions
 
@@ -3258,6 +3311,8 @@ as the action itself, so an audit failure rolls back what it describes.
 | `job.artifacts_rebuilt` | Artifact rebuild, with counts |
 | `input_data.import_staged` / `input_data.import_confirmed` | Tarball import |
 | `worker.banned` | Ban, with the free-text reason |
+| `worker.unbanned` | Lifting a ban, naming the identity rather than the ban row, which is gone |
+| `user.signed_out_everywhere` | "Sign out everywhere" on the account page |
 
 The `.census` rows are the reason the destructive ones are worth having.
 `purge_job`, `delete_job` and `delete_user` each count what they are about to
@@ -4170,13 +4225,14 @@ CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
 --
--- Account deletion is handled at the application layer (not via ON DELETE CASCADE) because
--- task counters (accepted_count, active_claim_count) must be decremented and tasks may need
--- to revert from completed → available. The deletion sequence is:
---   1. For each active/completed claim: update task counters.
---   2. Delete all task records (game_results, etc.) linked to those claims.
---   3. Delete the task_claim rows.
---   4. Delete the user row (cascades to api_keys, email_confirmations, password_reset_tokens).
+-- claimed_by_user_id carries no ON DELETE clause because a user row is never
+-- deleted: account deletion anonymizes it in place (users.deleted_at, and a
+-- tombstone username and email) and leaves these rows exactly where they are.
+-- Removing them instead would take with them the captured in-game positions
+-- keyed to those claims -- including the ones other redundant claims
+-- deduplicated against, which nothing else holds -- and leave-generation
+-- occurrences that were folded into per-rack totals and cannot be subtracted
+-- back out. See routes::admin::delete_user.
 
 -- 'declined' is distinct from 'abandoned': one is a worker saying "I cannot do
 -- this", the other is a claim that lapsed. Only the first is diagnostic.
@@ -5183,8 +5239,11 @@ invisible.
 **Phase 4 — restore tooling and drills.** [RUNBOOK.md](RUNBOOK.md) as literal
 copy-pasteable commands with the counter-repair SQL spelled out; the local
 dump/restore/scrub scripts; the monthly automated restore drill; a round-trip test
-that brings up `docker compose`, seeds with `fake_worker.py`, dumps, drops, restores
-and asserts the verification checks pass.
+that brings up `docker compose`, seeds a row in every table a result touches with
+plain SQL, dumps, drops, restores and asserts the verification checks pass.
+(`scripts/restore-roundtrip.sh` seeds directly rather than through a worker: what
+it is testing is `pg_dump`/`pg_restore`, and going through the worker API would
+add a client to the failure surface without adding a row shape.)
 
 #### Where the implementation differed from the plan
 

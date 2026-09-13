@@ -505,3 +505,118 @@ async fn public_endpoints_name_anonymous_workers_by_pseudonym_only() {
     let (status, _) = send(&app, get_request("/api/admin/workers", &[])).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+/// Bug: an opening-rack submission was never checked against the task it
+/// answered.
+///
+/// Every other job type has that rule -- a batch reports exactly what was
+/// dispatched -- and opening racks are where it bites hardest in both
+/// directions. Answering with fewer racks still completed the task, leaving a
+/// hole in the rack space nothing revisits, because the job's finish condition
+/// only asks whether every task completed. Answering with racks from nowhere
+/// stored them as analyses of this job and added them to `jobs.racks_analyzed`,
+/// the progress counter the dashboard reads.
+#[tokio::test]
+async fn an_opening_rack_result_must_answer_the_racks_it_was_given() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("solver", admin).await;
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 3, 7, 100)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = assignment["claim_token"].as_str().unwrap().to_string();
+    let racks: Vec<String> = assignment["task_request"]["racks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(racks.len(), 3);
+
+    let analysed = |racks: &[String]| {
+        json!({ "racks": racks.iter().map(|rack| json!({
+            "rack": rack,
+            "num_moves": 1,
+            "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
+        })).collect::<Vec<_>>() })
+    };
+
+    // Short of what was dispatched.
+    let (status, body) = submit_as(&app, &uuid, &token, analysed(&racks[..1])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("dispatched"), "{body}");
+
+    // The right number of racks, but not the ones asked for. The count check
+    // alone would let this through, which is why the set is compared.
+    let mut invented = racks.clone();
+    invented[1] = "ZZZZZZZ".to_string();
+    let (status, body) = submit_as(&app, &uuid, &token, analysed(&invented)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("ZZZZZZZ"), "{body}");
+
+    // Nothing was stored or counted by either attempt, and the claim is still
+    // open for the real answer.
+    let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(job_row.racks_analyzed, 0);
+
+    // Order is not part of the contract, only the set.
+    let mut reordered = racks.clone();
+    reordered.reverse();
+    let (status, body) = submit_as(&app, &uuid, &token, analysed(&reordered)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(job_row.racks_analyzed, 3);
+}
+
+/// Bug: concurrent claims against one job collided on the seed cursor and the
+/// losers were answered `204` while work existed.
+///
+/// The next seed is `MAX(seed)`, which a concurrent claim's uncommitted task is
+/// invisible to, so overlapping claims all compute the same one. The
+/// `(job_id, seed)` unique index catches that, but only by failing the loser,
+/// and `scheduler::claim` gives up after three attempts -- so past three-way
+/// contention a worker was told there was nothing to do. Claims for one job
+/// already serialize on the `jobs` row (`claims_issued`), so taking the job's
+/// dispatch lock before reading the cursor costs nothing that was not already
+/// being paid and turns the lost race into a short wait.
+#[tokio::test]
+async fn concurrent_claims_tile_the_seed_space_instead_of_colliding() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 10).await;
+    let app = birdtest::app(db.state().await);
+
+    // Well past the three retries the old path allowed.
+    const WORKERS: usize = 8;
+    let claims = futures::future::join_all((0..WORKERS).map(|_| {
+        let app = app.clone();
+        async move { send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await }
+    }))
+    .await;
+
+    let mut seeds = Vec::new();
+    for (status, body) in &claims {
+        assert_eq!(status, &StatusCode::OK, "a worker was told there was no work: {body}");
+        seeds.push(body["task_request"]["seed"].as_str().unwrap().to_string());
+    }
+    seeds.sort();
+    seeds.dedup();
+    assert_eq!(seeds.len(), WORKERS, "every claim got its own slice of the seed space");
+
+    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(tasks, WORKERS as i64);
+}

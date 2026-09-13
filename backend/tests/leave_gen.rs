@@ -482,3 +482,146 @@ async fn the_transition_owner_is_committed_before_the_transition_runs() {
     let step = next_step(&db, job).await;
     assert!(matches!(step, Step::Transition), "{step:?}");
 }
+
+/// Bug: a task left `available` by a lapsed claim was reissued *during* its
+/// generation's transition.
+///
+/// A generation does not read as closed until the transition commits its
+/// artifact row, and the transition takes tens of seconds -- streaming every
+/// rack, deriving the leave values, uploading the KLV. Throughout that window
+/// `current_generation` still named the closing generation, so the reissue that
+/// runs before `next_step` handed the task straight back out. The worker played
+/// it and its occurrences were folded into the very rows the transition was
+/// reading, so the KLV it uploaded no longer reproduced from the database --
+/// and a hash mismatch is the one signal `rebuild_artifacts` reserves for a
+/// corrupted object.
+#[tokio::test]
+async fn no_task_is_issued_while_a_generations_transition_runs() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    // One task, then let its claim lapse, so a reissuable `available` task
+    // exists for generation 1.
+    let (status, first) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    sqlx::query("UPDATE task_claims SET claimed_at = now() - interval '1 hour'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(birdtest::scheduler::reclaim_expired(&db.pool, job, 300.0).await.unwrap(), 1);
+
+    // The generation is complete and a transition owns it, exactly as the
+    // claim that found it complete leaves things.
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = 1000
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO leave_generation_transitions (job_id, generation) VALUES ($1, 1)",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a task of the closing generation was reissued mid-transition: {body}"
+    );
+
+    // A transition whose process died still gets taken over rather than
+    // stalling the job forever, which is why the check uses the same bound the
+    // takeover does.
+    sqlx::query(
+        "UPDATE leave_generation_transitions SET started_at = now() - interval '2 hours'
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::Transition), "past the takeover timeout: {step:?}");
+}
+
+/// A transition that outlived the job it was closing writes nothing.
+///
+/// Purge deletes the transitions row, the artifacts and the progress rows and
+/// reseeds generation 1 -- all while a transition spawned before it may still
+/// be streaming. Closing anyway would hand the purged job a generation-1 KLV
+/// derived from results it no longer has, and copy a freshly zeroed universe
+/// into generation 2, so the job would never do generation 1's work again.
+#[tokio::test]
+async fn a_transition_whose_job_was_purged_meanwhile_closes_nothing() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let config = sqlx::query_as::<_, birdtest::models::job::LeaveConfig>(
+        "SELECT * FROM job_leave_config WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let sha256 = "1".repeat(64);
+    let close = || {
+        birdtest::jobs::leave_gen::close_generation(
+            &db.pool,
+            job,
+            1,
+            "leaves/test/generation-1.klv2",
+            &sha256,
+            &config,
+        )
+    };
+
+    // With no ownership row at all -- what a purge leaves behind -- the close
+    // is refused rather than inventing a closed generation.
+    let err = close().await.expect_err("a transition with no owner row must not close");
+    assert!(err.message.contains("purged"), "{}", err.message);
+    let artifacts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(artifacts, 0, "nothing was written");
+    let generations: Vec<i32> = sqlx::query_scalar(
+        "SELECT DISTINCT generation FROM leave_rack_progress WHERE job_id = $1 ORDER BY 1",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(generations, vec![1], "generation 2's universe was not seeded");
+
+    // With the row this request owns, the same call closes the generation.
+    sqlx::query("INSERT INTO leave_generation_transitions (job_id, generation) VALUES ($1, 1)")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    close().await.expect("the owner closes its own generation");
+    let generations: Vec<i32> = sqlx::query_scalar(
+        "SELECT DISTINCT generation FROM leave_rack_progress WHERE job_id = $1 ORDER BY 1",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(generations, vec![1, 2]);
+
+    // And a second close of the same generation is refused too, so a taken-over
+    // transition that turns out to have been finished cannot rewrite it.
+    assert!(close().await.is_err());
+}

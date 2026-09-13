@@ -1848,14 +1848,35 @@ async fn unban_worker(
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
 
-    let deleted = sqlx::query("DELETE FROM worker_bans WHERE id = $1")
-        .bind(id)
-        .execute(&state.pool)
-        .await?;
-    if deleted.rows_affected() == 0 {
+    // Logged like the ban it lifts, in the same transaction, and naming the
+    // identity rather than the ban row: a ban that was applied and then quietly
+    // removed is exactly the sequence an audit log exists to make visible, and
+    // the ban row is gone by the time anyone reads it.
+    let mut tx = state.pool.begin().await?;
+    let target: Option<(Option<Uuid>, Option<Uuid>)> =
+        sqlx::query_as("DELETE FROM worker_bans WHERE id = $1 RETURNING user_id, anon_uuid")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some((user_id, anon_uuid)) = target else {
         return Err(AppError::not_found("no such ban"));
-    }
-    let _ = admin;
+    };
+    audit::log(
+        &mut tx,
+        "worker.unbanned",
+        Some(admin.0.id),
+        None,
+        Some("worker"),
+        Some(
+            user_id
+                .or(anon_uuid)
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+        ),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

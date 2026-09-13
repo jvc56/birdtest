@@ -612,6 +612,10 @@ mod contract_fixtures {
         for (name, fixture) in [
             ("games", include_str!("../../../contract-fixtures/assignment-games.json")),
             (
+                "opening-rack",
+                include_str!("../../../contract-fixtures/assignment-opening-rack.json"),
+            ),
+            (
                 "leave-generation",
                 include_str!("../../../contract-fixtures/assignment-leave-generation.json"),
             ),

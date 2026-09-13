@@ -15,6 +15,44 @@ use racks::LetterDistribution;
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
+/// The advisory-lock namespace for dispatch decisions. Postgres advisory locks
+/// are a single flat 64-bit space shared by every user of them, so the
+/// two-argument form's first key is a namespace and the second identifies the
+/// job.
+const DISPATCH_LOCK_NAMESPACE: i32 = 1;
+
+/// Serialize one job's dispatch decisions against each other, for the rest of
+/// the caller's transaction.
+///
+/// Every job type needs this, for the same reason: what to hand out next is
+/// decided from reads that a concurrent claim's uncommitted writes are
+/// invisible to.
+///
+/// - **Games, game pairs and opening racks** pick the next seed with
+///   `MAX(seed)`, so two overlapping claims compute the same one. The
+///   `(job_id, seed)` unique index catches that, but only by failing the loser,
+///   and `scheduler::claim` gives up after three attempts -- so past three-way
+///   contention on one job a worker is told `204` while work exists. The lock
+///   costs nothing that was not already being paid: `issue_claim` bumps
+///   `jobs.claims_issued`, which takes the job's row lock until commit, so
+///   claims against one job already serialize. This only moves the start of
+///   that window earlier, turning a lost race into a short wait.
+/// - **Leave generation** additionally decides which racks are still out and
+///   whether the generation can close; see `leave_gen::next_step`.
+///
+/// Per job, so claims for other jobs are unaffected, and transaction-scoped, so
+/// it is released on commit, on rollback, and on a dropped connection.
+/// `hashtext` may collide, which costs two unrelated jobs a little
+/// serialization and nothing else.
+pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(DISPATCH_LOCK_NAMESPACE)
+        .bind(job_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 pub(crate) async fn load_player_spec(
     conn: &mut PgConnection,
     player_config_id: Uuid,
