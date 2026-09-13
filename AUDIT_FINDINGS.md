@@ -21,7 +21,7 @@ decisions:
 |---|---|---|
 | **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **24** (21 in A.1, J3, K-D1, K-D2) |
 | **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **18** (16 in A.2, J1, J2) |
-| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised seven; K-D5 and K-D11 are decided (and K-D11 resolves K-D6 and K-D10), none of them built yet, plus I3 carried forward. | **8 decided, 3 open** |
+| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised seven; K-D5, K-D7 and K-D11 are decided and K-D11 resolves K-D6 and K-D10, none built yet, leaving K-D8, K-D9 and I3 open. | **10 decided, 3 open** |
 
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
@@ -32,9 +32,10 @@ the status of section I (I1 and I2 implemented, I3 still open), the
 discrepancies it found, and its verification. **Section K is the third pass**,
 which found and fixed two more races in leave generation, a scheduler contention
 bug, and a missing submission check. **K.6 is the current list of open
-questions** — K-D5 to K-D11, each with options and a recommendation. K-D5 and
-K-D11 are decided but not yet built, and K-D11 resolves K-D6 and K-D10 by
-deleting the fields they were about. It
+questions** — K-D5 to K-D11. **K-D5, K-D7 and K-D11 are decided and not yet
+built**; K-D6 and K-D10 are resolved by K-D11, which deletes the fields they
+were about, and survive only as tombstones. **K-D8 and K-D9 are still open**,
+with options and a recommendation each. It
 supersedes I3, whose suggested fix does not work (K-D9). The Verification
 section just below describes the first pass; J.6 and then K.7 supersede it for
 current numbers.
@@ -1173,94 +1174,47 @@ the KLVs.
   That is the whole point of building C: a completed job's corpus should be read
   from a stable artifact once, not re-scanned per caller.
 
-**What follows, and one thing to confirm.** These two together mean the bulk
-corpus of a completed-and-exported job is reachable only by an admin — a public
-caller hitting the stream is deferred to a URL it cannot fetch. So the
-deferral has to answer a non-admin with something honest (`404`, naming the
-export as the route) rather than a redirect into a wall. That leaves an odd
-shape: the public could bulk-stream an *active* job — expensive, unbounded,
-still growing — but not a *completed* one, which is the cheap stable case. That
-is backwards on cost.
+**And the stream becomes admin-only outright.** Admin-only exports plus a
+deferral to them would otherwise have left a public caller redirected to a URL
+it cannot fetch, and an odd shape behind it: the public could bulk-stream an
+*active* job — expensive, unbounded, still growing — but not a *completed* one,
+which is the cheap stable case. Backwards on cost. So bulk reads are an admin
+operation across the board, and the public keeps the paginated
+`GET /api/jobs/:id/results` for browsing. One rule instead of three.
 
-The way to square it, and the **recommendation**, is to make the stream
-**admin-only outright** and leave the public the paginated
-`GET /api/jobs/:id/results`. Then one rule covers everything: bulk is an admin
-operation, browsing is public. It also **simplifies A considerably** — with no
-anonymous caller able to start a scan, the per-IP rate limit stops earning its
-keep and only the concurrency cap remains, which is the half that was
-load-bearing anyway (it protects the connection pool from an admin or a script
-holding several streams open, which a rate limit never bounded).
+**This supersedes half of A.** With no anonymous caller able to start a scan,
+the per-IP rate limit stops earning its keep: it existed to stop an unauthenticated
+attacker, and there is no longer an unauthenticated caller on this endpoint.
+What remains is the **concurrency cap**, which was the load-bearing half anyway
+— it protects the connection pool from an admin, or a script holding an admin
+key, opening several streams at once, which a rate limit never bounded. So A
+reduces to: move the route under `/api/admin`, and add the semaphore.
 
-That is a change to A, which was originally chosen partly to *keep* the stream
-public, so it is flagged rather than assumed: **if the stream is meant to stay
-publicly reachable for active jobs, say so and A keeps its rate limit.**
+The final shape, then:
+
+| Path | Who | What it does |
+|---|---|---|
+| `GET /api/jobs/:id/results` | public | paginated browsing, unchanged |
+| `GET /api/admin/jobs/:id/results/stream` | admin | live scan, concurrency-capped; `303` to the export when the job is completed and one is ready |
+| `POST/GET /api/admin/jobs/:id/export` | admin | build and fetch the artifact for a completed job |
 
 **Sequencing: A first.** It is small, and it is the half that stops one
 request from costing the site. C is a feature, and can follow.
 
-#### K-D6. `opening_rack_stats` scans the job's whole history
+#### K-D6. *(resolved — `opening_rack_stats` scans the job's whole history)*
 
-> **Resolved by K-D11, which deletes both expensive queries rather than fixing
-> them.** The analysis below is kept because it is what established that the
-> cost lived entirely in the two fields K-D11 removes, and because the index
-> finding falls out of it. Option A — the query rewrite — is **not needed**.
+**Resolved by K-D11**, which removes the two fields rather than making their
+queries cheaper, so no decision is left and the analysis is not kept. What it
+established, preserved because K-D11 rests on it:
 
-**Concern.** Two of its three queries aggregate over every stored move row, on
-the job detail page and on every SSE push. I2 replaced the distinct-rack `COUNT`
-with `jobs.racks_analyzed` and left these:
-
-```sql
--- average_best_equity
-SELECT AVG(m.equity) FROM position_analysis_records r
-JOIN tasks t ON t.id = r.task_id
-LEFT JOIN position_analysis_moves m ON m.record_id = r.id AND m.rank = 1
-WHERE t.job_id = $1
-
--- best_move_types                              (F16: 541 ms at 1M racks)
-SELECT ... FROM position_analysis_moves m
-JOIN tasks t ON t.id = m.task_id
-WHERE t.job_id = $1 AND m.rank = 1 GROUP BY 1
-```
-
-**Correction to this pass's first write-up of it.** It said a running sum and
-count beside `racks_analyzed` was the fix, and called that "the trade-off I2
-already weighed". That was wrong about the cost, because the schema already
-carries a cheaper fix. `position_analysis_moves.task_id` is denormalized with
-the comment *"so job-wide aggregates need not join through the record"*, and
-`position_analysis_moves_best_idx` is `ON (task_id) INCLUDE (move, equity)
-WHERE rank = 1` — a covering partial index holding exactly one row per position,
-with `equity` already in it. The second query uses it. **The first does not**,
-because it joins on `record_id` rather than `task_id`, so it cannot reach the
-index that was built for it. It reads like a query that predates the index.
-
-**Options.**
-
-- **A. Rewrite the average to go through `task_id`**, the same shape as the
-  move-types query. The result is identical: the current `LEFT JOIN` yields
-  `NULL` for a record with no rank-1 move and `AVG` ignores `NULL`s, so
-  selecting from the moves directly covers the same set.
-  - *For:* turns a million-row nested join into an index-only scan of the index
-    added for it; no schema change, no counter, no staleness.
-  - *Against:* none identified.
-- **B. Running sum and count** beside `jobs.racks_analyzed`.
-  - *For:* the average becomes constant-time.
-  - *Against:* a third denormalized counter to keep correct through purge,
-    restore and RUNBOOK §2.3 — and it fixes only one of the two scans, since a
-    distribution over move types cannot be a scalar counter.
-- **C. Debounce the SSE push and cache the detail payload** per job (F16's
-  option B, never implemented). Superseded by K-D8, which is the same idea
-  done properly.
-- **D. Keep.**
-
-**Recommendation: A, unconditionally — it is a query rewrite with no
-identified downside — and then K-D8 for the general case.** Even after A the
-page still does two index-only scans over the job's whole history: roughly a
-second combined at a million racks, about 3.5 s projected for a full English
-job, on every view and every push. A makes that tolerable; only K-D8 bounds it.
-**B is withdrawn** in favour of K-D8, which is less machinery and covers more.
-
-**One thing to settle while there:** both queries count claims rather than
-racks, which is a correctness question rather than a cost one. It is **K-D10**.
+- The cost was entirely in `average_best_equity` and `best_move_types` — F16
+  measured the latter at 541 ms over a million racks, and the former is a
+  million-row nested join. Everything else in `opening_rack_stats` is a
+  single-row read.
+- `average_best_equity` joined on `record_id`, so it could not use
+  `position_analysis_moves_best_idx`, the covering partial index added for
+  exactly these aggregates. That is what led to finding the index has a single
+  reader (K-D11).
 
 #### K-D7. A locally-failed task's claim is left to time out
 
@@ -1321,6 +1275,15 @@ server-side, indistinguishable from a worker that vanished.
 and transient.** The five-minute delay is worth paying for the rate limiting it
 provides, and there is currently no evidence either way — which is the part
 actually worth fixing.
+
+**Decision: B.** Record the decline reason server-side and leave the timeout
+alone. The reason belongs on the audit row — `audit::log_detail` already takes
+`reason` and is what the census rows use — rather than on `task_claims`, since
+it describes an event rather than state, and `worker_data_gaps` already covers
+the one case where the *detail* matters. A is not adopted: no evidence yet that
+it would help, and the poison-task churn it risks is a real cost. Whether to
+add a `task_failed` reason at all is deferred with it, so MAGPIE needs no change
+and the three existing reasons stand.
 
 #### K-D8. Job statistics are display-only, and could be refreshed in the background
 
@@ -1400,16 +1363,90 @@ backgrounded parts with an `as_of` so the dashboard is not silently stale.
 is both a place to put it and a precedent for how its failures should be
 handled (K5: log and skip, never abort the sweep).
 
-Two things to settle first:
+Two things were listed as needing settling first. The first — do K-D6's query
+rewrite before caching over it — **is moot**: K-D11 deleted the query rather
+than rewriting it, so there is no longer an expensive cold path to cache over.
+Its honest successor is whether this is worth building at all. Both are expanded
+below.
 
-- **Do K-D6's option A regardless.** A cache over a 3.5-second query still has a
-  3.5-second cold path, and every option above has one. Making the underlying
-  query an index-only scan makes all of them cheaper, and makes C viable at all.
-- **This deepens the single-instance assumption.** An in-process cache is
-  coherent only because `desired_count` is pinned to 1 (C14). PLAN.md already
-  lists the import reaper, the rate limits and SSE as single-instance-dependent;
-  this would make four, and it belongs on that list rather than being discovered
-  during a future attempt to replicate.
+##### K-D8.1 — Is this still worth building?
+
+After K-D11, `jobstats::compute` for the largest jobs is roughly: the
+task-state counts over the job's tasks, plus `game_stats` (F16: ~50 ms at
+400,000 units) *or* `leave_gen_stats` (210 ms), plus `worker_contributions`
+(136 ms at 44,000 claims) and `estimate_eta`. Call it a few hundred
+milliseconds, against the seconds that motivated the item. The **argument** for
+backgrounding is untouched — nothing in the claim path reads a statistic — but
+the **urgency** is gone.
+
+What is left still grows without bound, only slower: `worker_contributions`
+with every claim over a job's life, `leave_gen_stats` with generations,
+the task counts with tasks.
+
+- **A. Drop it.** The case was opening-rack stats and they no longer exist.
+  - *For:* no cache, no invalidation, no staleness, no new state.
+  - *Against:* the remaining growth is slower, not bounded — it defers the
+    problem rather than answering it.
+- **B. Build it now**, while the design is worked out.
+  - *For:* bounded for good; the pattern and its failure handling already exist
+    in `ratings::recompute_stale`.
+  - *Against:* a cache for a few hundred milliseconds is premature, and every
+    option costs staleness on a live dashboard.
+- **C. Set a trigger and revisit.** Log the duration of `jobstats::compute` now
+  — one line — and build this when it crosses a stated threshold on a real job.
+  - *For:* costs almost nothing today, and decides on evidence. F16 set the
+    precedent: measuring first is what showed which reads actually mattered, and
+    two of the three it flagged turned out to want different fixes than assumed.
+  - *Against:* only works if someone is watching the number.
+- **D. Attack the remaining reads individually instead**, keeping everything
+  live. The obvious one: `worker_contributions` returns **every** worker with an
+  accepted result, unbounded, with no `LIMIT` — and the page renders a table. A
+  top-N plus "and *n* others" is cheaper *and* a better leaderboard.
+  - *For:* no cache, no staleness, and it fixes a payload that grows without
+    bound as well as a query that does.
+  - *Against:* piecemeal; each new aggregate has to be thought about again.
+
+**Recommendation: C, plus D's `worker_contributions` cap.** The cap is worth
+doing on its own merits — an unbounded list in a payload is a problem
+independent of how long the query takes — and the timing line is what makes the
+decision between A and B evidence-based rather than a guess, which is the same
+move that worked for F16.
+
+##### K-D8.2 — The single-instance coupling, if it is built
+
+An in-process cache is coherent only because `desired_count` is pinned to 1
+(C14, enforced by a Terraform validation). PLAN.md already lists the import
+reaper, the in-memory rate limits and per-process SSE as
+single-instance-dependent; an in-process stats cache would make four.
+
+- **A. Accept it and document it.** Add it to PLAN.md's list beside the other
+  three.
+  - *For:* zero cost, and honest. Replication is already a deliberate
+    non-goal that Terraform actively refuses.
+  - *Against:* a fourth thing to undo, and the list is the kind that grows
+    quietly until someone tries to scale out.
+- **B. Put the cache in Postgres** — a `job_stats_cache` row per job holding the
+  payload and `computed_at`.
+  - *For:* replication-safe by construction, so it adds nothing to the list. It
+    also **survives restart**, which removes the cold-first-view penalty that
+    counted against options B and C in the main list — after a deploy the page
+    is fast immediately.
+  - *Against:* a write per refresh, and a cache stored in the database it exists
+    to protect. In practice one small row write against the multi-hundred-
+    millisecond aggregate it replaces, so the objection is aesthetic more than
+    real.
+- **C. Accept per-instance divergence** — each instance caches its own.
+  - *For:* no shared state at all.
+  - *Against:* two people watching one dashboard see different numbers, which on
+    a live view reads as a bug.
+- **D. Defer** until replication is actually on the table.
+  - *For:* no work.
+  - *Against:* the choice gets made by default, in whichever direction the first
+    implementation happens to go.
+
+**Recommendation: B.** It is barely more work than an in-process map, it removes
+the cold-start penalty, and it is the only option that does not spend more of
+the single-instance budget on a feature that is explicitly not load-bearing.
 
 #### K-D9. The leave-generation universe copy (supersedes I3's suggested fix)
 
@@ -1516,94 +1553,22 @@ the same run; it currently times only the SQL copy. Then A answers itself, and
 answers it for the production instance class rather than for a laptop — which is
 a better use of I3's benchmark than running it and still having to guess.
 
-#### K-D10. The opening-rack aggregates count claims, not racks
+#### K-D10. *(resolved — the opening-rack aggregates count claims, not racks)*
 
-> **Resolved by K-D11.** The inconsistency was entirely between the two removed
-> fields and `racks_analyzed`; with them gone, the only number left is already
-> one-result-per-task. None of the four options below needs choosing. The
-> analysis is kept because it is the reason the removal is safe rather than
-> merely convenient — and because it records that opening racks are the one
-> place the stored corpus is genuinely per-claim, which stays true.
+**Resolved by K-D11**, which removes both per-claim aggregates, leaving a
+payload whose only number is already one-result-per-task. No decision is left.
+Two facts from it are preserved because they outlive the fields:
 
-**Concern.** `OpeningRackStats` carries three numbers, and at `redundancy > 1`
-they do not share a denominator:
-
-| Field | Counts | Source |
-|---|---|---|
-| `racks_analyzed` | **one result per task** | `jobs.racks_analyzed`, incremented by `registry::count_first_result` only on a task's first accepted result |
-| `average_best_equity` | **every accepted claim** | `AVG(m.equity)` over all rank-1 moves |
-| `best_move_types` | **every accepted claim** | `COUNT(*)` over all rank-1 moves, grouped |
-
-Opening-rack records are keyed `(task_claim_id, rack)`, so each redundant claim
-records its own analysis of the same rack — deliberately: the migration says
-"redundant claims each record their own and can be compared", and PLAN.md says
-the same. In-game captured positions are the opposite, keyed
-`(task_id, game_index, turn_number)` with `ON CONFLICT DO NOTHING`, so only the
-first claim's land. Opening racks are the one place the corpus is genuinely
-per-claim.
-
-**This is visible on the page, not just in the API.** The job detail view
-renders all three in one `<dl>`: "Racks analyzed 1,000,000 / 3,199,724" beside
-"Best move types: placement 1,842,000 · exchange 158,000" — raw counts, not
-proportions. At `redundancy = 2` the move-type counts sum to twice the racks
-stated next to them. Nothing is wrong at `redundancy = 1`, which is why this has
-not been seen; redundancy is a per-job setting an admin can raise without
-touching any of this code.
-
-**Why this is not simply "make it consistent".** PLAN.md's rule is that every
-aggregate treating results as observations reads one result per task, and its
-stated reason is determinism: "games are seeded and deterministic, so the other
-copies replay the same games, and counting them would multiply the evidence by
-the redundancy." That premise does not hold here. PLAN.md also says
-"opening-rack analysis by a simming player is non-deterministic by
-construction, so honest repeat runs disagree" — so for a simming opening-rack
-job the repeat analyses are real extra samples, not duplicates, and discarding
-them throws away exactly what redundancy bought. For a static player they are
-identical and it makes no difference either way.
-
-**Options.**
-
-- **A. One result per task**, matching `racks_analyzed` and every other
-  aggregate: restrict both queries to the first accepted claim per task.
-  - *For:* one rule across the whole system, easy to state and to keep. The
-    numbers stop depending on a job's redundancy. Discards nothing from
-    *storage* — the per-claim rows stay, and stay comparable.
-  - *Against:* the headline average ignores the repeat simming samples. Picking
-    "first" among genuinely different samples is arbitrary.
-- **B. Average per rack, then over racks.** Mean the analyses of each rack, then
-  mean those; count each rack's best-move type once.
-  - *For:* redundancy-independent *and* uses every sample. The number then means
-    what its label claims — the mean best equity of a rack — rather than of an
-    analysis.
-  - *Against:* it needs `rack`, which lives on `position_analysis_records` and
-    **not** in the covering index `(task_id) INCLUDE (move, equity)`. So it
-    either joins back to the records, giving up K-D6's option A speedup, or
-    `rack` is added to that index's `INCLUDE` list — cheap, but a schema change
-    that widens an index carrying one row per position. Move types also need a
-    tie-break when a rack's claims disagree.
-- **C. Keep per-claim and make the payload say so.** Add `analyses_count`
-  beside `racks_analyzed` so both denominators are present, and render move
-  types as proportions rather than bare counts.
-  - *For:* no query change; keeps every sample; fixes the *visible* error, which
-    is as much a display bug as a query one.
-  - *Against:* two denominators in one panel is still something a reader has to
-    hold, and the headline average still moves when an admin changes redundancy.
-- **D. Defer** until an opening-rack job actually runs at `redundancy > 1`.
-  - *For:* no work, and nothing is wrong today.
-  - *Against:* it is silently wrong the first time one does, and the setting that
-    triggers it is one field on the job creation form.
-
-**Recommendation: A, plus C's display fix.** One rule across the system is worth
-more than a marginally better estimator on a job type nobody has yet run
-redundantly, and A costs nothing that B would later need — the per-claim rows
-survive, so B remains available if those repeat samples ever get a consumer.
-Render move types as proportions regardless, since bare counts beside a
-different denominator is the part a reader actually misreads. **B is the right
-answer if simming opening-rack jobs at redundancy > 1 become a real workload**,
-and the index change it needs is small enough to make then rather than now.
-
-Whichever is chosen, it should be stated in PLAN.md next to the one-result-per-
-task rule, which currently reads as universal and is not.
+- Opening racks are **the one place the stored corpus is genuinely per-claim**.
+  Records are keyed `(task_claim_id, rack)` so redundant claims each record
+  their own and can be compared, where in-game captured positions are keyed
+  `(task_id, game_index, turn_number)` and only the first claim's land. K-D11
+  removes the aggregate over those rows, not the rows.
+- PLAN.md's one-result-per-task rule is justified **by determinism**, and that
+  premise does not hold for simming opening-rack analysis, which PLAN.md
+  elsewhere calls non-deterministic by construction. The rule reads as universal
+  and is not. That is worth a sentence in PLAN.md whether or not anything else
+  changes, since the next aggregate over opening racks will hit it again.
 
 #### K-D11. `OpeningRackStats` keeps only `racks_analyzed`
 
