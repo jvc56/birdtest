@@ -21,7 +21,7 @@ decisions:
 |---|---|---|
 | **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **24** (21 in A.1, J3, K-D1, K-D2) |
 | **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **18** (16 in A.2, J1, J2) |
-| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third left five open, K-D5 to K-D9, plus I3 carried forward. | **5 decided, 5 open** |
+| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised five, of which K-D5 is now decided but not yet built, plus I3 carried forward. | **6 decided, 4 open** |
 
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
@@ -32,7 +32,8 @@ the status of section I (I1 and I2 implemented, I3 still open), the
 discrepancies it found, and its verification. **Section K is the third pass**,
 which found and fixed two more races in leave generation, a scheduler contention
 bug, and a missing submission check. **K.6 is the current list of open
-questions** — K-D5 to K-D9, each with options and a recommendation — and it
+questions** — K-D5 to K-D9, each with options and a recommendation, K-D5 now
+decided but not yet built — and it
 supersedes I3, whose suggested fix does not work (K-D9). The Verification
 section just below describes the first pass; J.6 and then K.7 supersede it for
 current numbers.
@@ -989,7 +990,7 @@ the task-row lock the second pass added (J1).
 | K-D2 | `scripts/restore-roundtrip.sh` seeds the round-trip database with plain SQL. | Phase 4: the round trip "seeds with `fake_worker.py`". | **PLAN.md updated** | The code wins, and it is also right: what the round trip tests is `pg_dump`/`pg_restore`, and going through the worker API would add a client to the failure surface without adding a row shape. Also a Python-worker correction — see K.4. |
 | K-D3 | The claim path takes a per-job advisory lock for every job type (K3), and leave generation refuses to reissue during a transition (K1). | The lock was described as leave-generation-only; the reissue rule said nothing about transitions. | **PLAN.md updated to match the code change** | These are this pass's own fixes, not pre-existing disagreements. Recorded here so the sections stay in step. |
 | K-D4 | Opening-rack submissions are checked against the dispatched rack set (K4). | The submission section said only a *game* batch is checked against its task, and the impossibility table listed only the game rule. | **PLAN.md updated to match the code change** | As K-D3. PLAN.md's own framing — "the only submission-time check that catches a worker reporting work it did not do" — was what made the gap visible. |
-| K-D5 | `GET /api/jobs/:id/results/stream` streams a job's entire result table to anyone, unauthenticated and unpaginated. | PLAN.md describes it as the offline-analysis download, with no access note. | **Left unresolved — needs human input** | See K.6. |
+| K-D5 | `GET /api/jobs/:id/results/stream` streams a job's entire result table to anyone, unauthenticated and unpaginated. | PLAN.md describes it as the offline-analysis download, with no access note. | **Decided: rate limit and cap it (A), and add an admin export for completed jobs (C)**; neither built yet | See K.6. Raised as unresolved by this pass and decided in review; the options and the implied shape are recorded there. |
 
 **Count for this pass: 2 code-wins (PLAN.md updated), 0 plan-wins (code updated
 for a discrepancy), 1 unresolved.** K-D3 and K-D4 are documentation following
@@ -1080,6 +1081,102 @@ service that costs the attacker one HTTP request.
 **Recommendation: A now, C if the corpus becomes something people actually
 download.** Left unresolved because it is an access-policy decision about how
 open the data is meant to be, which is not the audit's to make.
+
+**Decision: A and C — both, with C scoped to completed jobs.** Not
+either/or: they cover different traffic. A keeps the live stream safe for
+ad-hoc and small-job use, which is what it is good at. C is the sanctioned path
+for pulling a completed job's whole corpus, which is where the tens-of-millions
+-of-rows problem actually lives. Neither is implemented; the shape below is
+what the decision implies, not what is built.
+
+##### How A could be done
+
+Two mechanisms, and the second is the load-bearing one.
+
+1. **Rate limit per client IP.** `RateLimiters` gains an `export` bucket
+   alongside `register`/`login`/`reset`; `job_results_stream` takes the
+   `ClientIp` extractor and calls `ratelimit::check`, which already answers
+   `429` with `Retry-After`. This bounds how often a stream *starts*.
+2. **Cap concurrent streams**, which is the part that matters. A limit on
+   starts does not bound long-lived streams: one request a minute, each running
+   ten minutes, still accumulates. And the resource being consumed is not CPU
+   but **the connection pool** — `db::connect` sets `max_connections(20)`, and
+   `sqlx::query(…).fetch(&pool)` holds one connection for the whole life of the
+   stream. A handful of concurrent streams starves dispatch and submission,
+   which is how a cheap public read turns into an outage. So: an
+   `Arc<Semaphore>` with a small permit count (2 or 3 against 20 connections),
+   `try_acquire_owned`, `429` when exhausted, and the **owned permit moved into
+   the `async_stream::stream!` body** so it is released when the stream ends
+   *and* when a client disconnects and the response body is dropped.
+
+The permit count and `max_connections` are one decision, not two, and belong
+next to each other in config so neither can be tuned without the other.
+
+##### How C could be done
+
+The shape is already established by `input_data_imports`, which is the same
+problem — a long operation an admin starts, polls, and then acts on:
+
+- **`job_exports`**: `id`, `job_id`, `state` (`running`/`ready`/`failed`),
+  `artifact_key`, `bytes`, `sha256`, `row_count`, `error`, `requested_by`,
+  `requested_at`, `completed_at`. Startup fails any row left `running`, exactly
+  as `inputdata::fail_orphaned_imports` does and for the same reason: single
+  instance, so such a row belongs to a process that is gone.
+- **`POST /api/admin/jobs/:id/export`** → `202` and an id, spawning a task;
+  **`GET`** to poll, and to fetch the URL once ready. The task runs the same
+  per-job-type query `job_results_stream` runs, gzips it, and uploads.
+- **Refuse a job that is not `completed`.** That is the constraint that makes
+  the whole thing worth building: a completed job's results are immutable, so
+  the export is a stable artifact — built once, reused by every later request,
+  and safe to cache. An export of an active job is stale as it is written.
+
+**Two things `ArtifactStore` cannot do today**, which are the bulk of the work
+and should be costed as such:
+
+- `put` takes a `Vec<u8>` — the entire object in memory. A full English
+  opening-rack export is on the order of gigabytes. It needs either a
+  **multipart upload streamed from the cursor** (the bucket already carries an
+  `abort-incomplete-uploads` lifecycle rule, so the infrastructure anticipates
+  this) or a spill to task-local disk plus `ByteStream::from_path`, which is
+  simpler but couples the export size to Fargate ephemeral storage.
+- `get` returns a `Vec<u8>` as well, so serving the download *through* the
+  backend has the same problem — and would put the bytes back on the connection
+  pool that A exists to protect. **A presigned GET**
+  (`get_object().presigned(…)`, available in the pinned `aws-sdk-s3 1.x`) is
+  what keeps the bytes out of the backend entirely, and is why the original
+  option said "signed URL".
+
+**Invalidation.** "Immutable once completed" holds except for purge and
+restore. Purge should delete a job's exports and their objects, for the same
+reason it already deletes `leave_generation_transitions` — a stale row that
+says "ready" is worse than no row. Recording `row_count` on the export means a
+later mismatch is visible rather than silent, which is the same
+signal-not-silence principle as the KLV `sha256`.
+
+**Lifecycle, and a difference from the existing artifacts.** Exports are
+derived data: regenerable from the database, so they need neither backup nor
+cross-region replication, and they *should* expire. That contradicts
+`infra/s3.tf`'s current comment — "Objects here are only ever added, never
+deleted" — so an `exports/` prefix wants its own expiry rule, exclusion from
+replication, and an amended comment saying why this prefix is different from
+the KLVs.
+
+**Two sub-questions this decision does not settle**, worth answering before
+building:
+
+- **Who may download a ready export?** Admin-only is the minimum and matches
+  "admins download the data for completed jobs". Making a ready export publicly
+  downloadable is what would let A's limits be tightened further, since there
+  would then be a cheap sanctioned path for exactly the jobs that make the
+  stream expensive.
+- **Should the stream defer to the export?** A completed job with a ready
+  export could have `job_results_stream` answer `303` to the signed URL instead
+  of scanning. Elegant, and it puts the cheap path in front of every existing
+  caller without them changing anything — but it couples the two endpoints and
+  makes the stream's behaviour depend on whether an admin has run an export.
+
+**Sequencing: A first.** It is small, and it is the half that stops one
+request from costing the site. C is a feature, and can follow.
 
 #### K-D6. `opening_rack_stats` scans the job's whole history
 
