@@ -214,3 +214,85 @@ async fn a_completed_job_cannot_be_deactivated() {
         .unwrap();
     assert_eq!(status_text, "completed");
 }
+
+/// Bulk reads of a job's results are admin operations.
+///
+/// The stream was public, unpaginated and unmetered, so one HTTP request was
+/// enough to start a scan of a job's whole result table — and what it consumes
+/// is a pool connection held for as long as the caller keeps reading, out of
+/// twenty. The public keeps the paginated endpoint.
+#[tokio::test]
+async fn the_results_stream_is_admin_only_and_the_paginated_one_is_not() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 10).await;
+    let cfg = db.config();
+    let admin = db.user("streamadmin", true).await;
+    let plain = db.user("plainuser", false).await;
+    let app = birdtest::app(db.state().await);
+
+    // The old public path is gone entirely.
+    let (status, _) = send(&app, get_request(&format!("/api/jobs/{job}/results/stream"), &[])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // The admin path needs an admin: anonymous, then a signed-in non-admin.
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    let (status, _) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = send(&app, get_request(&path, &admin_headers(&cfg, plain))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, _) = send(&app, get_request(&path, &admin_headers(&cfg, admin))).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Browsing stays public.
+    let (status, _) = send(&app, get_request(&format!("/api/jobs/{job}/results"), &[])).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Only a completed job can be exported: an export of a job still taking
+/// results would be stale before anyone downloaded it, and nothing would say so.
+#[tokio::test]
+async fn only_a_completed_job_can_be_exported() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 10).await;
+    let cfg = db.config();
+    let admin = db.user("exportadmin", true).await;
+    let app = birdtest::app(db.state().await);
+    let headers = admin_headers(&cfg, admin);
+
+    // Nothing exported yet.
+    let (status, _) =
+        send(&app, get_request(&format!("/api/admin/jobs/{job}/export"), &headers)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let start = |headers: Vec<(String, String)>| {
+        let borrowed: Vec<(&str, &str)> =
+            headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        post_json(&format!("/api/admin/jobs/{job}/export"), &borrowed, serde_json::json!({}))
+    };
+
+    let (status, body) = send(&app, start(headers.clone())).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("completed"), "{body}");
+
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = send(&app, start(headers)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert!(body["id"].is_string(), "{body}");
+
+    // The row exists from the moment the task is spawned. Its outcome depends
+    // on an object store the test config points at a closed port, so the state
+    // is whatever the spawned task reached; what is pinned here is that the
+    // export was accepted and recorded, not that the upload succeeded.
+    let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_exports WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(recorded, 1);
+}

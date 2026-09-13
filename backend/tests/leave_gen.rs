@@ -603,7 +603,7 @@ async fn a_transition_whose_job_was_purged_meanwhile_closes_nothing() {
     .fetch_all(&db.pool)
     .await
     .unwrap();
-    assert_eq!(generations, vec![1], "generation 2's universe was not seeded");
+    assert_eq!(generations, vec![1], "nothing was written");
 
     // With the row this request owns, the same call closes the generation.
     sqlx::query("INSERT INTO leave_generation_transitions (job_id, generation) VALUES ($1, 1)")
@@ -612,16 +612,79 @@ async fn a_transition_whose_job_was_purged_meanwhile_closes_nothing() {
         .await
         .unwrap();
     close().await.expect("the owner closes its own generation");
-    let generations: Vec<i32> = sqlx::query_scalar(
-        "SELECT DISTINCT generation FROM leave_rack_progress WHERE job_id = $1 ORDER BY 1",
+    let closed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1 AND generation = 1",
     )
     .bind(job)
-    .fetch_all(&db.pool)
+    .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(generations, vec![1, 2]);
+    assert_eq!(closed, 1);
 
     // And a second close of the same generation is refused too, so a taken-over
     // transition that turns out to have been finished cannot rewrite it.
     assert!(close().await.is_err());
+}
+
+/// Closing a generation does not write the next one's universe; the first claim
+/// for that generation does.
+///
+/// It used to be part of the same transaction, which made closing a generation
+/// a millions-of-rows write that every worker on the job waited out -- and one
+/// the transition had to redo in full if anything failed, because the close and
+/// the copy stood or fell together. Seeded from the claim path it happens while
+/// workers are busy, under the job's lock so two claims cannot both do it, and
+/// a failure costs a retry of the seeding alone.
+#[tokio::test]
+async fn the_next_generations_universe_is_seeded_by_a_claim_not_by_the_transition() {
+    let db = TestDb::new().await;
+    let (job, seeded) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+    let config = sqlx::query_as::<_, birdtest::models::job::LeaveConfig>(
+        "SELECT * FROM job_leave_config WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let universe = |generation: i32| {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM leave_rack_progress WHERE job_id = $1 AND generation = $2",
+        )
+        .bind(job)
+        .bind(generation)
+        .fetch_one(&db.pool)
+    };
+
+    sqlx::query("INSERT INTO leave_generation_transitions (job_id, generation) VALUES ($1, 1)")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    birdtest::jobs::leave_gen::close_generation(
+        &db.pool,
+        job,
+        1,
+        "leaves/test/generation-1.klv2",
+        &"1".repeat(64),
+        &config,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(universe(2).await.unwrap(), 0, "the transition wrote no rows");
+
+    // The next claim finds generation 2 current, seeds its universe, and hands
+    // out work from it.
+    let (status, assignment) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    assert_eq!(assignment["task_request"]["generation"], json!(2));
+    assert_eq!(universe(2).await.unwrap(), seeded, "the claim seeded it, in full");
+
+    // And a second claim does not seed it again.
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(universe(2).await.unwrap(), seeded);
 }

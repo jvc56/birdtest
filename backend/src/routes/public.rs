@@ -3,6 +3,7 @@ use crate::jobstats::{self, JobStats};
 use crate::models::job::{Job, JobType};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -20,7 +21,6 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id", get(job_detail))
         .route("/jobs/:id/results", get(job_results))
         .route("/jobs/:id/stream", get(job_stream))
-        .route("/jobs/:id/results/stream", get(job_results_stream))
         .route("/users", get(list_users))
         .route("/workers", get(list_workers))
 }
@@ -365,14 +365,47 @@ async fn job_stream(
 
 /// Newline-delimited JSON of every record for the job, streamed straight from a
 /// cursor so an offline analysis download never buffers the whole job in memory.
-async fn job_results_stream(
+///
+/// **Admin-only, and capped.** It was public, unpaginated and unmetered, which
+/// made one HTTP request enough to start a scan of tens of millions of rows —
+/// and the resource it consumes is not CPU but a pool connection, held for as
+/// long as the caller keeps reading, out of twenty. Bulk reads are an admin
+/// operation now; the public gets `GET /api/jobs/:id/results`, which is
+/// paginated. For a completed job this defers to the export, which is the same
+/// corpus read once rather than once per caller.
+pub(super) async fn job_results_stream(
     State(state): State<AppState>,
+    _admin: crate::auth::AdminUser,
     Path(id): Path<Uuid>,
-) -> AppResult<impl IntoResponse> {
+) -> AppResult<axum::response::Response> {
     let job = load_job(&state, id).await?;
-    let pool = state.pool.clone();
 
+    // A completed job's results are immutable, so an export of them is a stable
+    // artifact: read it instead of re-scanning. The redirect is what puts the
+    // cheap path in front of a caller without them having to know about it.
+    if job.status == crate::models::job::JobStatus::Completed {
+        if let Some((_, key)) = crate::exports::newest_ready(&state.pool, id).await? {
+            let url = state
+                .artifacts
+                .presigned_get(&key, crate::exports::DOWNLOAD_URL_TTL)
+                .await?;
+            return Ok((StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, url)])
+                .into_response());
+        }
+    }
+
+    // Held for the life of the stream, and released when the response body is
+    // dropped — which covers a caller that disconnects half way as well as one
+    // that reads to the end.
+    let permit = state
+        .result_streams
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| AppError::rate_limited(30))?;
+
+    let pool = state.pool.clone();
     let stream = async_stream::stream! {
+        let _permit = permit;
         let query = match job.job_type {
             JobType::OpeningRack =>
                 "SELECT to_jsonb(r) AS row FROM position_analysis_records r
@@ -402,7 +435,8 @@ async fn job_results_stream(
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
         axum::body::Body::from_stream(stream),
-    ))
+    )
+        .into_response())
 }
 
 #[derive(Serialize)]

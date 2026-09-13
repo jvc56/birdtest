@@ -238,6 +238,13 @@ each at 0 for the job types that do not use it, which is what they hold anyway.
 
 ### 2.4 Recompute derived state
 
+- **Job exports** (`job_exports`): derived data, and the one thing here that a
+  partial restore can make actively misleading — a row still saying `ready`
+  describes results the restore may not have brought back, and hands an admin a
+  stable-looking artifact of something else. Delete the job's rows
+  (`DELETE FROM job_exports WHERE job_id = :'job'`) and re-export if anyone
+  wants one; the objects behind them expire from the bucket on their own.
+
 - **Ratings** (`rating_runs` / `player_config_ratings`): a batch fit over
   each pool's `game_results`, never applied per submission. Once the results
   are back the two-minute sweep notices the pool's evidence changed and refits

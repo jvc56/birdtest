@@ -388,6 +388,39 @@ CREATE TABLE job_leave_config (
     use_wordmap       BOOLEAN NOT NULL DEFAULT TRUE
 );
 
+-- Exports
+--
+-- A completed job's results, as one gzipped NDJSON object in the artifact
+-- store. Only completed jobs can be exported, and that is what makes the
+-- artifact worth having: a completed job's results are immutable, so an export
+-- is built once and reused, where an export of an active job would be stale as
+-- it was written.
+--
+-- Shaped like input_data_imports, and for the same reason: a long operation an
+-- admin starts, polls, and then acts on. birdtest runs as a single instance, so
+-- the task needs no lease and startup may fail any row still 'running'.
+CREATE TABLE job_exports (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id        UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    state         TEXT NOT NULL DEFAULT 'running'
+                  CHECK (state IN ('running', 'ready', 'failed')),
+    -- NULL until the upload completes: the row exists from the moment the
+    -- background task is spawned.
+    artifact_key  TEXT,
+    bytes         BIGINT,
+    sha256        TEXT,
+    -- Rows written. Recorded so a later mismatch against the job is visible
+    -- rather than silent -- the same reason the KLV artifacts carry a digest.
+    row_count     BIGINT,
+    error         TEXT,
+    requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at  TIMESTAMPTZ
+);
+
+-- The newest ready export for a job, which is what a download resolves to.
+CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
+
 -- Tasks
 
 CREATE TYPE task_state AS ENUM ('available', 'claimed', 'completed');
@@ -616,7 +649,10 @@ CREATE INDEX position_analysis_records_task_idx
 CREATE TABLE position_analysis_moves (
     id              BIGSERIAL PRIMARY KEY,
     record_id       BIGINT NOT NULL REFERENCES position_analysis_records(id) ON DELETE CASCADE,
-    -- Denormalized so job-wide aggregates need not join through the record.
+    -- A second cascade path: moves already go with their record, which goes
+    -- with its task, but deleting a task reaches these directly too. It was
+    -- added to let job-wide aggregates skip the record join; there are no such
+    -- aggregates now, and it is kept for the cascade rather than for reads.
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
@@ -631,14 +667,15 @@ CREATE TABLE position_analysis_moves (
     -- static player, same as win_percentage.
     blended_utility DOUBLE PRECISION
 );
+-- Every read of a best move goes through its record: the results listing joins
+-- `record_id` and filters `rank = 1`, and a rack lookup reads a record's whole
+-- ranked list. There is deliberately no job-wide index on `(task_id) WHERE
+-- rank = 1`: one existed for a dashboard aggregate over every best move of a
+-- job, that aggregate is gone (the panel shows progress only), and the index
+-- cost maintenance on every move insert into a table that runs to tens of
+-- millions of rows.
 CREATE INDEX position_analysis_moves_record_idx
     ON position_analysis_moves (record_id, rank);
--- The dashboard's aggregates are all over best moves, which are read from here
--- rather than duplicated onto the record. A partial index keeps that a scan of
--- one row per position rather than of every stored move.
-CREATE INDEX position_analysis_moves_best_idx
-    ON position_analysis_moves (task_id) INCLUDE (move, equity)
-    WHERE rank = 1;
 
 -- Per-ply simulation stats for each candidate move. Only populated for simming
 -- player configs; a static player has no per-ply statistics to record.

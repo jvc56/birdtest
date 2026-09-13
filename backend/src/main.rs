@@ -42,6 +42,9 @@ async fn main() -> Result<()> {
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,
+        result_streams: std::sync::Arc::new(tokio::sync::Semaphore::new(
+            birdtest::state::MAX_CONCURRENT_RESULT_STREAMS,
+        )),
         http: reqwest::Client::builder()
             .user_agent("birdtest")
             .connect_timeout(std::time::Duration::from_secs(30))
@@ -56,6 +59,11 @@ async fn main() -> Result<()> {
         Ok(0) => {}
         Ok(n) => tracing::warn!(count = n, "failed input data imports left running by a restart"),
         Err(err) => tracing::error!(error = %err.message, "could not reap orphaned imports"),
+    }
+    match birdtest::exports::fail_orphaned(&state.pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "failed job exports left running by a restart"),
+        Err(err) => tracing::error!(error = %err.message, "could not reap orphaned exports"),
     }
 
     // Rating fits run on a periodic sweep rather than on result submission: a

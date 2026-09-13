@@ -143,8 +143,6 @@ export interface JobStats {
     racks_analyzed: number;
     /** Size of the rack space — the denominator for progress. */
     racks_total: number;
-    average_best_equity: number | null;
-    best_move_types: { move_type: string; count: number }[];
   };
   leave_generation?: {
     current_generation: number;
@@ -162,6 +160,8 @@ export interface JobStats {
     username: string | null;
     tasks_completed: number;
   }[];
+  /** Contributors beyond the ones listed; the list is capped. */
+  other_workers: number;
   eta_seconds: number | null;
 }
 

@@ -180,7 +180,7 @@
     {#if stats.opening_racks}
       <div class="card space-y-4">
         <h2 class="text-lg font-medium">Opening racks</h2>
-        <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
+        <dl class="grid grid-cols-2 gap-4 text-sm">
           <div>
             <dt class="text-muted-foreground">Racks analyzed</dt>
             <dd class="text-xl tabular-nums">
@@ -188,20 +188,6 @@
               <span class="text-sm text-muted-foreground">
                 / {stats.opening_racks.racks_total.toLocaleString()}
               </span>
-            </dd>
-          </div>
-          <div>
-            <dt class="text-muted-foreground">Average best equity</dt>
-            <dd class="text-xl tabular-nums">
-              {stats.opening_racks.average_best_equity?.toFixed(2) ?? '—'}
-            </dd>
-          </div>
-          <div>
-            <dt class="text-muted-foreground">Best move types</dt>
-            <dd class="text-sm">
-              {#each stats.opening_racks.best_move_types as type, i}
-                {i ? ' · ' : ''}{type.move_type} {type.count.toLocaleString()}
-              {:else}—{/each}
             </dd>
           </div>
         </dl>
@@ -264,11 +250,17 @@
     <div class="card">
       <h2 class="mb-3 text-lg font-medium">Contributors</h2>
       <WorkerTable workers={stats.workers} />
+      {#if stats.other_workers > 0}
+        <p class="mt-2 text-sm text-muted-foreground">
+          and {stats.other_workers.toLocaleString()} more
+        </p>
+      {/if}
     </div>
 
     <p class="text-sm text-muted-foreground">
-      Raw results: <a href="/api/jobs/{jobId}/results">paginated JSON</a> ·
-      <a href="/api/jobs/{jobId}/results/stream">full NDJSON download</a>
+      Raw results: <a href="/api/jobs/{jobId}/results">paginated JSON</a>. Bulk
+      downloads are an admin operation — a full scan holds a database connection
+      for as long as it runs.
     </p>
   </div>
 {/if}

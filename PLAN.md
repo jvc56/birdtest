@@ -227,8 +227,15 @@ job, so nothing else writes a request here.
 The record deliberately does **not** store the best move, its score or its
 equity. Those are the rank 1 row of `position_analysis_moves`, and a second copy
 is only something to keep consistent. `num_moves` stays, since the stored moves
-are truncated to `num_plays_recorded` and cannot tell you how many were ranked. A
-partial index on rank 1 keeps the dashboard's aggregates cheap.
+are truncated to `num_plays_recorded` and cannot tell you how many were ranked.
+Every read of a best move goes through its record — the results listing joins
+`record_id` and filters `rank = 1`, and a rack lookup reads a record's whole
+ranked list — so the index that serves them is on `(record_id, rank)`. There is
+deliberately no job-wide index on `(task_id) WHERE rank = 1`: one existed for a
+dashboard aggregate over every best move of a job, that aggregate is gone (see
+[Job Detail Page — By Job Type](#job-detail-page--by-job-type)), and it cost
+maintenance on every move insert into a table that runs to tens of millions of
+rows.
 
 #### How much of an analysis is kept
 
@@ -589,8 +596,21 @@ Shows all jobs with: job type, status, priority, allocation, and a completion co
 
 **Opening rack analysis**
 
-- Aggregate statistics across all analyzed racks: total racks analyzed, average best equity, distribution of best-move types.
+- Progress: racks analyzed against the size of the rack space, and nothing else.
 - Search input: enter a rack string to look up its analysis. Returns the full ranked move list (all N plays that were evaluated) for that rack, sourced from `position_analysis_moves`.
+
+  The panel used to carry the average best equity and a breakdown of what the
+  best opening play was — placement, exchange or pass — and both are gone.
+  They aggregated over every stored move row of the job, which made them the
+  most expensive read in the payload and one that grew without bound; and they
+  counted per *claim* where `racks_analyzed` counts per task, so at
+  `redundancy > 1` the move-type total was twice the rack count displayed beside
+  it. Nothing is lost from storage: every ranked move is still there,
+  `GET /api/jobs/:id/results` still returns the best move, score and equity per
+  rack, `?rack=` still returns a rack's full ranked list, and an
+  [admin export](#exports) is the path for analysing the corpus properly.
+  Summarising millions of racks in two numbers on a progress panel was not
+  where that analysis belonged.
 
 **Leave generation**
 
@@ -634,18 +654,28 @@ in the submit transaction, once per task, on its first accepted result — the s
 row the aggregates they replace selected, since redundant claims replay the same
 deterministic work. They exist because the reads were the two that did not scale:
 the job list re-derived per-task game totals for every job on every page view
-(2.2 s at the test volume), and counting distinct analysed racks alongside the
-average best equity cost 3.3 s at a million racks on every detail view and every
-live push, against 0.34 s for the average alone. Nothing
+(2.2 s at the test volume), and counting distinct analysed racks cost seconds at
+a million racks on every detail view and every live push. Nothing
 that *decides* anything reads them: SPRT still reads `game_results`, so a drifted
 counter is a wrong number on a page and cannot stop a job early. A purge zeroes
 them and a partial restore recomputes them (RUNBOOK §2.3).
 
-**Best-move types** are classified from the stored move string, over rank-1 rows
-only: MAGPIE renders a pass as `(Pass)` and an exchange as `(exch ABC)`, and
-anything else is a placement like `8G WUZ`. Matching a leading `ex` rather than
-`(exch` silently classifies every exchange as a placement, which is the bug this
-rule is written against.
+With the two opening-rack aggregates removed, `opening_racks` is now those two
+counters and nothing else: two single-row reads, constant time at any job size.
+
+**The contributor list is capped** at 50, with `other_workers` carrying how many
+more there are. It was every worker with an accepted result, unbounded, and a
+popular job has thousands — all of them serialized into every detail view and
+every live push. The count is only computed when the cap is actually reached,
+which for most jobs is never.
+
+**`compute` logs when it takes over a second.** Every read in the payload is
+display-only — nothing in the claim path reads a statistic — so none of it is
+urgent, but several still grow with a job's history: contributions with claims,
+leave progress with generations, task counts with tasks. Moving them to a
+background refresh is a real option and a real cost (staleness on a live
+dashboard, and a cache to keep coherent), so the log line is there to make that
+decision on evidence rather than on a guess about when it starts to matter.
 
 **ETA** is extrapolated from claims completed in the last hour. It is `null` for
 an inactive job and `null` when nothing completed in that window — there is
@@ -666,7 +696,13 @@ intermediary's timeout.
 
 ---
 
-Raw result data is queryable via a public API with pagination and filtering by worker. A streaming download endpoint allows offline analysis of completed job results.
+Raw result data is queryable via a **public** API with pagination and filtering
+by worker. **Bulk reads are admin-only**: the streaming download scans a job's
+result tables from a cursor and holds a database connection for as long as its
+caller keeps reading, so one request was enough to start a scan of tens of
+millions of rows against a pool of twenty. It lives under `/api/admin`, at most
+[two run at once](#exports), and for a completed job it redirects to an export
+rather than re-scanning.
 
 The **job list** carries a `stalled` flag per job — workers are declining it and
 none is completing it. A job pinned to data nobody has does not announce itself:
@@ -675,6 +711,42 @@ so the symptom is an absence and has to be stated rather than noticed. For
 on-demand SPRT jobs the list also reports `units_completed` against `max_units`,
 because a task count that grows as work is handed out is not a meaningful
 denominator.
+
+#### Exports
+
+A completed job's whole corpus is read **once**, not once per caller.
+
+The results stream scans from a cursor and holds a pool connection for as long
+as its caller keeps reading. That is fine for a spot check and wrong for a
+corpus: a full English opening-rack job is tens of millions of rows, and one
+caller per scan is one connection per scan against a pool of twenty. So bulk
+reads are admin-only, at most **two streams run at once** (a semaphore permit
+held for the life of the response body, released when a caller disconnects as
+well as when one reads to the end), and a completed job is served from an
+artifact instead.
+
+`POST /api/admin/jobs/:id/export` spawns a task that streams the job's rows out
+as gzipped NDJSON straight into an S3 multipart upload — nothing larger than one
+8 MiB part is ever resident, which is what lets it run against a job whose
+results do not fit in memory. The row is written before the task starts, polled
+through `GET`, and answered with a presigned URL once ready, so **the bytes never
+pass through the backend** and never touch the connection pool the cap exists to
+protect.
+
+**Only completed jobs can be exported**, and that restriction is what makes the
+artifact worth having: a completed job's results are immutable, so an export is
+built once and reused by every later download, where an export of an active job
+would be stale as it was written. It is also why the stream can safely redirect
+to one.
+
+Exports are derived data and are treated differently from the leave-generation
+KLVs in every way that matters: a purge deletes a job's exports with the results
+they describe (a row left saying `ready` would hand an admin a stable-looking
+artifact of a job that no longer holds any of it), they expire from the bucket
+after 30 days, and they are **not** cross-region replicated — losing one costs a
+re-export, where losing a KLV costs a rebuild that needs the database. `row_count`
+is recorded so a later mismatch against the job is visible rather than silent,
+the same reason the KLVs carry a digest.
 
 #### Audit Log
 
@@ -699,13 +771,14 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | `opening_rack_stats` — **as it was**, racks analysed and average equity in one query | job detail and every SSE push | **2,086 ms** (3,296 ms at 1,000,000 racks on a later run) |
 | `opening_rack_stats`: the average alone, after the split | job detail and every SSE push | 343 ms |
 | `opening_rack_stats`: best-move types | job detail and every SSE push | 541 ms (322 ms on the later run) |
+| `opening_rack_stats` **as it is now** — two counters, after both aggregates were dropped | job detail and every SSE push | two single-row reads |
 | Rating sweep `build_matrix`, 600,000 paired results | every two minutes | 452 ms |
 | `worker_contributions`, 44,000 claims | job detail and every SSE push | 136 ms |
 | Public worker list, all claims | page view | 93 ms |
 | Leave `next_step` rack selection | every leave claim | 47 ms |
 | `leave_gen_stats` | job detail and every SSE push | 210 ms |
 | Transition: stream generation 1 by rack | once per generation | 674 ms |
-| Transition: copy the universe to the next generation | once per generation | **56–66 s** |
+| Materializing a generation's rack universe | once per generation | **56–66 s** (measured as a SQL copy inside the transition, which is where it used to run; it now runs from the first claim of the generation it belongs to, off the critical path) |
 
 What the numbers settled:
 
@@ -1842,12 +1915,13 @@ Leave generation has sequential phases: generation N must complete before genera
 
 **State**: Per-rack occurrence progress *within* the current generation is tracked directly in Postgres, in `leave_rack_progress (job_id, generation, rack, occurrence_count, equity_sum)`, updated transactionally as each task result is accepted (see below) — this is what makes live, sub-generation dashboard progress possible without needing anything from MAGPIE beyond what already exists. The output of a *completed* generation (a combined KLV, built server-side once every rack has reached target — see Aggregation below) is stored in S3 and referenced by `leave_generation_artifacts.artifact_key`; the next generation's tasks receive that artifact key as input.
 
-**The racks are full racks.** MAGPIE's `RackList` forces, counts and reports full 7-tile racks, never leaves, and derives leave values from them itself. So `leave_rack_progress` holds one row per full rack the distribution can draw — 3,199,724 for English — seeded at zero when the job is created (unranked in chunks and bulk-inserted) and copied in SQL when each later generation opens. There is no `max_leave_size`: the leave domain of the KLV is always every leave of 1–6 tiles, and what is tracked is always every full rack.
+**The racks are full racks.** MAGPIE's `RackList` forces, counts and reports full 7-tile racks, never leaves, and derives leave values from them itself. So `leave_rack_progress` holds one row per full rack the distribution can draw — 3,199,724 for English — seeded at zero, unranked in chunks and bulk-inserted: generation 1's when the job is created, and every later generation's by the first claim that finds that generation current. There is no `max_leave_size`: the leave domain of the KLV is always every leave of 1–6 tiles, and what is tracked is always every full rack.
 
-**Two operations here outlast an ordinary HTTP request**, which is a deployment
+**Three operations here outlast an ordinary HTTP request**, which is a deployment
 constraint, not just a performance note. Creating an English leave-generation job
 writes those 3.2 million rows *inside* the creating request (`COPY` rather than
-batched `INSERT`s: 37 seconds against 54 on a developer machine), and a
+batched `INSERT`s: 37 seconds against 54 on a developer machine); the claim that
+first finds a later generation current writes the same rows for it; and a
 generation transition takes tens of seconds. A proxy that gives up on the request
 makes axum drop the handler future, which would roll back a creation part-way, or
 abandon a transition part-way on *every* attempt — so a generation whose
@@ -1860,7 +1934,7 @@ keep-alives every 15 seconds.
 
 At claim time:
 1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and `configured_generation_count` generations are already done, return "no work."
-2. Query `leave_rack_progress` for `(job_id, current_generation)`, ordered by `occurrence_count ASC`, and pick up to `racks_per_task` racks below `target_rack_count` (racks with no row yet count as 0). Racks named in the `forced_racks` of an open claim for this generation are excluded, so concurrent claims are not handed overlapping subsets. If none are below target *and* no `task_claims` row for this generation is still `claimed`, the generation is complete — run generation transition (below) instead of dispatching a task.
+2. Make sure the generation's rack universe exists, seeding it if it does not — generation 1's is written at job creation, every later one here, the first time a claim asks for work in it. Idempotent, and one indexed `EXISTS` when there is nothing to do, which is every claim after the first. Then query `leave_rack_progress` for `(job_id, current_generation)`, ordered by `occurrence_count ASC`, and pick up to `racks_per_task` racks below `target_rack_count` (racks with no row yet count as 0). Racks named in the `forced_racks` of an open claim for this generation are excluded, so concurrent claims are not handed overlapping subsets. If none are below target *and* no `task_claims` row for this generation is still `claimed`, the generation is complete — run generation transition (below) instead of dispatching a task.
 
    **The whole of step 2 runs under a per-job advisory lock** (`pg_advisory_xact_lock`, taken before anything is read and released when the claim transaction ends). Without it every read here is made against a view of the job that a concurrent claim may be in the middle of changing, and two races follow: a claim still being issued is not yet visible as in flight, so a generation could be closed while a task for it was going out — work that lands in a generation whose KLV is already built — and two claims could both find the generation complete and both start its transition, each streaming millions of rows and uploading a KLV. The lock is per job, so claims for other jobs never wait on it, and it is *not* held across the transition itself: a transaction held open across an S3 upload is what step 2 of the transition exists to avoid.
 
@@ -1881,6 +1955,8 @@ The reported list covers **every rack that occurred during the batch, forced or 
 **On result acceptance**: every reported rack must be a full 7-tile rack (plausibility refuses anything else). A result for a generation that has already been aggregated is credited to the worker and *not* folded in: its KLV is built and uploaded, so the occurrences would change nothing anyone reads, and adding them would leave the rows disagreeing with the artifact built from them — which is the one signal reserved for a corrupted or stale object (see [Artifacts: back up, or rebuild?](#artifacts-back-up-or-rebuild)). The claim flow no longer produces that state: a generation closes only when none of its claims is still `claimed`, a timed-out claim is abandoned and its late submission refused before it reaches this point, and a closed generation's tasks are never reissued (step 2). The check stays as a guard against state the flow never writes, such as a partial restore. Otherwise, within the same transaction that accepts the task result, all `{rack, count, mean}` entries are added to `leave_rack_progress` in one statement (`UPDATE ... FROM UNNEST($racks, $counts, $equity_sums)`, adding to `occurrence_count` and `equity_sum`) rather than row-by-row, since a submission can carry thousands of rows. An update rather than an upsert: the universe is seeded, so a rack with no row is not a rack of this distribution and must not create one. This is what drives the live dashboard figure — no heartbeat involved.
 
 **Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server derives every leave's value from that generation's full-rack means and builds the generation's KLV artifact directly in Rust (`backend/src/jobs/klv.rs`), uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete.
+
+The transition **does not write the next generation's rack universe.** That is millions of rows (3.2 million for English); inside the closing transaction it made every worker on the job wait the write out, and made the close and the copy stand or fall together, so anything that failed cost a full re-derive and re-upload as well. The universe is seeded when its generation *opens* instead — by the first claim that finds it current, under the job's lock so two claims cannot both do it — from the pinned letter distribution, through the same `seed_generation` that writes generation 1 at job creation. One implementation of what a generation's universe *is*, derived from the source of truth rather than from the previous generation's rows, and off the critical path.
 
 The transition takes tens of seconds and runs *outside* the claim transaction, on its own task so that a worker or proxy giving up on the request cannot cancel it part-way. That leaves the deciding claim holding no lock while it works, so ownership is recorded instead: the claim transaction that finds the generation complete inserts `leave_generation_transitions (job_id, generation)` and **commits** — its only write is that row, and committing is both what makes the row visible to everyone else and what releases the job's advisory lock before the upload starts. The row's primary key is what means every other claim arriving meanwhile is told there is no work yet rather than starting the same transition again. `completed_at` is set in the same transaction as the artifact row, and setting it is **conditional on the row still being there and still open** — that is how a transition finds out it no longer owns anything. A purge deletes the transitions row along with the artifacts and progress rows and reseeds generation 1, so a transition spawned before it would otherwise hand the purged job a generation-1 KLV derived from results it no longer has, and copy a freshly zeroed universe into generation 2. When the close is refused nothing is written and the uploaded object is left behind; it is keyed by job and generation, so a later transition of the same generation overwrites it, and `GET /api/worker/artifact` serves no key that no `leave_generation_artifacts` row names. A transition that never finishes — the process died, or the object store refused the upload — is taken over by a later claim once `started_at` is older than the takeover timeout (30 minutes, far longer than any measured transition), and `attempts` records that it happened; a failure the server survives hands ownership back immediately instead of waiting out the timeout.
 
@@ -3302,13 +3378,14 @@ as the action itself, so an audit failure rolls back what it describes.
 |---|---|
 | `user.registered` | Registration |
 | `task.claimed` | A worker claiming |
-| `task.declined` | A worker declining |
+| `task.declined` | A worker declining, with the reason in `reason` |
 | `result.submitted` | An accepted submission |
 | `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle |
 | `job.purged` / `job.purged.census` | Purge |
 | `job.deleted` / `job.deleted.census` | Delete |
 | `user.deleted` / `user.deleted.census` | Account deletion |
 | `job.artifacts_rebuilt` | Artifact rebuild, with counts |
+| `job.export_started` | An admin starting a results export |
 | `input_data.import_staged` / `input_data.import_confirmed` | Tarball import |
 | `worker.banned` | Ban, with the free-text reason |
 | `worker.unbanned` | Lifting a ban, naming the identity rather than the ban row, which is gone |
@@ -3387,6 +3464,9 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged, or the failure reason. |
 | `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged **new** rows, in one transaction. |
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
+| `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses, game results, or leave-rack progress. At most two run at once; a completed job with a ready export gets a `303` to it instead. |
+| `POST` | `/api/admin/jobs/:id/export` | Build a **completed** job's results into one gzipped NDJSON object in the artifact store. `202` with an id; the work runs on a background task. `409` for a job that is not completed. |
+| `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready. |
 | `GET` | `/api/admin/fleet` | What the field is running, from `task_claims.magpie_version`. |
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name, scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
@@ -3507,7 +3587,7 @@ do not exist.
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics. |
 | `GET` | `/api/jobs/:id/results` | Paginated task records for a job. `?worker=` filters to one contributor by username or anonymous UUID. `?rack=` is opening-rack jobs only and switches to a single-rack lookup. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after each accepted result. |
-| `GET` | `/api/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so an offline download never buffers a whole job in memory. The source table follows the job type: position analyses, game results, or leave-rack progress. |
+
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated), paginated. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
@@ -3665,7 +3745,8 @@ birdtest/
 │       │   ├── api_key.rs          # API key, password and code hashing
 │       │   └── csrf.rs             # CSRF double-submit verification
 │       ├── email.rs                # SES / console mail backends
-│       ├── artifacts.rs            # S3 (MinIO in dev) artifact store
+│       ├── artifacts.rs            # S3 (MinIO in dev) artifact store; multipart upload and presigned reads
+│       ├── exports.rs              # a completed job's results as one gzipped NDJSON artifact
 │       ├── ratelimit.rs            # in-memory governor token buckets
 │       ├── audit.rs                # append-only audit log writes
 │       ├── scheduler.rs            # job selection, lazy reclamation, task claiming
@@ -4199,6 +4280,39 @@ CREATE TABLE job_leave_config (
     use_wordmap       BOOLEAN NOT NULL DEFAULT TRUE
 );
 
+-- Exports
+--
+-- A completed job's results, as one gzipped NDJSON object in the artifact
+-- store. Only completed jobs can be exported, and that is what makes the
+-- artifact worth having: a completed job's results are immutable, so an export
+-- is built once and reused, where an export of an active job would be stale as
+-- it was written.
+--
+-- Shaped like input_data_imports, and for the same reason: a long operation an
+-- admin starts, polls, and then acts on. birdtest runs as a single instance, so
+-- the task needs no lease and startup may fail any row still 'running'.
+CREATE TABLE job_exports (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id        UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    state         TEXT NOT NULL DEFAULT 'running'
+                  CHECK (state IN ('running', 'ready', 'failed')),
+    -- NULL until the upload completes: the row exists from the moment the
+    -- background task is spawned.
+    artifact_key  TEXT,
+    bytes         BIGINT,
+    sha256        TEXT,
+    -- Rows written. Recorded so a later mismatch against the job is visible
+    -- rather than silent -- the same reason the KLV artifacts carry a digest.
+    row_count     BIGINT,
+    error         TEXT,
+    requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    completed_at  TIMESTAMPTZ
+);
+
+-- The newest ready export for a job, which is what a download resolves to.
+CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
+
 -- Tasks
 
 CREATE TYPE task_state AS ENUM ('available', 'claimed', 'completed');
@@ -4427,7 +4541,10 @@ CREATE INDEX position_analysis_records_task_idx
 CREATE TABLE position_analysis_moves (
     id              BIGSERIAL PRIMARY KEY,
     record_id       BIGINT NOT NULL REFERENCES position_analysis_records(id) ON DELETE CASCADE,
-    -- Denormalized so job-wide aggregates need not join through the record.
+    -- A second cascade path: moves already go with their record, which goes
+    -- with its task, but deleting a task reaches these directly too. It was
+    -- added to let job-wide aggregates skip the record join; there are no such
+    -- aggregates now, and it is kept for the cascade rather than for reads.
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
@@ -4442,14 +4559,15 @@ CREATE TABLE position_analysis_moves (
     -- static player, same as win_percentage.
     blended_utility DOUBLE PRECISION
 );
+-- Every read of a best move goes through its record: the results listing joins
+-- `record_id` and filters `rank = 1`, and a rack lookup reads a record's whole
+-- ranked list. There is deliberately no job-wide index on `(task_id) WHERE
+-- rank = 1`: one existed for a dashboard aggregate over every best move of a
+-- job, that aggregate is gone (the panel shows progress only), and the index
+-- cost maintenance on every move insert into a table that runs to tens of
+-- millions of rows.
 CREATE INDEX position_analysis_moves_record_idx
     ON position_analysis_moves (record_id, rank);
--- The dashboard's aggregates are all over best moves, which are read from here
--- rather than duplicated onto the record. A partial index keeps that a scan of
--- one row per position rather than of every stored move.
-CREATE INDEX position_analysis_moves_best_idx
-    ON position_analysis_moves (task_id) INCLUDE (move, equity)
-    WHERE rank = 1;
 
 -- Per-ply simulation stats for each candidate move. Only populated for simming
 -- player configs; a static player has no per-ply statistics to record.

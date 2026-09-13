@@ -108,3 +108,38 @@ pub async fn log_detail(
     .await?;
     Ok(())
 }
+
+/// A worker action logged with free-text detail in `reason`.
+///
+/// [`log_detail`] carries a reason but insists on an admin actor; a worker is
+/// a user *or* an anonymous UUID, and may be neither an admin nor a user at
+/// all. Declining is the case that needs it: the reason a claim came back is
+/// the only record that a worker declined rather than simply stopped, and it
+/// is what turns "are clients failing tasks locally?" into a query.
+#[allow(clippy::too_many_arguments)]
+pub async fn log_worker_detail(
+    conn: &mut PgConnection,
+    action: &str,
+    actor_user_id: Option<Uuid>,
+    actor_anon_uuid: Option<Uuid>,
+    target_type: &str,
+    target_id: String,
+    job_id: Option<Uuid>,
+    reason: String,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO audit_log
+             (action, actor_user_id, actor_anon_uuid, target_type, target_id, job_id, reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(action)
+    .bind(actor_user_id)
+    .bind(actor_anon_uuid)
+    .bind(target_type)
+    .bind(target_id)
+    .bind(job_id)
+    .bind(reason)
+    .execute(conn)
+    .await?;
+    Ok(())
+}

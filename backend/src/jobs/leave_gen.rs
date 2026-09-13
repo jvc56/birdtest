@@ -400,12 +400,16 @@ pub async fn next_step(
     }))
 }
 
-/// Write generation 1's rack universe at zero occurrences: every full rack
-/// the distribution can draw (3,199,724 for English). "Racks with no row yet
-/// count as 0" needs a known universe to draw from, and materializing it is
-/// what lets claim-time selection be a single indexed
-/// `ORDER BY occurrence_count` query. Later generations copy it in SQL
-/// ([`copy_universe`]) instead of re-sending it.
+/// Write a generation's rack universe at zero occurrences: every full rack the
+/// distribution can draw (3,199,724 for English). "Racks with no row yet count
+/// as 0" needs a known universe to draw from, and materializing it is what lets
+/// claim-time selection be a single indexed `ORDER BY occurrence_count` query.
+///
+/// Generation 1's is written when the job is created; later generations get
+/// theirs from [`ensure_universe`] when the claim path first asks for work in
+/// them. Both go through here, so there is one implementation of what a
+/// generation's universe *is*, derived from the pinned letter distribution
+/// rather than from the previous generation's rows.
 pub async fn seed_generation(
     conn: &mut PgConnection,
     job_id: Uuid,
@@ -451,18 +455,24 @@ pub async fn seed_generation(
     Ok(total as i64)
 }
 
-/// The next generation's universe: the same racks, at zero occurrences.
-async fn copy_universe(conn: &mut PgConnection, job_id: Uuid, from: i32) -> AppResult<()> {
-    sqlx::query(
-        "INSERT INTO leave_rack_progress (job_id, generation, rack)
-         SELECT job_id, generation + 1, rack FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = $2
-         ON CONFLICT (job_id, generation, rack) DO NOTHING",
-    )
-    .bind(job_id)
-    .bind(from)
-    .execute(conn)
-    .await?;
+/// Make sure `generation`'s rack universe exists, seeding it if it does not.
+///
+/// Generation 1's is written when the job is created; every later one is
+/// written here, the first time a claim asks for work in that generation, and
+/// not by the transition that closed the generation before it. That keeps the
+/// millions of rows off the transition's critical path -- a claim that arrives
+/// to find the universe missing pays for it once, while a transition that
+/// wrote it made every worker on the job wait, every time.
+///
+/// Idempotent and cheap when there is nothing to do: [`seed_generation`]
+/// returns on an `EXISTS` check, which is one index probe.
+pub async fn ensure_universe(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    distribution: &LetterDistribution,
+) -> AppResult<()> {
+    seed_generation(conn, job_id, generation, distribution).await?;
     Ok(())
 }
 
@@ -561,9 +571,7 @@ pub async fn close_generation(
     .execute(&mut *tx)
     .await?;
 
-    if generation < config.generation_count {
-        copy_universe(&mut tx, job_id, generation).await?;
-    } else {
+    if generation >= config.generation_count {
         sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
             .bind(job_id)
             .execute(&mut *tx)
@@ -571,6 +579,14 @@ pub async fn close_generation(
     }
     tx.commit().await?;
 
+    // The next generation's universe is NOT written here. It is seeded when
+    // that generation opens -- see `ensure_universe`, called from the claim
+    // path -- for two reasons. It is millions of rows (3.2 million for
+    // English), which inside this transaction made closing a generation a
+    // minute-long write that every worker on the job waited out, and which the
+    // transition then had to redo in full if anything failed, because the close
+    // and the copy stood or fell together. Seeded at the other end it happens
+    // while workers are busy, and a failure costs a retry of the seeding alone.
     Ok(())
 }
 

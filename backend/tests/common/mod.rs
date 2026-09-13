@@ -161,8 +161,27 @@ impl TestDb {
     }
 
     pub async fn state(&self) -> AppState {
+        // Credentials are resolved lazily, on the first S3 call. Without these
+        // the SDK walks the whole default chain -- including the EC2 instance
+        // metadata endpoint, which is unroutable here and takes about a minute
+        // to give up on -- so a test that touches the object store at all hung
+        // for that long before failing. The endpoint above is closed, so these
+        // are never used for anything.
+        for (key, value) in [
+            ("AWS_ACCESS_KEY_ID", "test"),
+            ("AWS_SECRET_ACCESS_KEY", "test"),
+            ("AWS_REGION", "us-east-1"),
+            ("AWS_EC2_METADATA_DISABLED", "true"),
+        ] {
+            if std::env::var_os(key).is_none() {
+                std::env::set_var(key, value);
+            }
+        }
         let cfg = Arc::new(self.config());
         AppState {
+            result_streams: std::sync::Arc::new(tokio::sync::Semaphore::new(
+                birdtest::state::MAX_CONCURRENT_RESULT_STREAMS,
+            )),
             pool: self.pool.clone(),
             cfg: cfg.clone(),
             sse: birdtest::sse::SseBroadcaster::new(),

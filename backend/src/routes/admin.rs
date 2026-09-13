@@ -34,6 +34,12 @@ pub fn router() -> Router<AppState> {
         .route("/input-data/imports/:id", get(get_import))
         .route("/input-data/imports/:id/confirm", post(confirm_import))
         .route("/jobs/:id/data-gaps", get(job_data_gaps))
+        // Bulk reads of a job's results are admin operations: the public gets
+        // the paginated `/api/jobs/:id/results`. The stream scans from a cursor
+        // and holds a pool connection while it does; the export is that scan
+        // done once, for a completed job, into a downloadable artifact.
+        .route("/jobs/:id/results/stream", get(super::public::job_results_stream))
+        .route("/jobs/:id/export", post(start_export).get(get_export))
         .route("/jobs/:id/rebuild-artifacts", post(rebuild_artifacts))
         .route("/backups", get(backups))
         .route("/fleet", get(fleet))
@@ -1576,6 +1582,11 @@ async fn purge_job(
     .await?;
     tx.commit().await?;
 
+    // Exports describe results this purge has just deleted. A row left saying
+    // `ready` would hand an admin a stable-looking artifact of a job that no
+    // longer holds any of it.
+    crate::exports::purge(&state, id).await?;
+
     // The generation-0 KLV was deleted with the artifacts above; rebuild it, or
     // generation 1 would have nothing to play with.
     registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
@@ -1628,6 +1639,96 @@ async fn delete_job(
     }
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Exports
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, sqlx::FromRow)]
+struct ExportRow {
+    id: Uuid,
+    state: String,
+    bytes: Option<i64>,
+    sha256: Option<String>,
+    row_count: Option<i64>,
+    error: Option<String>,
+    requested_at: chrono::DateTime<chrono::Utc>,
+    completed_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Serialize)]
+struct ExportDetail {
+    #[serde(flatten)]
+    export: ExportRow,
+    /// Present once the export is ready: a presigned URL that fetches the
+    /// object directly, so the bytes never pass through this process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    download_url: Option<String>,
+}
+
+/// Build a completed job's results into one downloadable artifact.
+///
+/// Returns immediately with an id; the work runs on a spawned task and the
+/// admin polls `GET`. Only completed jobs qualify — see `exports::start`.
+async fn start_export(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    Path(id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    let job = crate::jobstats::load_job(&state.pool, id).await?;
+    let export_id = crate::exports::start(&state, &job, admin.0.id).await?;
+
+    let mut conn = state.pool.acquire().await?;
+    audit::log(
+        &mut conn,
+        "job.export_started",
+        Some(admin.0.id),
+        None,
+        Some("job"),
+        Some(id.to_string()),
+        Some(id),
+    )
+    .await?;
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "id": export_id, "state": "running" })),
+    ))
+}
+
+/// The newest export for a job, with a download URL once it is ready.
+async fn get_export(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<ExportDetail>> {
+    let export = sqlx::query_as::<_, ExportRow>(
+        "SELECT id, state, bytes, sha256, row_count, error, requested_at, completed_at
+         FROM job_exports WHERE job_id = $1
+         ORDER BY requested_at DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("this job has never been exported"))?;
+
+    let download_url = match crate::exports::newest_ready(&state.pool, id).await? {
+        Some((ready_id, key)) if ready_id == export.id => Some(
+            state
+                .artifacts
+                .presigned_get(&key, crate::exports::DOWNLOAD_URL_TTL)
+                .await?,
+        ),
+        _ => None,
+    };
+
+    Ok(Json(ExportDetail { export, download_url }))
 }
 
 // ---------------------------------------------------------------------------

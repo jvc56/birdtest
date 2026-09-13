@@ -311,7 +311,6 @@ async fn analysed_racks_are_counted_once_per_task_as_they_arrive() {
     let stats = birdtest::jobstats::compute(&db.pool, &job_row).await.unwrap();
     let racks = stats.opening_racks.expect("an opening-rack job reports rack stats");
     assert_eq!(racks.racks_analyzed, 2, "two racks were analysed, by two workers");
-    assert_eq!(racks.average_best_equity, Some(32.5));
 }
 
 /// Bug: any error claiming from one job failed the whole claim, so a single

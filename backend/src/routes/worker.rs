@@ -284,14 +284,21 @@ async fn decline_task(
         .await?;
     }
 
-    audit::log(
+    // The reason is recorded, not just validated. `worker_data_gaps` says what
+    // was missing when a decline named files, but nothing said *why* a claim
+    // came back, so a worker that declined and a worker that vanished were
+    // indistinguishable afterwards -- and a client failing a task locally is
+    // invisible to the server entirely. It goes on the audit row rather than on
+    // `task_claims` because it describes an event rather than state.
+    audit::log_worker_detail(
         &mut tx,
         "task.declined",
         identity.user_id(),
         identity.anon_uuid(),
-        Some("claim"),
-        Some(claim_id.to_string()),
+        "claim",
+        claim_id.to_string(),
         Some(job_id),
+        body.reason.clone(),
     )
     .await?;
     tx.commit().await?;

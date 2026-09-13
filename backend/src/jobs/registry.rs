@@ -220,12 +220,19 @@ async fn generate_leave_gen(
         return Ok(Acquired::NoWork);
     }
 
+    // Generations past the first get their rack universe here, the first time a
+    // claim asks for work in one, rather than from the transition that closed
+    // the generation before. Under the lock, so two claims arriving together
+    // cannot both seed it, and before anything reads `leave_rack_progress`,
+    // which is what selection and the in-flight check are about to do.
+    let job_data = load_job_data(&mut *conn, job.id).await?;
+    leave_gen::ensure_universe(&mut *conn, job.id, generation, &job_data.letterdist).await?;
+
     if let Some(task_id) = next_available(&mut *conn, job.id, identity, Some(generation)).await? {
         let request = load_request(conn, job.job_type, task_id).await?;
         return Ok(Acquired::Task { task_id, request });
     }
 
-    let job_data = load_job_data(&mut *conn, job.id).await?;
     match leave_gen::next_step(conn, job.id, &config, &job_data).await? {
         leave_gen::LeaveGenStep::Dispatch(request) => {
             let task_id = insert_on_demand_task(conn, job.id, None).await?;
