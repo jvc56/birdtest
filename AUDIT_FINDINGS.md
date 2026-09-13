@@ -21,7 +21,7 @@ decisions:
 |---|---|---|
 | **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **24** (21 in A.1, J3, K-D1, K-D2) |
 | **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **18** (16 in A.2, J1, J2) |
-| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised six, of which K-D5 is now decided but not yet built, plus I3 carried forward. | **6 decided, 5 open** |
+| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised seven; K-D5 and K-D11 are decided (and K-D11 resolves K-D6 and K-D10), none of them built yet, plus I3 carried forward. | **8 decided, 3 open** |
 
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
@@ -32,8 +32,9 @@ the status of section I (I1 and I2 implemented, I3 still open), the
 discrepancies it found, and its verification. **Section K is the third pass**,
 which found and fixed two more races in leave generation, a scheduler contention
 bug, and a missing submission check. **K.6 is the current list of open
-questions** — K-D5 to K-D10, each with options and a recommendation, K-D5 now
-decided but not yet built — and it
+questions** — K-D5 to K-D11, each with options and a recommendation. K-D5 and
+K-D11 are decided but not yet built, and K-D11 resolves K-D6 and K-D10 by
+deleting the fields they were about. It
 supersedes I3, whose suggested fix does not work (K-D9). The Verification
 section just below describes the first pass; J.6 and then K.7 supersede it for
 current numbers.
@@ -1048,7 +1049,7 @@ produces correctly.
 ### K.6 Worth deciding next
 
 Each of these is a decision rather than a bug, so each is recorded with the
-options and a recommendation rather than acted on. **K-D6 through K-D10 were
+options and a recommendation rather than acted on. **K-D6 through K-D11 were
 worked through after the pass's code changes were committed**, in review; where
 that changed a conclusion the pass had already written down, the correction is
 stated rather than quietly swapped, since the point of this file is to be
@@ -1161,24 +1162,48 @@ deleted" — so an `exports/` prefix wants its own expiry rule, exclusion from
 replication, and an amended comment saying why this prefix is different from
 the KLVs.
 
-**Two sub-questions this decision does not settle**, worth answering before
-building:
+**Both sub-questions are now decided.**
 
-- **Who may download a ready export?** Admin-only is the minimum and matches
-  "admins download the data for completed jobs". Making a ready export publicly
-  downloadable is what would let A's limits be tightened further, since there
-  would then be a cheap sanctioned path for exactly the jobs that make the
-  stream expensive.
-- **Should the stream defer to the export?** A completed job with a ready
-  export could have `job_results_stream` answer `303` to the signed URL instead
-  of scanning. Elegant, and it puts the cheap path in front of every existing
-  caller without them changing anything — but it couples the two endpoints and
-  makes the stream's behaviour depend on whether an admin has run an export.
+- **Who may download a ready export? Admin-only.** The export endpoints sit
+  entirely under `/api/admin`, so C adds no public surface at all: no public
+  signed-URL policy, and the URL's expiry can be short because the only holder
+  is an authenticated admin who just asked for it.
+- **Should the stream defer to the export? Yes.** For a completed job with a
+  ready export, `job_results_stream` answers `303` to it rather than scanning.
+  That is the whole point of building C: a completed job's corpus should be read
+  from a stable artifact once, not re-scanned per caller.
+
+**What follows, and one thing to confirm.** These two together mean the bulk
+corpus of a completed-and-exported job is reachable only by an admin — a public
+caller hitting the stream is deferred to a URL it cannot fetch. So the
+deferral has to answer a non-admin with something honest (`404`, naming the
+export as the route) rather than a redirect into a wall. That leaves an odd
+shape: the public could bulk-stream an *active* job — expensive, unbounded,
+still growing — but not a *completed* one, which is the cheap stable case. That
+is backwards on cost.
+
+The way to square it, and the **recommendation**, is to make the stream
+**admin-only outright** and leave the public the paginated
+`GET /api/jobs/:id/results`. Then one rule covers everything: bulk is an admin
+operation, browsing is public. It also **simplifies A considerably** — with no
+anonymous caller able to start a scan, the per-IP rate limit stops earning its
+keep and only the concurrency cap remains, which is the half that was
+load-bearing anyway (it protects the connection pool from an admin or a script
+holding several streams open, which a rate limit never bounded).
+
+That is a change to A, which was originally chosen partly to *keep* the stream
+public, so it is flagged rather than assumed: **if the stream is meant to stay
+publicly reachable for active jobs, say so and A keeps its rate limit.**
 
 **Sequencing: A first.** It is small, and it is the half that stops one
 request from costing the site. C is a feature, and can follow.
 
 #### K-D6. `opening_rack_stats` scans the job's whole history
+
+> **Resolved by K-D11, which deletes both expensive queries rather than fixing
+> them.** The analysis below is kept because it is what established that the
+> cost lived entirely in the two fields K-D11 removes, and because the index
+> finding falls out of it. Option A — the query rewrite — is **not needed**.
 
 **Concern.** Two of its three queries aggregate over every stored move row, on
 the job detail page and on every SSE push. I2 replaced the distinct-rack `COUNT`
@@ -1359,6 +1384,16 @@ rather than one per result. That is the real cost, and it is a product decision.
   - *Against:* two update paths in one payload, and the frontend has to render
     staleness.
 
+**K-D11 shrinks the motivating case.** With `average_best_equity` and
+`best_move_types` gone, `opening_rack_stats` becomes two single-row reads and
+opening-rack jobs stop being the expensive ones. What still grows with a job's
+history inside `jobstats::compute` is `worker_contributions` (F16: 136 ms at
+44,000 claims), `estimate_eta`'s count over recent claims, the task-state counts
+over every task of the job, and `leave_gen_stats`. None of those is near the
+seconds the removed queries reached, so this is **no longer urgent** — but it is
+still the right shape, and the argument for it (nothing in the claim path reads
+a statistic) is unchanged.
+
 **Recommendation: B, shaped like D** — refresh under attention, and mark the
 backgrounded parts with an `as_of` so the dashboard is not silently stale.
 `ratings::recompute_stale` is already a two-minute sweep in `main.rs`, so there
@@ -1483,6 +1518,13 @@ a better use of I3's benchmark than running it and still having to guess.
 
 #### K-D10. The opening-rack aggregates count claims, not racks
 
+> **Resolved by K-D11.** The inconsistency was entirely between the two removed
+> fields and `racks_analyzed`; with them gone, the only number left is already
+> one-result-per-task. None of the four options below needs choosing. The
+> analysis is kept because it is the reason the removal is safe rather than
+> merely convenient — and because it records that opening racks are the one
+> place the stored corpus is genuinely per-claim, which stays true.
+
 **Concern.** `OpeningRackStats` carries three numbers, and at `redundancy > 1`
 they do not share a denominator:
 
@@ -1562,6 +1604,74 @@ and the index change it needs is small enough to make then rather than now.
 
 Whichever is chosen, it should be stated in PLAN.md next to the one-result-per-
 task rule, which currently reads as universal and is not.
+
+#### K-D11. `OpeningRackStats` keeps only `racks_analyzed`
+
+**Decision.** `average_best_equity` and `best_move_types` are removed from the
+job stats payload. `racks_analyzed` and `racks_total` — the progress pair — are
+the display the page actually needs; the other two were carrying most of the
+cost and all of the ambiguity in this area.
+
+**What this resolves outright.**
+
+- **K-D6.** The two removed fields *are* the two full-history scans. What is
+  left of `opening_rack_stats` is a read of `jobs.racks_analyzed` (a counter on
+  the `jobs` row) and `total_racks` from the config row: two single-row reads,
+  constant time, no index scan at any job size. The query rewrite K-D6
+  recommended is not needed, and neither is a counter.
+- **K-D10.** The denominator inconsistency was entirely between those two
+  per-claim aggregates and the per-task `racks_analyzed`. With them gone the
+  payload carries one number with one meaning, and the redundancy question does
+  not arise. **The per-claim rows are untouched** — nothing is deleted from
+  `position_analysis_records` or `position_analysis_moves`, so redundant
+  analyses remain stored and comparable, which is what the per-claim key exists
+  for. Only the aggregate over them goes.
+
+**What this unlocks, which is the part worth noticing.**
+`position_analysis_moves_best_idx` — `ON (task_id) INCLUDE (move, equity) WHERE
+rank = 1`, added because "the dashboard's aggregates are all over best moves" —
+has **exactly one reader**, and it is `best_move_types`. Checked: the other two
+rank-1 queries (`jobstats`'s average, and the opening-rack listing in
+`routes::public::job_results`) both join on `record_id`, so they use
+`position_analysis_moves_record_idx (record_id, rank)` instead. So removing
+these fields orphans that index, and dropping it takes maintenance work off
+**every move insert** on a table that runs to tens of millions of rows, plus its
+storage. That is a submission-path saving, not just a read-path one.
+
+`position_analysis_moves.task_id` loses its stated reason at the same time — the
+comment on it is "denormalized so job-wide aggregates need not join through the
+record", and there will be no job-wide aggregates. It is *not* recommended for
+removal: it is also a `REFERENCES tasks(id) ON DELETE CASCADE`, a second cascade
+path, and a column is cheap. But the comment becomes wrong and should say what
+the column is actually for now.
+
+**What has to change with it.**
+
+- `jobstats::OpeningRackStats` loses two fields; `MoveTypeCount` goes entirely,
+  and with it the move-type classification (the `ILIKE '(exch%'` /
+  `'(pass%'` logic and the comment explaining MAGPIE's rendering) becomes dead
+  code rather than something to keep working.
+- The job detail page's "Opening racks" panel drops two of its three cells,
+  leaving the progress pair. This also removes the visibly wrong number K-D10
+  found, rather than fixing it.
+- PLAN.md's *"A partial index on rank 1 keeps the dashboard's aggregates
+  cheap"* stops being true and should go with the index. The neighbouring
+  reasoning — that the record does not duplicate the best move because it is
+  the rank 1 row of `position_analysis_moves` — **still holds**: that row is
+  still read per-result by the results listing and by the rack lookup, just
+  never aggregated.
+- K-D8's motivating example shrinks; see the note there.
+
+**Cost of the decision**, stated so it is a choice rather than an oversight: the
+dashboard stops showing what the analysed racks *say* — the average best equity
+and how often the best opening is a placement, an exchange or a pass — and shows
+only how far through the space the job is. That information is not lost, only
+un-summarised: every ranked move is still stored, `GET /api/jobs/:id/results`
+still returns the best move, score and equity per rack, `?rack=` still returns a
+rack's full ranked list, and the admin export (K-D5) is the path for analysing
+the corpus properly. Summarising three million racks in two numbers on a
+progress page was arguably never where that analysis belonged.
+
 
 ### K.7 Verification (this pass)
 
