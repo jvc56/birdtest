@@ -21,7 +21,7 @@ decisions:
 |---|---|---|
 | **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **24** (21 in A.1, J3, K-D1, K-D2) |
 | **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **18** (16 in A.2, J1, J2) |
-| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised five, of which K-D5 is now decided but not yet built, plus I3 carried forward. | **6 decided, 4 open** |
+| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third raised six, of which K-D5 is now decided but not yet built, plus I3 carried forward. | **6 decided, 5 open** |
 
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
@@ -32,7 +32,7 @@ the status of section I (I1 and I2 implemented, I3 still open), the
 discrepancies it found, and its verification. **Section K is the third pass**,
 which found and fixed two more races in leave generation, a scheduler contention
 bug, and a missing submission check. **K.6 is the current list of open
-questions** — K-D5 to K-D9, each with options and a recommendation, K-D5 now
+questions** — K-D5 to K-D10, each with options and a recommendation, K-D5 now
 decided but not yet built — and it
 supersedes I3, whose suggested fix does not work (K-D9). The Verification
 section just below describes the first pass; J.6 and then K.7 supersede it for
@@ -1048,7 +1048,7 @@ produces correctly.
 ### K.6 Worth deciding next
 
 Each of these is a decision rather than a bug, so each is recorded with the
-options and a recommendation rather than acted on. **K-D6 through K-D9 were
+options and a recommendation rather than acted on. **K-D6 through K-D10 were
 worked through after the pass's code changes were committed**, in review; where
 that changed a conclusion the pass had already written down, the correction is
 stated rather than quietly swapped, since the point of this file is to be
@@ -1234,12 +1234,8 @@ second combined at a million racks, about 3.5 s projected for a full English
 job, on every view and every push. A makes that tolerable; only K-D8 bounds it.
 **B is withdrawn** in favour of K-D8, which is less machinery and covers more.
 
-**One thing to settle while there.** With `redundancy > 1` both queries average
-and count over *claims*, not racks, unlike every other aggregate in the system,
-which reads one result per task (`jobstats::FIRST_GAME_RESULT_PER_TASK`). For a
-simming player the repeated analyses genuinely differ, so averaging both is
-arguably right; for a static player they are identical and it is harmless.
-Defensible either way, but it is inconsistent and nothing says so.
+**One thing to settle while there:** both queries count claims rather than
+racks, which is a correctness question rather than a cost one. It is **K-D10**.
 
 #### K-D7. A locally-failed task's claim is left to time out
 
@@ -1484,6 +1480,88 @@ it happens. **A is measurement-dependent**, so rather than guessing, extend
 the same run; it currently times only the SQL copy. Then A answers itself, and
 answers it for the production instance class rather than for a laptop — which is
 a better use of I3's benchmark than running it and still having to guess.
+
+#### K-D10. The opening-rack aggregates count claims, not racks
+
+**Concern.** `OpeningRackStats` carries three numbers, and at `redundancy > 1`
+they do not share a denominator:
+
+| Field | Counts | Source |
+|---|---|---|
+| `racks_analyzed` | **one result per task** | `jobs.racks_analyzed`, incremented by `registry::count_first_result` only on a task's first accepted result |
+| `average_best_equity` | **every accepted claim** | `AVG(m.equity)` over all rank-1 moves |
+| `best_move_types` | **every accepted claim** | `COUNT(*)` over all rank-1 moves, grouped |
+
+Opening-rack records are keyed `(task_claim_id, rack)`, so each redundant claim
+records its own analysis of the same rack — deliberately: the migration says
+"redundant claims each record their own and can be compared", and PLAN.md says
+the same. In-game captured positions are the opposite, keyed
+`(task_id, game_index, turn_number)` with `ON CONFLICT DO NOTHING`, so only the
+first claim's land. Opening racks are the one place the corpus is genuinely
+per-claim.
+
+**This is visible on the page, not just in the API.** The job detail view
+renders all three in one `<dl>`: "Racks analyzed 1,000,000 / 3,199,724" beside
+"Best move types: placement 1,842,000 · exchange 158,000" — raw counts, not
+proportions. At `redundancy = 2` the move-type counts sum to twice the racks
+stated next to them. Nothing is wrong at `redundancy = 1`, which is why this has
+not been seen; redundancy is a per-job setting an admin can raise without
+touching any of this code.
+
+**Why this is not simply "make it consistent".** PLAN.md's rule is that every
+aggregate treating results as observations reads one result per task, and its
+stated reason is determinism: "games are seeded and deterministic, so the other
+copies replay the same games, and counting them would multiply the evidence by
+the redundancy." That premise does not hold here. PLAN.md also says
+"opening-rack analysis by a simming player is non-deterministic by
+construction, so honest repeat runs disagree" — so for a simming opening-rack
+job the repeat analyses are real extra samples, not duplicates, and discarding
+them throws away exactly what redundancy bought. For a static player they are
+identical and it makes no difference either way.
+
+**Options.**
+
+- **A. One result per task**, matching `racks_analyzed` and every other
+  aggregate: restrict both queries to the first accepted claim per task.
+  - *For:* one rule across the whole system, easy to state and to keep. The
+    numbers stop depending on a job's redundancy. Discards nothing from
+    *storage* — the per-claim rows stay, and stay comparable.
+  - *Against:* the headline average ignores the repeat simming samples. Picking
+    "first" among genuinely different samples is arbitrary.
+- **B. Average per rack, then over racks.** Mean the analyses of each rack, then
+  mean those; count each rack's best-move type once.
+  - *For:* redundancy-independent *and* uses every sample. The number then means
+    what its label claims — the mean best equity of a rack — rather than of an
+    analysis.
+  - *Against:* it needs `rack`, which lives on `position_analysis_records` and
+    **not** in the covering index `(task_id) INCLUDE (move, equity)`. So it
+    either joins back to the records, giving up K-D6's option A speedup, or
+    `rack` is added to that index's `INCLUDE` list — cheap, but a schema change
+    that widens an index carrying one row per position. Move types also need a
+    tie-break when a rack's claims disagree.
+- **C. Keep per-claim and make the payload say so.** Add `analyses_count`
+  beside `racks_analyzed` so both denominators are present, and render move
+  types as proportions rather than bare counts.
+  - *For:* no query change; keeps every sample; fixes the *visible* error, which
+    is as much a display bug as a query one.
+  - *Against:* two denominators in one panel is still something a reader has to
+    hold, and the headline average still moves when an admin changes redundancy.
+- **D. Defer** until an opening-rack job actually runs at `redundancy > 1`.
+  - *For:* no work, and nothing is wrong today.
+  - *Against:* it is silently wrong the first time one does, and the setting that
+    triggers it is one field on the job creation form.
+
+**Recommendation: A, plus C's display fix.** One rule across the system is worth
+more than a marginally better estimator on a job type nobody has yet run
+redundantly, and A costs nothing that B would later need — the per-claim rows
+survive, so B remains available if those repeat samples ever get a consumer.
+Render move types as proportions regardless, since bare counts beside a
+different denominator is the part a reader actually misreads. **B is the right
+answer if simming opening-rack jobs at redundancy > 1 become a real workload**,
+and the index change it needs is small enough to make then rather than now.
+
+Whichever is chosen, it should be stated in PLAN.md next to the one-result-per-
+task rule, which currently reads as universal and is not.
 
 ### K.7 Verification (this pass)
 
