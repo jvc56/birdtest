@@ -21,7 +21,7 @@ decisions:
 |---|---|---|
 | **PLAN.md updated** ("code wins") | The code's behaviour was right, or at least deliberate, and PLAN.md was a stale or inaccurate summary of it. | **24** (21 in A.1, J3, K-D1, K-D2) |
 | **Code updated** ("plan wins") | The code was wrong — a bug, or a clear mismatch with what the rest of the system needs — and PLAN.md described the intended behaviour. PLAN.md was also touched where its wording needed to follow the fix. | **18** (16 in A.2, J1, J2) |
-| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third found one, still open (K-D5). | **5, plus 1 still open** |
+| **Unresolved at first** | Reasonable arguments on both sides, or a real design decision, left for a human. **All five are now decided and implemented** (A.3, section F). The second pass found no new ones; the third left five open, K-D5 to K-D9, plus I3 carried forward. | **5 decided, 5 open** |
 
 Section B lists fixes that were not discrepancies (PLAN.md and code agreed and
 were both wrong, or PLAN.md was silent). Section F lists every question the
@@ -31,9 +31,11 @@ section I the follow-ups worth deciding next. Section J is the second pass:
 the status of section I (I1 and I2 implemented, I3 still open), the
 discrepancies it found, and its verification. **Section K is the third pass**,
 which found and fixed two more races in leave generation, a scheduler contention
-bug, and a missing submission check; K.6 carries the questions still open. The
-Verification section just below describes the first pass; J.6 and then K.7
-supersede it for current numbers.
+bug, and a missing submission check. **K.6 is the current list of open
+questions** — K-D5 to K-D9, each with options and a recommendation — and it
+supersedes I3, whose suggested fix does not work (K-D9). The Verification
+section just below describes the first pass; J.6 and then K.7 supersede it for
+current numbers.
 
 ## Verification
 
@@ -844,6 +846,10 @@ F16's measurements put the per-submission SPRT aggregates at about 50 ms for
 
 ### I3. Re-measure the universe copy on the production instance
 
+> **Superseded in part by K-D9.** The measurement is still wanted. The fallback
+> this section proposes — treat a missing row as zero and anti-join instead of
+> copying — does not work, for the reason given in K-D9, and is withdrawn.
+
 Copying 3.2 million leave rows to the next generation took 56–66 seconds on the
 F16 test database (the local compose Postgres at default settings, 2.7 GB of
 data), against a whole transition of about 15 seconds on the smaller dev
@@ -1040,10 +1046,15 @@ produces correctly.
 
 ### K.6 Worth deciding next
 
-Carried forward: **I3** (benchmark the universe copy on the production instance
-class) is still open and still needs production access.
+Each of these is a decision rather than a bug, so each is recorded with the
+options and a recommendation rather than acted on. **K-D6 through K-D9 were
+worked through after the pass's code changes were committed**, in review; where
+that changed a conclusion the pass had already written down, the correction is
+stated rather than quietly swapped, since the point of this file is to be
+second-guessable.
 
-New, and each a decision rather than a bug:
+Carried forward from section I: **I3** is still open, and K-D9 replaces its
+suggested fix, which does not work.
 
 #### K-D5. `GET /api/jobs/:id/results/stream` is public, unauthenticated and unbounded
 
@@ -1070,23 +1081,312 @@ service that costs the attacker one HTTP request.
 download.** Left unresolved because it is an access-policy decision about how
 open the data is meant to be, which is not the audit's to make.
 
-#### K-D6. Two smaller ones, recorded rather than fixed
+#### K-D6. `opening_rack_stats` scans the job's whole history
 
-- **`jobstats::opening_rack_stats` still averages over every stored move row.**
-  I2 replaced the distinct-rack `COUNT` with a counter but left
-  `AVG(m.equity)` scanning the job's whole history, on the detail page and every
-  SSE push. F16 measured the sibling query at 2.1 s for a million racks. A
-  running sum and count alongside `racks_analyzed` would make it constant-time,
-  but it is a third denormalized counter to keep correct through purge and
-  restore — the trade-off I2 already weighed, on a read nobody has complained
-  about yet.
-- **MAGPIE leaves a locally-failed task's claim to time out** rather than
-  declining it, so the task is not reissued for the heartbeat timeout (five
-  minutes by default). Declining would release it at once, but
-  `contribute_decline_task` also calls `remember_unsupported`, which would
-  blacklist the whole job for what may be a transient failure. Separating "give
-  this task back" from "I cannot run this job" is the real fix and is a protocol
-  change on both sides, so it is flagged rather than made.
+**Concern.** Two of its three queries aggregate over every stored move row, on
+the job detail page and on every SSE push. I2 replaced the distinct-rack `COUNT`
+with `jobs.racks_analyzed` and left these:
+
+```sql
+-- average_best_equity
+SELECT AVG(m.equity) FROM position_analysis_records r
+JOIN tasks t ON t.id = r.task_id
+LEFT JOIN position_analysis_moves m ON m.record_id = r.id AND m.rank = 1
+WHERE t.job_id = $1
+
+-- best_move_types                              (F16: 541 ms at 1M racks)
+SELECT ... FROM position_analysis_moves m
+JOIN tasks t ON t.id = m.task_id
+WHERE t.job_id = $1 AND m.rank = 1 GROUP BY 1
+```
+
+**Correction to this pass's first write-up of it.** It said a running sum and
+count beside `racks_analyzed` was the fix, and called that "the trade-off I2
+already weighed". That was wrong about the cost, because the schema already
+carries a cheaper fix. `position_analysis_moves.task_id` is denormalized with
+the comment *"so job-wide aggregates need not join through the record"*, and
+`position_analysis_moves_best_idx` is `ON (task_id) INCLUDE (move, equity)
+WHERE rank = 1` — a covering partial index holding exactly one row per position,
+with `equity` already in it. The second query uses it. **The first does not**,
+because it joins on `record_id` rather than `task_id`, so it cannot reach the
+index that was built for it. It reads like a query that predates the index.
+
+**Options.**
+
+- **A. Rewrite the average to go through `task_id`**, the same shape as the
+  move-types query. The result is identical: the current `LEFT JOIN` yields
+  `NULL` for a record with no rank-1 move and `AVG` ignores `NULL`s, so
+  selecting from the moves directly covers the same set.
+  - *For:* turns a million-row nested join into an index-only scan of the index
+    added for it; no schema change, no counter, no staleness.
+  - *Against:* none identified.
+- **B. Running sum and count** beside `jobs.racks_analyzed`.
+  - *For:* the average becomes constant-time.
+  - *Against:* a third denormalized counter to keep correct through purge,
+    restore and RUNBOOK §2.3 — and it fixes only one of the two scans, since a
+    distribution over move types cannot be a scalar counter.
+- **C. Debounce the SSE push and cache the detail payload** per job (F16's
+  option B, never implemented). Superseded by K-D8, which is the same idea
+  done properly.
+- **D. Keep.**
+
+**Recommendation: A, unconditionally — it is a query rewrite with no
+identified downside — and then K-D8 for the general case.** Even after A the
+page still does two index-only scans over the job's whole history: roughly a
+second combined at a million racks, about 3.5 s projected for a full English
+job, on every view and every push. A makes that tolerable; only K-D8 bounds it.
+**B is withdrawn** in favour of K-D8, which is less machinery and covers more.
+
+**One thing to settle while there.** With `redundancy > 1` both queries average
+and count over *claims*, not racks, unlike every other aggregate in the system,
+which reads one result per task (`jobstats::FIRST_GAME_RESULT_PER_TASK`). For a
+simming player the repeated analyses genuinely differ, so averaging both is
+arguably right; for a static player they are identical and it is harmless.
+Defensible either way, but it is inconsistent and nothing says so.
+
+#### K-D7. A locally-failed task's claim is left to time out
+
+**Concern.** When a MAGPIE executor fails, `contribute_submit_result` stops the
+heartbeat and drops the claim token without telling the server, so the task
+stays `claimed` for the whole heartbeat timeout (300 s by default) before anyone
+else can have it. `contribute_decline_task` would release it at once, but it
+also calls `remember_unsupported`, which blacklists the entire job for the rest
+of that run over what may be one bad task.
+
+**Correction to this pass's first write-up of it.** It called separating those
+two "the real fix". On reflection that is probably wrong, because of *why* an
+executor fails:
+
+- If the failure is a property of the **task or the job** — an unusable rack, a
+  batch size of zero, leavegen producing nothing — the task is poison and will
+  fail for every worker. Reissuing it in seconds rather than five minutes burns
+  the fleet through it *faster*. The timeout is accidentally rate-limiting
+  poison work.
+- If it is a property of the **worker** — a failed KLV write, a transient OOM —
+  MAGPIE's `MAX_CONSECUTIVE_FAILURES = 5` ends the run anyway, and the five
+  minutes cost one task's latency on a job that has other work.
+
+The case where fast reissue helps — a transient, worker-local failure on a job
+with nothing else to hand out — is narrow, and the change carries a real cost in
+the common case.
+
+**The gap that does look real is observability.** `routes::worker::decline_task`
+validates `reason` against `missing_data` / `magpie_version` /
+`unknown_job_type` and then **never stores it**. `worker_data_gaps` records
+*what* was missing; the audit row is a bare `task.declined` (`audit::log` has no
+`reason` parameter — only `log_ban` and `log_detail` do). So nothing anywhere
+records *why* claims are declined, and a local execution failure is invisible
+server-side, indistinguishable from a worker that vanished.
+
+**Options.**
+
+- **A. Add a `task_failed` reason and decline without blacklisting.**
+  - *For:* the task returns in seconds; the failure becomes visible.
+  - *Against:* the poison-task churn above. It needs a reissue guard — stop
+    re-dispatching a task after N declines — to be safe, and that guard is the
+    larger half of the work. Additive protocol change across both repositories
+    plus the fixtures.
+- **B. Record the decline reason server-side** — on the audit row
+  (`log_detail` already takes `reason`) or as a column on `task_claims` — and
+  leave the timeout behaviour alone.
+  - *For:* small, one-sided, no protocol change. Turns "is this happening at
+    all?" into a query, and is the prerequisite for judging A on evidence
+    instead of speculation.
+  - *Against:* does not speed up reclamation.
+- **C. Keep both as they are.**
+- **D. Shorten `HEARTBEAT_TIMEOUT_SECONDS`.**
+  - *For:* cheapens every lost claim, not just failed ones.
+  - *Against:* a legitimately slow batch gets reclaimed and duplicated. It
+    trades a rare cost for a common one; wrong lever.
+
+**Recommendation: B now, and A only if B shows that local failures are common
+and transient.** The five-minute delay is worth paying for the rate limiting it
+provides, and there is currently no evidence either way — which is the part
+actually worth fixing.
+
+#### K-D8. Job statistics are display-only, and could be refreshed in the background
+
+**What is load-bearing, checked rather than assumed.** `jobstats` has three
+entry points outside itself:
+
+| Call | Where | On what path |
+|---|---|---|
+| `jobstats::compute` | `public.rs` job detail, `public.rs` SSE connect, `worker.rs` SSE push (already gated on `has_subscribers`) | **Display only** |
+| `jobstats::game_stats` | `worker.rs`, inside `finish_condition_met` | **Job completion** |
+| `jobstats::load_job` | single-row reads | trivial |
+
+`scheduler.rs` does not reference `jobstats` at all, and neither does
+`registry::acquire`: the claim path reads `jobs`, `tasks`, `task_claims`, the
+per-type config rows and `leave_rack_progress`, and nothing else. **No worker
+anywhere waits on a statistic.** `opening_rack_stats`, `worker_contributions`
+(F16: 136 ms at 44,000 claims, and growing), `estimate_eta`, `leave_gen_stats`
+and the task-state counts all exist so a person can see how a job is doing.
+
+The one exception is not dispatch but **stopping**: `game_stats` runs on every
+submission to a games or game-pairs job and is what auto-completes it when the
+LLR crosses. PLAN.md commits to that explicitly ("SPRT is evaluated inline on
+every result submission (no background sweep)"), so backgrounding it would let a
+job overshoot its stopping point by the refresh interval. F16 put it at about
+50 ms for 400,000 units, so there is no pressure to move it and it should stay
+where it is.
+
+**Why it is not already this way** is history rather than a reason: the SSE
+design came first, and PLAN.md's promise is "one SSE event per accepted result,
+carrying the same payload `GET /api/jobs/:id` would return". Byte-identical live
+and reload payloads is a property the code went out of its way to keep. A
+background refresher gives that up — the stream becomes an event every *T*
+rather than one per result. That is the real cost, and it is a product decision.
+
+**Options.**
+
+- **A. Refresh every active job on a fixed interval; all reads serve the cache.**
+  - *For:* constant-time reads always; cost bounded and independent of traffic;
+    no cold-view penalty.
+  - *Against:* burns work on jobs nobody is looking at; every viewer sees stats
+    lagging by the interval.
+- **B. Refresh only jobs under attention** — a live SSE subscriber, or viewed
+  recently — on an interval.
+  - *For:* cost follows attention, which is the pattern `SseBroadcaster::has_subscribers`
+    already establishes here; no waste on idle jobs; a watched job still updates
+    continuously.
+  - *Against:* the first view of a cold job pays full cost; one more piece of
+    in-process state.
+- **C. Lazy TTL cache, no background task.**
+  - *For:* simplest; nothing to schedule.
+  - *Against:* whoever misses the cache pays the full cost — the very thing this
+    is meant to avoid — and a popular job stampedes on every expiry unless the
+    computation is single-flighted.
+- **D. Split the payload by freshness.** Progress and SPRT stay live (they are
+  counters already); the descriptive aggregates — analysed racks, the move-type
+  distribution, the worker table — come from the background and carry an
+  `as_of`.
+  - *For:* honest about which numbers are live; leaves the completion path
+    untouched; the page can say "analyses as of 30s ago" rather than being
+    quietly stale.
+  - *Against:* two update paths in one payload, and the frontend has to render
+    staleness.
+
+**Recommendation: B, shaped like D** — refresh under attention, and mark the
+backgrounded parts with an `as_of` so the dashboard is not silently stale.
+`ratings::recompute_stale` is already a two-minute sweep in `main.rs`, so there
+is both a place to put it and a precedent for how its failures should be
+handled (K5: log and skip, never abort the sweep).
+
+Two things to settle first:
+
+- **Do K-D6's option A regardless.** A cache over a 3.5-second query still has a
+  3.5-second cold path, and every option above has one. Making the underlying
+  query an index-only scan makes all of them cheaper, and makes C viable at all.
+- **This deepens the single-instance assumption.** An in-process cache is
+  coherent only because `desired_count` is pinned to 1 (C14). PLAN.md already
+  lists the import reaper, the rate limits and SSE as single-instance-dependent;
+  this would make four, and it belongs on that list rather than being discovered
+  during a future attempt to replicate.
+
+#### K-D9. The leave-generation universe copy (supersedes I3's suggested fix)
+
+**What it is.** When a generation closes, `copy_universe` inserts one row per
+rack into the next generation — 3,199,724 rows for English, since F1 made the
+tracked universe every full 7-tile rack. Three things need those rows
+materialized: claim-time selection is a single indexed
+`ORDER BY occurrence_count ASC LIMIT racks_per_task` and "a rack with no row
+counts as 0" needs a known universe (F16: 47 ms); result folding is an `UPDATE`
+rather than an upsert, so a rack with no row creates nothing, which is the only
+thing validating rack strings from workers; and `generation_klv` requires every
+rack to have a row, since a rack that never occurred still contributes mean 0 to
+the weighted average.
+
+**Why I3 cares.** F16 measured the copy at **56–66 s** on the loaded local
+compose Postgres against about a second on a small dev database — a spread wide
+enough that neither predicts the production `db_instance_class`.
+`scripts/leave-gen-bench.sh` answers it and is safe against production
+(everything is rolled back).
+
+**What the problem actually is**, worst last:
+
+1. It is on the critical path: claims for the job are refused while it runs, so
+   every worker on that job idles.
+2. It is a long write transaction — 3.2 M rows, a heap row plus two index
+   entries each, roughly half a gigabyte of writes and WAL, in the same
+   transaction as the artifact row. On RDS that is replication lag and an IOPS
+   burst; on a burstable class it can drain the I/O credit balance and leave the
+   whole database slow afterwards. That is the specific reason the instance class
+   matters.
+3. It is multiplied by `generation_count`: a ten-generation English job copies
+   32 M rows over its life and retains them all.
+4. It is all-or-nothing and retried. The copy is inside `close_generation`'s
+   transaction, so if it cannot finish, `completed_at` never commits and the
+   takeover path re-runs the **entire** transition 30 minutes later, re-deriving
+   and re-uploading as well. An instance slow enough not to finish does not
+   merely slow the job down — it wedges it in a retry loop.
+
+**I3's suggested fix does not work.** I3 says to "treat a missing row as zero
+occurrences, and select a generation's racks by anti-joining the previous
+generation's rows instead of copying them". It saves nothing: a generation closes
+only when *no* rack is below target, so every rack must reach the target, so
+every rack ends up with a row regardless. Sparse storage only changes *when* rows
+are created — trading one bulk `INSERT … SELECT` for 3.2 M lazy upserts spread
+across the generation's submissions, which is more total work — while turning the
+47 ms selection into an anti-join against the universe and giving up the
+"no row means not a real rack" validation. Steady-state storage is identical.
+**Withdrawn.**
+
+**Options.**
+
+- **A. Generate rather than copy.** `seed_generation` already builds a universe
+  from `RackIndex` via `COPY`, is idempotent and is already tested; calling it
+  for generation N+1 instead of `copy_universe` is close to a one-line change.
+  - *For:* one code path instead of two implementations of the same invariant,
+    derived from the pinned letter distribution rather than from prior rows.
+  - *Against:* it is a **trade, not a strict improvement**. The SQL copy keeps
+    all 3.2 M rows server-side, which is PLAN.md's stated rationale ("later
+    generations copy it in SQL instead of re-sending it"); generating pays
+    roughly 75 MB of client-to-server traffic per generation plus the CPU to
+    unrank 3.2 M racks. The two numbers available (H3's 37 s to `COPY`-generate,
+    F16's 56–66 s to SQL-copy) are from different machines in different states
+    and do not settle it.
+  - *Checked and rejected as an argument for A:* that copying could propagate a
+    damaged universe forward. `klv::FullRackLeaves::add_rack` rejects unknown
+    letters, wrong tile counts and over-drawn letters; `generation_klv` pins the
+    total against `RackIndex::total()`; and the primary key forbids duplicates.
+    Right count, all individually valid, all distinct is exactly the right set
+    for full racks, so the check is complete, and it fires at the transition —
+    which is when the copy happens anyway. A is a simplification, not a safety
+    fix.
+- **B. Move it off the critical path**: seed generation N+1's universe when
+  generation N *opens* rather than when it closes.
+  - *For:* same total work, done while workers are busy instead of while they
+    are idle. Storage is retained either way, so nothing extra is held — it just
+    exists earlier. The transition is then only the artifact row and
+    `completed_at`: a small, fast transaction, which also removes problem 4.
+  - *Against:* a generation's universe exists before anything can use it, which
+    is mildly confusing to read.
+- **C. Overlap it with the derivation.** Weaker than B but simpler: the next
+  universe depends only on generation N's rack *strings*, fixed from the moment
+  that generation was seeded, so the copy can run concurrently with the ~13 s
+  derivation and the S3 upload.
+- **D. Take it out of the transition transaction**, whenever it runs. It is
+  `ON CONFLICT DO NOTHING`, so it is independently retryable, and a failed copy
+  should not cost a re-derive and a re-upload.
+- **E. Stop retaining every generation's rows.** The structural one. Retention
+  exists because "Artifacts: back up, or rebuild?" chose rebuild; if the KLVs
+  were backed up instead — they already live in a cross-region-replicated bucket
+  — generation N's rows could be dropped once its artifact is committed and
+  verified, giving 3.2 M rows in total rather than 3.2 M per generation.
+  - *For:* fixes storage and vacuum pressure.
+  - *Against:* does **not** fix the copy time, and reverses a documented
+    decision.
+- **F. Keep it in proportion.** The copy is tens of seconds; driving 3.2 M racks
+  to `target_rack_count` is the job. None of the above changes that.
+
+**Recommendation: B plus D now** — both are unconditional and need no
+measurement, B because moving work off the critical path is right however fast
+the work is, D because a failure should be independently retryable however often
+it happens. **A is measurement-dependent**, so rather than guessing, extend
+`scripts/leave-gen-bench.sh` to time generate-versus-copy on the same machine in
+the same run; it currently times only the SQL copy. Then A answers itself, and
+answers it for the production instance class rather than for a laptop — which is
+a better use of I3's benchmark than running it and still having to guess.
 
 ### K.7 Verification (this pass)
 
