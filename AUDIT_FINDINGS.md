@@ -452,103 +452,339 @@ No blocker was left unresolved.
 
 ## 8. Left unresolved — needs human input
 
-These are genuine trade-offs. Neither the code nor `PLAN.md` was changed for any
-of them.
+These are genuine trade-offs. **Neither the code nor `PLAN.md` was changed for
+any of them.** Each carries a recommendation, which is a suggestion for whoever
+picks it up rather than a decision taken here — the point of the section is that
+the evidence does not settle these on its own.
 
 ### U1 — `GET /api/jobs/:id/results` has no bounded plan
 
 **The problem.** For an opening-rack job the query joins every
 `position_analysis_records` row of the job (through `tasks`), left-joins its
 rank-1 move, and sorts by `submitted_at DESC` before `LIMIT/OFFSET`. A full
-English job is 3.2 M records; a capture-on games job is millions more. No index
-can serve it, because the records tables carry `task_id` but not `job_id`, so
-the job filter lives on the other side of a join from the sort. The endpoint is
-public and unauthenticated. `total` is already `-1`, so the *count* is
-acknowledged as unbounded; the scan is not.
+English job is 3.2 M records; a games job with `capture_positions` on is
+millions more (PLAN.md's own figure: 9 M positions for `max_games = 400,000`).
+No index can serve it, because the record tables carry `task_id` but not
+`job_id`, so the job filter sits on the other side of a join from the sort
+column. `OFFSET` makes deep pages worse rather than better: the rows are
+produced and then discarded server-side, and `page` is only clamped at zero, so
+`?page=1000000` is a legal request. The endpoint is public and unauthenticated.
+`total` is already `-1`, so the *count* is acknowledged as unbounded; the scan
+is not.
 
-**Options.** (a) Denormalise `job_id` onto `position_analysis_records` and
-`game_results` and index `(job_id, submitted_at)` — the straightforward fix, at
-the cost of a column on the two largest tables and a third cascade path.
-(b) Switch to keyset pagination on `(submitted_at, id)`, which changes the
-public API's shape. (c) Bound the endpoint to recent tasks only, which changes
-what it means.
+Scope: opening-rack and games/pairs jobs only. The leave-generation branch reads
+`leave_rack_progress`, which is keyed on `(job_id, generation, rack)` and needs
+nothing.
 
-**Why not decided here.** All three change either the schema of the largest
-tables or a public API contract, and the right answer depends on whether deep
-paging into a finished job's corpus is a use case at all — the export exists for
-exactly that. Flagged rather than guessed.
+**Options.**
+
+- **(a) Denormalise `job_id` onto `position_analysis_records` and
+  `game_results`, and index `(job_id, submitted_at DESC)`.** The direct fix:
+  the filter and the sort end up in one index, and the plan becomes an ordered
+  index scan that stops at `LIMIT`. It is also the only option that helps the
+  admin NDJSON stream and the export, which run the same join. Costs: a column
+  on the two largest tables in the schema (tens of millions of rows each); a
+  third cascade path to `jobs` on tables that already cascade through `tasks`;
+  and index maintenance on every insert, on the same path B3/C8 just made
+  cheaper. `position_analysis_moves` already carries a denormalised `task_id`
+  for exactly this kind of reason, so the pattern is not new here. While there
+  is one migration, this is a free edit; after release it is a backfill over
+  those tables.
+- **(b) Keyset pagination on `(submitted_at, id)`.** Replaces `page`/`offset`
+  with an opaque cursor, so page *N* costs what page 1 costs. This is the
+  textbook fix for unbounded offsets and it needs no schema change — but on its
+  own it does not help, because without (a) the job filter still forces the
+  join, and the first page still scans the job. It is the right complement to
+  (a), not a substitute. It also changes the public response shape (`page` and
+  `per_page` are part of the documented pagination contract in PLAN.md's API
+  conventions), and the frontend's `Pagination.svelte` assumes page numbers.
+- **(c) Bound the endpoint to a recent window** — the last *N* tasks, or
+  results from the last *N* days. Cheapest to implement and it keeps the API
+  shape, but it silently changes what the endpoint means: "the job's results"
+  becomes "some of the job's results", and a caller paging to the end has no way
+  to tell the difference between "that is all of them" and "that is where we cut
+  it off".
+- **(d) Make it admin-only, as the NDJSON stream already is.** Consistent with
+  the reasoning that already moved bulk reads behind admin, and a one-line
+  change. But this is a *paginated* read of at most 500 rows — the thing the
+  public was explicitly left with when the stream was taken away — so this
+  removes the public's only path to a job's results rather than fixing the cost
+  of serving them.
+
+**Recommendation: (a), and (b) alongside it if the API shape is still
+negotiable before release.** (a) is the only option that removes the cost rather
+than hiding it, it fixes three call sites at once (the paginated read, the admin
+stream, and the export), and it is nearly free while `0001_initial.sql` is still
+being edited in place — which is a window that closes at the first deployment.
+(b) turns the remaining `OFFSET` cost into a constant, and pre-release is the
+only cheap moment to change a pagination contract. I would not take (c): an
+endpoint that quietly truncates is worse than a slow one, because nothing tells
+the caller. I would not take (d) alone: it answers "who is allowed to pay this"
+rather than "why does this cost so much", and the same query would still be slow
+for the admin.
+
+**What would change the answer.** If deep paging into a finished job's corpus
+turns out not to be a use case — the export exists for exactly that, and is
+built once and reused — then (c) or (d) become defensible, and (a)'s column on
+two enormous tables stops being worth it. That is a product question about who
+reads `/api/jobs/:id/results` and why, which the code cannot answer.
 
 ### U2 — the job list and contributor lists still aggregate over whole tables
 
-**The problem.** `GET /api/jobs` runs `COUNT(*)` and
-`COUNT(*) FILTER (state = 'completed')` over `tasks` for every job on the page;
-`GET /api/users` computes a completed-claim count per user and then sorts by it,
-so it reads every user's claims before applying `LIMIT`; `GET /api/workers`
-groups over all of `task_claims` twice (rows and total).
+**The problem.**
 
-**What was done.** `tasks_job_idx` widened to `(job_id, state)`, which makes the
-two task counts index-only rather than a heap visit per task. That is a real
-improvement and not a fix.
+- `GET /api/jobs` runs `COUNT(*)` and `COUNT(*) FILTER (state = 'completed')`
+  over `tasks` for every job on the page — up to 500 jobs per request, each
+  count linear in that job's task history. PLAN.md measured this page at
+  **2,188 ms** before `games_completed` became a counter; that change fixed the
+  game totals and left the task counts.
+- `GET /api/users` computes a completed-claim count per user as a correlated
+  subquery and then orders by it, so it must evaluate the count for *every*
+  user before `LIMIT` can apply.
+- `GET /api/workers` groups over all of `task_claims` twice — once for the rows,
+  once for the total. Measured at 93 ms for 44,000 claims and linear from there.
 
-**Options.** Running totals on `jobs` (the pattern `games_completed` and
-`racks_analyzed` already use, with the same drift caveat), a materialized view
-refreshed on a sweep, or a short-lived in-process cache.
+**What was already done.** `tasks_job_idx` widened from `(job_id)` to
+`(job_id, state)`, so both task counts are index-only rather than a heap visit
+per task. That is a real improvement and not a fix: the work is still
+proportional to the job's history, just with a much smaller constant.
 
-**Why not decided here.** `PLAN.md` took an explicit position — "No
-pre-aggregation for dashboard v1, except two measured exceptions" — and adding a
-third counter is a decision against that position, which should be made on
-measurement of the real volume rather than in an audit.
+**Options.**
+
+- **(a) Running totals on `jobs`** (`tasks_total`, `tasks_completed`),
+  maintained in the claim and submit transactions. Exactly the pattern
+  `games_completed` and `racks_analyzed` already use, with the same properties:
+  constant-time reads, and a counter that can drift under a partial restore.
+  Drift is survivable here for the same reason PLAN.md gives for the existing
+  two — nothing decides anything from these numbers, they are a progress display
+  — and RUNBOOK §2.3 already documents recomputing the existing counters, so
+  this extends a procedure rather than inventing one. Cost: two more writes on
+  the claim path, which is the path this audit spent its effort emptying.
+- **(b) A short-lived in-process cache** (say 5–10 s) in front of the whole job
+  list. No schema change, no writes on the claim path, and the staleness is
+  bounded and obvious. Fits a page a human refreshes. But it is per-process
+  state — fine today, since `desired_count` is pinned at 1 and rate limits and
+  SSE subscribers already work this way, and one more thing to reconsider if
+  that ever changes. Does nothing for `/api/users` or `/api/workers` unless
+  applied there too.
+- **(c) A materialized view refreshed on a sweep.** Moves the whole cost off
+  every request path to a timer, and covers all three endpoints with one
+  mechanism. Heaviest option: a new object in the schema, a refresh that itself
+  scans the tables, and a second source of truth to reason about during a
+  restore.
+- **(d) Leave it, and revisit on measurement.** The current numbers are a page
+  view, not a worker-facing path, and the index change bought real headroom.
+  PLAN.md's `SLOW_STATS_THRESHOLD` log line exists precisely to make this
+  decision on evidence, and nothing equivalent logs for these three endpoints.
+
+**Recommendation: (d) for now, with (a) as the intended fix — and add the
+logging that would trigger it.** PLAN.md took an explicit position ("No
+pre-aggregation for dashboard v1, except two measured exceptions"), and both
+exceptions were taken *on measurements* of the real query. There is no such
+measurement for these at production volume, and the index change moved them
+materially. The concrete next step is small and uncontroversial: log these three
+endpoints when they cross a threshold, the way `jobstats::compute` already does,
+so the third exception gets made on the same evidence the first two did. When it
+is time, (a) is the right shape — it matches the established pattern, it has a
+documented recovery path, and it is the only option that makes the job list
+genuinely constant-time.
+
+**What would change the answer.** A single job past a few hundred thousand
+tasks, or a job list page that starts appearing in the slow-query log. Either
+makes (a) worth its two extra writes immediately.
 
 ### U3 — SPRT reads `game_results` on every submission
 
-Measured at ~50 ms per 400,000 units, linear in the job's history, on every
-submission of every games job. `PLAN.md` chose this deliberately: "the stopping
-rule keeps reading `game_results` rather than a counter, and cannot be wrong
-because a counter drifted." A counter would make it constant time, at the cost
-that a counter which drifts *low* leaves a job running past its stopping rule
-forever. Left exactly as the plan has it. Worth revisiting if a job ever reaches
-several million units; `jobs.games_completed` already exists as a conservative
-pre-filter if someone decides that trade is acceptable.
+**The problem.** `game_stats` selects one result per task across the job and
+sums it, on every submission of every games or game-pairs job, to decide whether
+the job is finished. Measured at ~50 ms per 400,000 units, linear in the job's
+history. It is the largest remaining cost on the submit path, and the only one
+this audit deliberately left there.
+
+**Options.**
+
+- **(a) Leave it exactly as PLAN.md has it.** The stopping rule reads the rows
+  it is a statement about, so it cannot be wrong because a counter drifted.
+  PLAN.md's measurement note settles this in as many words: "About 50 ms at
+  400,000 units, on every submission, is within budget for the result rate a job
+  actually sees."
+- **(b) Gate the read behind the existing `jobs.games_completed` counter** — if
+  the counter says the job cannot have reached `min_units`, skip the aggregate
+  entirely. Cheap, and it only ever *delays* a decision, never brings one
+  forward. But a counter that drifts low would stop the job from ever
+  evaluating its stopping rule, which is the failure PLAN.md's design rules out
+  by construction: "a drifted counter is a wrong number on a page and cannot
+  stop a job early" would no longer be true.
+- **(c) Maintain the tally and the pentanomial as counters** and drop the
+  aggregate. Constant time, and the largest win available on the submit path.
+  It also makes a drifted counter able to stop a job early or late — the exact
+  thing the design is written against — and SPRT's conclusion is the job's
+  entire output.
+- **(d) Debounce the finish check** — evaluate every *N*th submission, or at
+  most once a second per job. Bounded overshoot (a few extra tasks dispatched
+  past the boundary, which a redundant claim would have cost anyway) and no new
+  source of truth. Adds a second piece of per-job scheduling state.
+
+**Recommendation: (a), unchanged, and (d) before (b) or (c) if it ever stops
+being affordable.** This is the one place in the system where being wrong is
+expensive and being slow is not: a job that stops early on a drifted counter
+publishes a wrong SPRT verdict, and that verdict is the job's whole product.
+(d) is the right escape hatch because it trades *latency of the decision* for
+cost, and the decision has no deadline — where (b) and (c) trade *correctness of
+the decision* for cost. `jobs.games_completed` already exists if someone decides
+otherwise, which is what makes (b) tempting and worth naming explicitly as the
+thing not to do first.
+
+**What would change the answer.** A job reaching several million units, at which
+point the read is hundreds of milliseconds per submission and (d) becomes worth
+building.
 
 ### U4 — duplicate `worker_bans` rows
 
-Nothing stops two ban rows for the same identity. `DELETE /api/admin/workers/ban/:id`
-removes one, and the identity stays banned with no indication why. A partial
-unique index on `user_id` and on `anon_uuid` would make a second ban a `409` and
-make unban mean what it says. Not done because it changes an admin-facing status
-code for a case nobody has hit, and because "ban again with a different reason"
-is arguably a feature. One line of migration whenever someone decides.
+**The problem.** Nothing stops two `worker_bans` rows naming the same identity.
+Enforcement is unaffected — the check is an `EXISTS`, so any row bans — but
+`DELETE /api/admin/workers/ban/:id` removes one row, and the identity stays
+banned with nothing in the response to say why. An admin who lifts a ban and
+watches the worker stay locked out has no signal beyond re-reading the table.
+
+**Options.**
+
+- **(a) Partial unique indexes** on `user_id` and on `anon_uuid`, each
+  `WHERE ... IS NOT NULL`. One line of migration; a second ban becomes a `409`
+  through the existing unique-violation mapping, and unban means what it says.
+  Changes an admin-facing status code for a request that succeeds today, and
+  forecloses "ban again with a different reason", which is arguably a useful
+  thing to be able to do.
+- **(b) Delete by identity rather than by row id** —
+  `DELETE /api/admin/workers/ban` taking `user_id`/`anon_uuid`, mirroring how
+  `POST .../ban` already addresses the target. Makes unban idempotent and
+  complete without constraining what may exist, and makes the two halves of the
+  API symmetrical. Changes a public admin route's shape and the frontend's
+  `/admin/workers` page.
+- **(c) Have unban delete every row for the identity it resolves**, keeping the
+  `:id` route. Smallest change that fixes the actual symptom, no new constraint,
+  no API shape change. Slightly surprising semantics for a route addressed by
+  row id.
+- **(d) Leave it.** Nobody has hit it; the data is not corrupted, only
+  confusing.
+
+**Recommendation: (a).** The duplicate row carries no information — the second
+ban's reason is never read by anything, since enforcement is an `EXISTS` — so
+the constraint removes a state that only ever misleads, and it does it in the
+database rather than in a handler that a future route could forget. "Ban again
+with a different reason" survives as unban-then-ban, and the audit log records
+both halves (`worker.unbanned`, then `worker.banned` with the new reason), which
+is a better history than two rows nobody reads. Note that under (a) a refused
+duplicate writes *no* audit row, since `ban_worker` logs inside the transaction
+the insert would abort — acceptable, because the `409` tells the caller the ban
+is already in place, but worth knowing. (c) is the reasonable fallback if
+someone wants no new constraint; (b) is the tidiest API but costs a change to
+`api.unbanWorker` and the `/admin/workers` page for a cosmetic gain.
+
+**What would change the answer.** If ban *reasons* ever need to accumulate per
+identity — a history rather than a flag — then (b) or (c) are right and (a) is
+wrong, because the duplicates stop being noise.
 
 ### U5 — registration's taken-email check is outside its transaction
 
-`register` checks `EXISTS` for the username and the email, then inserts in a
-separate transaction. Two concurrent registrations for the same address leave
-one with a `409` rather than the byte-identical body the endpoint goes to
-considerable trouble to return, so the race is a narrow account-enumeration
-oracle. Closing it means either an upsert-shaped insert or catching the unique
-violation and replaying the notification path. Left alone: the window is a few
-milliseconds and requires the attacker to already be racing a real registration
-of the address they are probing, which is a strictly harder position than the
-one the design defends against.
+**The problem.** `register` evaluates `EXISTS` for the username and the email,
+then inserts in a separate transaction. Two concurrent registrations for the
+same address both pass the check; one insert wins and the other hits the unique
+index, which the error mapping renders as `409 conflict`. The endpoint
+otherwise goes to considerable trouble to return a byte-identical body for a
+taken address — including hashing the password before the branch so both paths
+pay the same Argon2 cost — so the `409` is a narrow account-enumeration oracle
+in exactly the place that care was taken to close one.
+
+**Options.**
+
+- **(a) Catch the unique violation and replay the taken-email path** — send the
+  notice to the address's owner and return the same `201` body. Restores the
+  invariant exactly, with the distinction that the caller's timing now includes
+  a failed insert. Needs care to tell a username collision (which *should* be a
+  `409`, by design) from an email collision, which means reading the constraint
+  name from the error rather than just its SQLSTATE.
+- **(b) Do the check and the insert in one transaction** with the row locked, or
+  as an `INSERT ... ON CONFLICT DO NOTHING` whose zero-row result drives the
+  taken-email path. Structurally cleaner than catching an error, and it removes
+  the read entirely. Reshapes a handler that is currently written to be read
+  top-to-bottom in the order of its reasoning, which is most of why it is easy
+  to audit.
+- **(c) Leave it.** The window is a few milliseconds wide and requires the
+  attacker to be racing a *real* registration of the address they are probing —
+  which means already knowing the address is being registered, a strictly
+  stronger position than the one the oracle would grant.
+
+**Recommendation: (c), with (b) if this handler is touched for any other
+reason.** The attacker model that makes this exploitable already assumes the
+answer, so closing it buys close to nothing — and the handler's current shape,
+where each branch sits next to the comment explaining why it exists, is worth
+more to future audits than the few milliseconds it leaves open. (b) is the
+better of the two fixes if it is being rewritten anyway: `ON CONFLICT DO
+NOTHING` makes the race structurally impossible rather than caught, which is
+always preferable. I would avoid (a): distinguishing collisions by constraint
+name puts a security-relevant decision on a string the database chooses.
+
+**What would change the answer.** Any evidence of registration being probed in
+the wild, or a change that widens the window — an expensive validation step
+added between the check and the insert, for instance.
 
 ### U6 — the alternative fix for B1: relax `MOVE_RECORD_BEST` in MAGPIE
 
-Instead of birdtest refusing `best` + `num_plays_recorded > 1`, MAGPIE's
-opening-rack executor could force a recorder that keeps candidates, on the
-grounds that an opening-rack analysis *is* a ranked list and the recorder type
-is not something the job should have to think about. That would make the job do
-what the admin asked rather than refusing it, and it mirrors the note in
-`PLAN.md`'s capture section about relaxing the same override for static players.
+**The problem.** B1 shipped as a birdtest-side refusal: an opening-rack job may
+not pair `recorder_type = 'best'` with `num_plays_recorded > 1`. The other
+remedy is on the MAGPIE side — have the opening-rack executor record candidates
+regardless of the player's recorder type, on the grounds that an opening-rack
+analysis *is* a ranked list and the recorder is an implementation detail the job
+should not have to know about. This mirrors the note in PLAN.md's capture
+section about relaxing the same override for static players, which is listed
+there as "the one phase not yet done".
 
-Against it: it makes birdtest's job config lie in the other direction (the
-config says `best`, the worker does not do `best`), it changes what a
-*deliberate* `best` + `num_plays_recorded = 1` job does unless carefully
-conditioned, and move recording is on the hot path — `PLAN.md` calls relaxing it
-"a real slowdown on the job's primary purpose" in the capture case.
+**Options.**
 
-The validation shipped because it never changes what a running job computes; it
-only refuses a configuration whose result would be a quiet fraction of what was
-asked for. Which of the two is right is a design call.
+- **(a) The validation that shipped.** Refuses the contradictory configuration
+  at the point it is introduced, names the remedy in the error, and never
+  changes what a running job computes. The admin has to understand that
+  `recorder_type` matters for opening racks, which is one more thing to know —
+  but it is a thing that is true, and the error says it.
+- **(b) Override the recorder in MAGPIE's opening-rack executor**, forcing a
+  candidate-keeping type when `num_plays_recorded > 1`. The job does what the
+  admin asked instead of being refused, and every existing config keeps working.
+  Against it: birdtest's `player_configs` row is meant to be the exhaustive
+  record of what a job asked MAGPIE for — the migration says so in as many words
+  — and this makes it lie in the other direction, with the stored config saying
+  `best` and the worker doing something else. It also has to be conditioned
+  carefully so a deliberate `best` + `num_plays_recorded = 1` job (the "best
+  opening play for every rack" case) is left alone, and move recording is on the
+  hot path: PLAN.md calls relaxing this override "a real slowdown on the job's
+  primary purpose" in the capture case, and the end-to-end measurement here
+  agrees — the same job went from 5 s to 342 s once it actually ranked.
+- **(c) Both: validate in birdtest *and* have the UI steer the choice.** Refuse
+  the contradiction, and have `/admin/player-configs/new` and
+  `/admin/jobs/new` explain which recorder an opening-rack job wants, so the
+  refusal is something an admin rarely meets.
+- **(d) Widen it to a general rule**: derive `recorder_type` from the job type
+  rather than storing it per player at all, since `best` is right for autoplay
+  and wrong for opening-rack analysis. The cleanest model, and much the largest
+  change — it moves a column off `player_configs`, which is immutable and
+  referenced by existing jobs.
+
+**Recommendation: (c) — keep the validation, add the guidance.** The validation
+is the half that must exist either way: whatever the client does, birdtest
+should not be able to store a job config that contradicts itself, and (a) is the
+only option that holds without trusting the worker to compensate. (b) is
+genuinely attractive for the admin experience, but it breaks the property that
+makes this system auditable at all — that the stored config is what ran — and it
+would have hidden B1 rather than surfacing it. The UI half of (c) is cheap and
+turns a refusal into a choice made correctly the first time. (d) is the right
+long-term model and the wrong thing to do in an audit: it changes an immutable
+table that live jobs reference.
+
+**What would change the answer.** If contributors ever run opening-rack jobs
+configured by people who do not know MAGPIE's flags — a "submit a rack space to
+analyse" feature, say — then (b) or (d) become the right answer, because at that
+point the recorder genuinely is an implementation detail and asking the user
+about it is the bug.
 
 ---
 
