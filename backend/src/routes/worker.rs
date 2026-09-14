@@ -425,7 +425,13 @@ async fn submit_result(
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(
+    // `RETURNING` the new state is what tells the job's `tasks_completed`
+    // counter that a task has actually *reached* completed. A task makes that
+    // transition exactly once -- once `accepted_count` meets `redundancy` the
+    // task stops being dispatched, and a claim that lapsed before then is
+    // abandoned, so its late submission is refused above -- which is what makes
+    // counting on the transition safe rather than approximate.
+    let task_completed = sqlx::query_scalar::<_, bool>(
         "UPDATE tasks t
          SET accepted_count = t.accepted_count + 1,
              active_claim_count = GREATEST(t.active_claim_count - 1, 0),
@@ -440,11 +446,50 @@ async fn submit_result(
                  ELSE t.completed_at
              END
          FROM jobs j
-         WHERE t.id = $1 AND j.id = t.job_id",
+         WHERE t.id = $1 AND j.id = t.job_id
+         RETURNING t.state = 'completed'",
     )
     .bind(task_id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+
+    if task_completed {
+        sqlx::query("UPDATE jobs SET tasks_completed = tasks_completed + 1 WHERE id = $1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // The contributor's own running total, which is what the leaderboards read
+    // instead of counting this identity's claims. One statement, on the row the
+    // identity already owns. Deliberately not rolled back by account deletion:
+    // the account is anonymized in place and keeps its claims, so no donated
+    // compute is lost. `purge_job` and `delete_job` *do* decrement it, because
+    // unlike the counters on `jobs` this one spans every job the identity ever
+    // worked on.
+    match (identity.user_id(), identity.anon_uuid()) {
+        (Some(user_id), _) => {
+            sqlx::query(
+                "UPDATE users SET tasks_completed = tasks_completed + 1,
+                                  last_completed_at = now()
+                 WHERE id = $1",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        (None, Some(uuid)) => {
+            sqlx::query(
+                "UPDATE anonymous_workers SET tasks_completed = tasks_completed + 1,
+                                              last_completed_at = now()
+                 WHERE uuid = $1",
+            )
+            .bind(uuid)
+            .execute(&mut *tx)
+            .await?;
+        }
+        (None, None) => {}
+    }
 
     // Ratings are deliberately not touched here. A fit is global to a rating
     // pool and nothing in the submission path depends on it, so it runs on a
@@ -492,7 +537,10 @@ async fn submit_result(
 async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
     let job = jobstats::load_job(&state.pool, job_id).await?;
 
-    if job.status == JobStatus::Active && finish_condition_met(state, &job).await? {
+    if job.status == JobStatus::Active
+        && should_check_finish(state, job_id).await?
+        && finish_condition_met(state, &job).await?
+    {
         let updated = sqlx::query(
             "UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'",
         )
@@ -501,6 +549,8 @@ async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
         .await?;
         if updated.rows_affected() > 0 {
             tracing::info!(job_id = %job.id, "job auto-completed");
+            // Completion is final, so this job will never need checking again.
+            state.finish_checks.forget(job_id);
         }
     }
 
@@ -541,6 +591,36 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
             return;
         }
     }
+}
+
+/// Whether this submission is the one that evaluates the job's finish
+/// conditions.
+///
+/// Every `SPRT_CHECK_EVERY`th, which bounds how much work a job can do past its
+/// stopping point at `SPRT_CHECK_EVERY - 1` tasks — see the constant for why
+/// the first several of those cost nothing.
+///
+/// **Plus, unconditionally, when this job has nothing left in flight.** The
+/// check is triggered *by* submissions, so a job whose contributors all stop
+/// between checks would not be evaluated again until work resumed — which for a
+/// job that has already reached its stopping point means never, leaving it
+/// `active` and holding allocation in its priority tier. The `EXISTS` below is
+/// bounded by the number of claims open across the fleet, not by anything that
+/// grows with the job, and it is only reached when the debounce would otherwise
+/// skip.
+async fn should_check_finish(state: &AppState, job_id: Uuid) -> AppResult<bool> {
+    if state.finish_checks.should_check(job_id) {
+        return Ok(true);
+    }
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT NOT EXISTS (
+             SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'claimed'
+         )",
+    )
+    .bind(job_id)
+    .fetch_one(&state.pool)
+    .await?)
 }
 
 /// Either finish condition: SPRT significance (only after `min_units`) or the

@@ -241,8 +241,10 @@ pub(crate) async fn load_game_request(
 /// capture on (one per turn). `on_conflict_ignore` is set for in-game positions:
 /// games are deterministic, so redundant claims replay identical games, and the
 /// first accepted claim is the one that lands.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_position_analyses(
     conn: &mut PgConnection,
+    job_id: Uuid,
     task_id: Uuid,
     claim_id: Uuid,
     positions: &[PositionAnalysis],
@@ -268,12 +270,13 @@ pub(crate) async fn insert_position_analyses(
         let base = chunk_index * RECORD_ROWS_PER_STATEMENT;
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_records
-                 (task_claim_id, task_id, rack, position, game_index, turn_number,
-                  previous_move, previous_move_score, num_moves) ",
+                 (task_claim_id, task_id, job_id, rack, position, game_index,
+                  turn_number, previous_move, previous_move_score, num_moves) ",
         );
         builder.push_values(chunk.iter(), |mut b, position| {
             b.push_bind(claim_id)
                 .push_bind(task_id)
+                .push_bind(job_id)
                 .push_bind(position.rack.clone())
                 .push_bind(position.position.clone())
                 .push_bind(position.game_index)
@@ -391,6 +394,7 @@ const PLY_ROWS_PER_STATEMENT: usize = 8_000;
 
 pub(crate) async fn insert_game_results(
     conn: &mut PgConnection,
+    job_id: Uuid,
     task_id: Uuid,
     claim_id: Uuid,
     record: &GameResultsRecord,
@@ -401,14 +405,15 @@ pub(crate) async fn insert_game_results(
     let bucket = |i: usize| pentanomial.map(|p| p[i] as i32);
     sqlx::query(
         "INSERT INTO game_results
-             (task_claim_id, task_id, games, wins, losses, ties,
+             (task_claim_id, task_id, job_id, games, wins, losses, ties,
               p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
               pent_0, pent_1, pent_2, pent_3, pent_4,
               divergent_games, divergent_wins, divergent_losses, divergent_ties)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
     )
     .bind(claim_id)
     .bind(task_id)
+    .bind(job_id)
     .bind(all.games)
     .bind(all.wins)
     .bind(all.losses)
@@ -443,7 +448,8 @@ pub(crate) async fn insert_game_results(
     .fetch_one(&mut *conn)
     .await?;
 
-    insert_position_analyses(conn, task_id, claim_id, &record.positions, top_moves, true).await
+    insert_position_analyses(conn, job_id, task_id, claim_id, &record.positions, top_moves, true)
+        .await
 }
 
 /// One file a task needs, as the assignment states it.

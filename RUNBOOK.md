@@ -145,8 +145,8 @@ In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
 | 1 | `tasks` | `job_id = :job` |
 | 2 | `opening_rack_requests` / `game_requests` / `leave_requests` | `task_id IN (...)` |
 | 3 | `task_claims` | `task_id IN (...)` |
-| 4 | `game_results`, `leave_records` | `task_id IN (...)` |
-| 5 | `position_analysis_records` → `_moves` → `_plies` | `task_id IN (...)`, then by parent id |
+| 4 | `game_results`, `leave_records` | `job_id = :job` / `task_id IN (...)` |
+| 5 | `position_analysis_records` → `_moves` → `_plies` | `job_id = :job`, then by parent id |
 | 6 | `leave_rack_progress`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
@@ -158,7 +158,14 @@ re-run a transition that already happened, and a transition row without its
 artifact row would stall the job until the takeover timeout. Copy both or
 neither.
 
-The job's three counters are repaired in §2.3 with the rest.
+`game_results` and `position_analysis_records` carry `job_id` as well as
+`task_id`, so those two can be selected by the job directly rather than through
+a task list — which is also how every read of them works. `_moves` and `_plies`
+still hang off their parent's id.
+
+The job's counters are repaired in §2.3, and the contributors' in §2.3b — the
+latter globally rather than per job, because an identity's total spans every job
+it has worked on.
 
 `position_analysis_records.id` and `_moves.id` are `BIGSERIAL`. Restoring them
 with their original ids preserves the parent-child links; afterwards the
@@ -208,25 +215,27 @@ UPDATE tasks t
 
 -- The job's own counters. claims_issued is the scheduler's deficit numerator,
 -- so a restored job that keeps a zero here is dispatched ahead of everything
--- else until it catches up. games_completed and racks_analyzed are the
--- dashboard's progress totals; they are maintained one task at a time in the
--- submit path, so a row copy leaves them describing the results the job had
--- before. Each is recomputed here exactly as the read it replaced computed it:
--- one result per task, because redundant claims replay the same work.
+-- else until it catches up. The rest are the dashboard's progress totals; they
+-- are maintained one task at a time in the claim and submit paths, so a row
+-- copy leaves them describing the results the job had before. Each is
+-- recomputed here exactly as the read it replaced computed it: one result per
+-- task, because redundant claims replay the same work.
 UPDATE jobs j
    SET claims_issued = (SELECT count(*) FROM task_claims c
                           JOIN tasks t ON t.id = c.task_id
                          WHERE t.job_id = j.id),
+       tasks_total = (SELECT count(*) FROM tasks t WHERE t.job_id = j.id),
+       tasks_completed = (SELECT count(*) FROM tasks t
+                           WHERE t.job_id = j.id AND t.state = 'completed'),
        games_completed = (SELECT COALESCE(sum(g.games), 0) FROM (
                             SELECT DISTINCT ON (r.task_id) r.games
-                              FROM game_results r JOIN tasks t ON t.id = r.task_id
-                             WHERE t.job_id = j.id
+                              FROM game_results r
+                             WHERE r.job_id = j.id
                              ORDER BY r.task_id, r.submitted_at, r.task_claim_id
                           ) g),
        racks_analyzed = (SELECT count(DISTINCT p.rack)
                            FROM position_analysis_records p
-                           JOIN tasks t ON t.id = p.task_id
-                          WHERE t.job_id = j.id)
+                          WHERE p.job_id = j.id)
  WHERE j.id = :'job';
 
 COMMIT;
@@ -235,6 +244,50 @@ COMMIT;
 `racks_analyzed` is meaningful only for an opening-rack job and
 `games_completed` only for a games or game-pairs job; the statement above leaves
 each at 0 for the job types that do not use it, which is what they hold anyway.
+
+Run `tasks_total`/`tasks_completed` before §2.4's state repair or after it, but
+not between the two `UPDATE tasks` statements above: `tasks_completed` counts
+tasks whose `state` is `completed`, which the second of those recomputes.
+
+### 2.3b Repair the contributor counters
+
+The counters on `users` and `anonymous_workers` are not scoped to one job — they
+span every job an identity ever worked on — so a partial restore of one job
+cannot repair them in isolation the way §2.3 repairs the job's own. Recompute
+them globally, once, after every job has been restored:
+
+```sql
+BEGIN;
+
+UPDATE users u
+   SET tasks_completed = COALESCE(actual.n, 0),
+       last_completed_at = actual.last
+  FROM (SELECT c.claimed_by_user_id AS id, count(*) AS n, max(c.completed_at) AS last
+          FROM task_claims c
+         WHERE c.state = 'completed' AND c.claimed_by_user_id IS NOT NULL
+         GROUP BY 1) actual
+ WHERE u.id = actual.id;
+
+UPDATE anonymous_workers w
+   SET tasks_completed = COALESCE(actual.n, 0),
+       last_completed_at = actual.last
+  FROM (SELECT c.claimed_by_anon_uuid AS uuid, count(*) AS n, max(c.completed_at) AS last
+          FROM task_claims c
+         WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
+         GROUP BY 1) actual
+ WHERE w.uuid = actual.uuid;
+
+COMMIT;
+```
+
+This is the one recount a restore is most likely to need, and the one most
+likely to be forgotten: nothing about a single job's restore makes a wrong
+leaderboard visible. An identity with no completed claims at all keeps whatever
+it had — the joins above only touch identities that appear in `task_claims` — so
+if claims were *dropped* rather than restored, zero those rows first
+(`UPDATE users SET tasks_completed = 0, last_completed_at = NULL;` and the
+same for `anonymous_workers`) and let the statements above put back what the
+rows actually support.
 
 ### 2.4 Recompute derived state
 

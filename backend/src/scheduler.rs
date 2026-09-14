@@ -438,8 +438,8 @@ async fn try_claim_from_job(
             // candidate may well have work.
             Ok(None)
         }
-        Acquired::Task { task_id, request } => {
-            match issue_claim(&mut tx, identity, job, caps, task_id).await {
+        Acquired::Task { task_id, request, created } => {
+            match issue_claim(&mut tx, identity, job, caps, task_id, created).await {
                 Ok(claim_token) => {
                     let expected = expected_data(&mut tx, job)
                         .await
@@ -476,6 +476,7 @@ async fn issue_claim(
     job: &Job,
     caps: &WorkerCapabilities,
     task_id: Uuid,
+    task_created: bool,
 ) -> AppResult<Uuid> {
     // A worker that arrived with no identity becomes a real one only now,
     // when there is a task to attach it to and a response body to return its
@@ -530,11 +531,18 @@ async fn issue_claim(
 
     // Last, because it locks the job row: claims against the same job
     // serialize on it until commit, so it should be held for as little of the
-    // transaction as possible.
-    sqlx::query("UPDATE jobs SET claims_issued = claims_issued + 1 WHERE id = $1")
-        .bind(job.id)
-        .execute(&mut **tx)
-        .await?;
+    // transaction as possible. `tasks_total` rides along for the same reason --
+    // a second statement to count a created task would take the same lock
+    // earlier and buy nothing.
+    sqlx::query(
+        "UPDATE jobs
+         SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $2
+         WHERE id = $1",
+    )
+    .bind(job.id)
+    .bind(i64::from(task_created))
+    .execute(&mut **tx)
+    .await?;
 
     Ok(claim_token)
 }

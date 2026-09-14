@@ -11,8 +11,8 @@ what was decided, and why — enough to second-guess the decision without readin
 the diff.
 
 **Counts: 14 code-wins (PLAN.md updated), 6 plan-wins (code changed), and 6
-trade-offs the audit could not settle on its own — all six now decided in
-section 8, none of them implemented.**
+trade-offs the audit could not settle on its own — all six decided and
+implemented in section 8.**
 
 The default bias is that the code wins and `PLAN.md` is brought level with it,
 because the plan is a summary. The code was changed only where it was plainly
@@ -309,13 +309,13 @@ and stated as reasoning where one does not.
    request from three statements of identity resolution to one. This is the
    number that bounds a single job's dispatch throughput, because the lock
    serializes claims per job.
-8. **`GET /api/jobs/:id/results` is an unbounded, unindexed scan.** *Decided,
-   not implemented — see U1, options (a) and (b).* For an opening-rack job it joins every `position_analysis_records`
+8. **`GET /api/jobs/:id/results` was an unbounded, unindexed scan.** *Fixed —
+   see U1, options (a) and (b).* For an opening-rack job it joins every `position_analysis_records`
    row of the job and sorts by `submitted_at`; a full English job is 3.2 M rows
    and a capture-on games job is millions more. Public and unauthenticated.
    *Expected impact: seconds to minutes per request at full job size.*
-9. **The job list and the contributor lists aggregate over whole tables.**
-   *Partly fixed; the rest decided, not implemented — see U2, option (a).*
+9. **The job list and the contributor lists aggregated over whole tables.**
+   *Fixed — see U2, option (a).*
    `GET /api/jobs` runs two `COUNT(*)`s over `tasks` per job per page view
    (measured at **2,188 ms** before the `games_completed` counter, which fixed
    only the game totals); `GET /api/users` and `GET /api/workers` group over all
@@ -323,11 +323,12 @@ and stated as reasoning where one does not.
    `tasks_job_idx` widened to `(job_id, state)` so both task counts are
    index-only; running totals on `jobs` and per-identity counters on `users` and
    `anonymous_workers` are the decided fix for what remains.
-10. **SPRT reads `game_results` on every submission.** *Left as designed by this
-    audit; since decided for a count-based debounce, not implemented — see U3,
+10. **SPRT read `game_results` on every submission.** *Left as designed by the
+    audit, then decided for a count-based debounce and implemented — see U3,
     option (d1).* Measured at ~50 ms per 400,000 units. `PLAN.md` chose the read
     over a counter so a drifted counter cannot stop a job early, and the
-    debounce keeps that: a debounced check is late, never wrong.
+    debounce keeps that: a debounced check is late, never wrong. It also stopped
+    joining `tasks`, as a side effect of U1.
 11. **A simming opening-rack job is genuinely expensive.** *Inherent, noted.*
     With the recorder fixed (B1), the end-to-end job ranked ~100 candidates and
     simulated 5 of them at 60 iterations over 2 plies: **~57 s per rack**. That
@@ -455,23 +456,27 @@ No blocker was left unresolved.
 
 ---
 
-## 8. Decisions taken — not yet implemented
+## 8. Decisions taken — implemented
 
-The six trade-offs the audit could not settle on its own have now been decided.
-**None of them is implemented: no code and no `PLAN.md` text changed for any of
-the six.** This section is the record of what was chosen and why, and it doubles
-as the work queue — each entry keeps the options that were weighed, so a
-reviewer can see what the decision was made against, and adds what carrying it
-out involves.
+The six trade-offs the audit could not settle on its own were decided, and all
+six are now carried out. Each entry keeps the options that were weighed, so a
+reviewer can see what the decision was made against, and records what carrying
+it out actually took — including where doing it turned up something the
+write-up had not.
 
 | Item | Decision | State |
 |---|---|---|
-| U1 — the results query has no bounded plan | **(a)** denormalise `job_id` onto the record tables and index it, **and (b)** keyset pagination | Not started |
-| U2 — list endpoints aggregate whole tables | **(a)** running totals: on `jobs` for the job list, and per identity for the leaderboards | Not started |
-| U3 — SPRT read on every submission | **(d1)** count-based debounce | Not started |
-| U4 — duplicate `worker_bans` rows | **(a)** partial unique indexes | Not started |
+| U1 — the results query has no bounded plan | **(a)** denormalise `job_id` onto the record tables and index it, **and (b)** keyset pagination | **Done** — and three more callers than expected stopped joining |
+| U2 — list endpoints aggregate whole tables | **(a)** running totals: on `jobs` for the job list, and per identity for the leaderboards | **Done**, including the decrements on purge and delete |
+| U3 — SPRT read on every submission | **(d1)** count-based debounce | **Done** — every 8th submission, plus the quiet-fleet cover |
+| U4 — duplicate `worker_bans` rows | **(a)** partial unique indexes | **Done** |
 | U5 — registration's email check races | **(c)** leave it | Accepted risk; nothing to build |
-| U6 — a `best` recorder on an opening-rack job | **(c)** validation plus UI guidance | Validation shipped with this audit; guidance not started |
+| U6 — a `best` recorder on an opening-rack job | **(c)** validation plus UI guidance | **Done** — validation shipped with the audit, guidance after |
+
+`PLAN.md` and `RUNBOOK.md` were brought level, per this document's standing bias
+that the plan tracks the code: the schema block, the pagination convention and
+its one documented exception, the SPRT section, the running-totals section, the
+ban list, and two recount procedures in RUNBOOK §2.3 and a new §2.3b.
 
 Each entry opens with what the thing under discussion is *for*, so it can be
 read without the rest of this document or any prior knowledge of birdtest: what
@@ -609,7 +614,7 @@ nothing.
 
 **Decision: (a) and (b) — denormalise `job_id` onto
 `position_analysis_records` and `game_results` and index it, *and* move this
-endpoint to keyset pagination. Chosen; neither implemented.**
+endpoint to keyset pagination. Both implemented.**
 
 They are complements, not alternatives, and taking both is what actually bounds
 the endpoint. (a) removes the cost of *finding* a job's rows — the paginated
@@ -627,54 +632,64 @@ plus a backfill across two tables that run to tens of millions of rows. And
 pre-release is the only cheap moment to change a pagination contract, which is
 what (b) is.
 
-**What implementing (a) involves.**
+**What (a) took.**
 
 - `job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE` on
-  `position_analysis_records` and `game_results`.
-- A second index, `(job_id, rack) WHERE game_index IS NULL`, turns the `?rack=`
-  lookup into a single probe instead of one per task of the job — worth taking
-  in the same change, since that is the branch the site actually uses.
-- Both insert paths already hold the job: `registry::store_result` takes
-  `job: &Job`, so this is an extra bind rather than an extra lookup.
-- Drop the `JOIN tasks` from both branches of `job_results`, from `rack_lookup`,
-  from `job_results_stream`, and from `exports::export_query`.
-- A third cascade path to `jobs`, alongside the existing one through `tasks`.
-  Purge still reaches records by deleting tasks; job deletion gains a direct
-  path. Worth a test that purge still empties both tables.
-- `position_analysis_moves` already carries a denormalised `task_id` for the
-  same family of reason, so the pattern is established rather than new.
+  `position_analysis_records` and `game_results`, bound at insert from the job
+  `registry::store_result` already holds — an extra bind rather than an extra
+  lookup. It reaches the inserts through a new `job_id` parameter on
+  `JobHandler::insert_record`.
+- Feed indexes `(job_id, submitted_at DESC, id DESC)` and
+  `(job_id, submitted_at DESC, task_claim_id DESC)`, plus
+  `(job_id, rack) WHERE game_index IS NULL` for the `?rack=` lookup — one probe
+  instead of one per task of the job, and that is the branch the site actually
+  uses.
+- **Seven callers stopped joining `tasks`, not the four expected.** The four
+  named above (`job_results`' two branches, `rack_lookup`, `job_results_stream`,
+  `exports::export_query`) and then three the write-up had not counted:
+  `jobstats::FIRST_GAME_RESULT_PER_TASK`, which is the **SPRT read on the
+  submission path** and so the most valuable of the lot; `ratings::build_matrix`,
+  which now touches no `tasks` rows at all; and `job_census`, which runs
+  immediately before a purge or a delete.
+- A third cascade path to `jobs` alongside the one through `tasks`, covered by
+  the existing purge and delete tests and by the new
+  `purging_and_deleting_a_job_give_back_what_it_earned`.
+- `leave_gen`'s `insert_record` lost a query as a side effect: it had been
+  joining `tasks` purely to recover the job id it is now handed.
 
-**What implementing (b) involves.**
+**What (b) took.**
 
-- **The index (a) creates is decided by this.** With keyset the seek is
-  `WHERE job_id = $1 AND (submitted_at, id) < ($2, $3)`, so the index wants the
-  tiebreaker in it: `(job_id, submitted_at DESC, id DESC)` rather than
-  `(job_id, submitted_at DESC)`. Deciding (a) and (b) together is what avoids
-  building the index twice.
-- **A unique tiebreaker, which changes the visible order slightly.** Today the
-  opening-rack branch orders `submitted_at DESC, rack ASC`; `rack` is only
-  unique *within a claim*, so it is not a safe keyset key. `id` is
-  (`BIGSERIAL`), so the key becomes `(submitted_at, id)` and the order within a
-  batch goes from rack-alphabetical to insertion order — which, after this
-  audit's batching change, is the order the worker reported them in. Stable and
-  defensible, but it is a change to what the page shows. `game_results` has no
-  serial; `(submitted_at, task_claim_id)` is the equivalent there.
-- **The response shape.** `Page<T>` is `{items, total, page, per_page}` and would
-  gain a cursor, with `page` no longer meaningful. `total` is already `-1` on
-  this route, so it already deviates from the convention — which makes a
-  documented per-route exception much smaller than converting `/api/jobs`,
-  `/api/users`, `/api/workers` and the audit log to cursors as well. Take the
-  exception; do not convert the others.
-- **PLAN.md's API conventions describe `?page=` and the four-field envelope**,
-  so implementing this means updating that section. Not done here.
-- **The frontend.** `Pagination.svelte` assumes page numbers. A cursor control
-  needs next/previous, and previous needs either a cursor stack held in the page
-  or a reverse seek.
+- `CursorPage<T>` in `routes/mod.rs`, used by this route alone, with
+  `encode_cursor` / `decode_cursor` — the last row's sort key, hex-encoded so
+  nobody builds one by hand. A cursor this server did not produce reads as
+  "start at the beginning" rather than as an error.
+- **Three cursor shapes, not one.** Opening racks key on `(submitted_at, id)`
+  and games on `(submitted_at, task_claim_id)`; leave generation orders
+  `generation DESC, occurrence_count ASC, rack ASC`, and because those
+  directions differ its seek has to be spelled out rather than written as a row
+  comparison. `(job_id, generation, rack)` is that table's primary key, so the
+  triple is unique and a cursor cannot land between two identical rows.
+- The within-batch order changed as predicted, from rack-alphabetical to
+  insertion order, because `rack` is unique only within a claim and cannot be a
+  keyset key.
+- The frontend needed less than expected: `api.jobResults` is only ever called
+  with `?rack=`, which returns a whole list and no cursor, so
+  `Pagination.svelte` was untouched. `api.ts` gained a `CursorPage` type so the
+  shape is stated rather than implied.
+- PLAN.md's pagination conventions now document the exception, its keys, and why
+  it is made here and nowhere else.
+- `the_results_feed_walks_every_row_exactly_once` is the test that matters. It
+  pages a two-batch job at `per_page=5` and asserts the walk covers every rack
+  exactly once. A keyset that ties would silently repeat or skip rows between
+  pages — and `submitted_at` *does* tie, since it is transaction time and a
+  whole batch shares it — which is the failure mode that looks like nothing.
 
 **What would reopen this.** Only the endpoint's purpose changing. If it were
 decided that the API should not serve corpus enumeration at all — the export
 exists for that, built once and reused — the feed could be capped instead, and
-neither the column nor the cursor would be worth their cost.
+neither the column nor the cursor would be worth their cost. That decision is
+more expensive to revisit now than it was, which is the price of taking the
+free-schema-edit window while it was still open.
 
 ---
 
@@ -738,7 +753,7 @@ proportional to the job's history, just with a much smaller constant.
   decision on evidence, and nothing equivalent logs for these three endpoints.
 
 **Decision: (a) — running totals on `jobs`, maintained in the claim and submit
-transactions. Chosen; not yet implemented.**
+transactions. Implemented, for all three endpoints.**
 
 It matches the pattern `games_completed` and `racks_analyzed` already set, so it
 inherits a documented recovery path — RUNBOOK §2.3 already repairs the existing
@@ -751,73 +766,63 @@ They are small, and they land on rows those paths already lock — `jobs`, which
 `claims_issued` touches on every claim, and `tasks`, which the submit path locks
 before storing anything — so nothing new is serialized.
 
-**Scope: all three endpoints, which means two kinds of counter.** The job list's
-cost lives on `jobs`, so counters go there. `GET /api/users` and
-`GET /api/workers` aggregate over all of `task_claims` and need counters of
+**Scope: all three endpoints, which meant two kinds of counter.** The job
+list's cost lives on `jobs`, so counters went there. `GET /api/users` and
+`GET /api/workers` aggregate over all of `task_claims` and needed counters of
 their own, per **identity** rather than per job: a `tasks_completed` on `users`
-and one on `anonymous_workers`. Both halves are decided; they are separate
-pieces of work and the second is the more delicate one, for the reason below.
+and one on `anonymous_workers`. Both are in; the second was the more delicate,
+for the reason below.
 
-**What implementing the job list involves.**
+**What the job list took.**
 
-- `tasks_total` and `tasks_completed` on `jobs`, `BIGINT NOT NULL DEFAULT 0`
-  with non-negative checks, beside the three counters already there.
-- `tasks_total` increments in `insert_on_demand_task`, the one place every job
-  type creates a task.
-- `tasks_completed` increments when a task actually *reaches* completed, which
-  is the condition the submit path's `UPDATE tasks` already computes
-  (`accepted_count + 1 >= redundancy`). Keying on that condition rather than on
-  "the row now says completed" is what stops a redundant claim's submission
-  counting the same task a second time.
-- `purge_job` zeroes them with the other three; RUNBOOK §2.3 gains two rows.
-- `list_jobs` drops both correlated subqueries.
-- `admin_api::a_job_can_be_purged_and_its_dispatch_counter_resets` is the
-  natural place to assert the new counters reset too.
+- `tasks_total` and `tasks_completed` on `jobs`, beside the three counters
+  already there, and `list_jobs` dropped both correlated subqueries.
+- `tasks_total` costs **no extra statement at all**. The claim already runs one
+  `UPDATE jobs` for `claims_issued`, so `Acquired::Task` gained a `created` flag
+  saying whether this claim generated the task or re-dispatched one, and the
+  count rides on that update. Writing it where the task is inserted would have
+  taken the job's row lock earlier in the transaction for no gain.
+- `tasks_completed` keys on the moment a task actually *reaches* completed,
+  which the submit path's `UPDATE tasks` already computes — it now `RETURNING`s
+  the new state. That is what stops a redundant claim's submission counting the
+  same task twice, and it holds because the transition happens exactly once: at
+  `redundancy` accepted the task stops being dispatched, and a claim that lapsed
+  before then is abandoned, so its late submission is refused.
+- `purge_job` zeroes both with the other three.
 
-**What implementing the leaderboards involves.**
+**What the leaderboards took.**
 
-- `tasks_completed BIGINT NOT NULL DEFAULT 0` and `last_completed_at
-  TIMESTAMPTZ` on both `users` and `anonymous_workers`. The timestamp is not
-  optional: `/api/workers` currently shows `MAX(c.completed_at)` as
-  `last_seen_at`, which is "last task finished" and is *not* the same as
-  `anonymous_workers.last_seen_at`, which any request touches. Reusing the
-  existing column would silently change what the column means.
-- Both are stamped in the submit transaction, once per accepted submission,
-  against whichever of `claimed_by_user_id` / `claimed_by_anon_uuid` the claim
-  carries. The current queries count completed *claims*, so one increment per
-  submission is the matching unit — no redundancy special case here, unlike the
-  job counters.
-- `/api/users` reads `u.tasks_completed` and orders on it; with
-  `users (tasks_completed DESC)` the `LIMIT` stops at the top of an index
-  instead of costing every user's claims.
-- `/api/workers` ranks both kinds of worker in one list, so with the counters
-  split across two tables it becomes a `UNION ALL` of two ordered index scans
-  (`users` and `anonymous_workers`, each `tasks_completed DESC`) merged under
-  the `LIMIT`. Its second full group-by — the one computing `total` — becomes
-  two cheap counts.
-- **The sharp edge: every path that deletes claims must decrement.** This is
-  what makes these harder than the `jobs` counters, and it is the thing most
-  likely to be missed. A job counter belongs to the job being purged, so a purge
-  simply zeroes it; an identity counter spans every job that identity ever
-  worked on, so `purge_job` and `delete_job` — which delete and cascade away
-  completed claims — have to subtract the affected counts per identity *before*
-  the delete, or the leaderboards drift permanently high. `job_census` already
-  counts the claims about to be destroyed in the same transaction, so the
-  decrement has a natural home. Account deletion needs nothing: it anonymises in
-  place and deliberately keeps the claims, so no donated compute is lost.
-- RUNBOOK §2.3 gains the identity counters too, and their recount is the one a
-  restore is most likely to need, since it spans jobs.
-- Not covered by any of this: `jobstats::worker_contributions`, the per-job
-  contributor table on a job's detail page. It groups claims *within one job*,
-  which an identity-wide counter cannot answer. It stays as it is — already
-  capped at 50 and measured at 136 ms for 44,000 claims.
+- `tasks_completed` and `last_completed_at` on `users` and on
+  `anonymous_workers`, stamped in the submit transaction against whichever
+  identity the claim carries. Partial indexes on each
+  (`WHERE deleted_at IS NULL` and `WHERE tasks_completed > 0`) so the rankings
+  are ordered index scans.
+- `last_completed_at` had to be its own column, as expected:
+  `/api/workers` shows the last task *finished*, and
+  `anonymous_workers.last_seen_at` is touched by any request at all. Reusing it
+  would have silently changed what the column means.
+- `/api/workers` became a `UNION ALL` of the two tables merged under the
+  `LIMIT`, and its second full group-by — the one that computed `total` —
+  became two counts.
+- **The decrements, which were the sharp edge and stayed sharp.**
+  `release_contributions` subtracts, per identity, what a job contributed, and
+  both `purge_job` and `delete_job` call it *before* the claims go: purge
+  because it deletes them, delete because the cascade does.
+  `purging_and_deleting_a_job_give_back_what_it_earned` covers both paths, and
+  it is a test worth having precisely because nothing else would have shown a
+  wrong leaderboard.
+- `last_completed_at` is not rewound by those, as decided — finding the new
+  maximum is the scan the counter exists to avoid — so a purge can leave it
+  pointing at a time whose task is gone. Written down in the schema rather than
+  left to be discovered.
+- RUNBOOK gained **§2.3b**, a *global* recount, because unlike §2.3 these
+  counters cannot be repaired one job at a time.
 
 **What would reopen this.** Evidence that the counters drift in practice. For
 the job counters a drift shows a wrong progress number on the site's index page;
-for the identity counters it shows a wrong leaderboard, which is the more
-embarrassing of the two and the more likely, because it depends on the
-decrements above being complete. Recovery is the recount RUNBOOK §2.3 already
-documents, extended to the new columns.
+for the identity counters a wrong leaderboard, which is both more embarrassing
+and more likely, since it depends on every claim-destroying path calling
+`release_contributions`. Recovery is RUNBOOK §2.3 and §2.3b.
 
 ---
 
@@ -899,7 +904,8 @@ volunteer time spent on a question already answered.
   continues, and a run that reverses sharply gets checked late precisely when it
   mattered. Needs the most care and the most explaining.
 
-**Decision: (d1) — count-based debounce. Chosen; not yet implemented.**
+**Decision: (d1) — count-based debounce. Implemented, at every 8th
+submission.**
 
 This is a change from where the audit itself landed, which was to leave the
 check on every submission until measurement said otherwise. Taking (d1) now is
@@ -915,29 +921,28 @@ count bound is stated in tasks directly and holds regardless of fleet size,
 where a time bound converts into tasks only by multiplying by the submission
 rate — letting waste grow with the number of contributors, which is backwards.
 
-**What implementing it involves.**
+**What it took.**
 
-- A per-job submission counter in `AppState`, beside the SSE coalescing map. In
-  memory rather than in the database: losing it on a restart costs one extra
-  check, and it is a source of truth for nothing.
-- `after_submission` evaluates the finish condition on every *k*th submission
-  for that job instead of on every one. Nothing else about the check changes —
-  it still reads the rows, so a debounced check is late, never wrong. That is
-  the whole reason this option is acceptable where (b) and (c) are not.
-- **Cover the quiet-fleet window.** The check is triggered *by* submissions, so
-  a job whose contributors all stop between checks is not evaluated again until
-  work resumes. Benign today — one submission's delay, self-healing — and
-  debouncing widens it to *k*. The cheap cover is to evaluate unconditionally
-  when a job's last in-flight claim is released, a moment the scheduler already
-  knows about. Without it a job can sit `active` past its stopping point
-  indefinitely if the fleet leaves at the wrong moment.
-- Choosing *k*: at or below the typical in-flight task count, per the argument
-  above. If one constant feels blunt, derive it per job as a fraction of the
-  job's own budget — `k = max(1, max_units / (100 × units_per_task))` caps
-  overshoot at 1% of what the job was authorised to spend.
-- A test that a job still completes with debouncing on — submit past the
-  boundary and assert the job reaches `completed` within *k* submissions — and
-  one for the quiet-fleet cover, since that is the failure this introduces.
+- `FinishCheckCounters` in `AppState`: a per-job submission counter, in memory
+  rather than in the database, since it is a source of truth for nothing and
+  losing it on a restart costs one extra check. A job that completes is
+  forgotten, so the map does not grow with every job ever created.
+- `SPRT_CHECK_EVERY = 8`, chosen on the in-flight argument rather than on taste:
+  eight is well under any fleet worth having, so the seven tasks of overshoot it
+  permits are tasks that were already claimed and already going to be played.
+- Nothing else about the check changed. It still reads `game_results`, so a
+  debounced check is late and never wrong — which is the entire reason this
+  option was acceptable where (b) and (c) were not.
+- **The quiet-fleet cover is in**, and it is what makes the debounce safe rather
+  than merely cheap: `should_check_finish` also returns true when the job has no
+  claims in flight at all. That `EXISTS` is bounded by the number of open claims
+  across the fleet, not by anything that grows with the job, and it is reached
+  only when the debounce would otherwise skip. Without it a job whose
+  contributors all left at the wrong moment would sit `active` past its stopping
+  point indefinitely, holding allocation in its tier.
+- PLAN.md's "Statistical Result Evaluation" now states the debounce, the bound,
+  and why the overshoot is mostly free, rather than "evaluated inline on every
+  result submission".
 
 **What would reopen this.** A job type whose tasks are large enough that *k*−1
 of them is real compute rather than noise. Then *k* shrinks, or (d4)'s
@@ -988,8 +993,7 @@ that is hard to check.
 - **(d) Leave it.** Nobody has hit it; the data is not corrupted, only
   confusing.
 
-**Decision: (a) — partial unique indexes on `worker_bans`. Chosen; not yet
-implemented.**
+**Decision: (a) — partial unique indexes on `worker_bans`. Implemented.**
 
 The duplicate row carries no information — the second ban's reason is never read
 by anything, since enforcement is an `EXISTS` — so the constraint removes a
@@ -999,21 +1003,19 @@ reason" survives as unban-then-ban, and the audit log records both halves
 (`worker.unbanned`, then `worker.banned` with the new reason), which is a better
 history than two rows nobody reads.
 
-**What implementing it involves.**
+**What it took.**
 
 - Two partial unique indexes on `worker_bans`, one on `user_id` and one on
-  `anon_uuid`, each `WHERE ... IS NOT NULL`. The existing
+  `anon_uuid`, each `WHERE ... IS NOT NULL` — the existing
   `ban_has_single_target` check already guarantees exactly one is set per row.
-- No handler change: a duplicate ban becomes a `409` through the
-  unique-violation mapping already in `error.rs`.
-- One consequence to accept knowingly: a refused duplicate writes **no** audit
-  row, because `ban_worker` logs inside the transaction the insert aborts. The
-  `409` tells the caller the ban is already in place, so nothing needed is lost,
-  but the log then records bans that took effect rather than bans that were
-  attempted.
-- A test that a second ban of the same identity is refused, and that unban then
-  actually unbans — which is the behaviour the whole item is about and is
-  currently untested.
+- No handler change: a duplicate ban is a `409` through the unique-violation
+  mapping already in `error.rs`.
+- `an_identity_can_be_banned_once_and_unbanning_lifts_it` covers the whole
+  cycle, including that banning again after an unban still works — which is how
+  "ban with a different reason" is expressed now. The behaviour the item was
+  actually about, that unban lifts the ban, had no test before.
+- The consequence noted in advance holds: a refused duplicate writes no audit
+  row, because `ban_worker` logs inside the transaction the insert aborts.
 
 **What would reopen this.** If ban *reasons* ever need to accumulate per
 identity — a history rather than a flag — the duplicates stop being noise and
@@ -1066,7 +1068,7 @@ taken to close one.
   which means already knowing the address is being registered, a strictly
   stronger position than the one the oracle would grant.
 
-**Decision: (c) — leave it. Chosen; nothing to build.**
+**Decision: (c) — leave it. Nothing to build; recorded as an accepted risk.**
 
 The attacker model that makes this exploitable already assumes the answer: to
 win the race you have to be registering the same address at the same moment as a
@@ -1150,8 +1152,8 @@ not yet done".
   change — it moves a column off `player_configs`, which is immutable and
   referenced by existing jobs.
 
-**Decision: (c) — keep the validation, add the guidance. Chosen; the validation
-half shipped with this audit, the guidance half is not started.**
+**Decision: (c) — keep the validation, add the guidance. Both implemented; the
+validation shipped with the audit, the guidance after it.**
 
 The validation is the half that has to exist either way: whatever a client does,
 birdtest should not be able to store a job configuration that contradicts
@@ -1164,16 +1166,20 @@ rarely meets, not the way they find out the two settings interact. (b)'s appeal
 was exactly that it never refuses anyone — but it buys that by making the stored
 config lie about what ran, and it would have hidden B1 rather than surfacing it.
 
-**What implementing the remaining half involves.**
+**What the remaining half took.**
 
-- `/admin/player-configs/new`: say what `recorder_type` does, and that `best`
-  keeps only the top play — right for a games job, wrong for an opening-rack job
-  that wants a ranking.
-- `/admin/jobs/new`: when the job type is `opening_rack`, steer the player
-  config choice — at minimum surface `recorder_type` and `num_plays_recorded`
-  together, since it is their combination that gets refused.
-- Both are frontend-only; `GET /api/admin/player-configs` already returns
-  `recorder_type`.
+- `/admin/player-configs/new` now says what the recorder decides — what move
+  generation *keeps*, not which move is played — and that `best` throws away
+  every candidate but the winner, which is right for a games job and wrong for
+  an opening-rack job that wants a ranking.
+- `/admin/jobs/new` shows each config's recorder and recorded-play count in the
+  picker for an opening-rack job, and names the conflict inline before the
+  submit rather than leaving the server to reject it.
+- **A stale claim turned up next to it and was fixed.** The same form told
+  admins that "every distinct 7-tile rack becomes one task at creation time",
+  which has not been true since tasks became range-addressed and on-demand:
+  creating an opening-rack job writes no rows at all, however large the space.
+  It now says so.
 
 **What would reopen this.** If opening-rack jobs are ever configured by people
 who do not know MAGPIE's flags — a "submit a rack space to analyse" feature,
@@ -1194,6 +1200,15 @@ about it is the bug, and (b) or (d) become right.
 | `jobs::opening_rack::tests::*` (3) | `num_moves` kept when larger than the reported list, defaulted when absent, refused when smaller |
 | `sse::tests::pushes_coalesce_into_one_in_flight_and_one_pending` | The coalescing contract: one owner, one pending, back to idle |
 | `leave_gen::the_transition_owner_is_committed_before_the_transition_runs` (updated) | Ownership commits with the claim (unchanged), and ownership comes back *after* the now-detached transition fails (new) |
+
+And for the section 8 decisions:
+
+| Test | What it pins |
+|---|---|
+| `worker_api::contributions_are_counted_as_they_arrive` | The counters move once per accepted submission and not on a claim; `last_completed_at` is set; the job's `tasks_total` and `tasks_completed` track creation and completion separately; and `/api/workers` reads them rather than counting claims |
+| `worker_api::the_results_feed_walks_every_row_exactly_once` | The cursor covers the whole set once across pages — the failure a tied keyset produces is silent repetition or skipping, and `submitted_at` *does* tie. Also that an unparseable cursor starts from the beginning rather than erroring |
+| `admin_api::purging_and_deleting_a_job_give_back_what_it_earned` | Both claim-destroying paths decrement the identity counters. This is the half of the counter design the `jobs` counters do not have, and nothing else would show a leaderboard reading permanently high |
+| `admin_api::an_identity_can_be_banned_once_and_unbanning_lifts_it` | A second ban of one identity is refused, unban actually unbans, and banning again afterwards still works. The behaviour the item was about had no test at all before |
 
 `scripts/e2e_magpie.py` also gained a real assertion where it had a vacuous one:
 the simming opening-rack job must rank more than one move per rack.

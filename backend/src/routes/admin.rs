@@ -1489,12 +1489,10 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
              (SELECT count(*) FROM tasks WHERE job_id = $1)                        AS tasks,
              (SELECT count(*) FROM task_claims c JOIN tasks t ON t.id = c.task_id
                WHERE t.job_id = $1)                                                AS claims,
-             (SELECT count(*) FROM game_results r JOIN tasks t ON t.id = r.task_id
-               WHERE t.job_id = $1)                                                AS game_results,
+             (SELECT count(*) FROM game_results WHERE job_id = $1)                  AS game_results,
              (SELECT count(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id
                WHERE t.job_id = $1)                                                AS leave_records,
-             (SELECT count(*) FROM position_analysis_records r JOIN tasks t ON t.id = r.task_id
-               WHERE t.job_id = $1)                                                AS positions,
+             (SELECT count(*) FROM position_analysis_records WHERE job_id = $1)     AS positions,
              (SELECT count(*) FROM leave_rack_progress WHERE job_id = $1)          AS rack_progress,
              (SELECT count(*) FROM leave_generation_artifacts WHERE job_id = $1)   AS artifacts",
     )
@@ -1546,6 +1544,51 @@ struct PurgeResult {
 /// Clear every result and return the job's tasks to `available`. On-demand tasks
 /// are deleted outright — they are regenerated at claim time, and keeping them
 /// would leave the seed cursor advanced past work that was never done.
+/// Give back the contribution each identity earned on this job, before its
+/// claims are destroyed.
+///
+/// The counters on `jobs` belong to the job, so a purge simply zeroes them. The
+/// ones on `users` and `anonymous_workers` do not: they span every job an
+/// identity ever worked on, so a job whose claims are about to disappear has to
+/// hand back exactly what it contributed, or the contributor lists read high
+/// for good and nothing says why. Must run *before* the claims go, since it
+/// counts them.
+///
+/// `last_completed_at` is deliberately not rewound. Finding the new maximum
+/// means the scan these counters exist to avoid, and it is a display figure
+/// that only ever moves forward; a purge can leave it pointing at a time whose
+/// task is gone.
+async fn release_contributions(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE users u
+         SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
+         FROM (SELECT c.claimed_by_user_id AS id, COUNT(*)::bigint AS n
+               FROM task_claims c JOIN tasks t ON t.id = c.task_id
+               WHERE t.job_id = $1 AND c.state = 'completed'
+                 AND c.claimed_by_user_id IS NOT NULL
+               GROUP BY 1) d
+         WHERE u.id = d.id",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
+
+    sqlx::query(
+        "UPDATE anonymous_workers w
+         SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
+         FROM (SELECT c.claimed_by_anon_uuid AS uuid, COUNT(*)::bigint AS n
+               FROM task_claims c JOIN tasks t ON t.id = c.task_id
+               WHERE t.job_id = $1 AND c.state = 'completed'
+                 AND c.claimed_by_anon_uuid IS NOT NULL
+               GROUP BY 1) d
+         WHERE w.uuid = d.uuid",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 async fn purge_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1582,6 +1625,10 @@ async fn purge_job(
     )
     .await?;
 
+    // Before the claims go, and for the same reason the census is taken first:
+    // it counts what is about to be destroyed.
+    release_contributions(&mut tx, id).await?;
+
     // Records and claims cascade from tasks; leave-gen progress is keyed on
     // the job directly. Ratings are not touched: they belong to rating pools,
     // not jobs, and are a pure function of the results that remain -- the
@@ -1594,7 +1641,8 @@ async fn purge_job(
     // alone, a purged job would restart owing the scheduler every claim it ever
     // had, and reporting progress it no longer has any results for.
     sqlx::query(
-        "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0
+        "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
+                         tasks_total = 0, tasks_completed = 0
          WHERE id = $1",
     )
     .bind(id)
@@ -1688,6 +1736,11 @@ async fn delete_job(
         census,
     )
     .await?;
+
+    // Deleting the job cascades its tasks and their claims away, so the
+    // identities that earned them have to be paid back first -- see
+    // `release_contributions`.
+    release_contributions(&mut tx, id).await?;
 
     let deleted = sqlx::query("DELETE FROM jobs WHERE id = $1")
         .bind(id)

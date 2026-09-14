@@ -102,11 +102,12 @@ impl JobHandler for GameHandler {
 
     async fn insert_record(
         conn: &mut PgConnection,
+        job_id: Uuid,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
     ) -> AppResult<()> {
-        super::insert_game_results(conn, task_id, claim_id, record).await
+        super::insert_game_results(conn, job_id, task_id, claim_id, record).await
     }
 }
 

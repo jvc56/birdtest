@@ -378,3 +378,105 @@ async fn an_opening_rack_job_cannot_rank_moves_with_a_best_recorder() {
     let (status, body) = create_job(ranking).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
+
+/// An identity's contribution counter spans every job it ever worked on, so a
+/// job whose claims are destroyed has to hand back exactly what it contributed.
+///
+/// This is the half of the counter design that the `jobs` counters do not have:
+/// those belong to the job and a purge simply zeroes them. Left undone, a purge
+/// or a delete leaves every contributor on that job reading permanently high on
+/// the leaderboard, with nothing to say why.
+#[tokio::test]
+async fn purging_and_deleting_a_job_give_back_what_it_earned() {
+    for destroy in ["purge", "delete"] {
+        let db = TestDb::new().await;
+        let job = db.games_job(1, 2).await;
+        let state = db.state().await;
+        let app = birdtest::app(state.clone());
+        with_history(&app).await;
+        let admin = db.user("root", true).await;
+        let headers = admin_headers(&state.cfg, admin);
+
+        let contributed = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COALESCE(SUM(tasks_completed), 0)::bigint FROM anonymous_workers",
+            )
+            .fetch_one(&db.pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(contributed().await, 1, "the worker's task is on its counter");
+
+        let (status, body) = match destroy {
+            "purge" => {
+                send(&app, post_json(
+                    &format!("/api/admin/jobs/{job}/purge"),
+                    &headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(),
+                    json!({}),
+                ))
+                .await
+            }
+            _ => send(&app, request("DELETE", &format!("/api/admin/jobs/{job}"), &headers)).await,
+        };
+        assert!(status.is_success(), "{destroy}: {body}");
+        assert_eq!(
+            contributed().await,
+            0,
+            "{destroy}: the claims are gone, so the contribution must be too"
+        );
+    }
+}
+
+/// Banning is the only lever there is against a bad contributor — nothing bans
+/// automatically — so unban has to mean what it says.
+///
+/// It deletes by row id, so a second ban row for the same identity used to
+/// leave the identity banned after the admin had lifted the ban, with nothing
+/// in the response to say so. A duplicate is refused instead.
+#[tokio::test]
+async fn an_identity_can_be_banned_once_and_unbanning_lifts_it() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let header_refs: Vec<(&str, &str)> =
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let target = db.user("nuisance", false).await;
+
+    let ban = |reason: &'static str| {
+        let app = app.clone();
+        let refs = header_refs.clone();
+        async move {
+            send(
+                &app,
+                post_json("/api/admin/workers/ban", &refs, json!({ "user_id": target, "reason": reason })),
+            )
+            .await
+        }
+    };
+
+    let (status, body) = ban("submitting garbage").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let ban_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = ban("and again").await;
+    assert_eq!(status, StatusCode::CONFLICT, "a second ban of one identity: {body}");
+
+    let (status, body) =
+        send(&app, request("DELETE", &format!("/api/admin/workers/ban/{ban_id}"), &headers)).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let still_banned: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM worker_bans WHERE user_id = $1")
+            .bind(target)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(still_banned, 0, "unban lifted the ban rather than one row of it");
+
+    // And the identity can be banned again afterwards, which is how "ban with a
+    // different reason" is expressed.
+    let (status, body) = ban("a new reason").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}

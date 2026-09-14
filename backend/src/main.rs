@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
         pool,
         cfg: cfg.clone(),
         sse: sse::SseBroadcaster::new(),
+        finish_checks: Default::default(),
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,

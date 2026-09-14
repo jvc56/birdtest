@@ -75,20 +75,16 @@ impl JobHandler for LeaveGenHandler {
 
     async fn insert_record(
         conn: &mut PgConnection,
+        job_id: Uuid,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
     ) -> AppResult<()> {
-        let row = sqlx::query(
-            "SELECT r.generation, t.job_id
-             FROM leave_requests r JOIN tasks t ON t.id = r.task_id
-             WHERE r.task_id = $1",
-        )
-        .bind(task_id)
-        .fetch_one(&mut *conn)
-        .await?;
-        let generation: i32 = row.get("generation");
-        let job_id: Uuid = row.get("job_id");
+        let generation: i32 =
+            sqlx::query_scalar("SELECT generation FROM leave_requests WHERE task_id = $1")
+                .bind(task_id)
+                .fetch_one(&mut *conn)
+                .await?;
 
         sqlx::query(
             "INSERT INTO leave_records (task_claim_id, task_id, rack_count)

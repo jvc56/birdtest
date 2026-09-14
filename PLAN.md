@@ -92,7 +92,7 @@ Workers are the clients that perform tasks and submit results. Two types are sup
 #### Worker Integrity and Anomaly Detection
 
 - **Plausibility checks at submission time** — every submission is checked against what is *possible*, not against what is usual: a negative standard deviation, a play scoring negative points, a rack with eight tiles, a batch reporting a different number of games than the task dispatched. Implemented in [`backend/src/jobs/plausibility.rs`](backend/src/jobs/plausibility.rs). This is the only active integrity mechanism at submission time, and the rest of this section explains why it is the only one that can be.
-- **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID. Applied by an admin; nothing bans automatically.
+- **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID. Applied by an admin; nothing bans automatically. **One row per identity**, enforced by a partial unique index: enforcement is an `EXISTS`, so a second row's reason is never read, while unban deletes by row id — so a duplicate would leave an identity banned after an admin had lifted the ban, with nothing to say why. Banning again with a different reason is unban-then-ban, which the audit log records as both halves.
 - **Redundant task execution** — each job specifies a redundancy value X; X independent workers must each complete the task. All X results are stored independently. No consensus or agreement check is performed at submission time — reconciliation is a downstream analysis question deferred past v1. Every aggregate that treats results as observations — SPRT, progress counts, the job list and rating evidence — reads **one result per task**, the first accepted: games are seeded and deterministic, so the other copies replay the same games, and counting them would multiply the evidence by the redundancy.
 
 #### Why impossibility, and not per-worker anomaly detection
@@ -279,7 +279,28 @@ For game and game-pair jobs, results are evaluated using the Sequential Probabil
 1. **SPRT significance**: once `min_games` (or `min_pairs`) have been completed, SPRT is evaluated on every submitted result. The job auto-completes as soon as the LLR crosses the significance boundary.
 2. **Hard cap**: the job auto-completes when `max_games` (or `max_pairs`) is reached, regardless of SPRT outcome.
 
-SPRT is evaluated inline on every result submission (no background sweep). The server flips the job to `completed` automatically when either condition is met.
+SPRT is evaluated inline on the submission path (no background sweep), and
+**debounced**: every eighth submission for a job, plus unconditionally whenever
+that job has nothing left in flight. The server flips the job to `completed`
+automatically when either condition is met.
+
+The debounce trades *when* a job notices it is finished for the cost of
+noticing, and nothing else — the check still reads `game_results`, so a
+debounced check is late, never wrong. That is what separates it from replacing
+the read with a counter, which would make a drifted counter able to stop a job
+early (see [What these reads cost](#what-these-reads-cost-measured)). The cost
+is bounded at seven extra tasks, and the first several of those are free: when
+the LLR crosses, the job flips to `completed`, but every task already claimed
+across the fleet is still played and still accepted, because the submit path
+validates the claim rather than the job's status. A bound at or below the number
+of tasks typically in flight therefore wastes nothing that was not already going
+to be wasted.
+
+The unconditional check when nothing is in flight is a correctness cover rather
+than an optimisation. The check is triggered *by* submissions, so a job whose
+contributors all stop between checks would not be evaluated again until work
+resumed — which, for a job that has already reached its stopping point, means
+never: it would sit `active` holding allocation in its priority tier.
 
 #### How the LLR is computed
 
@@ -688,18 +709,38 @@ apply to. `workers` is always present, so a client can read its length without a
 presence check. There is no `ratings` block: ratings belong to rating pools, not
 jobs, and are read from the ratings page.
 
-**Two of these figures are running totals, not aggregates.** `games?` and the
-job list's `units_completed` read `jobs.games_completed`, and
-`opening_racks.racks_analyzed` reads `jobs.racks_analyzed`; both are maintained
-in the submit transaction, once per task, on its first accepted result — the same
-row the aggregates they replace selected, since redundant claims replay the same
-deterministic work. They exist because the reads were the two that did not scale:
-the job list re-derived per-task game totals for every job on every page view
-(2.2 s at the test volume), and counting distinct analysed racks cost seconds at
-a million racks on every detail view and every live push. Nothing
-that *decides* anything reads them: SPRT still reads `game_results`, so a drifted
-counter is a wrong number on a page and cannot stop a job early. A purge zeroes
-them and a partial restore recomputes them (RUNBOOK §2.3).
+**Several of these figures are running totals, not aggregates.** `games?` and
+the job list's `units_completed` read `jobs.games_completed`,
+`opening_racks.racks_analyzed` reads `jobs.racks_analyzed`, and the job list's
+task counts read `jobs.tasks_total` / `jobs.tasks_completed`. The first two are
+maintained in the submit transaction once per task, on its first accepted result
+— the same row the aggregates they replace selected, since redundant claims
+replay the same deterministic work. `tasks_total` rides on the claim's existing
+`UPDATE jobs`, and `tasks_completed` on the moment a task actually *reaches*
+completed, which the submit path's own update already computes.
+
+They exist because the reads did not scale: the job list re-derived per-task
+game totals for every job on every page view (2.2 s at the test volume) and
+counted each job's tasks twice more besides, and counting distinct analysed
+racks cost seconds at a million racks on every detail view and every live push.
+Nothing that *decides* anything reads them: SPRT still reads `game_results`, so
+a drifted counter is a wrong number on a page and cannot stop a job early. A
+purge zeroes them and a partial restore recomputes them (RUNBOOK §2.3).
+
+**The contributor lists have counters of their own**, on the identity rather
+than on the job: `users.tasks_completed` and
+`anonymous_workers.tasks_completed`, with a `last_completed_at` beside each.
+`/api/users` and `/api/workers` rank by contribution, so counting meant reading
+every identity's whole claim history before a `LIMIT` could apply — the ranking
+is the thing that cannot be paginated around. These differ from the job counters
+in one way that matters: a job's counter belongs to the job, so a purge zeroes
+it, while an identity's spans every job it ever worked on. `purge_job` and
+`delete_job` therefore hand back exactly what the job contributed, per identity,
+before its claims are destroyed. `last_completed_at` is deliberately not rewound
+by that — finding the new maximum is the scan the counter exists to avoid, and
+it is a display figure that only ever moves forward. Account deletion subtracts
+nothing: it anonymizes in place and keeps the claims, so no donated compute is
+lost.
 
 With the two opening-rack aggregates removed, `opening_racks` is now those two
 counters and nothing else: two single-row reads, constant time at any job size.
@@ -819,6 +860,8 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | `game_pair_stats` over 400,000 pairs | every paired submission and SSE push | 54 ms |
 | `game_stats` over 400,000 games | every game submission and SSE push | 50 ms |
 | `list_jobs`, 42 game jobs — **as it was**, re-deriving per-task game totals | every job-list page view | **2,188 ms** |
+| `list_jobs` task counts — **as they were**, two `COUNT(*)`s over `tasks` per job | every job-list page view | linear in every listed job's task history |
+| Contributor lists — **as they were**, grouping every completed claim in the database | every `/api/users` and `/api/workers` page view | 93 ms at 44,000 claims, linear from there |
 | `opening_rack_stats` — **as it was**, racks analysed and average equity in one query | job detail and every SSE push | **2,086 ms** (3,296 ms at 1,000,000 racks on a later run) |
 | `opening_rack_stats`: the average alone, after the split | job detail and every SSE push | 343 ms |
 | `opening_rack_stats`: best-move types | job detail and every SSE push | 541 ms (322 ms on the later run) |
@@ -833,21 +876,34 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 
 What the numbers settled:
 
-- **The SPRT path stays as it is.** About 50 ms at 400,000 units, on every
-  submission, is within budget for the result rate a job actually sees — so the
-  stopping rule keeps reading `game_results` rather than a counter, and cannot be
-  wrong because a counter drifted.
+- **The SPRT path still reads the rows, but not on every submission.** About
+  50 ms at 400,000 units, and linear in the job's history from there. The
+  stopping rule keeps reading `game_results` rather than a counter — it cannot
+  be wrong because a counter drifted — and is debounced to every eighth
+  submission instead, which is late rather than wrong. See [Statistical Result
+  Evaluation](#statistical-result-evaluation) for why the overshoot that buys is
+  mostly free.
 - **The SSE push moved off the submission path**, and is coalesced per job. It
   was the other 50 ms — the full payload was built before the worker was
   answered, so a dashboard nobody had open still cost every submission the same
   aggregates, and one that *was* open cost them twice over (once for the finish
   check, once for the payload). It is now built on a spawned task, one at a time
   per job. The finish check stays inline, because it decides something.
-- **The two reads above became running totals** (`jobs.games_completed`,
-  `jobs.racks_analyzed`), because they grew with a job's whole history and ran on
-  every page view and every live push. Splitting the opening-rack query mattered
-  as much as the counter: neither the distinct-rack count (631 ms) nor the average
-  (343 ms) is expensive alone — computing them together is what cost 3.3 s.
+- **The reads that grew with history became running totals.**
+  `jobs.games_completed` and `jobs.racks_analyzed` first, then
+  `jobs.tasks_total` / `jobs.tasks_completed` for the job list's own task counts,
+  and `tasks_completed` on `users` and `anonymous_workers` for the contributor
+  rankings — which could not be paginated around, because the ranking *is* the
+  ordering. Splitting the opening-rack query mattered as much as its counter:
+  neither the distinct-rack count (631 ms) nor the average (343 ms) is expensive
+  alone — computing them together is what cost 3.3 s.
+- **A job's results are read through the job, not through its tasks.**
+  `position_analysis_records` and `game_results` carry `job_id`, so the public
+  feed, the rack lookup, the admin stream and the export stop joining `tasks` to
+  find out which rows belong to the job — which had put the filter on the far
+  side of a join from the sort, making the whole job the unit of work before the
+  first page existed. With the feed indexes and cursor pagination, a page costs a
+  page.
 - **The rating matrix is scoped to the pool's own jobs first.** It used to pick
   one result per task across the *whole* of `game_results` and filter
   afterwards, so every fit sorted the entire table — and so did every public
@@ -3425,6 +3481,23 @@ List endpoints take `?page=` (zero-based, default 0) and `?per_page=` (default
 `total` is `-1` where an exact count would cost more than it is worth to the
 caller — the per-job result feeds, which are effectively unbounded.
 
+**One endpoint pages by cursor instead**, and it is the same one.
+`GET /api/jobs/:id/results` returns `{ items, total: -1, per_page, next_cursor }`
+and takes `?cursor=` in place of `?page=`. A job's corpus runs to millions of
+rows, and `OFFSET` produces and discards every row before the page asked for, so
+page *N* costs *N* pages; a cursor makes every page cost one. The exception is
+made here and nowhere else because every other list is bounded by something that
+does not grow the way a job's results do. The cursor is opaque — the last row's
+sort key, hex-encoded — and one this server did not produce reads as "start at
+the beginning" rather than as an error, since a caller cannot repair a token it
+cannot read.
+
+Its key is worth stating, because the obvious one is wrong: `submitted_at`
+defaults to `now()`, which is transaction time, so every record of one batch
+shares it exactly and it is not a key on its own. The tiebreaker is
+`position_analysis_records.id`, or `game_results.task_claim_id` where there is
+no serial, and it is in the feed indexes for that reason.
+
 #### Authentication and CSRF
 
 | Surface | Credential |
@@ -3577,8 +3650,8 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress row, artifact row and task for a job, reset its dispatch counter, then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. |
 | `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account and all their task claims and records. |
-| `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. |
-| `DELETE` | `/api/admin/workers/ban/:id` | Remove a ban. |
+| `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. One ban per identity: a second is `409`, so that unban means what it says. |
+| `DELETE` | `/api/admin/workers/ban/:id` | Remove a ban, and with it the identity's only ban. |
 | `GET` | `/api/admin/audit-log` | Query the audit log with filtering and pagination. |
 | `GET` | `/api/admin/input-data` | List known input data rows — path, role, name, digest, tarball date. |
 | `DELETE` | `/api/admin/input-data/:id` | Delete an input data row. A row referenced by a job, player config or rating pool cannot be deleted; the foreign key is the safety mechanism and the error is rendered as "used by N jobs". |
@@ -3711,7 +3784,7 @@ do not exist.
 |---|---|---|
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics. |
-| `GET` | `/api/jobs/:id/results` | Paginated task records for a job. `?worker=` filters to one contributor by username or anonymous UUID. `?rack=` is opening-rack jobs only and switches to a single-rack lookup. |
+| `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous UUID. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after each accepted result. |
 
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
@@ -4034,8 +4107,26 @@ CREATE TABLE users (
     -- tombstones and API keys are deleted, but the account's claims and
     -- results stay, so no donated compute is lost.
     deleted_at           TIMESTAMPTZ,
+    -- Completed claims by this account, and when the last one landed. Running
+    -- totals rather than a COUNT over task_claims: the contributor lists order
+    -- by this, so counting it meant computing every user's whole history before
+    -- a LIMIT could apply. Maintained in the submit transaction.
+    --
+    -- Unlike the counters on `jobs`, this one spans jobs, so it is not enough
+    -- to zero it when a job goes: purge_job and delete_job decrement it by what
+    -- they are about to destroy. `last_completed_at` is deliberately NOT
+    -- rewound by those, since finding the new maximum means the scan the
+    -- counter exists to avoid; it only ever moves forward, and is a display
+    -- figure.
+    tasks_completed      BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    last_completed_at    TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Serves /api/users, which ranks accounts by contribution. Partial because a
+-- deleted account is never listed.
+CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at ASC)
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE email_confirmations (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4071,8 +4162,23 @@ CREATE TABLE api_keys (
 CREATE TABLE anonymous_workers (
     uuid          UUID PRIMARY KEY,
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    -- Any request from this identity touches this, at most once a minute: it
+    -- answers "is this worker still around".
+    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The contribution counters, mirroring users.tasks_completed /
+    -- last_completed_at; see there for why they are counters and who
+    -- decrements them. `last_completed_at` is distinct from `last_seen_at`
+    -- above: one is the last task finished, the other is the last request of
+    -- any kind, and the contributor list shows the first.
+    tasks_completed   BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    last_completed_at TIMESTAMPTZ
 );
+
+-- Serves the anonymous half of /api/workers, which merges both kinds of
+-- identity in one ranking. Partial: an identity that has completed nothing is
+-- not a contributor and is not listed.
+CREATE INDEX anonymous_workers_contribution_idx
+    ON anonymous_workers (tasks_completed DESC) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -4087,6 +4193,18 @@ CREATE TABLE worker_bans (
         (user_id IS NOT NULL)::int + (anon_uuid IS NOT NULL)::int = 1
     )
 );
+
+-- One ban per identity. A second row for an identity already banned carries no
+-- information -- enforcement is an EXISTS, so the second reason is never read
+-- -- and it breaks unban, which deletes by row id: an admin lifts a ban, one
+-- row goes, the identity stays banned, and nothing says why. A duplicate is a
+-- 409 through the usual unique-violation mapping instead. "Ban again with a
+-- different reason" survives as unban-then-ban, which the audit log records as
+-- both halves.
+CREATE UNIQUE INDEX worker_bans_user_idx ON worker_bans (user_id)
+    WHERE user_id IS NOT NULL;
+CREATE UNIQUE INDEX worker_bans_anon_idx ON worker_bans (anon_uuid)
+    WHERE anon_uuid IS NOT NULL;
 
 -- Input data
 --
@@ -4244,6 +4362,14 @@ CREATE TABLE jobs (
     -- recomputes them (RUNBOOK 2.3).
     games_completed BIGINT NOT NULL DEFAULT 0 CHECK (games_completed >= 0),
     racks_analyzed  BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
+    -- Tasks created, and tasks that reached `completed`. The job list shows
+    -- both for every job on the page, and counting them meant two COUNT(*)s
+    -- over `tasks` per job per page view -- linear in each job's whole history,
+    -- on the site's index. Same reasoning and same caveats as the two counters
+    -- above: nothing decides anything from them, a purge zeroes them, and a
+    -- partial restore recomputes them (RUNBOOK 2.3).
+    tasks_total     BIGINT NOT NULL DEFAULT 0 CHECK (tasks_total >= 0),
+    tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ
@@ -4624,6 +4750,13 @@ CREATE TABLE position_analysis_records (
     id              BIGSERIAL PRIMARY KEY,
     task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- Denormalized from the task. Every read of a job's records -- the public
+    -- results feed, the rack lookup, the admin stream, the export -- filtered
+    -- on the job and could only reach it through `tasks`, which put the filter
+    -- on the far side of a join from the sort and made the whole job the unit
+    -- of work. With the column here they are index scans. `position_analysis_
+    -- moves` already carries `task_id` for the same family of reason.
+    job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     rack            TEXT NOT NULL,
     -- CGP of the position analysed. NULL for an opening rack, where the board
     -- is empty by definition and the rack is the whole position.
@@ -4667,6 +4800,19 @@ CREATE UNIQUE INDEX position_analysis_records_rack_idx
 
 CREATE INDEX position_analysis_records_task_idx
     ON position_analysis_records (task_id, rack);
+
+-- The public results feed, which is newest-first within a job and paginated by
+-- keyset. `id` is in the index because it is the cursor's tiebreaker:
+-- `submitted_at` defaults to now(), which is transaction time, so every record
+-- of one batch shares it exactly and it is not a key on its own.
+CREATE INDEX position_analysis_records_feed_idx
+    ON position_analysis_records (job_id, submitted_at DESC, id DESC);
+
+-- The rack lookup (`?rack=`), which is the branch the site actually uses. One
+-- probe rather than one per task of the job. Opening racks only: an
+-- incidentally-captured in-game position is not an opening-rack analysis.
+CREATE INDEX position_analysis_records_job_rack_idx
+    ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
 
 -- The top `num_plays_recorded` moves per position, from the player config that
 -- produced them. Storing every move the worker ranked would be untenable:
@@ -4730,6 +4876,8 @@ CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_i
 CREATE TABLE game_results (
     task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- Denormalized from the task; see position_analysis_records.job_id.
+    job_id            UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
 
     -- Every game this task played. Two per pair for a game_pairs task.
     games             INT NOT NULL CHECK (games >= 0),
@@ -5022,6 +5170,11 @@ CREATE INDEX        tasks_job_idx             ON tasks (job_id, state);
 -- (task_id, submitted_at) rather than task_id alone: the per-task "first
 -- accepted result" read that every aggregate uses orders on both.
 CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);
+-- The public results feed for a games or game-pairs job, keyset-paginated like
+-- the opening-rack one. `task_claim_id` is the primary key and so the
+-- tiebreaker, since `game_results` has no serial.
+CREATE INDEX        game_results_feed_idx
+    ON game_results (job_id, submitted_at DESC, task_claim_id DESC);
 CREATE INDEX        leave_records_task_idx    ON leave_records (task_id);
 CREATE INDEX        position_records_task_idx ON position_analysis_records (task_id);
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);

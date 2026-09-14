@@ -128,10 +128,9 @@ async fn build_matrix(
          -- job's weight in the fit by its redundancy.
          first_result_per_task AS (
              SELECT DISTINCT ON (r.task_id)
-                    t.job_id, r.pent_0, r.pent_1, r.pent_2, r.pent_3, r.pent_4
+                    r.job_id, r.pent_0, r.pent_1, r.pent_2, r.pent_3, r.pent_4
              FROM eligible_jobs e
-             JOIN tasks t        ON t.job_id = e.job_id
-             JOIN game_results r ON r.task_id = t.id
+             JOIN game_results r ON r.job_id = e.job_id
              WHERE r.pent_0 IS NOT NULL
              ORDER BY r.task_id, r.submitted_at, r.task_claim_id
          )

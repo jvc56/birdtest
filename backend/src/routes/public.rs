@@ -66,9 +66,10 @@ async fn list_jobs(
     let rows = sqlx::query(
         "SELECT j.id, j.job_type, j.status::text AS status, j.priority, j.allocation,
                 j.redundancy, j.created_at,
-                (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id) AS tasks_total,
-                (SELECT COUNT(*) FROM tasks t WHERE t.job_id = j.id AND t.state = 'completed')
-                    AS tasks_completed,
+                -- Running totals, like games_completed below. Counted, these
+                -- were two scans of a job's whole task history for every job on
+                -- the page -- see PLAN.md on what these reads cost.
+                j.tasks_total, j.tasks_completed,
                 -- The running total the submit path maintains, one result per
                 -- task, rather than the aggregate over every result row this
                 -- used to compute: it grew with the job's whole history, for
@@ -157,9 +158,10 @@ async fn job_detail(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppR
 
 #[derive(Deserialize)]
 struct ResultsQuery {
-    #[serde(default)]
-    page: i64,
     per_page: Option<i64>,
+    /// Where the previous page left off. Absent for the first page. This route
+    /// pages by cursor rather than by offset — see [`super::CursorPage`].
+    cursor: Option<String>,
     /// Filter to one contributor: a username, or an anonymous worker UUID.
     worker: Option<String>,
     /// Opening-rack jobs only: look up one rack's full ranked move list.
@@ -170,39 +172,65 @@ async fn job_results(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(query): Query<ResultsQuery>,
-) -> AppResult<Json<super::Page<serde_json::Value>>> {
+) -> AppResult<Json<super::CursorPage<serde_json::Value>>> {
     let job = load_job(&state, id).await?;
-    let (limit, offset) = super::paginate(query.page, query.per_page);
+    let (limit, _) = super::paginate(0, query.per_page);
+    let cursor = query.cursor.as_deref().and_then(super::decode_cursor);
 
     if let (JobType::OpeningRack, Some(rack)) = (job.job_type, query.rack.as_ref()) {
         return Ok(Json(rack_lookup(&state, id, rack).await?));
     }
 
-    let items = match job.job_type {
+    // Every branch below reads its rows through the job id the record tables
+    // now carry, rather than by joining `tasks` to find out which rows belong
+    // to the job — which put the filter on the far side of a join from the
+    // sort, so the whole job had to be gathered before the first page existed.
+    //
+    // The cursor is the other half: it is the last row of the previous page, so
+    // the scan starts there instead of counting past it.
+    let mut next_cursor = None;
+    let items: Vec<serde_json::Value> = match job.job_type {
         JobType::OpeningRack => {
+            // `id` is the tiebreaker rather than `rack`: `submitted_at` defaults
+            // to now(), which is transaction time, so every record of one batch
+            // shares it exactly and it is not a key on its own.
+            let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
             let rows = sqlx::query(
-                "SELECT r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
+                "SELECT r.id, r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
                         m.equity AS best_equity, r.num_moves, r.submitted_at,
                         u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
                  FROM position_analysis_records r
-                 JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN position_analysis_moves m
                      ON m.record_id = r.id AND m.rank = 1
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
-                 WHERE t.job_id = $1
+                 WHERE r.job_id = $1
                    AND ($2::text IS NULL
                         OR u.username = $2
                         OR left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) = $2)
-                 ORDER BY r.submitted_at DESC, r.rack ASC
-                 LIMIT $3 OFFSET $4",
+                   AND ($3::timestamptz IS NULL
+                        OR (r.submitted_at, r.id) < ($3, $4))
+                 ORDER BY r.submitted_at DESC, r.id DESC
+                 LIMIT $5",
             )
             .bind(id)
             .bind(&query.worker)
+            .bind(after_time)
+            .bind(after_id)
             .bind(limit)
-            .bind(offset)
             .fetch_all(&state.pool)
             .await?;
+
+            if rows.len() as i64 == limit {
+                if let Some(last) = rows.last() {
+                    next_cursor = Some(super::encode_cursor(&[
+                        last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
+                            .timestamp_micros()
+                            .to_string(),
+                        last.get::<i64, _>("id").to_string(),
+                    ]));
+                }
+            }
 
             rows.into_iter()
                 .map(|r| {
@@ -221,8 +249,14 @@ async fn job_results(
                 .collect()
         }
         JobType::Games | JobType::GamePairs => {
+            // `game_results` has no serial, so its primary key is the
+            // tiebreaker. `tasks` is still joined -- the listing shows the
+            // task's seed -- but as a primary-key lookup per returned row
+            // rather than as the thing that decides which rows belong to the
+            // job.
+            let (after_time, after_claim) = game_result_cursor(cursor.as_deref());
             let rows = sqlx::query(
-                "SELECT r.task_id, r.games, r.wins, r.losses, r.ties,
+                "SELECT r.task_claim_id, r.task_id, r.games, r.wins, r.losses, r.ties,
                         r.p1_score_mean, r.p1_score_sd, r.p2_score_mean, r.p2_score_sd,
                         r.divergent_games, r.divergent_wins, r.divergent_losses,
                         r.divergent_ties, r.submitted_at,
@@ -231,19 +265,33 @@ async fn job_results(
                  JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
-                 WHERE t.job_id = $1
+                 WHERE r.job_id = $1
                    AND ($2::text IS NULL
                         OR u.username = $2
                         OR left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) = $2)
-                 ORDER BY r.submitted_at DESC
-                 LIMIT $3 OFFSET $4",
+                   AND ($3::timestamptz IS NULL
+                        OR (r.submitted_at, r.task_claim_id) < ($3, $4))
+                 ORDER BY r.submitted_at DESC, r.task_claim_id DESC
+                 LIMIT $5",
             )
             .bind(id)
             .bind(&query.worker)
+            .bind(after_time)
+            .bind(after_claim)
             .bind(limit)
-            .bind(offset)
             .fetch_all(&state.pool)
             .await?;
+
+            if rows.len() as i64 == limit {
+                if let Some(last) = rows.last() {
+                    next_cursor = Some(super::encode_cursor(&[
+                        last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
+                            .timestamp_micros()
+                            .to_string(),
+                        last.get::<Uuid, _>("task_claim_id").to_string(),
+                    ]));
+                }
+            }
 
             rows.into_iter()
                 .map(|r| {
@@ -270,19 +318,41 @@ async fn job_results(
                 .collect()
         }
         JobType::LeaveGeneration => {
+            // Three columns, and the directions differ, so the seek is spelled
+            // out rather than written as a row comparison. `(job_id,
+            // generation, rack)` is the primary key, so the triple is unique
+            // and the cursor cannot land between two identical rows.
+            let (after_generation, after_count, after_rack) = leave_cursor(cursor.as_deref());
             let rows = sqlx::query(
                 "SELECT rack, generation, occurrence_count,
                         equity_sum / NULLIF(occurrence_count, 0) AS mean_equity, updated_at
                  FROM leave_rack_progress
                  WHERE job_id = $1
+                   AND ($2::int IS NULL
+                        OR generation < $2
+                        OR (generation = $2
+                            AND (occurrence_count > $3
+                                 OR (occurrence_count = $3 AND rack > $4))))
                  ORDER BY generation DESC, occurrence_count ASC, rack ASC
-                 LIMIT $2 OFFSET $3",
+                 LIMIT $5",
             )
             .bind(id)
+            .bind(after_generation)
+            .bind(after_count)
+            .bind(after_rack)
             .bind(limit)
-            .bind(offset)
             .fetch_all(&state.pool)
             .await?;
+
+            if rows.len() as i64 == limit {
+                if let Some(last) = rows.last() {
+                    next_cursor = Some(super::encode_cursor(&[
+                        last.get::<i32, _>("generation").to_string(),
+                        last.get::<i64, _>("occurrence_count").to_string(),
+                        last.get::<String, _>("rack"),
+                    ]));
+                }
+            }
 
             rows.into_iter()
                 .map(|r| {
@@ -298,7 +368,41 @@ async fn job_results(
         }
     };
 
-    Ok(Json(super::Page { items, total: -1, page: query.page.max(0), per_page: limit }))
+    Ok(Json(super::CursorPage { items, total: -1, per_page: limit, next_cursor }))
+}
+
+/// The three cursor shapes this route uses. Each returns `None`s for a missing
+/// or unparseable cursor, which the queries read as "start at the beginning" —
+/// a cursor is opaque, so a caller cannot be expected to repair one.
+fn opening_rack_cursor(
+    cursor: Option<&[String]>,
+) -> (Option<chrono::DateTime<chrono::Utc>>, Option<i64>) {
+    match cursor {
+        Some([time, id]) => (micros_to_time(time), id.parse().ok()),
+        _ => (None, None),
+    }
+}
+
+fn game_result_cursor(
+    cursor: Option<&[String]>,
+) -> (Option<chrono::DateTime<chrono::Utc>>, Option<Uuid>) {
+    match cursor {
+        Some([time, claim]) => (micros_to_time(time), claim.parse().ok()),
+        _ => (None, None),
+    }
+}
+
+fn leave_cursor(cursor: Option<&[String]>) -> (Option<i32>, Option<i64>, Option<String>) {
+    match cursor {
+        Some([generation, count, rack]) => {
+            (generation.parse().ok(), count.parse().ok(), Some(rack.clone()))
+        }
+        _ => (None, None, None),
+    }
+}
+
+fn micros_to_time(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::from_timestamp_micros(raw.parse().ok()?)
 }
 
 /// The full ranked move list for one rack, from `position_analysis_moves`.
@@ -306,19 +410,22 @@ async fn rack_lookup(
     state: &AppState,
     job_id: Uuid,
     rack: &str,
-) -> AppResult<super::Page<serde_json::Value>> {
+) -> AppResult<super::CursorPage<serde_json::Value>> {
     let canonical: String = {
         let mut chars: Vec<char> = rack.trim().to_uppercase().chars().collect();
         chars.sort_unstable();
         chars.into_iter().collect()
     };
 
+    // One probe of `(job_id, rack) WHERE game_index IS NULL` rather than a walk
+    // of the job's tasks. `game_index IS NULL` is what keeps an incidentally
+    // captured in-game position with the same rack out of an opening-rack
+    // lookup.
     let rows = sqlx::query(
         "SELECT m.rank, m.move, m.score, m.equity
-         FROM position_analysis_moves m
-         JOIN position_analysis_records r ON r.id = m.record_id
-         JOIN tasks t ON t.id = r.task_id
-         WHERE t.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
+         FROM position_analysis_records r
+         JOIN position_analysis_moves m ON m.record_id = r.id
+         WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
          ORDER BY m.rank ASC",
     )
     .bind(job_id)
@@ -338,8 +445,10 @@ async fn rack_lookup(
         })
         .collect();
 
+    // A rack's whole ranked list comes back in one page, so there is nothing to
+    // page to.
     let total = items.len() as i64;
-    Ok(super::Page { items, total, page: 0, per_page: total.max(1) })
+    Ok(super::CursorPage { items, total, per_page: total.max(1), next_cursor: None })
 }
 
 /// One SSE event per accepted result, carrying the same payload `GET
@@ -409,10 +518,9 @@ pub(super) async fn job_results_stream(
         let query = match job.job_type {
             JobType::OpeningRack =>
                 "SELECT to_jsonb(r) AS row FROM position_analysis_records r
-                 JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
+                 WHERE r.job_id = $1",
             JobType::Games | JobType::GamePairs =>
-                "SELECT to_jsonb(r) AS row FROM game_results r
-                 JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
+                "SELECT to_jsonb(r) AS row FROM game_results r WHERE r.job_id = $1",
             JobType::LeaveGeneration =>
                 "SELECT to_jsonb(r) AS row FROM leave_rack_progress r WHERE r.job_id = $1",
         };
@@ -455,13 +563,15 @@ async fn list_users(
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
     // Email addresses are deliberately absent — this endpoint is public.
+    // `users.tasks_completed` is a running total rather than a count over
+    // `task_claims`. The page orders by it, so counting meant computing every
+    // user's whole claim history before the LIMIT could apply; the partial
+    // index on (tasks_completed DESC, created_at ASC) now serves both.
     let rows = sqlx::query(
-        "SELECT u.id, u.username, u.is_admin, u.created_at,
-                (SELECT COUNT(*) FROM task_claims c
-                 WHERE c.claimed_by_user_id = u.id AND c.state = 'completed') AS tasks_completed
+        "SELECT u.id, u.username, u.is_admin, u.created_at, u.tasks_completed
          FROM users u
          WHERE u.deleted_at IS NULL
-         ORDER BY tasks_completed DESC, u.created_at ASC
+         ORDER BY u.tasks_completed DESC, u.created_at ASC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
@@ -526,17 +636,25 @@ async fn worker_page(
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
+    // Both kinds of contributor in one ranking, each from its own running
+    // total. This was a group-by over every completed claim in the database --
+    // twice, once for the page and once for the count. Each arm is now an
+    // ordered scan of a partial index, merged under the LIMIT.
+    //
+    // `last_seen_at` here is the last *task finished*, which is what this list
+    // has always shown; it is deliberately not `anonymous_workers.last_seen_at`,
+    // which any request touches and answers a different question.
     let rows = sqlx::query(
-        "SELECT c.claimed_by_user_id AS user_id,
-                c.claimed_by_anon_uuid AS anon_uuid,
-                left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
-                u.username,
-                COUNT(*)::bigint AS tasks_completed,
-                MAX(c.completed_at) AS last_seen_at
-         FROM task_claims c
-         LEFT JOIN users u ON u.id = c.claimed_by_user_id
-         WHERE c.state = 'completed'
-         GROUP BY c.claimed_by_user_id, c.claimed_by_anon_uuid, u.username
+        "SELECT * FROM (
+             SELECT u.id AS user_id, NULL::uuid AS anon_uuid, NULL::text AS anon_id,
+                    u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
+             FROM users u WHERE u.tasks_completed > 0
+             UNION ALL
+             SELECT NULL::uuid, w.uuid,
+                    left(encode(sha256(convert_to(w.uuid::text, 'UTF8')), 'hex'), 16),
+                    NULL::text, w.tasks_completed, w.last_completed_at
+             FROM anonymous_workers w WHERE w.tasks_completed > 0
+         ) contributors
          ORDER BY tasks_completed DESC
          LIMIT $1 OFFSET $2",
     )
@@ -546,10 +664,8 @@ async fn worker_page(
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM (
-             SELECT 1 FROM task_claims WHERE state = 'completed'
-             GROUP BY claimed_by_user_id, claimed_by_anon_uuid
-         ) w",
+        "SELECT (SELECT COUNT(*) FROM users WHERE tasks_completed > 0)
+              + (SELECT COUNT(*) FROM anonymous_workers WHERE tasks_completed > 0)",
     )
     .fetch_one(&state.pool)
     .await?;

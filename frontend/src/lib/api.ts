@@ -69,6 +69,20 @@ export interface Page<T> {
   per_page: number;
 }
 
+/**
+ * A job's results page by cursor rather than by offset: the corpus runs to
+ * millions of rows, where `OFFSET` produces every row before the page asked
+ * for. Pass `next_cursor` back as `cursor` for the next page; its absence is
+ * the end. This is the only endpoint that pages this way.
+ */
+export interface CursorPage<T> {
+  items: T[];
+  /** Always -1: an exact count costs more than it is worth to the caller. */
+  total: number;
+  per_page: number;
+  next_cursor?: string;
+}
+
 export interface JobListItem {
   id: string;
   job_type: JobType;
@@ -328,8 +342,9 @@ export const api = {
   // Public
   jobs: (page = 0) => get<Page<JobListItem>>(`/api/jobs?page=${page}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
+  /** Cursor-paginated; see {@link CursorPage}. `?rack=` returns one rack's whole list. */
   jobResults: (id: string, params: Record<string, string | number> = {}) =>
-    get<Page<Record<string, unknown>>>(
+    get<CursorPage<Record<string, unknown>>>(
       `/api/jobs/${id}/results?${new URLSearchParams(
         Object.entries(params).map(([k, v]) => [k, String(v)])
       )}`

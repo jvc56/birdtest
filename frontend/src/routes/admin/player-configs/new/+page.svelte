@@ -114,10 +114,18 @@
     <div>
       <label class="label" for="recorder">Recorder type (-r)</label>
       <select id="recorder" class="input" bind:value={recorderType}>
-        <option value="best">best — play the top-ranked move (right for autoplay)</option>
-        <option value="equity">equity — record all moves within the equity margin</option>
-        <option value="all">all — record every move</option>
+        <option value="best">best — keep only the top-ranked move (right for games jobs)</option>
+        <option value="equity">equity — keep every move within the equity margin</option>
+        <option value="all">all — keep every move</option>
       </select>
+      <p class="mt-1 text-xs text-muted-foreground">
+        This decides what move generation <em>keeps</em>, not which move is played.
+        <strong>best</strong> throws away every candidate but the winner, so a config using it
+        can only ever report one move per position — and a simmer using it has nothing to choose
+        between, which makes plies and plays do nothing. Right for games jobs, where only the
+        move played matters. An opening-rack job wants a ranking, so it needs
+        <strong>all</strong> or <strong>equity</strong> unless it records exactly one play.
+      </p>
     </div>
     <div>
       <label class="label" for="kwg">Lexicon (-l)</label>

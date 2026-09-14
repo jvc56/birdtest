@@ -873,3 +873,140 @@ async fn an_assignment_names_every_file_the_task_loads_and_no_others() {
         assert_eq!(file["tarball_date"], "20251004");
     }
 }
+
+/// Contribution counters are running totals now, not counts over `task_claims`,
+/// and the contributor lists read them. A counter that does not move, or moves
+/// twice, is a wrong leaderboard that nothing else contradicts.
+#[tokio::test]
+async fn contributions_are_counted_as_they_arrive() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let counters = |uuid: String| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, Option<chrono::DateTime<chrono::Utc>>)>(
+                "SELECT tasks_completed, last_completed_at FROM anonymous_workers WHERE uuid = $1::uuid",
+            )
+            .bind(uuid)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let (assignment, uuid) = first_claim(&app).await;
+    assert_eq!(counters(uuid.clone()).await, (0, None), "a claim is not a contribution");
+
+    let token = assignment["claim_token"].as_str().unwrap();
+    let (_, body) = submit_as(&app, &uuid, token, games_result(2, 1)).await;
+    assert_eq!(body["accepted"], true);
+
+    let (completed, last) = counters(uuid.clone()).await;
+    assert_eq!(completed, 1);
+    assert!(last.is_some(), "the timestamp is the last task finished, not the last request");
+
+    // And a second task moves it again.
+    let (status, assignment) = claim_as(&app, &uuid).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    let token = assignment["claim_token"].as_str().unwrap();
+    submit_as(&app, &uuid, token, games_result(2, 2)).await;
+    assert_eq!(counters(uuid.clone()).await.0, 2);
+
+    // The job's own task counters track creation and completion separately.
+    let (total, completed): (i64, i64) =
+        sqlx::query_as("SELECT tasks_total, tasks_completed FROM jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((total, completed), (2, 2));
+
+    // And the leaderboard reads them rather than counting claims.
+    let (status, body) = send(&app, get_request("/api/workers", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["items"][0]["tasks_completed"], 2);
+    assert!(body["items"][0]["last_seen_at"].is_string(), "{body}");
+}
+
+/// The results feed pages by cursor, because a job's corpus is millions of rows
+/// and `OFFSET` produces every one of them before the page asked for.
+///
+/// What this pins is that the cursor actually walks the whole set exactly once:
+/// a keyset that ties (`submitted_at` is transaction time, so a whole batch
+/// shares it) would silently repeat or skip rows between pages.
+#[tokio::test]
+async fn the_results_feed_walks_every_row_exactly_once() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("solver", admin).await;
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 6, 7, 100)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    // Two batches, so the feed spans more than one submission timestamp and
+    // more than one page.
+    let mut expected: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let (assignment, uuid) = first_claim(&app).await;
+        let token = assignment["claim_token"].as_str().unwrap().to_string();
+        let racks: Vec<String> = assignment["task_request"]["racks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect();
+        expected.extend(racks.iter().cloned());
+        let result = json!({
+            "racks": racks.iter().map(|rack| json!({
+                "rack": rack,
+                "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
+            })).collect::<Vec<_>>()
+        });
+        let (status, body) = submit_as(&app, &uuid, &token, result).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let path = match &cursor {
+            Some(c) => format!("/api/jobs/{job}/results?per_page=5&cursor={c}"),
+            None => format!("/api/jobs/{job}/results?per_page=5"),
+        };
+        let (status, body) = send(&app, get_request(&path, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for item in body["items"].as_array().unwrap() {
+            seen.push(item["rack"].as_str().unwrap().to_string());
+        }
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+
+    assert_eq!(seen.len(), expected.len(), "the walk repeated or skipped rows: {seen:?}");
+    let mut sorted_seen = seen.clone();
+    sorted_seen.sort();
+    let mut sorted_expected = expected.clone();
+    sorted_expected.sort();
+    assert_eq!(sorted_seen, sorted_expected);
+
+    // An unparseable cursor starts from the beginning rather than erroring: it
+    // is opaque, so a caller cannot be expected to repair one.
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{job}/results?cursor=nonsense"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().unwrap().len(), expected.len());
+}

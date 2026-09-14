@@ -80,6 +80,7 @@ impl JobHandler for OpeningRackHandler {
 
     async fn insert_record(
         conn: &mut PgConnection,
+        job_id: Uuid,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
@@ -102,9 +103,16 @@ impl JobHandler for OpeningRackHandler {
 
         // An opening rack is unique per (claim, rack), so a conflict here would
         // be a duplicate within one submission rather than a redundant claim.
-        super::insert_position_analyses(conn, task_id, claim_id, &record.positions,
-                                        num_plays_recorded, false)
-            .await?;
+        super::insert_position_analyses(
+            conn,
+            job_id,
+            task_id,
+            claim_id,
+            &record.positions,
+            num_plays_recorded,
+            false,
+        )
+        .await?;
 
         Ok(())
     }

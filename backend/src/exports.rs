@@ -42,11 +42,10 @@ fn export_query(job_type: JobType) -> &'static str {
     match job_type {
         JobType::OpeningRack => {
             "SELECT to_jsonb(r) AS row FROM position_analysis_records r
-             JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1"
+             WHERE r.job_id = $1"
         }
         JobType::Games | JobType::GamePairs => {
-            "SELECT to_jsonb(r) AS row FROM game_results r
-             JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1"
+            "SELECT to_jsonb(r) AS row FROM game_results r WHERE r.job_id = $1"
         }
         JobType::LeaveGeneration => {
             "SELECT to_jsonb(r) AS row FROM leave_rack_progress r WHERE r.job_id = $1"

@@ -25,8 +25,12 @@ pub trait JobHandler {
     /// Normalize a worker submission into its stored form.
     fn process_response(response: Self::Response) -> AppResult<Self::Record>;
 
+    /// `job_id` is passed rather than looked up: every record table carries it
+    /// denormalized so a job's rows can be read without joining through
+    /// `tasks`, and the caller has the job in hand already.
     async fn insert_record(
         conn: &mut PgConnection,
+        job_id: Uuid,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
