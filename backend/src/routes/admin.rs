@@ -532,18 +532,26 @@ async fn create_player_config(
         None => None,
     };
 
-    // A player with simulation parameters loads a win% model; a static player
-    // never opens one. Getting this wrong would either fail at the worker or
-    // lock a contributor out of jobs that would never have read the file.
-    let simming = body.max_iterations.is_some()
-        || body.num_plies.is_some()
-        || body.num_plays.is_some()
-        || body.stopping_pct.is_some();
     // MAGPIE decides per player whether to simulate on plies alone (autoplay
-    // reads `sim_args->num_plies > 0`). A config with simulation settings but
-    // no plies would be treated as a simmer here -- made to name a win%
-    // model, rated as one -- and play statically on every worker.
-    if simming && !body.num_plies.is_some_and(|plies| plies >= 1) {
+    // reads `sim_args->num_plies > 0`), so that is what a simmer is here too.
+    // A config with simulation settings but no plies would be carried as a
+    // simmer -- made to name a win% model, rated as one -- and play statically
+    // on every worker, so it is refused. `num_plays` is not a simulation
+    // setting: an opening-rack analysis sizes its move list from it, simulating
+    // or not.
+    let simming = body.num_plies.is_some_and(|plies| plies >= 1);
+    let states_simulation = body.max_iterations.is_some()
+        || body.stopping_pct.is_some()
+        || body.use_inference.is_some()
+        || body.time_limit_secs.is_some()
+        || body.min_play_iterations.is_some()
+        || body.threshold.is_some()
+        || body.sampling_rule.is_some()
+        || body.inference_margin.is_some()
+        || body.utility_w_winpct.is_some()
+        || body.utility_w_spread.is_some()
+        || body.utility_spread_scale.is_some();
+    if states_simulation && !simming {
         return Err(AppError::bad_request("player config is invalid")
             .with_field("num_plies", "a simming player must simulate at least 1 ply"));
     }
@@ -587,6 +595,36 @@ async fn create_player_config(
     // refuses a pairing from two different letter distributions.
     crate::compat::validate_lexicon_and_leaves(&kwg, &klv)?;
 
+    // Every setting a request states is written into the row now, from
+    // MAGPIE's defaults where the body leaves it out, so a task built from this
+    // config means the same thing on every MAGPIE release (see
+    // `magpie_defaults`). A static player's simulation settings stay NULL:
+    // nothing reads them, and the schema's CHECK holds the two sets apart.
+    use crate::magpie_defaults as defaults;
+    let sort_strategy =
+        body.sort_strategy.clone().unwrap_or_else(|| defaults::SORT_STRATEGY.to_string());
+    let num_plies = body.num_plies.unwrap_or(0);
+    let num_plays = body.num_plays.unwrap_or(defaults::NUM_PLAYS);
+    let num_plies_recorded = body.num_plies_recorded.unwrap_or(defaults::NUM_PLIES_RECORDED);
+    let movegen_margin = body.movegen_margin.unwrap_or(defaults::MOVEGEN_MARGIN);
+    let stopping_pct = simming.then(|| body.stopping_pct.unwrap_or(defaults::STOPPING_PCT));
+    let use_inference = simming.then(|| body.use_inference.unwrap_or(defaults::USE_INFERENCE));
+    let min_play_iterations =
+        simming.then(|| body.min_play_iterations.unwrap_or(defaults::MIN_PLAY_ITERATIONS));
+    let threshold = simming
+        .then(|| body.threshold.clone().unwrap_or_else(|| defaults::THRESHOLD.to_string()));
+    let sampling_rule = simming.then(|| {
+        body.sampling_rule.clone().unwrap_or_else(|| defaults::SAMPLING_RULE.to_string())
+    });
+    let inference_margin =
+        simming.then(|| body.inference_margin.unwrap_or(defaults::INFERENCE_MARGIN));
+    let utility_w_winpct =
+        simming.then(|| body.utility_w_winpct.unwrap_or(defaults::UTILITY_W_WINPCT));
+    let utility_w_spread =
+        simming.then(|| body.utility_w_spread.unwrap_or(defaults::UTILITY_W_SPREAD));
+    let utility_spread_scale =
+        simming.then(|| body.utility_spread_scale.unwrap_or(defaults::UTILITY_SPREAD_SCALE));
+
     let config = sqlx::query_as::<_, PlayerConfig>(
         "INSERT INTO player_configs
              (name, recorder_type, sort_strategy, kwg_id, klv_id, winpct_id,
@@ -602,29 +640,30 @@ async fn create_player_config(
     )
     .bind(body.name.trim())
     .bind(&body.recorder_type)
-    .bind(&body.sort_strategy)
+    .bind(&sort_strategy)
     .bind(body.kwg_id)
     .bind(body.klv_id)
     .bind(body.winpct_id)
     .bind(body.cloned_from_id)
     .bind(body.max_iterations)
-    .bind(body.num_plies)
-    .bind(body.num_plies_recorded)
-    .bind(body.num_plays)
+    .bind(num_plies)
+    .bind(num_plies_recorded)
+    .bind(num_plays)
     .bind(body.num_plays_recorded)
-    .bind(body.stopping_pct)
-    .bind(body.use_inference)
+    .bind(stopping_pct)
+    .bind(use_inference)
     .bind(body.time_limit_secs)
-    .bind(body.use_wordmap)
-    .bind(body.use_rit)
-    .bind(body.min_play_iterations)
-    .bind(&body.threshold)
-    .bind(&body.sampling_rule)
-    .bind(body.inference_margin)
-    .bind(body.utility_w_winpct)
-    .bind(body.utility_w_spread)
-    .bind(body.utility_spread_scale)
-    .bind(body.movegen_margin)
+    .bind(body.use_wordmap.unwrap_or(false))
+    // Refused above when true.
+    .bind(false)
+    .bind(min_play_iterations)
+    .bind(&threshold)
+    .bind(&sampling_rule)
+    .bind(inference_margin)
+    .bind(utility_w_winpct)
+    .bind(utility_w_spread)
+    .bind(utility_spread_scale)
+    .bind(movegen_margin)
     .bind(admin.0.id)
     .fetch_one(&state.pool)
     .await?;
@@ -922,8 +961,9 @@ async fn create_job(
     let job = sqlx::query_as::<_, Job>(
         "INSERT INTO jobs
              (job_type, priority, redundancy, variant, letterdist_id, layout_id,
-              min_magpie_major, min_magpie_minor, min_magpie_patch, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *",
+              min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
+              sim_cutoff, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *",
     )
     .bind(body.job_type)
     .bind(body.priority)
@@ -934,6 +974,11 @@ async fn create_job(
     .bind(floor.major)
     .bind(floor.minor)
     .bind(floor.patch)
+    // Written from MAGPIE's defaults, like a player config's settings, so
+    // every request states them rather than each worker's build supplying
+    // its own.
+    .bind(crate::magpie_defaults::BINGO_BONUS)
+    .bind(crate::magpie_defaults::SIM_CUTOFF)
     .bind(admin.0.id)
     .fetch_one(&mut *tx)
     .await?;
@@ -1161,8 +1206,8 @@ async fn validate_shared_player_options(
             "player configs disagree on the win% model, which MAGPIE cannot vary per player",
         ));
     }
-    let p1_movegen_margin: Option<f64> = row.get("p1_movegen_margin");
-    let p2_movegen_margin: Option<f64> = row.get("p2_movegen_margin");
+    let p1_movegen_margin: f64 = row.get("p1_movegen_margin");
+    let p2_movegen_margin: f64 = row.get("p2_movegen_margin");
     if p1_movegen_margin != p2_movegen_margin {
         return Err(AppError::bad_request(
             "player configs disagree on movegen_margin, which MAGPIE cannot vary per player",
@@ -1170,10 +1215,6 @@ async fn validate_shared_player_options(
     }
     Ok(())
 }
-
-/// MAGPIE's candidate-play count for a player whose config leaves `num_plays`
-/// null: the reset `contribute` applies before every request.
-const MAGPIE_DEFAULT_NUM_PLAYS: i32 = 100;
 
 /// A capture job's simmers must already consider at least as many plays as are
 /// captured.
@@ -1194,15 +1235,14 @@ async fn validate_capture_play_cap(
             .fetch_optional(&mut *conn)
             .await?
             .ok_or_else(|| AppError::bad_request("player config not found"))?;
-    let players = sqlx::query_as::<_, (String, Option<i32>, Option<i32>)>(
+    let players = sqlx::query_as::<_, (String, i32, i32)>(
         "SELECT name, num_plies, num_plays FROM player_configs WHERE id = ANY($1)",
     )
     .bind(vec![player1_config_id, player2_config_id])
     .fetch_all(&mut *conn)
     .await?;
     for (name, plies, plays) in players {
-        let plays = plays.unwrap_or(MAGPIE_DEFAULT_NUM_PLAYS);
-        if plies.unwrap_or(0) > 0 && plays < cap {
+        if plies > 0 && plays < cap {
             return Err(AppError::bad_request("job settings are invalid").with_field(
                 "capture_positions",
                 format!(

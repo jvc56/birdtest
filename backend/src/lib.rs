@@ -16,6 +16,7 @@ pub mod exports;
 pub mod inputdata;
 pub mod jobs;
 pub mod jobstats;
+pub mod magpie_defaults;
 pub mod models;
 pub mod ratelimit;
 pub mod ratings;

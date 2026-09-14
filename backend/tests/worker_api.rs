@@ -872,6 +872,16 @@ async fn an_assignment_names_every_file_the_task_loads_and_no_others() {
         assert!(file["path"].as_str().unwrap().contains('/'), "{file}");
         assert_eq!(file["tarball_date"], "20251004");
     }
+
+    // And it states every setting the task needs rather than leaving one to
+    // the worker's build, which MAGPIE refuses: the job's run-wide settings,
+    // and each player's.
+    let request = &assignment["task_request"];
+    assert_eq!(request["bingo_bonus"], json!(50), "{request}");
+    assert_eq!(request["sim_cutoff"], json!(0.005), "{request}");
+    for field in ["sort_strategy", "num_plies", "num_plays", "num_plies_recorded", "movegen_margin"] {
+        assert!(!request["player1"][field].is_null(), "player1 {field}: {request}");
+    }
 }
 
 /// Contribution counters are running totals now, not counts over `task_claims`,
@@ -1149,4 +1159,95 @@ async fn sprt_jobs_hand_out_nothing_past_their_cap() {
     let (status, body) =
         send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// A pool's page shows the residuals its latest fit stored, not ones rebuilt
+/// on each view. Rebuilding ran the pool's evidence matrix -- a grouped scan
+/// over every paired result it counts -- on every public page view. Stored,
+/// the residuals describe the evidence that fit used, even after more arrives.
+#[tokio::test]
+async fn a_pools_residuals_are_the_ones_its_latest_fit_stored() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let admin = db.user("pool-admin", true).await;
+    // Named so the pool orders the anchor first: it is the residual's row, and
+    // the job's player 1.
+    let anchor = db.static_player("anchor", admin).await;
+    let rival = db.static_player("rival", admin).await;
+    let job = db.bare_job("game_pairs", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_game_pair_config
+             (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs, max_pairs)
+         VALUES ($1, $2, $3, 1, 1000000, 1000000)",
+    )
+    .bind(job)
+    .bind(anchor)
+    .bind(rival)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let pool: Uuid = sqlx::query_scalar(
+        "INSERT INTO rating_pools (name, variant, letterdist_id, layout_id, anchor_player_config_id)
+         SELECT 'pool', variant, letterdist_id, layout_id, $2 FROM jobs WHERE id = $1
+         RETURNING id",
+    )
+    .bind(job)
+    .bind(anchor)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO rating_pool_members (pool_id, player_config_id) VALUES ($1, $2), ($1, $3)",
+    )
+    .bind(pool)
+    .bind(anchor)
+    .bind(rival)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    // One pair, both games to player 1, or both to player 2.
+    let pair = |player_one_won: bool| {
+        let mut result = games_result(2, if player_one_won { 2 } else { 0 });
+        result["pentanomial"] =
+            if player_one_won { json!([0, 0, 0, 0, 1]) } else { json!([1, 0, 0, 0, 0]) };
+        result
+    };
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = assignment["claim_token"].as_str().unwrap();
+    let (_, body) = submit_as(&app, &uuid, token, pair(true)).await;
+    assert_eq!(body["accepted"], true, "{body}");
+
+    let run = birdtest::ratings::recompute(&db.pool, pool, birdtest::ratings::Trigger::Manual)
+        .await
+        .unwrap();
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rating_run_residuals WHERE run_id = $1")
+            .bind(run)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 1, "one head-to-head, stored with the run");
+
+    let pool_page = format!("/api/rating-pools/{pool}");
+    let (status, detail) = send(&app, get_request(&pool_page, &[])).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    let residuals = detail["residuals"].as_array().unwrap();
+    assert_eq!(residuals.len(), 1, "{detail}");
+    assert_eq!(residuals[0]["row"], json!(anchor), "{detail}");
+    assert_eq!(residuals[0]["col"], json!(rival), "{detail}");
+    assert_eq!(residuals[0]["pairs"], json!(1.0), "{detail}");
+    assert_eq!(residuals[0]["actual"], json!(1.0), "{detail}");
+
+    // A second pair the other way, and no refit. The page still shows the
+    // fit's evidence, where a rebuilt matrix would show two pairs, split.
+    let (status, assignment) = claim_as(&app, &uuid).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    let token = assignment["claim_token"].as_str().unwrap();
+    let (_, body) = submit_as(&app, &uuid, token, pair(false)).await;
+    assert_eq!(body["accepted"], true, "{body}");
+    let (_, detail) = send(&app, get_request(&pool_page, &[])).await;
+    assert_eq!(detail["residuals"][0]["pairs"], json!(1.0), "{detail}");
+    assert_eq!(detail["residuals"][0]["actual"], json!(1.0), "{detail}");
 }

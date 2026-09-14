@@ -561,6 +561,88 @@ every worker fails is visible as repeated `task_failed` declines. **(b)** Let a
 job past its cap complete when its only unfinished tasks have failed more than N
 times. **Recommendation: (a),** revisiting if a job is ever seen stuck on one task.
 
+## 9a. Decisions taken — implemented
+
+| # | Decision | What was done |
+|---|---|---|
+| U1 | **(a)** Snapshot residuals with each fit | New table `rating_run_residuals` (migration and PLAN.md's schema block, which still match). `ratings::fit_and_store` writes a fit's residuals in the same transaction as its ratings, in one `UNNEST` insert; `GET /api/rating-pools/:id` reads the latest run's rows, worst first. `ratings::evidence_matrix` and the route's `residuals_for` and `build_fit_view` are deleted. A pool view costs a read, and its residuals describe the evidence the fit used rather than evidence that arrived since. The (c) stopgap was not needed. PLAN.md's performance notes updated. Test: `worker_api::a_pools_residuals_are_the_ones_its_latest_fit_stored` |
+| U2 | **Push, then raise** — to **`0.4.0`**, not `0.3.0` | `2a68705a` was already on `origin` when this started. U3 changed what a request must carry, so the floor has to name the build that reads it: MAGPIE `c2daa027`, reporting `0.4.0`. Raised in `config.rs`, the migration's column defaults and their comment, the three contract fixtures in both repositories, `infra/variables.tf`, `docker-compose.yml`, both env examples, `scripts/dev.py`, the test harness, README, TESTING.md and PLAN.md. A build reporting `0.3.0` or lower now gets `magpie_too_old` |
+| U3 | **(a)** Materialize defaults | See below. Found M4 on the way |
+| U4 | **(a)**, with **(c)** as the tuning knob | Nothing to build: a leave job's `num_iterations` is already its games per task, set at creation |
+| U5 | **(b)** Leave it | Nothing to build. Generations will not pass 20, which keeps `rebuild-artifacts` inside the ALB's 300 s idle timeout, and the path stays idempotent |
+| U6 | **(a)** Accept | Nothing to build; revisit if a job is ever seen stuck on one task |
+
+### U3 in detail
+
+- **Server.** `backend/src/magpie_defaults.rs` holds MAGPIE's values, each
+  documented with the MAGPIE constant it mirrors. `create_player_config` writes
+  them into every setting the body leaves out: `sort_strategy`, `num_plies` (0),
+  `num_plays`, `num_plies_recorded`, `movegen_margin`, `use_wordmap`, `use_rit`,
+  and for a simmer every simulation setting. A static player's simulation
+  settings stay NULL, since nothing reads them. `create_job` writes
+  `bingo_bonus` and `sim_cutoff` onto the job.
+- **Written, not applied at dispatch.** A later change to a default reaches new
+  configs and jobs only, so an existing config keeps playing, and being rated,
+  as it did.
+- **Schema.** The always-stated player columns are `NOT NULL`. The CHECK
+  `player_configs_simulation_settings` requires a simmer (`num_plies > 0`) to
+  state every simulation setting and a win% model, and a static player to state
+  none. `jobs` gains `bingo_bonus` and `sim_cutoff`.
+- **What a simmer is.** Plies alone, as MAGPIE decides. `num_plays` is no longer
+  counted as a simulation setting: an opening-rack analysis sizes its move list
+  from it, static or not, so a static config may state it. Every real
+  simulation setting on a player without plies is refused; before, only four
+  were checked, and the rest were stored and sent for nothing to read.
+- **Wire.** `PlayerSpec`'s always-stated fields are no longer `Option`s.
+  `GameRequest` and `OpeningRackRequest` gain `bingo_bonus` and `sim_cutoff`,
+  and `LeaveRequest` gains `bingo_bonus`, all read from the job.
+- **MAGPIE (`c2daa027`).** `config_contribute_apply_player_settings` refuses a
+  player missing an always-stated key, or a simmer missing a simulation key, and
+  names the key. `config_contribute_apply_run_settings` applies the request's
+  bingo bonus (every executor) and cutoff (games and opening racks), both
+  required. The run-wide settings no request states — multi-threading mode,
+  small plays, heat map — are still reset: they are contribute's fixed
+  behaviour, not defaults birdtest could choose differently.
+- **Frontend.** The form sends simulation settings only for a simmer; `api.ts`'s
+  `PlayerConfig` type matches.
+- **Existing databases must be reset** (PLAN.md, "Resetting the database after a
+  schema change"): the single migration was edited in place.
+
+### M4 — MAGPIE refused birdtest's sampling-rule names
+
+*Found while implementing U3. Code changed (MAGPIE), in `c2daa027`.*
+
+- **What the code did.** `config_contribute_parse_sampling_rule` matched with
+  `has_iprefix(value, "rr")` and `has_iprefix(value, "tt")`, which accept a value
+  that is a prefix of the CLI's short form. birdtest validates and stores
+  `round_robin` and `top_two_ids`, and neither is.
+- **Why it matters.** A job whose simmer named a sampling rule failed on every
+  worker. It went unseen because the form's default is blank and the fixtures
+  sent null; with U3, every simmer states one, so every simulating task would
+  have failed.
+- **Fix.** birdtest's names are matched exactly first; the short forms still
+  parse.
+- **How it was found.** `test_opening_rack_analysis_uses_the_players_settings`
+  failed once the fixture's simmer stated `top_two_ids`.
+
+### Verification
+
+- Backend: `cargo clippy --locked --all-targets -- -D warnings` clean;
+  `cargo test --locked` against Postgres 16: **149 tests** (88 unit and
+  contract, 61 integration), all passing. `svelte-check`: 0 errors, 0 warnings.
+- MAGPIE: `make magpie_test` (`-Werror`, sanitizers), then
+  `./bin/magpie_test contribute` and `./bin/magpie_test config`, both passing;
+  `git clang-format` reports nothing on the lines changed.
+- End to end: `scripts/e2e_magpie.py` against an isolated compose project
+  (`birdtest-e2e`, its own volumes and ports, backend image built from this
+  change) with a release `magpie` built from `c2daa027`, reporting `0.4.0`, and
+  a MAGPIE-DATA `data-20251004` import through the real API. **Every job type
+  passed**: games, game pairs, opening racks static and simming (2 accepted
+  claims each), and leave generation (97 s, 2 accepted claims) — so every request
+  birdtest builds carries every key MAGPIE now requires. The backend log held no
+  error, warning or deadlock line. The stack was torn down afterwards.
+- `c2daa027` is pushed to `origin/birdtest-contribute`.
+
 ---
 
 ## 10. Python worker
@@ -589,3 +671,9 @@ record's section 10.
 | `game::tests::dispatch_stops_once_every_unit_up_to_the_cap_is_out` | B1 arithmetic |
 | `admin_api::a_player_config_cannot_ask_for_a_rack_info_table` | M2 (server) |
 | MAGPIE `test_lexical_flags_are_set_before_the_load` | M1, M2 (worker) |
+| `worker_api::a_pools_residuals_are_the_ones_its_latest_fit_stored` | U1 |
+| `admin_api::a_player_config_and_a_job_state_every_setting_a_task_needs` | U3 (server) |
+| `worker_api::an_assignment_names_every_file_the_task_loads_and_no_others` (extended) | U3: the request states the job's and each player's settings |
+| MAGPIE `test_a_player_must_state_every_setting` | U3 (worker) |
+| MAGPIE `test_shared_settings_do_not_leak_between_tasks` (extended) | U3: the bingo bonus and cutoff are the request's, and required |
+| MAGPIE `test_opening_rack_analysis_uses_the_players_settings` (fixture now states a sampling rule) | M4 |

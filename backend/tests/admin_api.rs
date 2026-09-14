@@ -758,6 +758,87 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
     assert_eq!(status, StatusCode::CREATED, "a simmer already at the cap: {body}");
 }
 
+/// A config states every setting a task needs, and a job every run-wide one:
+/// what the body leaves out is written in from MAGPIE's defaults at creation.
+/// A null used to mean "the worker's compile-time default", so a result
+/// depended on which MAGPIE release ran it. A static player states no
+/// simulation settings at all, and one that sets one is refused.
+#[tokio::test]
+async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+
+    let (status, static_player) = player_config(&app, &headers, json!({
+        "name": "static", "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+        "num_plays_recorded": 1,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED, "{static_player}");
+    for (field, expected) in [
+        ("sort_strategy", json!("equity")),
+        ("num_plies", json!(0)),
+        ("num_plays", json!(100)),
+        ("num_plies_recorded", json!(2)),
+        ("movegen_margin", json!(5.0)),
+        ("use_wordmap", json!(false)),
+        ("use_rit", json!(false)),
+        ("max_iterations", json!(null)),
+        ("threshold", json!(null)),
+        ("utility_w_spread", json!(null)),
+    ] {
+        assert_eq!(static_player[field], expected, "static {field}: {static_player}");
+    }
+
+    // A simmer keeps what it states and gets MAGPIE's value for the rest.
+    let (status, simmer) = player_config(&app, &headers, json!({
+        "name": "simmer", "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+        "winpct_id": winpct, "num_plies": 2, "max_iterations": 100, "time_limit_secs": 0,
+        "threshold": "none", "num_plays_recorded": 1,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED, "{simmer}");
+    for (field, expected) in [
+        ("threshold", json!("none")),
+        ("sampling_rule", json!("top_two_ids")),
+        ("stopping_pct", json!(99.0)),
+        ("use_inference", json!(true)),
+        ("min_play_iterations", json!(500)),
+        ("inference_margin", json!(5.0)),
+        ("utility_w_winpct", json!(1.0)),
+        ("utility_w_spread", json!(0.5)),
+        ("utility_spread_scale", json!(100.0)),
+        ("num_plays", json!(100)),
+    ] {
+        assert_eq!(simmer[field], expected, "simmer {field}: {simmer}");
+    }
+
+    // A static player with a simulation setting would carry it on every
+    // request for nothing to read.
+    let (status, body) = player_config(&app, &headers, json!({
+        "name": "static-with-threshold", "recorder_type": "best", "kwg_id": kwg,
+        "klv_id": klv, "threshold": "gk16", "num_plays_recorded": 1,
+    })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "num_plies", "{body}");
+
+    let (status, created) = send(&app, post_json("/api/admin/jobs", &headers, json!({
+        "job_type": "games", "variant": "classic",
+        "letterdist_id": letterdist, "layout_id": layout,
+        "player1_config_id": static_player["id"], "player2_config_id": simmer["id"],
+        "min_games": 1, "max_games": 10,
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["job"]["bingo_bonus"], json!(50), "{created}");
+    assert_eq!(created["job"]["sim_cutoff"], json!(0.005), "{created}");
+}
+
 /// Banning is the only lever there is against a bad contributor — nothing bans
 /// automatically — so unban has to mean what it says.
 ///

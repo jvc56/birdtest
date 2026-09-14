@@ -152,7 +152,7 @@ impl TestDb {
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
-            min_magpie_version: "0.2.0".into(),
+            min_magpie_version: "0.4.0".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
             magpie_data_repo: "example/data".into(),
             github_token: None,
@@ -234,8 +234,11 @@ impl TestDb {
         let klv = self.input_data("klv", &format!("NWL{name}")).await;
         sqlx::query_scalar(
             "INSERT INTO player_configs
-                 (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plays_recorded, created_by)
-             VALUES ($1, 'best', 'equity', $2, $3, 10, $4) RETURNING id",
+                 (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
+                  num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
+                  movegen_margin, created_by)
+             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, false, false, 5, $4)
+             RETURNING id",
         )
         .bind(name)
         .bind(kwg)
@@ -267,14 +270,14 @@ impl TestDb {
         job
     }
 
-    /// A `jobs` row and nothing else: active, allocation 50, floor 0.2.0.
+    /// A `jobs` row and nothing else: active, allocation 50, floor 0.4.0.
     pub async fn bare_job(&self, job_type: &str, redundancy: i32, created_by: Uuid) -> Uuid {
         let ld = self.input_data("letterdist", "english").await;
         let layout = self.input_data("layout", "standard15").await;
         sqlx::query_scalar(
             "INSERT INTO jobs (job_type, priority, allocation, redundancy, status, created_by,
-                               variant, letterdist_id, layout_id)
-             VALUES ($1::job_type, 0, 50, $2, 'active', $3, 'classic', $4, $5)
+                               variant, letterdist_id, layout_id, bingo_bonus, sim_cutoff)
+             VALUES ($1::job_type, 0, 50, $2, 'active', $3, 'classic', $4, $5, 50, 0.005)
              RETURNING id",
         )
         .bind(job_type)

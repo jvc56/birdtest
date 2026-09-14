@@ -130,6 +130,8 @@ pub async fn next_request(
             num_games: config.pairs_per_batch,
             game_pairs: true,
             capture_positions: config.capture_positions,
+            bingo_bonus: job_data.bingo_bonus,
+            sim_cutoff: job_data.sim_cutoff,
             player1,
             player2,
         },

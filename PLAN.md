@@ -920,11 +920,16 @@ What the numbers settled:
   page.
 - **The rating matrix is scoped to the pool's own jobs first.** It used to pick
   one result per task across the *whole* of `game_results` and filter
-  afterwards, so every fit sorted the entire table — and so did every public
-  read of a pool's residuals, which computes the same matrix. With the job
-  filter first it is an index walk of those jobs' tasks. The sweep also builds
-  it once per tick rather than twice (once to decide the pool was stale, once
-  to fit).
+  afterwards, so every fit sorted the entire table. With the job filter first it
+  is an index walk of those jobs' tasks. The sweep also builds it once per tick
+  rather than twice (once to decide the pool was stale, once to fit).
+- **A pool's residuals are stored with its fit, not rebuilt per view.** The
+  public pool page used to rebuild the evidence matrix for its residual table on
+  every view — 452 ms at 600,000 paired results, on the connection pool claims
+  and submissions share, unauthenticated and not rate limited. A fit now writes
+  its residuals to `rating_run_residuals` in the same transaction as its
+  ratings, and the page reads them: a view costs a read, and the table describes
+  the evidence that fit used rather than evidence that has moved on since.
 - **Copying the rack universe to the next generation is the one slow write**, and
   it is slow on an under-provisioned database: a minute here, against about 15
   seconds for a whole transition on the smaller dev database. It runs once per
@@ -996,7 +1001,7 @@ start. The process has no SSM code path of its own.
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
-| `MIN_MAGPIE_VERSION` | `0.2.0` | The enforced global floor, and the default floor for a new job. |
+| `MIN_MAGPIE_VERSION` | `0.4.0` | The enforced global floor, and the default floor for a new job. |
 | `MAGPIE_DOWNLOAD_URL` | the MAGPIE repository | Sent in a shutdown directive. |
 | `MAGPIE_DATA_REPO` | `jvc56/MAGPIE-DATA` | Where import fetches tarballs from. Configuration, never user input. |
 | `GITHUB_TOKEN` | unset | Optional in development, set in production: unauthenticated ref resolution is 60 calls per hour per IP. |
@@ -1571,15 +1576,14 @@ WHERE (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
 distribution and a layout — and a client too old to understand `expected_data`
 will contribute unverified rather than decline. "No floor" is not a state worth
 being able to express once every job depends on the client honouring a protocol,
-so the columns are `NOT NULL` and default to **`0.2.0`**: the first MAGPIE
-version whose results do not depend on the contributor's own settings
-(`birdtest-contribute`). Builds reporting `0.1.0` still left the bingo bonus, an
-opening-rack simulation's settings and a leave-generation task's seed to the
-worker, and builds reporting `0.0.0` predate the fixes to simulation settings,
-distribution and layout, so both must be refused. `birdtest-contribute` has since
-moved to `0.3.0`, which also states a task's wordmap flag before its lexicon loads
-and keeps rack info tables off; the default floor stays `0.2.0` until that build is
-published, and a job's own floor can be set to `0.3.0` meanwhile. Because a stale config value would silently floor every new
+so the columns are `NOT NULL` and default to **`0.4.0`**: the first MAGPIE
+version whose results depend on nothing but the task (`birdtest-contribute`).
+Builds reporting `0.3.0` and `0.2.0` supplied their own compile-time defaults for
+every setting a request left null, and refused the sampling-rule names birdtest
+sends; `0.2.0` also applied a task's wordmap and rack-info-table flags to the next
+task; `0.1.0` still left the bingo bonus, an opening-rack simulation's settings and
+a leave-generation task's seed to the worker; and `0.0.0` predates the fixes to
+simulation settings, distribution and layout. All must be refused. Because a stale config value would silently floor every new
 job too low, the effective value is shown on the job creation form, pre-filled
 and editable — a visible default rather than a hidden one.
 
@@ -2813,7 +2817,7 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 | JSON field | Setting | Notes |
 |---|---|---|
 | `recorder_type` | `-rN` | `best` for all birdtest jobs |
-| `sort_strategy` | `-sN` | `equity` or `score`; null for simming players |
+| `sort_strategy` | `-sN` | `equity` or `score`, for every player: a simmer sorts its candidates before simulating them |
 | `lexicon` | `-lN` | **Required.** Every player names its own; there is no job lexicon to fall back to. |
 | `leaves` | `-kN` | **Required**, for the same reason. |
 | `win_pct_model` | `-winpct` | Null for a static player, which never loads one |
@@ -2836,14 +2840,24 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 | `utility_spread_scale` | `-uspreadscaleN` | |
 | `movegen_margin` | `-mmargin` | |
 
-A player whose `num_plies` is null or 0 is static: MAGPIE decides whether a player
+A player whose `num_plies` is 0 is static: MAGPIE decides whether a player
 simulates on plies alone, and birdtest refuses a config that sets other
-simulation settings without plies. A setting a request leaves null takes MAGPIE's
-compile-time default — never the value an earlier task or the contributor's
-`settings.txt` left behind — because every per-player setting is reset before a
-request is applied. So is every run-wide setting no request states — the bingo
-bonus, the movegen margin, the simulation cutoff, the multi-threading mode and
-small plays — since each changes what a task computes. `letter_distribution` and `board_layout` on the request are
+simulation settings without plies. **No setting that can change a result is left
+to the worker's build.** Player-config creation writes MAGPIE's default into every
+setting the body leaves out (`backend/src/magpie_defaults.rs`), so every request
+states `recorder_type`, `sort_strategy`, `num_plies`, `num_plays`,
+`num_plies_recorded`, `num_plays_recorded` and `movegen_margin` for every player,
+and every simulation setting for a simmer; a static player's simulation settings
+are null, since nothing reads them. The run-wide `bingo_bonus` and `sim_cutoff` are
+written onto the job at creation and stated at the top level of every request
+(leave generation states only `bingo_bonus`: its bot does not simulate). MAGPIE
+refuses a request that leaves any of these out rather than supplying its own
+compile-time default: a result has to be a function of the task, not of which
+release ran it, and a version floor — a minimum, not a pin — cannot exclude a
+release that changed a default. Every per-player setting is still reset before a
+request is applied, and so is every run-wide setting no request states — the
+multi-threading mode and small plays — so nothing is inherited from an earlier
+task or the contributor's `settings.txt`. `letter_distribution` and `board_layout` on the request are
 applied the same way: absent means MAGPIE's defaults, not whatever was loaded
 last. `win_pct_model` and
 `movegen_margin` are carried on each player object but are really one shared
@@ -3735,7 +3749,7 @@ would otherwise have to guess.
 
 **Creating a player config.** Enumerated fields are validated against their
 allowed values rather than trusted: `recorder_type` is `best` | `equity` | `all`,
-`sort_strategy` is `equity` | `score` | null, `threshold` is `none` | `gk16`,
+`sort_strategy` is `equity` | `score`, `threshold` is `none` | `gk16`,
 `sampling_rule` is `round_robin` | `top_two_ids`. Each of `kwg_id`, `klv_id` and
 `winpct_id` is checked to be a row of the **matching role** — every one of those
 foreign keys points at the same table, so the database cannot express it and it
@@ -3753,6 +3767,18 @@ contributor's hardware, so the iteration budget bounds it instead. `use_rit` mus
 not be true: a rack info table carries precomputed leave values keyed by lexicon
 name alone, covered by no digest, and move generation uses them in place of the
 leaves the config pins.
+
+Whatever the body leaves out is filled from MAGPIE's defaults
+(`backend/src/magpie_defaults.rs`) before the row is written, so the stored config
+is exactly what every request built from it states: `sort_strategy` (`equity`),
+`num_plies` (0, static), `num_plays` (100), `num_plies_recorded` (2),
+`movegen_margin` (5), `use_wordmap` (false), and for a simmer every simulation
+setting. A static player may not set a simulation setting at all — nothing would
+read it — and a CHECK on the table holds the two sets apart. `num_plays` is not a
+simulation setting: an opening-rack analysis sizes its move list from it,
+simulating or not. The values are written rather than applied at dispatch, so a
+later change to a default reaches new configs only, and an existing config keeps
+playing, and being rated, as it did.
 
 A clone onto newer data is not a separate endpoint — it is an ordinary create
 that sets `cloned_from_id`. The convention for the name (`base@tarball_date`) is
@@ -3774,6 +3800,11 @@ the body omits them:
 | `generation_count` | 1 |
 | `use_wordmap` (leave generation) | **true** — it is the most game-heavy job type there is and a wordmap is a large speedup; workers build one on demand |
 | `capture_positions` | false |
+
+A job's run-wide MAGPIE settings are not fields of the body: `bingo_bonus` (50)
+and `sim_cutoff` (0.005) are written onto the job from MAGPIE's defaults at
+creation and stated on every request, for the reason player configs state
+theirs.
 
 Beyond role matching, creation enforces six rules the schema cannot express:
 
@@ -4400,6 +4431,14 @@ CREATE TABLE jobs (
     variant       TEXT NOT NULL,                            -- 'classic' | 'wordsmog'; a rules setting, not a file
     letterdist_id UUID NOT NULL REFERENCES input_data(id),  -- one per job: MAGPIE takes one -ld for the whole game
     layout_id     UUID NOT NULL REFERENCES input_data(id),  -- 'standard15' unless a job says otherwise
+    -- Run-wide MAGPIE settings every request states: the bingo bonus, part of
+    -- every play's score, and the simulation cutoff. Written at creation from
+    -- MAGPIE's defaults (backend/src/magpie_defaults.rs) rather than left for
+    -- each worker's build to supply, so a task means the same thing on every
+    -- MAGPIE release. Leave generation states only the bingo bonus: its bot
+    -- does not simulate.
+    bingo_bonus   INT NOT NULL,                              -- -bb
+    sim_cutoff    DOUBLE PRECISION NOT NULL CHECK (sim_cutoff >= 0 AND sim_cutoff <= 100),  -- -cutoff
     -- Minimum MAGPIE version workers must have to execute tasks for this job,
     -- as sortable parts. Semver in TEXT compares lexically, where '1.10.0' <
     -- '1.9.0' -- a bug that appears only once a minor version reaches double
@@ -4407,13 +4446,15 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.2.0 is the
-    -- first MAGPIE version whose results do not depend on the contributor's own
-    -- settings: 0.1.0 implemented the protocol but left the bingo bonus, an
-    -- opening-rack simulation's settings and a leave-generation task's seed to
-    -- whatever the worker's MAGPIE had.
+    -- so "no floor" is not a state worth being able to express. 0.4.0 is the
+    -- first MAGPIE version whose results depend on nothing but the task: 0.1.0
+    -- left the bingo bonus, an opening-rack simulation's settings and a
+    -- leave-generation task's seed to the worker's own settings; before 0.3.0 a
+    -- task's wordmap and rack-info-table flags applied to the next task; and
+    -- before 0.4.0 every setting a request left null came from the worker's
+    -- compile-time defaults.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 2 CHECK (min_magpie_minor >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 4 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
@@ -4462,8 +4503,9 @@ CREATE TABLE jobs (
 --   For autoplay in birdtest, always use 'best'.
 --
 -- sort_strategy (-s1 / -s2): 'equity' = sort by equity (score + leave value) — standard static
---   player; 'score' = sort by raw score only. NULL for simming players (sim output determines
---   the move, not a static sort). Both static and simming players are valid in games/game_pairs jobs.
+--   player; 'score' = sort by raw score only. A simming player sorts its candidates too, before
+--   simulating them, so every row states one. Both static and simming players are valid in
+--   games/game_pairs jobs.
 --
 -- Simulation columns are all NULL for a static (no-sim) player.
 
@@ -4471,7 +4513,7 @@ CREATE TABLE player_configs (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name             TEXT NOT NULL UNIQUE,  -- human-readable label, e.g. "simmer-NWL23-4ply"
     recorder_type    TEXT NOT NULL,         -- 'best' | 'equity' | 'all'  (-r1 / -r2)
-    sort_strategy    TEXT,                  -- 'equity' | 'score' | NULL  (-s1 / -s2)
+    sort_strategy    TEXT NOT NULL,         -- 'equity' | 'score'  (-s1 / -s2)
     -- The files this player loads, pinned by content rather than named.
     --
     -- kwg_id and klv_id are NOT NULL: there is no job lexicon left to fall back
@@ -4490,26 +4532,36 @@ CREATE TABLE player_configs (
     -- with no games and no rating until it plays -- so the UI must show where a
     -- config with no history came from.
     cloned_from_id   UUID REFERENCES player_configs(id),
-    -- Simulation parameters (all NULL for a static player)
-    max_iterations   INT,                   -- -i1 / -i2
+    -- Every setting a task request states is stated here, never NULL for
+    -- "MAGPIE's default": creation writes MAGPIE's value into the row
+    -- (backend/src/magpie_defaults.rs), so a config plays the same on every
+    -- MAGPIE release, and MAGPIE refuses a request that leaves one out. The
+    -- exception is a static player's simulation settings, which are NULL
+    -- because nothing reads them; the CHECK at the end of the table holds the
+    -- two sets apart.
+    --
     -- Two pairs of "how much to compute" / "how much to report". MAGPIE
     -- generates plays and plies, then displays a subset of each; birdtest
     -- stores exactly what is displayed.
-    num_plies          INT,                 -- plies to simulate    (-pl1 / -pl2)
-    num_plies_recorded INT,                 -- plies to report      (shplies)
-    num_plays          INT,                 -- plays to simulate    (-np1 / -np2)
+    num_plies          INT NOT NULL CHECK (num_plies >= 0),           -- plies to simulate; 0 is static (-pl1 / -pl2)
+    num_plies_recorded INT NOT NULL CHECK (num_plies_recorded >= 1),  -- plies to report (shplies)
+    -- plays to generate and simulate (-np1 / -np2). Stated for a static player
+    -- too: an opening-rack analysis sizes its move list from it.
+    num_plays          INT NOT NULL CHECK (num_plays >= 1),
     -- plays to report (maxnumdplays). Required: "keep everything" is unbounded
     -- per position, and the worker and the server must agree on the number.
     num_plays_recorded INT NOT NULL CHECK (num_plays_recorded >= 1),
+    -- Simulation parameters (all NULL for a static player, all set for a simmer)
+    max_iterations   INT,                   -- -i1 / -i2
     stopping_pct     DOUBLE PRECISION,      -- -sc1 / -sc2 (0–100)
     use_inference    BOOLEAN,               -- -si1 / -si2
     time_limit_secs  INT,                   -- -tl1 / -tl2
     -- The remaining MAGPIE options that can affect how a player plays.
-    -- Exhaustive on purpose: anything not stated here falls back to whatever
-    -- value a worker's own MAGPIE process happens to have, which can differ
-    -- across workers and silently produce non-comparable data.
-    use_wordmap          BOOLEAN,            -- -w1 / -w2
-    use_rit               BOOLEAN,           -- rack info table            (-rit1 / -rit2)
+    -- Exhaustive on purpose: MAGPIE takes nothing a request leaves out from its
+    -- own defaults, so a setting missing here is a task no worker will run.
+    use_wordmap          BOOLEAN NOT NULL,   -- -w1 / -w2
+    use_rit               BOOLEAN NOT NULL,  -- rack info table            (-rit1 / -rit2)
+    -- More simulation parameters: NULL for a static player, set for a simmer.
     min_play_iterations   INT,               -- -mi1 / -mi2
     threshold             TEXT,              -- 'none' | 'gk16'            (-th1 / -th2)
     sampling_rule         TEXT,              -- 'round_robin' | 'top_two_ids' (-sa1 / -sa2)
@@ -4521,10 +4573,31 @@ CREATE TABLE player_configs (
     -- than per-player. Stored here anyway (duplicated on both players'
     -- rows in a job, validated equal at job-creation time) so this table
     -- stays the single, exhaustive source of what a job asked MAGPIE for.
-    movegen_margin         DOUBLE PRECISION, -- move-gen equity margin for 'equity' recording (-mmargin)
+    movegen_margin         DOUBLE PRECISION NOT NULL, -- move-gen equity margin for 'equity' recording (-mmargin)
     -- SET NULL, like jobs.created_by: a config outlives the admin who made it.
     created_by       UUID REFERENCES users(id) ON DELETE SET NULL,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- A player simulates exactly when it has plies (MAGPIE decides on
+    -- num_plies > 0). A simmer states every simulation setting, including the
+    -- win% model it loads; a static player states none, since nothing reads
+    -- them and a request carrying them would suggest otherwise.
+    CONSTRAINT player_configs_simulation_settings CHECK (
+        (num_plies > 0
+            AND winpct_id IS NOT NULL AND max_iterations IS NOT NULL
+            AND stopping_pct IS NOT NULL AND use_inference IS NOT NULL
+            AND time_limit_secs IS NOT NULL AND min_play_iterations IS NOT NULL
+            AND threshold IS NOT NULL AND sampling_rule IS NOT NULL
+            AND inference_margin IS NOT NULL AND utility_w_winpct IS NOT NULL
+            AND utility_w_spread IS NOT NULL AND utility_spread_scale IS NOT NULL)
+        OR
+        (num_plies = 0
+            AND winpct_id IS NULL AND max_iterations IS NULL
+            AND stopping_pct IS NULL AND use_inference IS NULL
+            AND time_limit_secs IS NULL AND min_play_iterations IS NULL
+            AND threshold IS NULL AND sampling_rule IS NULL
+            AND inference_margin IS NULL AND utility_w_winpct IS NULL
+            AND utility_w_spread IS NULL AND utility_spread_scale IS NULL)
+    )
 );
 
 -- Per-job-type config tables (one row per job; replaces the config JSONB column)
@@ -5176,6 +5249,22 @@ CREATE TABLE player_config_ratings (
     connected_to_anchor BOOLEAN NOT NULL,
     is_anchor        BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (run_id, player_config_id)
+);
+
+-- The residuals of one fit: for every head-to-head with games in it, the score
+-- the fit's ratings predict against the score that happened. Stored with the
+-- run rather than recomputed on each view of the pool, which rebuilt the
+-- pool's evidence matrix -- a grouped scan over every paired result it counts
+-- -- on every public page view. Stored, they also describe the evidence this
+-- fit used, not evidence that has moved on since.
+CREATE TABLE rating_run_residuals (
+    run_id               UUID NOT NULL REFERENCES rating_runs(id) ON DELETE CASCADE,
+    row_player_config_id UUID NOT NULL REFERENCES player_configs(id),
+    col_player_config_id UUID NOT NULL REFERENCES player_configs(id),
+    pairs                DOUBLE PRECISION NOT NULL,
+    actual               DOUBLE PRECISION NOT NULL,  -- the row config's score rate
+    predicted            DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (run_id, row_player_config_id, col_player_config_id)
 );
 
 -- Backups

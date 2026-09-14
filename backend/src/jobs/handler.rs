@@ -43,26 +43,31 @@ pub trait JobHandler {
 
 /// A player configuration flattened into the form the worker passes to MAGPIE.
 /// Denormalized into every request so a worker never needs a second round trip.
+///
+/// Every setting that can change a result is stated. The `Option`s left are
+/// the simulation settings, null for a static player (`num_plies` 0), which
+/// never reads them; MAGPIE refuses a simmer, or any player, that leaves out
+/// one it needs rather than supplying its own build's default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSpec {
     pub name: String,
     pub recorder_type: String,
-    pub sort_strategy: Option<String>,
+    pub sort_strategy: String,
     /// The lexicon and leaves this player loads. Required, not overrides:
     /// every player names its own files, and there is no job-level lexicon
     /// left to fall back to.
     pub lexicon: String,
     pub leaves: String,
     pub max_iterations: Option<i32>,
-    pub num_plies: Option<i32>,
-    pub num_plies_recorded: Option<i32>,
-    pub num_plays: Option<i32>,
+    pub num_plies: i32,
+    pub num_plies_recorded: i32,
+    pub num_plays: i32,
     pub num_plays_recorded: i32,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,
-    pub use_wordmap: Option<bool>,
-    pub use_rit: Option<bool>,
+    pub use_wordmap: bool,
+    pub use_rit: bool,
     pub min_play_iterations: Option<i32>,
     pub threshold: Option<String>,
     pub sampling_rule: Option<String>,
@@ -72,7 +77,7 @@ pub struct PlayerSpec {
     pub utility_spread_scale: Option<f64>,
     /// `None` for a static player, which never loads a win% model.
     pub win_pct_model: Option<String>,
-    pub movegen_margin: Option<f64>,
+    pub movegen_margin: f64,
 }
 
 impl From<NamedPlayerConfig> for PlayerSpec {
@@ -129,6 +134,10 @@ pub struct OpeningRackRequest {
     /// rack per second.
     pub racks: Vec<String>,
     pub previous_play: Option<String>,
+    /// Run-wide settings from the job, stated so no worker supplies its own
+    /// build's default: the bingo bonus, and the simulation cutoff.
+    pub bingo_bonus: i32,
+    pub sim_cutoff: f64,
     pub player: PlayerSpec,
 }
 
@@ -171,6 +180,9 @@ pub struct GameRequest {
     /// reports them. How many ranked moves come back per position is the
     /// player config's `num_plays_recorded`.
     pub capture_positions: bool,
+    /// See [`OpeningRackRequest::bingo_bonus`].
+    pub bingo_bonus: i32,
+    pub sim_cutoff: f64,
     pub player1: PlayerSpec,
     pub player2: PlayerSpec,
 }
@@ -207,6 +219,9 @@ pub struct LeaveRequest {
     /// Leave generation has one bot rather than a player pair, so its wordmap
     /// setting sits on the request instead of on a player spec.
     pub use_wordmap: bool,
+    /// The job's bingo bonus. No cutoff: the leave-generating bot plays
+    /// statically.
+    pub bingo_bonus: i32,
 }
 
 /// What actually goes over the wire to the worker. Internally tagged so the

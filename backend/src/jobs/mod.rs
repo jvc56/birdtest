@@ -184,6 +184,9 @@ pub struct JobData {
     /// The pinned board layout's name, which is what the worker's request
     /// states. The bytes stay on the row: nothing server-side reads a layout.
     pub layout_name: String,
+    /// Run-wide MAGPIE settings every request states.
+    pub bingo_bonus: i32,
+    pub sim_cutoff: f64,
 }
 
 /// The job settings every request and every rack enumeration is built from.
@@ -191,8 +194,8 @@ pub struct JobData {
 /// way the claim path makes it.
 pub async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<JobData> {
     let row = sqlx::query(
-        "SELECT j.variant, ld.name AS ld_name, ld.content AS ld_content,
-                layout.name AS layout_name
+        "SELECT j.variant, j.bingo_bonus, j.sim_cutoff, ld.name AS ld_name,
+                ld.content AS ld_content, layout.name AS layout_name
          FROM jobs j
          JOIN input_data ld ON ld.id = j.letterdist_id
          JOIN input_data layout ON layout.id = j.layout_id
@@ -212,6 +215,8 @@ pub async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<J
         letterdist: LetterDistribution::parse(&content, &letterdist_name)?,
         letterdist_name,
         layout_name: row.get("layout_name"),
+        bingo_bonus: row.get("bingo_bonus"),
+        sim_cutoff: row.get("sim_cutoff"),
     })
 }
 
@@ -269,12 +274,15 @@ pub(crate) async fn load_game_request(
     let row = game::load_game_request_row(conn, task_id).await?;
     let player1 = load_player_spec(conn, row.get("player1_config_id")).await?;
     let player2 = load_player_spec(conn, row.get("player2_config_id")).await?;
+    let job_data = load_job_data_for_task(conn, task_id).await?;
     Ok(GameRequest {
         variant: row.get("variant"),
         seed: game::seed_from_row(&row),
         num_games: row.get("num_games"),
         game_pairs,
         capture_positions: row.get("capture_positions"),
+        bingo_bonus: job_data.bingo_bonus,
+        sim_cutoff: job_data.sim_cutoff,
         letter_distribution: row.get("letter_distribution"),
         board_layout: row.get("board_layout"),
         player1,

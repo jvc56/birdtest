@@ -84,13 +84,18 @@
         time_limit_secs: simming ? 0 : null,
         use_wordmap: useWordmap,
         use_rit: useRit,
-        min_play_iterations: minPlayIterations === '' ? null : Number(minPlayIterations),
-        threshold: threshold || null,
-        sampling_rule: samplingRule || null,
-        inference_margin: inferenceMargin === '' ? null : Number(inferenceMargin),
-        utility_w_winpct: utilityWWinpct === '' ? null : Number(utilityWWinpct),
-        utility_w_spread: utilityWSpread === '' ? null : Number(utilityWSpread),
-        utility_spread_scale: utilitySpreadScale === '' ? null : Number(utilitySpreadScale),
+        // Left blank, the server writes MAGPIE's default into the config. These
+        // are simulation settings, which a static player states none of: the
+        // server refuses one that does.
+        min_play_iterations:
+          !simming || minPlayIterations === '' ? null : Number(minPlayIterations),
+        threshold: (simming && threshold) || null,
+        sampling_rule: (simming && samplingRule) || null,
+        inference_margin: !simming || inferenceMargin === '' ? null : Number(inferenceMargin),
+        utility_w_winpct: !simming || utilityWWinpct === '' ? null : Number(utilityWWinpct),
+        utility_w_spread: !simming || utilityWSpread === '' ? null : Number(utilityWSpread),
+        utility_spread_scale:
+          !simming || utilitySpreadScale === '' ? null : Number(utilitySpreadScale),
         movegen_margin: movegenMargin === '' ? null : Number(movegenMargin)
       });
       goto('/admin/player-configs');

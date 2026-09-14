@@ -183,7 +183,7 @@ export interface PlayerConfig {
   id: string;
   name: string;
   recorder_type: string;
-  sort_strategy: string | null;
+  sort_strategy: string;
   /** The files this player pins, as input_data rows rather than names. */
   kwg_id: string;
   klv_id: string;
@@ -191,16 +191,21 @@ export interface PlayerConfig {
   winpct_id: string | null;
   /** Set when this config was cloned onto newer data; a clone starts unrated. */
   cloned_from_id: string | null;
+  /**
+   * Every setting a task states is stated here: the server fills MAGPIE's
+   * defaults in at creation. The nullable ones are simulation settings, null
+   * for a static player (num_plies 0) and set for every simmer.
+   */
   max_iterations: number | null;
-  num_plies: number | null;
-  num_plies_recorded: number | null;
-  num_plays: number | null;
+  num_plies: number;
+  num_plies_recorded: number;
+  num_plays: number;
   num_plays_recorded: number;
   stopping_pct: number | null;
   use_inference: boolean | null;
   time_limit_secs: number | null;
-  use_wordmap: boolean | null;
-  use_rit: boolean | null;
+  use_wordmap: boolean;
+  use_rit: boolean;
   min_play_iterations: number | null;
   threshold: string | null;
   sampling_rule: string | null;
@@ -208,7 +213,7 @@ export interface PlayerConfig {
   utility_w_winpct: number | null;
   utility_w_spread: number | null;
   utility_spread_scale: number | null;
-  movegen_margin: number | null;
+  movegen_margin: number;
   created_at: string;
 }
 

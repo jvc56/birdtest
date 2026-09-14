@@ -36,6 +36,10 @@ pub struct Job {
     /// players cannot draw from different bags. Same for the board.
     pub letterdist_id: Uuid,
     pub layout_id: Uuid,
+    /// Run-wide MAGPIE settings every request states, written from
+    /// [`crate::magpie_defaults`] when the job is created.
+    pub bingo_bonus: i32,
+    pub sim_cutoff: f64,
     /// The floor as sortable parts. Semver in `TEXT` compares lexically, where
     /// `'1.10.0' < '1.9.0'`.
     pub min_magpie_major: i32,
@@ -72,7 +76,7 @@ pub struct PlayerConfig {
     pub id: Uuid,
     pub name: String,
     pub recorder_type: String,
-    pub sort_strategy: Option<String>,
+    pub sort_strategy: String,
     /// The files this player loads, pinned by content. `winpct_id` is `None`
     /// for a static player, which never loads a win% model at all.
     pub kwg_id: Uuid,
@@ -81,18 +85,22 @@ pub struct PlayerConfig {
     /// Set when this config was cloned onto newer data. Ratings do not carry
     /// over, so the UI shows the lineage instead.
     pub cloned_from_id: Option<Uuid>,
+    /// Every setting a request states is stated here, filled from
+    /// [`crate::magpie_defaults`] at creation. The `Option`s are simulation
+    /// settings: `None` for a static player (`num_plies` 0), which never reads
+    /// them, and `Some` for every simmer -- a CHECK holds the two apart.
     pub max_iterations: Option<i32>,
-    /// Plies to simulate, and how many of them to report back.
-    pub num_plies: Option<i32>,
-    pub num_plies_recorded: Option<i32>,
-    /// Plays to simulate, and how many of them to report back.
-    pub num_plays: Option<i32>,
+    /// Plies to simulate (0 for a static player), and how many to report back.
+    pub num_plies: i32,
+    pub num_plies_recorded: i32,
+    /// Plays to generate and simulate, and how many of them to report back.
+    pub num_plays: i32,
     pub num_plays_recorded: i32,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,
-    pub use_wordmap: Option<bool>,
-    pub use_rit: Option<bool>,
+    pub use_wordmap: bool,
+    pub use_rit: bool,
     pub min_play_iterations: Option<i32>,
     pub threshold: Option<String>,
     pub sampling_rule: Option<String>,
@@ -103,7 +111,7 @@ pub struct PlayerConfig {
     /// A shared MAGPIE setting, not really per-player, but stored here anyway
     /// so this table is the exhaustive source of what a job asked for; a
     /// job's two player configs must agree on it (validated at creation).
-    pub movegen_margin: Option<f64>,
+    pub movegen_margin: f64,
     /// `None` once the admin who created it has been deleted.
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,

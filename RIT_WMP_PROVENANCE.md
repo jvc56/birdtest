@@ -399,7 +399,7 @@ unprotected.
 1. Stop refusing `use_rit` in `validate_player_config_body`, update
    `admin_api::a_player_config_cannot_ask_for_a_rack_info_table` to match, and
    bring the option back in the player-config form.
-2. Require the MAGPIE version that includes the check (for example `0.4.0`) for
+2. Require the MAGPIE version that includes the check (for example `0.5.0`) for
    any job with a player that sets `use_rit`: either a per-job
    `min_magpie_version`, or raise the default floor once the build is released.
 3. Update PLAN.md (the executor table row for `use_rit`, and the admin

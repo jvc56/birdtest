@@ -51,8 +51,9 @@ impl JobHandler for LeaveGenHandler {
              FROM leave_requests WHERE task_id = $1",
         )
         .bind(task_id)
-        .fetch_one(conn)
+        .fetch_one(&mut *conn)
         .await?;
+        let job_data = super::load_job_data_for_task(conn, task_id).await?;
         Ok(LeaveRequest {
             lexicon: row.get("lexicon"),
             variant: row.get("variant"),
@@ -64,6 +65,7 @@ impl JobHandler for LeaveGenHandler {
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
             use_wordmap: row.get("use_wordmap"),
+            bingo_bonus: job_data.bingo_bonus,
         })
     }
 
@@ -455,6 +457,7 @@ pub async fn next_step(
         previous_artifact_key,
         num_games: config.num_iterations,
         use_wordmap: config.use_wordmap,
+        bingo_bonus: job_data.bingo_bonus,
     }))
 }
 

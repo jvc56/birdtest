@@ -72,16 +72,6 @@ async fn load_pool(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<Pool> {
 /// pair is side-balanced by construction, while an unpaired job is not, and
 /// going first is worth real Elo. Pooling unbalanced results would bias every
 /// rating in the direction of whoever happened to start more often.
-/// The pool's members and evidence matrix, without fitting. Exposed so the
-/// read endpoints can compute residuals against the same matrix the fit used.
-pub async fn evidence_matrix(
-    conn: &mut PgConnection,
-    pool_id: Uuid,
-) -> AppResult<(Vec<Uuid>, Matrix)> {
-    let (members, matrix, _, _) = build_matrix(conn, pool_id).await?;
-    Ok((members, matrix))
-}
-
 async fn build_matrix(
     conn: &mut PgConnection,
     pool_id: Uuid,
@@ -284,6 +274,39 @@ async fn fit_and_store(
         .bind(rated.games as i64)
         .bind(is_anchor || fit.is_rateable(i))
         .bind(is_anchor)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    // Stored with the run rather than recomputed when the pool is viewed: a
+    // view then costs a read instead of a rebuild of the evidence matrix, and
+    // the residuals describe the evidence this fit actually used.
+    let residuals = fit.residuals(&matrix);
+    if !residuals.is_empty() {
+        let mut rows = Vec::with_capacity(residuals.len());
+        let mut cols = Vec::with_capacity(residuals.len());
+        let mut pairs = Vec::with_capacity(residuals.len());
+        let mut actual = Vec::with_capacity(residuals.len());
+        let mut predicted = Vec::with_capacity(residuals.len());
+        for residual in &residuals {
+            rows.push(members[residual.i]);
+            cols.push(members[residual.j]);
+            pairs.push(residual.games);
+            actual.push(residual.actual);
+            predicted.push(residual.predicted);
+        }
+        sqlx::query(
+            "INSERT INTO rating_run_residuals
+                 (run_id, row_player_config_id, col_player_config_id, pairs, actual, predicted)
+             SELECT $1, * FROM UNNEST($2::uuid[], $3::uuid[], $4::float8[], $5::float8[],
+                                      $6::float8[])",
+        )
+        .bind(run_id)
+        .bind(&rows)
+        .bind(&cols)
+        .bind(&pairs)
+        .bind(&actual)
+        .bind(&predicted)
         .execute(&mut *tx)
         .await?;
     }
