@@ -427,6 +427,230 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
     }
 }
 
+/// A purge must count what a job's contributors earned *after* every submission
+/// in flight has landed, or the one that lands in between is never handed back.
+///
+/// The purge used to count contributions straight away and then delete the
+/// claims, waiting on a submission's claim lock only at the delete. A
+/// submission that committed in that gap credited its worker for a claim the
+/// purge went on to destroy, so the leaderboard read high for good. Here the
+/// "submission" is a transaction holding its claim, marked completed and
+/// credited but not yet committed, while the purge runs.
+#[tokio::test]
+async fn a_purge_waits_for_a_submission_in_flight_before_counting_contributions() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+
+    let (status, claim) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    let token: Uuid = claim["claim_token"].as_str().unwrap().parse().unwrap();
+    let uuid: Uuid = claim["worker_uuid"].as_str().unwrap().parse().unwrap();
+
+    let mut submission = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM task_claims WHERE claim_token = $1 FOR UPDATE")
+        .bind(token)
+        .execute(&mut *submission)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task_claims SET state = 'completed', completed_at = now() WHERE claim_token = $1")
+        .bind(token)
+        .execute(&mut *submission)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE anonymous_workers SET tasks_completed = tasks_completed + 1 WHERE uuid = $1")
+        .bind(uuid)
+        .execute(&mut *submission)
+        .await
+        .unwrap();
+
+    let purge = {
+        let app = app.clone();
+        let headers = headers.clone();
+        tokio::spawn(async move {
+            send(
+                &app,
+                post_json(
+                    &format!("/api/admin/jobs/{job}/purge"),
+                    &headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(),
+                    json!({}),
+                ),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    submission.commit().await.unwrap();
+
+    let (status, body) = purge.await.unwrap();
+    assert!(status.is_success(), "{body}");
+    let contributed: i64 =
+        sqlx::query_scalar("SELECT tasks_completed FROM anonymous_workers WHERE uuid = $1")
+            .bind(uuid)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(contributed, 0, "the submission that landed mid-purge was handed back too");
+}
+
+/// A completed job is not exported while its last claims are still out.
+///
+/// Completion does not stop results arriving: a job that met its stopping rule
+/// still accepts every claim already issued. An export built in that window
+/// was short, and every later download of the job was redirected to it.
+#[tokio::test]
+async fn a_completed_job_is_not_exported_until_its_claims_have_landed() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let (status, claim) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let export = || post_json(&format!("/api/admin/jobs/{job}/export"), &headers, json!({}));
+    let (status, body) = send(&app, export()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a claim is still in flight: {body}");
+
+    // The claim lapses; nothing can be issued against a completed job, so the
+    // results are now fixed.
+    sqlx::query("UPDATE task_claims SET state = 'abandoned'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, body) = send(&app, export()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+}
+
+/// A pool's public rating history is thinned rather than returned whole: a pool
+/// with an active job is refit every two minutes, forever.
+#[tokio::test]
+async fn a_long_rating_history_is_thinned_but_keeps_its_ends() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let admin = db.user("root", true).await;
+    let anchor = db.static_player("anchor", admin).await;
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+
+    let pool: Uuid = sqlx::query_scalar(
+        "INSERT INTO rating_pools (name, variant, letterdist_id, layout_id, anchor_player_config_id)
+         VALUES ('pool', 'classic', $1, $2, $3) RETURNING id",
+    )
+    .bind(letterdist)
+    .bind(layout)
+    .bind(anchor)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    // Twelve hundred runs, two minutes apart: under two days of one active job.
+    sqlx::query(
+        "WITH runs AS (
+             INSERT INTO rating_runs (pool_id, computed_at, trigger, iterations, converged,
+                                      pairs_used, jobs_used)
+             SELECT $1, timestamptz '2026-01-01' + g * interval '2 minutes', 'evidence', 1,
+                    true, g, 1
+             FROM generate_series(0, 1199) g
+             RETURNING id
+         )
+         INSERT INTO player_config_ratings
+             (run_id, player_config_id, rating, stderr, pairs_played, connected_to_anchor, is_anchor)
+         SELECT id, $2, 2000, 0, 0, true, true FROM runs",
+    )
+    .bind(pool)
+    .bind(anchor)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let (status, body) =
+        send(&app, get_request(&format!("/api/rating-pools/{pool}/history"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let points = body.as_array().unwrap();
+    assert!(points.len() <= 501, "thinned to the cap: {}", points.len());
+    assert!(points.len() >= 400, "but not thinned to nothing: {}", points.len());
+    assert_eq!(points.first().unwrap()["computed_at"], json!("2026-01-01T00:00:00Z"));
+    assert_eq!(
+        points.last().unwrap()["computed_at"],
+        json!("2026-01-02T15:58:00Z"),
+        "the newest run is always kept"
+    );
+}
+
+/// A games job may pit a static player against a simmer: PLAN.md promises "any
+/// mix", and it is the configuration a strength comparison most often wants.
+///
+/// Job creation compared the two players' win% models with plain equality, and
+/// a static player has none (a config that names one is refused), so every
+/// such job failed as a "disagreement". Two simmers on different models are
+/// still refused -- MAGPIE loads one model for the whole run.
+#[tokio::test]
+async fn a_games_job_may_pit_a_static_player_against_a_simmer() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+    let other_winpct = db.input_data("winpct", "winpct2").await;
+
+    let mut configs = Vec::new();
+    for (name, winpct_id) in [("static", None), ("simmer", Some(winpct)), ("simmer2", Some(other_winpct))] {
+        let mut body = json!({
+            "name": name, "recorder_type": "best", "sort_strategy": "equity",
+            "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1,
+        });
+        if let Some(winpct_id) = winpct_id {
+            body["winpct_id"] = json!(winpct_id);
+            body["num_plies"] = json!(2);
+            body["num_plays"] = json!(10);
+            body["max_iterations"] = json!(100);
+        }
+        let (status, created) = send(&app, post_json("/api/admin/player-configs", &headers, body)).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        configs.push(created["id"].as_str().unwrap().to_string());
+    }
+
+    let create = |p1: &str, p2: &str| {
+        post_json(
+            "/api/admin/jobs",
+            &headers,
+            json!({
+                "job_type": "games", "variant": "classic",
+                "letterdist_id": letterdist, "layout_id": layout,
+                "player1_config_id": p1, "player2_config_id": p2,
+                "min_games": 1, "max_games": 10,
+            }),
+        )
+    };
+
+    for (p1, p2) in [(&configs[0], &configs[1]), (&configs[1], &configs[0])] {
+        let (status, body) = send(&app, create(p1, p2)).await;
+        assert_eq!(status, StatusCode::CREATED, "static against simmer, either seat: {body}");
+    }
+    let (status, body) = send(&app, create(&configs[1], &configs[2])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "two simmers on different models: {body}");
+}
+
 /// Banning is the only lever there is against a bad contributor — nothing bans
 /// automatically — so unban has to mean what it says.
 ///

@@ -1108,9 +1108,14 @@ async fn validate_shared_player_options(
     .ok_or_else(|| AppError::bad_request("player config not found"))?;
 
     use sqlx::Row;
+    // Only two *simming* players can disagree. A static player has no win%
+    // model at all (`winpct_id` is refused on one), so comparing with plain
+    // equality made every static-versus-simmer job -- the mix PLAN.md promises
+    // a games job supports -- fail here as a "disagreement". The worker loads
+    // the model from whichever player states one.
     let p1_winpct_id: Option<Uuid> = row.get("p1_winpct_id");
     let p2_winpct_id: Option<Uuid> = row.get("p2_winpct_id");
-    if p1_winpct_id != p2_winpct_id {
+    if matches!((p1_winpct_id, p2_winpct_id), (Some(p1), Some(p2)) if p1 != p2) {
         return Err(AppError::bad_request(
             "player configs disagree on the win% model, which MAGPIE cannot vary per player",
         ));
@@ -1589,6 +1594,34 @@ async fn release_contributions(conn: &mut sqlx::PgConnection, job_id: Uuid) -> A
     Ok(())
 }
 
+/// Wait out every submission, decline and heartbeat in flight on this job's
+/// open claims, and hold further ones off until the caller commits.
+///
+/// A submission locks its claim, then its task, then the job's row. Purge and
+/// delete took the job's row first and deleted the claims afterwards -- the
+/// opposite order -- so a submission arriving mid-purge waited on the job's row
+/// while the purge waited on that submission's claim: a deadlock, which
+/// Postgres breaks by failing one of the two. And a submission that committed
+/// after `release_contributions` had counted, but before the delete, credited
+/// its identity for a claim the purge then destroyed, so that contributor's
+/// total read high for good.
+///
+/// Locking the open claims first, before the job's row, puts destruction in
+/// the order every submission uses, and means `release_contributions` sees
+/// every submission that got in ahead of it. The caller takes the dispatch lock
+/// before this, which is what stops new claims appearing meanwhile.
+async fn lock_open_claims(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query(
+        "SELECT c.id FROM task_claims c JOIN tasks t ON t.id = c.task_id
+         WHERE t.job_id = $1 AND c.state = 'claimed'
+         FOR UPDATE OF c",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 async fn purge_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1609,6 +1642,9 @@ async fn purge_job(
     // was supposed to start over. Taken before the census, so the numbers
     // written to the audit log are the ones actually destroyed.
     crate::jobs::lock_job_dispatch(&mut tx, id).await?;
+    // Before the job's row, for the lock order every submission uses: see
+    // `lock_open_claims`.
+    lock_open_claims(&mut tx, id).await?;
     let job = load_job_for_update(&mut tx, id).await?;
 
     // Written before anything is deleted: after this transaction commits, this
@@ -1712,9 +1748,18 @@ async fn delete_job(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
-    // The audit rows are written first: `audit_log.job_id` references `jobs`,
-    // so they have to exist while the job still does. The census is what a
-    // restore is scoped against if this delete turns out to be a mistake.
+    // The same locks a purge takes, in the same order and for the same
+    // reasons: no claim is issued meanwhile, and no submission is between its
+    // claim and its commit when `release_contributions` counts -- see
+    // `lock_open_claims`. The cascade below deletes every claim and task, so
+    // without them this deadlocked against a submission in flight just as
+    // purge did.
+    crate::jobs::lock_job_dispatch(&mut tx, id).await?;
+    lock_open_claims(&mut tx, id).await?;
+    load_job_for_update(&mut tx, id).await?;
+
+    // The census is what a restore is scoped against if this delete turns out
+    // to be a mistake, so it is written before anything is removed.
     let census = job_census(&mut tx, id).await?;
     audit::log(
         &mut tx,

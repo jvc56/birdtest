@@ -1003,8 +1003,8 @@ silently mean nothing was exercised. This follows the precedent already set by
 when the binary is absent.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.1.0`, the shipped `MIN_MAGPIE_VERSION` default,
-and a checkout from before the audit's fixes reports `0.0.0` and is refused. The
+`birdtest-contribute` reports `0.2.0`, the shipped `MIN_MAGPIE_VERSION` default,
+and a checkout from before the audits' fixes reports `0.1.0` or `0.0.0` and is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 

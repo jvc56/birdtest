@@ -406,17 +406,34 @@ async fn submit_result(
     // together each saw only their own uncommitted rows and both counted. The
     // task row is locked by the update below anyway; taking it first keeps the
     // order every path uses -- claim, then task, then job.
-    sqlx::query("SELECT 1 FROM tasks WHERE id = $1 FOR UPDATE")
-        .bind(task_id)
-        .execute(&mut *tx)
-        .await?;
+    //
+    // The lock is also what makes `accepted_count` trustworthy here: every
+    // accepted result increments it in the transaction that stores the result,
+    // and that transaction holds this lock, so a zero read under it means no
+    // result for the task has been accepted before this one. That is what
+    // "first accepted result" means everywhere it is used, and reading it is
+    // one row where counting the stored results was up to 10,000 of them for
+    // an opening-rack batch.
+    let prior_accepted: i32 =
+        sqlx::query_scalar("SELECT accepted_count FROM tasks WHERE id = $1 FOR UPDATE")
+            .bind(task_id)
+            .fetch_one(&mut *tx)
+            .await?;
 
     let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(job_id)
         .fetch_one(&mut *tx)
         .await?;
 
-    crate::jobs::registry::store_result(&mut tx, &job, task_id, claim_id, body.result).await?;
+    crate::jobs::registry::store_result(
+        &mut tx,
+        &job,
+        task_id,
+        claim_id,
+        prior_accepted == 0,
+        body.result,
+    )
+    .await?;
 
     sqlx::query(
         "UPDATE task_claims SET state = 'completed', completed_at = now() WHERE id = $1",
@@ -537,7 +554,11 @@ async fn submit_result(
 async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
     let job = jobstats::load_job(&state.pool, job_id).await?;
 
+    // Leave generation finishes in its own transition and has no finish
+    // condition here, so it skips the in-flight query `should_check_finish`
+    // would otherwise run on seven submissions out of eight.
     if job.status == JobStatus::Active
+        && job.job_type != JobType::LeaveGeneration
         && should_check_finish(state, job_id).await?
         && finish_condition_met(state, &job).await?
     {
@@ -590,8 +611,20 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         if !state.sse.end_push(job_id) {
             return;
         }
+        // Another round was asked for while this one built. On a busy job that
+        // is every round, so without a pause the loop rebuilt the payload back
+        // to back -- several aggregates over the job's history, one after
+        // another, for as long as a dashboard stayed open, on a pool of twenty
+        // connections the claim and submit paths share. Submissions arriving
+        // during the pause still coalesce into the one round that follows it.
+        tokio::time::sleep(MIN_STATS_PUSH_INTERVAL).await;
     }
 }
+
+/// The shortest gap between two live stats pushes for one job. The dashboard
+/// lags a busy job by at most this much, which a human watching it cannot tell
+/// from live.
+const MIN_STATS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether this submission is the one that evaluates the job's finish
 /// conditions.

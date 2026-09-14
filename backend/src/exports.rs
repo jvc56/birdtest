@@ -65,6 +65,29 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
         ));
     }
 
+    // Completed is not yet settled. A job flips to completed the moment its
+    // stopping rule is met or an admin forces it, but every claim already out
+    // is still played and still accepted -- the submit path checks the claim,
+    // not the job's status. An export built in that window missed those
+    // results, and the stream redirects every later download to it, so the
+    // corpus a completed job hands out would be short for good. No claim can be
+    // issued against a completed job, so once none is open the results really
+    // are fixed.
+    let settling = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
+                        WHERE t.job_id = $1 AND c.state = 'claimed')",
+    )
+    .bind(job.id)
+    .fetch_one(&state.pool)
+    .await?;
+    if settling {
+        return Err(AppError::conflict(
+            "this job completed with claims still in flight, and their results are still \
+             arriving; export it once they have landed or lapsed, which is at most the \
+             heartbeat timeout",
+        ));
+    }
+
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO job_exports (job_id, requested_by) VALUES ($1, $2) RETURNING id",
     )

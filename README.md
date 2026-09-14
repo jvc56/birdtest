@@ -156,8 +156,8 @@ docker compose exec postgres \
 ```
 
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.1.0`, which `birdtest-contribute` reports.
-A checkout from before that reports `0.0.0`, and every task is declined with
+`MIN_MAGPIE_VERSION` defaults to `0.2.0`, which `birdtest-contribute` reports.
+A checkout from before that reports `0.1.0` or `0.0.0`, and every task is declined with
 "update MAGPIE" until you update it or lower the floor — on the server *and*
 on the job, which records its own floor at creation:
 
@@ -270,8 +270,8 @@ To rotate the password later, run the same `modify-db-instance` and
 
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
 redirects — because the backend sets `Secure` cookies, which a browser will not
-keep over plain HTTP. `min_magpie_version` defaults to `0.1.0`, the first MAGPIE
-version that speaks the contribution protocol correctly; raise it whenever a
+keep over plain HTTP. `min_magpie_version` defaults to `0.2.0`, the first MAGPIE
+version whose results do not depend on a contributor's own settings; raise it whenever a
 MAGPIE release changes results.
 
 `alert_email` has no default: `terraform apply` refuses to run without

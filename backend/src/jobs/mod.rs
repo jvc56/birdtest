@@ -110,6 +110,22 @@ pub(crate) async fn try_lock_job_dispatch(
     }
 }
 
+/// Take the job's dispatch lock only if nobody holds it, without waiting.
+///
+/// For background work that any later claim will ask for again if it does not
+/// happen now: waiting would hold a pool connection for as long as the holder
+/// runs, and the holder may be another copy of the same work.
+pub(crate) async fn try_lock_job_dispatch_now(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(DISPATCH_LOCK_NAMESPACE)
+        .bind(job_id)
+        .fetch_one(conn)
+        .await?)
+}
+
 pub(crate) async fn load_player_spec(
     conn: &mut PgConnection,
     player_config_id: Uuid,
