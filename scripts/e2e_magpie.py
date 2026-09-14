@@ -68,6 +68,11 @@ def create_player(client, args, data: dict, name: str, body: dict) -> str:
     return created["id"]
 
 
+def ranked_moves(job_id_results: list) -> int:
+    """How many moves the busiest rack in a results page came back with."""
+    return max((r["num_moves"] for r in job_id_results), default=0)
+
+
 def deactivate_everything(client) -> None:
     page = client.json(client.get("/api/jobs?per_page=100"), "list jobs")
     for job in page["items"]:
@@ -174,10 +179,19 @@ def main() -> int:
     static_equity = create_player(client, args, data, "e2e-static-equity", {})
     static_score = create_player(client, args, data, "e2e-static-score",
                                  {"sort_strategy": "score"})
+    # `all`, not `best`: -r best is MOVE_RECORD_BEST, which leaves movegen with
+    # one play, so a simmer configured that way has nothing to choose between
+    # and every rack comes back with a single move. Job creation refuses the
+    # combination now; this is the config that actually ranks.
     simming = create_player(client, args, data, "e2e-simming", {
+        "recorder_type": "all",
         "winpct_id": winpct, "num_plies": 2, "num_plays": 5, "num_plies_recorded": 2,
         "max_iterations": 60, "stopping_pct": 99,
     })
+    # The static opening-rack job wants one move per rack, which `best` is
+    # exactly right for -- and is what `num_plays_recorded` 1 says.
+    static_best = create_player(client, args, data, "e2e-static-best",
+                                {"num_plays_recorded": 1})
 
     def games_counted(job_id: str) -> None:
         stats = client.json(client.get(f"/api/jobs/{job_id}"), "job stats")
@@ -193,7 +207,14 @@ def main() -> int:
                f"racks without a best move: {page['items'][:3]}")
 
     def simulated_statistics(job_id: str) -> None:
-        best_moves(job_id)
+        page = client.json(client.get(f"/api/jobs/{job_id}/results"), "results")
+        expect(page["items"] and all(r["best_move"] for r in page["items"]),
+               f"racks without a best move: {page['items'][:3]}")
+        # A simmer ranks far more than it reports, and num_moves is the only
+        # record of how many. One would mean the recorder kept the best play
+        # alone and the simulation had nothing to do.
+        expect(ranked_moves(page["items"]) > 1,
+               f"the simmer ranked one move per rack: {page['items'][:3]}")
         row = psql(args,
             "SELECT COUNT(*) FILTER (WHERE m.win_percentage IS NOT NULL), "
             "       COUNT(*) FILTER (WHERE m.blended_utility IS NOT NULL), "
@@ -227,7 +248,7 @@ def main() -> int:
                                  "min_games": 1000, "max_games": 1000}, games_counted)
     run_job(client, args, data, {"job_type": "game_pairs", **common, "pairs_per_batch": 2,
                                  "min_pairs": 1000, "max_pairs": 1000}, pairs_counted)
-    run_job(client, args, data, {"job_type": "opening_rack", "player_config_id": static_equity,
+    run_job(client, args, data, {"job_type": "opening_rack", "player_config_id": static_best,
                                  "racks_per_batch": 20, "rack_size": 7}, best_moves)
     run_job(client, args, data, {"job_type": "opening_rack", "player_config_id": simming,
                                  "racks_per_batch": 3, "rack_size": 7}, simulated_statistics)

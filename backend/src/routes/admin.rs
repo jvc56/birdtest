@@ -1028,6 +1028,55 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     }
 }
 
+/// An opening-rack job asks for a *ranked list* per rack, and a recorder type
+/// of `best` cannot produce one.
+///
+/// `-r best` is `MOVE_RECORD_BEST`: move generation keeps the single top play
+/// and discards the rest, so the batch comes back with exactly one move per
+/// rack however many the config says to record -- and, for a simming player,
+/// with nothing for the simulation to choose between, so `num_plies` and
+/// `num_plays` do nothing either. Verified against MAGPIE: `generate` on an
+/// opening rack reports "1 of 1 plays" under `-r1 best` and 100 under
+/// `-r1 all`.
+///
+/// Nothing downstream notices. The racks are analysed, the results are
+/// accepted, `racks_analyzed` climbs, and the corpus quietly holds a
+/// hundredth of the analysis it was configured for. So the contradiction is
+/// refused where it is introduced rather than discovered in the data later.
+///
+/// `best` with `num_plays_recorded = 1` is coherent and stays legal: "the best
+/// opening play for every rack" is a real job. This rule is scoped to opening
+/// racks; a `games` job's players are applied through autoplay, where the
+/// simmer's candidate list is sized by `num_plays` rather than by the move
+/// recorder, and `best` is the right setting there (PLAN.md, "Position Capture
+/// From Games").
+async fn validate_opening_rack_player(
+    conn: &mut sqlx::PgConnection,
+    player_config_id: Uuid,
+) -> AppResult<()> {
+    let row = sqlx::query_as::<_, (String, i32)>(
+        "SELECT recorder_type, num_plays_recorded FROM player_configs WHERE id = $1",
+    )
+    .bind(player_config_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| AppError::bad_request("player config not found"))?;
+
+    if row.0 == "best" && row.1 > 1 {
+        return Err(AppError::bad_request(
+            "an opening-rack job cannot rank moves with a 'best' recorder",
+        )
+        .with_field(
+            "player_config_id",
+            format!(
+                "this config records the single best move, so every rack would come back                  with one move rather than the {} it asks for. Use a config with                  recorder_type 'all' or 'equity', or set num_plays_recorded to 1.",
+                row.1
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// MAGPIE has one value for these for the whole run, not one per player, even
 /// though they live on `player_configs` (so that table stays the exhaustive
 /// source of what a job asked for -- see the migration comment on
@@ -1139,6 +1188,7 @@ async fn insert_job_config(
                 letterdist_name,
             )
             .await?;
+            validate_opening_rack_player(&mut *conn, *player_config_id).await?;
             // Counting the space is cheap -- a small dynamic-programming table
             // over the letter distribution -- and recording it here means the
             // scheduler can tell when the job is exhausted without re-deriving
@@ -1507,6 +1557,15 @@ async fn purge_job(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
+    // The same lock every claim takes before deciding what to hand out, and
+    // for the same reason. A claim in flight has already read the seed cursor
+    // and is about to insert its task and its claim row; the deletes below
+    // cannot see those uncommitted rows, so without this the purge finishes
+    // and the claim then commits a task into the job it just emptied --
+    // leaving the seed cursor past zero and `claims_issued` at 1 on a job that
+    // was supposed to start over. Taken before the census, so the numbers
+    // written to the audit log are the ones actually destroyed.
+    crate::jobs::lock_job_dispatch(&mut tx, id).await?;
     let job = load_job_for_update(&mut tx, id).await?;
 
     // Written before anything is deleted: after this transaction commits, this

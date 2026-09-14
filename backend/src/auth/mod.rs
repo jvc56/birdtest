@@ -173,28 +173,43 @@ impl FromRequestParts<AppState> for WorkerIdentity {
 
         let identity = if let Some(raw_key) = bearer {
             let hash = api_key::hash_key(&raw_key);
-            let row = sqlx::query_as::<_, (Uuid, Uuid)>(
-                "SELECT k.id, u.id
-                 FROM api_keys k JOIN users u ON u.id = k.user_id
-                 WHERE k.key_hash = $1 AND k.is_active",
+            // Lookup, `last_used_at` touch and ban check in one statement.
+            // This runs on every worker request -- every claim, heartbeat and
+            // submission -- so three round trips here were three on the
+            // critical path of getting a worker its next task, for one
+            // question the database can answer in a single pass.
+            //
+            // The touch is throttled: `last_used_at` answers "is this key in
+            // use", which a minute's resolution answers as well as a write per
+            // request does.
+            let row = sqlx::query_as::<_, (Uuid, bool)>(
+                "WITH found AS (
+                     SELECT k.id AS key_id, u.id AS user_id, k.last_used_at
+                     FROM api_keys k JOIN users u ON u.id = k.user_id
+                     WHERE k.key_hash = $1 AND k.is_active
+                 ),
+                 touched AS (
+                     UPDATE api_keys k SET last_used_at = now()
+                     FROM found
+                     WHERE k.id = found.key_id
+                       AND (found.last_used_at IS NULL
+                            OR found.last_used_at < now() - interval '60 seconds')
+                     RETURNING 1
+                 )
+                 SELECT found.user_id,
+                        EXISTS (SELECT 1 FROM worker_bans b
+                                WHERE b.user_id = found.user_id) AS banned
+                 FROM found",
             )
             .bind(&hash)
             .fetch_optional(&state.pool)
             .await?
             .ok_or_else(|| AppError::unauthorized("unknown or inactive API key"))?;
 
-            // Throttled: `last_used_at` answers "is this key in use", which a
-            // minute's resolution answers as well as a write per request does.
-            sqlx::query(
-                "UPDATE api_keys SET last_used_at = now()
-                 WHERE id = $1
-                   AND (last_used_at IS NULL OR last_used_at < now() - interval '60 seconds')",
-            )
-            .bind(row.0)
-            .execute(&state.pool)
-            .await?;
-
-            WorkerIdentity::User { user_id: row.1 }
+            if row.1 {
+                return Err(AppError::forbidden("this worker identity is banned"));
+            }
+            WorkerIdentity::User { user_id: row.0 }
         } else {
             let raw = parts
                 .headers
@@ -211,8 +226,10 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     // client-invented UUID would otherwise let anyone
                     // manufacture contributors, attributing work to identities
                     // that never claimed anything. `last_seen_at` is refreshed
-                    // at most once a minute, for the same reason as above.
-                    let known = sqlx::query_scalar::<_, bool>(
+                    // at most once a minute, and the ban check rides along in
+                    // the same statement rather than costing a second round
+                    // trip on every worker request.
+                    let banned = sqlx::query_scalar::<_, bool>(
                         "WITH known AS (
                              SELECT uuid, last_seen_at FROM anonymous_workers WHERE uuid = $1
                          ),
@@ -223,18 +240,23 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                                AND known.last_seen_at < now() - interval '60 seconds'
                              RETURNING 1
                          )
-                         SELECT EXISTS (SELECT 1 FROM known)",
+                         SELECT EXISTS (SELECT 1 FROM worker_bans b
+                                        WHERE b.anon_uuid = known.uuid)
+                         FROM known",
                     )
                     .bind(uuid)
-                    .fetch_one(&state.pool)
+                    .fetch_optional(&state.pool)
                     .await?;
 
-                    if !known {
+                    let Some(banned) = banned else {
                         return Err(AppError::unauthorized(
                             "unrecognized worker UUID. Omit the X-Worker-UUID \
                              header to be issued one, or authenticate with an \
                              API key.",
                         ));
+                    };
+                    if banned {
+                        return Err(AppError::forbidden("this worker identity is banned"));
                     }
                     WorkerIdentity::Anonymous { uuid }
                 }
@@ -246,25 +268,9 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             }
         };
 
-        ensure_not_banned(state, &identity).await?;
+        // The ban check happened above, in the same statement that resolved
+        // the identity: both branches refuse a banned one before reaching
+        // here, and an unregistered identity has nothing to ban.
         Ok(identity)
     }
-}
-
-async fn ensure_not_banned(state: &AppState, identity: &WorkerIdentity) -> AppResult<()> {
-    let banned = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (
-             SELECT 1 FROM worker_bans
-             WHERE user_id = $1 OR anon_uuid = $2
-         )",
-    )
-    .bind(identity.user_id())
-    .bind(identity.anon_uuid())
-    .fetch_one(&state.pool)
-    .await?;
-
-    if banned {
-        return Err(AppError::forbidden("this worker identity is banned"));
-    }
-    Ok(())
 }

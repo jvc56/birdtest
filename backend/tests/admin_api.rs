@@ -296,3 +296,85 @@ async fn only_a_completed_job_can_be_exported() {
         .unwrap();
     assert_eq!(recorded, 1);
 }
+
+/// An opening-rack job whose player records only the best move cannot produce
+/// a ranked list, and nothing downstream would say so.
+///
+/// `-r best` is MOVE_RECORD_BEST: move generation keeps the top play and
+/// discards the rest, so every rack comes back with exactly one move whatever
+/// `num_plays_recorded` says -- and for a simming player there is nothing left
+/// for the simulation to choose between. Verified against MAGPIE, which
+/// reports "1 of 1 plays" under `-r1 best` and 100 under `-r1 all`. The
+/// results look perfectly well-formed, so the misconfiguration is refused
+/// where it is made.
+#[tokio::test]
+async fn an_opening_rack_job_cannot_rank_moves_with_a_best_recorder() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+
+    let make_player = |name: &'static str, recorder: &'static str, recorded: i32| {
+        let headers = headers.clone();
+        let app = app.clone();
+        async move {
+            let (status, body) = send(
+                &app,
+                post_json(
+                    "/api/admin/player-configs",
+                    &headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(),
+                    json!({
+                        "name": name, "recorder_type": recorder, "sort_strategy": "equity",
+                        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": recorded,
+                    }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            body["id"].as_str().unwrap().to_string()
+        }
+    };
+
+    let create_job = |player: String| {
+        let headers = headers.clone();
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                post_json(
+                    "/api/admin/jobs",
+                    &headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(),
+                    json!({
+                        "job_type": "opening_rack", "variant": "classic",
+                        "letterdist_id": letterdist, "layout_id": layout,
+                        "player_config_id": player, "racks_per_batch": 10, "rack_size": 2,
+                    }),
+                ),
+            )
+            .await
+        }
+    };
+
+    // Ten moves asked for, one move possible.
+    let contradictory = make_player("best-ten", "best", 10).await;
+    let (status, body) = create_job(contradictory).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "player_config_id", "{body}");
+
+    // "The best opening play for every rack" is a real job, and `best` is
+    // exactly the right recorder for it.
+    let single = make_player("best-one", "best", 1).await;
+    let (status, body) = create_job(single).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // And a recorder that keeps candidates may rank as many as it likes.
+    let ranking = make_player("all-ten", "all", 10).await;
+    let (status, body) = create_job(ranking).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}

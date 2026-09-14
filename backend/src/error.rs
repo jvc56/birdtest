@@ -25,6 +25,8 @@ pub struct AppError {
 pub const UNIQUE_VIOLATION: &str = "23505";
 /// SQLSTATE for a foreign-key violation.
 pub const FOREIGN_KEY_VIOLATION: &str = "23503";
+/// SQLSTATE for a statement that gave up waiting for a lock (`lock_timeout`).
+pub const LOCK_NOT_AVAILABLE: &str = "55P03";
 
 #[derive(Serialize)]
 struct ErrorBody {

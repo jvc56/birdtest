@@ -59,7 +59,9 @@ pub async fn acquire(
 async fn generate_opening_rack(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
     // Before the range is read: `next_request` addresses the next slice with
     // `MAX(seed)`, which a concurrent claim's uncommitted task is invisible to.
-    super::lock_job_dispatch(&mut *conn, job.id).await?;
+    if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
+        return Ok(Acquired::NoWork);
+    }
 
     let config = sqlx::query_as::<_, OpeningRackConfig>(
         "SELECT * FROM job_opening_rack_config WHERE job_id = $1",
@@ -149,7 +151,9 @@ pub async fn load_request(
 
 async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
     // See `generate_opening_rack`: the seed cursor is `MAX(seed)`.
-    super::lock_job_dispatch(&mut *conn, job.id).await?;
+    if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
+        return Ok(Acquired::NoWork);
+    }
 
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
         .bind(job.id)
@@ -159,13 +163,22 @@ async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquire
     let job_data = load_job_data(&mut *conn, job.id).await?;
     let (seed, request) = game::next_request(conn, job.id, &config, &job_data).await?;
     let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
-    super::insert_game_request(conn, task_id, &request).await?;
+    super::insert_game_request(
+        conn,
+        task_id,
+        &request,
+        config.player1_config_id,
+        config.player2_config_id,
+    )
+    .await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::Games(request) })
 }
 
 async fn generate_game_pairs(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
     // See `generate_opening_rack`: the seed cursor is `MAX(seed)`.
-    super::lock_job_dispatch(&mut *conn, job.id).await?;
+    if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
+        return Ok(Acquired::NoWork);
+    }
 
     let config =
         sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
@@ -176,7 +189,14 @@ async fn generate_game_pairs(conn: &mut PgConnection, job: &Job) -> AppResult<Ac
     let job_data = load_job_data(&mut *conn, job.id).await?;
     let (seed, request) = game_pair::next_request(conn, job.id, &config, &job_data).await?;
     let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
-    super::insert_game_request(conn, task_id, &request).await?;
+    super::insert_game_request(
+        conn,
+        task_id,
+        &request,
+        config.player1_config_id,
+        config.player2_config_id,
+    )
+    .await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::GamePairs(request) })
 }
 
@@ -195,7 +215,9 @@ async fn generate_leave_gen(
     // hand out, and whether the generation can be closed, are decisions that
     // must not be made from a view of the job that another claim is in the
     // middle of changing. See PLAN.md's leave-generation claim steps.
-    leave_gen::lock_claim_decisions(conn, job.id).await?;
+    if !leave_gen::lock_claim_decisions(conn, job.id).await? {
+        return Ok(Acquired::NoWork);
+    }
 
     // A reopened task -- its claim timed out -- is reissued before a new one is
     // generated, as for every job type, but only here: after the lock, so the

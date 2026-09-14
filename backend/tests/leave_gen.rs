@@ -47,6 +47,24 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     (job, seeded)
 }
 
+/// Polls `condition` until it holds or a generous deadline passes, for the one
+/// thing in this file that is deliberately not finished when the request that
+/// started it returns: a generation transition, which runs on its own task so
+/// the claiming worker is not held for it.
+async fn wait_for<F, Fut>(mut condition: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..200 {
+        if condition().await {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    false
+}
+
 fn forced_racks(assignment: &serde_json::Value) -> Vec<String> {
     assignment["task_request"]["forced_racks"]
         .as_array()
@@ -460,21 +478,38 @@ async fn the_transition_owner_is_committed_before_the_transition_runs() {
     .await
     .unwrap();
 
-    // 204: the upload cannot succeed against a closed port, and a job that
+    // 204 immediately: the transition runs on its own task rather than on this
+    // request, so the claim is not held for the tens of seconds a real one
+    // takes. The upload cannot succeed against a closed port, and a job that
     // cannot dispatch is logged and skipped rather than failing the claim.
     let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let row: Option<(i32, Option<chrono::DateTime<chrono::Utc>>, bool)> = sqlx::query_as(
-        "SELECT attempts, completed_at, started_at <= to_timestamp(0)
+    // The owner row is committed by the claim itself, so it is there the
+    // moment the claim answers -- that is the property under test.
+    let row: Option<(i32, Option<chrono::DateTime<chrono::Utc>>)> = sqlx::query_as(
+        "SELECT attempts, completed_at
          FROM leave_generation_transitions WHERE job_id = $1 AND generation = 1",
     )
     .bind(job)
     .fetch_optional(&db.pool)
     .await
     .unwrap();
-    let (attempts, completed_at, released) = row.expect("the owner row survives the claim");
-    assert_eq!((attempts, completed_at), (1, None));
+    assert_eq!(row.expect("the owner row survives the claim"), (1, None));
+
+    // Ownership comes back when the detached transition fails, which is a
+    // moment later rather than before the claim answered.
+    let released = wait_for(|| async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT started_at <= to_timestamp(0) FROM leave_generation_transitions
+             WHERE job_id = $1 AND generation = 1",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    })
+    .await;
     assert!(released, "a failed transition hands ownership back immediately");
 
     // And the next claim decision picks it up rather than waiting out the

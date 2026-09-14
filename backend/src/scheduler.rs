@@ -227,13 +227,30 @@ async fn shutdown_or_idle(
 /// claim is either abandoned here or completed there -- never both, which is
 /// what would decrement the task's counter twice.
 pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> AppResult<u64> {
+    reclaim_expired_for(pool, &[job_id], timeout_secs).await
+}
+
+/// [`reclaim_expired`] over a whole tier of candidate jobs in one statement.
+///
+/// The scan is the same either way: the planner reaches the expired claims
+/// through the partial index on open claims -- one entry per claim currently in
+/// flight across the fleet -- and filters by job afterwards, because
+/// `task_claims` has no job column to narrow on. Run per job, a claim request
+/// therefore paid that scan once per candidate in its tier, for a set of rows
+/// that does not depend on the job at all. Run once over the tier it is a single
+/// pass and a single round trip.
+pub async fn reclaim_expired_for(
+    pool: &PgPool,
+    job_ids: &[Uuid],
+    timeout_secs: f64,
+) -> AppResult<u64> {
     let result = sqlx::query(
         "WITH expired AS (
              UPDATE task_claims c
              SET state = 'abandoned'
              FROM tasks t
              WHERE c.task_id = t.id
-               AND t.job_id = $1
+               AND t.job_id = ANY($1)
                AND c.state = 'claimed'
                AND COALESCE(c.last_heartbeat_at, c.claimed_at) < now() - make_interval(secs => $2)
              RETURNING c.task_id
@@ -252,7 +269,7 @@ pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> 
          FROM counts, jobs j
          WHERE t.id = counts.task_id AND j.id = t.job_id",
     )
-    .bind(job_id)
+    .bind(job_ids)
     .bind(timeout_secs)
     .execute(pool)
     .await?;
@@ -294,6 +311,18 @@ pub async fn claim(
             return shutdown_or_idle(state, caps).await;
         }
 
+        // Once for the whole tier, before anything is handed out: a task whose
+        // claim lapsed has to be back to `available` before the loop below
+        // looks for one. Per job this was a round trip per candidate for a
+        // scan that does not depend on the job; one statement covers the tier.
+        // A failure here is not fatal -- nothing is reclaimed this time round,
+        // so a lapsed task waits for the next claim -- and must not take the
+        // whole request down with it.
+        let job_ids: Vec<Uuid> = jobs.iter().map(|job| job.id).collect();
+        if let Err(err) = reclaim_expired_for(&state.pool, &job_ids, timeout_secs).await {
+            tracing::error!(error = %err.message, "reclaiming expired claims failed");
+        }
+
         let mut retry_outer = false;
         for job in &jobs {
             // One job that cannot dispatch -- a leave-generation job whose
@@ -302,11 +331,6 @@ pub async fn claim(
             // Failing the whole claim here would answer every worker with a
             // 500 for as long as that job sits at the top of the tier, and
             // every client retries 500s. It is logged loudly and skipped.
-            if let Err(err) = reclaim_expired(&state.pool, job.id, timeout_secs).await {
-                tracing::error!(job_id = %job.id, error = %err.message, "reclaiming expired claims failed; skipping job");
-                continue;
-            }
-
             match try_claim_from_job(state, identity, job, caps).await {
                 Ok(Some(outcome)) => return Ok(ClaimOutcome::Task(Box::new(outcome))),
                 Ok(None) => continue,
@@ -383,23 +407,36 @@ async fn try_claim_from_job(
             // builds a multi-megabyte KLV and uploads it to the object store,
             // and no claim transaction may stay open across that.
             tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
-            // On its own task, awaited: a transition takes tens of seconds, and
-            // if the worker or a load balancer gives up on this request the
-            // handler future is dropped. Run inline, that would abandon the
-            // transition part-way every time, and a generation whose
-            // transition outlasts the timeout would never close.
-            let (state, job) = (state.clone(), job.clone());
+            // On its own task, and **not awaited**. A transition takes tens of
+            // seconds; awaiting it held this worker's claim request open for
+            // all of it, so the one worker unlucky enough to find the
+            // generation complete paid the whole aggregation before it could
+            // ask for work again. Nothing in this request needs the answer:
+            // the generation it would open has no tasks until the transition
+            // commits, so this worker's next move is the same either way.
+            // Spawning is also what keeps the transition alive when the worker
+            // or a load balancer gives up on the request and the handler
+            // future is dropped -- run inline it would be abandoned part-way
+            // every time, and a generation whose transition outlasts the
+            // timeout would never close.
+            //
+            // Failure is logged rather than returned for the same reason: the
+            // transition hands ownership back (`started_at` backdated), so the
+            // next claim picks it up.
+            let (spawn_state, spawn_job) = (state.clone(), job.clone());
             tokio::spawn(async move {
-                run_leave_generation_transition(&state, &job, generation).await
-            })
-            .await
-            .map_err(|e| {
-                JobClaimError::Fatal(crate::error::AppError::internal(format!(
-                    "leave generation transition panicked: {e}"
-                )))
-            })?
-            .map_err(JobClaimError::Fatal)?;
-            Err(JobClaimError::Retry)
+                if let Err(err) =
+                    run_leave_generation_transition(&spawn_state, &spawn_job, generation).await
+                {
+                    tracing::error!(
+                        job_id = %spawn_job.id, generation, error = %err.message,
+                        "leave generation transition failed"
+                    );
+                }
+            });
+            // This job has nothing to hand out until that finishes; the next
+            // candidate may well have work.
+            Ok(None)
         }
         Acquired::Task { task_id, request } => {
             match issue_claim(&mut tx, identity, job, caps, task_id).await {

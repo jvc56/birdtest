@@ -86,7 +86,7 @@ async fn run(state: AppState, job: Job, export_id: Uuid) {
             tracing::warn!(job_id = %job.id, %export_id, error = %err.message, "job export failed");
             let _ = sqlx::query(
                 "UPDATE job_exports SET state = 'failed', error = $2, completed_at = now()
-                 WHERE id = $1",
+                 WHERE id = $1 AND state = 'running'",
             )
             .bind(export_id)
             .bind(&err.message)
@@ -152,11 +152,16 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
     }
     upload.finish().await?;
 
+    // Guarded on `running`, like the import's: a process starting while this
+    // one works reaps rows left `running` as failed, and a rolling deployment
+    // overlaps the two. Without the guard a reaped row would come back
+    // `ready`, and an admin would be handed a download of an export nobody
+    // was sure had finished.
     sqlx::query(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
              row_count = $5, completed_at = now()
-         WHERE id = $1",
+         WHERE id = $1 AND state = 'running'",
     )
     .bind(export_id)
     .bind(&key)

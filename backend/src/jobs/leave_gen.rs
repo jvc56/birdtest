@@ -191,11 +191,14 @@ const TRANSITION_TAKEOVER_AFTER: &str = "30 minutes";
 /// the `leave_generation_transitions` row this lock makes it safe to test and
 /// write.
 ///
-/// It is [`super::lock_job_dispatch`], which every job type now takes for the
-/// same underlying reason; leave generation just has the most to lose by not
-/// holding it.
-pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<()> {
-    super::lock_job_dispatch(conn, job_id).await
+/// It is [`super::try_lock_job_dispatch`], which every job type now takes for
+/// the same underlying reason; leave generation just has the most to lose by
+/// not holding it -- and the most to gain from the bounded wait, since seeding
+/// a generation's rack universe holds this lock for tens of seconds.
+///
+/// `false` means another claim holds it and this one should move on.
+pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<bool> {
+    super::try_lock_job_dispatch(conn, job_id).await
 }
 
 /// What the scheduler should do next for a leave-generation job.

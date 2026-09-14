@@ -29,7 +29,7 @@ Jobs are created by admins in the **inactive** state and only start receiving wo
 
 Jobs are created in the **inactive** state. Allocation is not set at creation time — it is supplied by the admin when they activate the job. This keeps the allocation budget coherent: an admin reviews the full set of active jobs, decides the new job's share, and activates it with a specific percentage in a single action.
 
-Admins can deactivate, reactivate, purge, force-complete, or delete a job at any time. **Purge deletes tasks outright** rather than returning them to `available`: every job type generates its tasks on demand, so a purged job regenerates them from the start of its space at the next claim. Leaving the rows behind would advance the seed cursor past work that was never done. Purging also re-seeds whatever a job needs before it can dispatch — for leave generation, the generation-1 rack universe and the generation-0 zeroed KLV, both of which the purge just deleted.
+Admins can deactivate, reactivate, purge, force-complete, or delete a job at any time. **Purge deletes tasks outright** rather than returning them to `available`: every job type generates its tasks on demand, so a purged job regenerates them from the start of its space at the next claim. Leaving the rows behind would advance the seed cursor past work that was never done. Purging also re-seeds whatever a job needs before it can dispatch — for leave generation, the generation-1 rack universe and the generation-0 zeroed KLV, both of which the purge just deleted. It takes the job's dispatch lock first, the same one every claim takes: a claim in flight has already read the seed cursor and is about to insert its task, which the purge's deletes cannot see, so without the lock the purge finishes and the claim then commits a task into the job it just emptied.
 
 A completed job cannot be reactivated, and for the same reason cannot be deactivated: deactivate-then-activate would otherwise restart it. Force-completion is unconditional.
 
@@ -74,7 +74,7 @@ Every job type generates its tasks **on demand**: the next task request is gener
 
 1. The worker sends a **task claim** to the server — a minimal message identifying itself and signaling it is ready for work.
 2. The system selects a job by priority tier (lowest integer value = highest priority, descending). Within the top available tier, the job chosen is the one **most behind its configured allocation share** — specifically, the active job with the lowest ratio of `claims_issued / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
-3. Expired claims for the selected job are lazily reclaimed: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`.
+3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`.
 4. The system acquires the next task (pre-populated or on-demand, depending on the job type), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
 6. The worker performs the task and submits a **task response** along with the claim token.
@@ -239,7 +239,36 @@ rows.
 
 #### How much of an analysis is kept
 
-A worker reports every move it ranked. The server keeps only the leading `num_plays_recorded` per rack, which is **deliberately a different number from how many the worker generated or simulated** (the player config's `num_plays`): a simmer may need to rank hundreds of candidates to order the top few correctly, while storing hundreds of rows for each of millions of racks is not something the database should be asked to do. `position_analysis_records.num_moves` records how many were ranked, so the discarded tail is still visible as a count.
+A worker reports the leading `num_plays_recorded` moves per rack and states, in
+`num_moves`, how many it ranked to get them. Those are **deliberately different
+numbers** (the player config's `num_plays` decides the second): a simmer may
+need to rank hundreds of candidates to order the top few correctly, while
+storing hundreds of rows for each of millions of racks is not something the
+database should be asked to do. `position_analysis_records.num_moves` keeps the
+count, so the discarded tail is still visible.
+
+The cap is applied on the **client**, not only on the server that stores the
+result. Reporting everything and truncating on receipt sends bytes nobody
+stores, and it does so per rack across a batch of up to 10,000 — enough, with a
+recorder that keeps every candidate, to put an ordinary job's submission past
+`MAX_RESULT_BYTES` and have it refused. `num_moves` is what makes the cap free
+of information loss. A client that omits the field reported everything it
+ranked, which is what builds before the field was added did, so the list's own
+length stands in for it.
+
+**An opening-rack job cannot use a `best` recorder to rank moves.** `-r best`
+is `MOVE_RECORD_BEST`: move generation keeps the single top play and discards
+the rest, so every rack comes back with one move however many
+`num_plays_recorded` asks for — and a simming player has nothing left to choose
+between, which makes `num_plies` and `num_plays` inert too. Nothing downstream
+notices: the racks are analysed, the results accepted, `racks_analyzed` climbs,
+and the corpus quietly holds a fraction of the analysis the job was configured
+for. Job creation therefore refuses `recorder_type = 'best'` together with a
+`num_plays_recorded` above 1, and names the remedy. `best` with
+`num_plays_recorded` of 1 stays legal, because "the best opening play for every
+rack" is a real job. The rule is scoped to opening racks: a `games` job's
+players go through autoplay, where a simmer's candidate list is sized by
+`num_plays` rather than by the move recorder, and `best` is right there.
 
 `position_analysis_plies` is populated only for **simming** player configs. A static player produces no per-ply statistics, so for the common case the table stays empty rather than filling with placeholder rows.
 
@@ -457,7 +486,19 @@ sweep (two minutes) rather than a hook on result submission. A fit is global to 
 pool, an active job submits results far faster than any rating needs to move, and
 — unlike SPRT — nothing blocks on the answer. The sweep compares the pool's
 current pair count against the last run's `pairs_used`, so no dirty flag is
-needed anywhere.
+needed anywhere; it reads the evidence once and fits from the same read, rather
+than reading it to decide and again to fit.
+
+**A fit holds the pool's lock while it runs** (`pg_advisory_xact_lock`, per
+pool, for the fitting transaction). It is a read-then-write over state an admin
+can change underneath it — it reads membership and evidence, then writes a run
+stamped `now()` — so two at once interleave, and the fit that *started* first
+can commit last. The newest `rating_runs` row is what the ratings page shows,
+so the visible symptom is a config removed from a pool coming straight back in
+the fit: the sweep had already read the old membership when the removal landed.
+It would correct itself at the next sweep, two minutes later, having shown
+something untrue in between. The lock is per pool, so pools never wait on each
+other.
 
 **One pool's failure does not stop the others.** A fit can fail on state an
 admin can reach — a pool whose anchor is no longer a member is the obvious one
@@ -690,9 +731,19 @@ Each job with at least one dashboard subscriber gets a broadcast channel, create
 on first subscribe and dropped when the last receiver goes away, so an idle
 server holds no per-job state. The submission path checks for a subscriber before
 building a payload at all. `GET /api/jobs/:id/stream` sends the current stats
-immediately as its first event, then one event per accepted result, all named
+immediately as its first event, then an event per accepted result, all named
 `stats`, with a 15-second keep-alive so an idle connection survives an
 intermediary's timeout.
+
+**An event per result, not one per result.** Building a payload is several
+aggregates over the job's history, so it happens off the submitting request and
+one at a time per job: a submission that finds a build already running marks it
+to repeat rather than starting a second. A burst of submissions therefore
+collapses into the one payload that follows it, which is both fewer reads and
+strictly fresher data than a queue of payloads would deliver. What the page
+loses is a guaranteed event per result, which it was not counting: every event
+carries the whole payload rather than a delta, so a merged one says everything
+the ones it replaced would have.
 
 ---
 
@@ -772,7 +823,7 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | `opening_rack_stats`: the average alone, after the split | job detail and every SSE push | 343 ms |
 | `opening_rack_stats`: best-move types | job detail and every SSE push | 541 ms (322 ms on the later run) |
 | `opening_rack_stats` **as it is now** — two counters, after both aggregates were dropped | job detail and every SSE push | two single-row reads |
-| Rating sweep `build_matrix`, 600,000 paired results | every two minutes | 452 ms |
+| Rating sweep `build_matrix`, 600,000 paired results | every two minutes, and on every public read of a pool | 452 ms |
 | `worker_contributions`, 44,000 claims | job detail and every SSE push | 136 ms |
 | Public worker list, all claims | page view | 93 ms |
 | Leave `next_step` rack selection | every leave claim | 47 ms |
@@ -785,13 +836,25 @@ What the numbers settled:
 - **The SPRT path stays as it is.** About 50 ms at 400,000 units, on every
   submission, is within budget for the result rate a job actually sees — so the
   stopping rule keeps reading `game_results` rather than a counter, and cannot be
-  wrong because a counter drifted. Debouncing the SSE push per job is the cheaper
-  next move if submission rates ever make this matter, and it is not needed yet.
+  wrong because a counter drifted.
+- **The SSE push moved off the submission path**, and is coalesced per job. It
+  was the other 50 ms — the full payload was built before the worker was
+  answered, so a dashboard nobody had open still cost every submission the same
+  aggregates, and one that *was* open cost them twice over (once for the finish
+  check, once for the payload). It is now built on a spawned task, one at a time
+  per job. The finish check stays inline, because it decides something.
 - **The two reads above became running totals** (`jobs.games_completed`,
   `jobs.racks_analyzed`), because they grew with a job's whole history and ran on
   every page view and every live push. Splitting the opening-rack query mattered
   as much as the counter: neither the distinct-rack count (631 ms) nor the average
   (343 ms) is expensive alone — computing them together is what cost 3.3 s.
+- **The rating matrix is scoped to the pool's own jobs first.** It used to pick
+  one result per task across the *whole* of `game_results` and filter
+  afterwards, so every fit sorted the entire table — and so did every public
+  read of a pool's residuals, which computes the same matrix. With the job
+  filter first it is an index walk of those jobs' tasks. The sweep also builds
+  it once per tick rather than twice (once to decide the pool was stale, once
+  to fit).
 - **Copying the rack universe to the next generation is the one slow write**, and
   it is slow on an under-provisioned database: a minute here, against about 15
   seconds for a whole transition on the smaller dev database. It runs once per
@@ -1282,7 +1345,11 @@ Almost nothing. The digests come from a join over the job's `letterdist_id` and
 `layout_id` plus its players' `kwg_id` / `klv_id` / `winpct_id`,
 **deduplicated** — two players on the same lexicon contribute one `kwg` entry,
 not two. The `expected_data` builder is a query, not an inference engine, which
-is what removes the piece most in need of unit tests. Task requests still carry
+is what removes the piece most in need of unit tests. It is also a *single*
+query: a union over the per-type config tables, which contributes nothing for a
+type that has no row in one, so there is no match on `job_type` and no second
+round trip to resolve the players. It runs inside the job's dispatch lock, so
+what it costs is time no other worker can be claiming from that job. Task requests still carry
 *names*, because that is what MAGPIE's command-line surface takes.
 
 ### Capability negotiation
@@ -1578,7 +1645,7 @@ of the message contract against this branch's fixtures.
 
 The core of birdtest is the task claim endpoint — the sequence that runs every time a worker asks for work.
 
-1. **Auth and verification**: The server reads the worker identity from request headers (`Authorization: Bearer <api-key>` for authenticated workers, `X-Worker-UUID` for anonymous workers). It verifies the worker is not banned. An anonymous identity is only ever *created* by a claim that hands out a task (see [Workers](#workers)).
+1. **Auth and verification**: The server reads the worker identity from request headers (`Authorization: Bearer <api-key>` for authenticated workers, `X-Worker-UUID` for anonymous workers). It verifies the worker is not banned. Resolving the identity, stamping its throttled `last_used_at` / `last_seen_at`, and checking the ban list are **one statement**, not three: this runs on every worker request, so each round trip here is on the critical path of getting a worker its next task. An anonymous identity is only ever *created* by a claim that hands out a task (see [Workers](#workers)).
 
 2. **Job selection**: The server filters to active jobs this worker can run — its MAGPIE version and its unsupported set, see [Scheduler side](#scheduler-side) — takes the lowest priority value among them, and orders that tier by `claims_issued / allocation`, most behind its share first. `jobs.claims_issued` counts every claim ever issued for the job, **including abandoned and declined ones**, so it only ever goes up; excluding abandoned claims would let it shrink as timeouts accrue and would unfairly favour jobs with flaky workers. Ties break on `created_at ASC`. No randomness is involved.
 
@@ -1595,7 +1662,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
             e.created_at ASC
    ```
 
-3. **Lazy reclamation**: Before acquiring a task, any claimed tasks for the selected job whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`.
+3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers the whole candidate tier rather than one per job: `task_claims` has no job column, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all.
 
 4. **Task acquisition** — strategy-dependent:
    - **Re-dispatch first**: `SELECT ... FOR UPDATE SKIP LOCKED` on the job's `available` tasks — a lapsed claim's task, or one with redundancy left to fill — **excluding any task this worker already holds a slot on**. Redundancy means independent workers; without the exclusion, a worker holding a slot on the oldest open task is offered it again on every attempt, refused by the per-identity unique index each time, and gets no work at all.
@@ -1630,10 +1697,14 @@ Then, up to **three attempts**:
    - **NoWork** — this job has nothing to hand out; try the next candidate.
    - **JobFinished** — the job's space is exhausted; flip it to `completed` and
      try the next candidate.
-   - **NeedsGenerationTransition** — leave generation only. The transition
-     uploads an artifact and does a multi-megabyte build, so it must not run
-     inside the claim transaction: roll back, run the transition, and restart the
-     whole attempt.
+   - **NeedsGenerationTransition** — leave generation only. **Commit** (the
+     transaction's only write is the row claiming ownership of the transition),
+     start the transition on its own task, and move to the next candidate. The
+     transition uploads an artifact and does a multi-megabyte build, so it must
+     not run inside the claim transaction — and it is not waited for either:
+     this job has nothing to hand out until it finishes, so holding the claim
+     open for the tens of seconds it takes only makes one worker idle for all
+     of it. It answers `204` and asks again.
 
    A candidate that fails outright — a missing config row, a leave-generation job
    with no generation-0 KLV — is logged and skipped rather than failing the claim.
@@ -1652,15 +1723,27 @@ claim bumps `jobs.claims_issued`, which holds that job's row lock until
 commit, so claims against one job already serialize — and it turns a lost race
 into a short wait. It is per job, so claims against other jobs are unaffected.
 
+**The wait for it is bounded** (`lock_timeout`, two seconds), and a claim that
+gives up treats the job as having nothing right now and tries the next
+candidate. Ordinary contention is milliseconds, so this is never reached in
+normal operation; it exists for the one holder that is not ordinary. Seeding a
+leave generation's rack universe is millions of rows and tens of seconds, and
+it runs inside the claim transaction under this lock — so without a bound every
+other claim for that job blocks for the duration *while holding a pool
+connection*, and the pool is twenty. One slow claim on one job would stall
+submissions and the dashboard for the whole server. The bound turns that into
+those workers being told to look elsewhere.
+
 **Two things legitimately restart an attempt**, and both are ordinary rather than
 exceptional:
 
 - A **lost race on `(job_id, seed)`**, when two workers generate the same
   on-demand task simultaneously. One insert wins; the loser retries and lands on
-  the next seed. The dispatch lock makes this rare rather than impossible — a
-  purge running between the cursor read and the insert can still produce it —
-  and it was the common case before that lock existed, where past three-way
-  contention on one job a worker was answered `204` while work existed.
+  the next seed. The dispatch lock makes this rare — it was the common case
+  before that lock existed, where past three-way contention on one job a worker
+  was answered `204` while work existed. A purge takes the same lock, so it is
+  no longer a way around it; the retry stays because a lock that can time out is
+  not a lock that always held.
 - A **lost race on the per-identity partial unique index**, which rejects a second
   concurrent slot on the same task by the same worker. That is not a failure —
   this worker already holds a slot here — so it re-runs selection and lands
@@ -1718,11 +1801,21 @@ The mirror of the claim, and the only place results enter the system.
    here: a fit is global to a rating pool and nothing in this path depends on
    it, so it runs on a periodic sweep instead.
 6. **After** the commit: evaluate the finish conditions on only the aggregates
-   they need — the SPRT statistics, or an opening-rack job's task counts — and
-   build and push the full stats payload only if the job has an SSE subscriber.
-   This step is best-effort: the result is already committed, so a failure here
-   is logged and the worker is still told `accepted: true` rather than invited to
-   retry a submission that landed.
+   they need — the SPRT statistics, or an opening-rack job's task counts.
+   Inline, because SPRT decides whether the job keeps dispatching. Best-effort:
+   the result is already committed, so a failure here is logged and the worker
+   is still told `accepted: true` rather than invited to retry a submission that
+   landed.
+7. **Off the request entirely**: the live stats payload, when the job has an SSE
+   subscriber. It is display-only — nothing in the claim path reads a statistic
+   — and it is the most expensive thing in this path, several aggregates over
+   the job's whole history. Built before answering, it made the worker's next
+   claim wait on a dashboard nobody may have open. It is **coalesced per job**:
+   the first submission to find no push running owns one, later ones only mark
+   it to go round again when it finishes, so a busy job builds one payload at a
+   time instead of one per submission, and the pushes stay ordered because one
+   task issues them. The dashboard can therefore lag a submission or two behind
+   under load, which is the intended trade.
 
 #### What a submission has to satisfy
 
@@ -1798,6 +1891,18 @@ empty rather than filling with placeholders.
 In-game positions are inserted with `ON CONFLICT DO NOTHING` and, when the insert
 is a no-op, their moves are skipped too — another claim already recorded that
 position, so its moves are already there.
+
+**Positions, moves and plies each go out in multi-row statements**, not one
+statement per position. An opening-rack task carries `racks_per_batch`
+positions — 500 by default and up to 10,000 — so a statement each meant
+thousands of round trips inside the submit transaction, holding the task's row
+lock for all of them. Batched, it is a handful. Two details make it correct
+rather than merely faster: a plain multi-row insert returns its rows in the
+order they were given, which is what lines record ids up with the positions
+they came from and move ids up with their per-ply statistics; and the
+conflict-ignoring path returns a *subset*, so those rows are matched back on
+`(game_index, turn_number)` — the columns the partial unique index is on —
+rather than zipped.
 
 ### Task Claim
 
@@ -2138,8 +2243,15 @@ on a static-player job produces much less than it looks like it should.
 instance per `AutoplayWorker`, accumulating a list per thread, concatenated on
 consolidate. Because threads interleave games, the merged list is **not** in game or
 turn order. Rather than sorting on consolidate, the output is left unordered and the
-server keys on `(game_number, pair_game_number, turn_number)` — which it must do
-anyway.
+server keys on the position, which it must do anyway.
+
+**A pair's two games are one `game_index` space.** The recorder tracks
+`game_number` and `pair_game_number` separately, but what crosses the wire is a
+single index over the batch: `game_number * 2 + (pair_game_number - 1)` for a
+paired run, and `game_number` for an unpaired one. That is what lets the server
+key on `(task_id, game_index, turn_number)` — one pair of columns rather than
+three — and it is what makes the batch-size check meaningful, since a paired
+batch of N pairs has game indices `[0, 2N)` and `all_games.games` is `2N`.
 
 **Emitting it.** The existing `str_func` produces the `-hr false` summary lines the
 client parses for game results; positions are far too large for that shape, and the
@@ -2665,7 +2777,15 @@ ends on the `leavegen_max_games` cap alone, and reads results out of `RackList`
 via `rack_list_get_rack_equity_json`.
 
 **Neither the forced racks nor the results touch the filesystem.** They arrive in
-the task's JSON request and go back in its JSON response. The `-writerackequitycsv`
+the task's JSON request and go back in its JSON response. The one file a
+leave-generation task does write is the *previous generation's* KLV, which is
+fetched from `GET /api/worker/artifact` and has to be on disk for MAGPIE to
+load it as leaves: it goes to `lexica/<lexicon>_birdtest_previous.klv2`, under
+the same directory the shipped lexicon data lives in, overwritten per task. The
+name starts with the lexicon's because MAGPIE checks leaves against their
+lexicon by inferring a letter distribution from each name's prefix, and a bare
+name was refused before a single game was played. So `./data` must be writable
+for leave generation as well as for wordmap provisioning. The `-writerackequitycsv`
 flag and the CSV writer behind it are gone: a worker rendering JSON, writing it to
 disk, reading it back and parsing it, all to hand it to an HTTP POST, is a round
 trip through the filesystem for data that never needed to leave the process — and
@@ -2962,7 +3082,7 @@ accepted — which is **not an error**: the work was reassigned or is done. `400
 when the result does not satisfy its shape; `413` over 64 MiB.
 
 ```json
-{ "racks": [ { "rack": "ABDEELT",
+{ "racks": [ { "rack": "ABDEELT", "num_moves": 412,
                "moves": [ { "move": "8D BEADLET", "score": 76, "equity": 81.5,
                             "plies": [ { "ply": 0, "bingo_percentage": 0.0,
                                          "average_score": 24.0 } ] } ] } ] }
@@ -2986,7 +3106,9 @@ Server-side validation, so the client must satisfy it:
   agree with the aggregate on the pair count and on player 1's half-points;
   `divergent_games`, if present, has consistent counts with `games` even and
   `<= games`.
-- `moves` and `racks` must be non-empty.
+- `moves` and `racks` must be non-empty. `moves` carries at most the player
+  config's `num_plays_recorded`; `num_moves` says how many were ranked and must
+  not be below the number reported. It is optional, for builds that predate it.
 - `positions` is present only when the job set `capture_positions`, and each entry
   must fall inside the task's own games — see
   [Position Capture From Games](#position-capture-from-games).
@@ -3516,7 +3638,7 @@ the body omits them:
 | `use_wordmap` (leave generation) | **true** — it is the most game-heavy job type there is and a wordmap is a large speedup; workers build one on demand |
 | `capture_positions` | false |
 
-Beyond role matching, creation enforces three rules the schema cannot express:
+Beyond role matching, creation enforces four rules the schema cannot express:
 
 - **Settings a worker can run and a test can evaluate.** `redundancy` at least 1;
   `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
@@ -3534,6 +3656,10 @@ Beyond role matching, creation enforces three rules the schema cannot express:
   player but are really one MAGPIE setting for the whole run, so two *different*
   configs must agree on both. Skipped when both slots name the same config, which
   is a legal and useful degenerate case.
+- **A recorder that can rank, for opening racks.** `recorder_type = 'best'` with
+  `num_plays_recorded` above 1 is refused: `best` records one move, so the job
+  would store one move per rack while claiming to store ten. See
+  [How much of an analysis is kept](#how-much-of-an-analysis-is-kept).
 
 The response is `{ job, initialized }`, where `initialized` counts rows written
 up front. Only leave generation has any — the generation-1 rack universe. No job
@@ -4333,8 +4459,16 @@ CREATE TABLE tasks (
 -- Prevent duplicate seed-based tasks within the same job.
 CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed) WHERE seed IS NOT NULL;
 
--- Partial indexes to support efficient SKIP LOCKED task selection and timeout reclamation.
-CREATE INDEX tasks_queue_idx   ON tasks (job_id, state) WHERE state = 'available';
+-- Partial indexes to support efficient SKIP LOCKED task selection and timeout
+-- reclamation.
+--
+-- The queue index carries `created_at` rather than `state`, which the partial
+-- predicate already fixes: claim-time selection takes the *oldest* available
+-- task of a job (`registry::next_available`), so with `state` in the key the
+-- planner had to read every available task of the job and sort it. A job with
+-- redundancy above 1 leaves tasks available until their slots fill, so that is
+-- not a short list.
+CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'available';
 CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
@@ -4881,7 +5015,10 @@ CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
-CREATE INDEX        tasks_job_idx             ON tasks (job_id);
+-- (job_id, state), not job_id alone: the job list counts a job's tasks and its
+-- completed tasks for every job on the page, and with state in the index both
+-- are index-only rather than a heap visit per task.
+CREATE INDEX        tasks_job_idx             ON tasks (job_id, state);
 -- (task_id, submitted_at) rather than task_id alone: the per-task "first
 -- accepted result" read that every aggregate uses orders on both.
 CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);
@@ -5401,7 +5538,17 @@ only configuration that survives full account compromise.
    `duration_seconds` in the manifest and the `DurationSeconds` metric are what to
    watch.
 4. **`desired_count` stays 1**, and `infra/variables.tf` now refuses anything else:
-   imports, rate limits and SSE subscribers are all per-process.
+   imports, rate limits and SSE subscribers are all per-process. The *service*
+   enforces it too, with `deployment_minimum_healthy_percent = 0` and
+   `deployment_maximum_percent = 100`: ECS's default rolling deploy runs the new
+   task alongside the old one, and a starting process marks any import or export
+   left `running` as failed on the assumption that whoever owned it is gone — so
+   under the default, every deployment would fail the outgoing instance's live
+   work. Stopping first costs a few seconds with nothing serving, against an
+   invariant that otherwise does not hold exactly when the code changes. The
+   terminal writes are guarded on `state = 'running'` as well, so a reaped row
+   stays reaped rather than coming back `staged` or `ready` with the reaper's
+   error still on it.
 5. **Regenerable tables stay in the dump.** Excluding `tasks` and the request tables
    would make every restore a partial restore that has to re-derive state, which is
    exactly the complexity a backup exists to avoid.

@@ -407,8 +407,14 @@ pub async fn run_import(state: AppState, import_id: Uuid, tarball_date: String, 
     match stage(&state, import_id, &tarball_date, &commit_sha, &progress).await {
         Ok(staged) => {
             progress.flush_entries().await;
+            // Guarded on `running`: a process that started while this one was
+            // working reaps rows left `running` as failed, and a deployment
+            // overlaps the two for a few seconds. Without the guard this would
+            // flip a reaped row back to `staged` with the reaper's error still
+            // on it, and the admin would confirm a diff nobody was sure of.
             let _ = sqlx::query(
-                "UPDATE input_data_imports SET state = 'staged', tarball_sha256 = $2 WHERE id = $1",
+                "UPDATE input_data_imports SET state = 'staged', tarball_sha256 = $2
+                 WHERE id = $1 AND state = 'running'",
             )
             .bind(import_id)
             .bind(staged)
@@ -418,7 +424,8 @@ pub async fn run_import(state: AppState, import_id: Uuid, tarball_date: String, 
         Err(err) => {
             tracing::warn!(%import_id, error = %err.message, "input data import failed");
             let _ = sqlx::query(
-                "UPDATE input_data_imports SET state = 'failed', error = $2 WHERE id = $1",
+                "UPDATE input_data_imports SET state = 'failed', error = $2
+                 WHERE id = $1 AND state = 'running'",
             )
             .bind(import_id)
             .bind(&err.message)

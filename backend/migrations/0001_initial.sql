@@ -441,8 +441,16 @@ CREATE TABLE tasks (
 -- Prevent duplicate seed-based tasks within the same job.
 CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed) WHERE seed IS NOT NULL;
 
--- Partial indexes to support efficient SKIP LOCKED task selection and timeout reclamation.
-CREATE INDEX tasks_queue_idx   ON tasks (job_id, state) WHERE state = 'available';
+-- Partial indexes to support efficient SKIP LOCKED task selection and timeout
+-- reclamation.
+--
+-- The queue index carries `created_at` rather than `state`, which the partial
+-- predicate already fixes: claim-time selection takes the *oldest* available
+-- task of a job (`registry::next_available`), so with `state` in the key the
+-- planner had to read every available task of the job and sort it. A job with
+-- redundancy above 1 leaves tasks available until their slots fill, so that is
+-- not a short list.
+CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'available';
 CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
@@ -989,7 +997,10 @@ CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
-CREATE INDEX        tasks_job_idx             ON tasks (job_id);
+-- (job_id, state), not job_id alone: the job list counts a job's tasks and its
+-- completed tasks for every job on the page, and with state in the index both
+-- are index-only rather than a heap visit per task.
+CREATE INDEX        tasks_job_idx             ON tasks (job_id, state);
 -- (task_id, submitted_at) rather than task_id alone: the per-task "first
 -- accepted result" read that every aggregate uses orders on both.
 CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);

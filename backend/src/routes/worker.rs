@@ -475,16 +475,22 @@ async fn submit_result(
     Ok(Json(ResultAck { accepted: true }))
 }
 
-/// Evaluates the job's finish conditions, then pushes live stats if anyone is
-/// watching.
+/// Everything that has to happen after a result lands, split by whether the
+/// submitting worker has to wait for it.
 ///
-/// SPRT and the finish conditions are evaluated inline on every submission --
-/// there is no background sweep -- but only the part of the stats the decision
-/// needs is computed for it. The full payload, which for an opening-rack job
-/// aggregates over every analysed position, is built only when the job has a
-/// dashboard subscriber.
+/// **Inline:** the finish conditions. SPRT gates whether the job keeps
+/// dispatching, so it is evaluated on every submission and the aggregates it
+/// needs are read once, here.
+///
+/// **Spawned:** the live stats payload. It is display-only -- nothing in the
+/// claim path reads a statistic -- and it is the most expensive thing in this
+/// path, several aggregates over the job's whole history. Building it before
+/// answering the worker made the next claim wait on a dashboard nobody may
+/// have open. It is coalesced per job (`sse::begin_push`), so a busy job
+/// builds one payload at a time rather than one per submission, and they stay
+/// ordered because one task issues them.
 async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
-    let mut job = jobstats::load_job(&state.pool, job_id).await?;
+    let job = jobstats::load_job(&state.pool, job_id).await?;
 
     if job.status == JobStatus::Active && finish_condition_met(state, &job).await? {
         let updated = sqlx::query(
@@ -495,19 +501,46 @@ async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
         .await?;
         if updated.rows_affected() > 0 {
             tracing::info!(job_id = %job.id, "job auto-completed");
-            // So the pushed payload says `completed` rather than the status
-            // this request started with.
-            job = jobstats::load_job(&state.pool, job_id).await?;
         }
     }
 
-    if state.sse.has_subscribers(job_id) {
-        let stats = jobstats::compute(&state.pool, &job).await?;
-        if let Ok(payload) = serde_json::to_string(&stats) {
-            state.sse.publish(job_id, payload);
-        }
+    // Checked here so a job nobody is watching costs nothing at all; the
+    // payload itself is built off this request.
+    if state.sse.has_subscribers(job_id) && state.sse.begin_push(job_id) {
+        let state = state.clone();
+        tokio::spawn(async move { push_stats_until_idle(&state, job_id).await });
     }
     Ok(())
+}
+
+/// Build and publish the job's stats, repeating while submissions asked for
+/// another round while the last was building. Owned by one task per job, so
+/// pushes never overtake each other.
+async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
+    loop {
+        // Reloaded each round rather than carried in: the status may have
+        // changed since the submission that asked for this, and a payload
+        // saying `active` for a job that just completed is exactly the
+        // staleness the dashboard would notice.
+        match jobstats::load_job(&state.pool, job_id).await {
+            Ok(job) => match jobstats::compute(&state.pool, &job).await {
+                Ok(stats) => {
+                    if let Ok(payload) = serde_json::to_string(&stats) {
+                        state.sse.publish(job_id, payload);
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    job_id = %job_id, error = %err.message, "building live job stats failed"
+                ),
+            },
+            Err(err) => tracing::warn!(
+                job_id = %job_id, error = %err.message, "loading a job for its live stats failed"
+            ),
+        }
+        if !state.sse.end_push(job_id) {
+            return;
+        }
+    }
 }
 
 /// Either finish condition: SPRT significance (only after `min_units`) or the
