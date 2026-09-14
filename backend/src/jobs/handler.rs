@@ -25,8 +25,12 @@ pub trait JobHandler {
     /// Normalize a worker submission into its stored form.
     fn process_response(response: Self::Response) -> AppResult<Self::Record>;
 
+    /// `job_id` is passed rather than looked up: every record table carries it
+    /// denormalized so a job's rows can be read without joining through
+    /// `tasks`, and the caller has the job in hand already.
     async fn insert_record(
         conn: &mut PgConnection,
+        job_id: Uuid,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
@@ -239,9 +243,15 @@ pub struct MoveEntry {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RackAnalysis {
     pub rack: String,
-    /// Ranked best-first as MAGPIE emitted them. The server keeps only the
-    /// leading `num_plays_recorded`.
+    /// Ranked best-first as MAGPIE emitted them, truncated to the player
+    /// config's `num_plays_recorded` -- the same number the server keeps.
     pub moves: Vec<MoveEntry>,
+    /// How many moves were ranked before that truncation, which is the one
+    /// thing the stored moves cannot recover. Optional because it was added
+    /// after the first `birdtest-contribute` builds: absent, the reported list
+    /// is all there was, which is what those builds sent.
+    #[serde(default)]
+    pub num_moves: Option<i32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -370,7 +380,11 @@ pub struct PositionAnalysis {
 
 impl PositionAnalysis {
     /// An opening rack: no board, no game, no turn, no previous move.
-    pub fn opening_rack(rack: String, moves: Vec<MoveEntry>) -> Self {
+    ///
+    /// `num_moves` is what the worker says it ranked, which is generally more
+    /// than it reported. A client that does not send it reported everything it
+    /// ranked, so the list's own length is the honest answer.
+    pub fn opening_rack(rack: String, moves: Vec<MoveEntry>, num_moves: Option<i32>) -> Self {
         Self {
             rack,
             position: None,
@@ -378,7 +392,7 @@ impl PositionAnalysis {
             turn_number: None,
             previous_move: None,
             previous_move_score: None,
-            num_moves: moves.len() as i32,
+            num_moves: num_moves.unwrap_or(moves.len() as i32),
             moves,
         }
     }

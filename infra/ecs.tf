@@ -317,6 +317,23 @@ resource "aws_ecs_service" "main" {
   desired_count   = var.desired_count
   launch_type     = "FARGATE"
 
+  # Stop the old task before starting the new one, rather than ECS's default
+  # rolling deploy (minimum 100%, maximum 200%), which runs both at once.
+  #
+  # birdtest is a single instance by construction and several things depend on
+  # it: a starting process marks any input-data import or job export left
+  # `running` as failed, on the assumption that the process that owned it is
+  # gone. Under the default the new task does that to the old task's live work.
+  # Rate limits are per process and SSE subscribers only hear submissions made
+  # to their own instance, so an overlap is wrong for those too -- see
+  # `desired_count`'s description in variables.tf.
+  #
+  # The cost is a few seconds with no instance serving during a deployment.
+  # Worker claims retry, the dashboard's stream reconnects, and the alternative
+  # is an invariant that silently does not hold exactly when the code changes.
+  deployment_minimum_healthy_percent = 0
+  deployment_maximum_percent         = 100
+
   network_configuration {
     subnets          = aws_subnet.public[*].id
     security_groups  = [aws_security_group.service.id]

@@ -258,7 +258,13 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
                         ],
                     }
                 )
-            analyses.append({"rack": rack, "moves": moves})
+            # How many were ranked before truncation to the job's
+            # num_plays_recorded, which is generally far more than is reported.
+            # MAGPIE sends it; a submission that omits it is read as having
+            # reported everything it ranked.
+            analyses.append(
+                {"rack": rack, "moves": moves, "num_moves": count + rng.randint(0, 200)}
+            )
         return {"racks": analyses}
 
     if job_type == "leave_generation":

@@ -1028,6 +1028,55 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     }
 }
 
+/// An opening-rack job asks for a *ranked list* per rack, and a recorder type
+/// of `best` cannot produce one.
+///
+/// `-r best` is `MOVE_RECORD_BEST`: move generation keeps the single top play
+/// and discards the rest, so the batch comes back with exactly one move per
+/// rack however many the config says to record -- and, for a simming player,
+/// with nothing for the simulation to choose between, so `num_plies` and
+/// `num_plays` do nothing either. Verified against MAGPIE: `generate` on an
+/// opening rack reports "1 of 1 plays" under `-r1 best` and 100 under
+/// `-r1 all`.
+///
+/// Nothing downstream notices. The racks are analysed, the results are
+/// accepted, `racks_analyzed` climbs, and the corpus quietly holds a
+/// hundredth of the analysis it was configured for. So the contradiction is
+/// refused where it is introduced rather than discovered in the data later.
+///
+/// `best` with `num_plays_recorded = 1` is coherent and stays legal: "the best
+/// opening play for every rack" is a real job. This rule is scoped to opening
+/// racks; a `games` job's players are applied through autoplay, where the
+/// simmer's candidate list is sized by `num_plays` rather than by the move
+/// recorder, and `best` is the right setting there (PLAN.md, "Position Capture
+/// From Games").
+async fn validate_opening_rack_player(
+    conn: &mut sqlx::PgConnection,
+    player_config_id: Uuid,
+) -> AppResult<()> {
+    let row = sqlx::query_as::<_, (String, i32)>(
+        "SELECT recorder_type, num_plays_recorded FROM player_configs WHERE id = $1",
+    )
+    .bind(player_config_id)
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or_else(|| AppError::bad_request("player config not found"))?;
+
+    if row.0 == "best" && row.1 > 1 {
+        return Err(AppError::bad_request(
+            "an opening-rack job cannot rank moves with a 'best' recorder",
+        )
+        .with_field(
+            "player_config_id",
+            format!(
+                "this config records the single best move, so every rack would come back                  with one move rather than the {} it asks for. Use a config with                  recorder_type 'all' or 'equity', or set num_plays_recorded to 1.",
+                row.1
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// MAGPIE has one value for these for the whole run, not one per player, even
 /// though they live on `player_configs` (so that table stays the exhaustive
 /// source of what a job asked for -- see the migration comment on
@@ -1139,6 +1188,7 @@ async fn insert_job_config(
                 letterdist_name,
             )
             .await?;
+            validate_opening_rack_player(&mut *conn, *player_config_id).await?;
             // Counting the space is cheap -- a small dynamic-programming table
             // over the letter distribution -- and recording it here means the
             // scheduler can tell when the job is exhausted without re-deriving
@@ -1439,12 +1489,10 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
              (SELECT count(*) FROM tasks WHERE job_id = $1)                        AS tasks,
              (SELECT count(*) FROM task_claims c JOIN tasks t ON t.id = c.task_id
                WHERE t.job_id = $1)                                                AS claims,
-             (SELECT count(*) FROM game_results r JOIN tasks t ON t.id = r.task_id
-               WHERE t.job_id = $1)                                                AS game_results,
+             (SELECT count(*) FROM game_results WHERE job_id = $1)                  AS game_results,
              (SELECT count(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id
                WHERE t.job_id = $1)                                                AS leave_records,
-             (SELECT count(*) FROM position_analysis_records r JOIN tasks t ON t.id = r.task_id
-               WHERE t.job_id = $1)                                                AS positions,
+             (SELECT count(*) FROM position_analysis_records WHERE job_id = $1)     AS positions,
              (SELECT count(*) FROM leave_rack_progress WHERE job_id = $1)          AS rack_progress,
              (SELECT count(*) FROM leave_generation_artifacts WHERE job_id = $1)   AS artifacts",
     )
@@ -1496,6 +1544,51 @@ struct PurgeResult {
 /// Clear every result and return the job's tasks to `available`. On-demand tasks
 /// are deleted outright — they are regenerated at claim time, and keeping them
 /// would leave the seed cursor advanced past work that was never done.
+/// Give back the contribution each identity earned on this job, before its
+/// claims are destroyed.
+///
+/// The counters on `jobs` belong to the job, so a purge simply zeroes them. The
+/// ones on `users` and `anonymous_workers` do not: they span every job an
+/// identity ever worked on, so a job whose claims are about to disappear has to
+/// hand back exactly what it contributed, or the contributor lists read high
+/// for good and nothing says why. Must run *before* the claims go, since it
+/// counts them.
+///
+/// `last_completed_at` is deliberately not rewound. Finding the new maximum
+/// means the scan these counters exist to avoid, and it is a display figure
+/// that only ever moves forward; a purge can leave it pointing at a time whose
+/// task is gone.
+async fn release_contributions(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE users u
+         SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
+         FROM (SELECT c.claimed_by_user_id AS id, COUNT(*)::bigint AS n
+               FROM task_claims c JOIN tasks t ON t.id = c.task_id
+               WHERE t.job_id = $1 AND c.state = 'completed'
+                 AND c.claimed_by_user_id IS NOT NULL
+               GROUP BY 1) d
+         WHERE u.id = d.id",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
+
+    sqlx::query(
+        "UPDATE anonymous_workers w
+         SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
+         FROM (SELECT c.claimed_by_anon_uuid AS uuid, COUNT(*)::bigint AS n
+               FROM task_claims c JOIN tasks t ON t.id = c.task_id
+               WHERE t.job_id = $1 AND c.state = 'completed'
+                 AND c.claimed_by_anon_uuid IS NOT NULL
+               GROUP BY 1) d
+         WHERE w.uuid = d.uuid",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 async fn purge_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1507,6 +1600,15 @@ async fn purge_job(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
+    // The same lock every claim takes before deciding what to hand out, and
+    // for the same reason. A claim in flight has already read the seed cursor
+    // and is about to insert its task and its claim row; the deletes below
+    // cannot see those uncommitted rows, so without this the purge finishes
+    // and the claim then commits a task into the job it just emptied --
+    // leaving the seed cursor past zero and `claims_issued` at 1 on a job that
+    // was supposed to start over. Taken before the census, so the numbers
+    // written to the audit log are the ones actually destroyed.
+    crate::jobs::lock_job_dispatch(&mut tx, id).await?;
     let job = load_job_for_update(&mut tx, id).await?;
 
     // Written before anything is deleted: after this transaction commits, this
@@ -1523,6 +1625,10 @@ async fn purge_job(
     )
     .await?;
 
+    // Before the claims go, and for the same reason the census is taken first:
+    // it counts what is about to be destroyed.
+    release_contributions(&mut tx, id).await?;
+
     // Records and claims cascade from tasks; leave-gen progress is keyed on
     // the job directly. Ratings are not touched: they belong to rating pools,
     // not jobs, and are a pure function of the results that remain -- the
@@ -1535,7 +1641,8 @@ async fn purge_job(
     // alone, a purged job would restart owing the scheduler every claim it ever
     // had, and reporting progress it no longer has any results for.
     sqlx::query(
-        "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0
+        "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
+                         tasks_total = 0, tasks_completed = 0
          WHERE id = $1",
     )
     .bind(id)
@@ -1629,6 +1736,11 @@ async fn delete_job(
         census,
     )
     .await?;
+
+    // Deleting the job cascades its tasks and their claims away, so the
+    // identities that earned them have to be paid back first -- see
+    // `release_contributions`.
+    release_contributions(&mut tx, id).await?;
 
     let deleted = sqlx::query("DELETE FROM jobs WHERE id = $1")
         .bind(id)

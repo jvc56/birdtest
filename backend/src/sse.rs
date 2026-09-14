@@ -9,6 +9,13 @@ use uuid::Uuid;
 #[derive(Clone, Default)]
 pub struct SseBroadcaster {
     channels: Arc<Mutex<HashMap<Uuid, broadcast::Sender<String>>>>,
+    /// Jobs with a stats push in flight, and whether a further one has been
+    /// asked for while it ran. Building the payload is several aggregates over
+    /// a job's history, so it runs on a spawned task rather than on the
+    /// submission that triggered it -- and this is what stops a busy job
+    /// spawning one of those per submission, all reading the same rows and
+    /// racing each other to publish out of order.
+    pushes: Arc<Mutex<HashMap<Uuid, bool>>>,
 }
 
 impl SseBroadcaster {
@@ -40,6 +47,43 @@ impl SseBroadcaster {
         }
     }
 
+    /// Ask for a stats push, and say whether the caller is the one to do it.
+    ///
+    /// `true` means no push is running for this job and the caller owns the
+    /// loop; `false` means one is already running and has been told to go
+    /// round again, so the caller has nothing to do. Coalescing rather than
+    /// spawning per submission keeps a busy job to one in-flight payload plus
+    /// one queued, and keeps the pushes ordered, since a single task issues
+    /// them.
+    pub fn begin_push(&self, job_id: Uuid) -> bool {
+        let mut pushes = self.pushes.lock().expect("sse push map poisoned");
+        match pushes.get_mut(&job_id) {
+            Some(pending) => {
+                *pending = true;
+                false
+            }
+            None => {
+                pushes.insert(job_id, false);
+                true
+            }
+        }
+    }
+
+    /// Finish a push, returning whether another round was asked for meanwhile.
+    pub fn end_push(&self, job_id: Uuid) -> bool {
+        let mut pushes = self.pushes.lock().expect("sse push map poisoned");
+        match pushes.get_mut(&job_id) {
+            Some(pending) if *pending => {
+                *pending = false;
+                true
+            }
+            _ => {
+                pushes.remove(&job_id);
+                false
+            }
+        }
+    }
+
     /// Push a serialized stats payload to everyone watching `job_id`. A send with
     /// no receivers is not an error — nobody has the dashboard open.
     pub fn publish(&self, job_id: Uuid, payload: String) {
@@ -55,6 +99,25 @@ impl SseBroadcaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A burst of submissions must not spawn a payload build each: the first
+    /// owns the loop, the rest only mark it to go round once more.
+    #[test]
+    fn pushes_coalesce_into_one_in_flight_and_one_pending() {
+        let sse = SseBroadcaster::new();
+        let job = Uuid::new_v4();
+
+        assert!(sse.begin_push(job), "the first caller owns the push");
+        assert!(!sse.begin_push(job), "a second caller defers to it");
+        assert!(!sse.begin_push(job), "and so does a third");
+
+        assert!(sse.end_push(job), "one more round was asked for");
+        assert!(!sse.end_push(job), "and nothing was asked for during that one");
+
+        // Back to idle, so the next submission owns the loop again.
+        assert!(sse.begin_push(job));
+        assert!(!sse.end_push(job));
+    }
 
     #[test]
     fn subscribers_are_counted_and_forgotten_when_they_leave() {

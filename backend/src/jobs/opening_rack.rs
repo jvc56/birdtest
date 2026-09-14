@@ -63,12 +63,16 @@ impl JobHandler for OpeningRackHandler {
                 )));
             }
             super::plausibility::check_rack(&analysis.rack, "opening rack")?;
-            // `RackAnalysis` carries no generated-move count, so there is
-            // nothing to check the list length against here.
-            super::plausibility::check_moves(&analysis.moves, None, "opening rack")?;
+            // A worker cannot have reported more moves than it says it ranked.
+            super::plausibility::check_moves(
+                &analysis.moves,
+                analysis.num_moves,
+                "opening rack",
+            )?;
             racks.push(PositionAnalysis::opening_rack(
                 analysis.rack.clone(),
                 analysis.moves,
+                analysis.num_moves,
             ));
         }
         Ok(PositionAnalysisRecord { positions: racks })
@@ -76,6 +80,7 @@ impl JobHandler for OpeningRackHandler {
 
     async fn insert_record(
         conn: &mut PgConnection,
+        job_id: Uuid,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
@@ -98,9 +103,16 @@ impl JobHandler for OpeningRackHandler {
 
         // An opening rack is unique per (claim, rack), so a conflict here would
         // be a duplicate within one submission rather than a redundant claim.
-        super::insert_position_analyses(conn, task_id, claim_id, &record.positions,
-                                        num_plays_recorded, false)
-            .await?;
+        super::insert_position_analyses(
+            conn,
+            job_id,
+            task_id,
+            claim_id,
+            &record.positions,
+            num_plays_recorded,
+            false,
+        )
+        .await?;
 
         Ok(())
     }
@@ -268,3 +280,48 @@ pub async fn insert_range(
     Ok(())
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analysis(rack: &str, moves: usize, num_moves: Option<i32>) -> serde_json::Value {
+        serde_json::json!({
+            "rack": rack,
+            "num_moves": num_moves,
+            "moves": (0..moves).map(|i| serde_json::json!({
+                "move": format!("8D PLAY{i}"), "score": 30, "equity": 32.5,
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    fn process(racks: Vec<serde_json::Value>) -> AppResult<PositionAnalysisRecord> {
+        let response: PositionAnalysisResponse =
+            serde_json::from_value(serde_json::json!({ "racks": racks })).unwrap();
+        OpeningRackHandler::process_response(response)
+    }
+
+    /// The stored moves are truncated, so `num_moves` is the only record of how
+    /// many the worker actually ranked. MAGPIE now caps the reported list at
+    /// the job's `num_plays_recorded` and states the full count alongside it.
+    #[test]
+    fn a_ranked_count_larger_than_the_reported_list_is_kept() {
+        let record = process(vec![analysis("AEINRST", 3, Some(412))]).unwrap();
+        assert_eq!(record.positions[0].num_moves, 412);
+        assert_eq!(record.positions[0].moves.len(), 3);
+    }
+
+    /// Builds that predate the field reported everything they ranked, so the
+    /// list's own length is the honest answer for them.
+    #[test]
+    fn an_absent_ranked_count_falls_back_to_the_reported_list() {
+        let record = process(vec![analysis("AEINRST", 4, None)]).unwrap();
+        assert_eq!(record.positions[0].num_moves, 4);
+    }
+
+    /// A worker cannot report more moves than it says it generated.
+    #[test]
+    fn a_ranked_count_below_the_reported_list_is_refused() {
+        assert!(process(vec![analysis("AEINRST", 5, Some(2))]).is_err());
+    }
+}

@@ -185,6 +185,7 @@ impl TestDb {
             pool: self.pool.clone(),
             cfg: cfg.clone(),
             sse: birdtest::sse::SseBroadcaster::new(),
+            finish_checks: Default::default(),
             limits: birdtest::ratelimit::RateLimiters::new(),
             mailer: birdtest::email::Mailer::new(cfg.clone()).await,
             artifacts: birdtest::artifacts::ArtifactStore::new(cfg.clone()).await,

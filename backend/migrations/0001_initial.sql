@@ -16,8 +16,26 @@ CREATE TABLE users (
     -- tombstones and API keys are deleted, but the account's claims and
     -- results stay, so no donated compute is lost.
     deleted_at           TIMESTAMPTZ,
+    -- Completed claims by this account, and when the last one landed. Running
+    -- totals rather than a COUNT over task_claims: the contributor lists order
+    -- by this, so counting it meant computing every user's whole history before
+    -- a LIMIT could apply. Maintained in the submit transaction.
+    --
+    -- Unlike the counters on `jobs`, this one spans jobs, so it is not enough
+    -- to zero it when a job goes: purge_job and delete_job decrement it by what
+    -- they are about to destroy. `last_completed_at` is deliberately NOT
+    -- rewound by those, since finding the new maximum means the scan the
+    -- counter exists to avoid; it only ever moves forward, and is a display
+    -- figure.
+    tasks_completed      BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    last_completed_at    TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Serves /api/users, which ranks accounts by contribution. Partial because a
+-- deleted account is never listed.
+CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at ASC)
+    WHERE deleted_at IS NULL;
 
 CREATE TABLE email_confirmations (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -53,8 +71,23 @@ CREATE TABLE api_keys (
 CREATE TABLE anonymous_workers (
     uuid          UUID PRIMARY KEY,
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    -- Any request from this identity touches this, at most once a minute: it
+    -- answers "is this worker still around".
+    last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- The contribution counters, mirroring users.tasks_completed /
+    -- last_completed_at; see there for why they are counters and who
+    -- decrements them. `last_completed_at` is distinct from `last_seen_at`
+    -- above: one is the last task finished, the other is the last request of
+    -- any kind, and the contributor list shows the first.
+    tasks_completed   BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    last_completed_at TIMESTAMPTZ
 );
+
+-- Serves the anonymous half of /api/workers, which merges both kinds of
+-- identity in one ranking. Partial: an identity that has completed nothing is
+-- not a contributor and is not listed.
+CREATE INDEX anonymous_workers_contribution_idx
+    ON anonymous_workers (tasks_completed DESC) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -69,6 +102,18 @@ CREATE TABLE worker_bans (
         (user_id IS NOT NULL)::int + (anon_uuid IS NOT NULL)::int = 1
     )
 );
+
+-- One ban per identity. A second row for an identity already banned carries no
+-- information -- enforcement is an EXISTS, so the second reason is never read
+-- -- and it breaks unban, which deletes by row id: an admin lifts a ban, one
+-- row goes, the identity stays banned, and nothing says why. A duplicate is a
+-- 409 through the usual unique-violation mapping instead. "Ban again with a
+-- different reason" survives as unban-then-ban, which the audit log records as
+-- both halves.
+CREATE UNIQUE INDEX worker_bans_user_idx ON worker_bans (user_id)
+    WHERE user_id IS NOT NULL;
+CREATE UNIQUE INDEX worker_bans_anon_idx ON worker_bans (anon_uuid)
+    WHERE anon_uuid IS NOT NULL;
 
 -- Input data
 --
@@ -226,6 +271,14 @@ CREATE TABLE jobs (
     -- recomputes them (RUNBOOK 2.3).
     games_completed BIGINT NOT NULL DEFAULT 0 CHECK (games_completed >= 0),
     racks_analyzed  BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
+    -- Tasks created, and tasks that reached `completed`. The job list shows
+    -- both for every job on the page, and counting them meant two COUNT(*)s
+    -- over `tasks` per job per page view -- linear in each job's whole history,
+    -- on the site's index. Same reasoning and same caveats as the two counters
+    -- above: nothing decides anything from them, a purge zeroes them, and a
+    -- partial restore recomputes them (RUNBOOK 2.3).
+    tasks_total     BIGINT NOT NULL DEFAULT 0 CHECK (tasks_total >= 0),
+    tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ
@@ -441,8 +494,16 @@ CREATE TABLE tasks (
 -- Prevent duplicate seed-based tasks within the same job.
 CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed) WHERE seed IS NOT NULL;
 
--- Partial indexes to support efficient SKIP LOCKED task selection and timeout reclamation.
-CREATE INDEX tasks_queue_idx   ON tasks (job_id, state) WHERE state = 'available';
+-- Partial indexes to support efficient SKIP LOCKED task selection and timeout
+-- reclamation.
+--
+-- The queue index carries `created_at` rather than `state`, which the partial
+-- predicate already fixes: claim-time selection takes the *oldest* available
+-- task of a job (`registry::next_available`), so with `state` in the key the
+-- planner had to read every available task of the job and sort it. A job with
+-- redundancy above 1 leaves tasks available until their slots fill, so that is
+-- not a short list.
+CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'available';
 CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
@@ -598,6 +659,13 @@ CREATE TABLE position_analysis_records (
     id              BIGSERIAL PRIMARY KEY,
     task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- Denormalized from the task. Every read of a job's records -- the public
+    -- results feed, the rack lookup, the admin stream, the export -- filtered
+    -- on the job and could only reach it through `tasks`, which put the filter
+    -- on the far side of a join from the sort and made the whole job the unit
+    -- of work. With the column here they are index scans. `position_analysis_
+    -- moves` already carries `task_id` for the same family of reason.
+    job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     rack            TEXT NOT NULL,
     -- CGP of the position analysed. NULL for an opening rack, where the board
     -- is empty by definition and the rack is the whole position.
@@ -641,6 +709,19 @@ CREATE UNIQUE INDEX position_analysis_records_rack_idx
 
 CREATE INDEX position_analysis_records_task_idx
     ON position_analysis_records (task_id, rack);
+
+-- The public results feed, which is newest-first within a job and paginated by
+-- keyset. `id` is in the index because it is the cursor's tiebreaker:
+-- `submitted_at` defaults to now(), which is transaction time, so every record
+-- of one batch shares it exactly and it is not a key on its own.
+CREATE INDEX position_analysis_records_feed_idx
+    ON position_analysis_records (job_id, submitted_at DESC, id DESC);
+
+-- The rack lookup (`?rack=`), which is the branch the site actually uses. One
+-- probe rather than one per task of the job. Opening racks only: an
+-- incidentally-captured in-game position is not an opening-rack analysis.
+CREATE INDEX position_analysis_records_job_rack_idx
+    ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
 
 -- The top `num_plays_recorded` moves per position, from the player config that
 -- produced them. Storing every move the worker ranked would be untenable:
@@ -704,6 +785,8 @@ CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_i
 CREATE TABLE game_results (
     task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- Denormalized from the task; see position_analysis_records.job_id.
+    job_id            UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
 
     -- Every game this task played. Two per pair for a game_pairs task.
     games             INT NOT NULL CHECK (games >= 0),
@@ -989,10 +1072,18 @@ CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
-CREATE INDEX        tasks_job_idx             ON tasks (job_id);
+-- (job_id, state), not job_id alone: the job list counts a job's tasks and its
+-- completed tasks for every job on the page, and with state in the index both
+-- are index-only rather than a heap visit per task.
+CREATE INDEX        tasks_job_idx             ON tasks (job_id, state);
 -- (task_id, submitted_at) rather than task_id alone: the per-task "first
 -- accepted result" read that every aggregate uses orders on both.
 CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);
+-- The public results feed for a games or game-pairs job, keyset-paginated like
+-- the opening-rack one. `task_claim_id` is the primary key and so the
+-- tiebreaker, since `game_results` has no serial.
+CREATE INDEX        game_results_feed_idx
+    ON game_results (job_id, submitted_at DESC, task_claim_id DESC);
 CREATE INDEX        leave_records_task_idx    ON leave_records (task_id);
 CREATE INDEX        position_records_task_idx ON position_analysis_records (task_id);
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);

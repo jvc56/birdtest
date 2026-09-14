@@ -48,6 +48,18 @@
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
+  // The combination job creation refuses, surfaced before the submit rather
+  // than as the error that comes back from it: `-r best` is MOVE_RECORD_BEST,
+  // so movegen keeps one play and the rest of the ranking never exists.
+  $: selectedConfig = configs.find((config) => config.id === playerConfigId);
+  $: openingRackConflict =
+    jobType === 'opening_rack' &&
+    selectedConfig &&
+    selectedConfig.recorder_type === 'best' &&
+    selectedConfig.num_plays_recorded > 1
+      ? `${selectedConfig.name} records only the best move, so this job would store one play per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
+      : null;
+
   function firstOfRole(role: string): string {
     return files.find((f) => f.role === role)?.id ?? '';
   }
@@ -187,13 +199,27 @@
     <div>
       <label class="label" for="pc">Player config</label>
       <select id="pc" class="input" bind:value={playerConfigId}>
-        {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
+        {#each configs as config}
+          <option value={config.id}>
+            {config.name} — recorder {config.recorder_type}, {config.num_plays_recorded} play{config.num_plays_recorded === 1
+              ? ''
+              : 's'} recorded
+          </option>
+        {/each}
       </select>
     </div>
+    {#if openingRackConflict}
+      <p class="field-error">
+        {openingRackConflict} Pick a config whose recorder is <strong>all</strong> or
+        <strong>equity</strong>, or one that records a single play.
+      </p>
+    {/if}
     <p class="text-xs text-muted-foreground">
-      Every distinct 7-tile rack drawable from this lexicon's bag becomes one task at creation
-      time. For a full English bag that is a large number of rows — use a small distribution while
-      testing.
+      The recorder is shown because it decides whether this job can rank anything at all:
+      <strong>best</strong> keeps only the top move, so every rack would come back with one
+      analysis however many plays the config says to record. Tasks address <em>ranges</em> of the
+      rack space and are generated as workers claim them, so creating the job writes no rows
+      however large the space is.
     </p>
   {:else if jobType === 'games' || jobType === 'game_pairs'}
     <div class="grid grid-cols-2 gap-3">

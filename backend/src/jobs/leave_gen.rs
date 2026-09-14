@@ -75,20 +75,16 @@ impl JobHandler for LeaveGenHandler {
 
     async fn insert_record(
         conn: &mut PgConnection,
+        job_id: Uuid,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
     ) -> AppResult<()> {
-        let row = sqlx::query(
-            "SELECT r.generation, t.job_id
-             FROM leave_requests r JOIN tasks t ON t.id = r.task_id
-             WHERE r.task_id = $1",
-        )
-        .bind(task_id)
-        .fetch_one(&mut *conn)
-        .await?;
-        let generation: i32 = row.get("generation");
-        let job_id: Uuid = row.get("job_id");
+        let generation: i32 =
+            sqlx::query_scalar("SELECT generation FROM leave_requests WHERE task_id = $1")
+                .bind(task_id)
+                .fetch_one(&mut *conn)
+                .await?;
 
         sqlx::query(
             "INSERT INTO leave_records (task_claim_id, task_id, rack_count)
@@ -191,11 +187,14 @@ const TRANSITION_TAKEOVER_AFTER: &str = "30 minutes";
 /// the `leave_generation_transitions` row this lock makes it safe to test and
 /// write.
 ///
-/// It is [`super::lock_job_dispatch`], which every job type now takes for the
-/// same underlying reason; leave generation just has the most to lose by not
-/// holding it.
-pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<()> {
-    super::lock_job_dispatch(conn, job_id).await
+/// It is [`super::try_lock_job_dispatch`], which every job type now takes for
+/// the same underlying reason; leave generation just has the most to lose by
+/// not holding it -- and the most to gain from the bounded wait, since seeding
+/// a generation's rack universe holds this lock for tens of seconds.
+///
+/// `false` means another claim holds it and this one should move on.
+pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppResult<bool> {
+    super::try_lock_job_dispatch(conn, job_id).await
 }
 
 /// What the scheduler should do next for a leave-generation job.

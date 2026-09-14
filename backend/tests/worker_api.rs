@@ -413,6 +413,74 @@ async fn every_claim_advances_the_dispatch_counter() {
     assert_eq!(active, 1);
 }
 
+/// A ban refuses the identity itself, on every worker endpoint.
+///
+/// The check rides in the same statement that resolves the identity, which is
+/// what keeps it off a second round trip on every claim -- so it is worth a
+/// test that it is still actually made, for both kinds of worker. Without it a
+/// banned contributor keeps claiming and submitting and nothing says so.
+#[tokio::test]
+async fn a_banned_identity_is_refused_however_it_authenticates() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    db.games_job(1, 2).await;
+
+    // An anonymous worker, banned by the UUID the server minted for it.
+    let (_, anon) = first_claim(&app).await;
+    sqlx::query("INSERT INTO worker_bans (anon_uuid) VALUES ($1::uuid)")
+        .bind(&anon)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app,
+        post_json("/api/worker/task", &[("x-worker-uuid", &anon)], claim_body("1.0.0", &[])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a banned anonymous worker cannot claim");
+    let (status, _) = send(
+        &app,
+        post_json(
+            "/api/worker/heartbeat",
+            &[("x-worker-uuid", &anon)],
+            json!({ "claim_token": Uuid::new_v4() }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "nor heartbeat for one it already held");
+
+    // An authenticated worker, banned by user id.
+    let user = db.user("bannedcontributor", false).await;
+    let raw_key = "bt_".to_string() + &"a".repeat(64);
+    sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)")
+        .bind(user)
+        .bind(birdtest::auth::api_key::hash_key(&raw_key))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let bearer = format!("Bearer {raw_key}");
+
+    // The key works before the ban...
+    let (status, _) = send(
+        &app,
+        post_json("/api/worker/task", &[("authorization", &bearer)], claim_body("1.0.0", &[])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "an unbanned key claims normally");
+
+    sqlx::query("INSERT INTO worker_bans (user_id) VALUES ($1)")
+        .bind(user)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, _) = send(
+        &app,
+        post_json("/api/worker/task", &[("authorization", &bearer)], claim_body("1.0.0", &[])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "and not after it");
+}
+
 /// Bug: a claim token worked for any registered identity, so a banned worker
 /// could hand its tokens to another, and a result was audit-logged under
 /// whoever submitted it. The token is now bound to the identity it was issued
@@ -618,4 +686,327 @@ async fn concurrent_claims_tile_the_seed_space_instead_of_colliding() {
         .await
         .unwrap();
     assert_eq!(tasks, WORKERS as i64);
+}
+
+/// Positions and their ranked moves go out in multi-row statements rather than
+/// one per position, so the thing worth pinning is that each record still ends
+/// up with *its own* moves.
+///
+/// A batch is `racks_per_batch` positions -- 500 by default, up to 10,000 --
+/// and the ids come back in insertion order, which is what lines them up. Get
+/// the order wrong and every rack is stored with another rack's analysis:
+/// well-formed, plausible, and silently false.
+#[tokio::test]
+async fn a_batched_opening_rack_submission_keeps_each_racks_own_moves() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("solver", admin).await;
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 8, 7, 100)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = assignment["claim_token"].as_str().unwrap().to_string();
+    let racks: Vec<String> = assignment["task_request"]["racks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(racks.len(), 8);
+
+    // Each rack gets a move naming itself, and two ranked moves, so both the
+    // record ordering and the per-record rank are checked.
+    let result = json!({
+        "racks": racks.iter().enumerate().map(|(i, rack)| json!({
+            "rack": rack,
+            "moves": [
+                { "move": format!("best-{rack}"), "score": 30 + i as i32, "equity": 32.5 },
+                { "move": format!("second-{rack}"), "score": 10, "equity": 12.5 },
+            ],
+        })).collect::<Vec<_>>()
+    });
+    let (status, body) = submit_as(&app, &uuid, &token, result).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let stored: Vec<(String, i16, String)> = sqlx::query_as(
+        "SELECT r.rack, m.rank, m.move
+         FROM position_analysis_records r
+         JOIN position_analysis_moves m ON m.record_id = r.id
+         JOIN tasks t ON t.id = r.task_id
+         WHERE t.job_id = $1
+         ORDER BY r.rack, m.rank",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+
+    assert_eq!(stored.len(), 16, "two moves for each of eight racks");
+    for (rack, rank, play) in &stored {
+        let expected = if *rank == 1 { format!("best-{rack}") } else { format!("second-{rack}") };
+        assert_eq!(play, &expected, "rack {rack} rank {rank} got another rack's move");
+    }
+}
+
+/// Captured in-game positions are keyed on the task, not the claim, so a
+/// redundant claim replaying the same deterministic games records nothing new.
+///
+/// Written as one multi-row insert with `ON CONFLICT DO NOTHING`, what comes
+/// back is a *subset* of what went in, so the second claim's moves must be
+/// matched to the rows that actually landed rather than zipped against the
+/// whole batch. Zipped, the second claim would attach its moves to the wrong
+/// records, or to none.
+#[tokio::test]
+async fn redundant_captured_positions_are_recorded_once() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2, 2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let positions = json!([
+        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+          "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
+        { "game_index": 1, "turn_number": 0, "rack": "AEINRSU", "position": "cgp-1",
+          "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
+    ]);
+    let mut result = games_result(2, 1);
+    result["positions"] = positions;
+
+    // Two independent workers on the same task, both replaying the same games.
+    let (first, first_uuid) = first_claim(&app).await;
+    let (second, second_uuid) = first_claim(&app).await;
+    assert_eq!(first["task_request"]["seed"], second["task_request"]["seed"], "the same task");
+
+    for (uuid, assignment) in [(&first_uuid, &first), (&second_uuid, &second)] {
+        let token = assignment["claim_token"].as_str().unwrap();
+        let (status, body) = submit_as(&app, uuid, token, result.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["accepted"], true, "{body}");
+    }
+
+    let (records, moves): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM position_analysis_records r
+                 JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1),
+                (SELECT COUNT(*) FROM position_analysis_moves m
+                 JOIN tasks t ON t.id = m.task_id WHERE t.job_id = $1)",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(records, 2, "redundancy must not multiply the corpus");
+    assert_eq!(moves, 2, "and the second claim's moves must not be written twice either");
+
+    // Both aggregates are still stored separately: redundancy still verifies
+    // the result, it just does not duplicate the positions.
+    let results: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM game_results r JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(results, 2);
+}
+
+/// `expected_data` is the union over the job and its players, deduplicated, and
+/// it is what the client verifies before it runs anything.
+///
+/// It is one query over a union of the per-type config tables rather than a
+/// match on `job_type` followed by two more queries, so this pins the answer
+/// rather than the shape of the code: two players on one lexicon contribute one
+/// `kwg` entry, a static player contributes no `winpct` entry at all, and a
+/// leave-generation job -- which has no player config row -- carries exactly
+/// the three files its bot loads.
+#[tokio::test]
+async fn an_assignment_names_every_file_the_task_loads_and_no_others() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+
+    // Both players are static and share one config row, which is legal and is
+    // the degenerate case the dedup has to survive.
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("shared", admin).await;
+    let job = db.bare_job("games", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_game_config
+             (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
+         VALUES ($1, $2, $2, 1, 1000000, 1000000)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let (assignment, _) = first_claim(&app).await;
+    let mut roles: Vec<String> = assignment["expected_data"]["files"]
+        .as_array()
+        .expect("expected_data carries files")
+        .iter()
+        .map(|f| f["role"].as_str().unwrap().to_string())
+        .collect();
+    roles.sort();
+    assert_eq!(
+        roles,
+        vec!["klv", "kwg", "layout", "letterdist"],
+        "one entry per distinct file, and no winpct for a static player"
+    );
+    assert_eq!(assignment["expected_data"]["algorithm"], "sha256");
+    for file in assignment["expected_data"]["files"].as_array().unwrap() {
+        assert!(file["sha256"].as_str().unwrap().len() == 64, "{file}");
+        assert!(file["path"].as_str().unwrap().contains('/'), "{file}");
+        assert_eq!(file["tarball_date"], "20251004");
+    }
+}
+
+/// Contribution counters are running totals now, not counts over `task_claims`,
+/// and the contributor lists read them. A counter that does not move, or moves
+/// twice, is a wrong leaderboard that nothing else contradicts.
+#[tokio::test]
+async fn contributions_are_counted_as_they_arrive() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let counters = |uuid: String| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, Option<chrono::DateTime<chrono::Utc>>)>(
+                "SELECT tasks_completed, last_completed_at FROM anonymous_workers WHERE uuid = $1::uuid",
+            )
+            .bind(uuid)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let (assignment, uuid) = first_claim(&app).await;
+    assert_eq!(counters(uuid.clone()).await, (0, None), "a claim is not a contribution");
+
+    let token = assignment["claim_token"].as_str().unwrap();
+    let (_, body) = submit_as(&app, &uuid, token, games_result(2, 1)).await;
+    assert_eq!(body["accepted"], true);
+
+    let (completed, last) = counters(uuid.clone()).await;
+    assert_eq!(completed, 1);
+    assert!(last.is_some(), "the timestamp is the last task finished, not the last request");
+
+    // And a second task moves it again.
+    let (status, assignment) = claim_as(&app, &uuid).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    let token = assignment["claim_token"].as_str().unwrap();
+    submit_as(&app, &uuid, token, games_result(2, 2)).await;
+    assert_eq!(counters(uuid.clone()).await.0, 2);
+
+    // The job's own task counters track creation and completion separately.
+    let (total, completed): (i64, i64) =
+        sqlx::query_as("SELECT tasks_total, tasks_completed FROM jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((total, completed), (2, 2));
+
+    // And the leaderboard reads them rather than counting claims.
+    let (status, body) = send(&app, get_request("/api/workers", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["items"][0]["tasks_completed"], 2);
+    assert!(body["items"][0]["last_seen_at"].is_string(), "{body}");
+}
+
+/// The results feed pages by cursor, because a job's corpus is millions of rows
+/// and `OFFSET` produces every one of them before the page asked for.
+///
+/// What this pins is that the cursor actually walks the whole set exactly once:
+/// a keyset that ties (`submitted_at` is transaction time, so a whole batch
+/// shares it) would silently repeat or skip rows between pages.
+#[tokio::test]
+async fn the_results_feed_walks_every_row_exactly_once() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("solver", admin).await;
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 6, 7, 100)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    // Two batches, so the feed spans more than one submission timestamp and
+    // more than one page.
+    let mut expected: Vec<String> = Vec::new();
+    for _ in 0..2 {
+        let (assignment, uuid) = first_claim(&app).await;
+        let token = assignment["claim_token"].as_str().unwrap().to_string();
+        let racks: Vec<String> = assignment["task_request"]["racks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect();
+        expected.extend(racks.iter().cloned());
+        let result = json!({
+            "racks": racks.iter().map(|rack| json!({
+                "rack": rack,
+                "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
+            })).collect::<Vec<_>>()
+        });
+        let (status, body) = submit_as(&app, &uuid, &token, result).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..10 {
+        let path = match &cursor {
+            Some(c) => format!("/api/jobs/{job}/results?per_page=5&cursor={c}"),
+            None => format!("/api/jobs/{job}/results?per_page=5"),
+        };
+        let (status, body) = send(&app, get_request(&path, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for item in body["items"].as_array().unwrap() {
+            seen.push(item["rack"].as_str().unwrap().to_string());
+        }
+        match body["next_cursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+
+    assert_eq!(seen.len(), expected.len(), "the walk repeated or skipped rows: {seen:?}");
+    let mut sorted_seen = seen.clone();
+    sorted_seen.sort();
+    let mut sorted_expected = expected.clone();
+    sorted_expected.sort();
+    assert_eq!(sorted_seen, sorted_expected);
+
+    // An unparseable cursor starts from the beginning rather than erroring: it
+    // is opaque, so a caller cannot be expected to repair one.
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{job}/results?cursor=nonsense"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().unwrap().len(), expected.len());
 }

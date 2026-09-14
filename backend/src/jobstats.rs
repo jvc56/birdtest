@@ -19,11 +19,15 @@ use uuid::Uuid;
 /// copy is used is arbitrary but fixed; reconciling copies that disagree is a
 /// cross-check this read deliberately does not attempt (PLAN.md, "Worker
 /// Integrity").
+///
+/// Reads the job's rows through `game_results.job_id` rather than by joining
+/// `tasks` to find out which rows belong to it. This is the query the finish
+/// check runs on the submission path, so it is the one place where dropping a
+/// join is worth the most.
 pub const FIRST_GAME_RESULT_PER_TASK: &str = "
     SELECT DISTINCT ON (r.task_id) r.*
     FROM game_results r
-    JOIN tasks t ON t.id = r.task_id
-    WHERE t.job_id = $1
+    WHERE r.job_id = $1
     ORDER BY r.task_id, r.submitted_at, r.task_claim_id";
 
 #[derive(Debug, Serialize)]

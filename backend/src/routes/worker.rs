@@ -425,7 +425,13 @@ async fn submit_result(
     .execute(&mut *tx)
     .await?;
 
-    sqlx::query(
+    // `RETURNING` the new state is what tells the job's `tasks_completed`
+    // counter that a task has actually *reached* completed. A task makes that
+    // transition exactly once -- once `accepted_count` meets `redundancy` the
+    // task stops being dispatched, and a claim that lapsed before then is
+    // abandoned, so its late submission is refused above -- which is what makes
+    // counting on the transition safe rather than approximate.
+    let task_completed = sqlx::query_scalar::<_, bool>(
         "UPDATE tasks t
          SET accepted_count = t.accepted_count + 1,
              active_claim_count = GREATEST(t.active_claim_count - 1, 0),
@@ -440,11 +446,50 @@ async fn submit_result(
                  ELSE t.completed_at
              END
          FROM jobs j
-         WHERE t.id = $1 AND j.id = t.job_id",
+         WHERE t.id = $1 AND j.id = t.job_id
+         RETURNING t.state = 'completed'",
     )
     .bind(task_id)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await?;
+
+    if task_completed {
+        sqlx::query("UPDATE jobs SET tasks_completed = tasks_completed + 1 WHERE id = $1")
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // The contributor's own running total, which is what the leaderboards read
+    // instead of counting this identity's claims. One statement, on the row the
+    // identity already owns. Deliberately not rolled back by account deletion:
+    // the account is anonymized in place and keeps its claims, so no donated
+    // compute is lost. `purge_job` and `delete_job` *do* decrement it, because
+    // unlike the counters on `jobs` this one spans every job the identity ever
+    // worked on.
+    match (identity.user_id(), identity.anon_uuid()) {
+        (Some(user_id), _) => {
+            sqlx::query(
+                "UPDATE users SET tasks_completed = tasks_completed + 1,
+                                  last_completed_at = now()
+                 WHERE id = $1",
+            )
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        (None, Some(uuid)) => {
+            sqlx::query(
+                "UPDATE anonymous_workers SET tasks_completed = tasks_completed + 1,
+                                              last_completed_at = now()
+                 WHERE uuid = $1",
+            )
+            .bind(uuid)
+            .execute(&mut *tx)
+            .await?;
+        }
+        (None, None) => {}
+    }
 
     // Ratings are deliberately not touched here. A fit is global to a rating
     // pool and nothing in the submission path depends on it, so it runs on a
@@ -475,18 +520,27 @@ async fn submit_result(
     Ok(Json(ResultAck { accepted: true }))
 }
 
-/// Evaluates the job's finish conditions, then pushes live stats if anyone is
-/// watching.
+/// Everything that has to happen after a result lands, split by whether the
+/// submitting worker has to wait for it.
 ///
-/// SPRT and the finish conditions are evaluated inline on every submission --
-/// there is no background sweep -- but only the part of the stats the decision
-/// needs is computed for it. The full payload, which for an opening-rack job
-/// aggregates over every analysed position, is built only when the job has a
-/// dashboard subscriber.
+/// **Inline:** the finish conditions. SPRT gates whether the job keeps
+/// dispatching, so it is evaluated on every submission and the aggregates it
+/// needs are read once, here.
+///
+/// **Spawned:** the live stats payload. It is display-only -- nothing in the
+/// claim path reads a statistic -- and it is the most expensive thing in this
+/// path, several aggregates over the job's whole history. Building it before
+/// answering the worker made the next claim wait on a dashboard nobody may
+/// have open. It is coalesced per job (`sse::begin_push`), so a busy job
+/// builds one payload at a time rather than one per submission, and they stay
+/// ordered because one task issues them.
 async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
-    let mut job = jobstats::load_job(&state.pool, job_id).await?;
+    let job = jobstats::load_job(&state.pool, job_id).await?;
 
-    if job.status == JobStatus::Active && finish_condition_met(state, &job).await? {
+    if job.status == JobStatus::Active
+        && should_check_finish(state, job_id).await?
+        && finish_condition_met(state, &job).await?
+    {
         let updated = sqlx::query(
             "UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'",
         )
@@ -495,19 +549,78 @@ async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
         .await?;
         if updated.rows_affected() > 0 {
             tracing::info!(job_id = %job.id, "job auto-completed");
-            // So the pushed payload says `completed` rather than the status
-            // this request started with.
-            job = jobstats::load_job(&state.pool, job_id).await?;
+            // Completion is final, so this job will never need checking again.
+            state.finish_checks.forget(job_id);
         }
     }
 
-    if state.sse.has_subscribers(job_id) {
-        let stats = jobstats::compute(&state.pool, &job).await?;
-        if let Ok(payload) = serde_json::to_string(&stats) {
-            state.sse.publish(job_id, payload);
-        }
+    // Checked here so a job nobody is watching costs nothing at all; the
+    // payload itself is built off this request.
+    if state.sse.has_subscribers(job_id) && state.sse.begin_push(job_id) {
+        let state = state.clone();
+        tokio::spawn(async move { push_stats_until_idle(&state, job_id).await });
     }
     Ok(())
+}
+
+/// Build and publish the job's stats, repeating while submissions asked for
+/// another round while the last was building. Owned by one task per job, so
+/// pushes never overtake each other.
+async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
+    loop {
+        // Reloaded each round rather than carried in: the status may have
+        // changed since the submission that asked for this, and a payload
+        // saying `active` for a job that just completed is exactly the
+        // staleness the dashboard would notice.
+        match jobstats::load_job(&state.pool, job_id).await {
+            Ok(job) => match jobstats::compute(&state.pool, &job).await {
+                Ok(stats) => {
+                    if let Ok(payload) = serde_json::to_string(&stats) {
+                        state.sse.publish(job_id, payload);
+                    }
+                }
+                Err(err) => tracing::warn!(
+                    job_id = %job_id, error = %err.message, "building live job stats failed"
+                ),
+            },
+            Err(err) => tracing::warn!(
+                job_id = %job_id, error = %err.message, "loading a job for its live stats failed"
+            ),
+        }
+        if !state.sse.end_push(job_id) {
+            return;
+        }
+    }
+}
+
+/// Whether this submission is the one that evaluates the job's finish
+/// conditions.
+///
+/// Every `SPRT_CHECK_EVERY`th, which bounds how much work a job can do past its
+/// stopping point at `SPRT_CHECK_EVERY - 1` tasks — see the constant for why
+/// the first several of those cost nothing.
+///
+/// **Plus, unconditionally, when this job has nothing left in flight.** The
+/// check is triggered *by* submissions, so a job whose contributors all stop
+/// between checks would not be evaluated again until work resumed — which for a
+/// job that has already reached its stopping point means never, leaving it
+/// `active` and holding allocation in its priority tier. The `EXISTS` below is
+/// bounded by the number of claims open across the fleet, not by anything that
+/// grows with the job, and it is only reached when the debounce would otherwise
+/// skip.
+async fn should_check_finish(state: &AppState, job_id: Uuid) -> AppResult<bool> {
+    if state.finish_checks.should_check(job_id) {
+        return Ok(true);
+    }
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT NOT EXISTS (
+             SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'claimed'
+         )",
+    )
+    .bind(job_id)
+    .fetch_one(&state.pool)
+    .await?)
 }
 
 /// Either finish condition: SPRT significance (only after `min_units`) or the

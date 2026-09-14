@@ -100,34 +100,49 @@ async fn build_matrix(
     let index: HashMap<Uuid, usize> = members.iter().enumerate().map(|(i, id)| (*id, i)).collect();
     let mut matrix = Matrix::new(members.len());
 
+    // The job filter comes first, and that ordering is the whole cost of this
+    // query. Selecting one result per task over *all* of `game_results` and
+    // filtering afterwards made every fit -- and every public read of a pool --
+    // sort the entire table, for every pool, every two minutes. Narrowing to
+    // the pool's own jobs first turns it into an index walk of those jobs'
+    // tasks and their results.
     let rows = sqlx::query(
-        "SELECT c.player1_config_id AS p1,
-                c.player2_config_id AS p2,
-                t.job_id            AS job_id,
-                COALESCE(SUM(r.pent_0), 0)::bigint AS pent_0,
-                COALESCE(SUM(r.pent_1), 0)::bigint AS pent_1,
-                COALESCE(SUM(r.pent_2), 0)::bigint AS pent_2,
-                COALESCE(SUM(r.pent_3), 0)::bigint AS pent_3,
-                COALESCE(SUM(r.pent_4), 0)::bigint AS pent_4
-         -- One result per task: with redundancy > 1 the other accepted
-         -- claims replayed the same seeded games, and counting them would
-         -- multiply a job's weight in the fit by its redundancy.
-         FROM (SELECT DISTINCT ON (task_id) *
-               FROM game_results
-               WHERE pent_0 IS NOT NULL
-               ORDER BY task_id, submitted_at, task_claim_id) r
-         JOIN tasks t                ON t.id = r.task_id
-         JOIN jobs j                 ON j.id = t.job_id
-         JOIN job_game_pair_config c ON c.job_id = j.id
-         JOIN rating_pools pool      ON pool.id = $1
-         WHERE j.job_type = 'game_pairs'
-           AND r.pent_0 IS NOT NULL
-           AND j.variant = pool.variant
-           AND j.letterdist_id = pool.letterdist_id
-           AND j.layout_id = pool.layout_id
-           AND c.player1_config_id IN (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)
-           AND c.player2_config_id IN (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)
-         GROUP BY c.player1_config_id, c.player2_config_id, t.job_id",
+        "WITH eligible_jobs AS (
+             SELECT j.id AS job_id,
+                    c.player1_config_id AS p1,
+                    c.player2_config_id AS p2
+             FROM jobs j
+             JOIN job_game_pair_config c ON c.job_id = j.id
+             JOIN rating_pools pool      ON pool.id = $1
+             WHERE j.job_type = 'game_pairs'
+               AND j.variant = pool.variant
+               AND j.letterdist_id = pool.letterdist_id
+               AND j.layout_id = pool.layout_id
+               AND c.player1_config_id IN
+                   (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)
+               AND c.player2_config_id IN
+                   (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)
+         ),
+         -- One result per task: with redundancy > 1 the other accepted claims
+         -- replayed the same seeded games, and counting them would multiply a
+         -- job's weight in the fit by its redundancy.
+         first_result_per_task AS (
+             SELECT DISTINCT ON (r.task_id)
+                    r.job_id, r.pent_0, r.pent_1, r.pent_2, r.pent_3, r.pent_4
+             FROM eligible_jobs e
+             JOIN game_results r ON r.job_id = e.job_id
+             WHERE r.pent_0 IS NOT NULL
+             ORDER BY r.task_id, r.submitted_at, r.task_claim_id
+         )
+         SELECT e.p1 AS p1, e.p2 AS p2, f.job_id AS job_id,
+                COALESCE(SUM(f.pent_0), 0)::bigint AS pent_0,
+                COALESCE(SUM(f.pent_1), 0)::bigint AS pent_1,
+                COALESCE(SUM(f.pent_2), 0)::bigint AS pent_2,
+                COALESCE(SUM(f.pent_3), 0)::bigint AS pent_3,
+                COALESCE(SUM(f.pent_4), 0)::bigint AS pent_4
+         FROM first_result_per_task f
+         JOIN eligible_jobs e ON e.job_id = f.job_id
+         GROUP BY e.p1, e.p2, f.job_id",
     )
     .bind(pool_id)
     .fetch_all(&mut *conn)
@@ -159,6 +174,34 @@ async fn build_matrix(
     Ok((members, matrix, total_pairs, jobs.len() as i32))
 }
 
+/// The advisory-lock namespace for rating fits, distinct from dispatch's.
+const RATING_LOCK_NAMESPACE: i32 = 2;
+
+/// Serialize one pool's fits against each other, for the rest of the caller's
+/// transaction.
+///
+/// A fit is read-then-write over state an admin can change underneath it: it
+/// reads membership and evidence, then writes a run stamped `now()`. Two fits
+/// running at once therefore interleave, and the one that *started* first can
+/// commit last -- so the newest `rating_runs` row, which is what the ratings
+/// page reads, can be the one built from the older membership. Removing a
+/// config and seeing it come straight back in the fit is the visible symptom,
+/// and it lasts until the next sweep happens to disagree with the stored
+/// `pairs_used`.
+///
+/// Taken before anything is read, so the read and the write are one atomic
+/// decision. Per pool, so pools never wait on each other, and
+/// transaction-scoped, so it is released on commit, on rollback, and on a
+/// dropped connection.
+async fn lock_pool_fit(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(RATING_LOCK_NAMESPACE)
+        .bind(pool_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// Refits a pool from scratch and stores the result as a new run.
 ///
 /// Always a full refit, never a patch: adding or removing a config changes what
@@ -166,9 +209,42 @@ async fn build_matrix(
 /// to unwind. Cheap enough to do this way — the MM iteration is microseconds
 /// for a pool of any plausible size, and the query above is one grouped scan.
 pub async fn recompute(db: &PgPool, pool_id: Uuid, trigger: Trigger) -> AppResult<Uuid> {
+    fit_and_store(db, pool_id, trigger, false)
+        .await?
+        .ok_or_else(|| AppError::internal("an unconditional refit stored nothing"))
+}
+
+/// The body of a fit: lock, read, fit, write, commit.
+///
+/// `only_if_evidence_changed` is the sweep's path -- it compares the evidence
+/// it just read against the last run's and stores nothing when they agree,
+/// which is what keeps a quiet pool from accumulating identical snapshots.
+/// Reusing this rather than checking first and refitting after is what stops
+/// the sweep building the (expensive) matrix twice per tick.
+async fn fit_and_store(
+    db: &PgPool,
+    pool_id: Uuid,
+    trigger: Trigger,
+    only_if_evidence_changed: bool,
+) -> AppResult<Option<Uuid>> {
     let mut tx = db.begin().await?;
+    lock_pool_fit(&mut tx, pool_id).await?;
     let pool = load_pool(&mut tx, pool_id).await?;
     let (members, matrix, pairs_used, jobs_used) = build_matrix(&mut tx, pool_id).await?;
+
+    if only_if_evidence_changed {
+        let last: Option<i64> = sqlx::query_scalar(
+            "SELECT pairs_used FROM rating_runs
+             WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
+        )
+        .bind(pool_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if last == Some(pairs_used as i64) {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+    }
 
     let anchor_index = members
         .iter()
@@ -213,7 +289,7 @@ pub async fn recompute(db: &PgPool, pool_id: Uuid, trigger: Trigger) -> AppResul
     }
 
     tx.commit().await?;
-    Ok(run_id)
+    Ok(Some(run_id))
 }
 
 /// Refits every pool whose evidence has grown since its last run.
@@ -247,21 +323,10 @@ pub async fn recompute_stale(db: &PgPool) -> AppResult<usize> {
 }
 
 /// Whether this pool's evidence has grown since its last run, and a refit if so.
+///
+/// One pass, not two: the staleness check and the fit read the same matrix
+/// inside the same transaction. Checking first and then calling `recompute`
+/// built it twice, and it is the most expensive query in the module.
 async fn recompute_if_stale(db: &PgPool, pool_id: Uuid) -> AppResult<bool> {
-    let mut conn = db.acquire().await?;
-    let (_, _, pairs_used, _) = build_matrix(&mut conn, pool_id).await?;
-    let last: Option<i64> = sqlx::query_scalar(
-        "SELECT pairs_used FROM rating_runs
-         WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
-    )
-    .bind(pool_id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    drop(conn);
-
-    if last == Some(pairs_used as i64) {
-        return Ok(false);
-    }
-    recompute(db, pool_id, Trigger::Evidence).await?;
-    Ok(true)
+    Ok(fit_and_store(db, pool_id, Trigger::Evidence, true).await?.is_some())
 }
