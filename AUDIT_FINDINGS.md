@@ -615,6 +615,22 @@ What the database held afterwards:
   it resolves the prior audit's performance item 11, which recorded the 342 s as
   inherent cost.
 
+**A second run, after the section 9a decisions** (backend from `c495b10`, MAGPIE
+from `cb390035`), also passed for every job type:
+
+- **Leave-generation job creation took 0.8 s, against 38.6 s before** (U9).
+  Creation wrote no rack universe. The first claim got `204` and started the
+  seeding task, and MAGPIE's own retry picked up work once it committed. The
+  leave task's MAGPIE run went from 67 s to 126 s because it now includes that
+  seeding and MAGPIE's idle waits, not because a task got slower.
+- **The audit log held no `task.claimed` or `result.submitted` rows** (U1),
+  only admin and import events.
+- **The simmer, now with `time_limit_secs` 0** (U3), was accepted at creation
+  and ran in 2 s as before.
+- **No task failed, so no `task_failed` decline was sent.** U5 is covered by
+  `worker_api::a_failed_task_is_handed_straight_back` on the server side and by
+  the MAGPIE build. It was not exercised end to end.
+
 ---
 
 ## 8. Deployment and implementation blockers
