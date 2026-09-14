@@ -43,7 +43,10 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
         .await
         .unwrap();
     let mut conn = db.pool.acquire().await.unwrap();
-    let seeded = birdtest::jobs::registry::initialize_job_state(&mut conn, &row).await.unwrap();
+    let job_data = birdtest::jobs::load_job_data(&mut conn, row.id).await.unwrap();
+    let seeded = birdtest::jobs::leave_gen::seed_generation(&mut conn, job, 1, &job_data.letterdist)
+        .await
+        .unwrap();
     (job, seeded)
 }
 
@@ -827,4 +830,40 @@ async fn only_the_first_result_for_a_leave_task_is_folded() {
     .await
     .unwrap();
     assert_eq!(credited, 2, "both claims are credited");
+}
+
+/// Generation 1's universe is seeded by the first claim, like every later
+/// generation's: creating or purging a job writes none of it, so neither holds
+/// its request, or a purge its locks, for the tens of seconds 3.2 million rows
+/// take.
+#[tokio::test]
+async fn generation_ones_universe_is_seeded_by_the_first_claim_too() {
+    let db = TestDb::new().await;
+    let (job, seeded) = leave_job(&db, 2).await;
+    // What creation and purge now leave behind.
+    sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let universe = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM leave_rack_progress WHERE job_id = $1 AND generation = 1",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    assert!(wait_for(|| async { universe().await == seeded }).await, "seeded in full");
+
+    let (status, assignment) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    assert_eq!(assignment["task_request"]["generation"], json!(1));
 }

@@ -85,7 +85,8 @@
     const common = {
       job_type: jobType,
       priority,
-      redundancy,
+      // Leave generation runs at redundancy 1 only: the server refuses more.
+      redundancy: jobType === 'leave_generation' ? 1 : redundancy,
       variant,
       letterdist_id: letterdistId,
       layout_id: layoutId,
@@ -160,7 +161,7 @@
     </div>
     <div>
       <label class="label" for="redundancy">Redundancy</label>
-      <input id="redundancy" type="number" min="1" class="input" bind:value={redundancy} />
+      <input id="redundancy" type="number" min="1" class="input" bind:value={redundancy} disabled={jobType === 'leave_generation'} />
     </div>
     <div>
       <label class="label" for="magpie">Min MAGPIE version</label>

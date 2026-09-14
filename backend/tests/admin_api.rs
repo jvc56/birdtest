@@ -62,13 +62,24 @@ async fn a_job_with_history_can_be_deleted_and_its_census_survives() {
     .await
     .unwrap();
     assert!(census.contains("claims=1"), "{census}");
-    let claimed_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE job_id = $1 AND action = 'task.claimed'")
-            .bind(job)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-    assert_eq!(claimed_rows, 1, "the job's history stays in the log after the job is gone");
+    let deleted_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action = 'job.deleted' AND target_id = $1",
+    )
+    .bind(job.to_string())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(deleted_rows, 1, "the job's deletion stays in the log after the job is gone");
+
+    // Claims and submissions write no audit rows: `task_claims` already records
+    // who claimed and completed what, and when.
+    let worker_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_log WHERE action IN ('task.claimed', 'result.submitted')",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(worker_rows, 0);
 }
 
 /// Bug: the purge census and the purge itself both queried
@@ -624,6 +635,7 @@ async fn a_games_job_may_pit_a_static_player_against_a_simmer() {
             body["num_plies"] = json!(2);
             body["num_plays"] = json!(10);
             body["max_iterations"] = json!(100);
+            body["time_limit_secs"] = json!(0);
         }
         let (status, created) = send(&app, post_json("/api/admin/player-configs", &headers, body)).await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -649,6 +661,101 @@ async fn a_games_job_may_pit_a_static_player_against_a_simmer() {
     }
     let (status, body) = send(&app, create(&configs[1], &configs[2])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "two simmers on different models: {body}");
+}
+
+/// Creates a player config through the API.
+async fn player_config(
+    app: &axum::Router,
+    headers: &[(&str, &str)],
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    send(app, post_json("/api/admin/player-configs", headers, body)).await
+}
+
+/// A simmer is bounded by its iteration budget, never by a time limit: a limit
+/// makes how far a simulation gets depend on the contributor's hardware, and a
+/// null limit means MAGPIE's 60-second default.
+#[tokio::test]
+async fn a_simming_player_config_is_bounded_by_iterations_not_time() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+
+    let cases = [
+        ("no-limit-stated", json!({ "max_iterations": 100 }), StatusCode::BAD_REQUEST, Some("time_limit_secs")),
+        ("a-limit", json!({ "max_iterations": 100, "time_limit_secs": 30 }), StatusCode::BAD_REQUEST, Some("time_limit_secs")),
+        ("no-budget", json!({ "time_limit_secs": 0 }), StatusCode::BAD_REQUEST, Some("max_iterations")),
+        ("bounded", json!({ "max_iterations": 100, "time_limit_secs": 0 }), StatusCode::CREATED, None),
+    ];
+    for (name, extra, expected, field) in cases {
+        let mut body = json!({
+            "name": name, "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+            "winpct_id": winpct, "num_plies": 2, "num_plays": 10, "num_plays_recorded": 1,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        let (status, response) = player_config(&app, &headers, body).await;
+        assert_eq!(status, expected, "{name}: {response}");
+        if let Some(field) = field {
+            assert_eq!(response["fields"][0]["field"], field, "{name}: {response}");
+        }
+    }
+}
+
+/// With capture on, MAGPIE raises a simmer's candidate count to the capture cap,
+/// so a capture job whose simmer considers fewer plays would play different
+/// games from the same job without capture.
+#[tokio::test]
+async fn a_capture_job_refuses_simmers_that_capture_would_change() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+
+    let (_, capturing) = player_config(&app, &headers, json!({
+        "name": "static-capturing-20", "recorder_type": "best", "sort_strategy": "equity",
+        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 20,
+    })).await;
+    let mut simmers = Vec::new();
+    for plays in [10, 20] {
+        let (status, created) = player_config(&app, &headers, json!({
+            "name": format!("simmer-{plays}"), "recorder_type": "best", "kwg_id": kwg,
+            "klv_id": klv, "winpct_id": winpct, "num_plies": 2, "num_plays": plays,
+            "max_iterations": 100, "time_limit_secs": 0, "num_plays_recorded": 1,
+        })).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        simmers.push(created["id"].clone());
+    }
+
+    let create = |p2: &serde_json::Value, capture: bool| {
+        post_json("/api/admin/jobs", &headers, json!({
+            "job_type": "games", "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout,
+            "player1_config_id": capturing["id"], "player2_config_id": p2,
+            "min_games": 1, "max_games": 10, "capture_positions": capture,
+        }))
+    };
+    let (status, body) = send(&app, create(&simmers[0], true)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "capture_positions", "{body}");
+    let (status, body) = send(&app, create(&simmers[0], false)).await;
+    assert_eq!(status, StatusCode::CREATED, "without capture nothing is raised: {body}");
+    let (status, body) = send(&app, create(&simmers[1], true)).await;
+    assert_eq!(status, StatusCode::CREATED, "a simmer already at the cap: {body}");
 }
 
 /// Banning is the only lever there is against a bad contributor — nothing bans

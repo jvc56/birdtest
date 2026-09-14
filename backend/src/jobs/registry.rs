@@ -435,21 +435,6 @@ async fn count_first_result(
     Ok(())
 }
 
-/// State a job needs in place before it can dispatch anything.
-///
-/// No job type pre-populates *tasks* any more -- every one generates them at
-/// claim time. This is only leave generation's rack universe, which claim-time
-/// rack selection orders by.
-pub async fn initialize_job_state(conn: &mut PgConnection, job: &Job) -> AppResult<i64> {
-    match job.job_type {
-        JobType::LeaveGeneration => {
-            let job_data = load_job_data(&mut *conn, job.id).await?;
-            leave_gen::seed_generation(conn, job.id, 1, &job_data.letterdist).await
-        }
-        JobType::OpeningRack | JobType::Games | JobType::GamePairs => Ok(0),
-    }
-}
-
 /// The part of job initialization that cannot run inside the creating
 /// transaction: generation 1's zeroed KLV is a multi-megabyte build and an
 /// object-store write. Called after the transaction commits, and again at

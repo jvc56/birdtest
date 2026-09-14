@@ -232,12 +232,15 @@ async fn decline_task(
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
 
+    // `task_failed` is a worker that ran the task and could not produce a
+    // result the server accepted. Declining hands the slot straight back, where
+    // stopping the heartbeat alone held it for the whole heartbeat timeout.
     if !matches!(
         body.reason.as_str(),
-        "missing_data" | "magpie_version" | "unknown_job_type"
+        "missing_data" | "magpie_version" | "unknown_job_type" | "task_failed"
     ) {
         return Err(AppError::bad_request(
-            "reason must be 'missing_data', 'magpie_version' or 'unknown_job_type'",
+            "reason must be 'missing_data', 'magpie_version', 'unknown_job_type' or 'task_failed'",
         ));
     }
 
@@ -512,17 +515,11 @@ async fn submit_result(
     // pool and nothing in the submission path depends on it, so it runs on a
     // periodic sweep (see ratings::recompute_stale) rather than inside every
     // result transaction.
-
-    audit::log(
-        &mut tx,
-        "result.submitted",
-        identity.user_id(),
-        identity.anon_uuid(),
-        Some("task"),
-        Some(task_id.to_string()),
-        Some(job_id),
-    )
-    .await?;
+    //
+    // No audit row either: the claim, now `completed` with its
+    // `completed_at`, and the stored result say everything a
+    // `result.submitted` row said, and the row was a write per submission on
+    // the path a worker waits on.
 
     tx.commit().await?;
 

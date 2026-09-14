@@ -1,7 +1,7 @@
 # birdtest audit — findings
 
 Branch: `audit/birdtest-2026-09-14`, off `main` at `449cafb`.
-MAGPIE changes: `birdtest-contribute` only (commit recorded in section 7).
+MAGPIE changes: `birdtest-contribute` only, commits `22c4c25f` and `cb390035`, pushed.
 Date: 2026-09-14.
 
 **This is the fourth audit.** It builds on three earlier ones, all merged into
@@ -43,7 +43,8 @@ wrong, or where the plan described the behaviour the rest of the system needs.
   decisions are still in the code as described.
 - Backend: `cargo clippy --locked --all-targets -D warnings` and `cargo test
   --locked` against a real Postgres 16, before and after every group of
-  changes. **130 tests before, 136 after**, all passing, clippy clean.
+  changes. **130 tests before, 136 after the audit's own fixes, 141 after the section 9a
+  decisions**, all passing, clippy clean. `svelte-check` clean after the form changes.
 - MAGPIE: `make magpie_test` (`-Werror`, address/undefined/leak sanitizers),
   then `./bin/magpie_test contribute` and `./bin/magpie_test config`, all
   passing. The release `magpie` binary builds and reports `0.2.0`.
@@ -555,9 +556,10 @@ section 10.
 
 ## 7. MAGPIE `birdtest-contribute`
 
-**All changes are on `birdtest-contribute`, in commit `22c4c25f`; none on `main`
-or any other branch.** The branch was checked out at `eb603694`. That commit,
-from the previous audit, was never pushed, and neither has this one been (U8).
+**All changes are on `birdtest-contribute`, in commits `22c4c25f` (sections 1–8)
+and `cb390035` (U5's `task_failed` decline, and fixtures for U3); none on `main`
+or any other branch.** The branch was checked out at `eb603694`, the previous
+audit's unpushed commit. All three are now pushed to `origin` (U8).
 
 ### What was missing, and was fixed
 
@@ -623,7 +625,7 @@ What the database held afterwards:
 | An export could be short and then served forever (B3) | **Fixed** |
 | Purge and delete deadlocked against submissions (R1) | **Fixed** |
 | MAGPIE results depended on each contributor's settings (section 1) | **Fixed**, and enforced by the `0.2.0` floor (M7) |
-| **`birdtest-contribute` is not pushed.** CI's `magpie-contract` and the nightly end-to-end job check out the branch from GitHub, where it lacks this audit's MAGPIE commit and the previous audit's `eb603694`. With the floor at `0.2.0`, the nightly job's MAGPIE (reporting `0.1.0`) gets a `magpie_too_old` shutdown | **Needs action** (U8): push `birdtest-contribute`. Not done here, because pushing publishes to a shared remote |
+| **`birdtest-contribute` is not pushed.** CI's `magpie-contract` and the nightly end-to-end job check out the branch from GitHub, where it lacks this audit's MAGPIE commit and the previous audit's `eb603694`. With the floor at `0.2.0`, the nightly job's MAGPIE (reporting `0.1.0`) gets a `magpie_too_old` shutdown | **Resolved** (U8): pushed after the decision was taken |
 | Existing development databases fail migration after this change, because `0001_initial.sql` was edited in place | Expected under the single-migration convention (PLAN.md, "Resetting the database") |
 | Verified unchanged since the previous audit: migrations before bind, graceful shutdown, ALB `idle_timeout` 300 s, ECS stop-then-start, SSM secrets, config validation, Nginx body limit and SSE buffering, CI coverage, no MAGPIE in the backend image | Holds |
 
@@ -754,6 +756,26 @@ create response, and a few tests.
 
 ---
 
+## 9a. Decisions taken — implemented
+
+All nine recommendations above were accepted, and all are carried out on this
+branch. Where an item's recommendation was to change nothing, the decision is
+recorded as taken.
+
+| Item | Decision | What it took |
+|---|---|---|
+| U1 | **(c)** Drop `task.claimed` and `result.submitted` | Both writes removed, one each from `scheduler::issue_claim` and `submit_result`. A write gone from each of the claim and submit transactions. `audit_log` keeps admin, account and decline events. The census test now checks the `job.deleted` row, and that claims and submissions write none. PLAN.md's audit table, claim loop, submission step 5 and dashboard audit note updated |
+| U2 | **(a)** Refuse a capture job whose simmers capture would raise | `validate_capture_play_cap`, run for `games` and `game_pairs` with `capture_positions` on: every simming player's `num_plays` (MAGPIE's 100 when null) must be at least player 1's `num_plays_recorded`. Error names the player and the remedy. Test: `a_capture_job_refuses_simmers_that_capture_would_change` |
+| U3 | **(a) + (c)** Simmers set no time limit and an iteration budget; simming jobs excluded from equality cross-checks | Player-config creation refuses a simmer without `max_iterations`, or with `time_limit_secs` other than 0. MAGPIE applies a limit only above 0 (checked in `bai_result.c`), and a null means its 60 s default. The form sends 0 and says why; the contract fixtures' simmers, and the e2e simmer, state 0. PLAN.md's cross-checking paragraph now excludes simming jobs. Test: `a_simming_player_config_is_bounded_by_iterations_not_time` |
+| U4 | **(c)** Leave generation at redundancy 1 | `validate_job_body` refuses `redundancy > 1` for leave generation, and the form disables the field. B2's fold-first rule stays as a guard for state creation no longer writes. Unit test: `leave_generation_runs_at_redundancy_one` |
+| U5 | **(a)** A `task_failed` decline | Server accepts the reason. MAGPIE (`contribute.c`, `decline_failed_task`) sends it when an executor fails and when the server refuses a result, so the slot comes back at once instead of after the heartbeat timeout. The job is not marked unsupported, so a one-off failure does not lock the worker out; the consecutive-failure guard still ends a run that fails every time. A failed decline is dropped rather than ending the run. Additive on the wire. Test: `worker_api::a_failed_task_is_handed_straight_back` |
+| U6 | **(a)** Wait for the slow-stats log line | Nothing to build |
+| U7 | **(c)** No retention yet | Nothing to build; U1 removed most of `audit_log`'s growth |
+| U8 | **Push `birdtest-contribute`** | Pushed: `origin` moved from `cac07a8a` to `cb390035` |
+| U9 | **(a)** Generation 1 seeded lazily | `registry::initialize_job_state` deleted. Job creation and purge write no rack universe; the first claim finds it missing and starts R3's seeding task, as for every later generation. The create response is `{ job }` (`initialized` dropped from the backend and `api.ts`). Test: `generation_ones_universe_is_seeded_by_the_first_claim_too`. PLAN.md's purge paragraph, claim step 2, long-operations paragraph, creation response and restore section updated |
+
+---
+
 ## 10. Python worker
 
 Searched the whole tree (README, RUNBOOK, TESTING, PLAN, compose, Dockerfile,
@@ -780,4 +802,10 @@ needs no change for the new seed field, because it does not read one.
 | `leave_gen::the_next_generations_universe_is_seeded_off_the_claim_path` (rewritten) | R3: the claim answers at once, the seeding completes, and work follows |
 | MAGPIE `test_shared_settings_do_not_leak_between_tasks` | M4 |
 | MAGPIE `test_opening_rack_analysis_uses_the_players_settings` | M1 |
+| `admin_api::a_simming_player_config_is_bounded_by_iterations_not_time` | U3: a simmer needs an iteration budget and no time limit |
+| `admin_api::a_capture_job_refuses_simmers_that_capture_would_change` | U2 |
+| `admin::tests::leave_generation_runs_at_redundancy_one` | U4 |
+| `worker_api::a_failed_task_is_handed_straight_back` | U5 |
+| `leave_gen::generation_ones_universe_is_seeded_by_the_first_claim_too` | U9 |
+| `admin_api::a_job_with_history_can_be_deleted_and_its_census_survives` (updated) | U1: no audit rows for claims or submissions |
 | MAGPIE contract key test (updated) | M6: the leave-generation fixture carries `seed` |

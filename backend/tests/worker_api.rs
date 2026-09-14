@@ -1010,3 +1010,30 @@ async fn the_results_feed_walks_every_row_exactly_once() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["items"].as_array().unwrap().len(), expected.len());
 }
+
+/// A worker that ran a task and could not produce an accepted result hands the
+/// slot straight back, rather than holding it for the heartbeat timeout.
+#[tokio::test]
+async fn a_failed_task_is_handed_straight_back() {
+    let db = TestDb::new().await;
+    db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/decline",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": assignment["claim_token"], "reason": "task_failed" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (next, _) = first_claim(&app).await;
+    assert_eq!(
+        next["task_request"]["seed"], assignment["task_request"]["seed"],
+        "the same task goes to the next worker at once"
+    );
+}

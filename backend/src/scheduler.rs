@@ -540,16 +540,10 @@ async fn issue_claim(
     .execute(&mut **tx)
     .await?;
 
-    crate::audit::log(
-        tx,
-        "task.claimed",
-        identity.user_id(),
-        identity.anon_uuid(),
-        Some("task"),
-        Some(task_id.to_string()),
-        Some(job.id),
-    )
-    .await?;
+    // No audit row. The claim row just inserted records who claimed which task
+    // and when, so a `task.claimed` audit row said nothing it did not -- while
+    // costing a write per claim on the path a worker waits on, and most of
+    // `audit_log`'s growth.
 
     // Last, because it locks the job row: claims against the same job
     // serialize on it until commit, so it should be held for as little of the
