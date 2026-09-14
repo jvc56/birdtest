@@ -482,6 +482,39 @@ each caller holds a database connection for as long as they keep reading, and
 this paginated read is what the public was left with in its place. So it is the
 only route by which anyone but an admin can see what a job actually produced.
 
+**What question is it answering, though?** This turns out to be the crux, so it
+is worth being exact. The endpoint is ordered
+`ORDER BY r.submitted_at DESC, r.rack ASC` and takes an optional `?worker=`
+filter, which together make it a **recency feed**: *what has this job — or this
+one contributor — produced lately?* The `DESC` is what makes the first page the
+newest arrivals, which is the only sensible thing for a live dashboard and the
+only sensible thing for "show me what this volunteer just submitted". The
+`rack ASC` after it is not decoration: `submitted_at` defaults to `now()`, which
+in Postgres is transaction time, so all 500 racks of one batch share one
+timestamp exactly. Without a tiebreaker the order within a batch would be
+arbitrary and, worse, free to differ between two requests — so page 2 could
+repeat or skip rows from page 1. Some total order is required for pagination to
+mean anything; recency-then-rack is the one chosen.
+
+But a recency feed is only one of two questions a caller might have, and the
+other is *enumerate this job's corpus* — read every rack and its best play, in
+some order that lets me get through all of them. The endpoint answers that one
+badly and expensively:
+
+- **Recency is the wrong order for a corpus.** For a *completed* opening-rack
+  job, every rack has been analysed, so "most recently submitted" is an
+  arbitrary (if stable) shuffle of the rack space, correlated with dispatch
+  order and jittered by which volunteers finished when. Nobody wants racks in
+  that order; they want them in rack order, or they want a specific rack.
+- **Only the first page of a feed is a feed.** Recency ordering earns its cost
+  on page 0 and stops earning anything by page 500.
+- **The two questions want opposite plans.** A feed wants the newest rows and
+  can stop early. An enumeration wants every row exactly once and never needs
+  a global sort at all.
+
+So the expensive case — deep paging — is precisely the case where the ordering
+that makes it expensive delivers no value.
+
 **The problem.** For an opening-rack job the query joins every
 `position_analysis_records` row of the job (through `tasks`), left-joins its
 rank-1 move, and sorts by `submitted_at DESC` before `LIMIT/OFFSET`. A full
@@ -535,6 +568,19 @@ nothing.
   becomes "some of the job's results", and a caller paging to the end has no way
   to tell the difference between "that is all of them" and "that is where we cut
   it off".
+- **(e) Page by *task*, in the job's own tiling order.** This is the option the
+  question above surfaces, and it needs no schema change at all. An
+  opening-rack job's tasks each cover a contiguous, disjoint slice of the
+  enumerated rack space, with `tasks.seed` holding the slice's start; a games
+  job's tasks tile the seed space the same way. `tasks (job_id, seed)` is
+  already a unique index. So "the job's results in rack order" is an indexed
+  walk of that index, plus `(task_id, rack)` per task — both already exist,
+  both bounded, and the result is stable and complete by construction.
+  It answers the *enumeration* question properly, and it answers it cheaply.
+  What it gives up is the feed: ordered by the job's own tiling, the first page
+  is the beginning of the rack space, not the newest arrivals. Keeping both
+  would mean saying which question is being asked — a `?order=` parameter, or
+  splitting the feed onto its own route.
 - **(d) Make the whole route admin-only, as the NDJSON stream already is.**
   Consistent with the reasoning that already moved bulk reads behind admin, and
   a one-line change. Two objections. This is a *paginated* read of at most 500
@@ -545,23 +591,43 @@ nothing.
   a rack" box is the one part of this endpoint the site actually uses, and it is
   not the expensive part.
 
-**Recommendation: (a), and (b) alongside it if the API shape is still
-negotiable before release.** (a) is the only option that removes the cost rather
-than hiding it, it fixes three call sites at once (the paginated read, the admin
-stream, and the export), and it is nearly free while `0001_initial.sql` is still
-being edited in place — which is a window that closes at the first deployment.
-(b) turns the remaining `OFFSET` cost into a constant, and pre-release is the
-only cheap moment to change a pagination contract. I would not take (c): an
-endpoint that quietly truncates is worse than a slow one, because nothing tells
-the caller. I would not take (d) alone: it answers "who is allowed to pay this"
-rather than "why does this cost so much", and the same query would still be slow
-for the admin.
+**Recommendation: decide which question the endpoint answers, then (e) if it is
+enumeration and (a) if it has to be both.**
 
-**What would change the answer.** If deep paging into a finished job's corpus
-turns out not to be a use case — the export exists for exactly that, and is
-built once and reused — then (c) or (d) become defensible, and (a)'s column on
-two enormous tables stops being worth it. That is a product question about who
-reads `/api/jobs/:id/results` and why, which the code cannot answer.
+The cheapest honest outcome is to accept that this endpoint is a **feed**, cap
+it, and let (e) or the export serve enumeration:
+
+- Keep `submitted_at DESC` and the `?worker=` filter, which is what a feed
+  needs.
+- Bound `page` so the feed cannot be paged into a scan — a feed has no
+  hundredth page. That converts the unbounded cost into a fixed one without a
+  schema change, a new column, or an API shape change.
+- Serve enumeration by (e), in the job's own tiling order, which is both the
+  order a corpus actually wants and the one the existing indexes already
+  provide.
+
+If instead both questions must be answerable on one route with one order, **(a)
+is the fix**: it is the only option that removes the cost rather than moving it,
+it fixes three call sites at once (this read, the admin stream, and the export),
+and it is nearly free while `0001_initial.sql` is still edited in place — a
+window that closes at the first deployment. **(b)** is worth taking alongside
+(a) if the pagination contract is still negotiable pre-release, since it makes
+page *N* cost what page 1 costs.
+
+I would not take **(c)**: an endpoint that quietly truncates is worse than a
+slow one, because nothing tells the caller which it did. I would not take **(d)**
+alone: it answers "who is allowed to pay this" rather than "why does this cost
+so much", the query would still be slow for the admin, and it would take the
+`?rack=` lookup with it.
+
+**What would change the answer.** Whether anyone actually needs to page through
+a finished job's corpus over the API at all. The export exists for exactly that
+— built once, reused by every download — so if the answer is no, the feed-plus-
+cap outcome is simply correct and (a)'s column on two enormous tables is not
+worth buying. That is a product question about who reads
+`/api/jobs/:id/results` and why, which the code cannot answer. It is also the
+question worth asking *first*, because it is the one that decides between a
+three-line change and a migration.
 
 ### U2 — the job list and contributor lists still aggregate over whole tables
 
@@ -680,24 +746,103 @@ one this audit deliberately left there.
   It also makes a drifted counter able to stop a job early or late — the exact
   thing the design is written against — and SPRT's conclusion is the job's
   entire output.
-- **(d) Debounce the finish check** — evaluate every *N*th submission, or at
-  most once a second per job. Bounded overshoot (a few extra tasks dispatched
-  past the boundary, which a redundant claim would have cost anyway) and no new
-  source of truth. Adds a second piece of per-job scheduling state.
+- **(d) Debounce the finish check** — evaluate it on some submissions rather
+  than all of them. No new source of truth: the check still reads the rows, it
+  just runs less often, so the only thing traded away is *when* the job notices
+  it is finished. Four shapes, below.
 
-**Recommendation: (a), unchanged, and (d) before (b) or (c) if it ever stops
-being affordable.** This is the one place in the system where being wrong is
-expensive and being slow is not: a job that stops early on a drifted counter
+**The four debounce shapes.** What is being traded is always the same pair:
+how much of the read cost is saved, against how much compute is played past the
+boundary before anyone notices. Note what "overshoot" costs — extra tasks
+dispatched and completed after the job should have stopped, which is donated
+volunteer time spent on a question already answered.
+
+- **(d1) Count-based** — keep a per-job submission counter and evaluate on every
+  *k*th. Overshoot is bounded at *k*−1 tasks, full stop, with no dependence on
+  anything else. Cost per submission is 1/*k* of the read regardless of how fast
+  results arrive, so a busy job — the one where the read hurts most — pays
+  proportionally least. The counter can live in memory beside the SSE
+  coalescing map; losing it on restart costs one extra check.
+- **(d2) Time-based** — keep a per-job "last evaluated at" and evaluate if it is
+  older than *T*. Bounds the cost in *server* terms: at most one read per *T*
+  per job, whatever the fleet does. But it does not bound overshoot in the unit
+  that matters — overshoot becomes *submission rate × T* tasks, so it grows
+  with the number of contributors. That is backwards: the more people donating
+  compute, the more of it is wasted, and a job at 10 submissions a second with
+  *T* = 5 s plays 50 tasks past the boundary where a quiet job plays none.
+- **(d3) Hybrid** — evaluate when *k* submissions **or** *T* seconds have passed,
+  whichever comes first. Bounds both, which sounds strictly better and is: the
+  count bounds the waste, the timer bounds the cost during a burst. It costs a
+  second piece of per-job state and a second constant to justify.
+- **(d4) Distance-aware** — use the last computed LLR and unit count to estimate
+  how far the job is from its boundary, and skip in proportion: check rarely
+  when far away, every time when close. The best overshoot-per-read ratio
+  available, and the only one that spends reads where they decide something.
+  Also the only one that can be *wrong*: an estimate assumes the trend
+  continues, and a run that reverses sharply gets checked late precisely when it
+  mattered. Needs the most care and the most explaining.
+
+**Recommendation: (a), unchanged — and when it stops being affordable, (d1),
+count-based.**
+
+On the main question: this is the one place in the system where being wrong is
+expensive and being slow is not. A job that stops early on a drifted counter
 publishes a wrong SPRT verdict, and that verdict is the job's whole product.
-(d) is the right escape hatch because it trades *latency of the decision* for
-cost, and the decision has no deadline — where (b) and (c) trade *correctness of
-the decision* for cost. `jobs.games_completed` already exists if someone decides
-otherwise, which is what makes (b) tempting and worth naming explicitly as the
-thing not to do first.
+Debouncing is the right escape hatch because it trades *latency of the decision*
+for cost, and the decision has no deadline — where (b) and (c) trade *correctness
+of the decision* for cost. `jobs.games_completed` already exists if someone
+decides otherwise, which is what makes (b) tempting and worth naming explicitly
+as the thing not to do first.
+
+**On count versus time, count wins, and the reason is unit-matching.** The harm
+being avoided is wasted volunteer compute, and waste is denominated in *tasks*.
+A count-based bound is stated in tasks directly: at most *k*−1, always,
+regardless of fleet size, batch size or submission rate. A time-based bound is
+stated in seconds and only converts into tasks by multiplying by the submission
+rate — which is the one quantity that varies most and that nobody controls. It
+therefore lets waste scale with the number of contributors, which is exactly
+backwards: the healthier the project gets, the more donated compute it throws
+away. Count-based also has the better cost profile, for the same reason in
+reverse: amortised at 1/*k* of a read per submission, a fast job pays
+proportionally less, while a slow job checks nearly every time and pays nearly
+full price — which is fine, because a slow job's read is cheap and its check is
+the one most likely to matter.
+
+**How to pick *k*, and why it can be generous.** Overshoot is already non-zero
+and always was. When the LLR crosses, the job flips to `completed`, but every
+task already claimed across the fleet is still played and still accepted — the
+submit path validates the claim, not the job's status. So the floor on wasted
+compute is "however many tasks are in flight right now", which is roughly the
+number of active contributors. **A debounce of *k* below that number is free**:
+it wastes nothing that was not already going to be wasted. That makes *k*
+defensible on evidence rather than taste — set it at or below the typical
+in-flight task count, and the change costs nothing at all while cutting the read
+rate by a factor of *k*. A refinement, if a single constant feels too blunt:
+derive it per job as a small fraction of the job's own budget, e.g.
+`k = max(1, max_units / (100 × units_per_task))`, capping overshoot at 1% of
+what the job was authorised to spend.
+
+**Take (d3) only if a burst turns out to hurt the server**, which per-worker
+rate limiting (1/s, burst 5) and a twenty-connection pool already bound from the
+other side. **Avoid (d4) for now:** it optimises the axis that is not the
+problem, and it introduces the one property this path has been carefully kept
+free of — a decision that depends on an estimate rather than on the rows.
+
+**One failure mode either shape shares, worth writing down.** The check is
+triggered *by* submissions, so a job whose fleet stops between checks is not
+evaluated again until work resumes. That is benign while a job is live — the
+next submission carries the check, and it self-heals — but it means a job could
+sit `active` past its stopping point if every contributor left at the wrong
+moment. Debouncing widens that window from one submission to *k*. If that
+matters, the cheap cover is to evaluate unconditionally when a job's last
+in-flight claim is released, which is a moment the scheduler already knows
+about.
 
 **What would change the answer.** A job reaching several million units, at which
-point the read is hundreds of milliseconds per submission and (d) becomes worth
-building.
+point the read is hundreds of milliseconds on every submission and this stops
+being theoretical. The trigger to watch is the same one PLAN.md already set up
+for the stats payload: log the check when it crosses a threshold, and let the
+number decide.
 
 ### U4 — duplicate `worker_bans` rows
 
