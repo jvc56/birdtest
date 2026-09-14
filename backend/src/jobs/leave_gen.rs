@@ -20,8 +20,8 @@ pub async fn insert_request(
     sqlx::query(
         "INSERT INTO leave_requests
              (task_id, lexicon, variant, letter_distribution, board_layout, generation,
-              forced_racks, num_games, previous_artifact_key, use_wordmap)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+              seed, forced_racks, num_games, previous_artifact_key, use_wordmap)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
     )
     .bind(task_id)
     .bind(&req.lexicon)
@@ -29,6 +29,7 @@ pub async fn insert_request(
     .bind(&req.letter_distribution)
     .bind(&req.board_layout)
     .bind(req.generation)
+    .bind(req.seed as i64)
     .bind(&req.forced_racks)
     .bind(req.num_games)
     .bind(&req.previous_artifact_key)
@@ -45,8 +46,8 @@ impl JobHandler for LeaveGenHandler {
 
     async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
         let row = sqlx::query(
-            "SELECT lexicon, variant, letter_distribution, board_layout, generation, forced_racks,
-                    num_games, previous_artifact_key, use_wordmap
+            "SELECT lexicon, variant, letter_distribution, board_layout, generation, seed,
+                    forced_racks, num_games, previous_artifact_key, use_wordmap
              FROM leave_requests WHERE task_id = $1",
         )
         .bind(task_id)
@@ -58,6 +59,7 @@ impl JobHandler for LeaveGenHandler {
             letter_distribution: row.get("letter_distribution"),
             board_layout: row.get("board_layout"),
             generation: row.get("generation"),
+            seed: row.get::<i64, _>("seed") as u64,
             forced_racks: row.get("forced_racks"),
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
@@ -73,6 +75,9 @@ impl JobHandler for LeaveGenHandler {
         Ok(LeaveRecord { racks: response.racks })
     }
 
+    /// Credits the claim and folds its occurrences into the generation. Only
+    /// the first accepted result for a task is folded -- see
+    /// [`credit_claim`] for the others.
     async fn insert_record(
         conn: &mut PgConnection,
         job_id: Uuid,
@@ -80,78 +85,106 @@ impl JobHandler for LeaveGenHandler {
         claim_id: Uuid,
         record: &Self::Record,
     ) -> AppResult<()> {
-        let generation: i32 =
-            sqlx::query_scalar("SELECT generation FROM leave_requests WHERE task_id = $1")
-                .bind(task_id)
-                .fetch_one(&mut *conn)
-                .await?;
-
-        sqlx::query(
-            "INSERT INTO leave_records (task_claim_id, task_id, rack_count)
-             VALUES ($1, $2, $3)",
-        )
-        .bind(claim_id)
-        .bind(task_id)
-        .bind(record.racks.len() as i32)
-        .execute(&mut *conn)
-        .await?;
-
-        // A result for a generation that has already been aggregated is
-        // credited to the worker -- it did the work, and the claim completes
-        // normally -- but must not be folded in. The
-        // generation's KLV is already built and uploaded, so nothing will ever
-        // read these occurrences; adding them would only make the rows disagree
-        // with the artifact built from them, which is the one signal reserved
-        // for a corrupted or stale object (see `rebuild_artifacts`).
-        //
-        // Defence in depth, not a path the claim flow takes: a generation
-        // closes only when none of its claims is still `claimed`, a claim that
-        // times out is abandoned (and its submission refused before reaching
-        // here), and a reopened task is reissued only while its own generation
-        // is current. What remains is state the flow never writes -- a
-        // partial restore, a hand edit -- and folding into a built
-        // generation is the one outcome worth guarding against there.
-        let closed = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM leave_generation_artifacts
-                            WHERE job_id = $1 AND generation = $2)",
-        )
-        .bind(job_id)
-        .bind(generation)
-        .fetch_one(&mut *conn)
-        .await?;
-        if closed {
-            tracing::warn!(
-                job_id = %job_id, generation, task_id = %task_id,
-                racks = record.racks.len(),
-                "discarding a leave result for a generation that has already closed"
-            );
-            return Ok(());
-        }
-
-        // One statement per submission, however many racks it carries. An
-        // UPDATE rather than an upsert: the generation's universe is every
-        // full rack, seeded up front, so a rack with no row is not a rack of
-        // this distribution and must not create one.
-        let racks: Vec<&str> = record.racks.iter().map(|o| o.rack.as_str()).collect();
-        let counts: Vec<i64> = record.racks.iter().map(|o| o.count).collect();
-        let sums: Vec<f64> = record.racks.iter().map(|o| o.mean * o.count as f64).collect();
-        sqlx::query(
-            "UPDATE leave_rack_progress p SET
-                 occurrence_count = p.occurrence_count + u.count,
-                 equity_sum       = p.equity_sum + u.equity_sum,
-                 updated_at       = now()
-             FROM UNNEST($3::text[], $4::bigint[], $5::float8[]) AS u(rack, count, equity_sum)
-             WHERE p.job_id = $1 AND p.generation = $2 AND p.rack = u.rack",
-        )
-        .bind(job_id)
-        .bind(generation)
-        .bind(&racks)
-        .bind(&counts)
-        .bind(&sums)
-        .execute(&mut *conn)
-        .await?;
-        Ok(())
+        credit_claim(conn, task_id, claim_id, record).await?;
+        fold_into_generation(conn, job_id, task_id, record).await
     }
+}
+
+/// Records that a claim did a task's work, without adding its occurrences to
+/// the generation.
+///
+/// This is all a redundant result gets. With redundancy above 1 every claim of
+/// a task plays the same seed, so folding each of them in counted the same
+/// games `redundancy` times -- a generation reached its occurrence target on
+/// a fraction of the coverage it names, and closed early. Every other job
+/// type's aggregates already read one result per task, the first accepted
+/// (PLAN.md, "Redundant task execution"); this is the leave-generation half of
+/// that rule.
+pub async fn credit_claim(
+    conn: &mut PgConnection,
+    task_id: Uuid,
+    claim_id: Uuid,
+    record: &LeaveRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO leave_records (task_claim_id, task_id, rack_count)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(claim_id)
+    .bind(task_id)
+    .bind(record.racks.len() as i32)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+async fn fold_into_generation(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    task_id: Uuid,
+    record: &LeaveRecord,
+) -> AppResult<()> {
+    let generation: i32 =
+        sqlx::query_scalar("SELECT generation FROM leave_requests WHERE task_id = $1")
+            .bind(task_id)
+            .fetch_one(&mut *conn)
+            .await?;
+
+    // A result for a generation that has already been aggregated is credited
+    // to the worker -- it did the work, and the claim completes normally --
+    // but must not be folded in. The generation's KLV is already built and
+    // uploaded, so nothing will ever read these occurrences; adding them would
+    // only make the rows disagree with the artifact built from them, which is
+    // the one signal reserved for a corrupted or stale object (see
+    // `rebuild_artifacts`).
+    //
+    // Defence in depth, not a path the claim flow takes: a generation closes
+    // only when none of its claims is still `claimed`, a claim that times out
+    // is abandoned (and its submission refused before reaching here), and a
+    // reopened task is reissued only while its own generation is current. What
+    // remains is state the flow never writes -- a partial restore, a hand edit
+    // -- and folding into a built generation is the one outcome worth guarding
+    // against there.
+    let closed = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM leave_generation_artifacts
+                        WHERE job_id = $1 AND generation = $2)",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?;
+    if closed {
+        tracing::warn!(
+            job_id = %job_id, generation, task_id = %task_id,
+            racks = record.racks.len(),
+            "discarding a leave result for a generation that has already closed"
+        );
+        return Ok(());
+    }
+
+    // One statement per submission, however many racks it carries. An UPDATE
+    // rather than an upsert: the generation's universe is every full rack,
+    // seeded up front, so a rack with no row is not a rack of this
+    // distribution and must not create one.
+    let racks: Vec<&str> = record.racks.iter().map(|o| o.rack.as_str()).collect();
+    let counts: Vec<i64> = record.racks.iter().map(|o| o.count).collect();
+    let sums: Vec<f64> = record.racks.iter().map(|o| o.mean * o.count as f64).collect();
+    sqlx::query(
+        "UPDATE leave_rack_progress p SET
+             occurrence_count = p.occurrence_count + u.count,
+             equity_sum       = p.equity_sum + u.equity_sum,
+             updated_at       = now()
+         FROM UNNEST($3::text[], $4::bigint[], $5::float8[]) AS u(rack, count, equity_sum)
+         WHERE p.job_id = $1 AND p.generation = $2 AND p.rack = u.rack",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .bind(&racks)
+    .bind(&counts)
+    .bind(&sums)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
 }
 
 /// How long a started transition may go without finishing before another claim
@@ -392,6 +425,11 @@ pub async fn next_step(
         letter_distribution: job_data.letterdist_name.clone(),
         board_layout: job_data.layout_name.clone(),
         generation,
+        // Drawn fresh per task rather than derived from the job, so two tasks
+        // of one generation do not replay the same games over different
+        // forced racks; stored with the request, so a reissued task replays
+        // its own.
+        seed: rand::random(),
         forced_racks: racks,
         previous_artifact_key,
         num_games: config.num_iterations,
@@ -452,6 +490,21 @@ pub async fn seed_generation(
     }
     copy.finish().await?;
     Ok(total as i64)
+}
+
+/// Whether `generation`'s rack universe has been written. One index probe.
+pub async fn universe_exists(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress WHERE job_id = $1 AND generation = $2)",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?)
 }
 
 /// Make sure `generation`'s rack universe exists, seeding it if it does not.

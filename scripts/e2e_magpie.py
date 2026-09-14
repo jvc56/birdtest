@@ -186,7 +186,7 @@ def main() -> int:
     simming = create_player(client, args, data, "e2e-simming", {
         "recorder_type": "all",
         "winpct_id": winpct, "num_plies": 2, "num_plays": 5, "num_plies_recorded": 2,
-        "max_iterations": 60, "stopping_pct": 99,
+        "max_iterations": 60, "stopping_pct": 99, "time_limit_secs": 0,
     })
     # The static opening-rack job wants one move per rack, which `best` is
     # exactly right for -- and is what `num_plays_recorded` 1 says.

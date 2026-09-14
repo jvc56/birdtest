@@ -94,11 +94,11 @@ services:
       # resolution is 60 calls an hour per IP.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       MAGPIE_DATA_REPO: ${MAGPIE_DATA_REPO:-jvc56/MAGPIE-DATA}
-      # The fleet-wide floor: the oldest MAGPIE that speaks the contribution
-      # protocol correctly. `birdtest-contribute` reports 0.1.0, which meets it;
+      # The fleet-wide floor: the oldest MAGPIE whose results do not depend on
+      # its own local settings. `birdtest-contribute` reports 0.2.0, which meets it;
       # scripts/dev.py reads the version out of your checkout and sets this for
       # you, so an older checkout still runs locally.
-      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.1.0}
+      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.2.0}
       # Nginx appends the client address to X-Forwarded-For, and the per-IP
       # rate limits key on it. Requests to :8080 directly carry no header and
       # fall back to the peer address.

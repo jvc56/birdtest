@@ -152,7 +152,7 @@ impl TestDb {
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
-            min_magpie_version: "0.1.0".into(),
+            min_magpie_version: "0.2.0".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
             magpie_data_repo: "example/data".into(),
             github_token: None,
@@ -267,7 +267,7 @@ impl TestDb {
         job
     }
 
-    /// A `jobs` row and nothing else: active, allocation 50, floor 0.1.0.
+    /// A `jobs` row and nothing else: active, allocation 50, floor 0.2.0.
     pub async fn bare_job(&self, job_type: &str, redundancy: i32, created_by: Uuid) -> Uuid {
         let ld = self.input_data("letterdist", "english").await;
         let layout = self.input_data("layout", "standard15").await;

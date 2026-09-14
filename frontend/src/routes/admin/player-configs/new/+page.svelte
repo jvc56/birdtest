@@ -20,7 +20,6 @@
   let numPliesRecorded = 2;
   let stoppingPct = 99;
   let useInference = false;
-  let timeLimitSecs: number | '' = '';
   let showAdvanced = false;
   // Exhaustive on purpose: any MAGPIE option not stated here falls back to
   // whatever a worker's own process happens to have, which can differ across
@@ -80,7 +79,9 @@
         num_plies_recorded: simming ? numPliesRecorded : null,
         stopping_pct: simming ? stoppingPct : null,
         use_inference: simming ? useInference : null,
-        time_limit_secs: simming && timeLimitSecs !== '' ? Number(timeLimitSecs) : null,
+        // Always 0 for a simmer: a time limit makes results depend on the
+        // contributor's hardware, so the iteration budget bounds a simulation.
+        time_limit_secs: simming ? 0 : null,
         use_wordmap: useWordmap,
         use_rit: useRit,
         min_play_iterations: minPlayIterations === '' ? null : Number(minPlayIterations),
@@ -178,7 +179,7 @@
       <div><label class="label" for="np">Plays to simulate (-np)</label><input id="np" type="number" class="input" bind:value={numPlays} /></div>
       <div><label class="label" for="npr">Plies to report (shplies)</label><input id="npr" type="number" class="input" bind:value={numPliesRecorded} /></div>
       <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="0.1" class="input" bind:value={stoppingPct} /></div>
-      <div><label class="label" for="tl">Time limit seconds (-tl)</label><input id="tl" type="number" step="1" class="input" bind:value={timeLimitSecs} /></div>
+      <p class="text-sm">No time limit: a simulation stops at its iteration budget, so what it finds does not depend on the contributor's hardware.</p>
       <label class="flex items-end gap-2 text-sm">
         <input type="checkbox" bind:checked={useInference} />
         Use inference (-si)

@@ -538,8 +538,8 @@ job creation touches needs one caller here.
   `input_data` rows.
 - `I-JOB-4` A job referencing a nonexistent `input_data` id fails cleanly with a
   400-shaped error, not a foreign-key 500.
-- `I-JOB-5` `initialize_job_state` seeds the leave universe for leave generation
-  and does nothing for the other three.
+- `I-JOB-5` Creating a job writes no rows up front; a leave-generation job's
+  first claim starts the seeding of its generation-1 universe.
 - `I-JOB-6` Activation sets `allocation` and `activated_at`; deactivation clears
   the schedule without destroying tasks; completion is terminal.
 - `I-JOB-7` An allocation outside 0–100 is rejected.
@@ -820,7 +820,7 @@ Write these as one table-driven test each rather than 50 separate functions.
 
 - `A-ADMIN-1` Player config create/get/list/delete round-trips, and a config in
   use cannot be deleted.
-- `A-ADMIN-2` Creating a job of each type returns `{job, initialized}` and the
+- `A-ADMIN-2` Creating a job of each type returns `{job}` and the
   job is inactive with no allocation.
 - `A-ADMIN-3` Job creation rejects: mismatched win% models, incompatible
   lexicon/distribution, an unknown `input_data` id, a simming player with no
@@ -1003,8 +1003,8 @@ silently mean nothing was exercised. This follows the precedent already set by
 when the binary is absent.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.1.0`, the shipped `MIN_MAGPIE_VERSION` default,
-and a checkout from before the audit's fixes reports `0.0.0` and is refused. The
+`birdtest-contribute` reports `0.2.0`, the shipped `MIN_MAGPIE_VERSION` default,
+and a checkout from before the audits' fixes reports `0.1.0` or `0.0.0` and is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 

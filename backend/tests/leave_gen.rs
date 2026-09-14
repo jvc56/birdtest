@@ -43,7 +43,10 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
         .await
         .unwrap();
     let mut conn = db.pool.acquire().await.unwrap();
-    let seeded = birdtest::jobs::registry::initialize_job_state(&mut conn, &row).await.unwrap();
+    let job_data = birdtest::jobs::load_job_data(&mut conn, row.id).await.unwrap();
+    let seeded = birdtest::jobs::leave_gen::seed_generation(&mut conn, job, 1, &job_data.letterdist)
+        .await
+        .unwrap();
     (job, seeded)
 }
 
@@ -661,17 +664,18 @@ async fn a_transition_whose_job_was_purged_meanwhile_closes_nothing() {
     assert!(close().await.is_err());
 }
 
-/// Closing a generation does not write the next one's universe; the first claim
-/// for that generation does.
+/// Closing a generation does not write the next one's universe, and neither
+/// does the claim that finds it missing: that claim starts the seeding on its
+/// own task and answers straight away.
 ///
-/// It used to be part of the same transaction, which made closing a generation
-/// a millions-of-rows write that every worker on the job waited out -- and one
-/// the transition had to redo in full if anything failed, because the close and
-/// the copy stood or fell together. Seeded from the claim path it happens while
-/// workers are busy, under the job's lock so two claims cannot both do it, and
-/// a failure costs a retry of the seeding alone.
+/// It used to be part of the transition's transaction, which made closing a
+/// generation a millions-of-rows write every worker on the job waited out. It
+/// then moved into the first claim for the new generation -- still inside a
+/// request, where a client that gave up rolled it back. MAGPIE gives up after
+/// 120 seconds, so on a database slower than that at seeding 3.2 million rows
+/// every claim restarted the seeding and none finished.
 #[tokio::test]
-async fn the_next_generations_universe_is_seeded_by_a_claim_not_by_the_transition() {
+async fn the_next_generations_universe_is_seeded_off_the_claim_path() {
     let db = TestDb::new().await;
     let (job, seeded) = leave_job(&db, 2).await;
     let app = birdtest::app(db.state().await);
@@ -710,16 +714,156 @@ async fn the_next_generations_universe_is_seeded_by_a_claim_not_by_the_transitio
 
     assert_eq!(universe(2).await.unwrap(), 0, "the transition wrote no rows");
 
-    // The next claim finds generation 2 current, seeds its universe, and hands
-    // out work from it.
+    // The next claim finds generation 2 current and its universe missing. It
+    // is answered at once with nothing to do rather than held for the seeding.
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // The seeding it started finishes on its own, in full.
+    let seeded_in_full = wait_for(|| async { universe(2).await.unwrap() == seeded }).await;
+    assert!(seeded_in_full, "the detached seeding wrote the whole universe");
+
+    // Then work flows from generation 2, and nothing seeds it a second time.
     let (status, assignment) =
         send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::OK, "{assignment}");
     assert_eq!(assignment["task_request"]["generation"], json!(2));
-    assert_eq!(universe(2).await.unwrap(), seeded, "the claim seeded it, in full");
-
-    // And a second claim does not seed it again.
     let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(universe(2).await.unwrap(), seeded);
+}
+
+/// A leave task carries a seed, chosen when the task is created and replayed
+/// when the task is reissued.
+///
+/// Before, the request had none and MAGPIE seeded the task's games from its own
+/// process state, so what a task played depended on which machine ran it.
+#[tokio::test]
+async fn a_leave_task_carries_its_seed_and_a_reissue_replays_it() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (status, first) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let seed = first["task_request"]["seed"].as_str().expect("a decimal-string seed");
+    seed.parse::<u64>().expect("a uint64");
+
+    sqlx::query("UPDATE task_claims SET claimed_at = now() - interval '1 hour'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(birdtest::scheduler::reclaim_expired(&db.pool, job, 300.0).await.unwrap(), 1);
+
+    let (status, again) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["task_request"]["seed"], first["task_request"]["seed"]);
+
+    // A new task of the same generation gets a seed of its own.
+    let (status, other) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+    assert_ne!(other["task_request"]["seed"], first["task_request"]["seed"]);
+}
+
+/// With redundancy above 1 every claim of a leave task replays the same seed,
+/// so only the first accepted result folds into the generation; the others are
+/// credited and nothing more.
+#[tokio::test]
+async fn only_the_first_result_for_a_leave_task_is_folded() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    sqlx::query("UPDATE jobs SET redundancy = 2 WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let mut claims = Vec::new();
+    for _ in 0..2 {
+        let (status, body) =
+            send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        claims.push(body);
+    }
+    assert_eq!(
+        claims[0]["task_request"]["seed"], claims[1]["task_request"]["seed"],
+        "both slots of one task: {claims:?}"
+    );
+    let rack = forced_racks(&claims[0])[0].clone();
+
+    for claim in &claims {
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/worker/result",
+                &[("x-worker-uuid", claim["worker_uuid"].as_str().unwrap())],
+                json!({ "claim_token": claim["claim_token"], "result": { "racks": [
+                    { "rack": rack, "count": 3, "mean": 10.0 }
+                ]}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["accepted"], json!(true));
+    }
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT occurrence_count FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = 1 AND rack = $2",
+    )
+    .bind(job)
+    .bind(&rack)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(count, 3, "the same games are counted once, not once per claim");
+
+    let credited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(credited, 2, "both claims are credited");
+}
+
+/// Generation 1's universe is seeded by the first claim, like every later
+/// generation's: creating or purging a job writes none of it, so neither holds
+/// its request, or a purge its locks, for the tens of seconds 3.2 million rows
+/// take.
+#[tokio::test]
+async fn generation_ones_universe_is_seeded_by_the_first_claim_too() {
+    let db = TestDb::new().await;
+    let (job, seeded) = leave_job(&db, 2).await;
+    // What creation and purge now leave behind.
+    sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let universe = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM leave_rack_progress WHERE job_id = $1 AND generation = 1",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    assert!(wait_for(|| async { universe().await == seeded }).await, "seeded in full");
+
+    let (status, assignment) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    assert_eq!(assignment["task_request"]["generation"], json!(1));
 }

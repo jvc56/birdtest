@@ -27,6 +27,10 @@ pub enum Acquired {
     /// Leave generation only: the current generation is finished and must be
     /// aggregated before more tasks exist. Handled outside the transaction.
     NeedsGenerationTransition { generation: i32 },
+    /// Leave generation only: the current generation's rack universe has not
+    /// been written yet. It is seeded on its own task, and the job has nothing
+    /// to hand out until that commits.
+    NeedsUniverse { generation: i32 },
     /// Leave generation only: all configured generations are done.
     JobFinished,
 }
@@ -36,6 +40,19 @@ pub async fn acquire(
     job: &Job,
     identity: &WorkerIdentity,
 ) -> AppResult<Acquired> {
+    // Every claim decision for a job is made under its dispatch lock, the
+    // re-dispatch of an existing task included. That path used to skip it, and
+    // it is the one a purge could not stop: a claim holding a task row it had
+    // just selected would wait on the job's row lock the purge held, while the
+    // purge waited on that same task row to delete it -- a deadlock, which
+    // Postgres breaks by failing one of the two. Claims against one job
+    // already serialized on that row lock (`issue_claim` bumps
+    // `claims_issued`), so taking the advisory lock first costs a little more
+    // of the same wait and nothing new.
+    if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
+        return Ok(Acquired::NoWork);
+    }
+
     // A task whose claim timed out drops back to `available`, and so does a
     // task with redundancy left to fill, so re-dispatching those comes first.
     // For games this is what keeps the seed space covered: an abandoned batch
@@ -62,12 +79,9 @@ pub async fn acquire(
 }
 
 async fn generate_opening_rack(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
-    // Before the range is read: `next_request` addresses the next slice with
-    // `MAX(seed)`, which a concurrent claim's uncommitted task is invisible to.
-    if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
-        return Ok(Acquired::NoWork);
-    }
-
+    // `acquire` already holds the job's dispatch lock, which is what this
+    // needs: `next_request` addresses the next slice with `MAX(seed)`, which a
+    // concurrent claim's uncommitted task is invisible to.
     let config = sqlx::query_as::<_, OpeningRackConfig>(
         "SELECT * FROM job_opening_rack_config WHERE job_id = $1",
     )
@@ -155,11 +169,8 @@ pub async fn load_request(
 }
 
 async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
-    // See `generate_opening_rack`: the seed cursor is `MAX(seed)`.
-    if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
-        return Ok(Acquired::NoWork);
-    }
-
+    // See `generate_opening_rack`: the seed cursor is `MAX(seed)`, read under
+    // the dispatch lock `acquire` holds.
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
         .bind(job.id)
         .fetch_one(&mut *conn)
@@ -180,11 +191,8 @@ async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquire
 }
 
 async fn generate_game_pairs(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
-    // See `generate_opening_rack`: the seed cursor is `MAX(seed)`.
-    if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
-        return Ok(Acquired::NoWork);
-    }
-
+    // See `generate_opening_rack`: the seed cursor is `MAX(seed)`, read under
+    // the dispatch lock `acquire` holds.
     let config =
         sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
             .bind(job.id)
@@ -216,13 +224,11 @@ async fn generate_leave_gen(
             .fetch_one(&mut *conn)
             .await?;
 
-    // Held for the rest of this transaction, before anything is read: what to
-    // hand out, and whether the generation can be closed, are decisions that
-    // must not be made from a view of the job that another claim is in the
-    // middle of changing. See PLAN.md's leave-generation claim steps.
-    if !leave_gen::lock_claim_decisions(conn, job.id).await? {
-        return Ok(Acquired::NoWork);
-    }
+    // `acquire` holds the job's dispatch lock for the rest of this transaction,
+    // taken before anything here is read: what to hand out, and whether the
+    // generation can be closed, are decisions that must not be made from a
+    // view of the job that another claim is in the middle of changing. See
+    // PLAN.md's leave-generation claim steps.
 
     // A reopened task -- its claim timed out -- is reissued before a new one is
     // generated, as for every job type, but only here: after the lock, so the
@@ -247,13 +253,16 @@ async fn generate_leave_gen(
         return Ok(Acquired::NoWork);
     }
 
-    // Generations past the first get their rack universe here, the first time a
-    // claim asks for work in one, rather than from the transition that closed
-    // the generation before. Under the lock, so two claims arriving together
-    // cannot both seed it, and before anything reads `leave_rack_progress`,
+    // Generations past the first get their rack universe when a claim first
+    // asks for work in one, rather than from the transition that closed the
+    // generation before -- but not inside the claim: it is millions of rows,
+    // and a request the client gives up on rolls it back. The caller seeds it
+    // on its own task. Checked before anything reads `leave_rack_progress`,
     // which is what selection and the in-flight check are about to do.
+    if !leave_gen::universe_exists(&mut *conn, job.id, generation).await? {
+        return Ok(Acquired::NeedsUniverse { generation });
+    }
     let job_data = load_job_data(&mut *conn, job.id).await?;
-    leave_gen::ensure_universe(&mut *conn, job.id, generation, &job_data.letterdist).await?;
 
     if let Some(task_id) = next_available(&mut *conn, job.id, identity, Some(generation)).await? {
         let request = load_request(conn, job.job_type, task_id).await?;
@@ -318,11 +327,17 @@ async fn check_batch_size(
 }
 
 /// Validate, normalize and store a worker submission.
+///
+/// `first_result` says whether this is the first accepted result for its task,
+/// which the caller reads from the task's `accepted_count` under the task's row
+/// lock. Only a first result adds to the job's running totals or folds into a
+/// leave generation: redundant claims replay the same deterministic work.
 pub async fn store_result(
     conn: &mut PgConnection,
     job: &Job,
     task_id: Uuid,
     claim_id: Uuid,
+    first_result: bool,
     payload: serde_json::Value,
 ) -> AppResult<()> {
     fn decode<T: serde::de::DeserializeOwned>(payload: serde_json::Value) -> AppResult<T> {
@@ -346,7 +361,7 @@ pub async fn store_result(
             count_first_result(
                 conn,
                 job,
-                task_id,
+                first_result,
                 "racks_analyzed",
                 record.positions.len() as i64,
             )
@@ -356,7 +371,7 @@ pub async fn store_result(
             let record = game::GameHandler::process_response(decode(payload)?)?;
             check_batch_size(conn, job, task_id, record.all_games.games).await?;
             game::GameHandler::insert_record(conn, job.id, task_id, claim_id, &record).await?;
-            count_first_result(conn, job, task_id, "games_completed", record.all_games.games as i64)
+            count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
                 .await
         }
         JobType::GamePairs => {
@@ -365,12 +380,17 @@ pub async fn store_result(
             game_pair::GamePairHandler::insert_record(conn, job.id, task_id, claim_id, &record).await?;
             // Games, not pairs, for both job types: the pairs count is half of
             // it and is derived where it is displayed.
-            count_first_result(conn, job, task_id, "games_completed", record.all_games.games as i64)
+            count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
                 .await
         }
         JobType::LeaveGeneration => {
             let record = leave_gen::LeaveGenHandler::process_response(decode(payload)?)?;
-            leave_gen::LeaveGenHandler::insert_record(conn, job.id, task_id, claim_id, &record).await
+            if first_result {
+                leave_gen::LeaveGenHandler::insert_record(conn, job.id, task_id, claim_id, &record)
+                    .await
+            } else {
+                leave_gen::credit_claim(conn, task_id, claim_id, &record).await
+            }
         }
     }
 }
@@ -381,14 +401,15 @@ pub async fn store_result(
 /// The reads these totals replace both selected one result per task -- the
 /// aggregates they summed describe the same deterministic work on every
 /// redundant claim, so counting all of them would multiply the total by the
-/// job's redundancy (PLAN.md, "What these reads cost"). "First" is decided from
-/// the rows just written rather than from the task's `accepted_count`, which
-/// the submit path has not incremented yet. That is sound only because
-/// `submit_result` locks the task row before storing anything, so this count
-/// sees every earlier submission for the task as committed. Without the lock,
-/// two submissions arriving together each counted only their own uncommitted
-/// rows and both added to the total. Count and update share the submission's
-/// transaction, so a submission that later fails contributes neither.
+/// job's redundancy (PLAN.md, "What these reads cost"). "First" comes from the
+/// task's `accepted_count`, read by `submit_result` under the task's row lock
+/// before anything is stored: every accepted result increments it in the
+/// transaction that stores the result, and that transaction holds the same
+/// lock, so two submissions arriving together cannot both read zero. It used to
+/// be decided by counting the rows just written, which for an opening-rack
+/// batch was a read of up to 10,000 of them to learn one bit. Update and store
+/// share the submission's transaction, so a submission that later fails
+/// contributes neither.
 ///
 /// The update takes a row lock on `jobs`, so two submissions for the same job
 /// serialize here for as long as the lock is held. A task is minutes of work, so
@@ -397,26 +418,11 @@ pub async fn store_result(
 async fn count_first_result(
     conn: &mut PgConnection,
     job: &Job,
-    task_id: Uuid,
+    first_result: bool,
     column: &str,
     amount: i64,
 ) -> AppResult<()> {
-    let results_for_task = match job.job_type {
-        JobType::OpeningRack => {
-            "SELECT COUNT(DISTINCT task_claim_id) FROM position_analysis_records WHERE task_id = $1"
-        }
-        JobType::Games | JobType::GamePairs => {
-            "SELECT COUNT(*) FROM game_results WHERE task_id = $1"
-        }
-        // Leave generation has no such total: its progress is
-        // `leave_rack_progress`, which is already one indexed row per rack.
-        JobType::LeaveGeneration => return Ok(()),
-    };
-    let results: i64 = sqlx::query_scalar(results_for_task)
-        .bind(task_id)
-        .fetch_one(&mut *conn)
-        .await?;
-    if results != 1 {
+    if !first_result {
         return Ok(());
     }
 
@@ -427,21 +433,6 @@ async fn count_first_result(
         .execute(&mut *conn)
         .await?;
     Ok(())
-}
-
-/// State a job needs in place before it can dispatch anything.
-///
-/// No job type pre-populates *tasks* any more -- every one generates them at
-/// claim time. This is only leave generation's rack universe, which claim-time
-/// rack selection orders by.
-pub async fn initialize_job_state(conn: &mut PgConnection, job: &Job) -> AppResult<i64> {
-    match job.job_type {
-        JobType::LeaveGeneration => {
-            let job_data = load_job_data(&mut *conn, job.id).await?;
-            leave_gen::seed_generation(conn, job.id, 1, &job_data.letterdist).await
-        }
-        JobType::OpeningRack | JobType::Games | JobType::GamePairs => Ok(0),
-    }
 }
 
 /// The part of job initialization that cannot run inside the creating

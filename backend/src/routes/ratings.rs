@@ -280,22 +280,47 @@ struct HistoryPoint {
     stderr: f64,
 }
 
-/// Every stored run's ratings, oldest first: the chart's time axis. Snapshots
-/// per run rather than a mutated current value are what make this possible at
-/// all.
+/// The most runs one history response carries.
+///
+/// A pool with an active job is refit every two minutes -- 720 runs a day, each
+/// with a row per member -- and this is a public page. Returning every run made
+/// its cost and its payload grow for the life of the pool: a month of one
+/// active job at ten members is over 200,000 points on every page view, for a
+/// chart a few hundred pixels wide.
+const MAX_HISTORY_RUNS: i64 = 500;
+
+/// The pool's rating history, oldest first: the chart's time axis. Snapshots per
+/// run rather than a mutated current value are what make this possible at all.
+///
+/// Thinned to at most [`MAX_HISTORY_RUNS`] runs, evenly spaced over the pool's
+/// whole history, with the first and the newest always kept -- so the chart
+/// still starts where the pool started and ends at the rating the page shows.
 async fn pool_history(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<HistoryPoint>>> {
     let rows = sqlx::query(
-        "SELECT run.computed_at, r.player_config_id, c.name, r.rating, r.stderr
-         FROM rating_runs run
-         JOIN player_config_ratings r ON r.run_id = run.id
+        "WITH runs AS (
+             SELECT id, computed_at,
+                    row_number() OVER (ORDER BY computed_at) AS n,
+                    count(*) OVER () AS total
+             FROM rating_runs WHERE pool_id = $1
+         ),
+         kept AS (
+             SELECT id, computed_at FROM runs
+             WHERE total <= $2
+                OR (n - 1) % ((total + $2 - 1) / $2) = 0
+                OR n = total
+         )
+         SELECT kept.computed_at, r.player_config_id, c.name, r.rating, r.stderr
+         FROM kept
+         JOIN player_config_ratings r ON r.run_id = kept.id
          JOIN player_configs c        ON c.id = r.player_config_id
-         WHERE run.pool_id = $1 AND r.connected_to_anchor
-         ORDER BY run.computed_at ASC, c.name ASC",
+         WHERE r.connected_to_anchor
+         ORDER BY kept.computed_at ASC, c.name ASC",
     )
     .bind(id)
+    .bind(MAX_HISTORY_RUNS)
     .fetch_all(&state.pool)
     .await?;
 

@@ -241,10 +241,13 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.1.0 is the
-    -- first MAGPIE version that implements the protocol correctly.
+    -- so "no floor" is not a state worth being able to express. 0.2.0 is the
+    -- first MAGPIE version whose results do not depend on the contributor's own
+    -- settings: 0.1.0 implemented the protocol but left the bingo bonus, an
+    -- opening-rack simulation's settings and a leave-generation task's seed to
+    -- whatever the worker's MAGPIE had.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 2 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
@@ -615,6 +618,11 @@ CREATE TABLE leave_requests (
     letter_distribution TEXT NOT NULL,
     board_layout        TEXT NOT NULL,
     generation          INT NOT NULL,
+    -- The seed the task's games are played from, chosen when the task is
+    -- created, so a reissued task replays it. Stored as signed int64 and
+    -- interpreted as uint64, like tasks.seed. Without it a worker seeded from
+    -- its own process state, which differs by machine.
+    seed                BIGINT NOT NULL,
     forced_racks        TEXT[] NOT NULL,   -- the rack subset this task must force (passed to MAGPIE's rack_list_create)
     num_games           INT NOT NULL,      -- denormalized from job_leave_config.num_iterations
     -- Combined KLV from the previous generation. Never NULL: generation 1 reads

@@ -184,6 +184,14 @@ pub struct LeaveRequest {
     /// See [`OpeningRackRequest::board_layout`].
     pub board_layout: String,
     pub generation: i32,
+    /// The seed the task's games are played from, as a decimal string like
+    /// [`GameRequest::seed`]. Chosen by the server when the task is created and
+    /// stored with it, so a reissued task replays the seed it was first given.
+    /// Without it the worker seeded leave generation from its own state -- the
+    /// process start time, a `-seed` in its settings, or the seed of the last
+    /// games task it ran -- so what a task played depended on the machine.
+    #[serde(with = "seed_as_string")]
+    pub seed: u64,
     pub forced_racks: Vec<String>,
     /// Combined KLV from the previous generation. Always present: generation 1
     /// reads the server-built zeroed KLV stored at generation 0, so every

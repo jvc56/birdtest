@@ -394,7 +394,7 @@ export const api = {
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>
-    post<{ job: JobListItem; initialized: number }>('/api/admin/jobs', body),
+    post<{ job: JobListItem }>('/api/admin/jobs', body),
   activateJob: (id: string, allocation: number) =>
     post<JobListItem>(`/api/admin/jobs/${id}/activate`, { allocation }),
   deactivateJob: (id: string) => post<JobListItem>(`/api/admin/jobs/${id}/deactivate`),

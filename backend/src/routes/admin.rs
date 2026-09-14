@@ -547,6 +547,28 @@ async fn create_player_config(
         return Err(AppError::bad_request("player config is invalid")
             .with_field("num_plies", "a simming player must simulate at least 1 ply"));
     }
+    // A simulation stops at whichever comes first, its iteration budget or its
+    // time limit, and a time limit makes how far it gets depend on the
+    // contributor's hardware: two honest workers would rank the same position
+    // differently. MAGPIE applies a limit only above 0, and a null here means
+    // its 60-second default, so a simmer states 0 and an iteration budget --
+    // without one, nothing but the stopping condition would end a simulation.
+    if simming {
+        let mut err = AppError::bad_request("player config is invalid");
+        if body.max_iterations.is_none() {
+            err = err.with_field("max_iterations", "a simming player must set an iteration budget");
+        }
+        if body.time_limit_secs != Some(0) {
+            err = err.with_field(
+                "time_limit_secs",
+                "must be 0 for a simming player: a time limit makes results depend on the \
+                 contributor's hardware, so the iteration budget bounds a simulation instead",
+            );
+        }
+        if !err.fields.is_empty() {
+            return Err(err);
+        }
+    }
     match (simming, &winpct) {
         (true, None) => {
             return Err(AppError::bad_request(
@@ -848,12 +870,13 @@ fn default_rack_size() -> i32 {
     7
 }
 
+/// Creation writes no rows up front for any job type: no tasks, and no
+/// leave-generation rack universe, which the first claim seeds on its own task
+/// as it does every generation's. Seeding generation 1 here held the creating
+/// request open for the tens of seconds 3.2 million rows take.
 #[derive(Serialize)]
 struct CreatedJob {
     job: Job,
-    /// Rows written up front. Only leave generation has any: the rack universe
-    /// that generation 1 is measured against. No job type pre-populates tasks.
-    initialized: i64,
 }
 
 /// Jobs are always created inactive. Allocation is supplied later, at
@@ -903,8 +926,6 @@ async fn create_job(
 
     insert_job_config(&mut tx, &job, &body.config, &letterdist_name).await?;
 
-    let initialized = registry::initialize_job_state(&mut tx, &job).await?;
-
     audit::log(
         &mut tx,
         "job.created",
@@ -921,7 +942,7 @@ async fn create_job(
     // write, so it happens after the transaction commits rather than inside it.
     registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
 
-    Ok((StatusCode::CREATED, Json(CreatedJob { job, initialized })))
+    Ok((StatusCode::CREATED, Json(CreatedJob { job })))
 }
 
 /// The largest opening-rack batch accepted. A task's racks are expanded into
@@ -942,6 +963,12 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let mut err = AppError::bad_request("job settings are invalid");
     if body.redundancy < 1 {
         err = err.with_field("redundancy", "must be at least 1");
+    }
+    // A leave task's redundant copies replay the same seed only when MAGPIE runs
+    // single-threaded; multi-threaded they are different samples, and there is
+    // no integrity use for them today. Refused rather than given a meaning.
+    if body.job_type == JobType::LeaveGeneration && body.redundancy > 1 {
+        err = err.with_field("redundancy", "leave generation runs at redundancy 1");
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
@@ -1108,9 +1135,14 @@ async fn validate_shared_player_options(
     .ok_or_else(|| AppError::bad_request("player config not found"))?;
 
     use sqlx::Row;
+    // Only two *simming* players can disagree. A static player has no win%
+    // model at all (`winpct_id` is refused on one), so comparing with plain
+    // equality made every static-versus-simmer job -- the mix PLAN.md promises
+    // a games job supports -- fail here as a "disagreement". The worker loads
+    // the model from whichever player states one.
     let p1_winpct_id: Option<Uuid> = row.get("p1_winpct_id");
     let p2_winpct_id: Option<Uuid> = row.get("p2_winpct_id");
-    if p1_winpct_id != p2_winpct_id {
+    if matches!((p1_winpct_id, p2_winpct_id), (Some(p1), Some(p2)) if p1 != p2) {
         return Err(AppError::bad_request(
             "player configs disagree on the win% model, which MAGPIE cannot vary per player",
         ));
@@ -1121,6 +1153,52 @@ async fn validate_shared_player_options(
         return Err(AppError::bad_request(
             "player configs disagree on movegen_margin, which MAGPIE cannot vary per player",
         ));
+    }
+    Ok(())
+}
+
+/// MAGPIE's candidate-play count for a player whose config leaves `num_plays`
+/// null: the reset `contribute` applies before every request.
+const MAGPIE_DEFAULT_NUM_PLAYS: i32 = 100;
+
+/// A capture job's simmers must already consider at least as many plays as are
+/// captured.
+///
+/// With `capture_positions` on, MAGPIE's autoplay raises each simming player's
+/// candidate count to the capture cap -- player 1's `num_plays_recorded` -- so
+/// there are enough ranked plays to record. A simmer configured for fewer would
+/// then consider more candidates with capture on than off, and turning capture
+/// on, which is meant only to decide what is kept, would change the games.
+async fn validate_capture_play_cap(
+    conn: &mut sqlx::PgConnection,
+    player1_config_id: Uuid,
+    player2_config_id: Uuid,
+) -> AppResult<()> {
+    let cap: i32 =
+        sqlx::query_scalar("SELECT num_plays_recorded FROM player_configs WHERE id = $1")
+            .bind(player1_config_id)
+            .fetch_optional(&mut *conn)
+            .await?
+            .ok_or_else(|| AppError::bad_request("player config not found"))?;
+    let players = sqlx::query_as::<_, (String, Option<i32>, Option<i32>)>(
+        "SELECT name, num_plies, num_plays FROM player_configs WHERE id = ANY($1)",
+    )
+    .bind(vec![player1_config_id, player2_config_id])
+    .fetch_all(&mut *conn)
+    .await?;
+    for (name, plies, plays) in players {
+        let plays = plays.unwrap_or(MAGPIE_DEFAULT_NUM_PLAYS);
+        if plies.unwrap_or(0) > 0 && plays < cap {
+            return Err(AppError::bad_request("job settings are invalid").with_field(
+                "capture_positions",
+                format!(
+                    "{name} simulates {plays} candidate plays, fewer than the {cap} captured \
+                     per position; with capture on MAGPIE would raise it and play different \
+                     games. Use a config with num_plays of at least {cap}, or lower player \
+                     1's num_plays_recorded."
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -1228,6 +1306,10 @@ async fn insert_job_config(
                 letterdist_name,
             )
             .await?;
+            if *capture_positions {
+                validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
+                    .await?;
+            }
             sqlx::query(
                 "INSERT INTO job_game_config
                      (job_id, player1_config_id,
@@ -1259,6 +1341,10 @@ async fn insert_job_config(
                 letterdist_name,
             )
             .await?;
+            if *capture_positions {
+                validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
+                    .await?;
+            }
             sqlx::query(
                 "INSERT INTO job_game_pair_config
                      (job_id, player1_config_id,
@@ -1589,6 +1675,34 @@ async fn release_contributions(conn: &mut sqlx::PgConnection, job_id: Uuid) -> A
     Ok(())
 }
 
+/// Wait out every submission, decline and heartbeat in flight on this job's
+/// open claims, and hold further ones off until the caller commits.
+///
+/// A submission locks its claim, then its task, then the job's row. Purge and
+/// delete took the job's row first and deleted the claims afterwards -- the
+/// opposite order -- so a submission arriving mid-purge waited on the job's row
+/// while the purge waited on that submission's claim: a deadlock, which
+/// Postgres breaks by failing one of the two. And a submission that committed
+/// after `release_contributions` had counted, but before the delete, credited
+/// its identity for a claim the purge then destroyed, so that contributor's
+/// total read high for good.
+///
+/// Locking the open claims first, before the job's row, puts destruction in
+/// the order every submission uses, and means `release_contributions` sees
+/// every submission that got in ahead of it. The caller takes the dispatch lock
+/// before this, which is what stops new claims appearing meanwhile.
+async fn lock_open_claims(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query(
+        "SELECT c.id FROM task_claims c JOIN tasks t ON t.id = c.task_id
+         WHERE t.job_id = $1 AND c.state = 'claimed'
+         FOR UPDATE OF c",
+    )
+    .bind(job_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 async fn purge_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1609,6 +1723,9 @@ async fn purge_job(
     // was supposed to start over. Taken before the census, so the numbers
     // written to the audit log are the ones actually destroyed.
     crate::jobs::lock_job_dispatch(&mut tx, id).await?;
+    // Before the job's row, for the lock order every submission uses: see
+    // `lock_open_claims`.
+    lock_open_claims(&mut tx, id).await?;
     let job = load_job_for_update(&mut tx, id).await?;
 
     // Written before anything is deleted: after this transaction commits, this
@@ -1673,9 +1790,11 @@ async fn purge_job(
         .await?
         .rows_affected();
 
-    // Leave-gen needs its generation-1 rack universe back to have anything to
-    // measure progress against.
-    registry::initialize_job_state(&mut tx, &job).await?;
+    // The generation-1 rack universe just deleted is not written back here. The
+    // first claim finds it missing and seeds it on its own task, as it does
+    // every generation's; seeding it inline held this transaction -- and with
+    // it the job's row and every open claim -- for the tens of seconds 3.2
+    // million rows take, while that job's submissions queued behind it.
 
     audit::log(
         &mut tx,
@@ -1712,9 +1831,18 @@ async fn delete_job(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
-    // The audit rows are written first: `audit_log.job_id` references `jobs`,
-    // so they have to exist while the job still does. The census is what a
-    // restore is scoped against if this delete turns out to be a mistake.
+    // The same locks a purge takes, in the same order and for the same
+    // reasons: no claim is issued meanwhile, and no submission is between its
+    // claim and its commit when `release_contributions` counts -- see
+    // `lock_open_claims`. The cascade below deletes every claim and task, so
+    // without them this deadlocked against a submission in flight just as
+    // purge did.
+    crate::jobs::lock_job_dispatch(&mut tx, id).await?;
+    lock_open_claims(&mut tx, id).await?;
+    load_job_for_update(&mut tx, id).await?;
+
+    // The census is what a restore is scoped against if this delete turns out
+    // to be a mistake, so it is written before anything is removed.
     let census = job_census(&mut tx, id).await?;
     audit::log(
         &mut tx,
@@ -2257,6 +2385,20 @@ mod tests {
             "racks_per_task": 0,
         }));
         assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "racks_per_task"]);
+    }
+
+    #[test]
+    fn leave_generation_runs_at_redundancy_one() {
+        let mut leave = body(serde_json::json!({
+            "job_type": "leave_generation",
+            "kwg_id": Uuid::nil(),
+            "num_iterations": 1,
+            "target_rack_count": 10,
+            "racks_per_task": 1,
+        }));
+        assert!(validate_job_body(&leave).is_ok());
+        leave.redundancy = 2;
+        assert_eq!(fields(validate_job_body(&leave)), ["redundancy"]);
     }
 
     #[test]

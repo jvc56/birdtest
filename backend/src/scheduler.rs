@@ -396,6 +396,28 @@ async fn try_claim_from_job(
                 .map_err(|e| JobClaimError::Fatal(e.into()))?;
             Ok(None)
         }
+        Acquired::NeedsUniverse { generation } => {
+            // Nothing was written, and rolling back releases the job's lock so
+            // the seeding can take it.
+            let _ = tx.rollback().await;
+            // Seeded on its own task rather than in this request, for the
+            // reason the transition is: it is millions of rows and tens of
+            // seconds, and a request can be dropped part-way. MAGPIE gives up
+            // on a request after 120 seconds, and a dropped request rolls the
+            // seeding back -- so on a database slow enough to take longer than
+            // that, every claim started the seeding again and none finished,
+            // and the job never left the generation it had just closed.
+            let (spawn_state, spawn_job) = (state.clone(), job.clone());
+            tokio::spawn(async move {
+                if let Err(err) = seed_leave_universe(&spawn_state, &spawn_job, generation).await {
+                    tracing::error!(
+                        job_id = %spawn_job.id, generation, error = %err.message,
+                        "seeding a leave generation's rack universe failed"
+                    );
+                }
+            });
+            Ok(None)
+        }
         Acquired::NeedsGenerationTransition { generation } => {
             // Committed, not rolled back, and this is load-bearing: the only
             // thing this transaction wrote is the
@@ -518,16 +540,10 @@ async fn issue_claim(
     .execute(&mut **tx)
     .await?;
 
-    crate::audit::log(
-        tx,
-        "task.claimed",
-        identity.user_id(),
-        identity.anon_uuid(),
-        Some("task"),
-        Some(task_id.to_string()),
-        Some(job.id),
-    )
-    .await?;
+    // No audit row. The claim row just inserted records who claimed which task
+    // and when, so a `task.claimed` audit row said nothing it did not -- while
+    // costing a write per claim on the path a worker waits on, and most of
+    // `audit_log`'s growth.
 
     // Last, because it locks the job row: claims against the same job
     // serialize on it until commit, so it should be held for as little of the
@@ -653,5 +669,28 @@ async fn run_leave_generation_transition(
         }
     };
     tracing::info!(job_id = %job.id, generation, artifact_key = %key, "leave generation complete");
+    Ok(())
+}
+
+/// Seed a leave generation's rack universe, off any request.
+///
+/// Holds the job's dispatch lock for as long as the seeding runs, which is
+/// what keeps claims from reading the half-written universe: each waits its
+/// bounded two seconds, is told there is nothing here right now, and moves on
+/// to another job. The lock is taken without waiting, because whoever holds it
+/// is either a claim -- which asks for this again if the universe is still
+/// missing when it looks -- or another copy of this seeding, and waiting would
+/// hold a pool connection for the duration of either.
+///
+/// A seeding that is interrupted rolls back whole, and the next claim that
+/// finds the universe missing starts it again.
+async fn seed_leave_universe(state: &AppState, job: &Job, generation: i32) -> AppResult<()> {
+    let mut tx = state.pool.begin().await?;
+    if !crate::jobs::try_lock_job_dispatch_now(&mut tx, job.id).await? {
+        return Ok(());
+    }
+    let job_data = crate::jobs::load_job_data(&mut tx, job.id).await?;
+    leave_gen::ensure_universe(&mut tx, job.id, generation, &job_data.letterdist).await?;
+    tx.commit().await?;
     Ok(())
 }
