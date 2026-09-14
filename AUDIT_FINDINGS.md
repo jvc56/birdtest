@@ -457,7 +457,30 @@ any of them.** Each carries a recommendation, which is a suggestion for whoever
 picks it up rather than a decision taken here — the point of the section is that
 the evidence does not settle these on its own.
 
+Each entry opens with what the thing under discussion is *for*, so it can be
+read without the rest of this document or any prior knowledge of birdtest: what
+the mechanism does, who depends on it, and which higher-level goal it serves.
+The trade-offs only make sense against that goal — "slow" and "wrong" cost
+different amounts depending on whether something is on a contributor's path, on
+a visitor's page, or standing between a job and its conclusion.
+
 ### U1 — `GET /api/jobs/:id/results` has no bounded plan
+
+**What this is.** birdtest crowdsources word-game computation. An admin defines
+a *job* — a long-running research goal such as "analyse every possible opening
+rack" or "play 400,000 games between these two bot configurations" — the server
+breaks it into *tasks*, and volunteers running the MAGPIE engine claim tasks,
+compute them, and submit results. Those results are the product: the entire
+reason for asking strangers to donate CPU time.
+
+`GET /api/jobs/:id/results` is how that product is read back. It is public,
+paginated, and returns one row per stored result — for an opening-rack job, a
+rack and the best play found for it; for a games job, one batch's win/loss/draw
+counts and score statistics. Its being public is a deliberate decision made
+earlier: the bulk NDJSON download was moved behind admin authentication because
+each caller holds a database connection for as long as they keep reading, and
+this paginated read is what the public was left with in its place. So it is the
+only route by which anyone but an admin can see what a job actually produced.
 
 **The problem.** For an opening-rack job the query joins every
 `position_analysis_records` row of the job (through `tasks`), left-joins its
@@ -466,11 +489,19 @@ English job is 3.2 M records; a games job with `capture_positions` on is
 millions more (PLAN.md's own figure: 9 M positions for `max_games = 400,000`).
 No index can serve it, because the record tables carry `task_id` but not
 `job_id`, so the job filter sits on the other side of a join from the sort
-column. `OFFSET` makes deep pages worse rather than better: the rows are
-produced and then discarded server-side, and `page` is only clamped at zero, so
-`?page=1000000` is a legal request. The endpoint is public and unauthenticated.
-`total` is already `-1`, so the *count* is acknowledged as unbounded; the scan
-is not.
+column — the whole job has to be gathered and sorted before the first 50 rows
+can be returned. `OFFSET` makes deep pages worse rather than better: the rows
+are produced and then discarded server-side, and `page` is only clamped at zero,
+so `?page=1000000` is a legal request. The endpoint is unauthenticated, so no
+credential is needed to start one of these.
+
+Two things bound how bad this is today. The frontend only ever calls this
+endpoint with `?rack=`, which takes a *different* branch — a single-rack lookup
+that goes `job → tasks → (task_id, rack)`, so it is bounded by the job's task
+count (thousands) rather than its record count (millions). The listing branch is
+reached by following the "paginated JSON" link on the job page, or by anyone
+calling the API directly. And `total` is already `-1` on this endpoint, so the
+unboundedness of the *count* was already acknowledged; the scan was not.
 
 Scope: opening-rack and games/pairs jobs only. The leave-generation branch reads
 `leave_rack_progress`, which is keyed on `(job_id, generation, rack)` and needs
@@ -504,12 +535,15 @@ nothing.
   becomes "some of the job's results", and a caller paging to the end has no way
   to tell the difference between "that is all of them" and "that is where we cut
   it off".
-- **(d) Make it admin-only, as the NDJSON stream already is.** Consistent with
-  the reasoning that already moved bulk reads behind admin, and a one-line
-  change. But this is a *paginated* read of at most 500 rows — the thing the
-  public was explicitly left with when the stream was taken away — so this
-  removes the public's only path to a job's results rather than fixing the cost
-  of serving them.
+- **(d) Make the whole route admin-only, as the NDJSON stream already is.**
+  Consistent with the reasoning that already moved bulk reads behind admin, and
+  a one-line change. Two objections. This is a *paginated* read of at most 500
+  rows — the thing the public was explicitly left with when the stream was taken
+  away — so it removes the public's only path to a job's results rather than
+  fixing the cost of serving them. And it would take the `?rack=` lookup with
+  it, since both branches live on the same route: the job detail page's "look up
+  a rack" box is the one part of this endpoint the site actually uses, and it is
+  not the expensive part.
 
 **Recommendation: (a), and (b) alongside it if the API shape is still
 negotiable before release.** (a) is the only option that removes the cost rather
@@ -530,6 +564,17 @@ two enormous tables stops being worth it. That is a product question about who
 reads `/api/jobs/:id/results` and why, which the code cannot answer.
 
 ### U2 — the job list and contributor lists still aggregate over whole tables
+
+**What this is.** Three public pages, and the first three things a visitor sees.
+`/jobs` is the site's index of what is being worked on — every job with its
+type, status, priority and how far along it is. `/users` and `/workers` are the
+contributor leaderboards, ranking accounts and anonymous workers by tasks
+completed. Volunteers are donating compute for nothing; the leaderboard is the
+recognition, which makes it load-bearing rather than decorative.
+
+None of the three is on a worker's path. They are page views, so being slow
+costs a visitor's patience rather than a job's throughput — which is why this
+was not fixed outright along with the dispatch and submission paths.
 
 **The problem.**
 
@@ -595,11 +640,26 @@ makes (a) worth its two extra writes immediately.
 
 ### U3 — SPRT reads `game_results` on every submission
 
-**The problem.** `game_stats` selects one result per task across the job and
-sums it, on every submission of every games or game-pairs job, to decide whether
-the job is finished. Measured at ~50 ms per 400,000 units, linear in the job's
-history. It is the largest remaining cost on the submit path, and the only one
-this audit deliberately left there.
+**What this is.** A `games` or `game_pairs` job exists to answer one question:
+is bot configuration A stronger than configuration B, and by enough to matter?
+Rather than playing a fixed number of games and looking at the result, the job
+runs a **sequential** test — SPRT, the same procedure chess engine testing uses.
+After each result it asks whether the evidence has crossed a significance
+boundary, and stops the moment it has.
+
+Stopping early is the point. Volunteer compute is finite and donated, so a
+comparison that can be settled in 20,000 games should not play 400,000. A
+minimum-games gate stops an early lucky streak from ending the job on noise, and
+a maximum-games gate bounds the cost when the answer never becomes clear. Being
+sequential is precisely why the test is evaluated on **every** submitted result:
+the job cannot stop at the right moment if it only checks occasionally.
+
+**The problem.** The evaluation reads the job's results to compute the test
+statistic — one row per task, summed — on every submission of every games or
+game-pairs job. Measured at ~50 ms per 400,000 units, and linear in the job's
+history, so it grows for the life of the job. It is the largest remaining cost
+on the path a worker waits on before it can ask for its next task, and the only
+one this audit deliberately left there.
 
 **Options.**
 
@@ -641,11 +701,25 @@ building.
 
 ### U4 — duplicate `worker_bans` rows
 
+**What this is.** A worker is either an account authenticating with an API key
+or an anonymous UUID the server mints on that worker's first task. birdtest
+deliberately has **no automatic banning** — the reasoning, set out at length in
+PLAN.md, is that no statistical test can separate "this worker is broken" from
+"these seeds favoured player 2", so automatic flagging would punish honest
+contributors while missing a real attacker. What is left is a table an admin
+writes to by hand: an identity in `worker_bans` cannot claim or submit.
+
+That makes it the only lever there is against a contributor sending garbage or
+abusing the API, and it is pulled by a human who then has to trust it. Ban and
+unban have to do exactly what they say.
+
 **The problem.** Nothing stops two `worker_bans` rows naming the same identity.
 Enforcement is unaffected — the check is an `EXISTS`, so any row bans — but
-`DELETE /api/admin/workers/ban/:id` removes one row, and the identity stays
-banned with nothing in the response to say why. An admin who lifts a ban and
-watches the worker stay locked out has no signal beyond re-reading the table.
+`DELETE /api/admin/workers/ban/:id` removes one row by its id, and the identity
+stays banned with nothing in the response to say so. An admin who lifts a ban
+and watches the worker stay locked out has no signal beyond re-reading the
+table, and the natural conclusion — that banning is broken — is wrong in a way
+that is hard to check.
 
 **Options.**
 
@@ -687,14 +761,29 @@ wrong, because the duplicates stop being noise.
 
 ### U5 — registration's taken-email check is outside its transaction
 
+**What this is.** An account exists for one reason in v1: to hold an API key, so
+a volunteer's contributions are credited to them rather than to an anonymous
+UUID. Anyone can contribute without one.
+
+Registration is careful about a single property — it must not reveal whether an
+email address already has an account. Login and password reset both go out of
+their way not to reveal it (one identical "incorrect username or password" for
+both a wrong password and an unknown user; always `200` for a reset request,
+registered or not), and registration answering "that address is taken" would
+undo all of it, turning a public endpoint into an oracle for "does this person
+have an account here?". So a taken address receives byte-for-byte what a new
+registration receives, the notice goes to the address's owner instead of the
+caller, and the password is hashed *before* that branch so both paths pay the
+same Argon2 cost and the response time does not give the answer away either.
+Several deliberate decisions are stacked up to protect this one property.
+
 **The problem.** `register` evaluates `EXISTS` for the username and the email,
 then inserts in a separate transaction. Two concurrent registrations for the
 same address both pass the check; one insert wins and the other hits the unique
-index, which the error mapping renders as `409 conflict`. The endpoint
-otherwise goes to considerable trouble to return a byte-identical body for a
-taken address — including hashing the password before the branch so both paths
-pay the same Argon2 cost — so the `409` is a narrow account-enumeration oracle
-in exactly the place that care was taken to close one.
+index, which the error mapping renders as `409 conflict`. So a caller who can
+arrange that race gets a different answer for a taken address than for a free
+one — a narrow account-enumeration oracle in exactly the place all that care was
+taken to close one.
 
 **Options.**
 
@@ -731,14 +820,35 @@ added between the check and the insert, for instance.
 
 ### U6 — the alternative fix for B1: relax `MOVE_RECORD_BEST` in MAGPIE
 
-**The problem.** B1 shipped as a birdtest-side refusal: an opening-rack job may
-not pair `recorder_type = 'best'` with `num_plays_recorded > 1`. The other
-remedy is on the MAGPIE side — have the opening-rack executor record candidates
-regardless of the player's recorder type, on the grounds that an opening-rack
-analysis *is* a ranked list and the recorder is an implementation detail the job
-should not have to know about. This mirrors the note in PLAN.md's capture
-section about relaxing the same override for static players, which is listed
-there as "the one phase not yet done".
+**What this is.** An opening-rack job analyses openings exhaustively: for each
+of the 3,199,724 distinct 7-tile racks drawable from the English bag, a worker
+generates the legal plays, ranks them, and reports the best few. The stored
+ranking is the corpus the job exists to build — "what should you play with this
+opening rack, and what were the alternatives".
+
+What engine settings a worker uses come from a *player config*: a frozen set of
+MAGPIE command-line flags, stored in birdtest and pinned by every job that
+references it, so that results from different contributors are comparable. Two
+of those settings matter here. `recorder_type` decides what move generation
+keeps — `best` retains only the single top-ranked play and throws the rest away
+(fast, and exactly right for autoplay, where only the move actually played
+matters), while `all` and `equity` retain candidates. `num_plays_recorded`
+separately says how many ranked plays to store per rack.
+
+**The problem.** The two settings can contradict each other, and nothing said
+so: with `recorder_type = 'best'`, a job asking for ten ranked plays per rack
+gets one, because the other nine were discarded before anything could rank them.
+Finding B1 covers the defect and how it was caught; this entry is about the
+choice of remedy.
+
+It shipped as a birdtest-side refusal — an opening-rack job may not pair
+`recorder_type = 'best'` with `num_plays_recorded > 1`. The other remedy is on
+the MAGPIE side: have the opening-rack executor record candidates regardless of
+the player's recorder type, on the grounds that an opening-rack analysis *is* a
+ranked list and the recorder is an implementation detail the job should not have
+to know about. This mirrors the note in PLAN.md's capture section about relaxing
+the same override for static players, which is listed there as "the one phase
+not yet done".
 
 **Options.**
 
