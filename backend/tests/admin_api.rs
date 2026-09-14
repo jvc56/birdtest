@@ -811,3 +811,70 @@ async fn an_identity_can_be_banned_once_and_unbanning_lifts_it() {
     let (status, body) = ban("a new reason").await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
+
+/// Bug: the finish check reads a job's results, then completes it. A purge in
+/// between left the job `completed` with none of those results, and a completed
+/// job cannot be reactivated. The purge zeroes `claims_issued`, which otherwise
+/// only grows, so the completion is refused once the counter is below what the
+/// check observed before it read.
+#[tokio::test]
+async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let status = |db: &TestDb| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT status::text FROM jobs WHERE id = $1")
+                .bind(job)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // The check observed five claims; a purge then reset the counter.
+    sqlx::query("UPDATE jobs SET claims_issued = 0 WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5).await.unwrap());
+    assert_eq!(status(&db).await, "active");
+
+    // With no purge in between the counter has only grown, and it completes.
+    sqlx::query("UPDATE jobs SET claims_issued = 6 WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(birdtest::jobs::complete_unless_purged(&db.pool, job, 5).await.unwrap());
+    assert_eq!(status(&db).await, "completed");
+}
+
+/// A rack info table carries precomputed leave values keyed by lexicon name
+/// alone, which move generation uses in place of the leaves a job pins.
+#[tokio::test]
+async fn a_player_config_cannot_ask_for_a_rack_info_table() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+
+    for (use_rit, expected) in
+        [(json!(true), StatusCode::BAD_REQUEST), (json!(false), StatusCode::CREATED)]
+    {
+        let (status, response) = player_config(&app, &headers, json!({
+            "name": format!("static-rit-{use_rit}"), "recorder_type": "best",
+            "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1, "use_rit": use_rit,
+        }))
+        .await;
+        assert_eq!(status, expected, "use_rit {use_rit}: {response}");
+        if expected == StatusCode::BAD_REQUEST {
+            assert_eq!(response["fields"][0]["field"], "use_rit", "{response}");
+        }
+    }
+}

@@ -61,8 +61,8 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
 /// Ordinary contention is milliseconds -- a claim transaction is a handful of
 /// indexed statements -- so this is never reached in normal operation. It
 /// exists for the one holder that is not ordinary: seeding a leave-generation
-/// generation's rack universe is millions of rows and tens of seconds, and it
-/// runs inside the claim transaction under this very lock. Without a bound,
+/// generation's rack universe is millions of rows and tens of seconds, and the
+/// task that seeds it holds this very lock throughout. Without a bound,
 /// every other claim for that job blocks for the duration *while holding a
 /// pool connection*, and the pool is twenty -- so one slow claim on one job
 /// stalls submissions and the dashboard for the whole server. With it, the
@@ -124,6 +124,37 @@ pub(crate) async fn try_lock_job_dispatch_now(
         .bind(job_id)
         .fetch_one(conn)
         .await?)
+}
+
+/// Mark a job completed because its finish condition was met -- unless it was
+/// purged after the evidence for that decision was read.
+///
+/// The finish check reads a job's results and then writes its status, holding
+/// no lock across the two: one held across the read would stall that job's
+/// claims or submissions for an aggregate over its whole history. A purge that
+/// landed in between left the job `completed` with every result the check had
+/// seen deleted, and a completed job cannot be reactivated, so the admin's
+/// restart was undone for good.
+///
+/// `claims_issued` is the witness. It only ever grows, except that a purge
+/// zeroes it, and the caller reads it before reading the results -- so a purge
+/// in between leaves it below what was observed, and the update does nothing.
+/// Returns whether the job was completed.
+pub async fn complete_unless_purged(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    observed_claims_issued: i64,
+) -> AppResult<bool> {
+    Ok(sqlx::query(
+        "UPDATE jobs SET status = 'completed'
+         WHERE id = $1 AND status = 'active' AND claims_issued >= $2",
+    )
+    .bind(job_id)
+    .bind(observed_claims_issued)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        > 0)
 }
 
 pub(crate) async fn load_player_spec(

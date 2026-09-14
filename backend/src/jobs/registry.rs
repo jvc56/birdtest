@@ -177,7 +177,10 @@ async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquire
         .await?;
 
     let job_data = load_job_data(&mut *conn, job.id).await?;
-    let (seed, request) = game::next_request(conn, job.id, &config, &job_data).await?;
+    let Some((seed, request)) = game::next_request(conn, job.id, &config, &job_data).await? else {
+        // Every game up to `max_games` has been handed out.
+        return Ok(Acquired::NoWork);
+    };
     let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
     super::insert_game_request(
         conn,
@@ -200,7 +203,12 @@ async fn generate_game_pairs(conn: &mut PgConnection, job: &Job) -> AppResult<Ac
             .await?;
 
     let job_data = load_job_data(&mut *conn, job.id).await?;
-    let (seed, request) = game_pair::next_request(conn, job.id, &config, &job_data).await?;
+    let Some((seed, request)) =
+        game_pair::next_request(conn, job.id, &config, &job_data).await?
+    else {
+        // Every pair up to `max_pairs` has been handed out.
+        return Ok(Acquired::NoWork);
+    };
     let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
     super::insert_game_request(
         conn,

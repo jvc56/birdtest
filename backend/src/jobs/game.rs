@@ -123,7 +123,7 @@ pub async fn next_request(
     job_id: Uuid,
     config: &GameConfig,
     job_data: &JobData,
-) -> AppResult<(i64, GameRequest)> {
+) -> AppResult<Option<(i64, GameRequest)>> {
     let next_seed = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(seed) FROM tasks WHERE job_id = $1",
     )
@@ -133,10 +133,14 @@ pub async fn next_request(
     .map(|max| max + config.games_per_batch as i64)
     .unwrap_or(1);
 
+    if past_the_cap(next_seed, config.max_games) {
+        return Ok(None);
+    }
+
     let player1 = super::load_player_spec(conn, config.player1_config_id).await?;
     let player2 = super::load_player_spec(conn, config.player2_config_id).await?;
 
-    Ok((
+    Ok(Some((
         next_seed,
         GameRequest {
             variant: job_data.variant.clone(),
@@ -149,7 +153,21 @@ pub async fn next_request(
             player1,
             player2,
         },
-    ))
+    )))
+}
+
+/// Whether a batch starting at `next_seed` would begin past the job's hard cap.
+///
+/// Seeds start at 1 and tile the space a batch at a time, so `next_seed - 1`
+/// units have already been handed out. Once that reaches the cap, every unit
+/// the stopping rule can count is out: the job finishes as those results land,
+/// and a task generated beyond it was work the fleet did for nothing -- as many
+/// batches as there were workers asking before the debounced finish check next
+/// ran. A task whose claim lapses is still re-dispatched, since its units are
+/// ones the cap counts.
+pub(super) fn past_the_cap(next_seed: i64, max_units: i32) -> bool {
+    // `next_seed - 1` units are out; the cap is reached once that meets it.
+    next_seed > i64::from(max_units)
 }
 
 pub(super) async fn load_game_request_row(
@@ -168,4 +186,21 @@ pub(super) async fn load_game_request_row(
 
 pub(super) fn seed_from_row(row: &sqlx::postgres::PgRow) -> u64 {
     row.get::<i64, _>("seed") as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::past_the_cap;
+
+    #[test]
+    fn dispatch_stops_once_every_unit_up_to_the_cap_is_out() {
+        // A batch of 2 against a cap of 5: seeds 1, 3 and 5 cover six units,
+        // and a fourth task would start past the cap.
+        assert!(!past_the_cap(1, 5));
+        assert!(!past_the_cap(5, 5));
+        assert!(past_the_cap(7, 5));
+        // Exactly on the cap.
+        assert!(past_the_cap(3, 2));
+        assert!(!past_the_cap(2, 2));
+    }
 }

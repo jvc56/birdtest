@@ -205,10 +205,6 @@
         <input type="checkbox" bind:checked={useWordmap} />
         Use wordmap (-w)
       </label>
-      <label class="flex items-end gap-2 text-sm">
-        <input type="checkbox" bind:checked={useRit} />
-        Use rack info table (-rit)
-      </label>
       <div>
         <label class="label" for="minpi">Min play iterations (-mi)</label>
         <input id="minpi" type="number" class="input" bind:value={minPlayIterations} />

@@ -201,7 +201,7 @@ struct MissingFile {
 #[derive(Deserialize)]
 struct DeclineBody {
     claim_token: Uuid,
-    /// `missing_data`, `magpie_version` or `unknown_job_type`.
+    /// `missing_data`, `magpie_version`, `unknown_job_type` or `task_failed`.
     reason: String,
     #[serde(default)]
     missing: Vec<MissingFile>,
@@ -559,13 +559,9 @@ async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
         && should_check_finish(state, job_id).await?
         && finish_condition_met(state, &job).await?
     {
-        let updated = sqlx::query(
-            "UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'",
-        )
-        .bind(job.id)
-        .execute(&state.pool)
-        .await?;
-        if updated.rows_affected() > 0 {
+        // `job` was loaded before the results were read, which is what lets
+        // its `claims_issued` tell a purge in between from no purge at all.
+        if crate::jobs::complete_unless_purged(&state.pool, job.id, job.claims_issued).await? {
             tracing::info!(job_id = %job.id, "job auto-completed");
             // Completion is final, so this job will never need checking again.
             state.finish_checks.forget(job_id);

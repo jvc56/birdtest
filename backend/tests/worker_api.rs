@@ -1037,3 +1037,116 @@ async fn a_failed_task_is_handed_straight_back() {
         "the same task goes to the next worker at once"
     );
 }
+
+/// Waits until at least `count` sessions of this test's database are blocked on
+/// a lock, so a test can release a blocker at the moment the interleaving it
+/// needs has happened.
+async fn wait_for_lock_waiters(db: &TestDb, count: i64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting >= count {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "expected {count} session(s) to block");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Bug: a claim that selected a job while it was active went on to hand out a
+/// task after the job had been completed (or deactivated) underneath it. The
+/// claim waited on the job's row lock and then updated it regardless.
+///
+/// Deterministic: the completion is held uncommitted until the claim is blocked
+/// on the job's row, which is the interleaving that issued the task.
+#[tokio::test]
+async fn a_claim_racing_a_jobs_completion_hands_nothing_out() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let mut completer = db.pool.begin().await.unwrap();
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(job)
+        .execute(&mut *completer)
+        .await
+        .unwrap();
+
+    let release = async {
+        wait_for_lock_waiters(&db, 1).await;
+        completer.commit().await.unwrap();
+    };
+    let ((status, body), ()) = tokio::join!(
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))),
+        release,
+    );
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let claims: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!((claims, tasks), (0, 0), "nothing is issued against a completed job");
+}
+
+/// Bug: games and game-pairs jobs generated tasks past `max_games` /
+/// `max_pairs`. Nothing those tasks played could change the verdict, and a
+/// busy fleet generated one per worker until the debounced finish check ran.
+#[tokio::test]
+async fn sprt_jobs_hand_out_nothing_past_their_cap() {
+    let db = TestDb::new().await;
+    let games = db.games_job(1, 2).await;
+    sqlx::query("UPDATE job_game_config SET max_games = 3 WHERE job_id = $1")
+        .bind(games)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    // Seeds 1 and 3 cover four games, which reaches the cap of three.
+    let (first, _) = first_claim(&app).await;
+    let (second, _) = first_claim(&app).await;
+    assert_eq!((first["task_request"]["seed"].as_str(), second["task_request"]["seed"].as_str()),
+               (Some("1"), Some("3")));
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "a third batch would start past the cap: {body}");
+
+    // The same cap, counted in pairs.
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(games)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let admin = db.user("pairs-admin", true).await;
+    let p1 = db.static_player("pairs-p1", admin).await;
+    let p2 = db.static_player("pairs-p2", admin).await;
+    let pairs = db.bare_job("game_pairs", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_game_pair_config
+             (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs, max_pairs)
+         VALUES ($1, $2, $3, 1, 1, 1)",
+    )
+    .bind(pairs)
+    .bind(p1)
+    .bind(p2)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (only, _) = first_claim(&app).await;
+    assert_eq!(only["job_id"].as_str(), Some(pairs.to_string().as_str()));
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}

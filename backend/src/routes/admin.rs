@@ -680,6 +680,20 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     if body.utility_spread_scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
         err = err.with_field("utility_spread_scale", "must be a finite, positive number");
     }
+    // A rack info table is not an exact accelerator the way a wordmap is: each
+    // entry carries precomputed leave values, which move generation uses in
+    // place of the loaded leaves. The file is named after the lexicon, records
+    // nothing about the KLV it was built from, and is covered by no digest, so
+    // a player whose leaves are not that KLV -- or a contributor whose table
+    // is older than their leaves -- would rank moves on the wrong leave values
+    // with nothing to say so. Refused until a table can be pinned or checked.
+    if body.use_rit == Some(true) {
+        err = err.with_field(
+            "use_rit",
+            "rack info tables are not supported: their leave values are not checked \
+             against the leaves a job pins",
+        );
+    }
     if err.fields.is_empty() {
         Ok(())
     } else {

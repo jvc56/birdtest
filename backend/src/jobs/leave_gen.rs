@@ -162,13 +162,34 @@ async fn fold_into_generation(
         return Ok(());
     }
 
+    let racks: Vec<&str> = record.racks.iter().map(|o| o.rack.as_str()).collect();
+    let counts: Vec<i64> = record.racks.iter().map(|o| o.count).collect();
+    let sums: Vec<f64> = record.racks.iter().map(|o| o.mean * o.count as f64).collect();
+
+    // Lock the rows first, in rack order. Submissions for different tasks of
+    // one generation do not serialize on anything else -- each holds only its
+    // own claim and task -- and they overlap heavily: every game draws common
+    // racks, whatever the task forced. The UPDATE below locks rows in whatever
+    // order its plan visits them, so two of them could each hold a rack the
+    // other was waiting for, and Postgres broke the deadlock by failing one
+    // submission with a 500 after `deadlock_timeout`. Taken in one order,
+    // the second submission waits for the first instead, holding nothing.
+    sqlx::query(
+        "SELECT 1 FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = $2 AND rack = ANY($3::text[])
+         ORDER BY rack
+         FOR UPDATE",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .bind(&racks)
+    .execute(&mut *conn)
+    .await?;
+
     // One statement per submission, however many racks it carries. An UPDATE
     // rather than an upsert: the generation's universe is every full rack,
     // seeded up front, so a rack with no row is not a rack of this
     // distribution and must not create one.
-    let racks: Vec<&str> = record.racks.iter().map(|o| o.rack.as_str()).collect();
-    let counts: Vec<i64> = record.racks.iter().map(|o| o.count).collect();
-    let sums: Vec<f64> = record.racks.iter().map(|o| o.mean * o.count as f64).collect();
     sqlx::query(
         "UPDATE leave_rack_progress p SET
              occurrence_count = p.occurrence_count + u.count,
@@ -442,11 +463,10 @@ pub async fn next_step(
 /// as 0" needs a known universe to draw from, and materializing it is what lets
 /// claim-time selection be a single indexed `ORDER BY occurrence_count` query.
 ///
-/// Generation 1's is written when the job is created; later generations get
-/// theirs from [`ensure_universe`] when the claim path first asks for work in
-/// them. Both go through here, so there is one implementation of what a
-/// generation's universe *is*, derived from the pinned letter distribution
-/// rather than from the previous generation's rows.
+/// Every generation's, the first included, comes from [`ensure_universe`], on a
+/// task the first claim to find it missing starts. There is one implementation
+/// of what a generation's universe *is*, derived from the pinned letter
+/// distribution rather than from the previous generation's rows.
 pub async fn seed_generation(
     conn: &mut PgConnection,
     job_id: Uuid,
@@ -456,8 +476,8 @@ pub async fn seed_generation(
     let index = RackIndex::new(distribution, RACK_SIZE);
     let total = index.total();
 
-    // Idempotent: a universe already seeded (a retried creation, or a purge
-    // that kept it) is left as it is.
+    // Idempotent: a universe already seeded (a seeding started twice) is left
+    // as it is.
     let seeded: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM leave_rack_progress WHERE job_id = $1 AND generation = $2)",
     )
@@ -470,9 +490,9 @@ pub async fn seed_generation(
     }
     tracing::info!(job_id = %job_id, generation, racks = total, "seeding full-rack universe");
 
-    // COPY rather than INSERT: millions of rows, inside the request that
-    // creates the job, which a load balancer's idle timeout bounds. Racks are
-    // unranked in chunks so they are never all in memory together. Rack
+    // COPY rather than INSERT: millions of rows, and the job's claims wait for
+    // the seeding's lock while it runs. Racks are unranked in chunks so they
+    // are never all in memory together. Rack
     // strings are letters and `?`, which need no escaping in COPY's text
     // format.
     const CHUNK: u64 = 50_000;
@@ -509,8 +529,8 @@ pub async fn universe_exists(
 
 /// Make sure `generation`'s rack universe exists, seeding it if it does not.
 ///
-/// Generation 1's is written when the job is created; every later one is
-/// written here, the first time a claim asks for work in that generation, and
+/// Every generation's, the first included, is written here, the first time a
+/// claim asks for work in that generation -- not at job creation or purge, and
 /// not by the transition that closed the generation before it. That keeps the
 /// millions of rows off the transition's critical path -- a claim that arrives
 /// to find the universe missing pays for it once, while a transition that
@@ -530,8 +550,8 @@ pub async fn ensure_universe(
 
 /// Close out a generation: derive leave values from `leave_rack_progress`'s
 /// full-rack means as MAGPIE does (see `klv::FullRackLeaves`), build the
-/// generation's KLV, store the artifact, and seed the next generation's rack
-/// universe.
+/// generation's KLV, and store the artifact. The next generation's rack
+/// universe is seeded when a claim first asks for work in it.
 pub async fn run_transition(
     pool: &sqlx::PgPool,
     artifacts: &ArtifactStore,
@@ -572,10 +592,9 @@ pub async fn close_generation(
     let mut tx = pool.begin().await?;
     // Claiming ownership back, and the one place this transition can find out
     // it no longer has any. A purge deletes the transitions row along with the
-    // artifacts and progress rows and reseeds generation 1 -- all while a
-    // transition spawned before it may still be streaming. Writing the artifact
-    // anyway would hand the purged job a generation-1 KLV derived from results
-    // it no longer has, and copy a freshly zeroed universe into generation 2.
+    // artifacts and progress rows -- all while a transition spawned before it
+    // may still be streaming. Writing the artifact anyway would hand the purged
+    // job a generation-1 KLV derived from results it no longer has.
     // The row this request committed when it took the transition is the
     // evidence that the job is still the one it started on, so the close is
     // conditional on it.
