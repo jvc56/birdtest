@@ -310,19 +310,19 @@ and stated as reasoning where one does not.
    number that bounds a single job's dispatch throughput, because the lock
    serializes claims per job.
 8. **`GET /api/jobs/:id/results` is an unbounded, unindexed scan.** *Decided,
-   not implemented — see U1, option (a).* For an opening-rack job it joins every `position_analysis_records`
+   not implemented — see U1, options (a) and (b).* For an opening-rack job it joins every `position_analysis_records`
    row of the job and sorts by `submitted_at`; a full English job is 3.2 M rows
    and a capture-on games job is millions more. Public and unauthenticated.
    *Expected impact: seconds to minutes per request at full job size.*
 9. **The job list and the contributor lists aggregate over whole tables.**
-   *Partly fixed; the job list half decided but not implemented — see U2,
-   option (a). The leaderboard half is still open.* `GET /api/jobs` runs two `COUNT(*)`s
-   over `tasks` per job per page view (measured at **2,188 ms** before the
-   `games_completed` counter, which fixed only the game totals); `GET /api/users`
-   and `GET /api/workers` group over all of `task_claims` (measured 93 ms at
-   44,000 claims, linear from there). `tasks_job_idx` widened to
-   `(job_id, state)` so both task counts are index-only; the rest needs running
-   totals or a cache.
+   *Partly fixed; the rest decided, not implemented — see U2, option (a).*
+   `GET /api/jobs` runs two `COUNT(*)`s over `tasks` per job per page view
+   (measured at **2,188 ms** before the `games_completed` counter, which fixed
+   only the game totals); `GET /api/users` and `GET /api/workers` group over all
+   of `task_claims` (measured 93 ms at 44,000 claims, linear from there).
+   `tasks_job_idx` widened to `(job_id, state)` so both task counts are
+   index-only; running totals on `jobs` and per-identity counters on `users` and
+   `anonymous_workers` are the decided fix for what remains.
 10. **SPRT reads `game_results` on every submission.** *Left as designed by this
     audit; since decided for a count-based debounce, not implemented — see U3,
     option (d1).* Measured at ~50 ms per 400,000 units. `PLAN.md` chose the read
@@ -466,8 +466,8 @@ out involves.
 
 | Item | Decision | State |
 |---|---|---|
-| U1 — the results query has no bounded plan | **(a)** denormalise `job_id` onto the record tables and index it | Not started |
-| U2 — list endpoints aggregate whole tables | **(a)** running totals on `jobs` | Not started; covers the job list, not the leaderboards |
+| U1 — the results query has no bounded plan | **(a)** denormalise `job_id` onto the record tables and index it, **and (b)** keyset pagination | Not started |
+| U2 — list endpoints aggregate whole tables | **(a)** running totals: on `jobs` for the job list, and per identity for the leaderboards | Not started |
 | U3 — SPRT read on every submission | **(d1)** count-based debounce | Not started |
 | U4 — duplicate `worker_bans` rows | **(a)** partial unique indexes | Not started |
 | U5 — registration's email check races | **(c)** leave it | Accepted risk; nothing to build |
@@ -607,37 +607,33 @@ nothing.
   a rack" box is the one part of this endpoint the site actually uses, and it is
   not the expensive part.
 
-**Decision: (a) — denormalise `job_id` onto `position_analysis_records` and
-`game_results`, and index it. Chosen; not yet implemented.**
+**Decision: (a) and (b) — denormalise `job_id` onto
+`position_analysis_records` and `game_results` and index it, *and* move this
+endpoint to keyset pagination. Chosen; neither implemented.**
 
-It is the option that removes the cost rather than moving it, and the only one
-that fixes every caller at once: the paginated read, the `?rack=` lookup, the
-admin NDJSON stream and the export all reach a job's rows through the same
-`JOIN tasks`, and all four stop needing it. It also keeps the endpoint answering
-both of the questions above on one route, which is what the cheaper options give
-up.
+They are complements, not alternatives, and taking both is what actually bounds
+the endpoint. (a) removes the cost of *finding* a job's rows — the paginated
+read, the `?rack=` lookup, the admin NDJSON stream and the export all reach them
+through the same `JOIN tasks`, and all four stop needing it. (b) removes the
+cost of *skipping* to a page: with (a) alone the planner finds the job's rows
+without gathering the whole job, but `OFFSET` still produces and discards every
+row before the one asked for, so a deep page is still linear in how deep it is.
+With both, page *N* costs what page 1 costs and the endpoint keeps answering
+both the feed question and the enumeration question on one route.
 
-Two consequences worth carrying into the implementation rather than discovering
-during it:
+**The window is closing on both.** While `0001_initial.sql` is still edited in
+place, (a) is a free schema edit; after the first deployment it is a migration
+plus a backfill across two tables that run to tens of millions of rows. And
+pre-release is the only cheap moment to change a pagination contract, which is
+what (b) is.
 
-- **It makes the filter cheap, not the paging.** With `job_id` indexed the
-  planner finds the job's rows without gathering the whole job, but `OFFSET`
-  still produces and discards every row before the requested page. Option (b),
-  keyset pagination, is what makes page *N* cost what page 1 costs, and it stays
-  available as a follow-up — pre-release is the cheap moment to change a
-  pagination contract.
-- **The window is closing.** While `0001_initial.sql` is still edited in place
-  this is a free schema edit. After the first deployment it is a migration plus
-  a backfill of a column across two tables that run to tens of millions of rows.
-
-**What implementing it involves.**
+**What implementing (a) involves.**
 
 - `job_id UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE` on
-  `position_analysis_records` and `game_results`, with
-  `(job_id, submitted_at DESC)` on both. A second index,
-  `(job_id, rack) WHERE game_index IS NULL`, is what turns the `?rack=` lookup
-  into a single probe instead of one per task of the job — worth taking in the
-  same change, since that is the branch the site actually uses.
+  `position_analysis_records` and `game_results`.
+- A second index, `(job_id, rack) WHERE game_index IS NULL`, turns the `?rack=`
+  lookup into a single probe instead of one per task of the job — worth taking
+  in the same change, since that is the branch the site actually uses.
 - Both insert paths already hold the job: `registry::store_result` takes
   `job: &Job`, so this is an extra bind rather than an extra lookup.
 - Drop the `JOIN tasks` from both branches of `job_results`, from `rack_lookup`,
@@ -648,10 +644,37 @@ during it:
 - `position_analysis_moves` already carries a denormalised `task_id` for the
   same family of reason, so the pattern is established rather than new.
 
+**What implementing (b) involves.**
+
+- **The index (a) creates is decided by this.** With keyset the seek is
+  `WHERE job_id = $1 AND (submitted_at, id) < ($2, $3)`, so the index wants the
+  tiebreaker in it: `(job_id, submitted_at DESC, id DESC)` rather than
+  `(job_id, submitted_at DESC)`. Deciding (a) and (b) together is what avoids
+  building the index twice.
+- **A unique tiebreaker, which changes the visible order slightly.** Today the
+  opening-rack branch orders `submitted_at DESC, rack ASC`; `rack` is only
+  unique *within a claim*, so it is not a safe keyset key. `id` is
+  (`BIGSERIAL`), so the key becomes `(submitted_at, id)` and the order within a
+  batch goes from rack-alphabetical to insertion order — which, after this
+  audit's batching change, is the order the worker reported them in. Stable and
+  defensible, but it is a change to what the page shows. `game_results` has no
+  serial; `(submitted_at, task_claim_id)` is the equivalent there.
+- **The response shape.** `Page<T>` is `{items, total, page, per_page}` and would
+  gain a cursor, with `page` no longer meaningful. `total` is already `-1` on
+  this route, so it already deviates from the convention — which makes a
+  documented per-route exception much smaller than converting `/api/jobs`,
+  `/api/users`, `/api/workers` and the audit log to cursors as well. Take the
+  exception; do not convert the others.
+- **PLAN.md's API conventions describe `?page=` and the four-field envelope**,
+  so implementing this means updating that section. Not done here.
+- **The frontend.** `Pagination.svelte` assumes page numbers. A cursor control
+  needs next/previous, and previous needs either a cursor stack held in the page
+  or a reverse seek.
+
 **What would reopen this.** Only the endpoint's purpose changing. If it were
 decided that the API should not serve corpus enumeration at all — the export
-exists for that, built once and reused — the feed could be capped instead and
-the column would stop being worth its maintenance.
+exists for that, built once and reused — the feed could be capped instead, and
+neither the column nor the cursor would be worth their cost.
 
 ---
 
@@ -728,15 +751,14 @@ They are small, and they land on rows those paths already lock — `jobs`, which
 `claims_issued` touches on every claim, and `tasks`, which the submit path locks
 before storing anything — so nothing new is serialized.
 
-**Scope: this resolves `GET /api/jobs` and not the two leaderboards.** As
-scoped, (a) puts counters on `jobs`, which is where the job list's cost is.
-`GET /api/users` and `GET /api/workers` aggregate over all of `task_claims` and
-would need counters of their own, per user and per worker identity, or the
-short-lived cache from (b). That half stays open and should be decided on its
-own evidence: it is cheaper than the job list today (93 ms at 44,000 claims) and
-it grows with total contributions rather than with any one job's history.
+**Scope: all three endpoints, which means two kinds of counter.** The job list's
+cost lives on `jobs`, so counters go there. `GET /api/users` and
+`GET /api/workers` aggregate over all of `task_claims` and need counters of
+their own, per **identity** rather than per job: a `tasks_completed` on `users`
+and one on `anonymous_workers`. Both halves are decided; they are separate
+pieces of work and the second is the more delicate one, for the reason below.
 
-**What implementing it involves.**
+**What implementing the job list involves.**
 
 - `tasks_total` and `tasks_completed` on `jobs`, `BIGINT NOT NULL DEFAULT 0`
   with non-negative checks, beside the three counters already there.
@@ -752,10 +774,50 @@ it grows with total contributions rather than with any one job's history.
 - `admin_api::a_job_can_be_purged_and_its_dispatch_counter_resets` is the
   natural place to assert the new counters reset too.
 
-**What would reopen this.** Evidence that the counters drift in practice. Unlike
-the existing two, a drift here shows a wrong progress number on the site's index
-page rather than on one job's detail view — more visible, same recovery (the
-recount RUNBOOK §2.3 already documents).
+**What implementing the leaderboards involves.**
+
+- `tasks_completed BIGINT NOT NULL DEFAULT 0` and `last_completed_at
+  TIMESTAMPTZ` on both `users` and `anonymous_workers`. The timestamp is not
+  optional: `/api/workers` currently shows `MAX(c.completed_at)` as
+  `last_seen_at`, which is "last task finished" and is *not* the same as
+  `anonymous_workers.last_seen_at`, which any request touches. Reusing the
+  existing column would silently change what the column means.
+- Both are stamped in the submit transaction, once per accepted submission,
+  against whichever of `claimed_by_user_id` / `claimed_by_anon_uuid` the claim
+  carries. The current queries count completed *claims*, so one increment per
+  submission is the matching unit — no redundancy special case here, unlike the
+  job counters.
+- `/api/users` reads `u.tasks_completed` and orders on it; with
+  `users (tasks_completed DESC)` the `LIMIT` stops at the top of an index
+  instead of costing every user's claims.
+- `/api/workers` ranks both kinds of worker in one list, so with the counters
+  split across two tables it becomes a `UNION ALL` of two ordered index scans
+  (`users` and `anonymous_workers`, each `tasks_completed DESC`) merged under
+  the `LIMIT`. Its second full group-by — the one computing `total` — becomes
+  two cheap counts.
+- **The sharp edge: every path that deletes claims must decrement.** This is
+  what makes these harder than the `jobs` counters, and it is the thing most
+  likely to be missed. A job counter belongs to the job being purged, so a purge
+  simply zeroes it; an identity counter spans every job that identity ever
+  worked on, so `purge_job` and `delete_job` — which delete and cascade away
+  completed claims — have to subtract the affected counts per identity *before*
+  the delete, or the leaderboards drift permanently high. `job_census` already
+  counts the claims about to be destroyed in the same transaction, so the
+  decrement has a natural home. Account deletion needs nothing: it anonymises in
+  place and deliberately keeps the claims, so no donated compute is lost.
+- RUNBOOK §2.3 gains the identity counters too, and their recount is the one a
+  restore is most likely to need, since it spans jobs.
+- Not covered by any of this: `jobstats::worker_contributions`, the per-job
+  contributor table on a job's detail page. It groups claims *within one job*,
+  which an identity-wide counter cannot answer. It stays as it is — already
+  capped at 50 and measured at 136 ms for 44,000 claims.
+
+**What would reopen this.** Evidence that the counters drift in practice. For
+the job counters a drift shows a wrong progress number on the site's index page;
+for the identity counters it shows a wrong leaderboard, which is the more
+embarrassing of the two and the more likely, because it depends on the
+decrements above being complete. Recovery is the recount RUNBOOK §2.3 already
+documents, extended to the new columns.
 
 ---
 
