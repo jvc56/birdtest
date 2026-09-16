@@ -78,11 +78,12 @@ resource "aws_security_group" "service" {
 resource "aws_lb" "main" {
   name               = local.name
   load_balancer_type = "application"
-  # Not the 60-second default. Creating a leave-generation job writes every
-  # full rack (3.2 million rows for English) inside the request, and a
-  # generation transition runs inside a worker's claim request; both take tens
-  # of seconds on a small instance. MAGPIE's own request timeout is 120s.
-  # SSE streams are unaffected: they send keep-alives.
+  # Not the 60-second default. Seeding a leave generation's rack universe and
+  # running its transition both happen on tasks of their own now, but a worker
+  # uploading a large batch, an admin's results stream and an artifact rebuild
+  # (about 13 seconds per generation, inline) still outlast a minute on a small
+  # instance. MAGPIE's own request timeout is 120s. SSE streams are unaffected:
+  # they send keep-alives.
   idle_timeout    = 300
   security_groups = [aws_security_group.alb.id]
   subnets         = aws_subnet.public[*].id

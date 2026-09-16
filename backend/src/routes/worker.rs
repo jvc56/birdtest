@@ -134,6 +134,16 @@ struct ExpectedData {
     /// be a fleet-wide outage, and `min_magpie_version` is the lever for that.
     algorithm: &'static str,
     files: Vec<crate::jobs::ExpectedFile>,
+    /// The files the worker builds for itself -- a wordmap, a rack info table
+    /// -- with the SHA-256 the server's own pinned MAGPIE got from the same
+    /// inputs. Neither can be shipped (179 MB and 1.9 GB for CSW24), so the
+    /// hash is what travels instead: the worker builds its own copy and uses
+    /// it only if the bytes agree.
+    ///
+    /// Always serialized, empty included. A missing key would be read by a
+    /// client as an older server that checks nothing, which is precisely the
+    /// state this replaces; `[]` says "this job needs no derived file".
+    derived: Vec<crate::derived::ExpectedDerived>,
 }
 
 #[derive(Serialize)]
@@ -179,7 +189,11 @@ async fn claim_task(
             job_id: claim.job_id,
             task_request: claim.request,
             min_magpie_version: claim.min_magpie_version,
-            expected_data: ExpectedData { algorithm: "sha256", files: claim.expected_data },
+            expected_data: ExpectedData {
+                algorithm: "sha256",
+                files: claim.expected_data,
+                derived: claim.derived_data,
+            },
             worker_uuid: identity.newly_assigned_uuid(),
         })
         .into_response()),
@@ -201,7 +215,8 @@ struct MissingFile {
 #[derive(Deserialize)]
 struct DeclineBody {
     claim_token: Uuid,
-    /// `missing_data`, `magpie_version` or `unknown_job_type`.
+    /// `missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`
+    /// or `task_failed`.
     reason: String,
     #[serde(default)]
     missing: Vec<MissingFile>,
@@ -235,12 +250,23 @@ async fn decline_task(
     // `task_failed` is a worker that ran the task and could not produce a
     // result the server accepted. Declining hands the slot straight back, where
     // stopping the heartbeat alone held it for the whole heartbeat timeout.
+    // `derived_mismatch` is a worker that built the wordmap or rack info table
+    // this job pins and got different bytes. Distinct from `missing_data`,
+    // which is a file the contributor was supposed to have downloaded: nothing
+    // the contributor can do fixes this one, and the two hashes it carries are
+    // the evidence that the fleet's builders disagree -- which is exactly what
+    // should be visible in the admin view rather than worked around silently.
     if !matches!(
         body.reason.as_str(),
-        "missing_data" | "magpie_version" | "unknown_job_type" | "task_failed"
+        "missing_data"
+            | "magpie_version"
+            | "unknown_job_type"
+            | "derived_mismatch"
+            | "task_failed"
     ) {
         return Err(AppError::bad_request(
-            "reason must be 'missing_data', 'magpie_version', 'unknown_job_type' or 'task_failed'",
+            "reason must be 'missing_data', 'magpie_version', 'unknown_job_type', \
+             'derived_mismatch' or 'task_failed'",
         ));
     }
 
@@ -559,13 +585,9 @@ async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
         && should_check_finish(state, job_id).await?
         && finish_condition_met(state, &job).await?
     {
-        let updated = sqlx::query(
-            "UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'",
-        )
-        .bind(job.id)
-        .execute(&state.pool)
-        .await?;
-        if updated.rows_affected() > 0 {
+        // `job` was loaded before the results were read, which is what lets
+        // its `claims_issued` tell a purge in between from no purge at all.
+        if crate::jobs::complete_unless_purged(&state.pool, job.id, job.claims_issued).await? {
             tracing::info!(job_id = %job.id, "job auto-completed");
             // Completion is final, so this job will never need checking again.
             state.finish_checks.forget(job_id);
@@ -805,6 +827,14 @@ mod contract_fixtures {
                     sha256: "3e74af98".into(),
                     bytes: 4_719_596,
                     tarball_date: "20251004".into(),
+                }],
+                derived: vec![crate::derived::ExpectedDerived {
+                    role: "wmp".into(),
+                    name: "NWL23".into(),
+                    sha256: "214a46d7".into(),
+                    bytes: 104_857_600,
+                    builder: "wmp-1".into(),
+                    build_target: "nehalem".into(),
                 }],
             },
             // Absent from the fixture: it is sent only to a worker that

@@ -1,7 +1,6 @@
 pub mod game;
 pub mod game_pair;
 pub mod handler;
-pub mod klv;
 pub mod leave_gen;
 pub mod opening_rack;
 pub mod plausibility;
@@ -61,8 +60,8 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
 /// Ordinary contention is milliseconds -- a claim transaction is a handful of
 /// indexed statements -- so this is never reached in normal operation. It
 /// exists for the one holder that is not ordinary: seeding a leave-generation
-/// generation's rack universe is millions of rows and tens of seconds, and it
-/// runs inside the claim transaction under this very lock. Without a bound,
+/// generation's rack universe is millions of rows and tens of seconds, and the
+/// task that seeds it holds this very lock throughout. Without a bound,
 /// every other claim for that job blocks for the duration *while holding a
 /// pool connection*, and the pool is twenty -- so one slow claim on one job
 /// stalls submissions and the dashboard for the whole server. With it, the
@@ -126,6 +125,37 @@ pub(crate) async fn try_lock_job_dispatch_now(
         .await?)
 }
 
+/// Mark a job completed because its finish condition was met -- unless it was
+/// purged after the evidence for that decision was read.
+///
+/// The finish check reads a job's results and then writes its status, holding
+/// no lock across the two: one held across the read would stall that job's
+/// claims or submissions for an aggregate over its whole history. A purge that
+/// landed in between left the job `completed` with every result the check had
+/// seen deleted, and a completed job cannot be reactivated, so the admin's
+/// restart was undone for good.
+///
+/// `claims_issued` is the witness. It only ever grows, except that a purge
+/// zeroes it, and the caller reads it before reading the results -- so a purge
+/// in between leaves it below what was observed, and the update does nothing.
+/// Returns whether the job was completed.
+pub async fn complete_unless_purged(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    observed_claims_issued: i64,
+) -> AppResult<bool> {
+    Ok(sqlx::query(
+        "UPDATE jobs SET status = 'completed'
+         WHERE id = $1 AND status = 'active' AND claims_issued >= $2",
+    )
+    .bind(job_id)
+    .bind(observed_claims_issued)
+    .execute(pool)
+    .await?
+    .rows_affected()
+        > 0)
+}
+
 pub(crate) async fn load_player_spec(
     conn: &mut PgConnection,
     player_config_id: Uuid,
@@ -153,6 +183,9 @@ pub struct JobData {
     /// The pinned board layout's name, which is what the worker's request
     /// states. The bytes stay on the row: nothing server-side reads a layout.
     pub layout_name: String,
+    /// Run-wide MAGPIE settings every request states.
+    pub bingo_bonus: i32,
+    pub sim_cutoff: f64,
 }
 
 /// The job settings every request and every rack enumeration is built from.
@@ -160,8 +193,8 @@ pub struct JobData {
 /// way the claim path makes it.
 pub async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<JobData> {
     let row = sqlx::query(
-        "SELECT j.variant, ld.name AS ld_name, ld.content AS ld_content,
-                layout.name AS layout_name
+        "SELECT j.variant, j.bingo_bonus, j.sim_cutoff, ld.name AS ld_name,
+                ld.content AS ld_content, layout.name AS layout_name
          FROM jobs j
          JOIN input_data ld ON ld.id = j.letterdist_id
          JOIN input_data layout ON layout.id = j.layout_id
@@ -181,6 +214,8 @@ pub async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<J
         letterdist: LetterDistribution::parse(&content, &letterdist_name)?,
         letterdist_name,
         layout_name: row.get("layout_name"),
+        bingo_bonus: row.get("bingo_bonus"),
+        sim_cutoff: row.get("sim_cutoff"),
     })
 }
 
@@ -238,12 +273,15 @@ pub(crate) async fn load_game_request(
     let row = game::load_game_request_row(conn, task_id).await?;
     let player1 = load_player_spec(conn, row.get("player1_config_id")).await?;
     let player2 = load_player_spec(conn, row.get("player2_config_id")).await?;
+    let job_data = load_job_data_for_task(conn, task_id).await?;
     Ok(GameRequest {
         variant: row.get("variant"),
         seed: game::seed_from_row(&row),
         num_games: row.get("num_games"),
         game_pairs,
         capture_positions: row.get("capture_positions"),
+        bingo_bonus: job_data.bingo_bonus,
+        sim_cutoff: job_data.sim_cutoff,
         letter_distribution: row.get("letter_distribution"),
         board_layout: row.get("board_layout"),
         player1,

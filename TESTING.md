@@ -56,13 +56,13 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 72 | `#[cfg(test)]` in `inputdata`, `backups`, `jobs::klv`, `jobs::racks`, `jobs::plausibility`, `version`, `compat`, `config`, `clientip`, `sse`, `routes::admin`, `stats::sprt`, `stats::bradley_terry` |
+| 1 Unit | 88 | `#[cfg(test)]` in `inputdata`, `backups`, `derived`, `magpie`, `jobs::racks`, `jobs::plausibility`, `version`, `compat`, `config`, `clientip`, `sse`, `routes::admin`, `stats::sprt`, `stats::bradley_terry` |
 | 1F Frontend unit | **0** | — (no runner yet) |
 | 2 Integration | 2 | `backend/tests/leave_gen.rs` — the claim decisions that never reach HTTP |
 | 3 API | 26 | `backend/tests/worker_api.rs` (12), `admin_api.rs` (4), `leave_gen.rs` (7), `auth_api.rs` (3) — each names the bug or decision it pins |
 | 4 Contract | 6 | `routes::worker::contract_fixtures`; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | **0** | — |
-| 6 MAGPIE smoke | 2 (`#[ignore]`) | `jobs::klv` round-trips |
+| 6 MAGPIE smoke | — | Retired: the server now *runs* MAGPIE for every KLV, so there is no second implementation to round-trip against. MAGPIE's own `builderhash` test is what holds the derived-file builders still; see below |
 
 Tier 2 is the largest gap and the highest value. Every SQL string in the
 codebase is currently unverified: `sqlx::query` is checked at runtime, so the
@@ -90,7 +90,8 @@ incidentally by higher tiers.
 | `version.rs` | 1 | Covered |
 | `compat.rs` | 1 | Covered |
 | `jobs/racks.rs` | 1 | Partial — see `U-RACK-*` |
-| `jobs/klv.rs` | 1 + 6 | Covered |
+| `derived.rs` | 1 + 2 | Partial — naming and the dispatch gate at tier 1; the build itself needs MAGPIE |
+| `magpie.rs` | 1 | Partial — the `builders` JSON contract and error bounding; the subprocess needs MAGPIE |
 | `jobs/plausibility.rs` | 1 | Covered |
 | `inputdata.rs` (archive walk) | 1 | Covered |
 | `inputdata.rs` (download, staging, confirm) | 2 | **Gap** |
@@ -153,8 +154,8 @@ come from `include_bytes!`; anything that needs a path uses a `tempdir`.
 ### Already covered
 
 `stats::sprt` (8), `stats::bradley_terry` (12), `version` (3), `compat` (3),
-`jobs::racks` (3), `jobs::klv` (3 + 2 ignored), `jobs::plausibility` (12),
-`inputdata` archive walk (9), `backups` (5). Do not rewrite these; the entries
+`jobs::racks` (3), `jobs::plausibility` (12),
+`inputdata` archive walk (10), `backups` (5), `derived` (2), `magpie` (3). Do not rewrite these; the entries
 below are what is missing.
 
 Two of them are **tables to maintain rather than tests to leave alone**.
@@ -695,9 +696,14 @@ The archive walk is unit-tested; the database half is not.
   `input_data` rows until confirmed.
 - `I-INPUT-2` Confirming inserts `input_data` rows, dedupes by `(path, sha256)`,
   and reports what was new versus already present.
-- `I-INPUT-3` Only server-read roles (`letterdist`, `layout`) keep their bytes;
-  `kwg`/`klv`/`winpct` store a digest and NULL content. Enforced by the CHECK —
-  assert the CHECK fires, not just that the code does it.
+- `I-INPUT-3` Only server-read roles (`letterdist`, `layout`) keep their bytes
+  in the row; `kwg`/`klv`/`winpct` store a digest and NULL content. Enforced by
+  the CHECK — assert the CHECK fires, not just that the code does it.
+- `I-INPUT-8` `kwg` and `klv` rows carry an `object_key` and their bytes are in
+  the object store, because the server builds wordmaps and rack info tables
+  from them; `winpct` rows carry neither, because nothing server-side builds
+  anything from a win% model. The key is the digest, so re-importing a tarball
+  whose lexica have not changed uploads nothing.
 - `I-INPUT-4` A second import of the same tarball is a no-op.
 - `I-INPUT-5` `fail_orphaned_imports` fails a row left `running` by a restart
   and leaves `staged` and `confirmed` rows alone.
@@ -726,8 +732,44 @@ The archive walk is unit-tested; the database half is not.
   with the same name and different bytes produce different `total_racks` for
   otherwise identical jobs. This is the one test that would catch the server and
   the worker disagreeing about the alphabet.
-- `I-DATA-2` `seed_generation` and `klv::build` read the job's pinned
-  distribution, not a filesystem path or a default.
+- `I-DATA-2` `seed_generation` and every MAGPIE conversion read the job's pinned
+  distribution, not a filesystem path or a default. For the conversions this is
+  structural — each runs in a throwaway directory written from
+  `input_data.content` and the object store, and the distribution is stated on
+  the command line rather than inferred from the lexicon's name — but a test
+  that two distributions with one name produce two different derived hashes is
+  what proves it.
+
+### `I-DERIVED-*` — wordmaps and rack info tables (`derived.rs`)
+
+- `I-DERIVED-1` A job whose players ask for a wordmap queues exactly one
+  `derived_data` row per (lexicon, distribution), however many players share
+  the lexicon; one asking for a rack info table queues a `rit` row **and** the
+  `wmp` row it is built from.
+- `I-DERIVED-2` A leave-generation job queues a wordmap and never a table.
+- `I-DERIVED-3` A job with any unbuilt derived file is not dispatched, and the
+  same job dispatches once the row says `built`. The single most important test
+  here: without it, dispatching early sends a worker no `derived` entry, which
+  it reads as a server that checks nothing.
+- `I-DERIVED-4` A `failed` row blocks dispatch exactly as a `pending` one does.
+  "Give up and send it anyway" is the wrong recovery and must be impossible to
+  reach by accident.
+- `I-DERIVED-5` Two builders cannot take the same row: the lease and
+  `SKIP LOCKED` together.
+- `I-DERIVED-6` A row queued under a builder version this binary does not have
+  is left alone, not built. Recording a hash against a builder that did not
+  produce it is the failure this whole design exists to prevent.
+- `I-DERIVED-7` A build whose `kwg` row predates `object_key` fails with a
+  message naming the remedy, and the row is left `failed` rather than retried
+  forever.
+- `I-DERIVED-8` A claim's `derived` entries name the table by
+  `<lexicon>.<leaves>`, and two jobs on one lexicon with different leaves get
+  two different names and two different hashes.
+- `I-DERIVED-9` Each player's derived files come from that player's own rows:
+  two players on one lexicon share a wordmap, two on different lexicons get one
+  each. Nothing is shared between players, so this ought to fall out of the
+  query — but comparing bots on two lexicons is a supported configuration that
+  a wordmap keyed on the wrong player would silently break.
 
 ---
 
@@ -996,15 +1038,19 @@ actual behaviour matches the contract.
 
 **Opt-in, then fail loudly.** Excluded from a default run. When you ask for it
 and MAGPIE is missing, that is a hard error, not a skip — a green run must never
-silently mean nothing was exercised. This follows the precedent already set by
-`jobs::klv`'s round-trip tests, which are the first two members of this tier:
-`MAGPIE_BIN` (default `../../MAGPIE/bin/magpie`) and `MAGPIE_DATA_PATH` (default
-`../../MAGPIE/data`), `#[ignore]` by default, and an `assert!` naming the remedy
-when the binary is absent.
+silently mean nothing was exercised.
+
+The backend itself is no longer opt-in about this: it runs a pinned MAGPIE for
+every derived file and every leave-generation KLV, reads the builder versions
+out of the binary at startup, and refuses to bind without one. `MAGPIE_BIN`
+names it (`/usr/local/bin/magpie` in the image, a local checkout's `bin/magpie`
+in development). That is a stronger version of what the old `#[ignore]`d
+round-trip tests bought: there is no longer a second implementation to check
+against MAGPIE, because there is no second implementation.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.2.0`, the shipped `MIN_MAGPIE_VERSION` default,
-and a checkout from before the audits' fixes reports `0.1.0` or `0.0.0` and is refused. The
+`birdtest-contribute` reports `0.5.0`, the shipped `MIN_MAGPIE_VERSION` default,
+and a checkout from before the audits' fixes reports `0.4.0` or lower and is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -1032,9 +1078,21 @@ surfacing the mismatch as a red build rather than as a dead job in production.
 - `M-7` `capture_positions` on a real game produces positions whose CGP parses
   back through MAGPIE.
 - `M-8` The KLV a generation transition builds loads in a real MAGPIE.
-  *(Covered by `jobs::klv`'s round-trips.)*
+  *(Now structural: the transition **is** a real MAGPIE writing it. What is
+  worth a case instead is that the CSV the server streams is one MAGPIE
+  accepts — a rack it names differently, or a generation missing a rack, is
+  refused rather than silently valued at zero.)*
 - `M-9` Two contributors run concurrently without duplicate seeds — the
   concurrency check from `I-SCHED-13`, against the real client.
+- `M-10` A job with `use_rit` dispatches only once its table is built, and a
+  real `magpie contribute` builds a table whose hash matches the server's and
+  plays with it. The expensive one in this list: a table is 1.9 GB and takes
+  minutes, so it belongs in the nightly run and wants the small fixture
+  distribution if `M-10` is ever to be quick.
+- `M-11` A worker whose derived file does not match declines with
+  `derived_mismatch` and both digests reach `worker_data_gaps`. Forcing the
+  mismatch is the work here: the honest way is a server whose recorded hash was
+  produced by a different builder version.
 
 `scripts/e2e_magpie.py` implements `M-1` to `M-4` (with `M-3` run for a static
 and a simming player, asserting the simulated statistics are stored) and checks
@@ -1048,9 +1106,9 @@ That makes a leave-generation smoke expensive here: real English means the
 3,199,724-rack universe above at job creation. Two ways out, in preference order:
 keep tier 6's leave-generation case to a single generation and accept a slow
 nightly job, or place the tiny fixture distribution on MAGPIE's own `-path`
-search list so both sides load the same small bag — which is exactly the trick
-`jobs::klv`'s round-trip tests already use to guarantee birdtest and MAGPIE are
-reading the same alphabet. The second is better if it works; **verify that a
+search list so both sides load the same small bag. The server already does the
+second thing for its own conversions — every one runs in a throwaway directory
+holding exactly the pinned bytes — so the machinery exists. The second is better if it works; **verify that a
 real MAGPIE actually plays with a real `NWL23.kwg` against a five-letter bag
 before relying on it**, because that combination has never been run.
 
@@ -1126,10 +1184,11 @@ than in prose.
 MAGPIE-DATA builds the real ones (`cp -RL`, `tar -czf`, `split`), so import's
 chunk-walking and extraction are exercised for real rather than bypassed.
 
-Under 2 KB, because of a useful asymmetry: the server only ever *reads*
-`letterdist` and `layout` bytes — that is what `input_data.content` is for. The
-`kwg`, `klv` and `winpct` rows are digest-only; nothing server-side opens them.
-So the fixture carries:
+Under 2 KB, because of a useful asymmetry: the server only ever *parses*
+`letterdist` and `layout` bytes — that is what `input_data.content` is for. It
+does now hand `kwg` and `klv` bytes to MAGPIE, but only for a job whose players
+ask for a wordmap or a rack info table, which below tier 6 none do. The `winpct`
+rows stay digest-only. So the fixture carries:
 
 | Path | Contents |
 |---|---|
@@ -1164,8 +1223,8 @@ creation:
 | Real `english` | **914,624** | 3,199,724 |
 | A 6-tile fixture bag | **431** | 149 |
 
-`seed_generation` inserts one `leave_rack_progress` row per full rack and
-`klv::build` constructs a trie over every leave, before the job is usable. On
+`seed_generation` inserts one `leave_rack_progress` row per full rack and the
+generation-0 KLV holds a value for every leave, before the job is usable. On
 real English that is 3.2 million rows per leave-generation job created —
 fine in production, where a job is created once and runs for weeks, and
 completely unusable as a per-test fixture. The tiny bag makes the same code path

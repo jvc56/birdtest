@@ -155,9 +155,16 @@ docker compose exec postgres \
   psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE username = 'you';"
 ```
 
+**The backend runs your MAGPIE checkout.** It builds every wordmap, rack info
+table and leave-generation KLV with it, reads the builder versions out of the
+binary at startup, and refuses to start without one. Build it first (`make
+magpie BUILD=portable_release`) and set `MAGPIE_ROOT` if the checkout is not at
+`../MAGPIE`; the same binary runs the contributors, which is what keeps the
+server's builder and the fleet's identical.
+
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.2.0`, which `birdtest-contribute` reports.
-A checkout from before that reports `0.1.0` or `0.0.0`, and every task is declined with
+`MIN_MAGPIE_VERSION` defaults to `0.5.0`, which `birdtest-contribute` reports.
+A checkout from before that reports `0.4.0` or lower, and every task is declined with
 "update MAGPIE" until you update it or lower the floor — on the server *and*
 on the job, which records its own floor at creation:
 
@@ -270,19 +277,31 @@ To rotate the password later, run the same `modify-db-instance` and
 
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
 redirects — because the backend sets `Secure` cookies, which a browser will not
-keep over plain HTTP. `min_magpie_version` defaults to `0.2.0`, the first MAGPIE
-version whose results do not depend on a contributor's own settings; raise it whenever a
-MAGPIE release changes results.
+keep over plain HTTP. `min_magpie_version` defaults to `0.5.0`, the first MAGPIE
+version that checks a wordmap or a rack info table against the hash the job
+pins; raise it whenever a MAGPIE release changes results. `derived_builder_image`
+has no default — it is the backend image built with `--target derived-builder`,
+and it must carry the same MAGPIE as `backend_image`, since the builder version
+recorded beside every hash comes from the binary that produced it.
 
 `alert_email` has no default: `terraform apply` refuses to run without
 somewhere to send backup failures, because an unmonitored backup is the failure
 mode the whole design exists to avoid. SNS emails a subscription confirmation
 that has to be accepted once.
 
-The backend has no MAGPIE dependency at all: leave-generation aggregation
-builds its KLV artifact directly (`backend/src/jobs/klv.rs`), and it reads
-letter distributions out of the `input_data` row a job pins rather than off
-disk, so the image carries nothing but its own compiled binary.
+The backend image carries a pinned MAGPIE, built from a commit the image
+records. The server runs it to build the reference copy of every wordmap, rack
+info table and leave-generation KLV, publishes the SHA-256 for workers to
+reproduce, and throws the file away — see
+[MAGPIE_DEPENDENCY.md](MAGPIE_DEPENDENCY.md). It still carries no data
+directory: every conversion runs against a throwaway directory written from the
+bytes a job pins, so nothing server-side reads a data file off its own disk.
+
+Wordmap and rack info table builds run in a separate scheduled task
+(`birdtest-derived-builder`), because a table peaks at about 2.4 GB of memory
+and writes a 1.9 GB file — neither of which fits the web task's 1 vCPU and
+2 GB. A job whose derived files are not built yet is not dispatched; the admin
+page at `/admin/derived-data` is where that wait is visible.
 
 ## Backups
 

@@ -37,6 +37,12 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     .await
     .unwrap();
 
+    // A leave job's bot plays with a wordmap by default, and a job whose
+    // derived files are not built is not dispatched. Creation through the API
+    // queues those builds; this job was assembled with plain SQL, so the gate
+    // is satisfied here the same way the generation-0 artifact row above is.
+    assert_eq!(db.derived_ready(job).await, 1, "a leave job needs one wordmap");
+
     let row = sqlx::query_as::<_, birdtest::models::job::Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(job)
         .fetch_one(&db.pool)
@@ -618,6 +624,7 @@ async fn a_transition_whose_job_was_purged_meanwhile_closes_nothing() {
             1,
             "leaves/test/generation-1.klv2",
             &sha256,
+            "klv-1",
             &config,
         )
     };
@@ -707,6 +714,7 @@ async fn the_next_generations_universe_is_seeded_off_the_claim_path() {
         1,
         "leaves/test/generation-1.klv2",
         &"1".repeat(64),
+        "klv-1",
         &config,
     )
     .await
@@ -866,4 +874,152 @@ async fn generation_ones_universe_is_seeded_by_the_first_claim_too() {
         send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::OK, "{assignment}");
     assert_eq!(assignment["task_request"]["generation"], json!(1));
+}
+
+/// Bug: submissions for different tasks of one generation serialize on
+/// nothing, and they fold into overlapping `leave_rack_progress` rows -- every
+/// game draws common racks. The fold's UPDATE locked rows in the order its plan
+/// visited them, so two submissions could each hold a rack the other needed,
+/// and Postgres failed one with a deadlock. Locked in rack order, the second
+/// submission waits holding nothing.
+///
+/// Deterministic: submission A has already folded the lower rack when B folds
+/// both, listing the higher first; A then touches the higher rack. Taken in
+/// B's order that is a cycle.
+#[tokio::test]
+async fn overlapping_leave_submissions_wait_instead_of_deadlocking() {
+    use birdtest::jobs::handler::{JobHandler, LeaveRecord, RackOccurrence};
+    use birdtest::jobs::leave_gen::LeaveGenHandler;
+
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let mut claims = Vec::new();
+    for _ in 0..2 {
+        let (status, body) =
+            send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let token: Uuid = body["claim_token"].as_str().unwrap().parse().unwrap();
+        let ids: (Uuid, Uuid) =
+            sqlx::query_as("SELECT id, task_id FROM task_claims WHERE claim_token = $1")
+                .bind(token)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        claims.push(ids);
+    }
+    let racks: Vec<String> = sqlx::query_scalar(
+        "SELECT rack FROM leave_rack_progress WHERE job_id = $1 AND generation = 1
+         ORDER BY rack LIMIT 2",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let (low, high) = (racks[0].clone(), racks[1].clone());
+    let occurrence = |rack: &str| RackOccurrence { rack: rack.to_string(), count: 1, mean: 2.0 };
+
+    // Give the lower rack's row a later physical position than the higher
+    // rack's. An unordered UPDATE then reaches the higher rack first however it
+    // is planned -- a scan in heap order, or a loop over B's list, which names
+    // the higher rack first -- so without the ordered lock B holds the higher
+    // rack while it waits for the lower one, which is the cycle this pins.
+    sqlx::query(
+        "UPDATE leave_rack_progress SET updated_at = now()
+         WHERE job_id = $1 AND generation = 1 AND rack = $2",
+    )
+    .bind(job)
+    .bind(&low)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let low_after_high: bool = sqlx::query_scalar(
+        "SELECT (SELECT ctid FROM leave_rack_progress
+                 WHERE job_id = $1 AND generation = 1 AND rack = $2)
+              > (SELECT ctid FROM leave_rack_progress
+                 WHERE job_id = $1 AND generation = 1 AND rack = $3)",
+    )
+    .bind(job)
+    .bind(&low)
+    .bind(&high)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(low_after_high, "the precondition this test relies on did not hold");
+
+    let mut a = db.pool.begin().await.unwrap();
+    LeaveGenHandler::insert_record(
+        &mut a, job, claims[0].1, claims[0].0,
+        &LeaveRecord { racks: vec![occurrence(&low)] },
+    )
+    .await
+    .unwrap();
+
+    let mut b = db.pool.begin().await.unwrap();
+    // Planned from the primary key `(job_id, generation, rack)`, an unordered
+    // UPDATE happens to take rows in rack order, and on a small table it is.
+    // Nothing guarantees that plan -- a heap scan or a loop over the submitted
+    // list are equally valid, and the choice moves with table statistics -- so
+    // B is made to read the table without its indexes, which is the order the
+    // deadlock needs. The ordered lock holds under either plan: it sorts before
+    // it locks.
+    sqlx::query("SET LOCAL enable_indexscan = off")
+        .execute(&mut *b)
+        .await
+        .unwrap();
+    sqlx::query("SET LOCAL enable_bitmapscan = off")
+        .execute(&mut *b)
+        .await
+        .unwrap();
+    let b_record = LeaveRecord { racks: vec![occurrence(&high), occurrence(&low)] };
+    let b_fold = async {
+        LeaveGenHandler::insert_record(&mut b, job, claims[1].1, claims[1].0, &b_record).await
+    };
+    let waiter_pool = db.pool.clone();
+    let high_for_a = high.clone();
+    let a_finish = async move {
+        // B is now waiting on a rack A holds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&waiter_pool)
+            .await
+            .unwrap();
+            if waiting >= 1 {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "B should block on A's rack");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // A's fold reaches the higher rack, as a second pass over it would,
+        // and commits -- which is what lets B go on.
+        sqlx::query(
+            "UPDATE leave_rack_progress SET occurrence_count = occurrence_count + 1
+             WHERE job_id = $1 AND generation = 1 AND rack = $2",
+        )
+        .bind(job)
+        .bind(&high_for_a)
+        .execute(&mut *a)
+        .await?;
+        a.commit().await
+    };
+    let (b_result, a_result) = tokio::join!(b_fold, a_finish);
+    a_result.expect("A must not be chosen as a deadlock victim");
+    b_result.expect("B must not be chosen as a deadlock victim");
+    b.commit().await.unwrap();
+
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT rack, occurrence_count FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = 1 AND rack = ANY($2) ORDER BY rack",
+    )
+    .bind(job)
+    .bind(vec![low.clone(), high.clone()])
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(counts, vec![(low, 2), (high, 2)]);
 }

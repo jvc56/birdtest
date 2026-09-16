@@ -43,26 +43,42 @@ pub trait JobHandler {
 
 /// A player configuration flattened into the form the worker passes to MAGPIE.
 /// Denormalized into every request so a worker never needs a second round trip.
+///
+/// Every setting that can change a result is stated. The `Option`s left are
+/// the simulation settings, null for a static player (`num_plies` 0), which
+/// never reads them; MAGPIE refuses a simmer, or any player, that leaves out
+/// one it needs rather than supplying its own build's default.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlayerSpec {
     pub name: String,
     pub recorder_type: String,
-    pub sort_strategy: Option<String>,
+    pub sort_strategy: String,
     /// The lexicon and leaves this player loads. Required, not overrides:
     /// every player names its own files, and there is no job-level lexicon
     /// left to fall back to.
     pub lexicon: String,
     pub leaves: String,
     pub max_iterations: Option<i32>,
-    pub num_plies: Option<i32>,
-    pub num_plies_recorded: Option<i32>,
-    pub num_plays: Option<i32>,
+    pub num_plies: i32,
+    pub num_plies_recorded: i32,
+    pub num_plays: i32,
     pub num_plays_recorded: i32,
     pub stopping_pct: Option<f64>,
     pub use_inference: Option<bool>,
     pub time_limit_secs: Option<i32>,
-    pub use_wordmap: Option<bool>,
-    pub use_rit: Option<bool>,
+    pub use_wordmap: bool,
+    pub use_rit: bool,
+    /// The name this player's rack info table is loaded under, or `None` when
+    /// it asks for none.
+    ///
+    /// A name rather than a boolean alone because a table stores precomputed
+    /// leave values, so it belongs to the (lexicon, leaves) pair rather than to
+    /// the lexicon. MAGPIE's CLI finds a table by lexicon name, which is how a
+    /// player pinning NWL23 words and CSW21 leaves -- a pairing birdtest
+    /// accepts on purpose -- would have loaded `NWL23.rit` and ranked every
+    /// full rack on NWL23's leaves instead. This is the same name the server
+    /// pinned a hash for in `expected_data.derived`.
+    pub rit_name: Option<String>,
     pub min_play_iterations: Option<i32>,
     pub threshold: Option<String>,
     pub sampling_rule: Option<String>,
@@ -72,18 +88,19 @@ pub struct PlayerSpec {
     pub utility_spread_scale: Option<f64>,
     /// `None` for a static player, which never loads a win% model.
     pub win_pct_model: Option<String>,
-    pub movegen_margin: Option<f64>,
+    pub movegen_margin: f64,
 }
 
 impl From<NamedPlayerConfig> for PlayerSpec {
     fn from(named: NamedPlayerConfig) -> Self {
         let NamedPlayerConfig { config: c, kwg_name, klv_name, winpct_name } = named;
+        let (lexicon, leaves) = (kwg_name, klv_name);
         Self {
             name: c.name,
             recorder_type: c.recorder_type,
             sort_strategy: c.sort_strategy,
-            lexicon: kwg_name,
-            leaves: klv_name,
+            lexicon: lexicon.clone(),
+            leaves: leaves.clone(),
             max_iterations: c.max_iterations,
             num_plies: c.num_plies,
             num_plies_recorded: c.num_plies_recorded,
@@ -94,6 +111,9 @@ impl From<NamedPlayerConfig> for PlayerSpec {
             time_limit_secs: c.time_limit_secs,
             use_wordmap: c.use_wordmap,
             use_rit: c.use_rit,
+            rit_name: c
+                .use_rit
+                .then(|| crate::derived::rack_info_table_name(&lexicon, &leaves)),
             min_play_iterations: c.min_play_iterations,
             threshold: c.threshold,
             sampling_rule: c.sampling_rule,
@@ -129,6 +149,10 @@ pub struct OpeningRackRequest {
     /// rack per second.
     pub racks: Vec<String>,
     pub previous_play: Option<String>,
+    /// Run-wide settings from the job, stated so no worker supplies its own
+    /// build's default: the bingo bonus, and the simulation cutoff.
+    pub bingo_bonus: i32,
+    pub sim_cutoff: f64,
     pub player: PlayerSpec,
 }
 
@@ -171,6 +195,9 @@ pub struct GameRequest {
     /// reports them. How many ranked moves come back per position is the
     /// player config's `num_plays_recorded`.
     pub capture_positions: bool,
+    /// See [`OpeningRackRequest::bingo_bonus`].
+    pub bingo_bonus: i32,
+    pub sim_cutoff: f64,
     pub player1: PlayerSpec,
     pub player2: PlayerSpec,
 }
@@ -207,6 +234,9 @@ pub struct LeaveRequest {
     /// Leave generation has one bot rather than a player pair, so its wordmap
     /// setting sits on the request instead of on a player spec.
     pub use_wordmap: bool,
+    /// The job's bingo bonus. No cutoff: the leave-generating bot plays
+    /// statically.
+    pub bingo_bonus: i32,
 }
 
 /// What actually goes over the wire to the worker. Internally tagged so the

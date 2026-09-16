@@ -1,6 +1,11 @@
-# The birdtest stack: database, object storage, backend and frontend, none of
-# which need MAGPIE — the backend builds its own leave-generation KLV artifacts
-# directly (see backend/src/jobs/klv.rs) rather than shelling out to it.
+# The birdtest stack: database, object storage, backend and frontend.
+#
+# The backend needs a MAGPIE build. It runs one for every wordmap, rack info
+# table and leave-generation KLV, reads the builder versions out of the binary
+# at startup, and refuses to bind without it — see MAGPIE_DEPENDENCY.md. Set
+# MAGPIE_BIN to a local checkout's bin/magpie (`make magpie
+# BUILD=portable_release`) and MAGPIE_ROOT to the checkout, which is mounted so
+# the container can run it.
 #
 # For local development use `scripts/dev.py`, which brings this up, seeds it,
 # and runs real `magpie contribute` processes against it. There is no "worker"
@@ -95,10 +100,19 @@ services:
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       MAGPIE_DATA_REPO: ${MAGPIE_DATA_REPO:-jvc56/MAGPIE-DATA}
       # The fleet-wide floor: the oldest MAGPIE whose results do not depend on
-      # its own local settings. `birdtest-contribute` reports 0.2.0, which meets it;
-      # scripts/dev.py reads the version out of your checkout and sets this for
-      # you, so an older checkout still runs locally.
-      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.2.0}
+      # its own local settings or build, and which checks a derived file against
+      # the hash the job pins. `birdtest-contribute` reports 0.5.0, which meets
+      # it; scripts/dev.py reads the version out of your checkout and sets this
+      # for you, so an older checkout still runs locally.
+      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.5.0}
+      # The pinned MAGPIE this process runs. The production image builds one in;
+      # locally it comes from the mounted checkout, so a `make magpie` there is
+      # picked up by a restart. The backend refuses to start without it.
+      MAGPIE_BIN: /magpie/bin/magpie
+      # One thread: the small conversions (a leave-generation KLV, a wordmap for
+      # the tiny dev distribution) are all that run here. A rack info table in
+      # production is a separate task with its own cores.
+      MAGPIE_THREADS: "1"
       # Nginx appends the client address to X-Forwarded-For, and the per-IP
       # rate limits key on it. Requests to :8080 directly carry no header and
       # fall back to the peer address.
@@ -109,6 +123,13 @@ services:
       AWS_SECRET_ACCESS_KEY: birdtestbirdtest
       AWS_REGION: us-east-1
       RUST_LOG: ${RUST_LOG:-birdtest=debug,tower_http=info}
+    volumes:
+      # Read-only: the container runs the binary and reads nothing else from
+      # the checkout. Every conversion gets a throwaway data directory written
+      # from the bytes a job pins, so the checkout's own ./data is never
+      # consulted -- which is the point, and worth keeping true in development
+      # as well as in production.
+      - ${MAGPIE_ROOT:-../MAGPIE}:/magpie:ro
     ports:
       - "${BACKEND_PORT:-8080}:8080"
     healthcheck:

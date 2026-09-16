@@ -183,7 +183,7 @@ export interface PlayerConfig {
   id: string;
   name: string;
   recorder_type: string;
-  sort_strategy: string | null;
+  sort_strategy: string;
   /** The files this player pins, as input_data rows rather than names. */
   kwg_id: string;
   klv_id: string;
@@ -191,16 +191,21 @@ export interface PlayerConfig {
   winpct_id: string | null;
   /** Set when this config was cloned onto newer data; a clone starts unrated. */
   cloned_from_id: string | null;
+  /**
+   * Every setting a task states is stated here: the server fills MAGPIE's
+   * defaults in at creation. The nullable ones are simulation settings, null
+   * for a static player (num_plies 0) and set for every simmer.
+   */
   max_iterations: number | null;
-  num_plies: number | null;
-  num_plies_recorded: number | null;
-  num_plays: number | null;
+  num_plies: number;
+  num_plies_recorded: number;
+  num_plays: number;
   num_plays_recorded: number;
   stopping_pct: number | null;
   use_inference: boolean | null;
   time_limit_secs: number | null;
-  use_wordmap: boolean | null;
-  use_rit: boolean | null;
+  use_wordmap: boolean;
+  use_rit: boolean;
   min_play_iterations: number | null;
   threshold: string | null;
   sampling_rule: string | null;
@@ -208,7 +213,7 @@ export interface PlayerConfig {
   utility_w_winpct: number | null;
   utility_w_spread: number | null;
   utility_spread_scale: number | null;
-  movegen_margin: number | null;
+  movegen_margin: number;
   created_at: string;
 }
 
@@ -287,12 +292,47 @@ export interface BackupStatus {
   recent: BackupRun[];
 }
 
+/**
+ * A wordmap or rack info table the server builds a reference copy of.
+ *
+ * Neither file is shipped — 179 MB and 1.9 GB for CSW24 — so what travels to a
+ * worker is the SHA-256 the server's own pinned MAGPIE got from the same
+ * inputs. A job that needs one is not dispatched until it is `built`, which is
+ * why this page exists: an active job doing nothing usually has a row here.
+ */
+export interface DerivedData {
+  /** `wmp` or `rit`. */
+  role: string;
+  /** What the worker loads it as: a lexicon, or `<lexicon>.<leaves>`. */
+  name: string;
+  /** The builder that produced the hash, e.g. `wmp-1`. */
+  builder: string;
+  /** `pending` | `building` | `built` | `failed`. */
+  state: string;
+  sha256: string | null;
+  bytes: number | null;
+  build_target: string | null;
+  error: string | null;
+  attempts: number;
+  requested_at: string;
+  built_at: string | null;
+}
+
 /** Per generation, what rebuilding a leave job's KLV from the database found. */
 export interface ArtifactRebuild {
   generation: number;
   artifact_key: string;
   stored_sha256: string;
   rebuilt_sha256: string;
+  /**
+   * Whether the stored artifact was written by the builder this rebuild used.
+   * When it was not, `matches` says nothing: MAGPIE built these, so an upgrade
+   * can legitimately change the bytes.
+   */
+  same_builder: boolean;
+  /** `null` for an artifact written before the server ran MAGPIE. */
+  stored_builder: string | null;
+  rebuilt_builder: string;
   matches: boolean;
   object_present: boolean;
   rewritten: boolean;
@@ -391,6 +431,9 @@ export const api = {
   jobDataGaps: (id: string) => get<DataGap[]>(`/api/admin/jobs/${id}/data-gaps`),
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
   backups: () => get<BackupStatus>('/api/admin/backups'),
+  derivedData: () => get<DerivedData[]>('/api/admin/derived-data'),
+  retryDerivedData: (role: string, name: string) =>
+    post<void>('/api/admin/derived-data/retry', { role, name }),
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>

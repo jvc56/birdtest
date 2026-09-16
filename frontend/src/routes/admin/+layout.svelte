@@ -9,6 +9,7 @@
     { href: '/admin/fleet', label: 'Fleet' },
     { href: '/admin/users', label: 'Users' },
     { href: '/admin/workers', label: 'Bans' },
+    { href: '/admin/derived-data', label: 'Derived data' },
     { href: '/admin/backups', label: 'Backups' },
     { href: '/admin/audit-log', label: 'Audit log' }
   ];

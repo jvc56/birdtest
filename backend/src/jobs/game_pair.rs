@@ -102,7 +102,7 @@ pub async fn next_request(
     job_id: Uuid,
     config: &GamePairConfig,
     job_data: &JobData,
-) -> AppResult<(i64, GameRequest)> {
+) -> AppResult<Option<(i64, GameRequest)>> {
     let next_seed = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(seed) FROM tasks WHERE job_id = $1",
     )
@@ -112,10 +112,15 @@ pub async fn next_request(
     .map(|max| max + config.pairs_per_batch as i64)
     .unwrap_or(1);
 
+    // Seeds count pairs here, so the same cap applies in pairs.
+    if super::game::past_the_cap(next_seed, config.max_pairs) {
+        return Ok(None);
+    }
+
     let player1 = super::load_player_spec(conn, config.player1_config_id).await?;
     let player2 = super::load_player_spec(conn, config.player2_config_id).await?;
 
-    Ok((
+    Ok(Some((
         next_seed,
         GameRequest {
             variant: job_data.variant.clone(),
@@ -125,8 +130,10 @@ pub async fn next_request(
             num_games: config.pairs_per_batch,
             game_pairs: true,
             capture_positions: config.capture_positions,
+            bingo_bonus: job_data.bingo_bonus,
+            sim_cutoff: job_data.sim_cutoff,
             player1,
             player2,
         },
-    ))
+    )))
 }

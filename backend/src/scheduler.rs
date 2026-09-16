@@ -33,6 +33,9 @@ pub struct TaskClaim {
     pub request: TaskRequest,
     pub min_magpie_version: String,
     pub expected_data: Vec<ExpectedFile>,
+    /// The wordmap and rack info table hashes this job's tasks must reproduce.
+    /// Empty for a job whose players ask for neither.
+    pub derived_data: Vec<crate::derived::ExpectedDerived>,
 }
 
 /// The four answers a claim can get. One decision, not four checks: `204` and
@@ -366,6 +369,31 @@ async fn try_claim_from_job(
     job: &Job,
     caps: &WorkerCapabilities,
 ) -> Result<Option<TaskClaim>, JobClaimError> {
+    // Before the dispatch lock, because a job with a table still building has
+    // nothing to hand out and taking the lock would only make every other
+    // claim for it wait. The hashes travel with the claim, so a task issued
+    // before they exist would either carry no `derived` entry -- which a
+    // worker reads as "this server does not check derived files", falling back
+    // to whatever is on its disk -- or carry an empty one. Waiting is the only
+    // answer that cannot be mistaken for success.
+    let derived = {
+        let mut conn = state.pool.acquire().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+        crate::derived::status_for_job(&mut conn, job.id, &state.builders)
+            .await
+            .map_err(JobClaimError::Fatal)?
+    };
+    if !derived.dispatchable() {
+        // Logged at debug: a table takes minutes to build, and every worker
+        // asking during those minutes would otherwise produce a line each.
+        // `GET /api/admin/derived-data` is where an admin looks.
+        tracing::debug!(
+            job_id = %job.id,
+            pending = ?derived.pending, failed = ?derived.failed,
+            "job is waiting on a derived file"
+        );
+        return Ok(None);
+    }
+
     let mut tx = state.pool.begin().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
 
     let acquired = match registry::acquire(&mut tx, job, identity).await {
@@ -386,14 +414,20 @@ async fn try_claim_from_job(
             Ok(None)
         }
         Acquired::JobFinished => {
-            let _ = tx.rollback().await;
-            // Guarded on `active`: an admin may have deactivated the job
-            // between selection and here, and that decision stands.
+            // Written inside this transaction, under the dispatch lock
+            // `acquire` took, rather than after rolling it back. A purge takes
+            // the same lock; released first, a purge could empty the job
+            // between the decision and this update, which then completed the
+            // job the purge had just restarted -- for good, since a completed
+            // job cannot be reactivated. Guarded on `active` as well: an admin
+            // may have deactivated the job between selection and here, and
+            // that decision stands.
             sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
                 .bind(job.id)
-                .execute(&state.pool)
+                .execute(&mut *tx)
                 .await
                 .map_err(|e| JobClaimError::Fatal(e.into()))?;
+            tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
             Ok(None)
         }
         Acquired::NeedsUniverse { generation } => {
@@ -462,7 +496,13 @@ async fn try_claim_from_job(
         }
         Acquired::Task { task_id, request, created } => {
             match issue_claim(&mut tx, identity, job, caps, task_id, created).await {
-                Ok(claim_token) => {
+                // The job stopped being active between its selection and this
+                // claim reaching its row: nothing is handed out.
+                Ok(None) => {
+                    let _ = tx.rollback().await;
+                    Ok(None)
+                }
+                Ok(Some(claim_token)) => {
                     let expected = expected_data(&mut tx, job)
                         .await
                         .map_err(JobClaimError::Fatal)?;
@@ -473,6 +513,7 @@ async fn try_claim_from_job(
                         request,
                         min_magpie_version: job.min_magpie_version().to_string(),
                         expected_data: expected,
+                        derived_data: derived.ready,
                     }))
                 }
                 Err(err) => {
@@ -492,6 +533,9 @@ async fn try_claim_from_job(
 }
 
 /// Everything a claim writes, inside the claim transaction.
+///
+/// `None` when the job is no longer active by the time the claim reaches its
+/// row; the caller rolls everything back.
 async fn issue_claim(
     tx: &mut sqlx::PgTransaction<'_>,
     identity: &WorkerIdentity,
@@ -499,7 +543,7 @@ async fn issue_claim(
     caps: &WorkerCapabilities,
     task_id: Uuid,
     task_created: bool,
-) -> AppResult<Uuid> {
+) -> AppResult<Option<Uuid>> {
     // A worker that arrived with no identity becomes a real one only now,
     // when there is a task to attach it to and a response body to return its
     // UUID in.
@@ -550,17 +594,28 @@ async fn issue_claim(
     // transaction as possible. `tasks_total` rides along for the same reason --
     // a second statement to count a created task would take the same lock
     // earlier and buy nothing.
-    sqlx::query(
+    //
+    // Guarded on `active`. The job was selected as active before this
+    // transaction held any lock on it, and completing it -- the stopping rule
+    // or an admin -- and deactivating it both update this row. Waiting on that
+    // update and then updating regardless handed out a task of a job that was
+    // already completed or switched off: work nobody wanted, and for a
+    // completed job a result landing after an export had checked that nothing
+    // was in flight. Postgres re-checks the condition on the row it waited
+    // for, so a claim that loses that race hands out nothing.
+    let still_active = sqlx::query(
         "UPDATE jobs
          SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $2
-         WHERE id = $1",
+         WHERE id = $1 AND status = 'active'",
     )
     .bind(job.id)
     .bind(i64::from(task_created))
     .execute(&mut **tx)
-    .await?;
+    .await?
+    .rows_affected()
+        > 0;
 
-    Ok(claim_token)
+    Ok(still_active.then_some(claim_token))
 }
 
 /// Release a claim that ended in something other than a submission.
@@ -636,8 +691,7 @@ async fn run_leave_generation_transition(
     // which keeps the attempt count and says in the log that a transition was
     // started and did not finish.
     let result = leave_gen::run_transition(
-        &state.pool,
-        &state.artifacts,
+        state,
         job.id,
         generation,
         &config,

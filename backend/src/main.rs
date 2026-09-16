@@ -29,6 +29,43 @@ async fn main() -> Result<()> {
         .init();
 
     let cfg = Arc::new(config::Config::from_env()?);
+
+    // Before anything else: the server builds every wordmap, rack info table
+    // and leave-generation KLV with this binary, and records the builder
+    // version beside each hash. An image without a working MAGPIE can dispatch
+    // nothing that needs one, so it fails here rather than on the first job an
+    // admin creates.
+    let magpie = birdtest::magpie::Magpie::new(&cfg.magpie_bin, cfg.magpie_threads);
+    let builders = magpie.builders().await.map_err(|e| {
+        anyhow::anyhow!(
+            "could not read builder versions from {}: {}. Set MAGPIE_BIN to a MAGPIE \
+             of at least {}.",
+            cfg.magpie_bin,
+            e.message,
+            cfg.min_magpie_version
+        )
+    })?;
+    if birdtest::version::Version::parse_or_zero(&builders.magpie_version)
+        < birdtest::version::Version::parse_or_zero(&cfg.min_magpie_version)
+    {
+        anyhow::bail!(
+            "the pinned MAGPIE at {} is {}, below this server's floor of {}. It would hand \
+             workers hashes built by a builder they are not allowed to run.",
+            cfg.magpie_bin,
+            builders.magpie_version,
+            cfg.min_magpie_version
+        );
+    }
+    tracing::info!(
+        binary = %cfg.magpie_bin,
+        version = %builders.magpie_version,
+        target = %builders.build_target,
+        wmp = %builders.wmp(),
+        rit = %builders.rit(),
+        klv = %builders.klv(),
+        "pinned MAGPIE"
+    );
+
     let pool = db::connect(&cfg.database_url).await?;
 
     // Migrations run before the server binds, so a container never serves
@@ -38,6 +75,8 @@ async fn main() -> Result<()> {
     let state = AppState {
         pool,
         cfg: cfg.clone(),
+        magpie,
+        builders: Arc::new(builders),
         sse: sse::SseBroadcaster::new(),
         finish_checks: Default::default(),
         limits: ratelimit::RateLimiters::new(),

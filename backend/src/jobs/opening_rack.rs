@@ -43,6 +43,8 @@ impl JobHandler for OpeningRackHandler {
             letter_distribution: row.get("letter_distribution"),
             board_layout: row.get("board_layout"),
             previous_play: row.get("previous_play"),
+            bingo_bonus: job_data.bingo_bonus,
+            sim_cutoff: job_data.sim_cutoff,
             player,
         })
     }
@@ -247,6 +249,8 @@ pub async fn next_request(
             board_layout: job_data.layout_name.clone(),
             racks,
             previous_play: None,
+            bingo_bonus: job_data.bingo_bonus,
+            sim_cutoff: job_data.sim_cutoff,
             player,
         },
     )))

@@ -89,7 +89,7 @@ def magpie_version(magpie_root: Path) -> Optional[str]:
     """`MAGPIE_VERSION` out of the checkout's source.
 
     The floor exists to keep a fleet off a build too old to speak the protocol,
-    and production sets it to a real release (0.2.0 by default). Locally the
+    and production sets it to a real release (0.5.0 by default). Locally the
     contributor is whatever checkout you built, which may be older -- and then
     every task is declined with "update MAGPIE" and nothing ever runs. Reading
     the constant the binary was built from is exact.
@@ -304,6 +304,13 @@ def main() -> int:
         # Compose recreates the backend when this changes, so switching floors
         # between runs takes effect without a manual `down`.
         "MIN_MAGPIE_VERSION": floor,
+        # The backend runs this same MAGPIE for every wordmap, rack info table
+        # and leave-generation KLV, and refuses to start without one. Mounting
+        # the checkout the contributors run from is what keeps the server's
+        # builder and the fleet's the same binary -- which is the whole point:
+        # a hash built by one and checked by the other has to come from the
+        # same build.
+        "MAGPIE_ROOT": str(magpie_root),
     })
     log(f"version floor {floor} (your MAGPIE build reports "
         f"{magpie_version(magpie_root) or 'an unknown version'})")

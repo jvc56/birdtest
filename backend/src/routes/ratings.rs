@@ -10,7 +10,6 @@ use crate::auth::{csrf, AdminUser};
 use crate::error::{AppError, AppResult};
 use crate::ratings::{self, Trigger};
 use crate::state::AppState;
-use crate::stats::bradley_terry::{self, Matrix};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{delete, get, post};
@@ -193,10 +192,32 @@ async fn pool_detail(
             .collect();
     }
 
-    // Residuals are recomputed from the stored ratings rather than stored
-    // themselves: they are a view of the same fit, they cost one grouped query,
-    // and storing them would mean a second thing to keep in step with the run.
-    let residuals = residuals_for(&state, id, &ratings).await?;
+    // Read from the run, not recomputed: recomputing rebuilt the pool's
+    // evidence matrix -- a grouped scan over every paired result it counts --
+    // on every view of a public, unauthenticated page, holding a connection
+    // from the pool claims and submissions share. A fit stores them in the
+    // same transaction as its ratings, so the two cannot disagree.
+    let residuals = match run.as_ref() {
+        Some(run) => sqlx::query(
+            "SELECT row_player_config_id, col_player_config_id, pairs, actual, predicted
+             FROM rating_run_residuals
+             WHERE run_id = $1
+             ORDER BY abs(actual - predicted) DESC, row_player_config_id, col_player_config_id",
+        )
+        .bind(run.id)
+        .fetch_all(&state.pool)
+        .await?
+        .iter()
+        .map(|row| MatrixCell {
+            row: row.get("row_player_config_id"),
+            col: row.get("col_player_config_id"),
+            pairs: row.get("pairs"),
+            actual: row.get("actual"),
+            predicted: row.get("predicted"),
+        })
+        .collect(),
+        None => Vec::new(),
+    };
 
     Ok(Json(PoolDetail {
         id: pool_row.get("id"),
@@ -210,65 +231,6 @@ async fn pool_detail(
         ratings,
         residuals,
     }))
-}
-
-async fn residuals_for(
-    state: &AppState,
-    pool_id: Uuid,
-    ratings: &[RatingRow],
-) -> AppResult<Vec<MatrixCell>> {
-    if ratings.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut conn = state.pool.acquire().await?;
-    let (members, matrix) = ratings::evidence_matrix(&mut conn, pool_id).await?;
-    drop(conn);
-
-    let index: std::collections::HashMap<Uuid, usize> =
-        members.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-    // Reuse the fit's own residual definition so the page and the model can
-    // never disagree about what "predicted" means.
-    let placeholder = build_fit_view(&matrix, ratings, &index);
-    Ok(placeholder
-        .residuals(&matrix)
-        .into_iter()
-        .map(|r| MatrixCell {
-            row: members[r.i],
-            col: members[r.j],
-            pairs: r.games,
-            actual: r.actual,
-            predicted: r.predicted,
-        })
-        .collect())
-}
-
-/// Wraps the stored ratings in a [`bradley_terry::Fit`] so the residual
-/// calculation is shared with the fitter rather than reimplemented here.
-fn build_fit_view(
-    matrix: &Matrix,
-    ratings: &[RatingRow],
-    index: &std::collections::HashMap<Uuid, usize>,
-) -> bradley_terry::Fit {
-    let mut rated = vec![
-        bradley_terry::Rated {
-            rating: 1500.0,
-            stderr: f64::INFINITY,
-            games: 0.0,
-            component: 0
-        };
-        matrix.len()
-    ];
-    for row in ratings {
-        if let Some(&i) = index.get(&row.player_config_id) {
-            rated[i] = bradley_terry::Rated {
-                rating: row.rating,
-                stderr: row.stderr,
-                games: row.pairs_played as f64,
-                component: 0,
-            };
-        }
-    }
-    bradley_terry::Fit { ratings: rated, anchor_component: 0, iterations: 0, converged: true }
 }
 
 #[derive(Serialize)]

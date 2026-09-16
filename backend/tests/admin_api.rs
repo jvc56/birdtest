@@ -758,6 +758,87 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
     assert_eq!(status, StatusCode::CREATED, "a simmer already at the cap: {body}");
 }
 
+/// A config states every setting a task needs, and a job every run-wide one:
+/// what the body leaves out is written in from MAGPIE's defaults at creation.
+/// A null used to mean "the worker's compile-time default", so a result
+/// depended on which MAGPIE release ran it. A static player states no
+/// simulation settings at all, and one that sets one is refused.
+#[tokio::test]
+async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+
+    let (status, static_player) = player_config(&app, &headers, json!({
+        "name": "static", "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+        "num_plays_recorded": 1,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED, "{static_player}");
+    for (field, expected) in [
+        ("sort_strategy", json!("equity")),
+        ("num_plies", json!(0)),
+        ("num_plays", json!(100)),
+        ("num_plies_recorded", json!(2)),
+        ("movegen_margin", json!(5.0)),
+        ("use_wordmap", json!(false)),
+        ("use_rit", json!(false)),
+        ("max_iterations", json!(null)),
+        ("threshold", json!(null)),
+        ("utility_w_spread", json!(null)),
+    ] {
+        assert_eq!(static_player[field], expected, "static {field}: {static_player}");
+    }
+
+    // A simmer keeps what it states and gets MAGPIE's value for the rest.
+    let (status, simmer) = player_config(&app, &headers, json!({
+        "name": "simmer", "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+        "winpct_id": winpct, "num_plies": 2, "max_iterations": 100, "time_limit_secs": 0,
+        "threshold": "none", "num_plays_recorded": 1,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED, "{simmer}");
+    for (field, expected) in [
+        ("threshold", json!("none")),
+        ("sampling_rule", json!("top_two_ids")),
+        ("stopping_pct", json!(99.0)),
+        ("use_inference", json!(true)),
+        ("min_play_iterations", json!(500)),
+        ("inference_margin", json!(5.0)),
+        ("utility_w_winpct", json!(1.0)),
+        ("utility_w_spread", json!(0.5)),
+        ("utility_spread_scale", json!(100.0)),
+        ("num_plays", json!(100)),
+    ] {
+        assert_eq!(simmer[field], expected, "simmer {field}: {simmer}");
+    }
+
+    // A static player with a simulation setting would carry it on every
+    // request for nothing to read.
+    let (status, body) = player_config(&app, &headers, json!({
+        "name": "static-with-threshold", "recorder_type": "best", "kwg_id": kwg,
+        "klv_id": klv, "threshold": "gk16", "num_plays_recorded": 1,
+    })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "num_plies", "{body}");
+
+    let (status, created) = send(&app, post_json("/api/admin/jobs", &headers, json!({
+        "job_type": "games", "variant": "classic",
+        "letterdist_id": letterdist, "layout_id": layout,
+        "player1_config_id": static_player["id"], "player2_config_id": simmer["id"],
+        "min_games": 1, "max_games": 10,
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["job"]["bingo_bonus"], json!(50), "{created}");
+    assert_eq!(created["job"]["sim_cutoff"], json!(0.005), "{created}");
+}
+
 /// Banning is the only lever there is against a bad contributor — nothing bans
 /// automatically — so unban has to mean what it says.
 ///
@@ -810,4 +891,94 @@ async fn an_identity_can_be_banned_once_and_unbanning_lifts_it() {
     // different reason" is expressed.
     let (status, body) = ban("a new reason").await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// Bug: the finish check reads a job's results, then completes it. A purge in
+/// between left the job `completed` with none of those results, and a completed
+/// job cannot be reactivated. The purge zeroes `claims_issued`, which otherwise
+/// only grows, so the completion is refused once the counter is below what the
+/// check observed before it read.
+#[tokio::test]
+async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let status = |db: &TestDb| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>("SELECT status::text FROM jobs WHERE id = $1")
+                .bind(job)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // The check observed five claims; a purge then reset the counter.
+    sqlx::query("UPDATE jobs SET claims_issued = 0 WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5).await.unwrap());
+    assert_eq!(status(&db).await, "active");
+
+    // With no purge in between the counter has only grown, and it completes.
+    sqlx::query("UPDATE jobs SET claims_issued = 6 WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    assert!(birdtest::jobs::complete_unless_purged(&db.pool, job, 5).await.unwrap());
+    assert_eq!(status(&db).await, "completed");
+}
+
+/// A rack info table carries precomputed leave values that move generation uses
+/// in place of the leaves a job pins, which is why it was refused outright
+/// until the server could build the table for a config's own (lexicon, leaves)
+/// pair and pin its hash. Both values are accepted now; what stops a wrong
+/// table being used is the hash and the dispatch gate, not this validator.
+#[tokio::test]
+async fn a_player_config_may_ask_for_a_rack_info_table() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+
+    for use_rit in [json!(true), json!(false)] {
+        let (status, response) = player_config(&app, &headers, json!({
+            "name": format!("static-rit-{use_rit}"), "recorder_type": "best",
+            "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1, "use_rit": use_rit,
+        }))
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "use_rit {use_rit}: {response}");
+        // Stored, not merely accepted. While the answer was always "no" the
+        // insert bound a literal `false`, so lifting the refusal without this
+        // would have produced configs that asked for a table and were written
+        // as not wanting one -- silently, and only visible as a job that never
+        // loaded the table it was created for.
+        assert_eq!(response["use_rit"], use_rit, "{response}");
+    }
+
+    // Absent still means no. A table is 1.9 GB on every contributor's disk and
+    // minutes of server time; nothing should get one by default.
+    let (status, response) = player_config(&app, &headers, json!({
+        "name": "static-rit-absent", "recorder_type": "best",
+        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1,
+    }))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_eq!(response["use_rit"], json!(false), "{response}");
+
+    // The table travels under the pair's name, not the lexicon's. That is what
+    // keeps NWL23-with-CSW21-leaves -- a configuration birdtest accepts on
+    // purpose -- from loading NWL23's own table and ranking every full rack on
+    // leaves the job did not pin.
+    assert_eq!(
+        birdtest::derived::rack_info_table_name("NWL23", "CSW21"),
+        "NWL23.CSW21"
+    );
 }

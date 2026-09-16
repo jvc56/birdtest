@@ -1,13 +1,21 @@
 use super::handler::*;
-use super::klv::{FullRackLeaves, RACK_SIZE};
 use super::racks::{LetterDistribution, RackIndex};
 use super::JobData;
 use crate::artifacts::ArtifactStore;
 use crate::error::{AppError, AppResult};
+use crate::magpie::{Builders, Magpie, ScratchData};
 use crate::models::job::LeaveConfig;
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, Row};
 use uuid::Uuid;
+
+/// Tiles on a full rack. Leave generation observes full racks, never leaves,
+/// and MAGPIE's `RACK_SIZE` is the same seven.
+pub const RACK_SIZE: usize = 7;
+
+/// The name the server hands MAGPIE for a generation's files inside a scratch
+/// directory. Nothing outside that directory ever sees it.
+const SCRATCH_KLV_NAME: &str = "generation";
 
 pub struct LeaveGenHandler;
 
@@ -51,8 +59,9 @@ impl JobHandler for LeaveGenHandler {
              FROM leave_requests WHERE task_id = $1",
         )
         .bind(task_id)
-        .fetch_one(conn)
+        .fetch_one(&mut *conn)
         .await?;
+        let job_data = super::load_job_data_for_task(conn, task_id).await?;
         Ok(LeaveRequest {
             lexicon: row.get("lexicon"),
             variant: row.get("variant"),
@@ -64,6 +73,7 @@ impl JobHandler for LeaveGenHandler {
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
             use_wordmap: row.get("use_wordmap"),
+            bingo_bonus: job_data.bingo_bonus,
         })
     }
 
@@ -162,13 +172,34 @@ async fn fold_into_generation(
         return Ok(());
     }
 
+    let racks: Vec<&str> = record.racks.iter().map(|o| o.rack.as_str()).collect();
+    let counts: Vec<i64> = record.racks.iter().map(|o| o.count).collect();
+    let sums: Vec<f64> = record.racks.iter().map(|o| o.mean * o.count as f64).collect();
+
+    // Lock the rows first, in rack order. Submissions for different tasks of
+    // one generation do not serialize on anything else -- each holds only its
+    // own claim and task -- and they overlap heavily: every game draws common
+    // racks, whatever the task forced. The UPDATE below locks rows in whatever
+    // order its plan visits them, so two of them could each hold a rack the
+    // other was waiting for, and Postgres broke the deadlock by failing one
+    // submission with a 500 after `deadlock_timeout`. Taken in one order,
+    // the second submission waits for the first instead, holding nothing.
+    sqlx::query(
+        "SELECT 1 FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = $2 AND rack = ANY($3::text[])
+         ORDER BY rack
+         FOR UPDATE",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .bind(&racks)
+    .execute(&mut *conn)
+    .await?;
+
     // One statement per submission, however many racks it carries. An UPDATE
     // rather than an upsert: the generation's universe is every full rack,
     // seeded up front, so a rack with no row is not a rack of this
     // distribution and must not create one.
-    let racks: Vec<&str> = record.racks.iter().map(|o| o.rack.as_str()).collect();
-    let counts: Vec<i64> = record.racks.iter().map(|o| o.count).collect();
-    let sums: Vec<f64> = record.racks.iter().map(|o| o.mean * o.count as f64).collect();
     sqlx::query(
         "UPDATE leave_rack_progress p SET
              occurrence_count = p.occurrence_count + u.count,
@@ -434,6 +465,7 @@ pub async fn next_step(
         previous_artifact_key,
         num_games: config.num_iterations,
         use_wordmap: config.use_wordmap,
+        bingo_bonus: job_data.bingo_bonus,
     }))
 }
 
@@ -442,11 +474,10 @@ pub async fn next_step(
 /// as 0" needs a known universe to draw from, and materializing it is what lets
 /// claim-time selection be a single indexed `ORDER BY occurrence_count` query.
 ///
-/// Generation 1's is written when the job is created; later generations get
-/// theirs from [`ensure_universe`] when the claim path first asks for work in
-/// them. Both go through here, so there is one implementation of what a
-/// generation's universe *is*, derived from the pinned letter distribution
-/// rather than from the previous generation's rows.
+/// Every generation's, the first included, comes from [`ensure_universe`], on a
+/// task the first claim to find it missing starts. There is one implementation
+/// of what a generation's universe *is*, derived from the pinned letter
+/// distribution rather than from the previous generation's rows.
 pub async fn seed_generation(
     conn: &mut PgConnection,
     job_id: Uuid,
@@ -456,8 +487,8 @@ pub async fn seed_generation(
     let index = RackIndex::new(distribution, RACK_SIZE);
     let total = index.total();
 
-    // Idempotent: a universe already seeded (a retried creation, or a purge
-    // that kept it) is left as it is.
+    // Idempotent: a universe already seeded (a seeding started twice) is left
+    // as it is.
     let seeded: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM leave_rack_progress WHERE job_id = $1 AND generation = $2)",
     )
@@ -470,9 +501,9 @@ pub async fn seed_generation(
     }
     tracing::info!(job_id = %job_id, generation, racks = total, "seeding full-rack universe");
 
-    // COPY rather than INSERT: millions of rows, inside the request that
-    // creates the job, which a load balancer's idle timeout bounds. Racks are
-    // unranked in chunks so they are never all in memory together. Rack
+    // COPY rather than INSERT: millions of rows, and the job's claims wait for
+    // the seeding's lock while it runs. Racks are unranked in chunks so they
+    // are never all in memory together. Rack
     // strings are letters and `?`, which need no escaping in COPY's text
     // format.
     const CHUNK: u64 = 50_000;
@@ -509,8 +540,8 @@ pub async fn universe_exists(
 
 /// Make sure `generation`'s rack universe exists, seeding it if it does not.
 ///
-/// Generation 1's is written when the job is created; every later one is
-/// written here, the first time a claim asks for work in that generation, and
+/// Every generation's, the first included, is written here, the first time a
+/// claim asks for work in that generation -- not at job creation or purge, and
 /// not by the transition that closed the generation before it. That keeps the
 /// millions of rows off the transition's critical path -- a claim that arrives
 /// to find the universe missing pays for it once, while a transition that
@@ -530,28 +561,29 @@ pub async fn ensure_universe(
 
 /// Close out a generation: derive leave values from `leave_rack_progress`'s
 /// full-rack means as MAGPIE does (see `klv::FullRackLeaves`), build the
-/// generation's KLV, store the artifact, and seed the next generation's rack
-/// universe.
+/// generation's KLV, and store the artifact. The next generation's rack
+/// universe is seeded when a claim first asks for work in it.
 pub async fn run_transition(
-    pool: &sqlx::PgPool,
-    artifacts: &ArtifactStore,
+    state: &crate::state::AppState,
     job_id: Uuid,
     generation: i32,
     config: &LeaveConfig,
     distribution: &LetterDistribution,
 ) -> AppResult<String> {
+    let (pool, artifacts, magpie, builders) =
+        (&state.pool, &state.artifacts, &state.magpie, &state.builders);
     // Shared with `rebuild_artifacts` rather than written twice: a rebuild is
     // only meaningful if it folds the rows exactly as the original write did,
     // and two copies of this would be free to drift into producing different
     // bytes for the same generation.
-    let klv = generation_klv(pool, job_id, generation, distribution).await?;
+    let klv = generation_klv(pool, magpie, job_id, generation, distribution).await?;
 
     // Hashed as written, not read back: the object store holds the only copy
     // of these bytes, and this is what a later rebuild is compared against.
     let sha256 = hex::encode(Sha256::digest(&klv));
     let key = format!("leaves/{job_id}/generation-{generation}.klv2");
     artifacts.put(&key, klv).await?;
-    close_generation(pool, job_id, generation, &key, &sha256, config).await?;
+    close_generation(pool, job_id, generation, &key, &sha256, &builders.klv(), config).await?;
     Ok(key)
 }
 
@@ -567,15 +599,15 @@ pub async fn close_generation(
     generation: i32,
     key: &str,
     sha256: &str,
+    builder: &str,
     config: &LeaveConfig,
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
     // Claiming ownership back, and the one place this transition can find out
     // it no longer has any. A purge deletes the transitions row along with the
-    // artifacts and progress rows and reseeds generation 1 -- all while a
-    // transition spawned before it may still be streaming. Writing the artifact
-    // anyway would hand the purged job a generation-1 KLV derived from results
-    // it no longer has, and copy a freshly zeroed universe into generation 2.
+    // artifacts and progress rows -- all while a transition spawned before it
+    // may still be streaming. Writing the artifact anyway would hand the purged
+    // job a generation-1 KLV derived from results it no longer has.
     // The row this request committed when it took the transition is the
     // evidence that the job is still the one it started on, so the close is
     // conditional on it.
@@ -612,14 +644,16 @@ pub async fn close_generation(
     // the original hash is what makes that visible afterwards instead of
     // quietly agreeing with whatever landed last.
     sqlx::query(
-        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO leave_generation_artifacts
+             (job_id, generation, artifact_key, sha256, builder)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (job_id, generation) DO NOTHING",
     )
     .bind(job_id)
     .bind(generation)
     .bind(key)
     .bind(sha256)
+    .bind(builder)
     .execute(&mut *tx)
     .await?;
 
@@ -665,24 +699,26 @@ pub async fn lexicon_name(conn: &mut PgConnection, kwg_id: Uuid) -> AppResult<St
 pub async fn seed_zero_generation(
     pool: &sqlx::PgPool,
     artifacts: &ArtifactStore,
+    magpie: &Magpie,
+    builders: &Builders,
     job_id: Uuid,
     distribution: &LetterDistribution,
 ) -> AppResult<String> {
-    // Empty means "no rack has a mean equity yet", which `build` renders as
-    // 0.0 for every leave -- exactly the zeroed KLV wanted here.
-    let klv = super::klv::build(distribution, &std::collections::HashMap::new())?;
+    let klv = zero_klv(magpie, distribution).await?;
     let sha256 = hex::encode(Sha256::digest(&klv));
     let key = format!("leaves/{job_id}/generation-0.klv2");
     artifacts.put(&key, klv).await?;
 
     sqlx::query(
-        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
-         VALUES ($1, 0, $2, $3)
+        "INSERT INTO leave_generation_artifacts
+             (job_id, generation, artifact_key, sha256, builder)
+         VALUES ($1, 0, $2, $3, $4)
          ON CONFLICT (job_id, generation) DO NOTHING",
     )
     .bind(job_id)
     .bind(&key)
     .bind(&sha256)
+    .bind(builders.klv())
     .execute(pool)
     .await?;
 
@@ -697,6 +733,14 @@ pub struct ArtifactRebuild {
     pub stored_sha256: String,
     pub rebuilt_sha256: String,
     pub matches: bool,
+    /// Whether the stored artifact was written by the builder this rebuild
+    /// used. When it was not, `matches` says nothing: two builders producing
+    /// different bytes for the same values is the expected outcome, not a
+    /// fault, and the admin view reads this first.
+    pub same_builder: bool,
+    /// `None` for an artifact written before the server ran MAGPIE.
+    pub stored_builder: Option<String>,
+    pub rebuilt_builder: String,
     pub object_present: bool,
     pub rewritten: bool,
 }
@@ -709,27 +753,35 @@ pub struct ArtifactRebuild {
 /// life of the job. That is what makes rebuilding an alternative to backing them
 /// up -- see PLAN.md, "Artifacts: back up, or rebuild?".
 ///
-/// Two things this deliberately does *not* do:
+/// Three things this deliberately does *not* do:
 ///
 /// - **It does not overwrite an object that is present but differs.** A hash
 ///   mismatch means the stored bytes are not what this code would produce now,
 ///   and that is evidence to look at rather than a fault to paper over: it is
 ///   equally consistent with a corrupted object and with a legitimate change to
-///   `klv::build`. Rewriting on sight would destroy the only copy of whichever
-///   one it was. `force` is the deliberate override.
+///   MAGPIE's KLV builder. Rewriting on sight would destroy the only copy of
+///   whichever one it was. `force` is the deliberate override.
+/// - **It does not treat a different builder as a mismatch.** Until MAGPIE
+///   built these, there was one implementation and differing bytes could only
+///   mean corruption. Now a MAGPIE upgrade can legitimately change them, so an
+///   artifact written by a different builder is reported as exactly that, and
+///   `matches` is not the question being asked of it. Without this the first
+///   upgrade after a restore drill would read as data loss.
 /// - **It does not rebuild generation 0 from `leave_rack_progress`.** Generation
 ///   0 is the zeroed KLV every job starts from, not a fold of any results, and
 ///   there are no progress rows behind it. It is rebuilt the way
-///   `seed_zero_generation` built it, from an empty map.
+///   `seed_zero_generation` built it.
 pub async fn rebuild_artifacts(
     pool: &sqlx::PgPool,
     artifacts: &ArtifactStore,
+    magpie: &Magpie,
+    builders: &Builders,
     job_id: Uuid,
     distribution: &LetterDistribution,
     force: bool,
 ) -> AppResult<Vec<ArtifactRebuild>> {
     let rows = sqlx::query(
-        "SELECT generation, artifact_key, sha256
+        "SELECT generation, artifact_key, sha256, builder
          FROM leave_generation_artifacts
          WHERE job_id = $1
          ORDER BY generation",
@@ -738,23 +790,31 @@ pub async fn rebuild_artifacts(
     .fetch_all(pool)
     .await?;
 
+    let rebuilding_with = builders.klv();
     let mut report = Vec::with_capacity(rows.len());
     for row in rows {
         let generation: i32 = row.get("generation");
         let artifact_key: String = row.get("artifact_key");
         let stored_sha256: String = row.get("sha256");
+        // NULL is an artifact from before the server ran MAGPIE at all, built
+        // by a Rust port that no longer exists. It is not this builder, and
+        // saying so is the honest answer.
+        let stored_builder: Option<String> = row.get("builder");
 
         let klv = if generation == 0 {
-            super::klv::build(distribution, &std::collections::HashMap::new())?
+            zero_klv(magpie, distribution).await?
         } else {
-            generation_klv(pool, job_id, generation, distribution).await?
+            generation_klv(pool, magpie, job_id, generation, distribution).await?
         };
         let rebuilt_sha256 = hex::encode(Sha256::digest(&klv));
 
         let object_present = artifacts.exists(&artifact_key).await?;
+        let same_builder = stored_builder.as_deref() == Some(rebuilding_with.as_str());
         let matches = rebuilt_sha256 == stored_sha256;
         // A missing object has no bytes to lose, so restoring it needs no
-        // permission. Replacing one that is present does.
+        // permission. Replacing one that is present does -- and replacing one
+        // built by a different builder needs it twice over, since the
+        // difference is expected rather than evidence of anything.
         let rewritten = !object_present || force;
         if rewritten {
             artifacts.put(&artifact_key, klv).await?;
@@ -766,6 +826,9 @@ pub async fn rebuild_artifacts(
             stored_sha256,
             rebuilt_sha256,
             matches,
+            same_builder,
+            stored_builder,
+            rebuilt_builder: rebuilding_with.clone(),
             object_present,
             rewritten,
         });
@@ -773,21 +836,51 @@ pub async fn rebuild_artifacts(
     Ok(report)
 }
 
-/// One generation's KLV from its full-rack results: the same derivation
-/// `run_transition` performs, which is what makes a rebuild reproduce the
-/// original bytes. Rows are streamed; a generation has millions of them.
+/// One generation's KLV from its full-rack results, built by MAGPIE.
+///
+/// The server used to derive this itself, with a Rust translation of MAGPIE's
+/// `rack_list_write_to_klv` and `generate_leaves`. That translation had to
+/// change whenever MAGPIE's did and nothing made it, and its KLVs differed in
+/// bytes from MAGPIE's for the same values -- a plain trie where MAGPIE builds
+/// a minimized DAWG -- which was a standing source of confusion. `convert
+/// rackequity2klv` is the same derivation, run by the code that defines it.
+///
+/// The transfer is a CSV in a scratch directory: one `rack,count,equity_sum`
+/// row per full rack, roughly 3.2 million of them for English. Rows are
+/// streamed from Postgres and written as they arrive, so neither side holds
+/// the generation in memory.
+///
+/// The job's pinned letter distribution is written into the same directory
+/// from `input_data.content`, so MAGPIE reads exactly the row the job pins
+/// rather than anything on the server's disk -- the rule PLAN.md sets, and the
+/// reason the backend image ships no `data/`.
 async fn generation_klv(
     pool: &sqlx::PgPool,
+    magpie: &Magpie,
     job_id: Uuid,
     generation: i32,
     distribution: &LetterDistribution,
 ) -> AppResult<Vec<u8>> {
     use futures::TryStreamExt;
+    use tokio::io::AsyncWriteExt;
 
-    let owned = distribution.clone();
-    let mut leaves = tokio::task::spawn_blocking(move || FullRackLeaves::new(&owned))
-        .await
-        .map_err(|e| AppError::internal(format!("leave derivation panicked: {e}")))??;
+    let scratch = ScratchData::empty().await?;
+    scratch
+        .write(
+            "letterdistributions",
+            &distribution.name,
+            ".csv",
+            &distribution.bytes,
+        )
+        .await?;
+
+    let csv_path = scratch.lexicon_path(SCRATCH_KLV_NAME, ".csv");
+    let mut csv = tokio::io::BufWriter::new(
+        tokio::fs::File::create(&csv_path)
+            .await
+            .map_err(|e| AppError::internal(format!("could not write the rack equity csv: {e}")))?,
+    );
+
     let mut rows = sqlx::query(
         "SELECT rack, occurrence_count, equity_sum
          FROM leave_rack_progress
@@ -797,47 +890,75 @@ async fn generation_klv(
     .bind(job_id)
     .bind(generation)
     .fetch(pool);
-    // The derivation is CPU-bound -- about 13 seconds for English in a
-    // release build -- so racks are folded on a blocking thread in chunks,
-    // never on the async executor, and never all held in memory at once.
-    const CHUNK: usize = 50_000;
-    let mut chunk: Vec<(String, f64)> = Vec::with_capacity(CHUNK);
-    loop {
-        let row = rows.try_next().await?;
-        if let Some(row) = &row {
-            let count: i64 = row.get("occurrence_count");
-            let equity_sum: f64 = row.get("equity_sum");
-            // A rack that never occurred has mean 0 and still counts toward
-            // the average, as in MAGPIE's rack list.
-            let mean = if count > 0 { equity_sum / count as f64 } else { 0.0 };
-            chunk.push((row.get("rack"), mean));
-        }
-        if chunk.len() == CHUNK || (row.is_none() && !chunk.is_empty()) {
-            let batch = std::mem::replace(&mut chunk, Vec::with_capacity(CHUNK));
-            leaves = tokio::task::spawn_blocking(move || -> AppResult<FullRackLeaves> {
-                for (rack, mean) in &batch {
-                    leaves.add_rack(rack, *mean)?;
-                }
-                Ok(leaves)
-            })
+
+    let mut written: u64 = 0;
+    while let Some(row) = rows.try_next().await? {
+        let rack: String = row.get("rack");
+        let count: i64 = row.get("occurrence_count");
+        let equity_sum: f64 = row.get("equity_sum");
+        // The sum, not the mean: MAGPIE divides, and handing it the number it
+        // would compute anyway keeps one rounding step out of the transfer.
+        // A rack that never occurred carries a sum of zero and still counts
+        // toward the weighted average, as it does inside a leavegen run.
+        csv.write_all(format!("{rack},{count},{equity_sum:.10}\n").as_bytes())
             .await
-            .map_err(|e| AppError::internal(format!("leave derivation panicked: {e}")))??;
-        }
-        if row.is_none() {
-            break;
-        }
+            .map_err(|e| AppError::internal(format!("could not write the rack equity csv: {e}")))?;
+        written += 1;
     }
     drop(rows);
+    csv.flush()
+        .await
+        .map_err(|e| AppError::internal(format!("could not write the rack equity csv: {e}")))?;
+    drop(csv);
 
+    // MAGPIE refuses a file that does not cover every full rack exactly once,
+    // so this is a second check rather than the only one -- but it fails with
+    // the job and generation in the message, where MAGPIE's failure would only
+    // name a path inside a directory that no longer exists.
     let expected = RackIndex::new(distribution, RACK_SIZE).total();
-    if leaves.racks_added() != expected {
+    if written != expected {
         return Err(AppError::internal(format!(
-            "leave job {job_id} generation {generation} has {} progress rows, but the \
-             distribution draws {expected} full racks",
-            leaves.racks_added()
+            "leave job {job_id} generation {generation} has {written} progress rows, but the \
+             distribution draws {expected} full racks"
         )));
     }
-    tokio::task::spawn_blocking(move || leaves.build())
-        .await
-        .map_err(|e| AppError::internal(format!("KLV build panicked: {e}")))
+
+    magpie
+        .convert(&scratch, "rackequity2klv", SCRATCH_KLV_NAME, &distribution.name)
+        .await?;
+    read_built_klv(&scratch, SCRATCH_KLV_NAME).await
+}
+
+/// The zeroed KLV a leave-generation job's first generation plays with.
+///
+/// `createdata klv` builds it from the letter distribution alone, with every
+/// leave worth zero. MAGPIE_DEPENDENCY.md proposed a `convert zero2klv` for
+/// this; `createdata klv` already is it, through the same `klv_create_empty`,
+/// so there is one spelling rather than two to keep in step.
+async fn zero_klv(magpie: &Magpie, distribution: &LetterDistribution) -> AppResult<Vec<u8>> {
+    let scratch = ScratchData::empty().await?;
+    scratch
+        .write(
+            "letterdistributions",
+            &distribution.name,
+            ".csv",
+            &distribution.bytes,
+        )
+        .await?;
+    magpie
+        .create_zero_klv(&scratch, SCRATCH_KLV_NAME, &distribution.name)
+        .await?;
+    read_built_klv(&scratch, SCRATCH_KLV_NAME).await
+}
+
+/// Reads back what MAGPIE wrote, before the scratch directory is dropped.
+///
+/// MAGPIE reports a failed conversion on its error stack and can still leave
+/// no file behind, so the output's existence is the real check -- the same
+/// rule the derived-file builder and the worker both apply.
+async fn read_built_klv(scratch: &ScratchData, name: &str) -> AppResult<Vec<u8>> {
+    let path = scratch.lexicon_path(name, ".klv2");
+    tokio::fs::read(&path).await.map_err(|e| {
+        AppError::internal(format!("MAGPIE reported no error but wrote no KLV: {e}"))
+    })
 }

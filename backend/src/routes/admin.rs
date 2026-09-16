@@ -41,6 +41,8 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/results/stream", get(super::public::job_results_stream))
         .route("/jobs/:id/export", post(start_export).get(get_export))
         .route("/jobs/:id/rebuild-artifacts", post(rebuild_artifacts))
+        .route("/derived-data", get(list_derived_data))
+        .route("/derived-data/retry", post(retry_derived_data))
         .route("/backups", get(backups))
         .route("/fleet", get(fleet))
 }
@@ -309,8 +311,9 @@ async fn confirm_import(
 
     let inserted = sqlx::query(
         "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date,
-                                 content, imported_by)
-         SELECT r.path, r.role, r.name, r.sha256, r.bytes, $2, r.content, $3
+                                 content, object_key, imported_by)
+         SELECT r.path, r.role, r.name, r.sha256, r.bytes, $2, r.content,
+                r.object_key, $3
          FROM input_data_import_rows r
          WHERE r.import_id = $1 AND r.disposition <> 'known'
          ON CONFLICT (path, sha256) DO NOTHING",
@@ -532,18 +535,26 @@ async fn create_player_config(
         None => None,
     };
 
-    // A player with simulation parameters loads a win% model; a static player
-    // never opens one. Getting this wrong would either fail at the worker or
-    // lock a contributor out of jobs that would never have read the file.
-    let simming = body.max_iterations.is_some()
-        || body.num_plies.is_some()
-        || body.num_plays.is_some()
-        || body.stopping_pct.is_some();
     // MAGPIE decides per player whether to simulate on plies alone (autoplay
-    // reads `sim_args->num_plies > 0`). A config with simulation settings but
-    // no plies would be treated as a simmer here -- made to name a win%
-    // model, rated as one -- and play statically on every worker.
-    if simming && !body.num_plies.is_some_and(|plies| plies >= 1) {
+    // reads `sim_args->num_plies > 0`), so that is what a simmer is here too.
+    // A config with simulation settings but no plies would be carried as a
+    // simmer -- made to name a win% model, rated as one -- and play statically
+    // on every worker, so it is refused. `num_plays` is not a simulation
+    // setting: an opening-rack analysis sizes its move list from it, simulating
+    // or not.
+    let simming = body.num_plies.is_some_and(|plies| plies >= 1);
+    let states_simulation = body.max_iterations.is_some()
+        || body.stopping_pct.is_some()
+        || body.use_inference.is_some()
+        || body.time_limit_secs.is_some()
+        || body.min_play_iterations.is_some()
+        || body.threshold.is_some()
+        || body.sampling_rule.is_some()
+        || body.inference_margin.is_some()
+        || body.utility_w_winpct.is_some()
+        || body.utility_w_spread.is_some()
+        || body.utility_spread_scale.is_some();
+    if states_simulation && !simming {
         return Err(AppError::bad_request("player config is invalid")
             .with_field("num_plies", "a simming player must simulate at least 1 ply"));
     }
@@ -587,6 +598,36 @@ async fn create_player_config(
     // refuses a pairing from two different letter distributions.
     crate::compat::validate_lexicon_and_leaves(&kwg, &klv)?;
 
+    // Every setting a request states is written into the row now, from
+    // MAGPIE's defaults where the body leaves it out, so a task built from this
+    // config means the same thing on every MAGPIE release (see
+    // `magpie_defaults`). A static player's simulation settings stay NULL:
+    // nothing reads them, and the schema's CHECK holds the two sets apart.
+    use crate::magpie_defaults as defaults;
+    let sort_strategy =
+        body.sort_strategy.clone().unwrap_or_else(|| defaults::SORT_STRATEGY.to_string());
+    let num_plies = body.num_plies.unwrap_or(0);
+    let num_plays = body.num_plays.unwrap_or(defaults::NUM_PLAYS);
+    let num_plies_recorded = body.num_plies_recorded.unwrap_or(defaults::NUM_PLIES_RECORDED);
+    let movegen_margin = body.movegen_margin.unwrap_or(defaults::MOVEGEN_MARGIN);
+    let stopping_pct = simming.then(|| body.stopping_pct.unwrap_or(defaults::STOPPING_PCT));
+    let use_inference = simming.then(|| body.use_inference.unwrap_or(defaults::USE_INFERENCE));
+    let min_play_iterations =
+        simming.then(|| body.min_play_iterations.unwrap_or(defaults::MIN_PLAY_ITERATIONS));
+    let threshold = simming
+        .then(|| body.threshold.clone().unwrap_or_else(|| defaults::THRESHOLD.to_string()));
+    let sampling_rule = simming.then(|| {
+        body.sampling_rule.clone().unwrap_or_else(|| defaults::SAMPLING_RULE.to_string())
+    });
+    let inference_margin =
+        simming.then(|| body.inference_margin.unwrap_or(defaults::INFERENCE_MARGIN));
+    let utility_w_winpct =
+        simming.then(|| body.utility_w_winpct.unwrap_or(defaults::UTILITY_W_WINPCT));
+    let utility_w_spread =
+        simming.then(|| body.utility_w_spread.unwrap_or(defaults::UTILITY_W_SPREAD));
+    let utility_spread_scale =
+        simming.then(|| body.utility_spread_scale.unwrap_or(defaults::UTILITY_SPREAD_SCALE));
+
     let config = sqlx::query_as::<_, PlayerConfig>(
         "INSERT INTO player_configs
              (name, recorder_type, sort_strategy, kwg_id, klv_id, winpct_id,
@@ -602,29 +643,32 @@ async fn create_player_config(
     )
     .bind(body.name.trim())
     .bind(&body.recorder_type)
-    .bind(&body.sort_strategy)
+    .bind(&sort_strategy)
     .bind(body.kwg_id)
     .bind(body.klv_id)
     .bind(body.winpct_id)
     .bind(body.cloned_from_id)
     .bind(body.max_iterations)
-    .bind(body.num_plies)
-    .bind(body.num_plies_recorded)
-    .bind(body.num_plays)
+    .bind(num_plies)
+    .bind(num_plies_recorded)
+    .bind(num_plays)
     .bind(body.num_plays_recorded)
-    .bind(body.stopping_pct)
-    .bind(body.use_inference)
+    .bind(stopping_pct)
+    .bind(use_inference)
     .bind(body.time_limit_secs)
-    .bind(body.use_wordmap)
-    .bind(body.use_rit)
-    .bind(body.min_play_iterations)
-    .bind(&body.threshold)
-    .bind(&body.sampling_rule)
-    .bind(body.inference_margin)
-    .bind(body.utility_w_winpct)
-    .bind(body.utility_w_spread)
-    .bind(body.utility_spread_scale)
-    .bind(body.movegen_margin)
+    .bind(body.use_wordmap.unwrap_or(false))
+    // Absent means no, for both: a rack info table is a large, slow thing to
+    // provision, and a config that did not ask for one must not get one
+    // because a default said so.
+    .bind(body.use_rit.unwrap_or(false))
+    .bind(min_play_iterations)
+    .bind(&threshold)
+    .bind(&sampling_rule)
+    .bind(inference_margin)
+    .bind(utility_w_winpct)
+    .bind(utility_w_spread)
+    .bind(utility_spread_scale)
+    .bind(movegen_margin)
     .bind(admin.0.id)
     .fetch_one(&state.pool)
     .await?;
@@ -680,6 +724,21 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     if body.utility_spread_scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
         err = err.with_field("utility_spread_scale", "must be a finite, positive number");
     }
+    // `use_rit` was refused outright until the server could check a table. A
+    // rack info table is not an exact accelerator the way a wordmap is: each
+    // entry carries precomputed leave values, which move generation uses in
+    // place of the loaded leaves. It was found by lexicon name alone, recorded
+    // nothing about the KLV it was built from, and was covered by no digest,
+    // so a player whose leaves are not that KLV -- or a contributor whose
+    // table is older than their leaves -- ranked moves on the wrong values
+    // with nothing to say so.
+    //
+    // Both halves of that are now closed. The server builds the table for this
+    // exact (lexicon, leaves) pair with its own pinned MAGPIE and sends the
+    // hash with every claim, and the file is named for the pair rather than
+    // the lexicon, so two jobs on one lexicon with different leaves cannot
+    // share one. A job that asks for a table waits until it is built; see
+    // `derived` and MAGPIE_DEPENDENCY.md.
     if err.fields.is_empty() {
         Ok(())
     } else {
@@ -908,8 +967,9 @@ async fn create_job(
     let job = sqlx::query_as::<_, Job>(
         "INSERT INTO jobs
              (job_type, priority, redundancy, variant, letterdist_id, layout_id,
-              min_magpie_major, min_magpie_minor, min_magpie_patch, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *",
+              min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
+              sim_cutoff, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *",
     )
     .bind(body.job_type)
     .bind(body.priority)
@@ -920,6 +980,11 @@ async fn create_job(
     .bind(floor.major)
     .bind(floor.minor)
     .bind(floor.patch)
+    // Written from MAGPIE's defaults, like a player config's settings, so
+    // every request states them rather than each worker's build supplying
+    // its own.
+    .bind(crate::magpie_defaults::BINGO_BONUS)
+    .bind(crate::magpie_defaults::SIM_CUTOFF)
     .bind(admin.0.id)
     .fetch_one(&mut *tx)
     .await?;
@@ -940,7 +1005,13 @@ async fn create_job(
 
     // Generation 1's zeroed KLV: a multi-megabyte build and an object-store
     // write, so it happens after the transaction commits rather than inside it.
-    registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
+    registry::initialize_job_artifacts(&state, &job).await?;
+
+    // Queued at creation rather than at activation: a rack info table takes
+    // minutes to build, and the admin who creates a job typically activates it
+    // in the next breath. Requesting it now means the wait happens while they
+    // are still deciding rather than after.
+    request_derived_data(&state, job.id).await?;
 
     Ok((StatusCode::CREATED, Json(CreatedJob { job })))
 }
@@ -1147,8 +1218,8 @@ async fn validate_shared_player_options(
             "player configs disagree on the win% model, which MAGPIE cannot vary per player",
         ));
     }
-    let p1_movegen_margin: Option<f64> = row.get("p1_movegen_margin");
-    let p2_movegen_margin: Option<f64> = row.get("p2_movegen_margin");
+    let p1_movegen_margin: f64 = row.get("p1_movegen_margin");
+    let p2_movegen_margin: f64 = row.get("p2_movegen_margin");
     if p1_movegen_margin != p2_movegen_margin {
         return Err(AppError::bad_request(
             "player configs disagree on movegen_margin, which MAGPIE cannot vary per player",
@@ -1156,10 +1227,6 @@ async fn validate_shared_player_options(
     }
     Ok(())
 }
-
-/// MAGPIE's candidate-play count for a player whose config leaves `num_plays`
-/// null: the reset `contribute` applies before every request.
-const MAGPIE_DEFAULT_NUM_PLAYS: i32 = 100;
 
 /// A capture job's simmers must already consider at least as many plays as are
 /// captured.
@@ -1180,15 +1247,14 @@ async fn validate_capture_play_cap(
             .fetch_optional(&mut *conn)
             .await?
             .ok_or_else(|| AppError::bad_request("player config not found"))?;
-    let players = sqlx::query_as::<_, (String, Option<i32>, Option<i32>)>(
+    let players = sqlx::query_as::<_, (String, i32, i32)>(
         "SELECT name, num_plies, num_plays FROM player_configs WHERE id = ANY($1)",
     )
     .bind(vec![player1_config_id, player2_config_id])
     .fetch_all(&mut *conn)
     .await?;
     for (name, plies, plays) in players {
-        let plays = plays.unwrap_or(MAGPIE_DEFAULT_NUM_PLAYS);
-        if plies.unwrap_or(0) > 0 && plays < cap {
+        if plies > 0 && plays < cap {
             return Err(AppError::bad_request("job settings are invalid").with_field(
                 "capture_positions",
                 format!(
@@ -1436,8 +1502,12 @@ async fn activate_job(
     // for the same reason creation builds it outside its own.
     let unlocked = crate::jobstats::load_job(&state.pool, id).await?;
     if !registry::job_artifacts_ready(&state.pool, &unlocked).await? {
-        registry::initialize_job_artifacts(&state.pool, &state.artifacts, &unlocked).await?;
+        registry::initialize_job_artifacts(&state, &unlocked).await?;
     }
+    // Again at activation, because the builder may have moved since creation:
+    // a deployment with a newer MAGPIE needs this job's files rebuilt under
+    // the new builder before it can dispatch, and nothing else would ask.
+    request_derived_data(&state, id).await?;
 
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
@@ -1815,7 +1885,7 @@ async fn purge_job(
 
     // The generation-0 KLV was deleted with the artifacts above; rebuild it, or
     // generation 1 would have nothing to play with.
-    registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
+    registry::initialize_job_artifacts(&state, &job).await?;
 
     Ok(Json(PurgeResult { tasks_reset }))
 }
@@ -1987,6 +2057,112 @@ async fn backups(
     Ok(Json(backups::status(&state.pool).await?))
 }
 
+/// Queues a build for every wordmap and rack info table the job needs.
+///
+/// Logged rather than returned on failure: a job that exists without its
+/// derived files simply does not dispatch, which is visible at
+/// `GET /api/admin/derived-data` and fixed by activating it again. Failing the
+/// creation would leave the admin with no job and a rolled-back transaction
+/// that had already written the generation-0 artifact.
+async fn request_derived_data(state: &AppState, job_id: Uuid) -> AppResult<()> {
+    let mut conn = state.pool.acquire().await?;
+    match crate::derived::request_for_job(&mut conn, job_id, &state.builders).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(%job_id, requested = n, "queued derived file builds"),
+        Err(err) => tracing::error!(
+            %job_id, error = %err.message,
+            "could not queue this job's derived file builds; it will not dispatch until it can"
+        ),
+    }
+    Ok(())
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct DerivedDataRow {
+    role: String,
+    name: String,
+    builder: String,
+    state: String,
+    sha256: Option<String>,
+    bytes: Option<i64>,
+    build_target: Option<String>,
+    error: Option<String>,
+    attempts: i32,
+    requested_at: chrono::DateTime<chrono::Utc>,
+    built_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Every wordmap and rack info table the server has been asked to build.
+///
+/// The admin-facing half of the dispatch gate: a job that asks for a rack info
+/// table is not handed out until this says `built`, and a build that failed is
+/// the reason a job is quietly doing nothing. Without this page, "the job is
+/// active and no worker is claiming from it" has no visible cause.
+async fn list_derived_data(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> AppResult<Json<Vec<DerivedDataRow>>> {
+    Ok(Json(
+        sqlx::query_as::<_, DerivedDataRow>(
+            "SELECT role, name, builder, state, sha256, bytes, build_target, error,
+                    attempts, requested_at, built_at
+             FROM derived_data
+             ORDER BY state = 'built', requested_at DESC",
+        )
+        .fetch_all(&state.pool)
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct RetryDerivedBody {
+    role: String,
+    name: String,
+}
+
+/// Puts a failed build back in the queue.
+///
+/// Explicit, because a build is a pure function of its inputs: one that failed
+/// three times failed for a reason that a fourth attempt does not change, and
+/// re-queueing it automatically would spend every builder run on the same
+/// doomed row. An admin retries it after fixing what it named -- most often a
+/// lexicon imported before the server stored its bytes.
+async fn retry_derived_data(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Json(body): Json<RetryDerivedBody>,
+) -> AppResult<StatusCode> {
+    csrf::verify(&method, &headers, &jar)?;
+    let reset = sqlx::query(
+        "UPDATE derived_data
+         SET state = 'pending', attempts = 0, error = NULL, leased_until = NULL
+         WHERE role = $1 AND name = $2 AND state = 'failed'",
+    )
+    .bind(&body.role)
+    .bind(&body.name)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+    if reset == 0 {
+        return Err(AppError::not_found("no failed build for that role and name"));
+    }
+    let mut conn = state.pool.acquire().await?;
+    audit::log(
+        &mut conn,
+        "derived_data.retried",
+        Some(admin.0.id),
+        None,
+        Some("derived_data"),
+        Some(format!("{} {}", body.role, body.name)),
+        None,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize)]
 struct RebuildQuery {
     /// Rewrite an object whose bytes no longer hash to what was recorded.
@@ -2030,6 +2206,8 @@ async fn rebuild_artifacts(
     let report = crate::jobs::leave_gen::rebuild_artifacts(
         &state.pool,
         &state.artifacts,
+        &state.magpie,
+        &state.builders,
         job.id,
         &job_data.letterdist,
         query.force,

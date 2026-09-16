@@ -193,13 +193,13 @@ variable "acm_certificate_arn" {
 
 variable "min_magpie_version" {
   description = <<-EOT
-    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.2.0 is the
-    first MAGPIE version whose results do not depend on a contributor's settings;
-    a build reporting a lower version is offered nothing. Raise it whenever a
-    MAGPIE release changes results.
+    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.4.0 is the
+    first MAGPIE version whose results depend on nothing but the task; a build
+    reporting a lower version is offered nothing. Raise it whenever a MAGPIE
+    release changes results.
   EOT
   type        = string
-  default     = "0.2.0"
+  default     = "0.4.0"
 }
 
 variable "github_token_parameter_arn" {
