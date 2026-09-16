@@ -68,6 +68,17 @@ pub struct PlayerSpec {
     pub time_limit_secs: Option<i32>,
     pub use_wordmap: bool,
     pub use_rit: bool,
+    /// The name this player's rack info table is loaded under, or `None` when
+    /// it asks for none.
+    ///
+    /// A name rather than a boolean alone because a table stores precomputed
+    /// leave values, so it belongs to the (lexicon, leaves) pair rather than to
+    /// the lexicon. MAGPIE's CLI finds a table by lexicon name, which is how a
+    /// player pinning NWL23 words and CSW21 leaves -- a pairing birdtest
+    /// accepts on purpose -- would have loaded `NWL23.rit` and ranked every
+    /// full rack on NWL23's leaves instead. This is the same name the server
+    /// pinned a hash for in `expected_data.derived`.
+    pub rit_name: Option<String>,
     pub min_play_iterations: Option<i32>,
     pub threshold: Option<String>,
     pub sampling_rule: Option<String>,
@@ -83,12 +94,13 @@ pub struct PlayerSpec {
 impl From<NamedPlayerConfig> for PlayerSpec {
     fn from(named: NamedPlayerConfig) -> Self {
         let NamedPlayerConfig { config: c, kwg_name, klv_name, winpct_name } = named;
+        let (lexicon, leaves) = (kwg_name, klv_name);
         Self {
             name: c.name,
             recorder_type: c.recorder_type,
             sort_strategy: c.sort_strategy,
-            lexicon: kwg_name,
-            leaves: klv_name,
+            lexicon: lexicon.clone(),
+            leaves: leaves.clone(),
             max_iterations: c.max_iterations,
             num_plies: c.num_plies,
             num_plies_recorded: c.num_plies_recorded,
@@ -99,6 +111,9 @@ impl From<NamedPlayerConfig> for PlayerSpec {
             time_limit_secs: c.time_limit_secs,
             use_wordmap: c.use_wordmap,
             use_rit: c.use_rit,
+            rit_name: c
+                .use_rit
+                .then(|| crate::derived::rack_info_table_name(&lexicon, &leaves)),
             min_play_iterations: c.min_play_iterations,
             threshold: c.threshold,
             sampling_rule: c.sampling_rule,

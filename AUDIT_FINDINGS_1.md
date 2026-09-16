@@ -97,7 +97,7 @@ corrections (M1, M2) and the additions below.
 | Setting | Changes results? | How it is set now | Change |
 |---|---|---|---|
 | Wordmap use (`-w1/-w2`, `-wmp`) | Only if the `.wmp` does not match the `.kwg` — which is exactly the case a leftover flag reaches | Stated per player **before** the lexicon loads | **M1** |
-| Rack info table use (`-rit*`) | **Yes**: entries carry leave values used instead of the KLV's | Always off in contribute; refused by birdtest | **M2** (reverses the prior table) |
+| Rack info table use (`-rit*`) | **Yes**: entries carry leave values used instead of the KLV's | Always off in contribute; refused by birdtest | **M2** (reverses the prior table; itself reversed 2026-09-15 — see M2) |
 | `use_game_pairs` | Not for leave generation: `autoplay_worker` builds a second game runner only for `AUTOPLAY_TYPE_DEFAULT`, and the recorder check passes for `games` | Set by the games executor; left for leave generation | Checked, no change |
 | `max_num_display_plays`, `shplies` | Not for stored results: `sim_results_lock_and_sort_display_simmed_plays` sorts every simmed play; the opening-rack writer caps from the request. `position_play_cap` raises simmers only when capturing (prior U2) | Set by the games executor from player 1 | Checked, no change |
 | `print_boards`, `game_string_options`, `human_readable` | No: output only | — | — |
@@ -176,6 +176,35 @@ corrections (M1, M2) and the additions below.
   corruption now. Recorded as a possible future improvement, not a decision.
 - **Test.** `admin_api::a_player_config_cannot_ask_for_a_rack_info_table`, and the
   MAGPIE test under M1.
+
+> **Reversed 2026-09-15 by [MAGPIE_DEPENDENCY.md](MAGPIE_DEPENDENCY.md).** The
+> finding stands as written — a table named after its lexicon, covered by no
+> digest, did replace the leaves a job pinned — and the refusal was right for as
+> long as there was nothing to check a table against. There is now.
+>
+> This entry's own "why refuse rather than verify" names the feature that was
+> built: the server pins a table by building one. A pinned MAGPIE in the backend
+> image builds the reference copy for each `(.kwg, .klv2)` pair, publishes its
+> SHA-256 in `expected_data.derived`, and a worker uses its own copy only if the
+> bytes agree, declining `derived_mismatch` if not. The table is named
+> `<lexicon>.<leaves>` rather than `<lexicon>`, so the pairing this entry
+> describes is no longer expressible; `klvwmp2rit` takes its two inputs' names
+> separately to allow that. Leave generation still loads no table, for this
+> entry's first consequence — that one is not solved but avoided, deliberately:
+> a table caches the very values a generation is producing, so it would have to
+> be rebuilt per generation at 1.9 GB on every worker. M1's fix is untouched and
+> still carries the third consequence: both flags, and now the table's name, are
+> stated before the lexicon loads, so a job that asked for nothing gets
+> nothing.
+>
+> So: `validate_player_config_body` accepts `use_rit` again, the form offers it,
+> contribute loads tables for games and opening-rack jobs, and
+> `a_player_config_cannot_ask_for_a_rack_info_table` is now
+> `a_player_config_may_ask_for_a_rack_info_table` — which additionally asserts
+> the flag is *stored*, since the insert bound a literal `false` for as long as
+> the answer could only be no. A job whose table is not built yet is not
+> dispatched. See PLAN.md, [Wordmap and rack info table
+> provenance](PLAN.md#wordmap-and-rack-info-table-provenance).
 
 ### M3 — version
 

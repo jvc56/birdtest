@@ -48,6 +48,16 @@ pub struct ImportedFile {
     pub bytes: i64,
     /// Kept only for the roles the server itself reads; see `input_data.content`.
     pub content: Option<Vec<u8>>,
+    /// Where these bytes belong in the object store, for the roles the server
+    /// builds derived files from; see `input_data.object_key`.
+    pub object_key: Option<String>,
+    /// The bytes destined for the object store, taken by [`upload_inputs`].
+    ///
+    /// `None` once uploaded, and for every role that stores nothing -- so an
+    /// archive's worth of lexica is held while it is being uploaded and not
+    /// for the rest of the import. Separate from `content`, which stays on the
+    /// row for the whole staging pass because confirmation writes it.
+    pub stored: Option<Vec<u8>>,
 }
 
 /// `data/<dir>/<basename>` to (path, role, name). The inverse of the table in
@@ -76,6 +86,28 @@ fn classify(entry_path: &str) -> Option<(String, String, String)> {
 /// itself and must read exactly what the job pins.
 fn keeps_content(role: &str) -> bool {
     matches!(role, "letterdist" | "layout")
+}
+
+/// Roles whose bytes go to the object store, because the server builds derived
+/// files from them.
+///
+/// Not the row, unlike [`keeps_content`]: a 6 MB lexicon and a 3.7 MB KLV per
+/// row is a different proposition from a 489-byte distribution, nothing
+/// queries their contents, and a full tarball is fifty of each. The key is the
+/// digest, so two tarballs carrying the same lexicon upload it once.
+///
+/// Win% models stay out. The server neither reads one nor builds anything from
+/// one -- only a simulating player on a worker opens it -- so storing it would
+/// be 800 KB a row for nothing.
+fn stores_object(role: &str) -> bool {
+    matches!(role, "kwg" | "klv")
+}
+
+/// The object-store key for a file's bytes. Keyed by digest, not by path:
+/// what a derived build needs is these exact bytes, and the same bytes under
+/// two paths are one object.
+pub fn input_object_key(sha256: &str) -> String {
+    format!("inputs/{sha256}")
 }
 
 /// Resolves a git ref to a commit sha, so `main` is pinned at import time and
@@ -327,6 +359,8 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
 
         let sha256 = hex::encode(Sha256::digest(&bytes));
         let content = keeps_content(&role).then(|| bytes.clone());
+        let stores_object_bytes = stores_object(&role);
+        let object_key = stores_object_bytes.then(|| input_object_key(&sha256));
         files.push(ImportedFile {
             path: mapped_path,
             role,
@@ -334,6 +368,8 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
             sha256,
             bytes: bytes.len() as i64,
             content,
+            object_key,
+            stored: stores_object_bytes.then_some(bytes),
         });
         if let Some(progress) = progress {
             progress.entries(files.len() as i32);
@@ -435,6 +471,33 @@ pub async fn run_import(state: AppState, import_id: Uuid, tarball_date: String, 
     }
 }
 
+/// Puts every lexicon and leaves file into the object store, and takes its
+/// bytes back out of memory.
+///
+/// Uploaded at staging time because that is when the bytes exist: the archive
+/// is in memory, and re-downloading it at confirmation would mean fetching
+/// 94 MB again for files the server has already hashed.
+///
+/// An object already present is skipped. Keys are digests, so a file unchanged
+/// between two tarballs -- which is most of them -- is uploaded once, and an
+/// import the admin then cancels leaves behind exactly what the next import
+/// would have uploaded anyway.
+async fn upload_inputs(state: &AppState, files: &mut [ImportedFile]) -> AppResult<()> {
+    let mut uploaded = 0;
+    for file in files.iter_mut() {
+        let (Some(key), Some(bytes)) = (file.object_key.clone(), file.stored.take()) else {
+            continue;
+        };
+        if state.artifacts.exists(&key).await? {
+            continue;
+        }
+        state.artifacts.put(&key, bytes).await?;
+        uploaded += 1;
+    }
+    tracing::info!(uploaded, "stored lexicon and leaves bytes for derived builds");
+    Ok(())
+}
+
 async fn stage(
     state: &AppState,
     import_id: Uuid,
@@ -443,7 +506,15 @@ async fn stage(
     progress: &Progress,
 ) -> AppResult<String> {
     let (body, tarball_sha256) = download(state, commit_sha, tarball_date, progress).await?;
-    let files = walk_archive(&body, Some(progress))?;
+    let mut files = walk_archive(&body, Some(progress))?;
+    // Before anything is staged: a row that names an object has to be a row
+    // whose object is there, or the first derived build from it fails with a
+    // missing key rather than a reason. Uploading before the transaction also
+    // keeps a multi-minute upload out of it.
+    upload_inputs(state, &mut files).await?;
+    // The whole archive is no longer needed once its entries are in `files`,
+    // and it is about 300 MB uncompressed.
+    drop(body);
 
     let mut tx = state.pool.begin().await?;
     for file in &files {
@@ -475,8 +546,9 @@ async fn stage(
 
         sqlx::query(
             "INSERT INTO input_data_import_rows
-                 (import_id, path, role, name, sha256, bytes, disposition, content)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 (import_id, path, role, name, sha256, bytes, disposition, content,
+                  object_key)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (import_id, path, sha256) DO NOTHING",
         )
         .bind(import_id)
@@ -487,6 +559,7 @@ async fn stage(
         .bind(file.bytes)
         .bind(disposition)
         .bind(file.content.as_deref())
+        .bind(file.object_key.as_deref())
         .execute(&mut *tx)
         .await?;
     }
@@ -559,6 +632,22 @@ mod tests {
         assert_eq!(classify("data/lexica/nested/NWL23.kwg"), None);
     }
 
+    /// The server builds a reference wordmap from a lexicon and a reference
+    /// rack info table from a lexicon and its leaves, so those two roles have
+    /// to be fetchable afterwards. A win% model is neither read by the server
+    /// nor built from, so storing one would be 800 KB a row for nothing.
+    #[test]
+    fn the_roles_a_derived_build_needs_go_to_the_object_store() {
+        assert!(stores_object("kwg"));
+        assert!(stores_object("klv"));
+        assert!(!stores_object("winpct"));
+        assert!(!stores_object("letterdist"));
+        assert!(!stores_object("layout"));
+        // Keyed by digest, so the same bytes under two paths are one object
+        // and a file unchanged between tarballs is uploaded once.
+        assert_eq!(input_object_key("abc123"), "inputs/abc123");
+    }
+
     #[test]
     fn only_server_read_roles_keep_their_bytes() {
         assert!(keeps_content("letterdist"));
@@ -605,6 +694,13 @@ mod tests {
 
         let kwg = files.iter().find(|f| f.role == "kwg").unwrap();
         assert!(kwg.content.is_none(), "lexica are not stored in the row");
+        // They go to the object store instead, so the server can build a
+        // reference wordmap from them. Keyed by digest: the same bytes in two
+        // tarballs are one object.
+        assert_eq!(kwg.object_key.as_deref(), Some(input_object_key(&kwg.sha256).as_str()));
+        assert_eq!(kwg.stored.as_deref(), Some(b"kwg-bytes" as &[u8]));
+        assert!(ld.object_key.is_none(), "the server reads a distribution off its row");
+        assert!(ld.stored.is_none());
     }
 
     #[test]

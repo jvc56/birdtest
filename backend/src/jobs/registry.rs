@@ -4,7 +4,6 @@
 
 use super::handler::*;
 use super::{game, game_pair, leave_gen, load_job_data, opening_rack};
-use crate::artifacts::ArtifactStore;
 use crate::auth::WorkerIdentity;
 use crate::error::{AppError, AppResult};
 use crate::models::job::*;
@@ -448,17 +447,24 @@ async fn count_first_result(
 /// object-store write. Called after the transaction commits, and again at
 /// activation if it has not happened yet. Idempotent.
 pub async fn initialize_job_artifacts(
-    pool: &sqlx::PgPool,
-    artifacts: &ArtifactStore,
+    state: &crate::state::AppState,
     job: &Job,
 ) -> AppResult<()> {
     if job.job_type != JobType::LeaveGeneration {
         return Ok(());
     }
-    let mut conn = pool.acquire().await?;
+    let mut conn = state.pool.acquire().await?;
     let job_data = load_job_data(&mut conn, job.id).await?;
     drop(conn);
-    leave_gen::seed_zero_generation(pool, artifacts, job.id, &job_data.letterdist).await?;
+    leave_gen::seed_zero_generation(
+        &state.pool,
+        &state.artifacts,
+        &state.magpie,
+        &state.builders,
+        job.id,
+        &job_data.letterdist,
+    )
+    .await?;
     Ok(())
 }
 

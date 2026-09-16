@@ -71,6 +71,15 @@ impl FinishCheckCounters {
 pub struct AppState {
     pub pool: PgPool,
     pub cfg: Arc<Config>,
+    /// The pinned MAGPIE binary, and what it says about its own builders.
+    ///
+    /// Resolved once at startup rather than per use: the builder versions are
+    /// a constant of the image, and asking the binary on every request would
+    /// spawn a process to read three integers. Reading them at startup also
+    /// means an image with a broken or missing MAGPIE fails before it binds,
+    /// instead of on the first job an admin creates.
+    pub magpie: crate::magpie::Magpie,
+    pub builders: Arc<crate::magpie::Builders>,
     pub sse: SseBroadcaster,
     pub limits: RateLimiters,
     pub mailer: Mailer,

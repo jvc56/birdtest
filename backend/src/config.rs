@@ -28,11 +28,23 @@ pub struct Config {
     /// stamped onto a new job when an admin does not raise it. Also reported
     /// by `GET /api/worker/client-version` so a client can check itself.
     ///
-    /// This is a floor on the *contributor's* build. The backend itself has no
-    /// MAGPIE dependency -- leave-generation aggregation builds its KLV
-    /// artifact directly (see `jobs::klv`).
+    /// This is a floor on the *contributor's* build, and it is now also a
+    /// floor the backend's own pinned MAGPIE has to clear: the server builds
+    /// the reference copy of every wordmap, rack info table and
+    /// leave-generation KLV, so a backend older than the fleet would be
+    /// handing out hashes its workers could not reproduce.
     pub min_magpie_version: String,
     pub magpie_download_url: String,
+    /// The pinned MAGPIE binary this process runs for every derived file and
+    /// every leave-generation KLV. Baked into the backend image at a fixed
+    /// path; overridden in development to point at a local checkout's
+    /// `bin/magpie`.
+    pub magpie_bin: String,
+    /// Threads to give a conversion. A rack info table build scales close to
+    /// linearly with them, and this is the builder task's vCPU count -- in the
+    /// web task, where only the small conversions run, it stays at 1 so a
+    /// build cannot take the whole process's CPU.
+    pub magpie_threads: usize,
     /// Where import fetches versioned tarballs from. Configuration, never user
     /// input: the residual exposure of parsing an archive from the network is
     /// a compromised upstream, not an arbitrary URL.
@@ -135,7 +147,7 @@ impl Config {
             other => anyhow::bail!("SECURE_COOKIES must be 'true' or 'false', got {other:?}"),
         };
 
-        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.4.0");
+        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.5.0");
         if crate::version::Version::parse_or_zero(&min_magpie_version)
             == crate::version::Version::ZERO
             && min_magpie_version.trim() != "0.0.0"
@@ -155,8 +167,14 @@ impl Config {
             heartbeat_timeout: Duration::from_secs(parsed("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            // 0.4.0 is the first MAGPIE version whose results depend on nothing
-            // but the task. 0.3.0 and 0.2.0 supplied their own compile-time
+            // 0.5.0 is the first MAGPIE version that checks a wordmap or a
+            // rack info table against the hash the job pins, and the first
+            // that will load a table at all. 0.4.0 was the first whose results
+            // depend on nothing but the task; it ran every job with rack info
+            // tables switched off, so raising the floor past it is what lets
+            // `use_rit` mean anything.
+            //
+            // 0.3.0 and 0.2.0 supplied their own compile-time
             // defaults for every setting a request left null, and refused the
             // sampling-rule names birdtest sends; 0.2.0 also carried a task's
             // wordmap and rack-info-table flags into the next task; 0.1.0 left
@@ -169,6 +187,8 @@ impl Config {
                 "MAGPIE_DOWNLOAD_URL",
                 "https://github.com/jvc56/MAGPIE",
             ),
+            magpie_bin: var_or("MAGPIE_BIN", crate::magpie::DEFAULT_MAGPIE_BIN),
+            magpie_threads: parsed("MAGPIE_THREADS", 1usize)?,
             magpie_data_repo: var_or("MAGPIE_DATA_REPO", "jvc56/MAGPIE-DATA"),
             github_token: var("GITHUB_TOKEN"),
             trusted_proxy_hops: parsed("TRUSTED_PROXY_HOPS", 0)?,

@@ -53,8 +53,15 @@
     try {
       rebuild = await api.rebuildArtifacts(jobId);
       const missing = rebuild.filter((r) => r.rewritten).length;
-      const drifted = rebuild.filter((r) => !r.matches).length;
-      notice = `Checked ${rebuild.length} generations: ${missing} restored, ${drifted} differing from the recorded hash.`;
+      // A generation written by a different builder is expected to differ:
+      // MAGPIE builds these now, so an upgrade legitimately changes the bytes.
+      // Counting it as drift would make every upgrade read as data loss.
+      const drifted = rebuild.filter((r) => !r.matches && r.same_builder).length;
+      const rebuilt = rebuild.filter((r) => !r.same_builder).length;
+      notice =
+        `Checked ${rebuild.length} generations: ${missing} restored, ` +
+        `${drifted} differing from the recorded hash` +
+        (rebuilt > 0 ? `, ${rebuilt} built by a different MAGPIE builder.` : '.');
     } catch (e) {
       error = (e as Error).message;
     }
@@ -145,8 +152,16 @@
                   <td class={row.object_present ? '' : 'text-destructive'}>
                     {row.object_present ? 'present' : 'missing'}
                   </td>
-                  <td class={row.matches ? '' : 'text-destructive'} title={row.stored_sha256}>
-                    {row.matches ? 'matches' : 'differs from the recorded hash'}
+                  <td
+                    class={row.matches || !row.same_builder ? '' : 'text-destructive'}
+                    title={row.stored_sha256}
+                  >
+                    {#if !row.same_builder}
+                      built by {row.stored_builder ?? 'the old server-side builder'},
+                      rebuilt by {row.rebuilt_builder}
+                    {:else}
+                      {row.matches ? 'matches' : 'differs from the recorded hash'}
+                    {/if}
                   </td>
                   <td>{row.rewritten ? 'rewritten' : 'left alone'}</td>
                 </tr>
@@ -158,6 +173,12 @@
           A missing object is rebuilt from the job's rack progress. A differing hash is not: the
           results have almost certainly moved on since the generation closed, and rewriting on that
           basis would replace the KLV workers actually played with by one they never saw.
+        </p>
+        <p class="text-xs text-muted-foreground">
+          A generation built by a different MAGPIE builder is expected to differ and is not
+          drift. MAGPIE builds these KLVs, so an upgrade can legitimately change the bytes for
+          the same leave values; only two artifacts from the <em>same</em> builder disagreeing
+          is evidence of anything.
         </p>
       {/if}
     </div>

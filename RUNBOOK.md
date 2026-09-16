@@ -308,6 +308,19 @@ rows actually support.
 - **Leave-generation artifacts**: if any object is missing, use
   `POST /api/admin/jobs/:id/rebuild-artifacts` (the "Check artifacts" button on
   the admin job page) rather than restoring bytes — see §3.
+- **Derived data** (`derived_data`): the SHA-256 of each wordmap and rack info
+  table the server built. Derived by definition, and **a job whose rows are
+  missing does not dispatch** — which is the symptom a restore produces here:
+  active jobs handing out nothing. Activating each job again re-queues them
+  (`POST /api/admin/jobs/:id/activate`), and the builder task fills them in
+  within a few minutes; `/admin/derived-data` shows the queue. The files
+  themselves are not restored because none is kept: the server hashes and
+  discards them.
+
+  A row whose `kwg_id` or `klv_id` points at an `input_data` row restored
+  without its object-store bytes will fail with that as its reason. Re-import
+  that tarball; the import is idempotent and adds no rows for files whose bytes
+  have not changed.
 
 ---
 
@@ -324,6 +337,12 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   rebuild legitimately produces different bytes, and rewriting would replace
   the KLV that workers actually played with. Investigate before forcing
   (`?force=true`).
+- **Built by a different builder.** Read this column first. MAGPIE builds these
+  KLVs, so a MAGPIE upgrade can legitimately change the bytes for the same
+  leave values; the report says which builder wrote the artifact and which one
+  rebuilt it. Only two artifacts from the *same* builder disagreeing is
+  evidence of anything. `builder` is NULL for an artifact written before the
+  server ran MAGPIE at all.
 - **Corrupted object with a known-good older version.** The bucket is
   versioned; restore that specific object version rather than rolling the
   bucket back:

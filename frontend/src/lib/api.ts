@@ -292,12 +292,47 @@ export interface BackupStatus {
   recent: BackupRun[];
 }
 
+/**
+ * A wordmap or rack info table the server builds a reference copy of.
+ *
+ * Neither file is shipped — 179 MB and 1.9 GB for CSW24 — so what travels to a
+ * worker is the SHA-256 the server's own pinned MAGPIE got from the same
+ * inputs. A job that needs one is not dispatched until it is `built`, which is
+ * why this page exists: an active job doing nothing usually has a row here.
+ */
+export interface DerivedData {
+  /** `wmp` or `rit`. */
+  role: string;
+  /** What the worker loads it as: a lexicon, or `<lexicon>.<leaves>`. */
+  name: string;
+  /** The builder that produced the hash, e.g. `wmp-1`. */
+  builder: string;
+  /** `pending` | `building` | `built` | `failed`. */
+  state: string;
+  sha256: string | null;
+  bytes: number | null;
+  build_target: string | null;
+  error: string | null;
+  attempts: number;
+  requested_at: string;
+  built_at: string | null;
+}
+
 /** Per generation, what rebuilding a leave job's KLV from the database found. */
 export interface ArtifactRebuild {
   generation: number;
   artifact_key: string;
   stored_sha256: string;
   rebuilt_sha256: string;
+  /**
+   * Whether the stored artifact was written by the builder this rebuild used.
+   * When it was not, `matches` says nothing: MAGPIE built these, so an upgrade
+   * can legitimately change the bytes.
+   */
+  same_builder: boolean;
+  /** `null` for an artifact written before the server ran MAGPIE. */
+  stored_builder: string | null;
+  rebuilt_builder: string;
   matches: boolean;
   object_present: boolean;
   rewritten: boolean;
@@ -396,6 +431,9 @@ export const api = {
   jobDataGaps: (id: string) => get<DataGap[]>(`/api/admin/jobs/${id}/data-gaps`),
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
   backups: () => get<BackupStatus>('/api/admin/backups'),
+  derivedData: () => get<DerivedData[]>('/api/admin/derived-data'),
+  retryDerivedData: (role: string, name: string) =>
+    post<void>('/api/admin/derived-data/retry', { role, name }),
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>

@@ -33,6 +33,9 @@ pub struct TaskClaim {
     pub request: TaskRequest,
     pub min_magpie_version: String,
     pub expected_data: Vec<ExpectedFile>,
+    /// The wordmap and rack info table hashes this job's tasks must reproduce.
+    /// Empty for a job whose players ask for neither.
+    pub derived_data: Vec<crate::derived::ExpectedDerived>,
 }
 
 /// The four answers a claim can get. One decision, not four checks: `204` and
@@ -366,6 +369,31 @@ async fn try_claim_from_job(
     job: &Job,
     caps: &WorkerCapabilities,
 ) -> Result<Option<TaskClaim>, JobClaimError> {
+    // Before the dispatch lock, because a job with a table still building has
+    // nothing to hand out and taking the lock would only make every other
+    // claim for it wait. The hashes travel with the claim, so a task issued
+    // before they exist would either carry no `derived` entry -- which a
+    // worker reads as "this server does not check derived files", falling back
+    // to whatever is on its disk -- or carry an empty one. Waiting is the only
+    // answer that cannot be mistaken for success.
+    let derived = {
+        let mut conn = state.pool.acquire().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+        crate::derived::status_for_job(&mut conn, job.id, &state.builders)
+            .await
+            .map_err(JobClaimError::Fatal)?
+    };
+    if !derived.dispatchable() {
+        // Logged at debug: a table takes minutes to build, and every worker
+        // asking during those minutes would otherwise produce a line each.
+        // `GET /api/admin/derived-data` is where an admin looks.
+        tracing::debug!(
+            job_id = %job.id,
+            pending = ?derived.pending, failed = ?derived.failed,
+            "job is waiting on a derived file"
+        );
+        return Ok(None);
+    }
+
     let mut tx = state.pool.begin().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
 
     let acquired = match registry::acquire(&mut tx, job, identity).await {
@@ -485,6 +513,7 @@ async fn try_claim_from_job(
                         request,
                         min_magpie_version: job.min_magpie_version().to_string(),
                         expected_data: expected,
+                        derived_data: derived.ready,
                     }))
                 }
                 Err(err) => {
@@ -662,8 +691,7 @@ async fn run_leave_generation_transition(
     // which keeps the attempt count and says in the log that a transition was
     // started and did not finish.
     let result = leave_gen::run_transition(
-        &state.pool,
-        &state.artifacts,
+        state,
         job.id,
         generation,
         &config,

@@ -210,6 +210,18 @@
         <input type="checkbox" bind:checked={useWordmap} />
         Use wordmap (-w)
       </label>
+      <label class="flex items-end gap-2 text-sm">
+        <input type="checkbox" bind:checked={useRit} />
+        Use rack info table (-rit)
+      </label>
+      {#if useRit}
+        <p class="col-span-2 text-sm text-muted-foreground">
+          The server builds this player's table from its lexicon and leaves before any
+          job using it can dispatch — a few minutes, once per pair. Watch it at
+          <a class="underline" href="/admin/derived-data">derived data</a>. Contributors
+          build their own copy and it costs about 1.9&nbsp;GB on their disk.
+        </p>
+      {/if}
       <div>
         <label class="label" for="minpi">Min play iterations (-mi)</label>
         <input id="minpi" type="number" class="input" bind:value={minPlayIterations} />

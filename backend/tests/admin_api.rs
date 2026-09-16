@@ -932,10 +932,13 @@ async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
     assert_eq!(status(&db).await, "completed");
 }
 
-/// A rack info table carries precomputed leave values keyed by lexicon name
-/// alone, which move generation uses in place of the leaves a job pins.
+/// A rack info table carries precomputed leave values that move generation uses
+/// in place of the leaves a job pins, which is why it was refused outright
+/// until the server could build the table for a config's own (lexicon, leaves)
+/// pair and pin its hash. Both values are accepted now; what stops a wrong
+/// table being used is the hash and the dispatch gate, not this validator.
 #[tokio::test]
-async fn a_player_config_cannot_ask_for_a_rack_info_table() {
+async fn a_player_config_may_ask_for_a_rack_info_table() {
     let db = TestDb::new().await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
@@ -945,17 +948,37 @@ async fn a_player_config_cannot_ask_for_a_rack_info_table() {
     let kwg = db.input_data("kwg", "NWL23").await;
     let klv = db.input_data("klv", "NWL23").await;
 
-    for (use_rit, expected) in
-        [(json!(true), StatusCode::BAD_REQUEST), (json!(false), StatusCode::CREATED)]
-    {
+    for use_rit in [json!(true), json!(false)] {
         let (status, response) = player_config(&app, &headers, json!({
             "name": format!("static-rit-{use_rit}"), "recorder_type": "best",
             "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1, "use_rit": use_rit,
         }))
         .await;
-        assert_eq!(status, expected, "use_rit {use_rit}: {response}");
-        if expected == StatusCode::BAD_REQUEST {
-            assert_eq!(response["fields"][0]["field"], "use_rit", "{response}");
-        }
+        assert_eq!(status, StatusCode::CREATED, "use_rit {use_rit}: {response}");
+        // Stored, not merely accepted. While the answer was always "no" the
+        // insert bound a literal `false`, so lifting the refusal without this
+        // would have produced configs that asked for a table and were written
+        // as not wanting one -- silently, and only visible as a job that never
+        // loaded the table it was created for.
+        assert_eq!(response["use_rit"], use_rit, "{response}");
     }
+
+    // Absent still means no. A table is 1.9 GB on every contributor's disk and
+    // minutes of server time; nothing should get one by default.
+    let (status, response) = player_config(&app, &headers, json!({
+        "name": "static-rit-absent", "recorder_type": "best",
+        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1,
+    }))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_eq!(response["use_rit"], json!(false), "{response}");
+
+    // The table travels under the pair's name, not the lexicon's. That is what
+    // keeps NWL23-with-CSW21-leaves -- a configuration birdtest accepts on
+    // purpose -- from loading NWL23's own table and ranking every full rack on
+    // leaves the job did not pin.
+    assert_eq!(
+        birdtest::derived::rack_info_table_name("NWL23", "CSW21"),
+        "NWL23.CSW21"
+    );
 }

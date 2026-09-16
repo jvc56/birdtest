@@ -37,6 +37,12 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     .await
     .unwrap();
 
+    // A leave job's bot plays with a wordmap by default, and a job whose
+    // derived files are not built is not dispatched. Creation through the API
+    // queues those builds; this job was assembled with plain SQL, so the gate
+    // is satisfied here the same way the generation-0 artifact row above is.
+    assert_eq!(db.derived_ready(job).await, 1, "a leave job needs one wordmap");
+
     let row = sqlx::query_as::<_, birdtest::models::job::Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(job)
         .fetch_one(&db.pool)
@@ -618,6 +624,7 @@ async fn a_transition_whose_job_was_purged_meanwhile_closes_nothing() {
             1,
             "leaves/test/generation-1.klv2",
             &sha256,
+            "klv-1",
             &config,
         )
     };
@@ -707,6 +714,7 @@ async fn the_next_generations_universe_is_seeded_off_the_claim_path() {
         1,
         "leaves/test/generation-1.klv2",
         &"1".repeat(64),
+        "klv-1",
         &config,
     )
     .await

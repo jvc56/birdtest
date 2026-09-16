@@ -15,6 +15,23 @@ pub struct Tile {
 
 #[derive(Debug, Clone)]
 pub struct LetterDistribution {
+    /// The `input_data` name this was parsed from -- `english`, `polish`.
+    ///
+    /// Carried because the server now hands the distribution to MAGPIE by
+    /// name: a conversion writes `letterdistributions/<name>.csv` into a
+    /// scratch directory and states it on the command line. Stating it is not
+    /// optional -- MAGPIE would otherwise infer one from the lexicon's name,
+    /// and a wordmap built against an inferred distribution is not necessarily
+    /// the one built against the distribution the job pins.
+    pub name: String,
+    /// The exact bytes of the pinned row.
+    ///
+    /// Kept rather than re-serialized from `tiles`: what MAGPIE reads has to
+    /// be the bytes the job pinned and the worker verified, not this parser's
+    /// idea of them. Round-tripping through the parse would drop the columns
+    /// this file does not read -- scores, vowel flags, display forms -- every
+    /// one of which MAGPIE does read.
+    pub bytes: Vec<u8>,
     pub tiles: Vec<Tile>,
     /// Letters in the order they appeared in the distribution file, before
     /// the canonical sort below. This is MAGPIE's own machine-letter
@@ -68,7 +85,12 @@ impl LetterDistribution {
         // Canonical rack strings are sorted, so sorting the distribution once
         // means the enumeration emits already-canonical strings.
         tiles.sort_by_key(|t| t.letter);
-        Ok(Self { tiles, machine_letters })
+        Ok(Self {
+            name: origin.to_string(),
+            bytes: bytes.to_vec(),
+            tiles,
+            machine_letters,
+        })
     }
 
     /// MAGPIE's machine-letter index for `letter` -- see the `machine_letters`
@@ -82,15 +104,24 @@ impl LetterDistribution {
             .map(|i| i as u8)
     }
 
-    /// Builds a distribution from an explicit tile list, in `klv.rs`'s tests
-    /// only -- everywhere else always goes through [`Self::load`], which is
-    /// the only place that should ever construct one from scratch.
+    /// Builds a distribution from an explicit tile list, for tests only --
+    /// everywhere else goes through [`Self::parse`], which is the only place
+    /// that should construct one from the bytes a job pins.
+    ///
+    /// The bytes it carries are a rendering of the tiles rather than the
+    /// original file, which is exactly why this is test-only: what MAGPIE
+    /// reads has to be the pinned bytes, not a reconstruction of them.
     #[cfg(test)]
     pub fn from_tiles_for_test(tiles: Vec<Tile>) -> Self {
-        let machine_letters = tiles.iter().map(|t| t.letter).collect();
+        let machine_letters: Vec<char> = tiles.iter().map(|t| t.letter).collect();
+        let bytes = tiles
+            .iter()
+            .map(|t| format!("{},{},{},1,0\n", t.letter, t.letter.to_lowercase(), t.count))
+            .collect::<String>()
+            .into_bytes();
         let mut tiles = tiles;
         tiles.sort_by_key(|t| t.letter);
-        Self { tiles, machine_letters }
+        Self { name: "test".into(), bytes, tiles, machine_letters }
     }
 
     /// Every distinct multiset of exactly `size` tiles drawable from the bag,
@@ -253,14 +284,11 @@ mod tests {
     use super::*;
 
     fn tiny() -> LetterDistribution {
-        LetterDistribution {
-            tiles: vec![
-                Tile { letter: 'A', count: 2 },
-                Tile { letter: 'B', count: 1 },
-                Tile { letter: 'C', count: 3 },
-            ],
-            machine_letters: vec!['A', 'B', 'C'],
-        }
+        LetterDistribution::from_tiles_for_test(vec![
+            Tile { letter: 'A', count: 2 },
+            Tile { letter: 'B', count: 1 },
+            Tile { letter: 'C', count: 3 },
+        ])
     }
 
     #[test]

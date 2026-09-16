@@ -64,8 +64,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Builds MAGPIE from the pinned commit as well as the Rust binary, so a
+      # commit that no longer compiles -- or a Dockerfile that stops copying
+      # the binary in -- is caught here rather than by a backend that refuses
+      # to bind in production.
       - name: Backend image
         run: docker build -f docker/Dockerfile --target backend -t birdtest-backend .
+      # Mounts a board layout and runs from it, the way the server's scratch
+      # directories do: MAGPIE loads a default layout before it parses any
+      # argument, and the image deliberately carries no data directory. The
+      # grep is the check -- MAGPIE reports failures on stderr and exits 0, so
+      # running it bare would pass whatever happened.
+      - name: The image's MAGPIE reports its builders
+        run: |
+          docker run --rm \
+            -v "$PWD/backend/src/magpie_standard15.txt:/probe/data/layouts/standard15.txt:ro" \
+            -w /probe --entrypoint magpie birdtest-backend builders \
+            | tee /dev/stderr | grep -q '"wmp_builder_version"'
+      - name: Derived-file builder image
+        run: docker build -f docker/Dockerfile --target derived-builder -t birdtest-derived-builder .
       - name: Frontend image
         run: docker build -t birdtest-frontend frontend
 
@@ -117,3 +134,26 @@ jobs:
       - name: Build and run MAGPIE's contribute tests
         working-directory: magpie
         run: make magpie_test && ./bin/magpie_test contribute
+      # The derived-file builders, pinned by hash. birdtest publishes the
+      # SHA-256 of the wordmap and rack info table its server built, and every
+      # worker refuses one whose bytes differ -- so a builder change that
+      # slipped through without a version bump would take the fleet down, job
+      # by job, with `derived_mismatch`. This is the test that makes that
+      # impossible to merge accidentally.
+      - name: Check the derived-file builders against their pinned hashes
+        working-directory: magpie
+        run: ./bin/magpie_test builderhash
+      # And the conversions birdtest's server actually invokes. A rename or a
+      # changed positional argument here is a server that cannot build
+      # anything, discovered on deploy rather than in CI.
+      - name: Check the conversions birdtest invokes still exist
+        working-directory: magpie
+        run: |
+          make magpie
+          ./bin/magpie builders
+          for conversion in dawg2wordmap klvwmp2rit rackequity2klv; do
+            if ! ./bin/magpie help convert | grep -q "$conversion"; then
+              echo "magpie no longer offers '$conversion', which birdtest runs" >&2
+              exit 1
+            fi
+          done

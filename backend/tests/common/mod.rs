@@ -21,7 +21,14 @@ use std::time::Duration;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-const MIGRATION: &str = include_str!("../../migrations/0001_initial.sql");
+/// Every migration, concatenated, and used only to *name* the template
+/// database. The template itself is built by `db::migrate`, which applies them
+/// properly; this is what makes an edit to any of them produce a fresh
+/// template rather than a stale one.
+const MIGRATIONS: [&str; 2] = [
+    include_str!("../../migrations/0001_initial.sql"),
+    include_str!("../../migrations/0002_magpie_dependency.sql"),
+];
 const TESTDIST: &[u8] = include_bytes!("../../src/jobs/testdata/testdist.csv");
 
 fn server_url() -> String {
@@ -45,11 +52,15 @@ fn with_database(url: &str, database: &str) -> String {
     format!("{}/{database}{query}", &base[..path_start])
 }
 
-/// Named after the migration's content, so an edited `0001_initial.sql` gets a
-/// fresh template rather than a stale one, and two concurrent `cargo test`
-/// processes on the same schema share one.
+/// Named after the migrations' content, so an edited migration gets a fresh
+/// template rather than a stale one, and two concurrent `cargo test` processes
+/// on the same schema share one.
 fn template_name() -> String {
-    let digest = hex::encode(Sha256::digest(MIGRATION.as_bytes()));
+    let mut hasher = Sha256::new();
+    for migration in MIGRATIONS {
+        hasher.update(migration.as_bytes());
+    }
+    let digest = hex::encode(hasher.finalize());
     format!("birdtest_tpl_{}", &digest[..16])
 }
 
@@ -102,6 +113,27 @@ async fn ensure_template() {
         .await;
 }
 
+/// The builder versions a test's `AppState` reports, without running MAGPIE.
+///
+/// The real server reads these out of the binary at startup, which is right
+/// there and wrong here: a tier-2 or tier-3 test asserts what the server does
+/// with a builder identity, not that a subprocess can be spawned. A test that
+/// actually needs a build belongs in tier 6, where a real MAGPIE is a
+/// precondition rather than an accident of the machine.
+///
+/// The versions are the ones `src/def/builder_defs.h` ships, so a fixture that
+/// names `wmp-1` stays honest until someone bumps them -- at which point these
+/// and the contract fixtures move together.
+pub fn test_builders() -> birdtest::magpie::Builders {
+    birdtest::magpie::Builders {
+        magpie_version: "0.5.0".into(),
+        build_target: "nehalem".into(),
+        wmp_builder_version: 1,
+        rit_builder_version: 1,
+        klv_builder_version: 1,
+    }
+}
+
 pub struct TestDb {
     pub pool: PgPool,
     pub url: String,
@@ -152,8 +184,15 @@ impl TestDb {
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
-            min_magpie_version: "0.4.0".into(),
+            min_magpie_version: "0.5.0".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
+            // A path that is not a binary. Nothing below tier 6 runs a
+            // conversion, and a test that reached one should fail loudly
+            // rather than pick up whatever MAGPIE happens to be installed on
+            // the machine -- which is how a test starts depending on a build
+            // nobody chose.
+            magpie_bin: "/nonexistent/magpie".into(),
+            magpie_threads: 1,
             magpie_data_repo: "example/data".into(),
             github_token: None,
             trusted_proxy_hops: 0,
@@ -183,6 +222,8 @@ impl TestDb {
                 birdtest::state::MAX_CONCURRENT_RESULT_STREAMS,
             )),
             pool: self.pool.clone(),
+            magpie: birdtest::magpie::Magpie::new(&cfg.magpie_bin, 1),
+            builders: Arc::new(test_builders()),
             cfg: cfg.clone(),
             sse: birdtest::sse::SseBroadcaster::new(),
             finish_checks: Default::default(),
@@ -191,6 +232,45 @@ impl TestDb {
             artifacts: birdtest::artifacts::ArtifactStore::new(cfg.clone()).await,
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Marks every wordmap and rack info table this job needs as built, with a
+    /// made-up hash.
+    ///
+    /// A job whose derived files are not built is not dispatched, which is the
+    /// whole point of `derived_data` — so a test that builds a job by hand has
+    /// to satisfy that gate by hand too, exactly as it inserts the
+    /// generation-0 artifact row by hand. The hash is arbitrary because
+    /// nothing below tier 6 reproduces one: what these tests exercise is the
+    /// gate and what the claim carries, not the build.
+    ///
+    /// Returns how many rows it wrote, so a test can assert a job needed what
+    /// it expected to need.
+    pub async fn derived_ready(&self, job: Uuid) -> usize {
+        let builders = test_builders();
+        let mut conn = self.pool.acquire().await.unwrap();
+        let needs = birdtest::derived::needs_for_job(&mut conn, job).await.unwrap();
+        for (i, need) in needs.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO derived_data
+                     (role, name, builder, kwg_id, klv_id, letterdist_id,
+                      state, sha256, bytes, build_target, built_at)
+                 VALUES ($1,$2,$3,$4,$5,$6,'built',$7,1,$8,now())
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(&need.role)
+            .bind(&need.name)
+            .bind(builders.for_role(&need.role).unwrap())
+            .bind(need.kwg_id)
+            .bind(need.klv_id)
+            .bind(need.letterdist_id)
+            .bind(format!("{i:064x}"))
+            .bind(&builders.build_target)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        needs.len()
     }
 
     // --- builders: plain SQL, no validation --------------------------------

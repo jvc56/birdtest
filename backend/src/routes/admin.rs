@@ -41,6 +41,8 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/results/stream", get(super::public::job_results_stream))
         .route("/jobs/:id/export", post(start_export).get(get_export))
         .route("/jobs/:id/rebuild-artifacts", post(rebuild_artifacts))
+        .route("/derived-data", get(list_derived_data))
+        .route("/derived-data/retry", post(retry_derived_data))
         .route("/backups", get(backups))
         .route("/fleet", get(fleet))
 }
@@ -309,8 +311,9 @@ async fn confirm_import(
 
     let inserted = sqlx::query(
         "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date,
-                                 content, imported_by)
-         SELECT r.path, r.role, r.name, r.sha256, r.bytes, $2, r.content, $3
+                                 content, object_key, imported_by)
+         SELECT r.path, r.role, r.name, r.sha256, r.bytes, $2, r.content,
+                r.object_key, $3
          FROM input_data_import_rows r
          WHERE r.import_id = $1 AND r.disposition <> 'known'
          ON CONFLICT (path, sha256) DO NOTHING",
@@ -654,8 +657,10 @@ async fn create_player_config(
     .bind(use_inference)
     .bind(body.time_limit_secs)
     .bind(body.use_wordmap.unwrap_or(false))
-    // Refused above when true.
-    .bind(false)
+    // Absent means no, for both: a rack info table is a large, slow thing to
+    // provision, and a config that did not ask for one must not get one
+    // because a default said so.
+    .bind(body.use_rit.unwrap_or(false))
     .bind(min_play_iterations)
     .bind(&threshold)
     .bind(&sampling_rule)
@@ -719,20 +724,21 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     if body.utility_spread_scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
         err = err.with_field("utility_spread_scale", "must be a finite, positive number");
     }
-    // A rack info table is not an exact accelerator the way a wordmap is: each
+    // `use_rit` was refused outright until the server could check a table. A
+    // rack info table is not an exact accelerator the way a wordmap is: each
     // entry carries precomputed leave values, which move generation uses in
-    // place of the loaded leaves. The file is named after the lexicon, records
-    // nothing about the KLV it was built from, and is covered by no digest, so
-    // a player whose leaves are not that KLV -- or a contributor whose table
-    // is older than their leaves -- would rank moves on the wrong leave values
-    // with nothing to say so. Refused until a table can be pinned or checked.
-    if body.use_rit == Some(true) {
-        err = err.with_field(
-            "use_rit",
-            "rack info tables are not supported: their leave values are not checked \
-             against the leaves a job pins",
-        );
-    }
+    // place of the loaded leaves. It was found by lexicon name alone, recorded
+    // nothing about the KLV it was built from, and was covered by no digest,
+    // so a player whose leaves are not that KLV -- or a contributor whose
+    // table is older than their leaves -- ranked moves on the wrong values
+    // with nothing to say so.
+    //
+    // Both halves of that are now closed. The server builds the table for this
+    // exact (lexicon, leaves) pair with its own pinned MAGPIE and sends the
+    // hash with every claim, and the file is named for the pair rather than
+    // the lexicon, so two jobs on one lexicon with different leaves cannot
+    // share one. A job that asks for a table waits until it is built; see
+    // `derived` and MAGPIE_DEPENDENCY.md.
     if err.fields.is_empty() {
         Ok(())
     } else {
@@ -999,7 +1005,13 @@ async fn create_job(
 
     // Generation 1's zeroed KLV: a multi-megabyte build and an object-store
     // write, so it happens after the transaction commits rather than inside it.
-    registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
+    registry::initialize_job_artifacts(&state, &job).await?;
+
+    // Queued at creation rather than at activation: a rack info table takes
+    // minutes to build, and the admin who creates a job typically activates it
+    // in the next breath. Requesting it now means the wait happens while they
+    // are still deciding rather than after.
+    request_derived_data(&state, job.id).await?;
 
     Ok((StatusCode::CREATED, Json(CreatedJob { job })))
 }
@@ -1490,8 +1502,12 @@ async fn activate_job(
     // for the same reason creation builds it outside its own.
     let unlocked = crate::jobstats::load_job(&state.pool, id).await?;
     if !registry::job_artifacts_ready(&state.pool, &unlocked).await? {
-        registry::initialize_job_artifacts(&state.pool, &state.artifacts, &unlocked).await?;
+        registry::initialize_job_artifacts(&state, &unlocked).await?;
     }
+    // Again at activation, because the builder may have moved since creation:
+    // a deployment with a newer MAGPIE needs this job's files rebuilt under
+    // the new builder before it can dispatch, and nothing else would ask.
+    request_derived_data(&state, id).await?;
 
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
@@ -1869,7 +1885,7 @@ async fn purge_job(
 
     // The generation-0 KLV was deleted with the artifacts above; rebuild it, or
     // generation 1 would have nothing to play with.
-    registry::initialize_job_artifacts(&state.pool, &state.artifacts, &job).await?;
+    registry::initialize_job_artifacts(&state, &job).await?;
 
     Ok(Json(PurgeResult { tasks_reset }))
 }
@@ -2041,6 +2057,112 @@ async fn backups(
     Ok(Json(backups::status(&state.pool).await?))
 }
 
+/// Queues a build for every wordmap and rack info table the job needs.
+///
+/// Logged rather than returned on failure: a job that exists without its
+/// derived files simply does not dispatch, which is visible at
+/// `GET /api/admin/derived-data` and fixed by activating it again. Failing the
+/// creation would leave the admin with no job and a rolled-back transaction
+/// that had already written the generation-0 artifact.
+async fn request_derived_data(state: &AppState, job_id: Uuid) -> AppResult<()> {
+    let mut conn = state.pool.acquire().await?;
+    match crate::derived::request_for_job(&mut conn, job_id, &state.builders).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(%job_id, requested = n, "queued derived file builds"),
+        Err(err) => tracing::error!(
+            %job_id, error = %err.message,
+            "could not queue this job's derived file builds; it will not dispatch until it can"
+        ),
+    }
+    Ok(())
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct DerivedDataRow {
+    role: String,
+    name: String,
+    builder: String,
+    state: String,
+    sha256: Option<String>,
+    bytes: Option<i64>,
+    build_target: Option<String>,
+    error: Option<String>,
+    attempts: i32,
+    requested_at: chrono::DateTime<chrono::Utc>,
+    built_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Every wordmap and rack info table the server has been asked to build.
+///
+/// The admin-facing half of the dispatch gate: a job that asks for a rack info
+/// table is not handed out until this says `built`, and a build that failed is
+/// the reason a job is quietly doing nothing. Without this page, "the job is
+/// active and no worker is claiming from it" has no visible cause.
+async fn list_derived_data(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+) -> AppResult<Json<Vec<DerivedDataRow>>> {
+    Ok(Json(
+        sqlx::query_as::<_, DerivedDataRow>(
+            "SELECT role, name, builder, state, sha256, bytes, build_target, error,
+                    attempts, requested_at, built_at
+             FROM derived_data
+             ORDER BY state = 'built', requested_at DESC",
+        )
+        .fetch_all(&state.pool)
+        .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct RetryDerivedBody {
+    role: String,
+    name: String,
+}
+
+/// Puts a failed build back in the queue.
+///
+/// Explicit, because a build is a pure function of its inputs: one that failed
+/// three times failed for a reason that a fourth attempt does not change, and
+/// re-queueing it automatically would spend every builder run on the same
+/// doomed row. An admin retries it after fixing what it named -- most often a
+/// lexicon imported before the server stored its bytes.
+async fn retry_derived_data(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    Json(body): Json<RetryDerivedBody>,
+) -> AppResult<StatusCode> {
+    csrf::verify(&method, &headers, &jar)?;
+    let reset = sqlx::query(
+        "UPDATE derived_data
+         SET state = 'pending', attempts = 0, error = NULL, leased_until = NULL
+         WHERE role = $1 AND name = $2 AND state = 'failed'",
+    )
+    .bind(&body.role)
+    .bind(&body.name)
+    .execute(&state.pool)
+    .await?
+    .rows_affected();
+    if reset == 0 {
+        return Err(AppError::not_found("no failed build for that role and name"));
+    }
+    let mut conn = state.pool.acquire().await?;
+    audit::log(
+        &mut conn,
+        "derived_data.retried",
+        Some(admin.0.id),
+        None,
+        Some("derived_data"),
+        Some(format!("{} {}", body.role, body.name)),
+        None,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[derive(Deserialize)]
 struct RebuildQuery {
     /// Rewrite an object whose bytes no longer hash to what was recorded.
@@ -2084,6 +2206,8 @@ async fn rebuild_artifacts(
     let report = crate::jobs::leave_gen::rebuild_artifacts(
         &state.pool,
         &state.artifacts,
+        &state.magpie,
+        &state.builders,
         job.id,
         &job_data.letterdist,
         query.force,

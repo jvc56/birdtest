@@ -1074,6 +1074,7 @@ A task request used to name its inputs without pinning them:
 | `letter_distribution` | `"english"` | `letterdistributions/english.csv` | 489 B |
 | (board layout, never named) | — | `layouts/standard15.txt` | 244 B |
 | `use_wordmap` | true/false | `lexica/NWL23.wmp` — built locally from the `.kwg` | ~104 MB |
+| `use_rit` | true/false | `lexica/NWL23.NWL23.rit` — built locally from the `.klv2` and the `.wmp` | ~1.9 GB |
 
 Two contributors could both honestly report running `NWL23` with `winpct` and be
 running different bytes. This is not hypothetical: `download_data.sh` installs
@@ -1154,15 +1155,20 @@ was removed rather than fixed. There is no virtual generation 0 anywhere else:
 no `leave_rack_progress` rows, no tasks, nothing beyond the one row recording
 the key.
 
-**Exemptions.** `.wmp` gets no row — it is ~104 MB, absent from the tarball, and
-built locally from the `.kwg` (see [Wordmap provisioning](#wordmap-provisioning)).
+**Exemptions.** `.wmp` and `.rit` get no rows — they are ~179 MB and ~1.9 GB,
+absent from the tarball, and built locally. They are covered instead by
+`derived_data`, where the server records the hash of the copy it built and every
+claim states it (see [Wordmap and rack info table
+provenance](#wordmap-and-rack-info-table-provenance)). Their inputs still have
+`input_data` rows, which is what makes a derived file's identity expressible at
+all.
 
 **Byte-exact files only.** Byte identity is stricter than semantic identity, and
-the gap is real: birdtest's own KLV builder emits a plain trie where MAGPIE's
-`kwg_maker` emits a minimized DAWG — both correct, bytes differ. That gap does
-not bite here, because every `input_data` row comes from a tarball distributed
-byte-exact. It *would* bite the moment someone adds a row for a locally
-generated file. Don't.
+the gap is real: two builders can produce different bytes for the same values —
+which is why `derived_data` records the builder that produced every hash. That
+gap does not bite `input_data`, because every row there comes from a tarball
+distributed byte-exact. It *would* bite the moment someone adds a row for a
+locally generated file. Don't.
 
 ### How production data is actually distributed
 
@@ -1231,7 +1237,7 @@ things itself, and to do that it read letter-distribution CSVs off its own
 filesystem from `DATA_PATH`: `total_racks` and `expand` in
 [`opening_rack.rs`](backend/src/jobs/opening_rack.rs), `seed_generation` in
 [`leave_gen.rs`](backend/src/jobs/leave_gen.rs), and the machine-letter numbering
-baked into KWG node bytes by [`klv.rs`](backend/src/jobs/klv.rs). None of those
+baked into KWG node bytes by the KLV builder. None of those
 reads went anywhere near `input_data`. There were two copies of `english.csv` in
 the system with no relationship between them.
 
@@ -1299,10 +1305,19 @@ is the first thing that breaks.
    archive name** — the import hashes bytes and has no reason to form one.
    Anything failing aborts the whole import rather than skipping the entry,
    because a malformed archive is not a partially trustworthy one.
-4. Compare each `(path, sha256)` against `input_data`. Stage the result, keeping
-   the bytes of every `letterdist` and `layout` entry so confirmation does not
-   have to download again.
-5. Mark the row `staged`, or `failed` with the reason in `error`.
+4. Upload every `kwg` and `klv` entry's bytes to the object store, keyed by
+   digest, while the archive is still in memory — re-downloading 94 MB at
+   confirmation time for files already hashed would be pure waste. The server
+   builds reference wordmaps and rack info tables from these; a `winpct` file is
+   neither read nor built from server-side, so it stays digest-only. An object
+   already present is skipped, so a tarball whose lexica have not changed
+   uploads nothing. This happens **before** anything is staged: a row that names
+   an object has to be a row whose object is there, or the first derived build
+   from it fails with a missing key instead of a reason.
+5. Compare each `(path, sha256)` against `input_data`. Stage the result, keeping
+   the bytes of every `letterdist` and `layout` entry, and the object key of
+   every `kwg` and `klv` entry, so confirmation does not have to download again.
+6. Mark the row `staged`, or `failed` with the reason in `error`.
 
 **Phase 2 — confirm.** The admin sees three groups: **new** rows, **known** rows
 (the majority, and the reason the diff exists), and **path collisions** — a path
@@ -2153,15 +2168,21 @@ The reported list covers **every rack that occurred during the batch, forced or 
 
 **On result acceptance**: every reported rack must be a full 7-tile rack (plausibility refuses anything else). A result for a generation that has already been aggregated is credited to the worker and *not* folded in: its KLV is built and uploaded, so the occurrences would change nothing anyone reads, and adding them would leave the rows disagreeing with the artifact built from them — which is the one signal reserved for a corrupted or stale object (see [Artifacts: back up, or rebuild?](#artifacts-back-up-or-rebuild)). The claim flow no longer produces that state: a generation closes only when none of its claims is still `claimed`, a timed-out claim is abandoned and its late submission refused before it reaches this point, and a closed generation's tasks are never reissued (step 2). The check stays as a guard against state the flow never writes, such as a partial restore. Otherwise, within the same transaction that accepts the task result, all `{rack, count, mean}` entries are added to `leave_rack_progress` in one statement (`UPDATE ... FROM UNNEST($racks, $counts, $equity_sums)`, adding to `occurrence_count` and `equity_sum`) rather than row-by-row, since a submission can carry thousands of rows. The rows are locked first, in rack order (`SELECT … ORDER BY rack FOR UPDATE`): submissions for different tasks of one generation serialize on nothing else and overlap on every commonly drawn rack, and an `UPDATE` locks rows in whatever order its plan visits them, so two of them deadlocked and Postgres failed one. An update rather than an upsert: the universe is seeded, so a rack with no row is not a rack of this distribution and must not create one. This is what drives the live dashboard figure — no heartbeat involved.
 
-**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server derives every leave's value from that generation's full-rack means and builds the generation's KLV artifact directly in Rust (`backend/src/jobs/klv.rs`), uploads it to S3, records it in `leave_generation_artifacts`, and marks the generation complete.
+**Generation transition (aggregation)**: once claim-time step 2 finds no rack below target and no claim in flight, the server streams that generation's full-rack results into a CSV, runs `magpie convert rackequity2klv` over it to build the generation's KLV artifact, uploads it to S3, records it in `leave_generation_artifacts` along with the builder that wrote it, and marks the generation complete.
 
 The transition **does not write the next generation's rack universe.** That is millions of rows (3.2 million for English); inside the closing transaction it made every worker on the job wait the write out, and made the close and the copy stand or fall together, so anything that failed cost a full re-derive and re-upload as well. The universe is seeded when its generation *opens* instead — on a task of its own, started by the first claim that finds it missing, under the job's lock so two seedings cannot both do it — from the pinned letter distribution, through the same `seed_generation` for every generation, the first included. One implementation of what a generation's universe *is*, derived from the source of truth rather than from the previous generation's rows, and off the critical path.
 
 The transition takes tens of seconds and runs *outside* the claim transaction, on its own task so that a worker or proxy giving up on the request cannot cancel it part-way. That leaves the deciding claim holding no lock while it works, so ownership is recorded instead: the claim transaction that finds the generation complete inserts `leave_generation_transitions (job_id, generation)` and **commits** — its only write is that row, and committing is both what makes the row visible to everyone else and what releases the job's advisory lock before the upload starts. The row's primary key is what means every other claim arriving meanwhile is told there is no work yet rather than starting the same transition again. `completed_at` is set in the same transaction as the artifact row, and setting it is **conditional on the row still being there and still open** — that is how a transition finds out it no longer owns anything. A purge deletes the transitions row along with the artifacts and progress rows, so a transition spawned before it would otherwise hand the purged job a generation-1 KLV derived from results it no longer has. When the close is refused nothing is written and the uploaded object is left behind; it is keyed by job and generation, so a later transition of the same generation overwrites it, and `GET /api/worker/artifact` serves no key that no `leave_generation_artifacts` row names. A transition that never finishes — the process died, or the object store refused the upload — is taken over by a later claim once `started_at` is older than the takeover timeout (30 minutes, far longer than any measured transition), and `attempts` records that it happened; a failure the server survives hands ownership back immediately instead of waiting out the timeout.
 
-The derivation is a port of MAGPIE's `rack_list_write_to_klv` (`klv::FullRackLeaves`). Each full rack `R` has a mean `m(R)` — `equity_sum / occurrence_count`, or 0 if it never occurred — and a weight, the ways to draw it from a full bag (the product over letters of `C(dist, R)`). The average is the weighted mean of `m(R)` over every full rack. Every proper, non-empty sub-multiset `L` of `R` receives `m(R)` weighted by the ways to draw the rest of `R` once `L` is held (the product of `C(dist − L, R − L)`), and a leave's value is its weighted mean minus the average, or 0 if nothing contributed. A unit test pins the port against a direct, brute-force statement of that definition. Rows are streamed and the arithmetic runs on blocking threads; English takes about 13 seconds in a release build.
+The derivation is MAGPIE's own `rack_list_write_to_klv`. Each full rack `R` has a mean `m(R)` — `equity_sum / occurrence_count`, or 0 if it never occurred — and a weight, the ways to draw it from a full bag (the product over letters of `C(dist, R)`). The average is the weighted mean of `m(R)` over every full rack. Every proper, non-empty sub-multiset `L` of `R` receives `m(R)` weighted by the ways to draw the rest of `R` once `L` is held (the product of `C(dist − L, R − L)`), and a leave's value is its weighted mean minus the average, or 0 if nothing contributed.
 
-This is a from-scratch reimplementation of what `magpie convert csv2klv` does — a KWG (trie) of every leave the domain admits, plus one `f32` value per leave addressed by a *word index* computed from the graph's own topology at load time rather than stored in the file — not a guess at the format: it's translated line-for-line from MAGPIE's own `klv.h`/`klv_csv.c`, and is cross-validated against a real MAGPIE binary (`jobs::klv::tests::round_trips_through_a_real_magpie_*`; `#[ignore]`d by default since they need a local MAGPIE build and CI does not build MAGPIE) rather than trusted on inspection alone. Building a plain (non-suffix-shared) trie is enough — the word-index algorithm only needs a topologically correct graph, not MAGPIE's own DAWG-minimizing construction, since both sides compute indices fresh from whatever graph is actually on disk. Doing this in Rust rather than shelling out means the backend has no MAGPIE dependency at all: no binary or lexical data baked into its image, and no subprocess boundary to keep working across MAGPIE version bumps for a format unlikely to change.
+**The server used to do this itself**, in a Rust translation of that function (`jobs/klv.rs`, 868 lines). It was a faithful translation, cross-validated against a real MAGPIE binary — but it had to change whenever MAGPIE's did and nothing made it, and its KLVs differed in bytes from MAGPIE's for the same leave values, because it built a plain trie where MAGPIE builds a minimized DAWG. Both are correct and they load to the same values; having two of them was a standing source of confusion, and the second one was the one nobody would notice going stale.
+
+So the transfer is a CSV instead: `generation_klv` streams the generation's roughly 3.2 million `rack,count,equity_sum` rows into a scratch directory, `convert rackequity2klv` reads them into a `RackList` and writes the KLV, and the server reads the bytes back and uploads them. Neither side holds a generation in memory. Before `klv.rs` was deleted, the two were run against each other over the whole 149-rack test distribution and agreed on every leave value.
+
+`rackequity2klv` is new on the MAGPIE side, along with a `RackList` setter that takes a rack's count and mean outright: `rack_list_add_rack` folds one game's equity at a time, which is what a `leavegen` run has and not what a whole generation's aggregate is. Every full rack must appear exactly once in the CSV — a rack the file omits would contribute a mean of zero at full weight to every leave it contains, which is a real leave value and indistinguishable from a measured one — so MAGPIE marks every rack unset before reading and refuses a file that leaves any of them that way.
+
+The generation-0 zeroed KLV is `magpie createdata klv`, which builds exactly that from the letter distribution alone. MAGPIE_DEPENDENCY.md proposed a `convert zero2klv` for it; `createdata klv` already is it, through the same `klv_create_empty`, and one spelling is better than two.
 
 
 **Dashboard progress**: because progress is now driven by many small task completions across possibly many workers rather than one long-running worker, the rack-with-fewest-occurrences figure (the leave-generation bullet under [Job Detail Page — By Job Type](#job-detail-page--by-job-type)) is live and derived directly from `leave_rack_progress`, updating on every accepted task result via the existing per-job SSE stream — no heartbeat payload is needed.
@@ -2496,12 +2517,24 @@ results, including the adversarial paths a real client cannot reach on purpose:
 malformed submissions, stale claim tokens, abandoned claims, concurrent
 claimers, and a decline for each reason).
 
-birdtest's own backend has no MAGPIE dependency at all, and never has to build or
-ship one: leave-generation aggregation, the one place the server used to shell
-out to `magpie convert csv2klv`, now builds its KLV artifact directly (see
-[Leave Generation](#leave-generation--on-demand-partitioned-generations) and
-`backend/src/jobs/klv.rs`). The backend's Docker image carries only its own
-compiled Rust binary.
+birdtest's backend runs a pinned MAGPIE, built into its image from a recorded
+commit. It has two jobs, and the second is the reason the first became worth
+doing (see [MAGPIE_DEPENDENCY.md](MAGPIE_DEPENDENCY.md)):
+
+- **Reference copies of derived files.** A wordmap and a rack info table are
+  built on each contributor's own machine and are far too large to ship. The
+  server builds its own copy of each from the bytes a job pins, keeps the
+  SHA-256, discards the file, and sends the hash with the claim; a worker uses
+  its own copy only if the bytes agree. That is what lets `use_rit` mean
+  anything — see [Wordmap and rack info table
+  provenance](#wordmap-and-rack-info-table-provenance).
+- **Leave-generation KLVs.** Aggregation used to build its KLV artifact with a
+  Rust translation of MAGPIE's `rack_list_write_to_klv`, which had to be kept in
+  step by hand and produced different bytes for the same values. `convert
+  rackequity2klv` is the same derivation run by the code that defines it.
+
+The image still carries no data directory: every conversion runs in a throwaway
+directory written from the object store and from `input_data.content`.
 
 ### Status
 
@@ -2830,7 +2863,8 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 | `use_inference` | `-siN` | |
 | `time_limit_secs` | `-tlN` | 0 for a simmer: no limit, so the iteration budget decides |
 | `use_wordmap` | `-wN` | applied directly against `players_data`, not `-wN`'s own arg parsing, and **before** the task's lexicon loads, which is when MAGPIE decides whether to load a wordmap |
-| `use_rit` | — | Refused at player-config creation, and the worker keeps rack info tables off for every task: a table stores precomputed leave values under the lexicon's name alone, which move generation uses in place of the leaves a job pins |
+| `use_rit` | — | applied against `players_data` the same way, and **before** the lexicon loads |
+| `rit_name` | — | The name to load the table under, `<lexicon>.<leaves>`. A table stores precomputed leave values, so it belongs to the pair rather than the lexicon; the server pins a hash for this exact name (see [Wordmap and rack info table provenance](#wordmap-and-rack-info-table-provenance)) |
 | `min_play_iterations` | `-miN` | |
 | `threshold` | `-thN` | `'none'` \| `'gk16'` |
 | `sampling_rule` | `-saN` | `'round_robin'` \| `'top_two_ids'` |
@@ -2964,62 +2998,151 @@ birdtest matches this: `game_records` is gone, replaced by `game_results` storin
 the two aggregates plus the pentanomial, with pairs SPRT computed from the
 pentanomial and the divergent counts kept only as a diagnostic.
 
-### Wordmap provisioning
+### Wordmap and rack info table provenance
 
-Whether a wordmap is used is the **job's** decision, not the client's: it is a
-player setting like any other, sent as `use_wordmap` on each player object (and,
-for `leave_generation`, which has one bot rather than a player pair, on the
-request itself). A job that omits it runs without a wordmap. Games run
-dramatically faster with one, so most jobs will ask for it — but the client
-neither assumes it nor builds one it was not asked for, and a wordmap already
-sitting in `./data` from an earlier job is not switched on by its mere presence.
+Whether either file is used is the **job's** decision, not the client's: both
+are player settings like any other, sent as `use_wordmap` and `use_rit` on each
+player object (and, for `leave_generation`, which has one bot rather than a
+player pair, `use_wordmap` on the request itself). A job that omits them runs
+without them. Games run dramatically faster with a wordmap, so most jobs will
+ask for it — but the client neither assumes it nor builds one it was not asked
+for, and a file already sitting in `./data` from an earlier job is not switched
+on by its mere presence.
 
-When a job *does* ask for one, the client provisions it. Wordmaps are never
-transmitted — they are roughly ten times the size of everything else MAGPIE ships
-— so the client builds what it needs from the `.kwg` it already has. The full
-`kwg -> txt -> wmp` chain measures **~1.3 seconds** per lexicon (0.17s + 1.1s,
-NWL23, 4 threads). Only the lexicon a player that asked for a wordmap actually
-plays with is built, and two players sharing a lexicon build it once.
+Neither file is ever transmitted. A wordmap is 179 MB and a rack info table
+1.9 GB for CSW24, roughly ten and a hundred times everything else MAGPIE ships,
+so the client builds what it needs from files it already has: a `.wmp` from the
+`.kwg` (about 1.3 seconds), a `.rit` from a `.klv2` and a `.wmp` (one to three
+minutes, and about 2.4 GB of memory).
 
-Before running such a task, if `<lexicon>.wmp` is absent **or stale**:
+#### The problem the hash solves
 
-1. If `<lexicon>.txt` is absent, `convert dawg2text <lexicon>`.
-2. `convert text2wordmap <lexicon> -threads <n>`.
+A derived file records nothing about what it was built from, and MAGPIE's CLI
+finds both by **lexicon name alone**. Four ways that goes wrong:
 
-**Stale means built from a different `.kwg` than the one on disk now.** This is
-the one hole in the digest story, and it matters more under tarball distribution
-than it would otherwise. A wordmap is derived from a lexicon and nothing else
-notices when the lexicon changes underneath it: `download_data.sh` overwrites the
-`.kwg` in place and leaves the old `.wmp` beside it, which passes every check —
-the `.kwg` genuinely is the right lexicon, and the `.wmp` is covered by no digest
-at all, because the server never pins a file the contributor generated locally.
-The worker then plays with a wordmap describing a lexicon that no longer exists
-on its disk: exactly the corruption this whole design exists to prevent.
+1. **Leaves that do not match the table.** A player config pins NWL23 words and
+   CSW21 leaves, a pairing birdtest accepts on purpose (`compat.rs` compares
+   alphabets, not names). With a table on, MAGPIE would load `NWL23.rit`, built
+   from `NWL23.klv2`, and rank every full-rack position on NWL23's leaves
+   rather than the CSW21 leaves the job pinned and the worker just verified.
+2. **Leave generation.** Each generation plays with a KLV fetched for that
+   generation. A table built from the shipped leaves would replace exactly the
+   values being generated, and the error would carry into every later
+   generation.
+3. **A stale local file with the right name.** `download_data.sh` overwrites
+   `CSW24.klv2` or `CSW24.kwg` in place and leaves the old `.rit` or `.wmp`
+   beside it. The names still match; the contents no longer do.
+4. **A stale wordmap**, the same as 3: a `.wmp` from an older `.kwg` produces a
+   different set of moves.
 
-So the client writes a `<lexicon>.wmp.src` sidecar holding the SHA-256 of the
-`.kwg` the wordmap was built from, and rebuilds whenever the `.wmp` is absent,
-the sidecar is absent, or the sidecar disagrees with the `.kwg` digest just
-verified. A `.wmp` with no sidecar — every wordmap a contributor already has — is
-stale by that rule and is rebuilt once, which is correct: nothing recorded what it
-was built from. A client running an unpinned job has no digest to compare and
-keeps today's behaviour: use the wordmap if present.
+In every case the output looks normal, and a contribution computed this way
+passes every plausibility check.
 
-The sidecar is written **after** the `.wmp` is renamed into place. Written first,
-an interrupted build would leave a sidecar claiming a wordmap that does not
-exist, and the next run would trust it. Both files are generated to a temporary
-name and `rename()`d into place, so two MAGPIE processes contributing from the
-same directory cannot race.
+#### What the server does
 
-**Whether a wordmap is used is decided as the lexicon loads**, so the client
-states each player's flag before it loads a task's lexicon, never after. Set
-afterwards, the flag applied to the next task: a task that had not asked for a
-wordmap got the previous task's choice, loading a `.wmp` the staleness check above
-had never looked at.
+The wordmap half was covered by a `<lexicon>.wmp.src` sidecar holding the
+SHA-256 of the `.kwg` it was built from — which catches 3 and 4 and, crucially,
+**still trusts the builder**. That is not a theoretical gap: a CSW24 wordmap
+built in December 2025 and one built nine months later differ in 72,852,152
+bytes with the same inputs and the same wordmap format version 3, because the
+builder changed and the format did not have to. Recording what a file was built
+*from* cannot see that; comparing the output can.
+
+So birdtest's server builds its own copy of each derived file with a pinned
+MAGPIE, from the exact bytes the job pins, keeps the SHA-256, and discards the
+file. Each claim carries them under `expected_data.derived`:
+
+```json
+"derived": [
+  { "role": "wmp", "name": "NWL23", "sha256": "214a…", "bytes": 104857600,
+    "builder": "wmp-1", "build_target": "nehalem" },
+  { "role": "rit", "name": "CSW24.CSW_quackle_leaves", "sha256": "157b…",
+    "bytes": 1885416048, "builder": "rit-1", "build_target": "nehalem" }
+]
+```
+
+The worker hashes what is on its disk, builds the file if it does not match,
+hashes it again, and uses it only if the bytes agree. On a mismatch it declines
+with `derived_mismatch`, carrying both digests, so a disagreement between the
+fleet's builders shows up in the admin view instead of being worked around
+silently by every worker independently.
+
+**A table is named for its pair, not its lexicon.** `CSW24.CSW_quackle_leaves`,
+not `CSW24` — case 1 above is not a check to add but a name to make
+unrepresentable. `klvwmp2rit` takes the KLV's and the wordmap's names separately
+so the output does not have to borrow one of theirs.
+
+**A hash is tied to its builder.** MAGPIE carries `WMP_BUILDER_VERSION` and
+`RIT_BUILDER_VERSION`, separate from `MAGPIE_VERSION` because a builder change
+need not touch a file format, and a pinned-hash test
+(`test/builder_hash_test.c`) fails until a change that alters either builder's
+output bumps its version. The server reads the versions from the binary it runs
+(`magpie builders`) rather than from configuration, so the builder recorded
+beside a hash is always the one that produced it.
+
+**The build target is recorded, not enforced.** Measured on x86-64 with GCC 10:
+`-march=native` and `-march=nehalem` produce byte-identical wordmaps and rack
+info tables, for a two-letter test lexicon and for NWL23, and so do one thread
+and eight. So a worker whose target differs builds the file and compares rather
+than declining unseen — refusing on the field alone would lock out every
+contributor who builds from source in exchange for nothing. The MAGPIE release
+build and the server image both use `portable_release` regardless, because
+being right by construction is better than being right by measurement.
+
+#### What the worker does
+
+Before running a task, for each derived file the claim pins:
+
+1. Hash what is on disk, through the run's digest cache (a 1.9 GB table takes
+   about nine seconds to hash, so this must be once per file and not once per
+   task). If it matches, use it.
+2. Otherwise build it — `convert dawg2wordmap` for a wordmap, `convert
+   klvwmp2rit` for a table — and hash the result.
+3. If it still does not match, record both digests and decline the task with
+   `derived_mismatch`. The job is remembered as unsupported, so the worker does
+   not spend another three minutes rebuilding a table it has just found it
+   cannot match.
+
+A claim that pins **nothing** for a wordmap — an older server — falls back to
+the `.wmp.src` sidecar, which is still what protects the CLI. A claim that pins
+nothing for a table means no table is loaded at all: a table that cannot be
+checked would rank every full rack on leave values nothing verified, and running
+without one is always correct, just slower.
+
+`dawg2wordmap` replaced the `dawg2text` + `text2wordmap` pair the client used to
+run. The two produce identical bytes, this is the one the server builds its
+reference copy with, and it writes no intermediate `.txt`.
+
+**Whether either file is used is decided as the lexicon loads**, so the client
+states every flag before it loads a task's lexicon, never after. Set afterwards,
+a flag applied to the *next* task: a task that had not asked for a wordmap got
+the previous task's choice, and a table switched on by a contributor's
+`settings.txt` stayed on.
 
 Both write into `./data`, which is **assumed writable**. If it is not, that is a
-clear error and `contribute` stops — there is no fallback location. A job that did
-not ask for a wordmap never reaches this path, so an unwritable `./data` does not
-block it.
+clear error and `contribute` stops — there is no fallback location. A job that
+asked for neither file never reaches this path.
+
+#### Leave generation keeps tables off
+
+Every generation plays with a different KLV, so a table — which caches leave
+values — would have to be rebuilt per generation at 1.9 GB and several minutes
+on every worker, to replace exactly the values being generated. The server pins
+none for a `leave_generation` job and the client loads none.
+
+#### Where the builds run
+
+On the server, in a separate scheduled ECS task (`infra/derived.tf`), not in the
+web task: a table build peaks at about 2.4 GB and writes a 1.9 GB file, against
+the web task's 1 vCPU and 2 GB. It drains a queue (`derived_data`) under a lease
+and exits. **A job whose derived files are not built is not dispatched** — the
+same wait as a leave-generation job whose universe is not seeded — because
+dispatching without the hash would mean sending a worker no `derived` entry,
+which it reads as a server that checks nothing. `/admin/derived-data` is where
+that wait is visible.
+
+On the worker, during task execution, after the heartbeat has started: a table
+takes minutes, and the heartbeat is what keeps the claim alive through it.
 
 ### Heartbeat thread
 
@@ -3763,10 +3886,12 @@ a player simulates on plies alone: a "simmer" without plies would play
 statically on every worker. A simmer must also set `max_iterations`, and
 `time_limit_secs` of 0: MAGPIE applies a time limit only above 0 (a null means
 its 60-second default), and a limit makes how far a simulation gets depend on the
-contributor's hardware, so the iteration budget bounds it instead. `use_rit` must
-not be true: a rack info table carries precomputed leave values keyed by lexicon
-name alone, covered by no digest, and move generation uses them in place of the
-leaves the config pins.
+contributor's hardware, so the iteration budget bounds it instead. `use_rit` is
+accepted: a rack info table carries precomputed leave values that move
+generation uses in place of the leaves the config pins, which is why it was
+refused until the server could build the table for this exact (lexicon, leaves)
+pair and pin its hash. A job whose players ask for one is not dispatched until
+it is built.
 
 Whatever the body leaves out is filled from MAGPIE's defaults
 (`backend/src/magpie_defaults.rs`) before the row is written, so the stored config
@@ -4339,11 +4464,12 @@ CREATE TABLE input_data (
     -- from. Text, not DATE: it is the artifact's name, and it appears verbatim
     -- in the message a contributor is told to act on.
     tarball_date TEXT NOT NULL CHECK (tarball_date ~ '^\d{8}$'),
-    -- The file's bytes, for the roles the SERVER itself reads. birdtest
-    -- enumerates rack universes and builds KLVs from the letter distribution,
-    -- so those bytes must be the pinned ones -- there is no server-side disk
-    -- copy of the data any more. Lexica stay out: a 15 MB .kwg in a row is a
-    -- different proposition and nothing server-side reads one.
+    -- The file's bytes, for the roles the SERVER itself parses. birdtest
+    -- enumerates rack universes from the letter distribution and hands it to
+    -- MAGPIE for every conversion, so those bytes must be the pinned ones --
+    -- there is no server-side disk copy of the data any more. Lexica stay out:
+    -- a 6 MB .kwg in a row is a different proposition, and fifty of them per
+    -- tarball.
     --
     -- The check is an equivalence, not a nullable convenience: a letterdist or
     -- layout row without bytes cannot exist, and a kwg/klv/winpct row with
@@ -4351,6 +4477,16 @@ CREATE TABLE input_data (
     -- filesystem" branch to write.
     content      BYTEA
                  CHECK ((role IN ('letterdist','layout')) = (content IS NOT NULL)),
+    -- Object-store key for the bytes of the roles the server *builds* from: a
+    -- wordmap needs the .kwg and a rack info table the .klv2 as well. Keyed by
+    -- digest, so a file unchanged between two tarballs is uploaded once.
+    --
+    -- Nullable, and deliberately not backfilled: rows imported before this
+    -- existed have their bytes nowhere, and there is nothing to derive them
+    -- from short of the tarball. A derived build from such a row fails saying
+    -- exactly that, which tells an admin to re-import -- idempotent, and adding
+    -- no rows for files whose bytes have not changed.
+    object_key   TEXT,
     imported_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     imported_by  UUID REFERENCES users(id) ON DELETE SET NULL,
     UNIQUE (path, sha256)
@@ -4394,6 +4530,11 @@ CREATE TABLE input_data_import_rows (
     -- Carried from phase 1 for letterdist/layout entries so confirmation
     -- inserts input_data.content without re-downloading the tarball.
     content     BYTEA,
+    -- Likewise for kwg/klv entries, whose bytes went to the object store while
+    -- the archive was still in memory. An import the admin then cancels leaves
+    -- an object nobody references, which is keyed by digest and so is exactly
+    -- what the next import of the same file would have uploaded anyway.
+    object_key  TEXT,
     PRIMARY KEY (import_id, path, sha256)
 );
 
@@ -5117,14 +5258,72 @@ CREATE TABLE leave_generation_artifacts (
     -- SHA-256 of the KLV bytes as first written. The object store holds the
     -- only copy of these bytes, and an artifact is the one piece of state that
     -- can be silently overwritten -- by a restore that replays a generation
-    -- transition against fewer results, or by a rebuild under a changed
-    -- klv::build. Recording the hash is what turns that from invisible into a
+    -- transition against fewer results, or by a rebuild under a different KLV
+    -- builder. Recording the hash is what turns that from invisible into a
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    -- The MAGPIE KLV builder that wrote these bytes ('klv-1'). Until MAGPIE
+    -- built them there was one implementation, so differing bytes could only
+    -- mean corruption; now a MAGPIE upgrade can legitimately change them, and a
+    -- rebuild has to be able to say "different builder" rather than "differs".
+    -- Without that, the first upgrade after a restore drill reads as data loss.
+    --
+    -- NULL for an artifact written by the server's own Rust port, before there
+    -- was a MAGPIE on the server at all.
+    builder       TEXT,
     completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, generation)
 );
+
+-- One row per (role, inputs, builder): the wordmap or rack info table the
+-- server built, and the hash a worker has to reproduce. See "Wordmap and rack
+-- info table provenance".
+--
+-- Neither file is shipped -- 179 MB and 1.9 GB for CSW24 -- so what travels is
+-- the hash. The key is the whole identity of the file rather than a surrogate,
+-- because what makes two derived files the same file is that they were built
+-- from the same inputs by the same builder.
+CREATE TABLE derived_data (
+    role          TEXT NOT NULL CHECK (role IN ('wmp','rit')),
+    -- What the worker loads the file as: a lexicon's name for a wordmap,
+    -- '<lexicon>.<leaves>' for a table, because a table stores precomputed
+    -- leave values and so belongs to the pair.
+    name          TEXT NOT NULL,
+    builder       TEXT NOT NULL,          -- 'wmp-1', 'rit-1'
+    kwg_id        UUID NOT NULL REFERENCES input_data(id),
+    klv_id        UUID REFERENCES input_data(id),   -- NULL for a wordmap
+    letterdist_id UUID NOT NULL REFERENCES input_data(id),
+    state         TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (state IN ('pending','building','built','failed')),
+    -- Set exactly when state = 'built'. An equivalence rather than a
+    -- convention because dispatch reads this hash: a row saying 'built' with
+    -- no hash would be dispatched as if it had one.
+    sha256        TEXT CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    bytes         BIGINT CHECK (bytes >= 0),
+    build_target  TEXT,                   -- 'nehalem'; recorded, never compared
+    error         TEXT,
+    leased_until  TIMESTAMPTZ,            -- so two builders cannot take one row
+    attempts      INT NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    built_at      TIMESTAMPTZ,
+    CONSTRAINT derived_data_built_has_hash CHECK (
+        (state = 'built') = (sha256 IS NOT NULL AND bytes IS NOT NULL)
+    ),
+    CONSTRAINT derived_data_inputs_match_role CHECK (
+        (role = 'rit') = (klv_id IS NOT NULL)
+    )
+);
+
+-- Partial, not a UNIQUE constraint: a wordmap's klv_id is NULL and two NULLs
+-- are distinct in a UNIQUE, which would silently permit duplicate wordmap rows.
+CREATE UNIQUE INDEX derived_data_wmp_idx
+    ON derived_data (name, builder, kwg_id, letterdist_id) WHERE role = 'wmp';
+CREATE UNIQUE INDEX derived_data_rit_idx
+    ON derived_data (name, builder, kwg_id, klv_id, letterdist_id)
+    WHERE role = 'rit';
+CREATE INDEX derived_data_queue_idx ON derived_data (requested_at)
+    WHERE state IN ('pending','building');
 
 -- One row per generation transition that has been *started*, claimed by the
 -- worker request that found the generation complete.
@@ -5481,7 +5680,7 @@ The scenarios worth designing against, in descending order of likelihood:
    any artifact key; an attacker with broader AWS access can delete backups. This
    is what object versioning and Object Lock are for.
 6. **Artifact corruption or accidental overwrite.** A KLV rebuilt with a changed
-   `klv.rs` and written to an existing key silently changes what workers fetch for
+   the KLV builder and written to an existing key silently changes what workers fetch for
    that generation.
 
 ### Backing up Postgres
@@ -5598,14 +5797,23 @@ is a poor trade, and `DATABASE_URL` is derived during restore anyway.
 
 The KLVs in S3 are the only application data outside Postgres, and they have an
 unusual property: **they are pure functions of data that is already in the
-database.** `run_transition` folds `leave_rack_progress` into per-rack mean equities
-and calls `klv::build` with the pinned letter distribution — whose bytes are
-themselves in `input_data.content`. `leave_rack_progress` rows are never deleted per
+database.** `run_transition` streams `leave_rack_progress` into a
+`rack,count,equity_sum` CSV and runs `magpie convert rackequity2klv` against the
+pinned letter distribution — whose bytes are themselves in
+`input_data.content`. `leave_rack_progress` rows are never deleted per
 generation, so every generation's inputs remain present for the life of the job.
+
+One thing changed when MAGPIE took this over: **a rebuild that produces
+different bytes is no longer on its own evidence of corruption.** With a single
+Rust implementation it was; with MAGPIE building them, an upgrade can
+legitimately change the bytes for the same leave values. So
+`leave_generation_artifacts.builder` records which builder wrote each artifact,
+and a rebuild under a different one reports that rather than "differs" — without
+it, the first MAGPIE upgrade after a restore drill reads as data loss.
 
 | Option | For | Against |
 |---|---|---|
-| **Rely on versioning + rebuild** | No extra copies of multi-megabyte binaries; the DB stays the single system of record | Rebuild must be byte-reproducible; a future `klv.rs` change silently produces different bytes for an old generation |
+| **Rely on versioning + rebuild** | No extra copies of multi-megabyte binaries; the DB stays the single system of record | Rebuild must be byte-reproducible; a future MAGPIE KLV builder produces different bytes for an old generation (which is why the builder is recorded per artifact) |
 | **Replicate the artifacts bucket cross-region** | Trivial (CRR); covers "S3 object gone" without any rebuild logic | Pays storage for derivable data |
 | Include artifacts in the nightly bundle | One restore unit; fully self-contained | Largest and most redundant; re-uploads unchanged binaries nightly unless made incremental |
 | **Store the artifact's sha256 in the DB** | Makes corruption and drift *detectable*, and makes a rebuild verifiable | A schema change and a small code change |
@@ -5809,7 +6017,7 @@ CloudWatch metric and inserting the `backups` row; the alarms and the SNS topic.
 Delivers portable, encrypted, off-instance backups with failure alerting.
 
 **Phase 3 — application support.** The `backups` table and
-`leave_generation_artifacts.sha256`, with `klv::build` output hashed at write time in
+`leave_generation_artifacts.sha256`, with the built KLV hashed at write time in
 both `run_transition` and `seed_zero_generation`; `GET /api/admin/backups` and its
 dashboard card; `POST /api/admin/jobs/:id/rebuild-artifacts`; destructive endpoints
 recording what they destroyed before destroying it. Delivers backup state visible
@@ -5895,10 +6103,11 @@ host.
 |---|---|
 | Docker / Docker Compose | The entire stack |
 
-Nothing in the compose stack depends on MAGPIE: the backend builds its KLV
-artifacts itself (`backend/src/jobs/klv.rs`). A MAGPIE checkout is needed for the
-one thing the stack cannot do alone — work — because MAGPIE is the only worker
-client. `worker/fake_worker.py` is an end-to-end-suite instrument that submits
+The compose stack needs a MAGPIE build: the backend runs one for every derived
+file and every leave-generation KLV, and refuses to start without it. Point
+`MAGPIE_BIN` at a local checkout's `bin/magpie` (`make magpie
+BUILD=portable_release`). The same checkout is what runs work against the
+stack, because MAGPIE is the only worker client. `worker/fake_worker.py` is an end-to-end-suite instrument that submits
 invented results, not a way to develop against the stack. See [Contributing
 locally](#5-contributing-locally).
 

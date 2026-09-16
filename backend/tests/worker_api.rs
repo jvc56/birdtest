@@ -1251,3 +1251,257 @@ async fn a_pools_residuals_are_the_ones_its_latest_fit_stored() {
     assert_eq!(detail["residuals"][0]["pairs"], json!(1.0), "{detail}");
     assert_eq!(detail["residuals"][0]["actual"], json!(1.0), "{detail}");
 }
+
+// ---------------------------------------------------------------------------
+// Derived files: wordmaps and rack info tables
+// ---------------------------------------------------------------------------
+
+/// An identity the claim endpoint recognises, without having to be handed a
+/// task to be issued one. A worker is minted with its first assignment, and
+/// several tests below need to claim against a job that has none to give.
+async fn registered_worker(db: &TestDb) -> String {
+    let uuid = Uuid::new_v4();
+    sqlx::query("INSERT INTO anonymous_workers (uuid) VALUES ($1)")
+        .bind(uuid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    uuid.to_string()
+}
+
+/// A player config that asks for a wordmap and, optionally, a rack info table.
+/// Written with plain SQL like every other builder here: what is under test is
+/// dispatch, not the validator.
+///
+/// `kwg` and `klv` are passed in rather than created, because two players
+/// sharing a lexicon must share the *row*: `input_data` rows are identified by
+/// content, so two rows both named `NWL23` are two different lexicons that
+/// happen to share a name, and would correctly need two different wordmaps.
+async fn deriving_player(
+    db: &TestDb,
+    name: &str,
+    kwg: Uuid,
+    klv: Uuid,
+    use_rit: bool,
+) -> Uuid {
+    let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
+    sqlx::query_scalar(
+        "INSERT INTO player_configs
+             (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
+              num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
+              movegen_margin, created_by)
+         VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, true, $4, 5, $5)
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(kwg)
+    .bind(klv)
+    .bind(use_rit)
+    .bind(admin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// A `games` job between two given player configs.
+async fn job_between(db: &TestDb, p1: Uuid, p2: Uuid) -> Uuid {
+    let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
+    let job = db.bare_job("games", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_game_config
+             (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
+         VALUES ($1, $2, $3, 10, 1000000, 1000000)",
+    )
+    .bind(job)
+    .bind(p1)
+    .bind(p2)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    job
+}
+
+/// The gate. A wordmap and a rack info table are built on the contributor's own
+/// machine, and what makes that checkable is the hash the server publishes —
+/// so a job whose hash does not exist yet must not be handed out. Dispatching
+/// early would send a worker no `derived` entry, which it reads as a server
+/// that checks nothing: the exact state this replaces, reached silently.
+#[tokio::test]
+async fn a_job_is_not_dispatched_until_its_derived_files_are_built() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = deriving_player(&db, "wmp-p1", kwg, klv, false).await;
+    let p2 = deriving_player(&db, "wmp-p2", kwg, klv, false).await;
+    let job = job_between(&db, p1, p2).await;
+    let worker = registered_worker(&db).await;
+
+    let (status, body) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "nothing is built yet: {body}");
+
+    // Two players on one lexicon need one wordmap, not two.
+    assert_eq!(db.derived_ready(job).await, 1);
+
+    let (status, body) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let derived = body["expected_data"]["derived"].as_array().expect("derived");
+    assert_eq!(derived.len(), 1, "{body}");
+    assert_eq!(derived[0]["role"], "wmp");
+    assert_eq!(derived[0]["name"], "NWL23");
+    assert_eq!(derived[0]["builder"], "wmp-1");
+    assert!(derived[0]["sha256"].is_string(), "{body}");
+}
+
+/// A failed build blocks dispatch exactly as an unbuilt one does. "Give up and
+/// send it anyway" is the wrong recovery — the worker would fall back to
+/// whatever is on its disk, unchecked — and must not be reachable by accident.
+#[tokio::test]
+async fn a_failed_derived_build_keeps_a_job_undispatched() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = deriving_player(&db, "fail-p1", kwg, klv, false).await;
+    let p2 = deriving_player(&db, "fail-p2", kwg, klv, false).await;
+    let job = job_between(&db, p1, p2).await;
+    db.derived_ready(job).await;
+    sqlx::query(
+        "UPDATE derived_data SET state = 'failed', sha256 = NULL, bytes = NULL,
+                                 error = 'the lexicon has no stored bytes'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let (status, body) = claim_as(&app, &registered_worker(&db).await).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// A rack info table belongs to a (lexicon, leaves) pair, not to a lexicon,
+/// because it stores precomputed leave values that move generation uses in
+/// place of the loaded KLV. MAGPIE's CLI finds one by lexicon name alone, which
+/// is how a player pinning NWL23 words and CSW21 leaves — a pairing birdtest
+/// accepts on purpose — would have ranked every full rack on NWL23's leaves.
+/// The claim names the pair, so that is not expressible.
+#[tokio::test]
+async fn a_rack_info_table_is_pinned_under_its_pairs_name() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let p1 = deriving_player(&db, "rit-p1", kwg, db.input_data("klv", "CSW21").await, true).await;
+    let p2 = deriving_player(&db, "rit-p2", kwg, db.input_data("klv", "NWL23").await, false).await;
+    let job = job_between(&db, p1, p2).await;
+
+    // One wordmap for the shared lexicon, and one table for p1's pair. p1 asks
+    // for the table; the wordmap it is built from is needed either way.
+    assert_eq!(db.derived_ready(job).await, 2);
+
+    let (status, body) = claim_as(&app, &registered_worker(&db).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let derived = body["expected_data"]["derived"].as_array().expect("derived");
+    let rit = derived.iter().find(|d| d["role"] == "rit").expect("a rit entry");
+    assert_eq!(rit["name"], "NWL23.CSW21", "{body}");
+    assert_eq!(rit["builder"], "rit-1");
+
+    // And the task request names the same file, so the worker loads what the
+    // server pinned rather than inferring a name from the lexicon.
+    let request = &body["task_request"];
+    assert_eq!(request["player1"]["rit_name"], "NWL23.CSW21", "{body}");
+    assert!(request["player2"]["rit_name"].is_null(), "{body}");
+}
+
+/// A worker that built the file and got different bytes hands the claim back
+/// with both digests. Distinct from `missing_data`, which is a file the
+/// contributor was supposed to download: nothing the contributor can do fixes
+/// this one, and the two hashes are what makes a disagreement between the
+/// fleet's builders visible instead of silently worked around.
+#[tokio::test]
+async fn a_derived_mismatch_releases_the_claim_and_records_both_hashes() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = deriving_player(&db, "mm-p1", kwg, klv, false).await;
+    let p2 = deriving_player(&db, "mm-p2", kwg, klv, false).await;
+    let job = job_between(&db, p1, p2).await;
+    db.derived_ready(job).await;
+
+    let uuid = registered_worker(&db).await;
+    let (status, body) = claim_as(&app, &uuid).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let token = body["claim_token"].as_str().unwrap().to_string();
+
+    let (status, decline) = send(
+        &app,
+        post_json(
+            "/api/worker/decline",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({
+                "claim_token": token,
+                "reason": "derived_mismatch",
+                "missing": [{
+                    "role": "wmp", "name": "NWL23",
+                    "expected": "a".repeat(64), "actual": "b".repeat(64),
+                }],
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{decline}");
+
+    let (role, expected, actual) = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT role, expected, actual FROM worker_data_gaps WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(role, "wmp");
+    assert_eq!(expected, "a".repeat(64));
+    assert_eq!(actual.as_deref(), Some("b".repeat(64).as_str()));
+
+    // The claim is handed straight back rather than held for the heartbeat
+    // timeout: the task is fine, this worker cannot run it.
+    let open: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_claims WHERE state = 'claimed'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(open, 0);
+}
+
+/// Each player's derived files come from that player's own rows, so two players
+/// on different lexicons need two wordmaps rather than sharing one.
+///
+/// Nothing is shared between players, so this ought to fall out of the query —
+/// but "ought to" is what a test is for, and comparing bots on two lexicons is
+/// a supported configuration that a wordmap keyed on the wrong player would
+/// silently break.
+#[tokio::test]
+async fn players_on_different_lexicons_need_a_wordmap_each() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let nwl = db.input_data("kwg", "NWL23").await;
+    let csw = db.input_data("kwg", "CSW21").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = deriving_player(&db, "two-lex-p1", nwl, klv, false).await;
+    let p2 = deriving_player(&db, "two-lex-p2", csw, klv, false).await;
+    let job = job_between(&db, p1, p2).await;
+
+    assert_eq!(db.derived_ready(job).await, 2);
+
+    let (status, body) = claim_as(&app, &registered_worker(&db).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let derived = body["expected_data"]["derived"].as_array().expect("derived");
+    let mut names: Vec<&str> =
+        derived.iter().map(|d| d["name"].as_str().unwrap()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["CSW21", "NWL23"], "{body}");
+    // Two lexicons, two hashes: a single wordmap standing in for both is the
+    // failure this rules out.
+    let hashes: std::collections::HashSet<&str> =
+        derived.iter().map(|d| d["sha256"].as_str().unwrap()).collect();
+    assert_eq!(hashes.len(), 2, "{body}");
+}
