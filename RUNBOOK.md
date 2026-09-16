@@ -341,8 +341,7 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   KLVs, so a MAGPIE upgrade can legitimately change the bytes for the same
   leave values; the report says which builder wrote the artifact and which one
   rebuilt it. Only two artifacts from the *same* builder disagreeing is
-  evidence of anything. `builder` is NULL for an artifact written before the
-  server ran MAGPIE at all.
+  evidence of anything.
 - **Corrupted object with a known-good older version.** The bucket is
   versioned; restore that specific object version rather than rolling the
   bucket back:

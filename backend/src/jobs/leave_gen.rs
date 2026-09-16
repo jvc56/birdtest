@@ -738,8 +738,7 @@ pub struct ArtifactRebuild {
     /// different bytes for the same values is the expected outcome, not a
     /// fault, and the admin view reads this first.
     pub same_builder: bool,
-    /// `None` for an artifact written before the server ran MAGPIE.
-    pub stored_builder: Option<String>,
+    pub stored_builder: String,
     pub rebuilt_builder: String,
     pub object_present: bool,
     pub rewritten: bool,
@@ -796,10 +795,7 @@ pub async fn rebuild_artifacts(
         let generation: i32 = row.get("generation");
         let artifact_key: String = row.get("artifact_key");
         let stored_sha256: String = row.get("sha256");
-        // NULL is an artifact from before the server ran MAGPIE at all, built
-        // by a Rust port that no longer exists. It is not this builder, and
-        // saying so is the honest answer.
-        let stored_builder: Option<String> = row.get("builder");
+        let stored_builder: String = row.get("builder");
 
         let klv = if generation == 0 {
             zero_klv(magpie, distribution).await?
@@ -809,7 +805,7 @@ pub async fn rebuild_artifacts(
         let rebuilt_sha256 = hex::encode(Sha256::digest(&klv));
 
         let object_present = artifacts.exists(&artifact_key).await?;
-        let same_builder = stored_builder.as_deref() == Some(rebuilding_with.as_str());
+        let same_builder = stored_builder == rebuilding_with;
         let matches = rebuilt_sha256 == stored_sha256;
         // A missing object has no bytes to lose, so restoring it needs no
         // permission. Replacing one that is present does -- and replacing one

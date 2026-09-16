@@ -157,8 +157,7 @@
                     title={row.stored_sha256}
                   >
                     {#if !row.same_builder}
-                      built by {row.stored_builder ?? 'the old server-side builder'},
-                      rebuilt by {row.rebuilt_builder}
+                      built by {row.stored_builder}, rebuilt by {row.rebuilt_builder}
                     {:else}
                       {row.matches ? 'matches' : 'differs from the recorded hash'}
                     {/if}

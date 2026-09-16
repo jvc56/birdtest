@@ -399,8 +399,8 @@ both existed.
 **birdtest**
 
 - Import: store `.kwg` and `.klv2` bytes in the object store, keyed by digest.
-- Migration `0002_magpie_dependency.sql`: `derived_data`;
-  `input_data.object_key` and its staging counterpart;
+- Schema (folded into `0001_initial.sql`, since birdtest is not live):
+  `derived_data`; `input_data.object_key` and its staging counterpart;
   `leave_generation_artifacts.builder`.
 - `magpie.rs` (the pinned binary and its scratch directories) and `derived.rs`
   (what a job needs, the queue, the build).
