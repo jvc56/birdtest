@@ -154,6 +154,21 @@ CREATE TABLE input_data (
     -- filesystem" branch to write.
     content      BYTEA
                  CHECK ((role IN ('letterdist','layout')) = (content IS NOT NULL)),
+    -- Object-store key for the bytes of the roles the server *builds* from, as
+    -- opposed to the ones it parses. A reference wordmap needs the .kwg and a
+    -- reference rack info table the .klv2 as well (see `derived_data`), so
+    -- those two go to the object store rather than into `content`: a 6 MB
+    -- lexicon and a 3.7 MB KLV in a row is a different proposition from a
+    -- 489-byte distribution, there are fifty of each per tarball, and nothing
+    -- queries their contents.
+    --
+    -- Keyed by digest, so the same bytes under two paths are one object and a
+    -- file unchanged between two tarballs is uploaded once. NULL for every
+    -- other role, and for a row whose bytes were never stored -- a derived
+    -- build from one of those fails naming the remedy rather than finding a
+    -- missing key. Not an equivalence CHECK like `content` above, because
+    -- nothing stops a row being written by something other than the import.
+    object_key   TEXT,
     imported_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     imported_by  UUID REFERENCES users(id) ON DELETE SET NULL,
     UNIQUE (path, sha256)
@@ -197,8 +212,100 @@ CREATE TABLE input_data_import_rows (
     -- Carried from phase 1 for letterdist/layout entries so confirmation
     -- inserts input_data.content without re-downloading the tarball.
     content     BYTEA,
+    -- Likewise for kwg/klv entries, whose bytes go to the object store while
+    -- the archive is still in memory. An import the admin then cancels leaves
+    -- an object nobody references, which is keyed by digest and so is exactly
+    -- what the next import of the same file would have uploaded anyway.
+    object_key  TEXT,
     PRIMARY KEY (import_id, path, sha256)
 );
+
+-- Derived files: the wordmaps and rack info tables the server builds a
+-- reference copy of, and the hash a worker has to reproduce.
+--
+-- Neither file is ever shipped -- 179 MB and 1.9 GB for CSW24 -- so every
+-- machine that needs one builds it from files it already has. What travels
+-- instead is the SHA-256 the server's own pinned MAGPIE got from the same
+-- inputs: a worker builds its own copy and uses it only if the bytes agree,
+-- and declines the task otherwise. See MAGPIE_DEPENDENCY.md.
+--
+-- The key is the whole identity of the file rather than a surrogate, because
+-- what makes two derived files the same file is that they were built from the
+-- same inputs by the same builder. A wordmap depends on a .kwg and the letter
+-- distribution it is built against; a rack info table depends on a .klv2 as
+-- well, because its entries carry precomputed leave values.
+--
+-- `builder` is separate from the MAGPIE version on purpose. A CSW24 wordmap
+-- built in December 2025 and one built nine months later differ in 72,852,152
+-- bytes with the same inputs and the same wordmap format version: the builder
+-- changed and the format did not have to. MAGPIE carries WMP_BUILDER_VERSION
+-- and RIT_BUILDER_VERSION for exactly this, a test pins their output so a
+-- change cannot pass without bumping them, and the server asks the binary it
+-- runs (`magpie builders`) rather than being told in configuration.
+CREATE TABLE derived_data (
+    role          TEXT NOT NULL CHECK (role IN ('wmp','rit')),
+    -- What the worker loads the file as. A wordmap's is its lexicon's name; a
+    -- rack info table's is '<lexicon>.<leaves>', because a table belongs to a
+    -- (.kwg, .klv2) pair and two jobs on CSW24 with different leaves must not
+    -- share one.
+    name          TEXT NOT NULL,
+    builder       TEXT NOT NULL,          -- 'wmp-1', 'rit-1'
+    kwg_id        UUID NOT NULL REFERENCES input_data(id),
+    -- NULL for a wordmap, which is built from the lexicon alone. The partial
+    -- unique indexes below are what make (role, name, builder, kwg, NULL) a key
+    -- rather than a duplicate waiting to happen: in a UNIQUE constraint two
+    -- NULLs are distinct, so a plain UNIQUE would let a wordmap be queued
+    -- twice.
+    klv_id        UUID REFERENCES input_data(id),
+    letterdist_id UUID NOT NULL REFERENCES input_data(id),
+    state         TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (state IN ('pending','building','built','failed')),
+    -- Set exactly when state = 'built'. The equivalence is a constraint rather
+    -- than a convention because dispatch reads this hash: a row that says
+    -- 'built' with no hash would be dispatched as if it had one.
+    sha256        TEXT CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    bytes         BIGINT CHECK (bytes >= 0),
+    -- The instruction-set target the building MAGPIE was compiled for, e.g.
+    -- 'nehalem'. Recorded and reported, never compared: measurement says these
+    -- builders' output does not depend on it, and a contributor who builds
+    -- from source should not be locked out on the strength of a field. If that
+    -- ever stops being true, this column is the evidence.
+    build_target  TEXT,
+    -- Why the last attempt failed, shown to the admin verbatim.
+    error         TEXT,
+    -- Taken by the builder task when it starts a row, so a second builder does
+    -- not start the same three-minute build. A lease rather than a plain flag:
+    -- a builder that dies leaves 'building' behind forever otherwise.
+    leased_until  TIMESTAMPTZ,
+    attempts      INT NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    built_at      TIMESTAMPTZ,
+    CONSTRAINT derived_data_built_has_hash CHECK (
+        (state = 'built') = (sha256 IS NOT NULL AND bytes IS NOT NULL)
+    ),
+    -- A wordmap is built from the lexicon and the distribution; a rack info
+    -- table additionally from the leaves. A wmp row carrying a klv_id would be
+    -- claiming a dependency it does not have.
+    CONSTRAINT derived_data_inputs_match_role CHECK (
+        (role = 'rit') = (klv_id IS NOT NULL)
+    )
+);
+
+-- The identity of a derived file, in the two shapes it comes in. Partial
+-- indexes because a wordmap's klv_id is NULL and NULLs are distinct in a
+-- UNIQUE constraint, which would silently permit duplicate wordmap rows.
+CREATE UNIQUE INDEX derived_data_wmp_idx
+    ON derived_data (name, builder, kwg_id, letterdist_id)
+    WHERE role = 'wmp';
+CREATE UNIQUE INDEX derived_data_rit_idx
+    ON derived_data (name, builder, kwg_id, klv_id, letterdist_id)
+    WHERE role = 'rit';
+
+-- The builder task's queue: oldest request first, so a job that has been
+-- waiting is not starved by one created since.
+CREATE INDEX derived_data_queue_idx
+    ON derived_data (requested_at)
+    WHERE state IN ('pending','building');
 
 -- Jobs
 
@@ -925,6 +1032,15 @@ CREATE TABLE leave_generation_artifacts (
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    -- The MAGPIE KLV builder that wrote these bytes ('klv-1').
+    --
+    -- MAGPIE builds these artifacts, so an upgrade can legitimately change the
+    -- bytes for the same leave values. Without knowing which builder wrote an
+    -- artifact, `rebuild-artifacts` could only report "differs" -- and the
+    -- first MAGPIE upgrade after a restore drill would read as data loss. With
+    -- it, a rebuild under a different builder says so, and only two artifacts
+    -- from the *same* builder disagreeing is evidence of anything.
+    builder       TEXT NOT NULL,
     completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, generation)
 );

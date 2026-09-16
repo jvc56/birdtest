@@ -29,8 +29,9 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
-         VALUES ($1, 0, 'leaves/test/generation-0.klv2', repeat('0', 64))",
+        "INSERT INTO leave_generation_artifacts
+             (job_id, generation, artifact_key, sha256, builder)
+         VALUES ($1, 0, 'leaves/test/generation-0.klv2', repeat('0', 64), 'klv-1')",
     )
     .bind(job)
     .execute(&db.pool)
@@ -245,8 +246,9 @@ async fn a_reclaimed_task_is_reissued_only_while_its_generation_is_open() {
 
     // Generation 1 closes, and generation 2's universe exists.
     sqlx::query(
-        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
-         VALUES ($1, 1, 'leaves/test/generation-1.klv2', repeat('1', 64))",
+        "INSERT INTO leave_generation_artifacts
+             (job_id, generation, artifact_key, sha256, builder)
+         VALUES ($1, 1, 'leaves/test/generation-1.klv2', repeat('1', 64), 'klv-1')",
     )
     .bind(job)
     .execute(&db.pool)
@@ -294,8 +296,9 @@ async fn a_result_for_a_closed_generation_is_credited_but_not_folded() {
     // Generation 1 closes while the task is out, as a transition started just
     // before the claim committed would have closed it.
     sqlx::query(
-        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256)
-         VALUES ($1, 1, 'leaves/test/generation-1.klv2', repeat('1', 64))",
+        "INSERT INTO leave_generation_artifacts
+             (job_id, generation, artifact_key, sha256, builder)
+         VALUES ($1, 1, 'leaves/test/generation-1.klv2', repeat('1', 64), 'klv-1')",
     )
     .bind(job)
     .execute(&db.pool)

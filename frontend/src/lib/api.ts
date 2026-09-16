@@ -330,8 +330,7 @@ export interface ArtifactRebuild {
    * can legitimately change the bytes.
    */
   same_builder: boolean;
-  /** `null` for an artifact written before the server ran MAGPIE. */
-  stored_builder: string | null;
+  stored_builder: string;
   rebuilt_builder: string;
   matches: boolean;
   object_present: boolean;

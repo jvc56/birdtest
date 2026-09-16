@@ -21,14 +21,11 @@ use std::time::Duration;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// Every migration, concatenated, and used only to *name* the template
-/// database. The template itself is built by `db::migrate`, which applies them
-/// properly; this is what makes an edit to any of them produce a fresh
-/// template rather than a stale one.
-const MIGRATIONS: [&str; 2] = [
-    include_str!("../../migrations/0001_initial.sql"),
-    include_str!("../../migrations/0002_magpie_dependency.sql"),
-];
+/// The migrations, used only to *name* the template database. The template
+/// itself is built by `db::migrate`, which applies them properly; this is what
+/// makes an edit to any of them produce a fresh template rather than a stale
+/// one.
+const MIGRATIONS: [&str; 1] = [include_str!("../../migrations/0001_initial.sql")];
 const TESTDIST: &[u8] = include_bytes!("../../src/jobs/testdata/testdist.csv");
 
 fn server_url() -> String {

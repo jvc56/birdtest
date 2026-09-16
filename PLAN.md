@@ -5263,15 +5263,12 @@ CREATE TABLE leave_generation_artifacts (
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    -- The MAGPIE KLV builder that wrote these bytes ('klv-1'). Until MAGPIE
-    -- built them there was one implementation, so differing bytes could only
-    -- mean corruption; now a MAGPIE upgrade can legitimately change them, and a
-    -- rebuild has to be able to say "different builder" rather than "differs".
-    -- Without that, the first upgrade after a restore drill reads as data loss.
-    --
-    -- NULL for an artifact written by the server's own Rust port, before there
-    -- was a MAGPIE on the server at all.
-    builder       TEXT,
+    -- The MAGPIE KLV builder that wrote these bytes ('klv-1'). MAGPIE builds
+    -- these artifacts, so an upgrade can legitimately change the bytes for the
+    -- same leave values, and a rebuild has to be able to say "different
+    -- builder" rather than "differs". Without that, the first upgrade after a
+    -- restore drill reads as data loss.
+    builder       TEXT NOT NULL,
     completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, generation)
 );
