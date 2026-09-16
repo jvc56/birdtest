@@ -394,12 +394,11 @@ pub(crate) async fn insert_position_analyses(
     for chunk in pending.chunks(MOVE_ROWS_PER_STATEMENT) {
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_moves
-                 (record_id, task_id, rank, move, score, equity, win_percentage,
+                 (record_id, rank, move, score, equity, win_percentage,
                   blended_utility) ",
         );
         builder.push_values(chunk.iter(), |mut b, (record_id, rank, entry)| {
             b.push_bind(*record_id)
-                .push_bind(task_id)
                 .push_bind(*rank)
                 .push_bind(entry.play.clone())
                 .push_bind(entry.score)
@@ -441,7 +440,7 @@ pub(crate) async fn insert_position_analyses(
 }
 
 /// Rows per multi-row insert, keeping each statement well under Postgres's
-/// 65,535-parameter ceiling (9, 8 and 4 binds per row respectively).
+/// 65,535-parameter ceiling (10, 7 and 4 binds per row respectively).
 const RECORD_ROWS_PER_STATEMENT: usize = 2_000;
 const MOVE_ROWS_PER_STATEMENT: usize = 4_000;
 const PLY_ROWS_PER_STATEMENT: usize = 8_000;
@@ -490,6 +489,13 @@ pub(crate) async fn insert_game_results(
 
     // Deterministic games mean redundant claims replay identical positions, so
     // the first accepted claim records them and the rest are no-ops.
+    //
+    // A job without capture submits no positions, and that is every games job
+    // by default; the read below is only for deciding how many moves to keep,
+    // so it is skipped rather than spent on the submit path for nothing.
+    if record.positions.is_empty() {
+        return Ok(());
+    }
     // How many ranked moves to keep: player 1's num_plays_recorded, which is
     // also the one MAGPIE reads to decide how many to report.
     let top_moves = sqlx::query_scalar::<_, i32>(

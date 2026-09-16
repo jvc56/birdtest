@@ -138,8 +138,14 @@ impl JobHandler for OpeningRackHandler {
 ///
 /// Expanding the range costs what dispatching it cost: a handful of additions
 /// per rack, against a batch capped at 10,000.
+///
+/// `job_id` is passed rather than looked up from the task: the caller has the
+/// job in hand, and this runs inside the submit transaction with the task's
+/// row locked, where each round trip is time every other submission for the
+/// task waits.
 pub async fn check_batch_against_task(
     conn: &mut PgConnection,
+    job_id: Uuid,
     task_id: Uuid,
     reported: &[String],
 ) -> AppResult<()> {
@@ -154,7 +160,7 @@ pub async fn check_batch_against_task(
     .fetch_one(&mut *conn)
     .await?;
 
-    let job_data = super::load_job_data_for_task(&mut *conn, task_id).await?;
+    let job_data = super::load_job_data(&mut *conn, job_id).await?;
     let expected = RackRange {
         rack_size: row.get("rack_size"),
         start: row.get("rack_start"),

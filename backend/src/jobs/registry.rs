@@ -357,7 +357,7 @@ pub async fn store_result(
             let record = opening_rack::OpeningRackHandler::process_response(decode(payload)?)?;
             let racks: Vec<String> =
                 record.positions.iter().map(|p| p.rack.clone()).collect();
-            opening_rack::check_batch_against_task(conn, task_id, &racks).await?;
+            opening_rack::check_batch_against_task(conn, job.id, task_id, &racks).await?;
             opening_rack::OpeningRackHandler::insert_record(conn, job.id, task_id, claim_id, &record)
                 .await?;
             // One row per rack, and the unique index on (task_claim_id, rack)

@@ -356,15 +356,20 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.4.0 is the
-    -- first MAGPIE version whose results depend on nothing but the task: 0.1.0
+    -- so "no floor" is not a state worth being able to express. 0.5.0 is the
+    -- first MAGPIE version that checks a wordmap or a rack info table against
+    -- the hash the job pins, and the first that loads a table at all: 0.1.0
     -- left the bingo bonus, an opening-rack simulation's settings and a
     -- leave-generation task's seed to the worker's own settings; before 0.3.0 a
-    -- task's wordmap and rack-info-table flags applied to the next task; and
+    -- task's wordmap and rack-info-table flags applied to the next task;
     -- before 0.4.0 every setting a request left null came from the worker's
-    -- compile-time defaults.
+    -- compile-time defaults; and 0.4.0 played with whatever wordmap sat on the
+    -- worker's disk, checked against nothing. The default here is the same
+    -- value as the server's MIN_MAGPIE_VERSION, which create_job writes
+    -- explicitly; the two are kept equal so a row written any other way
+    -- (a restore, a hand insert) does not floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 4 CHECK (min_magpie_minor >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 5 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
@@ -715,7 +720,11 @@ CREATE TABLE worker_data_gaps (
     actual       TEXT,                    -- NULL = file absent
     reported_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, role, name);
+-- (job_id, reported_at): the job list asks whether a job has a gap reported in
+-- the last 24 hours, and the admin view groups a job's gaps, so both start at
+-- the job. Ordered by time within it, the first question stops at the newest
+-- row rather than walking every gap the job ever had.
+CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, reported_at DESC);
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
@@ -820,8 +829,7 @@ CREATE TABLE position_analysis_records (
     -- results feed, the rack lookup, the admin stream, the export -- filtered
     -- on the job and could only reach it through `tasks`, which put the filter
     -- on the far side of a join from the sort and made the whole job the unit
-    -- of work. With the column here they are index scans. `position_analysis_
-    -- moves` already carries `task_id` for the same family of reason.
+    -- of work. With the column here they are index scans.
     job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     rack            TEXT NOT NULL,
     -- CGP of the position analysed. NULL for an opening rack, where the board
@@ -864,9 +872,6 @@ CREATE UNIQUE INDEX position_analysis_records_rack_idx
     ON position_analysis_records (task_claim_id, rack)
     WHERE game_index IS NULL;
 
-CREATE INDEX position_analysis_records_task_idx
-    ON position_analysis_records (task_id, rack);
-
 -- The public results feed, which is newest-first within a job and paginated by
 -- keyset. `id` is in the index because it is the cursor's tiebreaker:
 -- `submitted_at` defaults to now(), which is transaction time, so every record
@@ -886,12 +891,17 @@ CREATE INDEX position_analysis_records_job_rack_idx
 -- 40,000-pair job with capture on is 1.8 million positions.
 CREATE TABLE position_analysis_moves (
     id              BIGSERIAL PRIMARY KEY,
+    -- The record is the only parent. A `task_id` column used to sit here as
+    -- well, with its own ON DELETE CASCADE, kept "for the cascade" after the
+    -- job-wide aggregates that read it were removed. That cascade was the
+    -- problem: the column had no index, so deleting a task -- which a purge or
+    -- a job delete does once per task -- scanned this whole table to find the
+    -- moves to cascade, and this is the largest table in the schema. A full
+    -- English opening-rack job is some 6,400 tasks over 32 million move rows,
+    -- which made its purge thousands of sequential scans of the table, hours
+    -- inside one transaction holding the job's dispatch lock. The record's
+    -- cascade already reaches every move through the index below.
     record_id       BIGINT NOT NULL REFERENCES position_analysis_records(id) ON DELETE CASCADE,
-    -- A second cascade path: moves already go with their record, which goes
-    -- with its task, but deleting a task reaches these directly too. It was
-    -- added to let job-wide aggregates skip the record join; there are no such
-    -- aggregates now, and it is kept for the cascade rather than for reads.
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
     score           INT NOT NULL,
@@ -923,9 +933,10 @@ CREATE TABLE position_analysis_plies (
     ply              SMALLINT NOT NULL,
     bingo_percentage DOUBLE PRECISION NOT NULL,
     average_score    DOUBLE PRECISION NOT NULL,
+    -- The UNIQUE above is the index the cascade from moves uses: move_id is
+    -- its leading column, so there is deliberately no second index on it.
     UNIQUE (move_id, ply)
 );
-CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
 -- Shared by games and game pairs: one row per accepted claim, holding the
 -- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games
@@ -1252,6 +1263,15 @@ CREATE TABLE audit_log (
 CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
+-- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
+-- detail view and live push) and the job list's `stalled` flag both ask
+-- "how many of this job's claims completed in the last hour / day", and
+-- task_claims has no job column, so the alternative plan walks every task of
+-- the job and every claim of each -- the job's whole history, for a question
+-- about its last hour. Through this index the scan is bounded by the fleet's
+-- recent completions instead, whatever the job's age.
+CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
+    WHERE state = 'completed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
 -- (job_id, state), not job_id alone: the job list counts a job's tasks and its

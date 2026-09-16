@@ -224,6 +224,7 @@ impl TestDb {
             cfg: cfg.clone(),
             sse: birdtest::sse::SseBroadcaster::new(),
             finish_checks: Default::default(),
+            derived_ready: Default::default(),
             limits: birdtest::ratelimit::RateLimiters::new(),
             mailer: birdtest::email::Mailer::new(cfg.clone()).await,
             artifacts: birdtest::artifacts::ArtifactStore::new(cfg.clone()).await,
@@ -347,7 +348,7 @@ impl TestDb {
         job
     }
 
-    /// A `jobs` row and nothing else: active, allocation 50, floor 0.4.0.
+    /// A `jobs` row and nothing else: active, allocation 50, floor 0.5.0.
     pub async fn bare_job(&self, job_type: &str, redundancy: i32, created_by: Uuid) -> Uuid {
         let ld = self.input_data("letterdist", "english").await;
         let layout = self.input_data("layout", "standard15").await;

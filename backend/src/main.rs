@@ -14,6 +14,11 @@ const RATING_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// unused entry lingers in memory, not how anyone is limited.
 const RATE_LIMIT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How often to expire staged input-data imports nobody confirmed. They
+/// expire after a day (`inputdata::UNCONFIRMED_IMPORT_TTL`), so an hourly
+/// look is plenty.
+const IMPORT_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Local development reads `.env`; in ECS the same variables arrive from the
@@ -79,6 +84,7 @@ async fn main() -> Result<()> {
         builders: Arc::new(builders),
         sse: sse::SseBroadcaster::new(),
         finish_checks: Default::default(),
+        derived_ready: Default::default(),
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,
@@ -139,6 +145,27 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 limits.retain_recent();
+            }
+        });
+    }
+
+    // A staged import is a proposal an admin was shown and did not act on.
+    // Left forever it holds its staged rows and their bytes, and shows a diff
+    // against a vocabulary that has since moved on.
+    {
+        let db = state.pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(IMPORT_EXPIRY_SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match inputdata::expire_unconfirmed_imports(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "expired unconfirmed input data imports"),
+                    Err(err) => {
+                        tracing::error!(error = %err.message, "expiring unconfirmed imports failed")
+                    }
+                }
             }
         });
     }

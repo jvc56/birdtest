@@ -650,7 +650,7 @@ Shows all jobs with: job type, status, priority, allocation, and a completion co
 
 - Job metadata: type, status, config summary, created by, created at.
 - Completion progress.
-- **Per-worker contribution table**: worker identity (username or anonymous UUID), tasks completed for this job. Sorted by tasks completed descending.
+- **Per-worker contribution table**: worker identity (username, or an anonymous worker's pseudonym — never its UUID, which is its credential), tasks completed for this job. Sorted by tasks completed descending.
 
 #### Job Detail Page — By Job Type
 
@@ -923,6 +923,23 @@ What the numbers settled:
   afterwards, so every fit sorted the entire table. With the job filter first it
   is an index walk of those jobs' tasks. The sweep also builds it once per tick
   rather than twice (once to decide the pool was stale, once to fit).
+- **The two questions about recent completions read a time index.** The ETA
+  (on every detail view and live push) counts a job's claims completed in the
+  last hour, and the job list's `stalled` flag asks whether any completed in
+  the last day. `task_claims` has no job column, so both used to walk every
+  task of the job and every claim of each — the job's whole history, for a
+  question about its last hour — on a job whose age is exactly what makes the
+  walk long. A partial index on completed claims by time
+  (`task_claims_completed_idx`) bounds both by the fleet's recent completions
+  instead, whatever the job's age.
+- **Deleting a task no longer scans the moves table.** `position_analysis_moves`
+  carried a `task_id` of its own, with a cascade and no index, so every task a
+  purge or a job delete removed scanned the largest table in the schema to
+  find rows the record's cascade was about to delete anyway — a full English
+  opening-rack job's purge was thousands of sequential scans over tens of
+  millions of rows, inside one transaction holding the job's dispatch lock.
+  The column is gone; moves cascade from their record through the index that
+  serves every read of them.
 - **A pool's residuals are stored with its fit, not rebuilt per view.** The
   public pool page used to rebuild the evidence matrix for its residual table on
   every view — 452 ms at 600,000 paired results, on the connection pool claims
@@ -1001,7 +1018,10 @@ start. The process has no SSM code path of its own.
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
-| `MIN_MAGPIE_VERSION` | `0.4.0` | The enforced global floor, and the default floor for a new job. |
+| `MIN_MAGPIE_VERSION` | `0.5.0` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
+| `MAGPIE_BIN` | `/usr/local/bin/magpie` | The pinned MAGPIE the server runs for every derived file and every leave-generation KLV. The backend image builds one in; locally, a checkout's `bin/magpie`. Startup fails without a working one. |
+| `MAGPIE_THREADS` | `1` | Threads given to a conversion. The web task keeps 1; the derived-file builder task sets its vCPU count. |
+| `MAGPIE_SCRATCH_DIR` | the system temp directory | Where a conversion's throwaway data directory goes. The builder task points it at its ephemeral volume, since a rack info table is 1.9 GB. |
 | `MAGPIE_DOWNLOAD_URL` | the MAGPIE repository | Sent in a shutdown directive. |
 | `MAGPIE_DATA_REPO` | `jvc56/MAGPIE-DATA` | Where import fetches tarballs from. Configuration, never user input. |
 | `GITHUB_TOKEN` | unset | Optional in development, set in production: unauthenticated ref resolution is 60 calls per hour per IP. |
@@ -1345,8 +1365,12 @@ from user input, so the residual exposure is a compromised upstream; that is the
 threat model these checks are written against.
 
 Staging rather than recomputing on confirm means the download happens once and
-the admin confirms exactly what they were shown. Unconfirmed imports are
-garbage-collected after 24 hours. `tarball_sha256` is kept because it is a single
+the admin confirms exactly what they were shown. An import left staged for 24
+hours is expired by an hourly sweep: its staged rows — and the distribution and
+layout bytes they carry — are deleted, and the import is marked `cancelled` with
+a reason, so the admin page says what happened rather than showing a gap. The
+objects it uploaded stay, since they are keyed by digest and are exactly what
+the next import of the same files would upload. `tarball_sha256` is kept because it is a single
 value identifying a whole install, which makes "did this version change under its
 own name?" one comparison. Both phases are audit-logged.
 
@@ -1591,16 +1615,31 @@ WHERE (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
 distribution and a layout — and a client too old to understand `expected_data`
 will contribute unverified rather than decline. "No floor" is not a state worth
 being able to express once every job depends on the client honouring a protocol,
-so the columns are `NOT NULL` and default to **`0.4.0`**: the first MAGPIE
-version whose results depend on nothing but the task (`birdtest-contribute`).
-Builds reporting `0.3.0` and `0.2.0` supplied their own compile-time defaults for
-every setting a request left null, and refused the sampling-rule names birdtest
-sends; `0.2.0` also applied a task's wordmap and rack-info-table flags to the next
-task; `0.1.0` still left the bingo bonus, an opening-rack simulation's settings and
-a leave-generation task's seed to the worker; and `0.0.0` predates the fixes to
-simulation settings, distribution and layout. All must be refused. Because a stale config value would silently floor every new
-job too low, the effective value is shown on the job creation form, pre-filled
-and editable — a visible default rather than a hidden one.
+so the columns are `NOT NULL` and default to **`0.5.0`**, the same value as the
+server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly: the first
+MAGPIE version that checks a wordmap or a rack info table against the hash the
+job pins, and the first that loads a table at all (`birdtest-contribute`).
+`0.4.0` was the first whose results depended on nothing but the task's stated
+settings, but it played with whatever wordmap sat on the worker's disk, checked
+against nothing. Builds reporting `0.3.0` and `0.2.0` supplied their own
+compile-time defaults for every setting a request left null, and refused the
+sampling-rule names birdtest sends; `0.2.0` also applied a task's wordmap and
+rack-info-table flags to the next task; `0.1.0` still left the bingo bonus, an
+opening-rack simulation's settings and a leave-generation task's seed to the
+worker; and `0.0.0` predates the fixes to simulation settings, distribution and
+layout. All must be refused. The one place the floor lives is the server's
+configuration: the column default, the Terraform variable, the compose file and
+the env examples all carry the same value so no path writes a lower one.
+
+`birdtest-contribute` now reports **`0.5.1`**, which additionally switches a
+word info table off for every task (`0.5.0` left a contributor's own `-wit`
+setting in force, an accelerator birdtest neither offers nor checks). The floor
+stays `0.5.0` until the backend image's pinned MAGPIE is moved to a `0.5.1`
+commit: the server refuses to start with a pinned MAGPIE below its own floor,
+so the two move together, and moving the pin is a deliberate step. Because a
+stale config value would silently floor every new job too low, the effective
+value is shown on the job creation form, pre-filled and editable — a visible
+default rather than a hidden one.
 
 **An unparseable version** is treated as `0.0.0`, which under that floor means
 the client is offered nothing and told to update. An *absent* version is not a
@@ -3123,6 +3162,15 @@ Both write into `./data`, which is **assumed writable**. If it is not, that is a
 clear error and `contribute` stops — there is no fallback location. A job that
 asked for neither file never reaches this path.
 
+MAGPIE can open a third file by lexicon name as it loads: a **word info table**
+(`.wit`), a per-substring letter mask move generation prunes with. birdtest
+offers no setting for it and pins no hash, so contribute switches it off for
+both players before every load. It is opt-in on the CLI (`-wit`), and left
+alone a contributor's `settings.txt` — or an earlier command in the same
+process — would have carried it into every task: built from the lexicon on disk
+it prunes nothing legal, built from an older one it prunes plays that exist,
+and nothing in a task would have checked which.
+
 #### Leave generation keeps tables off
 
 Every generation plays with a different KLV, so a table — which caches leave
@@ -3140,6 +3188,15 @@ same wait as a leave-generation job whose universe is not seeded — because
 dispatching without the hash would mean sending a worker no `derived` entry,
 which it reads as a server that checks nothing. `/admin/derived-data` is where
 that wait is visible.
+
+The gate is a query over the job's config, its players, `input_data` and
+`derived_data`, and it runs before the dispatch lock for every candidate job on
+every claim. Once a job has been found dispatchable the answer is remembered
+in the process for good (`derived::DerivedCache`): what a job needs is fixed at
+creation, a `derived_data` row only ever moves toward `built`, and the builder
+the query matches on is a constant of the running binary, so nothing can make a
+remembered answer wrong. A job still waiting is asked about on every claim,
+which is what lets it be dispatched the moment its last file is built.
 
 On the worker, during task execution, after the heartbeat has started: a table
 takes minutes, and the heartbeat is what keeps the claim alive through it.
@@ -3780,6 +3837,8 @@ of the log's growth.
 | `worker.banned` | Ban, with the free-text reason |
 | `worker.unbanned` | Lifting a ban, naming the identity rather than the ban row, which is gone |
 | `user.signed_out_everywhere` | "Sign out everywhere" on the account page |
+| `rating_pool.created` / `rating_pool.member_added` / `rating_pool.member_removed` | Rating pool membership, each of which refits the pool |
+| `derived_data.retried` | An admin re-queueing a failed wordmap or rack info table build |
 
 The `.census` rows are the reason the destructive ones are worth having.
 `purge_job`, `delete_job` and `delete_user` each count what they are about to
@@ -3857,6 +3916,9 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses, game results, or leave-rack progress. At most two run at once; a completed job with a ready export gets a `303` to it instead. |
 | `POST` | `/api/admin/jobs/:id/export` | Build a **completed** job's results into one gzipped NDJSON object in the artifact store. `202` with an id; the work runs on a background task. `409` for a job that is not completed, or whose last claims are still in flight. |
 | `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready. |
+| `GET` | `/api/admin/workers` | The contributor list with anonymous workers' real UUIDs, which banning one needs; the public list carries pseudonyms only. |
+| `GET` | `/api/admin/derived-data` | Every wordmap and rack info table the server has been asked to build: state, builder, hash, attempts and the last error. A job whose files are not `built` is not dispatched, and this is where that wait — or the failure behind it — is visible. |
+| `POST` | `/api/admin/derived-data/retry` | Put a `failed` build back in the queue (`{ role, name }`). Explicit rather than automatic: a build is a pure function of its inputs, so three failures mean a missing input or a broken binary, which a fourth attempt does not fix. |
 | `GET` | `/api/admin/fleet` | What the field is running, from `task_claims.magpie_version`. |
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name, scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
@@ -4013,7 +4075,7 @@ do not exist.
 |---|---|---|
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics. |
-| `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous UUID. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
+| `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`). `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one a second. |
 
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
@@ -4082,6 +4144,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | `/admin/audit-log` | Audit log viewer — filterable by action type, actor, and target; paginated. |
 | `/admin/input-data` | Input data browser and import wizard — pick a tarball date, watch the import, review the staged diff, confirm. |
 | `/admin/fleet` | What MAGPIE versions have claimed work recently, from `task_claims.magpie_version`. |
+| `/admin/derived-data` | The wordmap and rack info table build queue: what is built, pending or failed, and a retry for the failures. |
 | `/admin/backups` | Recent backup runs and the staleness of the newest successful one. |
 
 ---
@@ -4158,6 +4221,9 @@ birdtest/
 │   ├── tests/                      # tiers 2-3: a cloned database per test (TEST_DATABASE_URL)
 │   └── src/
 │       ├── main.rs                 # binary: config, pool, migrations, sweeps, serve
+│       ├── bin/
+│       │   └── build-derived.rs    # the derived-file builder: drains `derived_data`, then exits;
+│       │                           # a scheduled ECS task on the same image (infra/derived.tf)
 │       ├── lib.rs                  # module tree and router assembly, shared with tests/
 │       ├── clientip.rs             # the caller's address behind TRUSTED_PROXY_HOPS proxies
 │       ├── config.rs               # config from env (ECS injects SSM values as env vars)
@@ -4168,6 +4234,12 @@ birdtest/
 │       ├── compat.rs               # MAGPIE's lexicon/leaves/letter-distribution compatibility
 │       │                           # rules, ported to Rust — see Input Data
 │       ├── inputdata.rs            # tarball fetch, untar, per-file digest, diff against input_data
+│       ├── magpie.rs               # the pinned MAGPIE binary as a subprocess, and its scratch
+│       │                           # data directories — see MAGPIE_DEPENDENCY.md
+│       ├── magpie_standard15.txt   # the board layout every scratch directory carries so MAGPIE starts
+│       ├── magpie_defaults.rs      # MAGPIE's defaults, written into player configs and jobs at creation
+│       ├── derived.rs              # wordmaps and rack info tables: what a job needs, the build
+│       │                           # queue, the builds, and the dispatch gate
 │       ├── backups.rs              # reads the `backups` table; never performs a backup
 │       ├── auth/
 │       │   ├── mod.rs              # CurrentUser / AdminUser / WorkerIdentity extractors
@@ -4287,6 +4359,8 @@ birdtest/
 │               │   └── +page.svelte                # /admin/input-data — import wizard
 │               ├── fleet/
 │               │   └── +page.svelte                # /admin/fleet
+│               ├── derived-data/
+│               │   └── +page.svelte                # /admin/derived-data — the build queue
 │               └── backups/
 │                   └── +page.svelte                # /admin/backups
 │
@@ -4302,6 +4376,7 @@ birdtest/
     ├── variables.tf
     ├── outputs.tf
     ├── ecs.tf                      # ECS cluster, task definition, service
+    ├── derived.tf                  # the derived-file builder: task definition, role, schedule
     ├── rds.tf                      # RDS Postgres instance, security group, PITR retention
     ├── s3.tf                       # artifact bucket: versioning, lifecycle, cross-region replication
     ├── backup.tf                   # backup bucket (KMS, Object Lock, CRR), the nightly dump task,
@@ -4464,12 +4539,11 @@ CREATE TABLE input_data (
     -- from. Text, not DATE: it is the artifact's name, and it appears verbatim
     -- in the message a contributor is told to act on.
     tarball_date TEXT NOT NULL CHECK (tarball_date ~ '^\d{8}$'),
-    -- The file's bytes, for the roles the SERVER itself parses. birdtest
-    -- enumerates rack universes from the letter distribution and hands it to
-    -- MAGPIE for every conversion, so those bytes must be the pinned ones --
-    -- there is no server-side disk copy of the data any more. Lexica stay out:
-    -- a 6 MB .kwg in a row is a different proposition, and fifty of them per
-    -- tarball.
+    -- The file's bytes, for the roles the SERVER itself reads. birdtest
+    -- enumerates rack universes and builds KLVs from the letter distribution,
+    -- so those bytes must be the pinned ones -- there is no server-side disk
+    -- copy of the data any more. Lexica stay out: a 15 MB .kwg in a row is a
+    -- different proposition and nothing server-side reads one.
     --
     -- The check is an equivalence, not a nullable convenience: a letterdist or
     -- layout row without bytes cannot exist, and a kwg/klv/winpct row with
@@ -4477,15 +4551,20 @@ CREATE TABLE input_data (
     -- filesystem" branch to write.
     content      BYTEA
                  CHECK ((role IN ('letterdist','layout')) = (content IS NOT NULL)),
-    -- Object-store key for the bytes of the roles the server *builds* from: a
-    -- wordmap needs the .kwg and a rack info table the .klv2 as well. Keyed by
-    -- digest, so a file unchanged between two tarballs is uploaded once.
+    -- Object-store key for the bytes of the roles the server *builds* from, as
+    -- opposed to the ones it parses. A reference wordmap needs the .kwg and a
+    -- reference rack info table the .klv2 as well (see `derived_data`), so
+    -- those two go to the object store rather than into `content`: a 6 MB
+    -- lexicon and a 3.7 MB KLV in a row is a different proposition from a
+    -- 489-byte distribution, there are fifty of each per tarball, and nothing
+    -- queries their contents.
     --
-    -- Nullable, and deliberately not backfilled: rows imported before this
-    -- existed have their bytes nowhere, and there is nothing to derive them
-    -- from short of the tarball. A derived build from such a row fails saying
-    -- exactly that, which tells an admin to re-import -- idempotent, and adding
-    -- no rows for files whose bytes have not changed.
+    -- Keyed by digest, so the same bytes under two paths are one object and a
+    -- file unchanged between two tarballs is uploaded once. NULL for every
+    -- other role, and for a row whose bytes were never stored -- a derived
+    -- build from one of those fails naming the remedy rather than finding a
+    -- missing key. Not an equivalence CHECK like `content` above, because
+    -- nothing stops a row being written by something other than the import.
     object_key   TEXT,
     imported_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     imported_by  UUID REFERENCES users(id) ON DELETE SET NULL,
@@ -4530,13 +4609,100 @@ CREATE TABLE input_data_import_rows (
     -- Carried from phase 1 for letterdist/layout entries so confirmation
     -- inserts input_data.content without re-downloading the tarball.
     content     BYTEA,
-    -- Likewise for kwg/klv entries, whose bytes went to the object store while
-    -- the archive was still in memory. An import the admin then cancels leaves
+    -- Likewise for kwg/klv entries, whose bytes go to the object store while
+    -- the archive is still in memory. An import the admin then cancels leaves
     -- an object nobody references, which is keyed by digest and so is exactly
     -- what the next import of the same file would have uploaded anyway.
     object_key  TEXT,
     PRIMARY KEY (import_id, path, sha256)
 );
+
+-- Derived files: the wordmaps and rack info tables the server builds a
+-- reference copy of, and the hash a worker has to reproduce.
+--
+-- Neither file is ever shipped -- 179 MB and 1.9 GB for CSW24 -- so every
+-- machine that needs one builds it from files it already has. What travels
+-- instead is the SHA-256 the server's own pinned MAGPIE got from the same
+-- inputs: a worker builds its own copy and uses it only if the bytes agree,
+-- and declines the task otherwise. See MAGPIE_DEPENDENCY.md.
+--
+-- The key is the whole identity of the file rather than a surrogate, because
+-- what makes two derived files the same file is that they were built from the
+-- same inputs by the same builder. A wordmap depends on a .kwg and the letter
+-- distribution it is built against; a rack info table depends on a .klv2 as
+-- well, because its entries carry precomputed leave values.
+--
+-- `builder` is separate from the MAGPIE version on purpose. A CSW24 wordmap
+-- built in December 2025 and one built nine months later differ in 72,852,152
+-- bytes with the same inputs and the same wordmap format version: the builder
+-- changed and the format did not have to. MAGPIE carries WMP_BUILDER_VERSION
+-- and RIT_BUILDER_VERSION for exactly this, a test pins their output so a
+-- change cannot pass without bumping them, and the server asks the binary it
+-- runs (`magpie builders`) rather than being told in configuration.
+CREATE TABLE derived_data (
+    role          TEXT NOT NULL CHECK (role IN ('wmp','rit')),
+    -- What the worker loads the file as. A wordmap's is its lexicon's name; a
+    -- rack info table's is '<lexicon>.<leaves>', because a table belongs to a
+    -- (.kwg, .klv2) pair and two jobs on CSW24 with different leaves must not
+    -- share one.
+    name          TEXT NOT NULL,
+    builder       TEXT NOT NULL,          -- 'wmp-1', 'rit-1'
+    kwg_id        UUID NOT NULL REFERENCES input_data(id),
+    -- NULL for a wordmap, which is built from the lexicon alone. The partial
+    -- unique indexes below are what make (role, name, builder, kwg, NULL) a key
+    -- rather than a duplicate waiting to happen: in a UNIQUE constraint two
+    -- NULLs are distinct, so a plain UNIQUE would let a wordmap be queued
+    -- twice.
+    klv_id        UUID REFERENCES input_data(id),
+    letterdist_id UUID NOT NULL REFERENCES input_data(id),
+    state         TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (state IN ('pending','building','built','failed')),
+    -- Set exactly when state = 'built'. The equivalence is a constraint rather
+    -- than a convention because dispatch reads this hash: a row that says
+    -- 'built' with no hash would be dispatched as if it had one.
+    sha256        TEXT CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    bytes         BIGINT CHECK (bytes >= 0),
+    -- The instruction-set target the building MAGPIE was compiled for, e.g.
+    -- 'nehalem'. Recorded and reported, never compared: measurement says these
+    -- builders' output does not depend on it, and a contributor who builds
+    -- from source should not be locked out on the strength of a field. If that
+    -- ever stops being true, this column is the evidence.
+    build_target  TEXT,
+    -- Why the last attempt failed, shown to the admin verbatim.
+    error         TEXT,
+    -- Taken by the builder task when it starts a row, so a second builder does
+    -- not start the same three-minute build. A lease rather than a plain flag:
+    -- a builder that dies leaves 'building' behind forever otherwise.
+    leased_until  TIMESTAMPTZ,
+    attempts      INT NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    built_at      TIMESTAMPTZ,
+    CONSTRAINT derived_data_built_has_hash CHECK (
+        (state = 'built') = (sha256 IS NOT NULL AND bytes IS NOT NULL)
+    ),
+    -- A wordmap is built from the lexicon and the distribution; a rack info
+    -- table additionally from the leaves. A wmp row carrying a klv_id would be
+    -- claiming a dependency it does not have.
+    CONSTRAINT derived_data_inputs_match_role CHECK (
+        (role = 'rit') = (klv_id IS NOT NULL)
+    )
+);
+
+-- The identity of a derived file, in the two shapes it comes in. Partial
+-- indexes because a wordmap's klv_id is NULL and NULLs are distinct in a
+-- UNIQUE constraint, which would silently permit duplicate wordmap rows.
+CREATE UNIQUE INDEX derived_data_wmp_idx
+    ON derived_data (name, builder, kwg_id, letterdist_id)
+    WHERE role = 'wmp';
+CREATE UNIQUE INDEX derived_data_rit_idx
+    ON derived_data (name, builder, kwg_id, klv_id, letterdist_id)
+    WHERE role = 'rit';
+
+-- The builder task's queue: oldest request first, so a job that has been
+-- waiting is not starved by one created since.
+CREATE INDEX derived_data_queue_idx
+    ON derived_data (requested_at)
+    WHERE state IN ('pending','building');
 
 -- Jobs
 
@@ -4587,15 +4753,20 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.4.0 is the
-    -- first MAGPIE version whose results depend on nothing but the task: 0.1.0
+    -- so "no floor" is not a state worth being able to express. 0.5.0 is the
+    -- first MAGPIE version that checks a wordmap or a rack info table against
+    -- the hash the job pins, and the first that loads a table at all: 0.1.0
     -- left the bingo bonus, an opening-rack simulation's settings and a
     -- leave-generation task's seed to the worker's own settings; before 0.3.0 a
-    -- task's wordmap and rack-info-table flags applied to the next task; and
+    -- task's wordmap and rack-info-table flags applied to the next task;
     -- before 0.4.0 every setting a request left null came from the worker's
-    -- compile-time defaults.
+    -- compile-time defaults; and 0.4.0 played with whatever wordmap sat on the
+    -- worker's disk, checked against nothing. The default here is the same
+    -- value as the server's MIN_MAGPIE_VERSION, which create_job writes
+    -- explicitly; the two are kept equal so a row written any other way
+    -- (a restore, a hand insert) does not floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 4 CHECK (min_magpie_minor >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 5 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
@@ -4946,7 +5117,11 @@ CREATE TABLE worker_data_gaps (
     actual       TEXT,                    -- NULL = file absent
     reported_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, role, name);
+-- (job_id, reported_at): the job list asks whether a job has a gap reported in
+-- the last 24 hours, and the admin view groups a job's gaps, so both start at
+-- the job. Ordered by time within it, the first question stops at the newest
+-- row rather than walking every gap the job ever had.
+CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, reported_at DESC);
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
@@ -5051,8 +5226,7 @@ CREATE TABLE position_analysis_records (
     -- results feed, the rack lookup, the admin stream, the export -- filtered
     -- on the job and could only reach it through `tasks`, which put the filter
     -- on the far side of a join from the sort and made the whole job the unit
-    -- of work. With the column here they are index scans. `position_analysis_
-    -- moves` already carries `task_id` for the same family of reason.
+    -- of work. With the column here they are index scans.
     job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     rack            TEXT NOT NULL,
     -- CGP of the position analysed. NULL for an opening rack, where the board
@@ -5095,9 +5269,6 @@ CREATE UNIQUE INDEX position_analysis_records_rack_idx
     ON position_analysis_records (task_claim_id, rack)
     WHERE game_index IS NULL;
 
-CREATE INDEX position_analysis_records_task_idx
-    ON position_analysis_records (task_id, rack);
-
 -- The public results feed, which is newest-first within a job and paginated by
 -- keyset. `id` is in the index because it is the cursor's tiebreaker:
 -- `submitted_at` defaults to now(), which is transaction time, so every record
@@ -5117,12 +5288,17 @@ CREATE INDEX position_analysis_records_job_rack_idx
 -- 40,000-pair job with capture on is 1.8 million positions.
 CREATE TABLE position_analysis_moves (
     id              BIGSERIAL PRIMARY KEY,
+    -- The record is the only parent. A `task_id` column used to sit here as
+    -- well, with its own ON DELETE CASCADE, kept "for the cascade" after the
+    -- job-wide aggregates that read it were removed. That cascade was the
+    -- problem: the column had no index, so deleting a task -- which a purge or
+    -- a job delete does once per task -- scanned this whole table to find the
+    -- moves to cascade, and this is the largest table in the schema. A full
+    -- English opening-rack job is some 6,400 tasks over 32 million move rows,
+    -- which made its purge thousands of sequential scans of the table, hours
+    -- inside one transaction holding the job's dispatch lock. The record's
+    -- cascade already reaches every move through the index below.
     record_id       BIGINT NOT NULL REFERENCES position_analysis_records(id) ON DELETE CASCADE,
-    -- A second cascade path: moves already go with their record, which goes
-    -- with its task, but deleting a task reaches these directly too. It was
-    -- added to let job-wide aggregates skip the record join; there are no such
-    -- aggregates now, and it is kept for the cascade rather than for reads.
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
     score           INT NOT NULL,
@@ -5154,9 +5330,10 @@ CREATE TABLE position_analysis_plies (
     ply              SMALLINT NOT NULL,
     bingo_percentage DOUBLE PRECISION NOT NULL,
     average_score    DOUBLE PRECISION NOT NULL,
+    -- The UNIQUE above is the index the cascade from moves uses: move_id is
+    -- its leading column, so there is deliberately no second index on it.
     UNIQUE (move_id, ply)
 );
-CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
 -- Shared by games and game pairs: one row per accepted claim, holding the
 -- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games
@@ -5258,69 +5435,23 @@ CREATE TABLE leave_generation_artifacts (
     -- SHA-256 of the KLV bytes as first written. The object store holds the
     -- only copy of these bytes, and an artifact is the one piece of state that
     -- can be silently overwritten -- by a restore that replays a generation
-    -- transition against fewer results, or by a rebuild under a different KLV
-    -- builder. Recording the hash is what turns that from invisible into a
+    -- transition against fewer results, or by a rebuild under a changed
+    -- klv::build. Recording the hash is what turns that from invisible into a
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    -- The MAGPIE KLV builder that wrote these bytes ('klv-1'). MAGPIE builds
-    -- these artifacts, so an upgrade can legitimately change the bytes for the
-    -- same leave values, and a rebuild has to be able to say "different
-    -- builder" rather than "differs". Without that, the first upgrade after a
-    -- restore drill reads as data loss.
+    -- The MAGPIE KLV builder that wrote these bytes ('klv-1').
+    --
+    -- MAGPIE builds these artifacts, so an upgrade can legitimately change the
+    -- bytes for the same leave values. Without knowing which builder wrote an
+    -- artifact, `rebuild-artifacts` could only report "differs" -- and the
+    -- first MAGPIE upgrade after a restore drill would read as data loss. With
+    -- it, a rebuild under a different builder says so, and only two artifacts
+    -- from the *same* builder disagreeing is evidence of anything.
     builder       TEXT NOT NULL,
     completed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, generation)
 );
-
--- One row per (role, inputs, builder): the wordmap or rack info table the
--- server built, and the hash a worker has to reproduce. See "Wordmap and rack
--- info table provenance".
---
--- Neither file is shipped -- 179 MB and 1.9 GB for CSW24 -- so what travels is
--- the hash. The key is the whole identity of the file rather than a surrogate,
--- because what makes two derived files the same file is that they were built
--- from the same inputs by the same builder.
-CREATE TABLE derived_data (
-    role          TEXT NOT NULL CHECK (role IN ('wmp','rit')),
-    -- What the worker loads the file as: a lexicon's name for a wordmap,
-    -- '<lexicon>.<leaves>' for a table, because a table stores precomputed
-    -- leave values and so belongs to the pair.
-    name          TEXT NOT NULL,
-    builder       TEXT NOT NULL,          -- 'wmp-1', 'rit-1'
-    kwg_id        UUID NOT NULL REFERENCES input_data(id),
-    klv_id        UUID REFERENCES input_data(id),   -- NULL for a wordmap
-    letterdist_id UUID NOT NULL REFERENCES input_data(id),
-    state         TEXT NOT NULL DEFAULT 'pending'
-                  CHECK (state IN ('pending','building','built','failed')),
-    -- Set exactly when state = 'built'. An equivalence rather than a
-    -- convention because dispatch reads this hash: a row saying 'built' with
-    -- no hash would be dispatched as if it had one.
-    sha256        TEXT CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    bytes         BIGINT CHECK (bytes >= 0),
-    build_target  TEXT,                   -- 'nehalem'; recorded, never compared
-    error         TEXT,
-    leased_until  TIMESTAMPTZ,            -- so two builders cannot take one row
-    attempts      INT NOT NULL DEFAULT 0 CHECK (attempts >= 0),
-    requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    built_at      TIMESTAMPTZ,
-    CONSTRAINT derived_data_built_has_hash CHECK (
-        (state = 'built') = (sha256 IS NOT NULL AND bytes IS NOT NULL)
-    ),
-    CONSTRAINT derived_data_inputs_match_role CHECK (
-        (role = 'rit') = (klv_id IS NOT NULL)
-    )
-);
-
--- Partial, not a UNIQUE constraint: a wordmap's klv_id is NULL and two NULLs
--- are distinct in a UNIQUE, which would silently permit duplicate wordmap rows.
-CREATE UNIQUE INDEX derived_data_wmp_idx
-    ON derived_data (name, builder, kwg_id, letterdist_id) WHERE role = 'wmp';
-CREATE UNIQUE INDEX derived_data_rit_idx
-    ON derived_data (name, builder, kwg_id, klv_id, letterdist_id)
-    WHERE role = 'rit';
-CREATE INDEX derived_data_queue_idx ON derived_data (requested_at)
-    WHERE state IN ('pending','building');
 
 -- One row per generation transition that has been *started*, claimed by the
 -- worker request that found the generation complete.
@@ -5529,6 +5660,15 @@ CREATE TABLE audit_log (
 CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
+-- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
+-- detail view and live push) and the job list's `stalled` flag both ask
+-- "how many of this job's claims completed in the last hour / day", and
+-- task_claims has no job column, so the alternative plan walks every task of
+-- the job and every claim of each -- the job's whole history, for a question
+-- about its last hour. Through this index the scan is bounded by the fleet's
+-- recent completions instead, whatever the job's age.
+CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
+    WHERE state = 'completed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
 -- (job_id, state), not job_id alone: the job list counts a job's tasks and its
@@ -6176,7 +6316,18 @@ directly on the host with `cargo run`.
 ```bash
 docker compose --profile dev up          # adds Vite with HMR on :5174
 docker compose --profile fake-worker up  # end-to-end suite only: synthetic results
+docker compose run --rm derived-builder  # on demand: build the wordmaps and rack
+                                         # info tables queued jobs are waiting on
 ```
+
+The builder is the same image with the entrypoint production's scheduled task
+uses (`infra/derived.tf`), run once and exited. Nothing else in the stack
+builds a derived file, so a job whose players ask for a wordmap or a rack info
+table -- a leave-generation job does by default -- is not dispatched until it
+has run; `/admin/derived-data` shows the queue. `scripts/e2e_magpie.py` runs
+it for the jobs it creates that need one, which is what makes the server-built
+hash, the worker's own build and the comparison between them part of the
+nightly end-to-end run.
 
 The `dev` profile runs the Vite dev server with `frontend/` bind-mounted and
 `node_modules` in a named volume, so hot reload works without Node on the host

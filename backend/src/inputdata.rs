@@ -568,6 +568,45 @@ async fn stage(
     Ok(tarball_sha256)
 }
 
+/// How long a staged import waits for the admin's confirmation before it is
+/// expired. The diff it shows is against `input_data` as it was when the
+/// import ran, so an old one is a proposal about a vocabulary that may have
+/// moved on; and each staged row keeps the bytes of its letter distributions
+/// and layouts, which is storage held for a decision nobody is going to make.
+pub const UNCONFIRMED_IMPORT_TTL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Expires staged imports older than [`UNCONFIRMED_IMPORT_TTL`]: the staged
+/// rows -- and the bytes they carry -- are deleted, and the import is marked
+/// `cancelled` with a reason, so the admin page says what happened to it
+/// rather than showing a gap. The objects an import uploaded stay: they are
+/// keyed by digest and are exactly what the next import of the same files
+/// would upload anyway.
+///
+/// Returns how many imports were expired.
+pub async fn expire_unconfirmed_imports(pool: &sqlx::PgPool) -> AppResult<u64> {
+    let mut tx = pool.begin().await?;
+    let expired: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE input_data_imports
+         SET state = 'cancelled',
+             error = 'not confirmed within 24 hours; start the import again to review it'
+         WHERE state = 'staged'
+           AND requested_at < now() - make_interval(secs => $1)
+         RETURNING id",
+    )
+    .bind(UNCONFIRMED_IMPORT_TTL.as_secs_f64())
+    .fetch_all(&mut *tx)
+    .await?;
+    if !expired.is_empty() {
+        sqlx::query("DELETE FROM input_data_import_rows WHERE import_id = ANY($1)")
+            .bind(&expired)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(expired.len() as u64)
+}
+
 /// Startup reaper. Single instance, so a row left `running` belongs to a
 /// process that is gone.
 pub async fn fail_orphaned_imports(pool: &sqlx::PgPool) -> AppResult<u64> {

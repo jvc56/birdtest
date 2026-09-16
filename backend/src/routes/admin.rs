@@ -1948,6 +1948,9 @@ async fn delete_job(
         return Err(AppError::not_found("no such job"));
     }
     tx.commit().await?;
+    // Tidiness only: a remembered answer for a job that no longer exists is
+    // never asked for, but there is no reason to keep it.
+    state.derived_ready.forget(id);
     Ok(StatusCode::NO_CONTENT)
 }
 

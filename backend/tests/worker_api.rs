@@ -799,10 +799,10 @@ async fn redundant_captured_positions_are_recorded_once() {
     }
 
     let (records, moves): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM position_analysis_records r
-                 JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1),
+        "SELECT (SELECT COUNT(*) FROM position_analysis_records r WHERE r.job_id = $1),
                 (SELECT COUNT(*) FROM position_analysis_moves m
-                 JOIN tasks t ON t.id = m.task_id WHERE t.job_id = $1)",
+                 JOIN position_analysis_records r ON r.id = m.record_id
+                 WHERE r.job_id = $1)",
     )
     .bind(job)
     .fetch_one(&db.pool)
@@ -1351,6 +1351,57 @@ async fn a_job_is_not_dispatched_until_its_derived_files_are_built() {
     assert_eq!(derived[0]["name"], "NWL23");
     assert_eq!(derived[0]["builder"], "wmp-1");
     assert!(derived[0]["sha256"].is_string(), "{body}");
+}
+
+/// Once a job has been found dispatchable, its hashes are answered from memory
+/// for the rest of the process: the query behind them ran for every candidate
+/// job on every claim, and its answer for a dispatchable job cannot change
+/// (see `derived::DerivedCache`). Pinned by removing the rows behind the
+/// answer -- not a path anything real takes, but the one observation that
+/// tells a remembered answer from a re-read one -- and by forgetting the job,
+/// after which the gate is consulted again.
+#[tokio::test]
+async fn a_dispatchable_jobs_hashes_are_remembered_for_the_process() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = deriving_player(&db, "cache-p1", kwg, klv, false).await;
+    let p2 = deriving_player(&db, "cache-p2", kwg, klv, false).await;
+    let job = job_between(&db, p1, p2).await;
+    let worker = registered_worker(&db).await;
+
+    // Waiting is never remembered: the job is dispatched the moment it is built.
+    let (status, _) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(state.derived_ready.get(job).is_none(), "a waiting job is not remembered");
+    db.derived_ready(job).await;
+    let (status, first) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let remembered = state.derived_ready.get(job).expect("a dispatchable job is remembered");
+    assert_eq!(remembered.len(), 1);
+
+    // Submit, so the worker can be handed the job's next task, then take the
+    // rows away: the next claim can only carry the hash if it was remembered.
+    let token = first["claim_token"].as_str().unwrap();
+    let (status, body) = submit_as(&app, &worker, token, games_result(10, 5)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    sqlx::query("DELETE FROM derived_data").execute(&db.pool).await.unwrap();
+    let (status, second) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["expected_data"]["derived"], first["expected_data"]["derived"],
+        "the remembered hashes are the ones the claim carries"
+    );
+
+    // Forgotten, the gate is consulted again -- and now finds nothing built.
+    // A second worker asks, since the first has spent its request burst.
+    let token = second["claim_token"].as_str().unwrap();
+    submit_as(&app, &worker, token, games_result(10, 5)).await;
+    state.derived_ready.forget(job);
+    let (status, body) = claim_as(&app, &registered_worker(&db).await).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
 
 /// A failed build blocks dispatch exactly as an unbuilt one does. "Give up and

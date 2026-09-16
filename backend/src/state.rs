@@ -94,4 +94,8 @@ pub struct AppState {
     /// Debounces the per-submission finish-condition check; see
     /// [`SPRT_CHECK_EVERY`].
     pub finish_checks: FinishCheckCounters,
+    /// The built wordmap and rack-info-table hashes of every job this process
+    /// has found dispatchable, so the claim path asks the database once per
+    /// job rather than once per claim; see [`crate::derived::DerivedCache`].
+    pub derived_ready: crate::derived::DerivedCache,
 }

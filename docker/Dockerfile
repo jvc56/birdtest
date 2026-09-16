@@ -28,7 +28,11 @@ FROM debian:bookworm-slim AS magpie-build
 
 # The commit this image's hashes are produced by. Passed as a build argument
 # and recorded on the image, so "which MAGPIE built this wordmap" is a `docker
-# inspect` rather than a guess. CI's magpie-contract job pins the same commit.
+# inspect` rather than a guess. CI's magpie-contract and nightly jobs test the
+# head of `birdtest-contribute` rather than this commit, on purpose: they are
+# what notices a MAGPIE-side change before the pin is moved to it. Moving the
+# pin is a deliberate step, and MIN_MAGPIE_VERSION must never exceed the
+# version this commit reports.
 ARG MAGPIE_COMMIT=dc007fc5a01bceac9154225454519cd72834d364
 ARG MAGPIE_REPO=https://github.com/jvc56/MAGPIE.git
 

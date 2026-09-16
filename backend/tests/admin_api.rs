@@ -114,6 +114,135 @@ async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
     assert_eq!((tasks, issued, games, racks), (0, 0, 0, 0));
 }
 
+/// Captured positions, their moves and their plies go with the job when it is
+/// purged, through the record: `position_analysis_moves` used to carry its own
+/// `task_id` with a cascade of its own, and that column had no index, so every
+/// task a purge deleted scanned the whole moves table -- the largest in the
+/// schema -- to find the rows the record cascade was about to delete anyway.
+#[tokio::test]
+async fn purging_a_job_removes_its_captured_positions_through_the_record() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+
+    let (status, assignment) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    let uuid = assignment["worker_uuid"].as_str().unwrap();
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([
+        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+          "num_moves": 40,
+          "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
+                      "win_percentage": 55.0, "blended_utility": 0.6,
+                      "plies": [{ "ply": 0, "bingo_percentage": 0.0, "average_score": 24.0 }] }] },
+    ]);
+    let (_, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": assignment["claim_token"], "result": result }),
+        ),
+    )
+    .await;
+    assert_eq!(body, json!({ "accepted": true }));
+
+    let counts = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT (SELECT COUNT(*) FROM position_analysis_records),
+                    (SELECT COUNT(*) FROM position_analysis_moves),
+                    (SELECT COUNT(*) FROM position_analysis_plies)",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(counts().await, (1, 1, 1));
+
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let (status, body) =
+        send(&app, request("POST", &format!("/api/admin/jobs/{job}/purge"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(counts().await, (0, 0, 0), "record, moves and plies all cascade from the task");
+}
+
+/// A staged import the admin never confirmed is a proposal about a vocabulary
+/// that has since moved on, holding the bytes of every distribution and layout
+/// it staged. After a day it is expired: its rows go, and the import says why,
+/// rather than vanishing from the page.
+#[tokio::test]
+async fn an_unconfirmed_import_expires_after_a_day_and_says_so() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let insert = |state: &'static str, age: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO input_data_imports
+                     (tarball_date, commit_sha, state, requested_by, requested_at)
+                 VALUES ('20251004', repeat('a', 40), $1, $2, now() - $3::interval)
+                 RETURNING id",
+            )
+            .bind(state)
+            .bind(admin)
+            .bind(age)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO input_data_import_rows
+                     (import_id, path, role, name, sha256, bytes, disposition, content)
+                 VALUES ($1, 'letterdistributions/english.csv', 'letterdist', 'english',
+                         repeat('b', 64), 5, 'new', 'bytes'::bytea)",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let stale = insert("staged", "25 hours").await;
+    let fresh = insert("staged", "23 hours").await;
+    let running = insert("running", "25 hours").await;
+    let confirmed = insert("confirmed", "25 hours").await;
+
+    assert_eq!(birdtest::inputdata::expire_unconfirmed_imports(&db.pool).await.unwrap(), 1);
+
+    let state_and_rows = |id: Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT state, error,
+                        (SELECT COUNT(*) FROM input_data_import_rows r WHERE r.import_id = i.id)
+                 FROM input_data_imports i WHERE i.id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (state, error, rows) = state_and_rows(stale).await;
+    assert_eq!((state.as_str(), rows), ("cancelled", 0));
+    assert!(error.unwrap_or_default().contains("24 hours"));
+    // Younger than a day, still running, or already confirmed: untouched.
+    for (id, expected) in [(fresh, "staged"), (running, "running"), (confirmed, "confirmed")] {
+        let (state, _, rows) = state_and_rows(id).await;
+        assert_eq!((state.as_str(), rows), (expected, 1));
+    }
+    // And a second sweep finds nothing left to expire.
+    assert_eq!(birdtest::inputdata::expire_unconfirmed_imports(&db.pool).await.unwrap(), 0);
+}
+
 /// Bug: `audit_log.actor_user_id`, `player_configs.created_by` and
 /// `worker_bans.banned_by` all referenced `users` with no ON DELETE clause, so
 /// a user who had registered (and so has a `user.registered` row), created a

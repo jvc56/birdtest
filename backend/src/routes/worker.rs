@@ -143,7 +143,7 @@ struct ExpectedData {
     /// Always serialized, empty included. A missing key would be read by a
     /// client as an older server that checks nothing, which is precisely the
     /// state this replaces; `[]` says "this job needs no derived file".
-    derived: Vec<crate::derived::ExpectedDerived>,
+    derived: std::sync::Arc<Vec<crate::derived::ExpectedDerived>>,
 }
 
 #[derive(Serialize)]
@@ -828,14 +828,14 @@ mod contract_fixtures {
                     bytes: 4_719_596,
                     tarball_date: "20251004".into(),
                 }],
-                derived: vec![crate::derived::ExpectedDerived {
+                derived: std::sync::Arc::new(vec![crate::derived::ExpectedDerived {
                     role: "wmp".into(),
                     name: "NWL23".into(),
                     sha256: "214a46d7".into(),
                     bytes: 104_857_600,
                     builder: "wmp-1".into(),
                     build_target: "nehalem".into(),
-                }],
+                }]),
             },
             // Absent from the fixture: it is sent only to a worker that
             // arrived with no identity at all, which this one did not.

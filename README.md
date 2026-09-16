@@ -49,6 +49,19 @@ toolchain in the loop — that is a property of an assertion harness, not of a
 place you develop. Watching synthetic numbers move a dashboard tells you
 nothing about what your change did.
 
+**A job whose players ask for a wordmap or a rack info table waits for the
+builder.** The server publishes the hash of a copy it built itself, and nothing
+in the compose stack builds one on its own — production runs the builder as a
+scheduled task ([infra/derived.tf](infra/derived.tf)). Run it once, after
+creating such a job, and it drains the queue and exits:
+
+```bash
+docker compose run --rm derived-builder
+```
+
+`/admin/derived-data` shows what is waiting. The end-to-end script does this
+itself for the jobs it creates that need it.
+
 So this needs two things Docker cannot provide, and fails naming both when
 either is missing:
 

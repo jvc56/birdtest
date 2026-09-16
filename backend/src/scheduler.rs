@@ -35,7 +35,7 @@ pub struct TaskClaim {
     pub expected_data: Vec<ExpectedFile>,
     /// The wordmap and rack info table hashes this job's tasks must reproduce.
     /// Empty for a job whose players ask for neither.
-    pub derived_data: Vec<crate::derived::ExpectedDerived>,
+    pub derived_data: std::sync::Arc<Vec<crate::derived::ExpectedDerived>>,
 }
 
 /// The four answers a claim can get. One decision, not four checks: `204` and
@@ -376,23 +376,29 @@ async fn try_claim_from_job(
     // worker reads as "this server does not check derived files", falling back
     // to whatever is on its disk -- or carry an empty one. Waiting is the only
     // answer that cannot be mistaken for success.
-    let derived = {
-        let mut conn = state.pool.acquire().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
-        crate::derived::status_for_job(&mut conn, job.id, &state.builders)
-            .await
-            .map_err(JobClaimError::Fatal)?
+    //
+    // Answered from memory once a job has been found dispatchable: this runs
+    // for every candidate job on every claim, and the answer for a
+    // dispatchable job cannot change for the life of the process (see
+    // `derived::DerivedCache`). A job still waiting is asked about each time.
+    let derived = match state.derived_ready.get(job.id) {
+        Some(ready) => ready,
+        // Only a miss takes a pool connection: the common case is a hit, and
+        // a connection held for a lookup the cache answers is one a worker's
+        // claim or submission is waiting for.
+        None => {
+            let mut conn =
+                state.pool.acquire().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+            let ready =
+                crate::derived::ready_for_job(&mut conn, job.id, &state.builders, &state.derived_ready)
+                    .await
+                    .map_err(JobClaimError::Fatal)?;
+            match ready {
+                Some(ready) => ready,
+                None => return Ok(None),
+            }
+        }
     };
-    if !derived.dispatchable() {
-        // Logged at debug: a table takes minutes to build, and every worker
-        // asking during those minutes would otherwise produce a line each.
-        // `GET /api/admin/derived-data` is where an admin looks.
-        tracing::debug!(
-            job_id = %job.id,
-            pending = ?derived.pending, failed = ?derived.failed,
-            "job is waiting on a derived file"
-        );
-        return Ok(None);
-    }
 
     let mut tx = state.pool.begin().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
 
@@ -513,7 +519,7 @@ async fn try_claim_from_job(
                         request,
                         min_magpie_version: job.min_magpie_version().to_string(),
                         expected_data: expected,
-                        derived_data: derived.ready,
+                        derived_data: derived,
                     }))
                 }
                 Err(err) => {
