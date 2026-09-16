@@ -123,7 +123,7 @@ async fn ensure_template() {
 /// and the contract fixtures move together.
 pub fn test_builders() -> birdtest::magpie::Builders {
     birdtest::magpie::Builders {
-        magpie_version: "0.5.0".into(),
+        magpie_version: "0.5.1".into(),
         build_target: "nehalem".into(),
         wmp_builder_version: 1,
         rit_builder_version: 1,
@@ -181,7 +181,7 @@ impl TestDb {
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
-            min_magpie_version: "0.5.0".into(),
+            min_magpie_version: "0.5.1".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
             // A path that is not a binary. Nothing below tier 6 runs a
             // conversion, and a test that reached one should fail loudly
@@ -348,7 +348,7 @@ impl TestDb {
         job
     }
 
-    /// A `jobs` row and nothing else: active, allocation 50, floor 0.5.0.
+    /// A `jobs` row and nothing else: active, allocation 50, floor 0.5.1.
     pub async fn bare_job(&self, job_type: &str, redundancy: i32, created_by: Uuid) -> Uuid {
         let ld = self.input_data("letterdist", "english").await;
         let layout = self.input_data("layout", "standard15").await;

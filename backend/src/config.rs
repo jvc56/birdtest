@@ -147,7 +147,7 @@ impl Config {
             other => anyhow::bail!("SECURE_COOKIES must be 'true' or 'false', got {other:?}"),
         };
 
-        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.5.0");
+        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.5.1");
         if crate::version::Version::parse_or_zero(&min_magpie_version)
             == crate::version::Version::ZERO
             && min_magpie_version.trim() != "0.0.0"
@@ -167,12 +167,16 @@ impl Config {
             heartbeat_timeout: Duration::from_secs(parsed("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            // 0.5.0 is the first MAGPIE version that checks a wordmap or a
-            // rack info table against the hash the job pins, and the first
-            // that will load a table at all. 0.4.0 was the first whose results
-            // depend on nothing but the task; it ran every job with rack info
-            // tables switched off, so raising the floor past it is what lets
-            // `use_rit` mean anything.
+            // 0.5.1 is the first MAGPIE version that switches a word info
+            // table off before every task's lexicon loads. 0.5.0 left a
+            // contributor's own `-wit` setting in force: a table built from
+            // an older lexicon prunes plays that exist, and birdtest neither
+            // offers a setting for it nor pins a hash. 0.5.0 was the first
+            // that checks a wordmap or a rack info table against the hash the
+            // job pins, and the first that will load a table at all. 0.4.0
+            // was the first whose results depend on nothing but the task; it
+            // ran every job with rack info tables switched off, so raising the
+            // floor past it is what lets `use_rit` mean anything.
             //
             // 0.3.0 and 0.2.0 supplied their own compile-time
             // defaults for every setting a request left null, and refused the

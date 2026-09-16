@@ -176,8 +176,8 @@ magpie BUILD=portable_release`) and set `MAGPIE_ROOT` if the checkout is not at
 server's builder and the fleet's identical.
 
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.5.0`, which `birdtest-contribute` reports.
-A checkout from before that reports `0.4.0` or lower, and every task is declined with
+`MIN_MAGPIE_VERSION` defaults to `0.5.1`, which `birdtest-contribute` reports.
+A checkout from before that reports `0.5.0` or lower, and every task is declined with
 "update MAGPIE" until you update it or lower the floor — on the server *and*
 on the job, which records its own floor at creation:
 
@@ -290,9 +290,11 @@ To rotate the password later, run the same `modify-db-instance` and
 
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
 redirects — because the backend sets `Secure` cookies, which a browser will not
-keep over plain HTTP. `min_magpie_version` defaults to `0.5.0`, the first MAGPIE
-version that checks a wordmap or a rack info table against the hash the job
-pins; raise it whenever a MAGPIE release changes results. `derived_builder_image`
+keep over plain HTTP. `min_magpie_version` defaults to `0.5.1`, the first MAGPIE
+version that switches a word info table off for every task (`0.5.0` checked a
+wordmap or a rack info table against the hash the job pins but left a
+contributor's own word info table in force); raise it whenever a MAGPIE release
+changes results. `derived_builder_image`
 has no default — it is the backend image built with `--target derived-builder`,
 and it must carry the same MAGPIE as `backend_image`, since the builder version
 recorded beside every hash comes from the binary that produced it.

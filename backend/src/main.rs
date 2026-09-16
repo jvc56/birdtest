@@ -19,6 +19,12 @@ const RATE_LIMIT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from
 /// look is plenty.
 const IMPORT_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
 
+/// How often to thin each pool's rating runs older than
+/// `ratings::RUN_FULL_RESOLUTION` down to one a day. The window is a month, so
+/// an hourly look is plenty; past the first pass each one deletes an hour's
+/// worth of runs.
+const RATING_RUN_THIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Local development reads `.env`; in ECS the same variables arrive from the
@@ -164,6 +170,27 @@ async fn main() -> Result<()> {
                     Ok(n) => tracing::info!(count = n, "expired unconfirmed input data imports"),
                     Err(err) => {
                         tracing::error!(error = %err.message, "expiring unconfirmed imports failed")
+                    }
+                }
+            }
+        });
+    }
+
+    // Rating runs are snapshots, one per fit, and a pool with an active job
+    // takes one every two minutes for as long as the job runs. Past a month the
+    // last run of each day is all the history chart can show anyway.
+    {
+        let db = state.pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RATING_RUN_THIN_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match ratings::thin_old_runs(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(runs = n, "thinned old rating runs"),
+                    Err(err) => {
+                        tracing::error!(error = %err.message, "thinning old rating runs failed")
                     }
                 }
             }

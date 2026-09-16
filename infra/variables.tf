@@ -193,18 +193,19 @@ variable "acm_certificate_arn" {
 
 variable "min_magpie_version" {
   description = <<-EOT
-    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.5.0 is the
-    first MAGPIE version that checks a wordmap or a rack info table against
-    the hash the job pins (0.4.0 played with whatever wordmap sat on the
-    worker's disk, and never loaded a table); a build reporting a lower
-    version is offered nothing. Raise it whenever a MAGPIE release changes
-    results. Must not exceed the version the backend image's own pinned MAGPIE
+    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.5.1 is the
+    first MAGPIE version that switches a word info table off for every task
+    (0.5.0, the first to check a wordmap or a rack info table against the
+    hash the job pins, left a contributor's own table in force; 0.4.0 played
+    with whatever wordmap sat on the worker's disk, and never loaded a
+    table); a build reporting a lower version is offered nothing. Raise it
+    whenever a MAGPIE release changes results. Must not exceed the version the backend image's own pinned MAGPIE
     reports (docker/Dockerfile's MAGPIE_COMMIT), or the backend refuses to
     start: it will not hand out hashes built by a MAGPIE its workers may not
     run.
   EOT
   type        = string
-  default     = "0.5.0"
+  default     = "0.5.1"
 }
 
 variable "github_token_parameter_arn" {

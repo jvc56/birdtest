@@ -538,6 +538,21 @@ rating change?" answerable and gives the ratings page a time axis for free. A ru
 that did not converge is stored and displayed, flagged — hiding it would leave
 the page silently stale.
 
+**Runs are kept in full for a month, then thinned to one a day.** A pool with
+an active job is refit every two minutes: ~720 runs a day, each with a rating
+row per member and a residual row per head-to-head — ~150,000 rows a day for a
+pool of twenty, for the life of the pool. Inside the month the run-by-run diff
+is what answers "why did this rating change?". Past it, an hourly sweep
+(`ratings::thin_old_runs`) keeps each UTC day's last run and the pool's first
+and deletes the rest, their ratings and residuals cascading. A day is the
+resolution the history chart draws at anyway — it thins to 500 points over the
+pool's whole life — so the chart keeps its shape and its ends; deleting
+everything past the window would have started its past at the window's edge.
+The newest run, the one the page shows, is the last of its day and so always
+survives, however long the pool has been quiet. Runs go in batches of a
+thousand so each transaction is bounded, and no fit lock is taken: a fit
+inserts a run stamped `now()`, never inside the window.
+
 ---
 
 ### User Accounts
@@ -1018,7 +1033,7 @@ start. The process has no SSM code path of its own.
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
-| `MIN_MAGPIE_VERSION` | `0.5.0` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
+| `MIN_MAGPIE_VERSION` | `0.5.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
 | `MAGPIE_BIN` | `/usr/local/bin/magpie` | The pinned MAGPIE the server runs for every derived file and every leave-generation KLV. The backend image builds one in; locally, a checkout's `bin/magpie`. Startup fails without a working one. |
 | `MAGPIE_THREADS` | `1` | Threads given to a conversion. The web task keeps 1; the derived-file builder task sets its vCPU count. |
 | `MAGPIE_SCRATCH_DIR` | the system temp directory | Where a conversion's throwaway data directory goes. The builder task points it at its ephemeral volume, since a rack info table is 1.9 GB. |
@@ -1615,10 +1630,14 @@ WHERE (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
 distribution and a layout — and a client too old to understand `expected_data`
 will contribute unverified rather than decline. "No floor" is not a state worth
 being able to express once every job depends on the client honouring a protocol,
-so the columns are `NOT NULL` and default to **`0.5.0`**, the same value as the
+so the columns are `NOT NULL` and default to **`0.5.1`**, the same value as the
 server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly: the first
-MAGPIE version that checks a wordmap or a rack info table against the hash the
-job pins, and the first that loads a table at all (`birdtest-contribute`).
+MAGPIE version that switches a word info table off before every task's lexicon
+loads (`birdtest-contribute`). `0.5.0` was the first that checks a wordmap or a
+rack info table against the hash the job pins, and the first that loads a table
+at all, but it left a contributor's own `-wit` setting in force — an accelerator
+birdtest neither offers nor checks, which built from an older lexicon prunes
+plays that exist.
 `0.4.0` was the first whose results depended on nothing but the task's stated
 settings, but it played with whatever wordmap sat on the worker's disk, checked
 against nothing. Builds reporting `0.3.0` and `0.2.0` supplied their own
@@ -1631,13 +1650,12 @@ layout. All must be refused. The one place the floor lives is the server's
 configuration: the column default, the Terraform variable, the compose file and
 the env examples all carry the same value so no path writes a lower one.
 
-`birdtest-contribute` now reports **`0.5.1`**, which additionally switches a
-word info table off for every task (`0.5.0` left a contributor's own `-wit`
-setting in force, an accelerator birdtest neither offers nor checks). The floor
-stays `0.5.0` until the backend image's pinned MAGPIE is moved to a `0.5.1`
-commit: the server refuses to start with a pinned MAGPIE below its own floor,
-so the two move together, and moving the pin is a deliberate step. Because a
-stale config value would silently floor every new job too low, the effective
+The floor and the backend image's pinned MAGPIE (`docker/Dockerfile`'s
+`MAGPIE_COMMIT`) move together: the server refuses to start with a pinned MAGPIE
+below its own floor, so the floor can rise only once the pin has been moved to a
+commit that reports the new version, and moving the pin is a deliberate step.
+Because a stale config value would silently floor every new job too low, the
+effective
 value is shown on the job creation form, pre-filled and editable — a visible
 default rather than a hidden one.
 
@@ -4753,21 +4771,24 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.5.0 is the
-    -- first MAGPIE version that checks a wordmap or a rack info table against
-    -- the hash the job pins, and the first that loads a table at all: 0.1.0
+    -- so "no floor" is not a state worth being able to express. 0.5.1 is the
+    -- first MAGPIE version that switches a word info table off before every
+    -- task's lexicon loads -- an accelerator birdtest neither offers nor
+    -- checks, which built from an older lexicon prunes plays that exist: 0.1.0
     -- left the bingo bonus, an opening-rack simulation's settings and a
     -- leave-generation task's seed to the worker's own settings; before 0.3.0 a
     -- task's wordmap and rack-info-table flags applied to the next task;
     -- before 0.4.0 every setting a request left null came from the worker's
-    -- compile-time defaults; and 0.4.0 played with whatever wordmap sat on the
-    -- worker's disk, checked against nothing. The default here is the same
+    -- compile-time defaults; 0.4.0 played with whatever wordmap sat on the
+    -- worker's disk, checked against nothing; and 0.5.0, the first to check a
+    -- wordmap or a rack info table against the hash the job pins, left a
+    -- contributor's own word info table in force. The default here is the same
     -- value as the server's MIN_MAGPIE_VERSION, which create_job writes
     -- explicitly; the two are kept equal so a row written any other way
     -- (a restore, a hand insert) does not floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 5 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -5538,6 +5559,12 @@ CREATE TABLE rating_pool_members (
 -- One fit. Ratings are snapshotted per run rather than mutated in place, which
 -- is what makes "why did this rating change?" answerable and gives the ratings
 -- page a time axis at no extra cost.
+--
+-- Kept in full for a month, then thinned to the last run of each UTC day, the
+-- pool's first run aside (ratings::thin_old_runs, hourly). A pool with an
+-- active job takes a run every two minutes, and past a month a day is the
+-- resolution the history chart draws at anyway. The ratings and residuals
+-- below go with their run.
 CREATE TABLE rating_runs (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,

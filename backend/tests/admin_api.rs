@@ -730,6 +730,106 @@ async fn a_long_rating_history_is_thinned_but_keeps_its_ends() {
     );
 }
 
+/// Runs older than a month are thinned to the last of each day, so a pool's
+/// tables are bounded while its history chart keeps its shape and its ends:
+/// the first run, each old day's last and every recent run survive, and a
+/// deleted run's ratings and residuals go with it.
+#[tokio::test]
+async fn old_rating_runs_are_thinned_to_the_last_of_each_day() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let anchor = db.static_player("anchor", admin).await;
+    let rival = db.static_player("rival", admin).await;
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let pool: Uuid = sqlx::query_scalar(
+        "INSERT INTO rating_pools (name, variant, letterdist_id, layout_id, anchor_player_config_id)
+         VALUES ('pool', 'classic', $1, $2, $3) RETURNING id",
+    )
+    .bind(letterdist)
+    .bind(layout)
+    .bind(anchor)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    // The pool's first run, alone on its day; two old days of three runs each;
+    // and three runs from the last few minutes. Every run carries a rating and
+    // a residual.
+    sqlx::query(
+        "WITH runs AS (
+             INSERT INTO rating_runs (pool_id, computed_at, trigger, iterations, converged,
+                                      pairs_used, jobs_used)
+             SELECT $1, t, 'evidence', 1, true, 0, 1
+             FROM unnest(ARRAY[
+                 timestamptz '2025-12-01 00:00Z',
+                 timestamptz '2026-01-01 10:00Z', timestamptz '2026-01-01 10:02Z',
+                 timestamptz '2026-01-01 10:04Z',
+                 timestamptz '2026-01-02 10:00Z', timestamptz '2026-01-02 10:02Z',
+                 timestamptz '2026-01-02 10:04Z',
+                 now() - interval '6 minutes', now() - interval '4 minutes',
+                 now() - interval '2 minutes'
+             ]) AS t
+             RETURNING id
+         ),
+         rated AS (
+             INSERT INTO player_config_ratings
+                 (run_id, player_config_id, rating, stderr, pairs_played, connected_to_anchor,
+                  is_anchor)
+             SELECT id, $2, 2000, 0, 0, true, true FROM runs
+         )
+         INSERT INTO rating_run_residuals
+             (run_id, row_player_config_id, col_player_config_id, pairs, actual, predicted)
+         SELECT id, $2, $3, 1, 0.5, 0.5 FROM runs",
+    )
+    .bind(pool)
+    .bind(anchor)
+    .bind(rival)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let deleted = birdtest::ratings::thin_old_runs(&db.pool).await.unwrap();
+    assert_eq!(deleted, 4, "two of each old day's three runs");
+
+    let old_kept: Vec<String> = sqlx::query_scalar(
+        "SELECT to_char(computed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI')
+         FROM rating_runs
+         WHERE pool_id = $1 AND computed_at < now() - interval '1 day'
+         ORDER BY computed_at",
+    )
+    .bind(pool)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        old_kept,
+        ["2025-12-01 00:00", "2026-01-01 10:04", "2026-01-02 10:04"],
+        "the first run and each old day's last"
+    );
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rating_runs
+         WHERE pool_id = $1 AND computed_at > now() - interval '1 day'",
+    )
+    .bind(pool)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(recent, 3, "runs inside the window are untouched");
+    let ratings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM player_config_ratings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let residuals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rating_run_residuals")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!((ratings, residuals), (6, 6), "a deleted run's ratings and residuals go with it");
+
+    let again = birdtest::ratings::thin_old_runs(&db.pool).await.unwrap();
+    assert_eq!(again, 0, "thinning is idempotent");
+}
+
 /// A games job may pit a static player against a simmer: PLAN.md promises "any
 /// mix", and it is the configuration a strength comparison most often wants.
 ///

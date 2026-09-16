@@ -89,7 +89,7 @@ def magpie_version(magpie_root: Path) -> Optional[str]:
     """`MAGPIE_VERSION` out of the checkout's source.
 
     The floor exists to keep a fleet off a build too old to speak the protocol,
-    and production sets it to a real release (0.5.0 by default). Locally the
+    and production sets it to a real release (0.5.1 by default). Locally the
     contributor is whatever checkout you built, which may be older -- and then
     every task is declined with "update MAGPIE" and nothing ever runs. Reading
     the constant the binary was built from is exact.

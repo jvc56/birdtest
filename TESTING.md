@@ -1049,8 +1049,8 @@ round-trip tests bought: there is no longer a second implementation to check
 against MAGPIE, because there is no second implementation.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.5.0`, the shipped `MIN_MAGPIE_VERSION` default,
-and a checkout from before the audits' fixes reports `0.4.0` or lower and is refused. The
+`birdtest-contribute` reports `0.5.1`, the shipped `MIN_MAGPIE_VERSION` default,
+and a checkout from before the audits' fixes reports `0.5.0` or lower and is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 

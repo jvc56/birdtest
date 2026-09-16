@@ -394,7 +394,9 @@ both existed.
   zero.
 - `klvwmp2rit` takes the KLV's and the wordmap's names separately.
 - `BUILD=portable_release`.
-- `MAGPIE_VERSION` 0.5.0.
+- `MAGPIE_VERSION` 0.5.0; then 0.5.1 once `config_contribute_load_lexicon_and_variant`
+  switched the word info table off before every lexical load (the sixth audit's
+  M1), and the floor moved with it.
 
 **birdtest**
 

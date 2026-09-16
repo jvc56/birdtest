@@ -356,21 +356,24 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.5.0 is the
-    -- first MAGPIE version that checks a wordmap or a rack info table against
-    -- the hash the job pins, and the first that loads a table at all: 0.1.0
+    -- so "no floor" is not a state worth being able to express. 0.5.1 is the
+    -- first MAGPIE version that switches a word info table off before every
+    -- task's lexicon loads -- an accelerator birdtest neither offers nor
+    -- checks, which built from an older lexicon prunes plays that exist: 0.1.0
     -- left the bingo bonus, an opening-rack simulation's settings and a
     -- leave-generation task's seed to the worker's own settings; before 0.3.0 a
     -- task's wordmap and rack-info-table flags applied to the next task;
     -- before 0.4.0 every setting a request left null came from the worker's
-    -- compile-time defaults; and 0.4.0 played with whatever wordmap sat on the
-    -- worker's disk, checked against nothing. The default here is the same
+    -- compile-time defaults; 0.4.0 played with whatever wordmap sat on the
+    -- worker's disk, checked against nothing; and 0.5.0, the first to check a
+    -- wordmap or a rack info table against the hash the job pins, left a
+    -- contributor's own word info table in force. The default here is the same
     -- value as the server's MIN_MAGPIE_VERSION, which create_job writes
     -- explicitly; the two are kept equal so a row written any other way
     -- (a restore, a hand insert) does not floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 5 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -1141,6 +1144,12 @@ CREATE TABLE rating_pool_members (
 -- One fit. Ratings are snapshotted per run rather than mutated in place, which
 -- is what makes "why did this rating change?" answerable and gives the ratings
 -- page a time axis at no extra cost.
+--
+-- Kept in full for a month, then thinned to the last run of each UTC day, the
+-- pool's first run aside (ratings::thin_old_runs, hourly). A pool with an
+-- active job takes a run every two minutes, and past a month a day is the
+-- resolution the history chart draws at anyway. The ratings and residuals
+-- below go with their run.
 CREATE TABLE rating_runs (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,

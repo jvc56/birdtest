@@ -2,7 +2,8 @@
 
 Branch: `audit/birdtest-2026-09-15`, off `main` at `6a72333`.
 MAGPIE changes: `birdtest-contribute` only, commit `65a246d5` on top of
-`dc007fc5`. **Committed locally, not pushed** (see U1).
+`dc007fc5`, plus an uncommitted fixture bump in the checkout (section 10,
+U1). **Neither is pushed** (see U1).
 Date: 2026-09-15 / 2026-09-16.
 
 **This is the sixth audit.** It builds on [AUDIT_FINDINGS_1.md](AUDIT_FINDINGS_1.md)
@@ -26,7 +27,8 @@ made in this audit, and of the bugs, MAGPIE argument gaps, critical-path
 analysis, performance and storage findings behind them.
 
 **Counts: 9 code-wins (PLAN.md updated to match the code), 3 plan-wins (code
-changed), and 4 items left for human input (section 10).**
+changed), and 4 items left for human input, since decided and implemented
+(section 10).**
 
 The default bias is that the code wins and `PLAN.md` is brought level with it.
 The code was changed only where it was wrong, or where the plan described the
@@ -399,7 +401,8 @@ the SSE payload.
   a pool of 20 configs with an active job refits every two minutes, so
   ~720 × 210 ≈ 150,000 residual rows a day. Prior U7 decided no retention
   for rating runs; the number is recorded here so that decision is revisited
-  with it — U2.
+  with it — U2, since decided: runs older than a month are thinned to one a
+  day (section 10).
 - **`worker_data_gaps` and `audit_log` `task.declined` rows** grow with
   declines: up to 32 gap rows plus one audit row per decline. Bounded in
   practice by workers × jobs (a client remembers a job it declined) but reset
@@ -464,9 +467,21 @@ shape. The landing page says "You need only MAGPIE — no Python, no Docker".
 
 ---
 
-## 10. Left for human input
+## 10. Left for human input — decided and implemented (2026-09-16)
 
-### U1 — publish MAGPIE `65a246d5`, move the pin, raise the floor to `0.5.1`
+Each item's recommendation was taken. The original options are kept below the
+table for the record.
+
+| # | Decision | What was done |
+|---|---|---|
+| U1 | **Publish `65a246d5`, move the pin, raise the floor to `0.5.1`** | `docker/Dockerfile`'s `MAGPIE_COMMIT` (both stages) is `65a246d5`, whose MAGPIE reports `0.5.1`. The floor is `0.5.1` in `config.rs` and its comment, the `jobs` column default (`min_magpie_patch DEFAULT 1`) and its comment in the migration and PLAN.md's schema block (still identical), `infra/variables.tf`, `docker-compose.yml` (both services), both env examples, the three contract fixtures in both repositories, `backend/tests/common/mod.rs`, the `magpie.rs` unit tests, `scripts/dev.py`, README, TESTING.md, MAGPIE_DEPENDENCY.md and PLAN.md, whose "floor stays `0.5.0` until the pin moves" paragraph now states the rule rather than the wait. MAGPIE's README `builders` example prints `0.5.1`. A build reporting `0.5.0` or lower now gets `magpie_too_old`. **The push is still to do**: this session's permission mode refused `git commit` and `git push` in the MAGPIE checkout, so `origin/birdtest-contribute` is still `dc007fc5`, `65a246d5` is local, and the fixture and README bump sits uncommitted in that checkout's working tree. Until `65a246d5` is on GitHub the backend image cannot build (the Dockerfile's shallow fetch of the pin fails) and `MIN_MAGPIE_VERSION=0.5.1` refuses to start against a `dc007fc5` binary. CI's `magpie-contract` job is unaffected meanwhile: MAGPIE's contribute test never reads a fixture's `min_magpie_version`. Existing databases must be reset (PLAN.md, "Resetting the database after a schema change"): the single migration was edited in place |
+| U2 | **(b)**, as a thinning rather than a cut | `ratings::thin_old_runs`, hourly from `main.rs`: runs older than `RUN_FULL_RESOLUTION` (30 days) are thinned to the last run of each UTC day, the pool's first run kept whatever its day; ratings and residuals cascade; batches of 1,000 runs, no fit lock. The recommendation said "delete runs older than N days except the first". That would have started the history chart's past at the window's edge, while a day is the resolution the chart draws at anyway (500 points over the pool's life), so the thinning keeps everything the chart shows and bounds the tables all the same: an active twenty-member pool holds ~21,600 full runs (~4.5 million residual rows) plus 20 rating and ~210 residual rows a day beyond that, instead of ~150,000 new residual rows a day forever. The newest run is the last of its day and so always survives, however long the pool has been quiet. The "few hundred thousand runs" trigger was not built: a gate that waits for a table to grow before bounding it buys nothing but a large first delete. Option (c), `leave_rack_progress`, is untouched, as recommended. Schema comments (migration and PLAN.md's block), PLAN.md ("Ratings") and RUNBOOK.md describe it. Test: `admin_api::old_rating_runs_are_thinned_to_the_last_of_each_day` |
+| U3 | **(a)** Leave the CGP as `TEXT` | Nothing to build |
+| U4 | **(a)** Wait for the slow-stats log line | Nothing to build |
+
+### The items as they were put
+
+#### U1 — publish MAGPIE `65a246d5`, move the pin, raise the floor to `0.5.1`
 
 The MAGPIE commit is local. The backend image builds `MAGPIE_COMMIT =
 dc007fc5` from GitHub, so the pin cannot move to a commit that is not there,
@@ -480,7 +495,7 @@ examples, the fixtures in both repositories, the test harness, README,
 TESTING.md and PLAN.md to `0.5.1`**, as the prior audits did for `0.2.0` and
 `0.4.0`. All outward-facing; not done here.
 
-### U2 — retention (re-raised with numbers)
+#### U2 — retention (re-raised with numbers)
 
 Prior U7 decided no retention yet. Section 7 adds the figures for the two
 tables that have grown a dimension since: `rating_run_residuals` (~150,000
@@ -494,7 +509,7 @@ against the recorded hash, keeping the hash. **Recommendation: (b) when a pool
 first passes a few hundred thousand runs; (c) only if disk actually becomes
 the constraint**, since it trades away the ability to re-derive a KLV.
 
-### U3 — a compact encoding for captured positions' CGPs
+#### U3 — a compact encoding for captured positions' CGPs
 
 **(a)** Leave `TEXT`: readable, and the corpus has no consumer yet.
 **(b)** Store a packed machine-letter board (one byte a square, 225 bytes,
@@ -503,7 +518,7 @@ the largest capture table, but a wire and schema change and a decoder on
 every read path. **Recommendation: (a) until the first consumer exists**,
 which will say what shape it wants.
 
-### U4 — `worker_contributions` per push (prior U6, restated)
+#### U4 — `worker_contributions` per push (prior U6, restated)
 
 Unchanged. Options as before: **(a)** wait for the slow-stats log line;
 **(b)** a per-(job, identity) counter maintained in the submit transaction,
@@ -517,7 +532,12 @@ which is one more row lock per submission. **Recommendation: (a)**, still.
   `cargo test --locked` against Postgres 16: **158 tests** (89 unit and
   contract, 69 integration), all passing (154 before this audit). The five
   `magpie_smoke` tests are `#[ignore]` by design. `svelte-check`: 0 errors,
-  0 warnings.
+  0 warnings. After section 10's implementation: **159 tests** (89 unit and
+  contract, 70 integration), all passing, clippy clean; the frontend is
+  untouched. MAGPIE's `./bin/magpie_test contribute` passes at `65a246d5`
+  with the fixtures at `0.5.1`. The backend image was not rebuilt and the end
+  to end run not repeated: the pin now names a commit GitHub does not yet
+  have (U1).
 - MAGPIE: `make magpie_test` (sanitizers), `./bin/magpie_test contribute` and
   `./bin/magpie_test config` pass at `65a246d5`; `git clang-format --diff` is
   empty.
@@ -546,4 +566,5 @@ which is one more row lock per submission. **Recommendation: (a)**, still.
 | `derived::tests::the_cache_remembers_only_what_it_is_told_and_forgets_on_request` | C2 |
 | `worker_api::redundant_captured_positions_are_recorded_once` (updated) | Counts moves through the record, since the column is gone |
 | MAGPIE `test_lexical_flags_are_set_before_the_load` (extended) | M1: the word info table flag is cleared before the load |
+| `admin_api::old_rating_runs_are_thinned_to_the_last_of_each_day` | U2: the first run, each old day's last and every recent run survive; a deleted run's ratings and residuals go with it; a second pass deletes nothing |
 | `scripts/e2e_magpie.py` (extended) | B4: two jobs go through the derived-file path end to end; a decline in MAGPIE's output fails the run |

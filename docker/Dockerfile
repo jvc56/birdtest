@@ -33,7 +33,7 @@ FROM debian:bookworm-slim AS magpie-build
 # what notices a MAGPIE-side change before the pin is moved to it. Moving the
 # pin is a deliberate step, and MIN_MAGPIE_VERSION must never exceed the
 # version this commit reports.
-ARG MAGPIE_COMMIT=dc007fc5a01bceac9154225454519cd72834d364
+ARG MAGPIE_COMMIT=65a246d514a52aa39cb1bb9110fb08a213cdc198
 ARG MAGPIE_REPO=https://github.com/jvc56/MAGPIE.git
 
 RUN apt-get update \
@@ -103,7 +103,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=backend-build /usr/local/bin/birdtest /usr/local/bin/birdtest
 COPY --from=magpie-build /src/bin/magpie /usr/local/bin/magpie
-ARG MAGPIE_COMMIT=dc007fc5a01bceac9154225454519cd72834d364
+ARG MAGPIE_COMMIT=65a246d514a52aa39cb1bb9110fb08a213cdc198
 LABEL org.birdtest.magpie-commit="$MAGPIE_COMMIT"
 # Still no data directory. MAGPIE is run against a throwaway directory built
 # per conversion from the bytes the job pins — the object store for lexica and

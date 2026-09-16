@@ -302,7 +302,9 @@ rows actually support.
   each pool's `game_results`, never applied per submission. Once the results
   are back the two-minute sweep notices the pool's evidence changed and refits
   it; `POST /api/admin/rating-pools/:id/recompute` does it immediately. Nothing
-  to copy.
+  to copy. Runs older than a month are thinned to one a day in any case
+  (PLAN.md, "Ratings"), so a restored history is at that resolution past the
+  month whatever the backup's age.
 - **SPRT**: computed from `game_results` on read, so it corrects itself once
   the results are back.
 - **Leave-generation artifacts**: if any object is missing, use
