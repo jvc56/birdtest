@@ -1,3 +1,4 @@
+use super::dispatch::JobTemplate;
 use super::handler::*;
 use super::racks::{LetterDistribution, RackIndex};
 use super::JobData;
@@ -52,7 +53,11 @@ impl JobHandler for LeaveGenHandler {
     type Response = LeaveResponse;
     type Record = LeaveRecord;
 
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
+    async fn load_request(
+        conn: &mut PgConnection,
+        template: &JobTemplate,
+        task_id: Uuid,
+    ) -> AppResult<Self::Request> {
         let row = sqlx::query(
             "SELECT lexicon, variant, letter_distribution, board_layout, generation, seed,
                     forced_racks, num_games, previous_artifact_key, use_wordmap
@@ -61,7 +66,6 @@ impl JobHandler for LeaveGenHandler {
         .bind(task_id)
         .fetch_one(&mut *conn)
         .await?;
-        let job_data = super::load_job_data_for_task(conn, task_id).await?;
         Ok(LeaveRequest {
             lexicon: row.get("lexicon"),
             variant: row.get("variant"),
@@ -73,7 +77,7 @@ impl JobHandler for LeaveGenHandler {
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
             use_wordmap: row.get("use_wordmap"),
-            bingo_bonus: job_data.bingo_bonus,
+            bingo_bonus: template.data.bingo_bonus,
         })
     }
 
@@ -90,13 +94,13 @@ impl JobHandler for LeaveGenHandler {
     /// [`credit_claim`] for the others.
     async fn insert_record(
         conn: &mut PgConnection,
-        job_id: Uuid,
+        template: &JobTemplate,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
     ) -> AppResult<()> {
         credit_claim(conn, task_id, claim_id, record).await?;
-        fold_into_generation(conn, job_id, task_id, record).await
+        fold_into_generation(conn, template.job_id, task_id, record).await
     }
 }
 
@@ -338,11 +342,14 @@ pub async fn current_generation(
 
 /// Claim-time rack selection: the racks furthest from this generation's target
 /// that no open claim is already playing.
+///
+/// `lexicon` is the name of the row the job pins, from its template.
 pub async fn next_step(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &LeaveConfig,
     job_data: &JobData,
+    lexicon: &str,
 ) -> AppResult<LeaveGenStep> {
     let Some(generation) = current_generation(&mut *conn, job_id, config).await? else {
         return Ok(LeaveGenStep::Finished);
@@ -451,7 +458,7 @@ pub async fn next_step(
     })?;
 
     Ok(LeaveGenStep::Dispatch(LeaveRequest {
-        lexicon: lexicon_name(&mut *conn, config.kwg_id).await?,
+        lexicon: lexicon.to_string(),
         variant: job_data.variant.clone(),
         letter_distribution: job_data.letterdist_name.clone(),
         board_layout: job_data.layout_name.clone(),

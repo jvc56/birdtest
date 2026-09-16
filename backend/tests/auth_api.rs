@@ -92,3 +92,24 @@ async fn a_player_config_must_say_how_many_plays_to_report() {
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["num_plays_recorded"], 10);
 }
+
+/// The account page reads the same running total the contributor lists do,
+/// rather than counting the account's claims: the count walked every claim the
+/// account ever made, and disagreed with `/api/users` after a purge had given
+/// some of them back.
+#[tokio::test]
+async fn the_account_page_reads_the_contribution_counter() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let user = db.user("counted", false).await;
+    sqlx::query("UPDATE users SET tasks_completed = 7 WHERE id = $1")
+        .bind(user)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = send(&app, get_request("/api/me", &admin_headers(&state.cfg, user))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tasks_completed"], 7);
+}

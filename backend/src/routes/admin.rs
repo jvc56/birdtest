@@ -1951,6 +1951,8 @@ async fn delete_job(
     // Tidiness only: a remembered answer for a job that no longer exists is
     // never asked for, but there is no reason to keep it.
     state.derived_ready.forget(id);
+    state.templates.forget(id);
+    state.finish_checks.forget(id);
     Ok(StatusCode::NO_CONTENT)
 }
 

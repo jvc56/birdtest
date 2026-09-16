@@ -728,6 +728,9 @@ CREATE TABLE worker_data_gaps (
 -- the job. Ordered by time within it, the first question stops at the newest
 -- row rather than walking every gap the job ever had.
 CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, reported_at DESC);
+-- The cascade from a claim. A purge deletes every claim of a job, and without
+-- this the lookup was a sequential scan of this table per deleted claim.
+CREATE INDEX worker_data_gaps_claim_idx ON worker_data_gaps (claim_id);
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
@@ -887,6 +890,19 @@ CREATE INDEX position_analysis_records_feed_idx
 -- incidentally-captured in-game position is not an opening-rack analysis.
 CREATE INDEX position_analysis_records_job_rack_idx
     ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
+
+-- The cascade from a claim (`task_claim_id ... ON DELETE CASCADE`). The
+-- partial unique index on (task_claim_id, rack) above cannot serve it: a plain
+-- equality on task_claim_id does not imply `game_index IS NULL`, so the
+-- planner never uses a partial index for it. Without this a purge or a job
+-- delete -- which removes every claim of the job, and Postgres runs the
+-- cascade once per deleted row -- scanned this whole table once per claim: a
+-- full English opening-rack job is ~6,400 claims over ~3.2 million records,
+-- thousands of sequential scans inside one transaction holding the job's
+-- dispatch lock and every open claim's row. One entry per record; the moves
+-- below cascade from the record through their own index.
+CREATE INDEX position_analysis_records_claim_idx
+    ON position_analysis_records (task_claim_id);
 
 -- The top `num_plays_recorded` moves per position, from the player config that
 -- produced them. Storing every move the worker ranked would be untenable:

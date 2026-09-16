@@ -1556,3 +1556,54 @@ async fn players_on_different_lexicons_need_a_wordmap_each() {
         derived.iter().map(|d| d["sha256"].as_str().unwrap()).collect();
     assert_eq!(hashes.len(), 2, "{body}");
 }
+
+/// A job's immutable configuration -- its players, its letter distribution,
+/// its `expected_data` -- is read once per process and kept
+/// (`jobs::dispatch::JobTemplates`), so the claim transaction reads only what
+/// changes from claim to claim. A purge deletes results and tasks and leaves
+/// the configuration alone, so the template stands across one; deleting the
+/// job is what forgets it.
+#[tokio::test]
+async fn a_jobs_template_is_read_once_survives_a_purge_and_goes_with_the_job() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let borrowed: Vec<(&str, &str)> =
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    assert!(state.templates.get(job).is_none(), "nothing is read before the first claim");
+    let (first, uuid) = first_claim(&app).await;
+    let template = state.templates.get(job).expect("the first claim reads the template");
+    assert_eq!(
+        template.expected.len(),
+        first["expected_data"]["files"].as_array().unwrap().len(),
+        "the assignment's expected_data is the template's"
+    );
+
+    let (status, body) =
+        send(&app, post_json(&format!("/api/admin/jobs/{job}/purge"), &borrowed, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(state.templates.get(job).is_some(), "a purge changes no configuration");
+
+    // The purged job starts its space over, and every claim after it carries
+    // exactly what the first did.
+    let (status, again) = claim_as(&app, &uuid).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["task_request"]["seed"], "1");
+    assert_eq!(again["expected_data"]["files"], first["expected_data"]["files"]);
+    assert_eq!(again["task_request"]["player1"], first["task_request"]["player1"]);
+    assert_eq!(again["task_request"]["player2"], first["task_request"]["player2"]);
+    assert_eq!(again["task_request"]["bingo_bonus"], first["task_request"]["bingo_bonus"]);
+
+    let delete = axum::http::Request::delete(format!("/api/admin/jobs/{job}"))
+        .header("cookie", headers[0].1.as_str())
+        .header("x-csrf-token", headers[1].1.as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (status, body) = send(&app, delete).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(state.templates.get(job).is_none(), "a deleted job is forgotten");
+}

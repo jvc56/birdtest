@@ -1211,3 +1211,56 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
         "NWL23.CSW21"
     );
 }
+
+/// Bug: reclamation is lazy and runs when a worker asks for work from the
+/// job's priority tier, which never happens for a completed job. A claim whose
+/// worker died therefore stayed `claimed` for good, and the export refused
+/// with "at most the heartbeat timeout" for good.
+#[tokio::test]
+async fn an_export_is_not_blocked_by_a_claim_whose_worker_vanished() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let (status, claim) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let export = || post_json(&format!("/api/admin/jobs/{job}/export"), &headers, json!({}));
+    let (status, body) = send(&app, export()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a live claim is still in flight: {body}");
+
+    // The worker vanished: its claim is past the heartbeat timeout, and no
+    // claim request will ever reclaim it, since nothing claims from a
+    // completed job.
+    sqlx::query(
+        "UPDATE task_claims SET claimed_at = now() - interval '1 hour', last_heartbeat_at = NULL",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (status, body) = send(&app, export()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // Reclaimed through the same path dispatch uses, so the claim and its
+    // task read as every other lapsed claim does.
+    let (claim_state, active): (String, i32) = sqlx::query_as(
+        "SELECT c.state::text, t.active_claim_count
+         FROM task_claims c JOIN tasks t ON t.id = c.task_id
+         WHERE c.claim_token = $1",
+    )
+    .bind(Uuid::parse_str(claim["claim_token"].as_str().unwrap()).unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((claim_state.as_str(), active), ("abandoned", 0));
+}

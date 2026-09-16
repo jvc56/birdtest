@@ -6,7 +6,7 @@ use crate::error::{AppError, AppResult};
 use crate::jobs::handler::TaskRequest;
 use crate::jobs::leave_gen;
 use crate::jobs::registry::{self, Acquired};
-use crate::jobs::{expected_data, ExpectedFile};
+use crate::jobs::ExpectedFile;
 use crate::models::job::{Job, JobType, LeaveConfig};
 use crate::state::AppState;
 use crate::version::Version;
@@ -32,7 +32,10 @@ pub struct TaskClaim {
     pub claim_token: Uuid,
     pub request: TaskRequest,
     pub min_magpie_version: String,
-    pub expected_data: Vec<ExpectedFile>,
+    /// Every file the task loads, with the digest the job pins. Shared with
+    /// the job's template rather than queried per claim: the set is fixed when
+    /// the job is created.
+    pub expected_data: std::sync::Arc<Vec<ExpectedFile>>,
     /// The wordmap and rack info table hashes this job's tasks must reproduce.
     /// Empty for a job whose players ask for neither.
     pub derived_data: std::sync::Arc<Vec<crate::derived::ExpectedDerived>>,
@@ -381,28 +384,50 @@ async fn try_claim_from_job(
     // for every candidate job on every claim, and the answer for a
     // dispatchable job cannot change for the life of the process (see
     // `derived::DerivedCache`). A job still waiting is asked about each time.
-    let derived = match state.derived_ready.get(job.id) {
-        Some(ready) => ready,
-        // Only a miss takes a pool connection: the common case is a hit, and
-        // a connection held for a lookup the cache answers is one a worker's
-        // claim or submission is waiting for.
-        None => {
+    //
+    // The job's template -- its config, players, letter distribution and
+    // `expected_data` -- is remembered the same way (`dispatch::JobTemplates`),
+    // so the claim transaction below reads only what changes from claim to
+    // claim. Only a miss on either takes a pool connection: the common case is
+    // a hit, and a connection held for a lookup the cache answers is one a
+    // worker's claim or submission is waiting for.
+    let (derived, template) = match (state.derived_ready.get(job.id), state.templates.get(job.id)) {
+        (Some(derived), Some(template)) => (derived, template),
+        (derived, template) => {
             let mut conn =
                 state.pool.acquire().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
-            let ready =
-                crate::derived::ready_for_job(&mut conn, job.id, &state.builders, &state.derived_ready)
+            let derived = match derived {
+                Some(derived) => derived,
+                None => {
+                    let ready = crate::derived::ready_for_job(
+                        &mut conn,
+                        job.id,
+                        &state.builders,
+                        &state.derived_ready,
+                    )
                     .await
                     .map_err(JobClaimError::Fatal)?;
-            match ready {
-                Some(ready) => ready,
-                None => return Ok(None),
-            }
+                    match ready {
+                        Some(ready) => ready,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            let template = match template {
+                Some(template) => template,
+                None => state
+                    .templates
+                    .get_or_load(&mut conn, job)
+                    .await
+                    .map_err(JobClaimError::Fatal)?,
+            };
+            (derived, template)
         }
     };
 
     let mut tx = state.pool.begin().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
 
-    let acquired = match registry::acquire(&mut tx, job, identity).await {
+    let acquired = match registry::acquire(&mut tx, job, identity, &template).await {
         Ok(acquired) => acquired,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -509,16 +534,16 @@ async fn try_claim_from_job(
                     Ok(None)
                 }
                 Ok(Some(claim_token)) => {
-                    let expected = expected_data(&mut tx, job)
-                        .await
-                        .map_err(JobClaimError::Fatal)?;
                     tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
                     Ok(Some(TaskClaim {
                         job_id: job.id,
                         claim_token,
                         request,
                         min_magpie_version: job.min_magpie_version().to_string(),
-                        expected_data: expected,
+                        // Fixed at job creation, so it is the template's copy
+                        // rather than a union over six tables inside the
+                        // dispatch lock and the job's row lock on every claim.
+                        expected_data: template.expected.clone(),
                         derived_data: derived,
                     }))
                 }

@@ -62,7 +62,7 @@ State is determined by denormalized counters (`accepted_count`, `active_claim_co
 - **claimed**: `accepted_count + active_claim_count = redundancy` but `accepted_count < redundancy` — all slots are filled with in-flight claims; waiting on results.
 - **completed**: `accepted_count = redundancy` — all X results have been submitted and accepted.
 
-Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested, not via a background process.
+Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested from the job's priority tier, not via a background process. A job nobody asks for work from — one that is inactive or completed — therefore keeps a lapsed claim on its books until something reclaims it: activation puts it back in a tier, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
 
 #### Task Generation
 
@@ -858,7 +858,12 @@ out are still played and still accepted, so its results keep arriving for up to
 the heartbeat timeout. An export started in that window missed them, and every
 later download was redirected to it. So an export is refused (`409`) while any
 claim of the job is still open; no claim can be issued against a completed job,
-so once none is open the results are fixed.
+so once none is open the results are fixed. The job's lapsed claims are
+reclaimed first, through the same statement dispatch uses: reclamation is
+otherwise lazy, running only when a worker asks for work from the job's
+priority tier, and nothing ever asks for work from a completed job — so a
+claim whose worker vanished would have stayed `claimed`, and refused the
+export, for good.
 
 Exports are derived data and are treated differently from the leave-generation
 KLVs in every way that matters: a purge deletes a job's exports with the results
@@ -955,6 +960,24 @@ What the numbers settled:
   millions of rows, inside one transaction holding the job's dispatch lock.
   The column is gone; moves cascade from their record through the index that
   serves every read of them.
+- **A job's configuration is read once per process, not once per claim.**
+  The per-type config row, the parsed letter distribution, a three-way join
+  per player and the six-table `expected_data` union were re-read inside the
+  job's dispatch lock on every claim, and a re-dispatched task's request
+  re-read the players and the distribution again; the submit path read the
+  request row for the batch size and the player config for the move cap
+  inside the task's row lock. All of it is fixed at job creation, so it is the
+  job's template now (`jobs::dispatch::JobTemplate`), and the reads under the
+  locks are the ones that change from claim to claim.
+- **Deleting a claim no longer scans the position table.**
+  `position_analysis_records.task_claim_id` cascades from `task_claims`, and
+  its only index was the partial unique one on `(task_claim_id, rack) WHERE
+  game_index IS NULL`, which a plain equality cannot use — so a purge or a job
+  delete, which removes every claim of the job one cascade at a time, scanned
+  the whole records table once per claim: thousands of sequential scans over
+  millions of rows for a full opening-rack job, the same shape as the moves
+  cascade fixed the audit before. `position_analysis_records_claim_idx` and
+  `worker_data_gaps_claim_idx` serve the two cascades that had no index.
 - **A pool's residuals are stored with its fit, not rebuilt per view.** The
   public pool page used to rebuild the evidence matrix for its residual table on
   every view — 452 ms at 600,000 paired results, on the connection pool claims
@@ -1477,8 +1500,13 @@ not two. The `expected_data` builder is a query, not an inference engine, which
 is what removes the piece most in need of unit tests. It is also a *single*
 query: a union over the per-type config tables, which contributes nothing for a
 type that has no row in one, so there is no match on `job_type` and no second
-round trip to resolve the players. It runs inside the job's dispatch lock, so
-what it costs is time no other worker can be claiming from that job. Task requests still carry
+round trip to resolve the players. It runs **once per job per process**, not
+once per claim: what a job pins is fixed when the job is created, so the list
+is read with the rest of the job's template
+(`jobs::dispatch::JobTemplate`, see [The claim loop in
+full](#the-claim-loop-in-full)) and every assignment shares that copy. It used
+to run inside the job's dispatch lock on every claim, where what it cost was
+time no other worker could be claiming from that job. Task requests still carry
 *names*, because that is what MAGPIE's command-line surface takes.
 
 ### Capability negotiation
@@ -1740,7 +1768,10 @@ release installs it, and check `task_claims.magpie_version` and
 
 **An end-to-end test guards the two constants**, and it runs nightly rather than
 per pull request (`.github/workflows/nightly.yml`, running
-`scripts/e2e_magpie.py`): it compiles MAGPIE `birdtest-contribute`, installs data
+`scripts/e2e_magpie.py`): it compiles MAGPIE `birdtest-contribute` as
+`portable_release` (the build the backend image and the MAGPIE release use, so
+the wordmap it builds hashes the same as the server's; MAGPIE's Makefile
+refuses `BUILD=release`, which is a PGO target with its own recipe), installs data
 with that MAGPIE's `download_data.sh`, and runs one real task per job type against
 a seeded stack. If birdtest's pinned rows name content MAGPIE does not install,
 the client declines, the task never completes, and the job fails — so the mismatch
@@ -1843,8 +1874,8 @@ Then, up to **three attempts**:
    acquire a task from it. Acquisition returns one of four things:
    - **Task** — for a worker that arrived with no identity, insert its
      `anonymous_workers` row; insert the claim, bump the task's counters and the
-     job's `claims_issued`, build `expected_data`, commit,
-     return it. The `claims_issued` update is guarded on the job still being
+     job's `claims_issued`, commit, and return it with the job's
+     `expected_data` from its template. The `claims_issued` update is guarded on the job still being
      `active`: a claim that selected the job before the stopping rule or an admin
      completed or deactivated it waits on that update's row lock, then finds the
      job no longer active and hands out nothing.
@@ -1883,6 +1914,25 @@ close. The lock costs nothing that was not already being paid — issuing a
 claim bumps `jobs.claims_issued`, which holds that job's row lock until
 commit, so claims against one job already serialize — and it turns a lost race
 into a short wait. It is per job, so claims against other jobs are unaffected.
+
+**Under the lock, only what changes from claim to claim is read.** Everything
+a claim needs that the job fixed at creation — its per-type config row, its
+letter distribution (parsed), its players' configs flattened into the shape a
+request carries, its `expected_data`, and for opening racks the rack-space
+table a range is unranked with — is a *template* (`jobs::dispatch::JobTemplate`)
+read once per job per process and kept in memory (`AppState.templates`), the
+way a dispatchable job's derived-file hashes are. It cannot go stale: a job's
+config rows have no update path, player configs are immutable, and an
+`input_data` row cannot be deleted while a job or a config pins it. A purge
+changes none of it; deleting the job forgets it. Before the template, a games
+claim made five reads of those rows inside the lock — the config, the
+distribution, a three-way join per player and the six-table `expected_data`
+union — and a re-dispatched task's request made six; now the reads under the
+lock are the seed cursor, the available tasks, and the request row of a task
+being reissued. The submit path uses the same template for the batch size a
+task was dispatched with and the number of moves to keep per position, inside
+the task's row lock, instead of reading the request row and the player config
+again.
 
 **The wait for it is bounded** (`lock_timeout`, two seconds), and a claim that
 gives up treats the job as having nothing right now and tries the next
@@ -1964,7 +2014,10 @@ The mirror of the claim, and the only place results enter the system.
    it, so it runs on a periodic sweep instead.
 6. **After** the commit: evaluate the finish conditions on only the aggregates
    they need — the SPRT statistics, or an opening-rack job's task counts.
-   Inline, because SPRT decides whether the job keeps dispatching. The
+   Inline, because SPRT decides whether the job keeps dispatching. The job row
+   the submission's transaction read (step 1, before anything was stored) is
+   the one the check uses, rather than a second read of it on the path the
+   worker waits on. The
    completion is conditional on the job's `claims_issued` not having fallen since
    the job was read, ahead of its results: only a purge lowers it, so a check that
    read results from before a purge does not complete the job the purge just
@@ -2519,14 +2572,26 @@ pub trait JobHandler {
 
     /// Read back a stored request. A task whose claim lapsed is re-dispatched
     /// through here rather than regenerated, so the request a worker sees is
-    /// always the one recorded against the task.
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request>;
+    /// always the one recorded against the task. The job's immutable half --
+    /// its players, its letter distribution, its run-wide settings -- comes
+    /// from `template`, read once per process, so only the row that differs
+    /// per task is read here.
+    async fn load_request(
+        conn: &mut PgConnection,
+        template: &JobTemplate,
+        task_id: Uuid,
+    ) -> AppResult<Self::Request>;
 
     /// Normalize a worker submission into its stored form.
     fn process_response(response: Self::Response) -> AppResult<Self::Record>;
 
+    /// `template` carries the job id, which every record table stores
+    /// denormalized so a job's rows can be read without joining through
+    /// `tasks`, and the per-player settings that decide how much of a result
+    /// to keep.
     async fn insert_record(
         conn: &mut PgConnection,
+        template: &JobTemplate,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
@@ -2545,7 +2610,10 @@ response, store the record.
 Handlers take a `&mut PgConnection` rather than a `&PgPool` because every one of
 these runs inside the caller's transaction: a claim inserts task, request and
 claim atomically, and a submission writes the record and bumps the counters
-atomically.
+atomically. They take the job's `JobTemplate` (`jobs/dispatch.rs`) rather than
+its id because everything a handler needs about the job other than the task's
+own row is immutable and already in memory: the players, the letter
+distribution, the batch size, the per-position move cap.
 
 A top-level `JobType` enum dispatches to each concrete handler. The compiler enforces exhaustiveness on all match arms, so no case can be silently forgotten.
 
@@ -3891,6 +3959,7 @@ The full request and response shapes are in [The Worker API Contract](#the-worke
 | `POST` | `/api/auth/register` | Create a new user account. Sends a confirmation email. |
 | `POST` | `/api/auth/login` | Create a session. Returns a Paseto token in an httpOnly cookie. |
 | `POST` | `/api/auth/logout` | End the current session. |
+| `POST` | `/api/auth/sign-out-everywhere` | Revoke every session of the account, the caller's included, by bumping `users.session_generation`. |
 | `POST` | `/api/auth/confirm-email` | Confirm email address using the code from the confirmation email. |
 | `POST` | `/api/auth/reset-password/request` | Send a password reset email. |
 | `POST` | `/api/auth/reset-password/confirm` | Apply a password reset using the token from the reset email. |
@@ -4107,7 +4176,10 @@ trimmed, letters sorted. A rack is a multiset of tiles, so `AEINRST` and
 `TSRNIEA` are the same rack and a user typing either should find it. It matches
 only opening-rack records (`game_index IS NULL`), so an incidentally-captured
 in-game position with the same rack does not surface as an opening-rack analysis.
-The full ranked move list is returned in one page rather than paginated.
+The full ranked move list is returned in one page rather than paginated. Under
+redundancy above 1 a rack has one record per accepted claim, and the lists come
+back one record after another, each in rank order, rather than interleaved by
+rank.
 
 ---
 
@@ -4281,6 +4353,7 @@ birdtest/
 │       │   ├── handler.rs          # JobHandler trait plus wire types
 │       │   ├── plausibility.rs    # impossibility checks on submissions
 │       │   ├── registry.rs         # JobType dispatch (exhaustive matches)
+│       │   ├── dispatch.rs         # a job's immutable template, read once per process
 │       │   ├── racks.rs            # letter distributions, rack/leave enumeration, CGP
 │       │   ├── opening_rack.rs
 │       │   ├── game.rs
@@ -5143,6 +5216,9 @@ CREATE TABLE worker_data_gaps (
 -- the job. Ordered by time within it, the first question stops at the newest
 -- row rather than walking every gap the job ever had.
 CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, reported_at DESC);
+-- The cascade from a claim. A purge deletes every claim of a job, and without
+-- this the lookup was a sequential scan of this table per deleted claim.
+CREATE INDEX worker_data_gaps_claim_idx ON worker_data_gaps (claim_id);
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
@@ -5302,6 +5378,19 @@ CREATE INDEX position_analysis_records_feed_idx
 -- incidentally-captured in-game position is not an opening-rack analysis.
 CREATE INDEX position_analysis_records_job_rack_idx
     ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
+
+-- The cascade from a claim (`task_claim_id ... ON DELETE CASCADE`). The
+-- partial unique index on (task_claim_id, rack) above cannot serve it: a plain
+-- equality on task_claim_id does not imply `game_index IS NULL`, so the
+-- planner never uses a partial index for it. Without this a purge or a job
+-- delete -- which removes every claim of the job, and Postgres runs the
+-- cascade once per deleted row -- scanned this whole table once per claim: a
+-- full English opening-rack job is ~6,400 claims over ~3.2 million records,
+-- thousands of sequential scans inside one transaction holding the job's
+-- dispatch lock and every open claim's row. One entry per record; the moves
+-- below cascade from the record through their own index.
+CREATE INDEX position_analysis_records_claim_idx
+    ON position_analysis_records (task_claim_id);
 
 -- The top `num_plays_recorded` moves per position, from the player config that
 -- produced them. Storing every move the worker ranked would be untenable:

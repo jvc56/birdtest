@@ -73,6 +73,20 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
     // corpus a completed job hands out would be short for good. No claim can be
     // issued against a completed job, so once none is open the results really
     // are fixed.
+    //
+    // Reclamation is lazy: a lapsed claim is flipped to `abandoned` when a
+    // worker next asks for work from the job's priority tier, and nothing ever
+    // asks for work from a completed job. So a claim whose worker died stayed
+    // `claimed` for good, and refused every export of the job for good --
+    // where the design says a claim lapses at the heartbeat timeout. Reclaimed
+    // here first, through the same statement dispatch uses, so "open" below
+    // means live.
+    crate::scheduler::reclaim_expired(
+        &state.pool,
+        job.id,
+        state.cfg.heartbeat_timeout.as_secs_f64(),
+    )
+    .await?;
     let settling = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
                         WHERE t.job_id = $1 AND c.state = 'claimed')",

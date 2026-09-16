@@ -31,12 +31,15 @@ struct Me {
 }
 
 async fn me(State(state): State<AppState>, user: CurrentUser) -> AppResult<Json<Me>> {
-    let tasks_completed = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM task_claims WHERE claimed_by_user_id = $1 AND state = 'completed'",
-    )
-    .bind(user.id)
-    .fetch_one(&state.pool)
-    .await?;
+    // The running total the contributor lists read, rather than a count over
+    // this account's claims: the count walked every claim the account ever
+    // made, and disagreed with `/api/users` whenever a purge had given some
+    // back.
+    let tasks_completed =
+        sqlx::query_scalar::<_, i64>("SELECT tasks_completed FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_one(&state.pool)
+            .await?;
 
     Ok(Json(Me {
         id: user.id,

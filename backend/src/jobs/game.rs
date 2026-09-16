@@ -1,3 +1,4 @@
+use super::dispatch::JobTemplate;
 use super::handler::*;
 use super::JobData;
 use crate::error::{AppError, AppResult};
@@ -79,8 +80,12 @@ impl JobHandler for GameHandler {
 
 
 
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
-        super::load_game_request(conn, task_id, false).await
+    async fn load_request(
+        conn: &mut PgConnection,
+        template: &JobTemplate,
+        task_id: Uuid,
+    ) -> AppResult<Self::Request> {
+        super::load_game_request(conn, template, task_id, false).await
     }
 
     fn process_response(response: Self::Response) -> AppResult<Self::Record> {
@@ -102,12 +107,12 @@ impl JobHandler for GameHandler {
 
     async fn insert_record(
         conn: &mut PgConnection,
-        job_id: Uuid,
+        template: &JobTemplate,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
     ) -> AppResult<()> {
-        super::insert_game_results(conn, job_id, task_id, claim_id, record).await
+        super::insert_game_results(conn, template, task_id, claim_id, record).await
     }
 }
 
@@ -118,11 +123,16 @@ impl JobHandler for GameHandler {
 /// neither gaps nor overlaps. Two workers racing here both compute the same
 /// next seed; the `(job_id, seed)` unique index makes one of them lose, and the
 /// loser retries.
+///
+/// The players come from the job's template rather than a read per claim: the
+/// one read here is the seed cursor.
 pub async fn next_request(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &GameConfig,
     job_data: &JobData,
+    player1: &PlayerSpec,
+    player2: &PlayerSpec,
 ) -> AppResult<Option<(i64, GameRequest)>> {
     let next_seed = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(seed) FROM tasks WHERE job_id = $1",
@@ -137,9 +147,6 @@ pub async fn next_request(
         return Ok(None);
     }
 
-    let player1 = super::load_player_spec(conn, config.player1_config_id).await?;
-    let player2 = super::load_player_spec(conn, config.player2_config_id).await?;
-
     Ok(Some((
         next_seed,
         GameRequest {
@@ -152,8 +159,8 @@ pub async fn next_request(
             capture_positions: config.capture_positions,
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,
-            player1,
-            player2,
+            player1: player1.clone(),
+            player2: player2.clone(),
         },
     )))
 }

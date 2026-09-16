@@ -225,6 +225,7 @@ impl TestDb {
             sse: birdtest::sse::SseBroadcaster::new(),
             finish_checks: Default::default(),
             derived_ready: Default::default(),
+            templates: Default::default(),
             limits: birdtest::ratelimit::RateLimiters::new(),
             mailer: birdtest::email::Mailer::new(cfg.clone()).await,
             artifacts: birdtest::artifacts::ArtifactStore::new(cfg.clone()).await,

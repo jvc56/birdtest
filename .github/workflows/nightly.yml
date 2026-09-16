@@ -37,9 +37,15 @@ jobs:
         if: steps.magpie-data.outputs.cache-hit != 'true'
         working-directory: magpie
         run: ./download_data.sh && ./convert_lexica.sh
+      # portable_release, the build the backend image and the MAGPIE release
+      # use: a fixed instruction-set target, so a wordmap built here hashes
+      # the same as the server's. Not `BUILD=release`: MAGPIE's Makefile
+      # refuses that spelling outright (`release` is a PGO target that needs
+      # clang and a training run), which made every nightly run fail at this
+      # step before a single task ran.
       - name: Build MAGPIE
         working-directory: magpie
-        run: make magpie BUILD=release
+        run: make magpie BUILD=portable_release
 
       - name: Start the stack
         env:

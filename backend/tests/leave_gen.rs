@@ -454,8 +454,9 @@ async fn next_step(db: &TestDb, job: Uuid) -> Step {
     .await
     .unwrap();
     let job_data = birdtest::jobs::load_job_data(&mut tx, job_row.id).await.unwrap();
+    let lexicon = leave_gen::lexicon_name(&mut tx, config.kwg_id).await.unwrap();
     leave_gen::lock_claim_decisions(&mut tx, job).await.unwrap();
-    let step = leave_gen::next_step(&mut tx, job, &config, &job_data).await.unwrap();
+    let step = leave_gen::next_step(&mut tx, job, &config, &job_data, &lexicon).await.unwrap();
     let step = match step {
         LeaveGenStep::Transition { .. } => Step::Transition,
         LeaveGenStep::TransitionInProgress { .. } => Step::InProgress,
@@ -951,9 +952,20 @@ async fn overlapping_leave_submissions_wait_instead_of_deadlocking() {
     .unwrap();
     assert!(low_after_high, "the precondition this test relies on did not hold");
 
+    // The handler takes the job's template rather than its id, the way the
+    // submit path hands it in.
+    let job_row = sqlx::query_as::<_, birdtest::models::job::Job>("SELECT * FROM jobs WHERE id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let mut conn = db.pool.acquire().await.unwrap();
+    let template = birdtest::jobs::dispatch::JobTemplate::load(&mut conn, &job_row).await.unwrap();
+    drop(conn);
+
     let mut a = db.pool.begin().await.unwrap();
     LeaveGenHandler::insert_record(
-        &mut a, job, claims[0].1, claims[0].0,
+        &mut a, &template, claims[0].1, claims[0].0,
         &LeaveRecord { racks: vec![occurrence(&low)] },
     )
     .await
@@ -977,7 +989,7 @@ async fn overlapping_leave_submissions_wait_instead_of_deadlocking() {
         .unwrap();
     let b_record = LeaveRecord { racks: vec![occurrence(&high), occurrence(&low)] };
     let b_fold = async {
-        LeaveGenHandler::insert_record(&mut b, job, claims[1].1, claims[1].0, &b_record).await
+        LeaveGenHandler::insert_record(&mut b, &template, claims[1].1, claims[1].0, &b_record).await
     };
     let waiter_pool = db.pool.clone();
     let high_for_a = high.clone();

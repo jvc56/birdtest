@@ -98,4 +98,10 @@ pub struct AppState {
     /// has found dispatchable, so the claim path asks the database once per
     /// job rather than once per claim; see [`crate::derived::DerivedCache`].
     pub derived_ready: crate::derived::DerivedCache,
+    /// The immutable configuration of every job this process has dispatched
+    /// from or accepted a result for -- its config row, its players, its
+    /// letter distribution, its `expected_data` -- read once per job rather
+    /// than once per claim inside the dispatch lock; see
+    /// [`crate::jobs::dispatch::JobTemplates`].
+    pub templates: crate::jobs::dispatch::JobTemplates,
 }

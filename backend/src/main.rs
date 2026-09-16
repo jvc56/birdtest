@@ -91,6 +91,7 @@ async fn main() -> Result<()> {
         sse: sse::SseBroadcaster::new(),
         finish_checks: Default::default(),
         derived_ready: Default::default(),
+        templates: Default::default(),
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,

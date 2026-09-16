@@ -421,12 +421,17 @@ async fn rack_lookup(
     // of the job's tasks. `game_index IS NULL` is what keeps an incidentally
     // captured in-game position with the same rack out of an opening-rack
     // lookup.
+    //
+    // Ordered by record first: under redundancy above 1 a rack has one record
+    // per accepted claim, and ordering by rank alone interleaved the lists --
+    // two rank-1 rows, then two rank-2 rows -- as if one analysis had ranked
+    // every move twice.
     let rows = sqlx::query(
         "SELECT m.rank, m.move, m.score, m.equity
          FROM position_analysis_records r
          JOIN position_analysis_moves m ON m.record_id = r.id
          WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
-         ORDER BY m.rank ASC",
+         ORDER BY r.id ASC, m.rank ASC",
     )
     .bind(job_id)
     .bind(&canonical)
