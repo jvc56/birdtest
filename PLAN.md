@@ -62,7 +62,7 @@ State is determined by denormalized counters (`accepted_count`, `active_claim_co
 - **claimed**: `accepted_count + active_claim_count = redundancy` but `accepted_count < redundancy` — all slots are filled with in-flight claims; waiting on results.
 - **completed**: `accepted_count = redundancy` — all X results have been submitted and accepted.
 
-Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested and the job is a candidate, not via a background process. A job nobody asks for work from — one that is inactive, completed, or parked at 0% — therefore keeps a lapsed claim on its books until something reclaims it: activation above 0% makes it a candidate again, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
+Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested and the job is a candidate, not via a background process — **and a process reclaims nothing until it has been up for the heartbeat timeout itself** (`scheduler::reclaim_lapsed`). A heartbeat can only arrive at a server that is there to receive it: after an outage longer than the timeout, every open claim in the fleet looks that old however alive its worker, and the first claim request after the restart abandoned all of them — every task in flight handed out again, every result being computed answered `accepted: false`. A live worker's heartbeat arrives within thirty seconds of the server's return, so a claim still silent a full timeout after startup is reclaimed as before; what it costs is that a worker which really did die during the outage is noticed up to one timeout later. A job nobody asks for work from — one that is inactive, completed, or parked at 0% — therefore keeps a lapsed claim on its books until something reclaims it: activation above 0% makes it a candidate again, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
 
 #### Task Generation
 
@@ -133,6 +133,7 @@ one of them rejects an arithmetic or physical impossibility:
 | A rack has 1–7 tiles | More tiles than a rack holds cannot be dealt |
 | `num_moves` is at least the number of moves reported | A worker cannot report more moves than it says it generated |
 | A leave submission lists no rack twice | Occurrences are **summed** on receipt, so a duplicate silently inflates a generation's coverage |
+| A leave submission reports no more rack occurrences than its games could draw | At most two racks are recorded a turn, so `num_games` × 1,000 is far past any game; and the counts are summed into `bigint` columns, where a garbage count near 2^63 made every later merge of the generation fail and the generation impossible to close |
 | A batch reports exactly the games the task dispatched | The size was fixed when the task was handed out |
 | An opening-rack batch analyses exactly the racks the task dispatched | The racks themselves were named when the task was handed out |
 
@@ -1983,7 +1984,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
    ORDER BY (j.claims_issued - j.claims_baseline)::float / j.allocation ASC, j.created_at ASC
    ```
 
-3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: `task_claims` has no job column, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all.
+3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: `task_claims` has no job column, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all. Skipped entirely while the process is younger than the heartbeat timeout — see [Task States](#task-states) for why a restarted server has to hear from the fleet before it judges it.
 
 4. **Task acquisition** — strategy-dependent:
    - **Re-dispatch first**, under the job's dispatch lock like everything else here: `SELECT ... FOR UPDATE SKIP LOCKED` on the job's `available` tasks — a lapsed claim's task, or one with redundancy left to fill — **excluding any task this worker already holds a slot on**. Redundancy means independent workers; without the exclusion, a worker holding a slot on the oldest open task is offered it again on every attempt, refused by the per-identity unique index each time, and gets no work at all.
@@ -2227,7 +2228,7 @@ rather than oddities. See [Why impossibility, and not per-worker anomaly
 detection](#why-impossibility-and-not-per-worker-anomaly-detection) for the
 reasoning and the full table.
 
-Two of them cannot run in the pure validation step, because they need the
+Three of them cannot run in the pure validation step, because they need the
 request. They run in `store_result`, where the task id is in hand, and they are
 the only submission-time checks that catch a worker reporting work it did not
 do:
@@ -2244,6 +2245,17 @@ do:
   whether every task completed; racks from nowhere are stored as analyses of
   this job and added to `jobs.racks_analyzed`, the progress counter the
   dashboard reads.
+- **A leave batch must not report more rack occurrences than its games could
+  have drawn** (`plausibility::check_rack_occurrence_total`): the total across
+  the submission is held to `num_games` × 1,000, where MAGPIE records at most
+  two racks a turn. The other leave rules bound a count from below only, and
+  this is the job type where an unbounded one is a wedge rather than a wrong
+  number: occurrences are summed into `bigint` columns by a merge that folds
+  everything staged for the generation in one statement, so a count out of a
+  broken client's uninitialised buffer — as likely near 2^63 as anywhere —
+  made that statement fail with `bigint out of range` on every merge from then
+  on, including the drain no transition closes without. The generation could
+  not close until someone deleted the staged row by hand.
 
 #### How much of an analysis is stored
 
@@ -2411,7 +2423,7 @@ At claim time:
 1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and `configured_generation_count` generations are already done, return "no work."
 2. Check that the generation's rack universe exists — every generation's, the first included, is written by a task the first claim to find it missing starts. That check is one indexed `EXISTS`. A claim that finds the universe missing rolls back, starts the seeding on its own task, and treats the job as having no work yet: the seeding takes the job's lock without waiting and holds it while it writes, so no claim reads a half-written universe, and a seeding a client or a deploy interrupts rolls back whole and is started again by the next claim. (It used to run inside the claim itself, where MAGPIE's 120-second request timeout could cancel it — on a database slower than that at writing 3.2 million rows, every claim restarted it and none finished.) Then select up to `racks_per_task` racks below `target_rack_count`, in one of two ways (`leave_gen::next_step`), chosen from the generation's summary row — how many racks were below target as of the last merge, the same age as the counts both selections read.
 
-   **While many racks are below target — more than a hundred tasks' worth (`SWEEP_WHILE_TASKS_REMAIN`) — a sweep.** The generation's racks are handed out in primary-key order from a cursor remembered between claims (`leave_selection_cursors`, one row per generation, read and written only under the job's lock), one *lap* over the universe at a time, skipping racks already at target. A lap **starts only with no claim of the generation in flight and nothing staged**. From there every rack that is out — forced by an open claim, or by a result not yet merged — was handed out during this lap and so lies behind the cursor, and nothing ahead of it is out: a claim needs no list of what is out, and selection costs the same with one result staged as with ten thousand. (A task whose claim lapsed is reissued as it stands, before anything new is selected, so its racks stay behind the cursor with it.) Each selection reads one rack more than a task holds, so the task that takes a lap's last racks knows it and deletes the cursor in its own transaction; after that the job hands out nothing until the lap's last results are in and merged, and the next lap selects on exact counts. That pause is one task's duration and one merge per lap — some 6,400 tasks for English — and it is the wait that already precedes closing a generation, which is simply a lap that starts and finds nothing below target. A cursor lost to a purge or a partial restore is a lap not started: the same rule applies and nothing is handed out twice. A claim that hands out nothing commits rather than rolls back, so a lap found finished stays found.
+   **While many racks are below target — more than a hundred tasks' worth (`SWEEP_WHILE_TASKS_REMAIN`) — a sweep.** The generation's racks are handed out in primary-key order from a cursor remembered between claims (`leave_selection_cursors`, one row per generation, read and written only under the job's lock), one *lap* over the universe at a time, skipping racks already at target. A lap **starts only with no claim of the generation in flight and nothing staged**. From there every rack that is out — forced by an open claim, or by a result not yet merged — was handed out during this lap and so lies behind the cursor, and nothing ahead of it is out: a claim needs no list of what is out, and selection costs the same with one result staged as with ten thousand. (A task whose claim lapsed is reissued as it stands, before anything new is selected, so its racks stay behind the cursor with it.) Each selection reads one rack more than a task holds, so the task that takes a lap's last racks knows it and deletes the cursor in its own transaction; after that the job hands out nothing until the lap's last results are in and merged, and the next lap selects on exact counts. That pause is one task's duration and one merge per lap — some 6,400 tasks for English — and it is the wait that already precedes closing a generation, which is simply a lap that starts and finds nothing below target. (One task's duration when every worker holding one of the lap's last tasks is alive. When one is not, it is the heartbeat timeout for that claim to lapse plus a whole task for whoever is reissued it, with the job handing out nothing meanwhile; whether that is worth engineering around is open — see `AUDIT_FINDINGS_6.md`, U1.) A cursor lost to a purge or a partial restore is a lap not started: the same rule applies and nothing is handed out twice. A claim that hands out nothing commits rather than rolls back, so a lap found finished stays found.
 
    This replaced lowest-count-first selection for the bulk of a generation because of what that costs between merges: `leave_rack_progress` shows a finished task's racks at the counts they had before it played, so they are the *lowest* in the generation the moment their claim completes. They have to be held out — or they are handed straight back out, to every claim until the next merge — and holding them out meant every claim hashing and stepping over every staged rack, about a microsecond each, inside the dispatch lock: 160–290 ms with 400 results staged, a second at a hundred workers, where the lock's other claimants give up after two.
 
@@ -3000,8 +3012,21 @@ and the retry policy, applied uniformly:
 | 2xx | Return it. |
 | 204 | Return it; the caller decides (for `/task` it means "no work"). |
 | 429 | Sleep `Retry-After` (default 1s) and retry, up to 5 times. |
-| 5xx, or a transport error | Exponential backoff 1s, 2s, 4s, 8s, 16s; then fail. |
+| 5xx, or a transport error | Exponential backoff from 1s, doubling to a ceiling of 60s, for 20 retries — about fifteen minutes — then fail. |
 | 4xx other than 429 | Return it; the caller decides. Never retried. |
+
+**The transient budget is sized to outlast a deployment, and it was not.** It
+was five retries — 31 seconds — and a request that exhausts its retries ends the
+`contribute` run. birdtest is a single instance whose old task stops before the
+new one starts, so a routine deploy is a minute or two of refused connections
+and load-balancer `503`s: every contributor that asked for a task in that window
+stopped contributing until a person noticed, and one that was *submitting* lost
+the finished task with it. Fifteen minutes covers a deploy, a database failover
+and a short maintenance window; a server that is really gone still ends the run.
+The heartbeat is the exception, and goes out **once** with no retry
+(`http_client_post_json_once`): its own thirty-second schedule is the retry, and
+a heartbeat backing off through an outage would hold up the task's submission,
+which waits for the heartbeat thread to stop.
 
 #### JSON
 
@@ -3136,7 +3161,13 @@ not silently inherit whatever a user last set for simulation.
 5. Start the heartbeat thread.
 6. Dispatch on `job_type`.
 7. `POST /api/worker/result`.
-8. Stop the heartbeat. If `maxtasks` is reached, stop; otherwise repeat.
+8. Stop the heartbeat — **after** the submission, not before it. A claim is
+   only as alive as its last heartbeat, and a submission is not instant: a batch
+   with captured positions is tens of megabytes on a contributor's uplink, and a
+   server that is restarting is retried for a quarter of an hour. (The code
+   stopped the heartbeat first for a while, so a claim could lapse and be handed
+   to another worker while its own result was on the way.) If `maxtasks` is
+   reached, stop; otherwise repeat.
 
 **Digests are cached** by (resolved path, size, mtime, inode, ctime), with
 nanosecond timestamps where the filesystem records them, so a 15 MB lexicon is
@@ -3166,7 +3197,7 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 
 | JSON field | Setting | Notes |
 |---|---|---|
-| `recorder_type` | `-rN` | `best` for all birdtest jobs |
+| `recorder_type` | `-rN` | `best` \| `equity` \| `all`. `best` is right for games and game pairs, where autoplay keeps the one move it plays; an opening-rack job that keeps more than one move per rack needs `equity` or `all`, and job creation refuses `best` there |
 | `sort_strategy` | `-sN` | `equity` or `score`, for every player: a simmer sorts its candidates before simulating them |
 | `lexicon` | `-lN` | **Required.** Every player names its own; there is no job lexicon to fall back to. |
 | `leaves` | `-kN` | **Required**, for the same reason. |
@@ -3487,8 +3518,10 @@ takes minutes, and the heartbeat is what keeps the claim alive through it.
 ### Heartbeat thread
 
 `POST /api/worker/heartbeat` with `{"claim_token": "..."}` every 30 seconds for
-the lifetime of a claim, using `cpthread` and a stop flag. Failures are logged and
-ignored: the server treats a missed heartbeat as a lapsed claim and reassigns the
+the lifetime of a claim — through the result's submission, see the loop's step 8
+— using `cpthread` and a stop flag. Each goes out once, with no retry: the next
+one is thirty seconds away whatever happened to this one. Failures are ignored:
+the server treats a missed heartbeat as a lapsed claim and reassigns the
 task, which is the designed behaviour.
 
 The heartbeat starts *before* task execution, because wordmap generation and a
@@ -3596,17 +3629,24 @@ the worker applies both rather than whatever its own settings last loaded.
   "racks": ["AABCELT", "AABCELU"],
   "seed": "0",
   "previous_play": null,
-  "player": { "name": "static", "recorder_type": "best", "sort_strategy": "equity",
-              "lexicon": "NWL23", "leaves": "NWL23", "win_pct_model": null,
-              "max_iterations": null, "num_plies": null,
-              "num_plays": null, "num_plays_recorded": null,
-              "stopping_pct": null, "use_inference": null,
-              "time_limit_secs": null } }
+  "bingo_bonus": 50, "sim_cutoff": 0.005,
+  "player": { "name": "static", "recorder_type": "all", "sort_strategy": "equity",
+              "lexicon": "NWL23", "leaves": "NWL23",
+              "num_plies": 0, "num_plies_recorded": 2,
+              "num_plays": 100, "num_plays_recorded": 10,
+              "movegen_margin": 5.0,
+              "use_wordmap": false, "use_rit": false, "rit_name": null,
+              "win_pct_model": null, "max_iterations": null,
+              "stopping_pct": null, "use_inference": null, "time_limit_secs": null,
+              "min_play_iterations": null, "threshold": null, "sampling_rule": null,
+              "inference_margin": null, "utility_w_winpct": null,
+              "utility_w_spread": null, "utility_spread_scale": null } }
 
 { "job_type": "games",
   "variant": "classic", "letter_distribution": "english", "board_layout": "standard15",
   "seed": "1", "num_games": 10, "game_pairs": false,
   "capture_positions": false,
+  "bingo_bonus": 50, "sim_cutoff": 0.005,
   "player1": { }, "player2": { } }
 
 { "job_type": "game_pairs", "...": "as games, with game_pairs true",
@@ -3617,11 +3657,20 @@ the worker applies both rather than whatever its own settings last loaded.
   "board_layout": "standard15",
   "generation": 2,
   "seed": "7",
-  "forced_racks": ["AA", "AB"],
+  "forced_racks": ["AABCELT", "AABCELU"],
   "previous_artifact_key": "leaves/<job>/generation-1.klv2",
   "use_wordmap": true,
+  "bingo_bonus": 50,
   "num_games": 10000 }
 ```
+
+The player above is a **static** one, and it is the whole shape: the settings
+every player states are numbers, never null — MAGPIE refuses a player without
+`recorder_type`, `sort_strategy`, `num_plies`, `num_plays`, `num_plies_recorded`,
+`num_plays_recorded` or `movegen_margin` — and the simulation settings are null
+because `num_plies` is 0. A simmer states all of those as well. The committed
+fixtures under [`contract-fixtures/`](contract-fixtures/) are the authority on
+the shape; these are for reading.
 
 `racks` is a batch, not a single rack: the rack space runs to millions and one
 rack per task would spend a claim/submit round trip on each.
@@ -3694,7 +3743,7 @@ when the result does not satisfy its shape; `413` over 64 MiB.
   "pentanomial": [12, 3, 140, 5, 40],
   "divergent_games": { "...": "same shape, the divergent subset" } }
 
-{ "racks": [ { "rack": "AA", "count": 30, "mean": 1.5 } ] }
+{ "racks": [ { "rack": "AABCELT", "count": 30, "mean": 1.5 } ] }
 ```
 
 Server-side validation, so the client must satisfy it:
@@ -3710,6 +3759,9 @@ Server-side validation, so the client must satisfy it:
 - `positions` is present only when the job set `capture_positions`, and each entry
   must fall inside the task's own games — see
   [Position Capture From Games](#position-capture-from-games).
+- A leave result names full 7-tile racks only, each once, each with a `count` of
+  at least 1 and a finite `mean`; and the counts together may not exceed
+  `num_games` × 1,000, which no run of that many games can reach.
 
 #### `GET /api/worker/artifact?key=<key>`
 
@@ -4152,7 +4204,11 @@ half-hour takeover timeout), and only then listens.
 
 On the way out it **shuts down gracefully**: `SIGTERM` (what ECS sends before it
 escalates to `SIGKILL` at the stop timeout) and `SIGINT` stop it accepting new
-connections and let in-flight requests finish. Without that, a deployment drops
+connections and let in-flight requests finish. The dashboards' SSE streams are
+ended by the same signal (`state::Shutdown`): a stream is a request that never
+finishes, so with one job page open anywhere the wait for "in-flight requests"
+could only end at the `SIGKILL`, thirty seconds added to every deployment's
+gap. The page's `EventSource` reconnects by itself, to the new process. Without that, a deployment drops
 whatever is in flight — and a worker that has just uploaded a completed batch
 loses it, because the claim it was for is still `claimed` and stays that way
 until the heartbeat timeout, so the retry is answered `accepted: false`.
@@ -6743,8 +6799,20 @@ only configuration that survives full account compromise.
    task alongside the old one, and a starting process marks any import or export
    left `running` as failed on the assumption that whoever owned it is gone — so
    under the default, every deployment would fail the outgoing instance's live
-   work. Stopping first costs a few seconds with nothing serving, against an
-   invariant that otherwise does not hold exactly when the code changes. The
+   work. Stopping first costs a gap with nothing serving, against an
+   invariant that otherwise does not hold exactly when the code changes. That
+   gap is **a minute or two, not seconds**, and only because the Terraform
+   says so: ECS waits out the target group's deregistration delay before it
+   even sends `SIGTERM`, and the defaults (300 s of draining, then three health
+   checks thirty seconds apart for the new task) made it seven or eight
+   minutes — longer than the heartbeat timeout. `infra/ecs.tf` sets 30 s of
+   draining and two checks ten seconds apart. Three things are sized to ride
+   out what is left: MAGPIE retries a refused or `5xx` request for about
+   fifteen minutes (see [HTTP](#http-srccompatchttp--srcutilhttp_client)), a
+   restarted server reclaims no claim until it has been up for the heartbeat
+   timeout (see [Task States](#task-states)), and the process ends its SSE
+   streams on `SIGTERM` rather than waiting for a `SIGKILL` (see [Health and
+   startup](#health-and-startup)). The
    terminal writes are guarded on `state = 'running'` as well, so a reaped row
    stays reaped rather than coming back `staged` or `ready` with the reaper's
    error still on it.
