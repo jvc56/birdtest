@@ -315,7 +315,7 @@ async fn analysed_racks_are_counted_once_per_task_as_they_arrive() {
 
 /// Bug: any error claiming from one job failed the whole claim, so a single
 /// job that could not dispatch -- here, one whose config row is missing --
-/// answered every worker with a 500 for as long as it led the tier.
+/// answered every worker with a 500 for as long as it led the candidate list.
 #[tokio::test]
 async fn a_job_that_cannot_dispatch_does_not_block_the_others() {
     let db = TestDb::new().await;
@@ -1676,4 +1676,224 @@ async fn every_assignment_states_the_seed_its_task_was_stored_with() {
     .await
     .unwrap();
     assert_eq!(stored, vec![0, 3], "the assignment's seed is the task's");
+}
+
+/// Bug: `shutdown_or_idle` counted every active job, parked ones included, so a
+/// job at 0% -- which is offered to nobody, exactly as an inactive one is --
+/// could still get a worker told to shut down: a parked job with a floor above
+/// the worker's MAGPIE answered `magpie_too_old`, and a parked job in its
+/// unsupported set answered `data_out_of_date`. The same job switched to
+/// `inactive` answered `204`. A contributor who exits on that is not there when
+/// the admin raises a job it could have run.
+#[tokio::test]
+async fn a_parked_job_shuts_nobody_down() {
+    let db = TestDb::new().await;
+    let too_new = db.games_job(1, 2).await;
+    sqlx::query(
+        "UPDATE jobs SET allocation = 0, min_magpie_major = 2, min_magpie_minor = 0,
+                         min_magpie_patch = 0
+         WHERE id = $1",
+    )
+    .bind(too_new)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let unsupported = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+        .bind(unsupported)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    // Both axes would rule this worker out, and neither job is on offer.
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[unsupported]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // Raised above 0%, the same jobs are what the worker is told about.
+    sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = ANY($1)")
+        .bind(vec![too_new, unsupported])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[unsupported]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["shutdown"]["reason"], "both", "{body}");
+}
+
+/// Bug: the admin results stream and the export of an opening-rack job wrote
+/// the `position_analysis_records` row alone -- the rack, how many moves were
+/// ranked, when -- and none of the moves. The artifact PLAN.md names as the
+/// path for analysing the corpus held no move, score or equity at all.
+#[tokio::test]
+async fn an_opening_rack_corpus_carries_each_racks_ranked_moves() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("solver", admin).await;
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 3, 7, 100)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let cfg = db.config();
+    let app = birdtest::app(db.state().await);
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = assignment["claim_token"].as_str().unwrap().to_string();
+    let racks: Vec<String> = assignment["task_request"]["racks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect();
+    let result = json!({
+        "racks": racks.iter().map(|rack| json!({
+            "rack": rack,
+            "num_moves": 40,
+            "moves": [
+                { "move": format!("best-{rack}"), "score": 30, "equity": 32.5,
+                  "win_percentage": 55.0, "blended_utility": 0.6,
+                  "plies": [ { "ply": 0, "bingo_percentage": 1.5, "average_score": 24.0 },
+                             { "ply": 1, "bingo_percentage": 2.5, "average_score": 31.0 } ] },
+            ],
+        })).collect::<Vec<_>>()
+    });
+    let (status, body) = submit_as(&app, &uuid, &token, result).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    let (status, body) = send(&app, get_request(&path, &admin_headers(&cfg, admin))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Newline-delimited, so not one JSON document: the harness hands it back
+    // as text.
+    let text = body.as_str().expect("an NDJSON body").to_string();
+    let lines: Vec<serde_json::Value> =
+        text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(lines.len(), 3, "one line per analysed rack: {text}");
+    for line in &lines {
+        let rack = line["rack"].as_str().unwrap();
+        assert_eq!(line["num_moves"], 40);
+        let moves = line["moves"].as_array().expect("a record carries its moves");
+        assert_eq!(moves.len(), 1, "{line}");
+        assert_eq!(moves[0]["rank"], 1);
+        assert_eq!(moves[0]["move"], format!("best-{rack}"));
+        assert_eq!(moves[0]["equity"], 32.5);
+        assert_eq!(moves[0]["win_percentage"], 55.0);
+        let plies = moves[0]["plies"].as_array().expect("a move carries its plies");
+        assert_eq!(plies.len(), 2, "{line}");
+        assert_eq!(plies[1]["ply"], 1);
+        assert_eq!(plies[1]["average_score"], 31.0);
+    }
+}
+
+/// Bug: `?worker=` was applied to every row of the job -- a username compare
+/// or a SHA-256 of the claim's UUID per record, behind two joins -- so a page
+/// for a name nobody has read the whole job to find nothing: seconds per
+/// request at a million records, on a public route with no limit on it. The
+/// name is resolved to an identity first now, a name that belongs to nobody is
+/// an empty page without reading the job, and the filter is an equality on the
+/// claim's identity column.
+#[tokio::test]
+async fn the_results_feed_filters_by_who_a_name_is() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let job = db.games_job(1, 2).await;
+
+    // One result from an anonymous worker...
+    let (claim, anon) = first_claim(&app).await;
+    let token = claim["claim_token"].as_str().unwrap();
+    let (_, body) = submit_as(&app, &anon, token, games_result(2, 1)).await;
+    assert_eq!(body["accepted"], true, "{body}");
+    let pseudonym = birdtest::auth::public_anon_id(anon.parse().unwrap());
+
+    // ...and two from an account.
+    let user = db.user("keyed", false).await;
+    let raw_key = "bt_".to_string() + &"b".repeat(64);
+    sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)")
+        .bind(user)
+        .bind(birdtest::auth::api_key::hash_key(&raw_key))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let bearer = format!("Bearer {raw_key}");
+    for _ in 0..2 {
+        let (status, claim) = send(
+            &app,
+            post_json("/api/worker/task", &[("authorization", &bearer)], claim_body("1.0.0", &[])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{claim}");
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/worker/result",
+                &[("authorization", &bearer)],
+                json!({ "claim_token": claim["claim_token"], "result": games_result(2, 2) }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let feed = |worker: &str| get_request(&format!("/api/jobs/{job}/results?worker={worker}"), &[]);
+
+    let (status, body) = send(&app, feed("keyed")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{body}");
+    assert!(items.iter().all(|item| item["username"] == "keyed"), "{body}");
+
+    let (status, body) = send(&app, feed(&pseudonym)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["anon_id"], pseudonym);
+
+    // Nobody: a username that does not exist, and a well-formed pseudonym that
+    // no contributor has.
+    for nobody in ["no-such-contributor", "0123456789abcdef"] {
+        let (status, body) = send(&app, feed(nobody)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"].as_array().unwrap().len(), 0, "{nobody}: {body}");
+        assert!(body["next_cursor"].is_null(), "{body}");
+    }
+
+    // Unfiltered, all three.
+    let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}/results"), &[])).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 3, "{body}");
+}
+
+/// The display pool is what keeps page views off the path workers wait on, and
+/// its statement timeout is what bounds how long any one read holds one of its
+/// connections. A cancelled read is load, not a fault: `503`, not `500`.
+#[tokio::test]
+async fn the_display_pool_bounds_its_reads() {
+    let db = TestDb::new().await;
+    let read_pool = birdtest::db::connect_read(&db.url).await.unwrap();
+
+    let timeout: String =
+        sqlx::query_scalar("SHOW statement_timeout").fetch_one(&read_pool).await.unwrap();
+    assert_eq!(timeout, "15s");
+    // The main pool is unbounded: a purge or a generation's seeding runs on it.
+    let timeout: String =
+        sqlx::query_scalar("SHOW statement_timeout").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(timeout, "0");
+
+    // What a read past the bound turns into, without waiting fifteen seconds.
+    let mut conn = read_pool.acquire().await.unwrap();
+    sqlx::query("SET statement_timeout = '50ms'").execute(&mut *conn).await.unwrap();
+    let cancelled = sqlx::query("SELECT pg_sleep(5)").execute(&mut *conn).await.unwrap_err();
+    let err: birdtest::error::AppError = cancelled.into();
+    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err.code, "unavailable");
+    drop(conn);
+    read_pool.close().await;
 }

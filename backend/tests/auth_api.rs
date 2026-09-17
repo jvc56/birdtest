@@ -113,3 +113,44 @@ async fn the_account_page_reads_the_contribution_counter() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["tasks_completed"], 7);
 }
+
+/// Race: the hundred-key limit was a `COUNT` and then an `INSERT`, two
+/// statements with nothing between them, so requests arriving together each
+/// read the same count and each inserted. The limit lives in the application,
+/// not the schema, so that check is all there is.
+#[tokio::test]
+async fn concurrent_key_requests_cannot_exceed_the_key_limit() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let user = db.user("keyhoarder", false).await;
+    // Two short of the limit, written directly.
+    sqlx::query(
+        "INSERT INTO api_keys (user_id, key_hash)
+         SELECT $1, 'seeded-' || g FROM generate_series(1, 98) g",
+    )
+    .bind(user)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let headers = admin_headers(&cfg, user);
+    let request = || {
+        let mut builder = Request::post("/api/me/api-keys").header("content-type", "application/json");
+        for (name, value) in &headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+        builder.body(Body::from("{}")).unwrap()
+    };
+    let attempts = futures::future::join_all((0..12).map(|_| send(&app, request()))).await;
+
+    let created = attempts.iter().filter(|(status, _)| *status == StatusCode::CREATED).count();
+    let refused = attempts.iter().filter(|(status, _)| *status == StatusCode::CONFLICT).count();
+    assert_eq!((created, refused), (2, 10), "{attempts:?}");
+    let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(held, 100);
+}

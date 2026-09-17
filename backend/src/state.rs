@@ -69,7 +69,14 @@ impl FinishCheckCounters {
 
 #[derive(Clone)]
 pub struct AppState {
+    /// The pool claims, submissions, heartbeats, the finish check, admin
+    /// actions and the background sweeps run on.
     pub pool: PgPool,
+    /// The pool the public pages and the live dashboard read from
+    /// (`db::connect_read`): smaller, with a statement timeout, and separate so
+    /// that nothing display-only can hold a connection a worker is waiting
+    /// for. Nothing that decides anything reads through it.
+    pub read_pool: PgPool,
     pub cfg: Arc<Config>,
     /// The pinned MAGPIE binary, and what it says about its own builders.
     ///

@@ -627,8 +627,10 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // changed since the submission that asked for this, and a payload
         // saying `active` for a job that just completed is exactly the
         // staleness the dashboard would notice.
-        match jobstats::load_job(&state.pool, job_id).await {
-            Ok(job) => match jobstats::compute(&state.pool, &job).await {
+        // On the display pool: this is a dashboard payload, and must not take
+        // a connection from the pool the submission that asked for it used.
+        match jobstats::load_job(&state.read_pool, job_id).await {
+            Ok(job) => match jobstats::compute(&state.read_pool, &job).await {
                 Ok(stats) => {
                     if let Ok(payload) = serde_json::to_string(&stats) {
                         state.sse.publish(job_id, payload);

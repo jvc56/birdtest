@@ -51,7 +51,8 @@ pub enum ClaimOutcome {
     Task(Box<TaskClaim>),
     /// Work this worker could run exists, but none is available right now.
     Idle,
-    /// No active jobs at all. A quiet server is not the worker's fault.
+    /// No job is offering work at all: none is active, or every active one is
+    /// parked at 0%. A quiet server is not the worker's fault.
     NoWorkExists,
     /// Every active job is ruled out for this worker.
     Shutdown(ShutdownDirective),
@@ -117,10 +118,19 @@ async fn shutdown_or_idle(
     state: &AppState,
     caps: &WorkerCapabilities,
 ) -> AppResult<ClaimOutcome> {
-    // An axis counts as blocking only for *active* jobs it actually rules out.
-    // The unsupported set is client-supplied and may name jobs that have since
-    // completed or been deactivated; its mere non-emptiness says nothing about
-    // why the active jobs are out of reach.
+    // An axis counts as blocking only for jobs that are *offering work* --
+    // active and above 0% -- and that it actually rules out. The unsupported
+    // set is client-supplied and may name jobs that have since completed or
+    // been deactivated; its mere non-emptiness says nothing about why the
+    // jobs on offer are out of reach.
+    //
+    // A job parked at 0% is offered to nobody, which is what `inactive` means,
+    // so it is left out exactly as an inactive job is. Counted, a parked job
+    // this worker could not run told the worker to shut down -- "every active
+    // job requires MAGPIE 0.2.0" -- over a job that was handing out nothing to
+    // anyone, where the same job switched to `inactive` answered `204`. A
+    // contributor who exits on that does not come back when the admin raises
+    // the allocation of a job it could have run all along.
     let row = sqlx::query(
         "SELECT COUNT(*) AS total,
                 COUNT(*) FILTER (
@@ -130,7 +140,7 @@ async fn shutdown_or_idle(
                     WHERE (min_magpie_major, min_magpie_minor, min_magpie_patch) <= ($1, $2, $3)
                       AND id = ANY($4)
                 ) AS data_blocked
-         FROM jobs WHERE status = 'active'",
+         FROM jobs WHERE status = 'active' AND allocation > 0",
     )
     .bind(caps.magpie_version.major)
     .bind(caps.magpie_version.minor)
@@ -146,8 +156,8 @@ async fn shutdown_or_idle(
     let version_blocked = row.get::<i64, _>("too_new") > 0;
     let data_blocked = row.get::<i64, _>("data_blocked") > 0;
     if !version_blocked && !data_blocked {
-        // Active jobs exist and nothing rules them out; they simply had no
-        // task to hand out this instant, or every one of them is at 0%.
+        // Jobs are on offer and nothing rules them out; they simply had no
+        // task to hand out this instant.
         return Ok(ClaimOutcome::Idle);
     }
 
@@ -157,7 +167,7 @@ async fn shutdown_or_idle(
         sqlx::query_scalar::<_, String>(
             "SELECT format('%s.%s.%s', min_magpie_major, min_magpie_minor, min_magpie_patch)
              FROM jobs
-             WHERE status = 'active'
+             WHERE status = 'active' AND allocation > 0
                AND (min_magpie_major, min_magpie_minor, min_magpie_patch) > ($1, $2, $3)
              ORDER BY min_magpie_major, min_magpie_minor, min_magpie_patch
              LIMIT 1",
@@ -176,7 +186,7 @@ async fn shutdown_or_idle(
             "SELECT DISTINCT d.tarball_date
              FROM jobs j
              JOIN input_data d ON d.id IN (j.letterdist_id, j.layout_id)
-             WHERE j.id = ANY($1) AND j.status = 'active'
+             WHERE j.id = ANY($1) AND j.status = 'active' AND j.allocation > 0
              ORDER BY d.tarball_date DESC",
         )
         .bind(&caps.unsupported_jobs)

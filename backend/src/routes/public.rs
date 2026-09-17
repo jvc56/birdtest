@@ -102,11 +102,11 @@ async fn list_jobs(
     )
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs")
-        .fetch_one(&state.pool)
+        .fetch_one(&state.read_pool)
         .await?;
 
     let items = rows
@@ -144,14 +144,14 @@ async fn list_jobs(
 async fn load_job(state: &AppState, id: Uuid) -> AppResult<Job> {
     sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.read_pool)
         .await?
         .ok_or_else(|| AppError::not_found("no such job"))
 }
 
 async fn job_detail(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<JobStats>> {
     let job = load_job(&state, id).await?;
-    Ok(Json(jobstats::compute(&state.pool, &job).await?))
+    Ok(Json(jobstats::compute(&state.read_pool, &job).await?))
 }
 
 #[derive(Deserialize)]
@@ -179,6 +179,29 @@ async fn job_results(
         return Ok(Json(rack_lookup(&state, id, rack).await?));
     }
 
+    // `?worker=` names a contributor; the rows are filtered on who that *is*.
+    // A name that belongs to nobody is an empty page, decided here in two
+    // indexed probes rather than by reading the job to find out.
+    let worker = match query.worker.as_deref() {
+        Some(name) => match resolve_worker(&state, name).await? {
+            Some(worker) => Some(worker),
+            None => {
+                return Ok(Json(super::CursorPage {
+                    items: Vec::new(),
+                    total: -1,
+                    per_page: limit,
+                    next_cursor: None,
+                }))
+            }
+        },
+        None => None,
+    };
+    let (worker_user, worker_anon) = match &worker {
+        Some(w) => (w.user_id, w.anon_uuid),
+        None => (None, None),
+    };
+    let worker_predicate = worker_predicate(worker.as_ref());
+
     // Every branch below reads its rows through the job id the record tables
     // now carry, rather than by joining `tasks` to find out which rows belong
     // to the job — which put the filter on the far side of a join from the
@@ -193,7 +216,7 @@ async fn job_results(
             // to now(), which is transaction time, so every record of one batch
             // shares it exactly and it is not a key on its own.
             let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
-            let rows = sqlx::query(
+            let rows = sqlx::query(&format!(
                 "SELECT r.id, r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
                         m.equity AS best_equity, r.num_moves, r.submitted_at,
                         u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
@@ -203,20 +226,22 @@ async fn job_results(
                      ON m.record_id = r.id AND m.rank = 1
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE r.job_id = $1
-                   AND ($2::text IS NULL
-                        OR u.username = $2
-                        OR left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) = $2)
-                   AND ($3::timestamptz IS NULL
-                        OR (r.submitted_at, r.id) < ($3, $4))
+                   {worker_predicate}
+                   AND ($4::timestamptz IS NULL
+                        OR (r.submitted_at, r.id) < ($4, $5))
                  ORDER BY r.submitted_at DESC, r.id DESC
-                 LIMIT $5",
-            )
+                 LIMIT $6",
+            ))
+            // Planned for the values it is run with, not cached: see
+            // `worker_predicate`.
+            .persistent(worker.is_none())
             .bind(id)
-            .bind(&query.worker)
+            .bind(worker_user)
+            .bind(worker_anon)
             .bind(after_time)
             .bind(after_id)
             .bind(limit)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.read_pool)
             .await?;
 
             if rows.len() as i64 == limit {
@@ -253,7 +278,7 @@ async fn job_results(
             // rather than as the thing that decides which rows belong to the
             // job.
             let (after_time, after_claim) = game_result_cursor(cursor.as_deref());
-            let rows = sqlx::query(
+            let rows = sqlx::query(&format!(
                 "SELECT r.task_claim_id, r.task_id, r.games, r.wins, r.losses, r.ties,
                         r.p1_score_mean, r.p1_score_sd, r.p2_score_mean, r.p2_score_sd,
                         r.divergent_games, r.divergent_wins, r.divergent_losses,
@@ -264,20 +289,20 @@ async fn job_results(
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE r.job_id = $1
-                   AND ($2::text IS NULL
-                        OR u.username = $2
-                        OR left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) = $2)
-                   AND ($3::timestamptz IS NULL
-                        OR (r.submitted_at, r.task_claim_id) < ($3, $4))
+                   {worker_predicate}
+                   AND ($4::timestamptz IS NULL
+                        OR (r.submitted_at, r.task_claim_id) < ($4, $5))
                  ORDER BY r.submitted_at DESC, r.task_claim_id DESC
-                 LIMIT $5",
-            )
+                 LIMIT $6",
+            ))
+            .persistent(worker.is_none())
             .bind(id)
-            .bind(&query.worker)
+            .bind(worker_user)
+            .bind(worker_anon)
             .bind(after_time)
             .bind(after_claim)
             .bind(limit)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.read_pool)
             .await?;
 
             if rows.len() as i64 == limit {
@@ -339,7 +364,7 @@ async fn job_results(
             .bind(after_count)
             .bind(after_rack)
             .bind(limit)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.read_pool)
             .await?;
 
             if rows.len() as i64 == limit {
@@ -367,6 +392,80 @@ async fn job_results(
     };
 
     Ok(Json(super::CursorPage { items, total: -1, per_page: limit, next_cursor }))
+}
+
+/// Who `?worker=` names: an account, an anonymous worker, or -- a username may
+/// happen to be sixteen hex characters -- one of each.
+struct WorkerFilter {
+    user_id: Option<Uuid>,
+    anon_uuid: Option<Uuid>,
+}
+
+/// Resolves `?worker=` to the identities it names, or `None` when it names
+/// nobody.
+///
+/// The filter used to be applied to every row of the job instead: `u.username
+/// = $2 OR left(encode(sha256(...claimed_by_anon_uuid...)), 16) = $2`, a hash
+/// per record on the far side of two joins, which no index can serve. A page
+/// for a contributor with few results -- or for a name nobody has -- therefore
+/// read the *whole job* looking for fifty rows that were not there: 2.4 seconds
+/// at a million records, measured, on a public, unauthenticated, unmetered
+/// route, each request holding a pool connection for all of it. Resolved first,
+/// the filter is an equality on an indexed column of `task_claims`, and a name
+/// that matches nothing never reads the job at all.
+///
+/// A pseudonym is matched among contributors only (`tasks_completed > 0`, the
+/// partial index `/api/workers` reads): an identity with results in any job has
+/// completed something, and that set is bounded by work actually done rather
+/// than by how many UUIDs were ever minted. The hash cannot be indexed as it
+/// is defined -- `convert_to` is not immutable.
+async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<WorkerFilter>> {
+    // Deleted accounts included: the contribution table still lists their
+    // results, under the tombstone name, and that name filters like any other.
+    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE username = $1")
+    .bind(name)
+    .fetch_optional(&state.read_pool)
+    .await?;
+
+    let looks_like_a_pseudonym =
+        name.len() == 16 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let anon_uuid = if looks_like_a_pseudonym {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT uuid FROM anonymous_workers
+             WHERE tasks_completed > 0
+               AND left(encode(sha256(convert_to(uuid::text, 'UTF8')), 'hex'), 16) = $1
+             LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&state.read_pool)
+        .await?
+    } else {
+        None
+    };
+
+    Ok((user_id.is_some() || anon_uuid.is_some()).then_some(WorkerFilter { user_id, anon_uuid }))
+}
+
+/// The feed queries' worker clause, over `$2` (an account) and `$3` (an
+/// anonymous worker). Every variant mentions both, typed, so the statement
+/// prepares whichever are NULL.
+///
+/// A filtered feed is sent unprepared (`persistent(false)`), so Postgres plans
+/// it for the identity actually asked about. The right plan differs by two
+/// orders of magnitude with who that is -- a heavy contributor is found at the
+/// head of the job's feed index, a rare one through their own claims -- and a
+/// cached generic plan picks one for everybody.
+fn worker_predicate(worker: Option<&WorkerFilter>) -> &'static str {
+    match worker {
+        None => "AND $2::uuid IS NULL AND $3::uuid IS NULL",
+        Some(WorkerFilter { user_id: Some(_), anon_uuid: None }) => {
+            "AND c.claimed_by_user_id = $2::uuid AND $3::uuid IS NULL"
+        }
+        Some(WorkerFilter { user_id: None, anon_uuid: Some(_) }) => {
+            "AND $2::uuid IS NULL AND c.claimed_by_anon_uuid = $3::uuid"
+        }
+        Some(_) => "AND (c.claimed_by_user_id = $2::uuid OR c.claimed_by_anon_uuid = $3::uuid)",
+    }
 }
 
 /// The three cursor shapes this route uses. Each returns `None`s for a missing
@@ -433,7 +532,7 @@ async fn rack_lookup(
     )
     .bind(job_id)
     .bind(&canonical)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let items: Vec<serde_json::Value> = rows
@@ -461,7 +560,7 @@ async fn job_stream(
     Path(id): Path<Uuid>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let job = load_job(&state, id).await?;
-    let initial = jobstats::compute(&state.pool, &job).await?;
+    let initial = jobstats::compute(&state.read_pool, &job).await?;
     let initial = serde_json::to_string(&initial).unwrap_or_else(|_| "{}".into());
 
     let receiver = state.sse.subscribe(id);
@@ -515,18 +614,16 @@ pub(super) async fn job_results_stream(
         .try_acquire_owned()
         .map_err(|_| AppError::rate_limited(30))?;
 
+    // The main pool, not the display one: this cursor is held for as long as
+    // the caller keeps reading, which the display pool's statement timeout
+    // exists to forbid. The permit above is what bounds it instead.
     let pool = state.pool.clone();
     let stream = async_stream::stream! {
         let _permit = permit;
-        let query = match job.job_type {
-            JobType::OpeningRack =>
-                "SELECT to_jsonb(r) AS row FROM position_analysis_records r
-                 WHERE r.job_id = $1",
-            JobType::Games | JobType::GamePairs =>
-                "SELECT to_jsonb(r) AS row FROM game_results r WHERE r.job_id = $1",
-            JobType::LeaveGeneration =>
-                "SELECT to_jsonb(r) AS row FROM leave_rack_progress r WHERE r.job_id = $1",
-        };
+        // The export's own queries, so the stream of an active job and the
+        // export of a completed one are the same corpus -- an opening-rack
+        // record with its ranked moves nested in it, not the record alone.
+        let query = crate::exports::export_query(job.job_type);
 
         let mut rows = sqlx::query(query).bind(id).fetch(&pool);
         while let Some(row) = rows.next().await {
@@ -579,11 +676,11 @@ async fn list_users(
     )
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")
-        .fetch_one(&state.pool)
+        .fetch_one(&state.read_pool)
         .await?;
 
     Ok(Json(super::Page {
@@ -663,14 +760,14 @@ async fn worker_page(
     )
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>(
         "SELECT (SELECT COUNT(*) FROM users WHERE tasks_completed > 0)
               + (SELECT COUNT(*) FROM anonymous_workers WHERE tasks_completed > 0)",
     )
-    .fetch_one(&state.pool)
+    .fetch_one(&state.read_pool)
     .await?;
 
     Ok(Json(super::Page {

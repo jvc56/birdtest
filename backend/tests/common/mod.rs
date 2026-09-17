@@ -219,6 +219,9 @@ impl TestDb {
                 birdtest::state::MAX_CONCURRENT_RESULT_STREAMS,
             )),
             pool: self.pool.clone(),
+            // One pool in tests: a test reads what it just wrote, and the
+            // separation is about connection budgets, not visibility.
+            read_pool: self.pool.clone(),
             magpie: birdtest::magpie::Magpie::new(&cfg.magpie_bin, 1),
             builders: Arc::new(test_builders()),
             cfg: cfg.clone(),

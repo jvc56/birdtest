@@ -67,6 +67,29 @@
     }
   }
 
+  // Both are one click away from Activate and neither can be taken back: a
+  // purge deletes every task, claim and result the job holds, and a completed
+  // job can never be reactivated. Delete already asked; these did not.
+  function purge() {
+    if (
+      !confirm(
+        'Purge this job? Every task, claim and result it holds is deleted and the job starts over. This cannot be undone.'
+      )
+    )
+      return;
+    run(() => api.purgeJob(jobId), 'Results purged; the job starts over from its first task.');
+  }
+
+  function forceComplete() {
+    if (
+      !confirm(
+        'Force-complete this job? It stops dispatching for good: a completed job cannot be reactivated.'
+      )
+    )
+      return;
+    run(() => api.completeJob(jobId), 'Job force-completed.');
+  }
+
   async function remove() {
     if (!confirm('Delete this job and every task and result it holds? This cannot be undone.'))
       return;
@@ -111,19 +134,8 @@
         >
           Deactivate
         </button>
-        <button
-          class="btn-secondary"
-          on:click={() => run(() => api.completeJob(jobId), 'Job force-completed.')}
-        >
-          Force complete
-        </button>
-        <button
-          class="btn-secondary"
-          on:click={() =>
-            run(() => api.purgeJob(jobId), 'Results purged; tasks returned to available.')}
-        >
-          Purge results
-        </button>
+        <button class="btn-secondary" on:click={forceComplete}>Force complete</button>
+        <button class="btn-secondary" on:click={purge}>Purge results</button>
         {#if stats.job.job_type === 'leave_generation'}
           <button class="btn-secondary" on:click={rebuildArtifacts}>Check artifacts</button>
         {/if}

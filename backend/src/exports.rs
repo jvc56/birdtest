@@ -36,14 +36,50 @@ use uuid::Uuid;
 /// is made, not while it is being served.
 pub const DOWNLOAD_URL_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
 
-/// The rows an export contains, per job type. The same queries the live stream
-/// runs, so the two produce the same corpus.
-fn export_query(job_type: JobType) -> &'static str {
+/// An opening-rack job's corpus: one row per analysed rack, **with its ranked
+/// moves and their per-ply statistics nested inside it**.
+///
+/// The record row alone is a header -- the rack, how many moves were ranked,
+/// when -- and the analysis itself is in `position_analysis_moves` and
+/// `position_analysis_plies`. This used to export the header only, so the
+/// artifact PLAN.md names as "the path for analysing the corpus properly" held
+/// no move, score or equity at all, and nothing else reads the moves in bulk:
+/// the public feed returns the best move only, and `?rack=` one rack at a time.
+///
+/// Nested rather than joined, so the unit stays one line per record and
+/// `row_count` still counts records. Each record's moves come through
+/// `position_analysis_moves_record_idx (record_id, rank)` and each move's plies
+/// through the `(move_id, ply)` unique index, so the cost is an index probe per
+/// record and per simmed move, on a background task (or under the two-stream
+/// cap) rather than on anything a worker waits for.
+const OPENING_RACK_CORPUS: &str = "
+    SELECT to_jsonb(r) || jsonb_build_object('moves', COALESCE((
+               SELECT jsonb_agg(
+                          jsonb_build_object(
+                              'rank', m.rank, 'move', m.move, 'score', m.score,
+                              'equity', m.equity, 'win_percentage', m.win_percentage,
+                              'blended_utility', m.blended_utility,
+                              'plies', COALESCE((
+                                  SELECT jsonb_agg(
+                                             jsonb_build_object(
+                                                 'ply', p.ply,
+                                                 'bingo_percentage', p.bingo_percentage,
+                                                 'average_score', p.average_score)
+                                             ORDER BY p.ply)
+                                  FROM position_analysis_plies p WHERE p.move_id = m.id
+                              ), '[]'::jsonb))
+                          ORDER BY m.rank)
+               FROM position_analysis_moves m WHERE m.record_id = r.id
+           ), '[]'::jsonb)) AS row
+    FROM position_analysis_records r
+    WHERE r.job_id = $1";
+
+/// The rows an export contains, per job type. The live stream
+/// (`routes::public::job_results_stream`) runs the same queries, so the two
+/// produce the same corpus.
+pub fn export_query(job_type: JobType) -> &'static str {
     match job_type {
-        JobType::OpeningRack => {
-            "SELECT to_jsonb(r) AS row FROM position_analysis_records r
-             WHERE r.job_id = $1"
-        }
+        JobType::OpeningRack => OPENING_RACK_CORPUS,
         JobType::Games | JobType::GamePairs => {
             "SELECT to_jsonb(r) AS row FROM game_results r WHERE r.job_id = $1"
         }

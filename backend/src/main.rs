@@ -83,8 +83,12 @@ async fn main() -> Result<()> {
     // traffic against an out-of-date schema.
     db::migrate(&pool).await?;
 
+    // After the migration, so its connections never see the old schema.
+    let read_pool = db::connect_read(&cfg.database_url).await?;
+
     let state = AppState {
         pool,
+        read_pool,
         cfg: cfg.clone(),
         magpie,
         builders: Arc::new(builders),

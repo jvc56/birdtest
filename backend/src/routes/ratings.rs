@@ -59,7 +59,7 @@ async fn list_pools(State(state): State<AppState>) -> AppResult<Json<Vec<PoolLis
          JOIN input_data lay ON lay.id = p.layout_id
          ORDER BY p.name",
     )
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     Ok(Json(
@@ -144,7 +144,7 @@ async fn pool_detail(
          WHERE p.id = $1",
     )
     .bind(id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.read_pool)
     .await?
     .ok_or_else(|| AppError::not_found("rating pool not found"))?;
 
@@ -153,7 +153,7 @@ async fn pool_detail(
          FROM rating_runs WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
     )
     .bind(id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&state.read_pool)
     .await?
     .map(|row| RunSummary {
         id: row.get("id"),
@@ -176,7 +176,7 @@ async fn pool_detail(
              ORDER BY r.rating DESC",
         )
         .bind(run.id)
-        .fetch_all(&state.pool)
+        .fetch_all(&state.read_pool)
         .await?;
         ratings = rows
             .iter()
@@ -205,7 +205,7 @@ async fn pool_detail(
              ORDER BY abs(actual - predicted) DESC, row_player_config_id, col_player_config_id",
         )
         .bind(run.id)
-        .fetch_all(&state.pool)
+        .fetch_all(&state.read_pool)
         .await?
         .iter()
         .map(|row| MatrixCell {
@@ -283,7 +283,7 @@ async fn pool_history(
     )
     .bind(id)
     .bind(MAX_HISTORY_RUNS)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     Ok(Json(

@@ -294,8 +294,8 @@ pub async fn status_for_job(
 
 /// The built hashes of every job this process has found dispatchable, by job.
 ///
-/// `status_for_job` runs on every claim, for every candidate job in the
-/// worker's tier, before that job's dispatch lock is taken -- a join over the
+/// `status_for_job` used to run on every claim, for every candidate job,
+/// before that job's dispatch lock was taken -- a join over the
 /// job's config, its players, `input_data` and `derived_data` on the path a
 /// worker waits on to get its next task. The answer for a job that is
 /// dispatchable never changes for the life of the process, so it is asked

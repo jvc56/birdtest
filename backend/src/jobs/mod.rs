@@ -532,12 +532,12 @@ pub async fn expected_data(
     conn: &mut PgConnection,
     job: &crate::models::job::Job,
 ) -> AppResult<Vec<ExpectedFile>> {
-    // One query, not three. This runs on every claim that hands out a task,
-    // inside the job's dispatch lock, so each round trip here is time no other
-    // worker can be claiming from this job. The union also removes the match
-    // on `job_type` that used to choose between them: a job type simply has no
-    // row in the config tables it does not use, so the branches contribute
-    // nothing rather than needing to be skipped.
+    // One query, not three, and run once per job per process: the answer is
+    // fixed at job creation, so it is part of the job's template
+    // (`dispatch::JobTemplate`) rather than read on every claim. The union
+    // also removes the match on `job_type` that used to choose between them:
+    // a job type simply has no row in the config tables it does not use, so
+    // the branches contribute nothing rather than needing to be skipped.
     let rows = sqlx::query(
         "WITH players AS (
              SELECT unnest(ARRAY[player1_config_id, player2_config_id]) AS id

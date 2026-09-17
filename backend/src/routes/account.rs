@@ -89,9 +89,20 @@ async fn create_key(
 ) -> AppResult<(StatusCode, Json<CreatedKey>)> {
     csrf::verify(&method, &headers, &jar)?;
 
+    // Count and insert under the account's row lock. Counted and then inserted
+    // as two statements on the pool, requests arriving together each read the
+    // same count and each inserted, so the limit held only against a caller who
+    // asked one at a time: a hundred concurrent requests at 99 keys left 199.
+    // The limit is enforced here rather than in the schema, so this is the
+    // only thing that enforces it.
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
         .bind(user.id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await?;
     if count >= MAX_API_KEYS {
         return Err(AppError::conflict(format!(
@@ -106,8 +117,9 @@ async fn create_key(
     .bind(user.id)
     .bind(api_key::hash_key(&raw))
     .bind(&body.label)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(CreatedKey { id, label: body.label, key: raw })))
 }
