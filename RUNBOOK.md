@@ -100,10 +100,12 @@ Then run §4 (verification). Only once it passes, rename or retire the damaged
 instance — never before.
 
 **What the fleet does meanwhile.** Workers go on playing the tasks they hold.
-MAGPIE retries a refused or `5xx` request for about fifteen minutes and then
-ends its `contribute` run, so an outage this long stops most contributors, and
-only they can start again — a routine deployment, a minute or two, stops
-nobody. When the server comes back it reclaims **no** claim until it has been
+A worker asking for a task keeps asking, once a minute, for as long as the
+server is away, and picks up again by itself when it is back. A worker
+*submitting* retries for about fifteen minutes and then ends its `contribute`
+run — its claim will have lapsed anyway — so an outage this long stops the
+contributors that finished a task in the middle of it, and only they can start
+again. A routine deployment, a minute or two, stops nobody. When the server comes back it reclaims **no** claim until it has been
 up for the heartbeat timeout (`HEARTBEAT_TIMEOUT_SECONDS`, 300): a claim's
 evidence of life is a heartbeat, and nobody could deliver one while the server
 was away. Workers still running are heard from within thirty seconds and their

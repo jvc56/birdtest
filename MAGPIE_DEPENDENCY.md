@@ -13,8 +13,8 @@ which is where to look first — this is the argument, not the reference.
 
 It supersedes RIT_WMP_PROVENANCE.md, which described the provenance problem and
 four narrower options; that document is deleted, and its analysis is folded into
-PLAN.md's section above. It reverses audit finding M2
-([AUDIT_FINDINGS_1.md](AUDIT_FINDINGS_1.md)), which refused `use_rit` precisely
+PLAN.md's section above. It reverses an earlier audit's decision (its finding
+M2; the record is in the git history), which refused `use_rit` precisely
 because there was nothing to check a table against.
 
 **Scope.** This is about contributed results — data a worker computes and
