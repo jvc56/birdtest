@@ -897,8 +897,9 @@ Write these as one table-driven test each rather than 50 separate functions.
 - `A-WORKER-7` A claim returns `expected_data` with digests, and the client
   declining with `missing_data` records `worker_data_gaps` and releases the
   claim immediately.
-- `A-WORKER-8` A decline with an unknown reason is rejected; the three known
-  reasons are accepted.
+- `A-WORKER-8` A decline with an unknown reason is rejected; the five known
+  reasons (`missing_data`, `magpie_version`, `unknown_job_type`,
+  `derived_mismatch`, `task_failed`) are accepted.
 - `A-WORKER-9` Heartbeat extends the claim and is rejected for a stale token.
 - `A-WORKER-10` Result submission with a valid token is accepted and publishes
   an SSE event.
@@ -985,9 +986,12 @@ request. Server→client fixtures are compared by **field structure, not bytes**
 so fields stay free to move before the first release while a renamed or dropped
 field still fails.
 
-Five fixtures exist. The set is complete when every message has one:
+Eight fixtures exist: an assignment of each request shape (games, opening
+racks, leave generation), a claim, a decline, and each of the three shutdown
+reasons. The set is complete when every message has one:
 
-- `C-1` `assignment-opening-rack.json` — **missing**.
+- `C-1` `assignment-opening-rack.json` — exists, and MAGPIE's
+  `test/birdtest_contract/` carries a byte-identical copy.
 - `C-2` `assignment-game-pairs.json`, carrying `game_pairs: true` — **missing**.
 - `C-3` `result-games.json` — **missing**.
 - `C-4` `result-game-pairs.json`, carrying the pentanomial — **missing**, and

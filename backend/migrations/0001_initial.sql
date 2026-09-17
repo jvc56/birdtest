@@ -1426,8 +1426,14 @@ CREATE INDEX        audit_log_job_idx         ON audit_log (job_id);
 -- leave claim read the whole generation and sorted it to find its few hundred
 -- racks -- inside the job's dispatch lock. With it a claim walks the index from
 -- the lowest count and stops when it has enough; the cost no longer depends on
--- the size of the universe (PLAN.md, "What these reads cost"). It costs a wider
--- entry in an index every merge already rewrites, since `occurrence_count`
--- changing is what a merge is.
+-- the size of the universe (PLAN.md, "What these reads cost").
+--
+-- What it costs is storage, measured on a full English generation: 180 MB,
+-- where the index without `rack` was 22 MB -- its keys were nearly all equal,
+-- so Postgres deduplicated them, and unique keys cannot be. That is 590 MB a
+-- generation (258 heap, 152 primary key, 180 this) against 432, for every
+-- generation of the job's life. The alternative that keeps the small index is
+-- to order on `occurrence_count` alone and let ties fall as they may; see
+-- PLAN.md, "What a merge costs".
 CREATE INDEX leave_rack_progress_pick_idx
     ON leave_rack_progress (job_id, generation, occurrence_count, rack);

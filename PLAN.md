@@ -2437,7 +2437,7 @@ The generation-0 zeroed KLV is `magpie createdata klv`, which builds exactly tha
 
 #### What a merge costs
 
-A submission used to fold itself: `UPDATE leave_rack_progress … FROM UNNEST(…)` over every rack its games drew, tens to hundreds of thousands of rows scattered uniformly over a generation's 3,199,724 (258 MB of heap, 172 MB of indexes). Measured on a seeded full-size generation:
+A submission used to fold itself: `UPDATE leave_rack_progress … FROM UNNEST(…)` over every rack its games drew, tens to hundreds of thousands of rows scattered uniformly over a generation's 3,199,724 (258 MB of heap, 174 MB of indexes then; 332 MB now that the selection index carries `rack`). Measured on a seeded full-size generation:
 
 | One submission folding itself | Time in the submit transaction | WAL |
 |---|---|---|
@@ -2460,7 +2460,9 @@ Nothing needs the per-rack totals that promptly. Selection needs them roughly; c
 
 The merge interval (`leave_gen::MERGE_INTERVAL`, thirty minutes) sets that volume and the dashboard's lag, and nothing else: selection holds a staged task's racks out of play rather than trusting stale counts, claims near a generation's end ask for a merge themselves (`TAIL_MERGE_INTERVAL`, a minute), and a generation never closes with anything staged. A process that stops with results staged loses nothing — they are rows — and the sweep's first tick, at startup, merges them.
 
-What is left unsolved is that a merge still rewrites most of a 430 MB relation as non-HOT updates. Removing that means taking `occurrence_count` out of the index selection uses — for instance selecting "any rack below target" through a partial index on a flag the merge maintains, rather than "the racks furthest below" — which changes the selection policy, and has not been decided.
+**The selection index is a second storage decision bound up with this one.** Selection orders on `(occurrence_count, rack)`, and to walk that order rather than sort the generation for it the index has to carry `rack` (see [What these reads cost](#what-these-reads-cost-measured)). Measured on a full English generation that index is **180 MB where the one without `rack` was 22 MB** — nearly all its keys were equal, so Postgres deduplicated them, and unique keys cannot be — which makes a generation 590 MB (258 heap, 152 primary key, 180 selection index) rather than 432, kept for the life of the job. The alternative keeps the small index: order on `occurrence_count` alone, let ties fall in whatever order the index holds them, and page the public feed by rack through the primary key. It gives up a deterministic dispatch order and the feed's furthest-from-target order for about 160 MB a generation, and has not been chosen.
+
+What is left unsolved is that a merge still rewrites most of a 590 MB relation as non-HOT updates. Removing that means taking `occurrence_count` out of the index selection uses — for instance selecting "any rack below target" through a partial index on a flag the merge maintains, rather than "the racks furthest below" — which changes the selection policy, and has not been decided.
 
 ### Position Capture From Games
 
@@ -2801,12 +2803,15 @@ or anonymous UUID), heartbeating, data verification and the request/result cycle
 automatically, all driven by a local `contribute.txt`.
 
 This used to be a separate Python client (`worker/worker.py`) that shelled out to
-a MAGPIE binary distributed in its own Docker image. That client is retired;
-`worker/fake_worker.py` remains as a MAGPIE-free way to test the server itself
-(`worker/fake_worker.py`, which speaks the worker API and submits synthetic
-results, including the adversarial paths a real client cannot reach on purpose:
-malformed submissions, stale claim tokens, abandoned claims, concurrent
-claimers, and a decline for each reason).
+a MAGPIE binary distributed in its own Docker image. That client is retired,
+and **MAGPIE is the only production client there is.** What remains under
+`worker/` is `fake_worker.py`, which is test tooling and nothing else: a
+MAGPIE-free way to test the server itself. It speaks the worker API and submits
+*synthetic* results, including the adversarial paths a real client cannot reach
+on purpose -- malformed submissions, stale claim tokens, abandoned claims,
+concurrent claimers, and a decline for each reason. Pointed at a real server,
+every result it invents would be recorded as a genuine contribution, so it is
+never run against anything but a disposable test stack.
 
 birdtest's backend runs a pinned MAGPIE, built into its image from a recorded
 commit. It has two jobs, and the second is the reason the first became worth
@@ -6155,9 +6160,15 @@ CREATE INDEX        audit_log_job_idx         ON audit_log (job_id);
 -- leave claim read the whole generation and sorted it to find its few hundred
 -- racks -- inside the job's dispatch lock. With it a claim walks the index from
 -- the lowest count and stops when it has enough; the cost no longer depends on
--- the size of the universe (PLAN.md, "What these reads cost"). It costs a wider
--- entry in an index every merge already rewrites, since `occurrence_count`
--- changing is what a merge is.
+-- the size of the universe (PLAN.md, "What these reads cost").
+--
+-- What it costs is storage, measured on a full English generation: 180 MB,
+-- where the index without `rack` was 22 MB -- its keys were nearly all equal,
+-- so Postgres deduplicated them, and unique keys cannot be. That is 590 MB a
+-- generation (258 heap, 152 primary key, 180 this) against 432, for every
+-- generation of the job's life. The alternative that keeps the small index is
+-- to order on `occurrence_count` alone and let ties fall as they may; see
+-- PLAN.md, "What a merge costs".
 CREATE INDEX leave_rack_progress_pick_idx
     ON leave_rack_progress (job_id, generation, occurrence_count, rack);
 ```
