@@ -163,12 +163,7 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
     // where the design says a claim lapses at the heartbeat timeout. Reclaimed
     // here first, through the same statement dispatch uses, so "open" below
     // means live.
-    crate::scheduler::reclaim_expired(
-        &state.pool,
-        job.id,
-        state.cfg.heartbeat_timeout.as_secs_f64(),
-    )
-    .await?;
+    crate::scheduler::reclaim_lapsed(state, &[job.id]).await?;
     let settling = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
                         WHERE t.job_id = $1 AND c.state = 'claimed')",
@@ -180,7 +175,8 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
         return Err(AppError::conflict(
             "this job completed with claims still in flight, and their results are still \
              arriving; export it once they have landed or lapsed, which is at most the \
-             heartbeat timeout",
+             heartbeat timeout (counted from the server's last start, if that is more recent \
+             than the claim's last heartbeat)",
         ));
     }
 

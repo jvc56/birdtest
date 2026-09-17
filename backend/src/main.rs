@@ -97,6 +97,11 @@ async fn main() -> Result<()> {
         derived_ready: Default::default(),
         templates: Default::default(),
         leave_merges: Default::default(),
+        shutdown: Default::default(),
+        // A claim's only evidence of life is a heartbeat this process
+        // received, and it has received none yet: see
+        // `scheduler::reclaim_lapsed`.
+        reclaim_from: std::time::Instant::now() + cfg.heartbeat_timeout,
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,
@@ -235,6 +240,7 @@ async fn main() -> Result<()> {
         });
     }
 
+    let shutdown = state.shutdown.clone();
     let app = birdtest::app(state);
 
     let addr: SocketAddr = cfg.bind_addr.parse()?;
@@ -249,8 +255,15 @@ async fn main() -> Result<()> {
     // its retry is answered `accepted: false`, because the claim it was for is
     // still `claimed` and stays that way until the heartbeat timeout. Letting
     // open requests finish costs a few seconds of a rollout.
+    //
+    // The dashboards' SSE streams are told as well (`state::Shutdown`): they
+    // are requests that never finish, and waiting for one is waiting for the
+    // runtime's SIGKILL.
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown.trigger();
+        })
         .await?;
     Ok(())
 }

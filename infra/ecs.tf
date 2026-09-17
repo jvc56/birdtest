@@ -90,6 +90,26 @@ resource "aws_lb" "main" {
   tags            = local.tags
 }
 
+# Both target groups set `deregistration_delay` and the health check's cadence
+# rather than taking the defaults, because the service below stops its one task
+# before it starts the next, and the defaults decide how long nothing serves.
+#
+# ECS deregisters a stopping task's targets and waits out the deregistration
+# delay -- 300 seconds by default -- before it sends SIGTERM; the load balancer
+# routes nothing new to a draining target, so with a single task that is five
+# minutes of 503s before the old process is even asked to stop. The new task
+# then has to pass `healthy_threshold` checks `interval` apart (3 x 30 s by
+# default) before it is sent a request. Together with Fargate's own start-up
+# that made a deployment seven or eight minutes with nothing serving, where the
+# comment on the service says "a few seconds" -- longer than the heartbeat
+# timeout, so every claim in flight across the fleet lapsed on every deploy.
+#
+# Thirty seconds of draining is ample: a request in flight is milliseconds,
+# bar a large result upload, and the process itself finishes open requests on
+# SIGTERM (`main.rs`). Two checks ten seconds apart put a started task in
+# service within about twenty seconds. What is left is Fargate's provisioning,
+# a minute or so, which MAGPIE's retry budget and the server's reclamation
+# grace after a restart (`scheduler::reclaim_lapsed`) are sized to ride out.
 resource "aws_lb_target_group" "backend" {
   name        = "${local.name}-backend"
   port        = 8080
@@ -97,9 +117,15 @@ resource "aws_lb_target_group" "backend" {
   target_type = "ip"
   vpc_id      = aws_vpc.main.id
 
+  deregistration_delay = 30
+
   health_check {
-    path    = "/health"
-    matcher = "200"
+    path                = "/health"
+    matcher             = "200"
+    interval            = 10
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
   }
 
   tags = local.tags
@@ -112,9 +138,15 @@ resource "aws_lb_target_group" "frontend" {
   target_type = "ip"
   vpc_id      = aws_vpc.main.id
 
+  deregistration_delay = 30
+
   health_check {
-    path    = "/"
-    matcher = "200"
+    path                = "/"
+    matcher             = "200"
+    interval            = 10
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 3
   }
 
   tags = local.tags
@@ -329,9 +361,14 @@ resource "aws_ecs_service" "main" {
   # to their own instance, so an overlap is wrong for those too -- see
   # `desired_count`'s description in variables.tf.
   #
-  # The cost is a few seconds with no instance serving during a deployment.
-  # Worker claims retry, the dashboard's stream reconnects, and the alternative
-  # is an invariant that silently does not hold exactly when the code changes.
+  # The cost is a gap with no instance serving during a deployment: the old
+  # task's draining (30 s, set on the target groups above), its shutdown, the
+  # new task's provisioning and its first health checks -- a minute or two in
+  # all, not seconds. Worker requests retry for about fifteen minutes (MAGPIE's
+  # `http_client`), a restarted server reclaims no claim until it has been up
+  # for the heartbeat timeout (`scheduler::reclaim_lapsed`), and the
+  # dashboard's stream reconnects. The alternative is an invariant that
+  # silently does not hold exactly when the code changes.
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
 
