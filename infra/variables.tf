@@ -36,6 +36,19 @@ variable "db_instance_class" {
   default = "db.t4g.micro"
 }
 
+variable "db_max_wal_size_mb" {
+  description = <<-EOT
+    Postgres max_wal_size, in MB: how much WAL may accumulate before a
+    checkpoint is forced. Sized so that one leave-generation merge (about
+    1.3 GB of WAL for a full-size generation) fits inside a single checkpoint
+    cycle; at Postgres's 1 GB default the same merge spans five and writes
+    4.8 GB. It is also an upper bound on the disk WAL occupies, so keep it well
+    under db_allocated_storage.
+  EOT
+  type        = number
+  default     = 4096
+}
+
 variable "db_allocated_storage" {
   type    = number
   default = 20
@@ -193,13 +206,17 @@ variable "acm_certificate_arn" {
 
 variable "min_magpie_version" {
   description = <<-EOT
-    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.4.0 is the
-    first MAGPIE version whose results depend on nothing but the task; a build
-    reporting a lower version is offered nothing. Raise it whenever a MAGPIE
-    release changes results.
+    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.1.0 is
+    `birdtest-contribute`'s pre-release version: nothing is in production yet,
+    so everything the protocol relies on is in 0.1.0, and a build reporting a
+    lower version is offered nothing. Raise it whenever a MAGPIE release
+    changes results. Must not exceed the version the backend image's own
+    pinned MAGPIE reports (docker/Dockerfile's MAGPIE_COMMIT), or the backend
+    refuses to start: it will not hand out hashes built by a MAGPIE its
+    workers may not run.
   EOT
   type        = string
-  default     = "0.4.0"
+  default     = "0.1.0"
 }
 
 variable "github_token_parameter_arn" {

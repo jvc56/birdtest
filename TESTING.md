@@ -202,6 +202,13 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
 - `U-ERR-2` The serialized body always carries `code` and `message`, and
   `with_field` errors appear under `fields`.
 - `U-ERR-3` `rate_limited(n)` sets `Retry-After: n`, and never below 1.
+- `U-ERR-5` **A body that does not parse is an API error too**
+  (`extract::ApiJson`): no body, malformed JSON, the wrong shape, a missing
+  field and a missing content type are each `400 bad_request` in the
+  `{code, message}` shape; a body over the route's limit is `413
+  payload_too_large` in the same shape; and a body above the blocking-pool
+  threshold parses to the same value as one below it. *(Covered:
+  `extract::tests::*`.)*
 - `U-ERR-4` A `sqlx::Error` converted into `AppError` becomes a 500 whose public
   message does **not** contain the SQL string or the database URL. A leaked
   query in an error body is the failure this test exists for.
@@ -466,18 +473,33 @@ The single most important group. Every entry is about a decision made in SQL.
 
 - `I-SCHED-1` A claim against one active job returns a task, inserts a
   `task_claims` row, and increments `active_claim_count`.
-- `I-SCHED-2` Deficit selection: two active jobs at equal priority with
-  allocations 75/25 converge on that ratio over many claims.
-- `I-SCHED-3` Priority tiers: a job at priority 0 is always chosen over one at
-  priority 1, regardless of allocation deficit.
+- `I-SCHED-2` Deficit selection: two active jobs with allocations 75/25
+  converge on that ratio over many claims.
+- `I-SCHED-3` A job at 0% is offered to nobody, exactly as an inactive one is:
+  every claim goes to the other active job, and with every active job at 0%
+  the answer is `204`, not a shutdown — including when a parked job is too new
+  for the worker or in its unsupported set, which shuts nobody down until the
+  job is raised above 0% (`a_parked_job_shuts_nobody_down`). There is no
+  priority.
+- `I-SCHED-3a` **A job joins at parity.** A job activated beside one with a
+  long claim history splits the next claims by allocation rather than taking
+  all of them, a changed allocation holds from the moment it is set, and a
+  purged job rejoins level (`claims_baseline`, `scheduler::join_at_parity`).
+  *(Covered: `admin_api::a_newly_activated_job_joins_at_parity_instead_of_taking_everything`,
+  `admin_api::a_purged_job_rejoins_at_parity`.)*
+- `I-SCHED-3b` **Parity is with the jobs being served.** Beside a veteran and a
+  job on offer that this fleet cannot run (and so has issued nothing), a
+  newcomer splits the next twelve claims 6/6 with the veteran rather than
+  taking all twelve; and issuing a claim stamps `jobs.last_claimed_at`, which
+  is what "served" reads. *(Covered:
+  `admin_api::a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity`.)*
 - `I-SCHED-4` `tasks_dispatched` counts abandoned claims. Abandon many claims on
   one job and confirm its share does **not** grow — excluding them would let a
   job with flaky workers accumulate more than its share.
 - `I-SCHED-5` Ties break on `created_at ASC`.
-- `I-SCHED-6` **Both capability filters run before `MIN(priority)`.** A worker
-  whose `unsupported_jobs` covers the entire top tier is offered work from the
-  next tier, not shut down. Filtering afterwards produces exactly this bug and
-  looks correct in isolation.
+- `I-SCHED-6` **Both capability filters are part of candidate selection.** A
+  worker whose `unsupported_jobs` covers the job furthest behind its share is
+  offered the next one in deficit order, not shut down.
 - `I-SCHED-7` Version filtering: a worker on `1.9.0` is offered a job requiring
   `1.9.0` and not one requiring `1.10.0`. Include the `1.9.0` vs `1.10.0` pair
   specifically — lexical comparison passes every other case.
@@ -581,14 +603,52 @@ job creation touches needs one caller here.
   7-tile rack for the pinned distribution, the count matches
   `enumerate_racks(7)`, and a claim's forced racks are full racks.
   *(Covered: `leave_gen::the_universe_and_the_forced_racks_are_full_racks`.)*
-- `I-LEAVE-2` The bulk update **sums** occurrences and accumulates equity under
-  concurrent submissions from several workers, and a rack outside the universe
-  creates no row. *(Single-submission half covered:
-  `leave_gen::a_result_folds_into_the_generation_and_creates_no_rows`.)*
+- `I-LEAVE-2` A submission is **staged** — one row, the generation's live
+  counters bumped, no per-rack row touched — and a merge **sums** what is
+  staged into `leave_rack_progress`, exactly once, with a rack outside the
+  universe creating no row. Two submissions open at once, naming the same racks
+  in opposite orders, neither deadlock nor lose an occurrence. *(Covered:
+  `leave_gen::a_result_folds_into_the_generation_and_creates_no_rows`,
+  `leave_gen::overlapping_leave_submissions_do_not_wait_on_each_other`.)*
+- `I-LEAVE-2a` The racks a staged result's task forced are held out of
+  selection until the merge, and a generation does not close with anything
+  staged: the claim asks for a merge and the next one decides on exact figures.
+  A purge discards what is staged. *(Covered:
+  `leave_gen::racks_of_a_staged_result_are_not_handed_out_again_before_the_merge`,
+  `leave_gen::a_generation_does_not_close_with_results_still_staged`,
+  `leave_gen::a_purge_discards_staged_results`.)*
+- `I-LEAVE-2b` **A purge waits for a running merge rather than deadlocking with
+  it.** A merge takes the staged rows and then the per-rack rows; a purge that
+  deleted them the other way round stopped on a rack the merge had updated
+  while holding racks the merge had yet to reach, and Postgres failed one of
+  the two. Purge and delete take the job's merge lock before anything else.
+  *(Covered:
+  `leave_gen::a_purge_waits_for_a_running_merge_instead_of_deadlocking_with_it`,
+  which fails against a purge without the lock: the purge is the deadlock's
+  victim and deletes nothing.)*
+- `I-LEAVE-2c` **A completed leave job's corpus includes what was still
+  staged.** Force-completed mid-generation, a job holds accepted results no
+  merge has folded in; its stream and its export settle it first. *(Covered:
+  `leave_gen::a_completed_leave_jobs_corpus_includes_what_was_still_staged`.)*
 - `I-LEAVE-3` Rack selection picks the racks furthest below target, skips racks
   an open claim is already forcing, and returns nothing once all are at target
   with no claim in flight. *(Skipping covered:
   `leave_gen::racks_out_with_an_open_claim_are_not_handed_out_again`.)*
+- `I-LEAVE-3a` **Selection by sweep.** While more than
+  `SWEEP_WHILE_TASKS_REMAIN` tasks' worth of racks are below target, racks are
+  handed out in primary-key order from `leave_selection_cursors`, with no list
+  of what is out: twelve tasks take the first twelve racks, none twice, with
+  all twelve results still staged, and a merge does not move the cursor. A lap
+  that runs off the end of the universe deletes its cursor with its last task,
+  hands out nothing while a claim of the lap is still open, asks for a merge
+  once only staged results remain, and then selects on exact counts -- a rack
+  its result left short is forced again. A pass from the top that finds nothing
+  below target, with nothing in flight or staged, starts the transition.
+  *(Covered: `leave_gen::a_sweep_hands_out_the_racks_in_order_whatever_is_staged`,
+  `leave_gen::a_lap_ends_with_its_results_in_and_merged_before_the_next_begins`,
+  `leave_gen::a_sweep_that_finds_nothing_below_target_closes_the_generation`.
+  The other leave tests run two racks a task, which keeps the 149-rack test
+  universe under the threshold and on lowest-count-first selection.)*
 - `I-LEAVE-4` Generation transition folds progress into a KLV, uploads it,
   records the digest, and marks the generation complete.
 - `I-LEAVE-5` `ON CONFLICT DO NOTHING` on the artifact row keeps the **first**
@@ -613,6 +673,11 @@ job creation touches needs one caller here.
   takeover timeout, and the takeover is recorded in `attempts`; a *completed*
   transition is never restarted however old it is. *(Covered:
   `leave_gen::a_transition_that_never_finished_is_taken_over`.)*
+- `I-LEAVE-12a` **A restart hands an open transition to the next claim.** A
+  transition runs on a spawned task, so one left open at startup belongs to a
+  process that is gone; it is released there and then, not after the takeover
+  timeout, and a completed one is left alone. *(Covered:
+  `leave_gen::a_restart_hands_an_open_transition_to_the_next_claim`.)*
 - `I-LEAVE-13` **The transition owner's row is committed** before the transition
   runs -- the claim transaction that decides a generation is complete commits
   rather than rolls back, or the row that stops a second transition would be
@@ -630,6 +695,13 @@ job creation touches needs one caller here.
   generation has closed, the next claim gets a task for the new generation
   instead. *(Covered:
   `leave_gen::a_reclaimed_task_is_reissued_only_while_its_generation_is_open`.)*
+
+- `I-LEAVE-16` **The public results feed of a leave job tiles it.** Read a
+  generation at a time through the primary key rather than as one sort of
+  every progress row, the pages return every row once, newest generation first
+  and in the database's `rack` order within one, across the boundary between
+  two generations. *(Covered:
+  `leave_gen::the_leave_results_feed_pages_through_every_generation_in_order`.)*
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -828,7 +900,11 @@ Write these as one table-driven test each rather than 50 separate functions.
 ### `A-WORKER-*` — `routes/worker.rs`
 
 - `A-WORKER-1` A claim with no body is rejected with a message naming the fix,
-  not a bare 422.
+  not a bare 422. *(Covered:
+  `worker_api::a_claim_without_a_usable_body_is_told_what_to_send` -- no body,
+  `{}`, a body without `magpie_version` and a body that is not JSON are each a
+  `400` in the API's error shape whose message names `magpie_version` and says
+  to update MAGPIE. Until the ninth audit this was axum's plain-text `422`.)*
 - `A-WORKER-2` A claim with a malformed `magpie_version` is rejected rather than
   assumed.
 - `A-WORKER-3` An `unsupported_jobs` list over 200 is **truncated, not
@@ -842,8 +918,9 @@ Write these as one table-driven test each rather than 50 separate functions.
 - `A-WORKER-7` A claim returns `expected_data` with digests, and the client
   declining with `missing_data` records `worker_data_gaps` and releases the
   claim immediately.
-- `A-WORKER-8` A decline with an unknown reason is rejected; the three known
-  reasons are accepted.
+- `A-WORKER-8` A decline with an unknown reason is rejected; the five known
+  reasons (`missing_data`, `magpie_version`, `unknown_job_type`,
+  `derived_mismatch`, `task_failed`) are accepted.
 - `A-WORKER-9` Heartbeat extends the claim and is rejected for a stale token.
 - `A-WORKER-10` Result submission with a valid token is accepted and publishes
   an SSE event.
@@ -930,9 +1007,12 @@ request. Server→client fixtures are compared by **field structure, not bytes**
 so fields stay free to move before the first release while a renamed or dropped
 field still fails.
 
-Five fixtures exist. The set is complete when every message has one:
+Eight fixtures exist: an assignment of each request shape (games, opening
+racks, leave generation), a claim, a decline, and each of the three shutdown
+reasons. The set is complete when every message has one:
 
-- `C-1` `assignment-opening-rack.json` — **missing**.
+- `C-1` `assignment-opening-rack.json` — exists, and MAGPIE's
+  `test/birdtest_contract/` carries a byte-identical copy.
 - `C-2` `assignment-game-pairs.json`, carrying `game_pairs: true` — **missing**.
 - `C-3` `result-games.json` — **missing**.
 - `C-4` `result-game-pairs.json`, carrying the pentanomial — **missing**, and
@@ -1049,8 +1129,8 @@ round-trip tests bought: there is no longer a second implementation to check
 against MAGPIE, because there is no second implementation.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.5.0`, the shipped `MIN_MAGPIE_VERSION` default,
-and a checkout from before the audits' fixes reports `0.4.0` or lower and is refused. The
+`birdtest-contribute` reports `0.1.0`, the shipped `MIN_MAGPIE_VERSION` default
+and the branch's pre-release version; a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -1071,7 +1151,8 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   MAGPIE's pentanomial and birdtest's validation agree; it has been run by hand
   and must not stay manual.
 - `M-3` One `opening_rack` task lands, with one analysis per requested rack.
-- `M-4` One `leave_generation` task lands and folds into `leave_rack_progress`.
+- `M-4` One `leave_generation` task lands, is staged, moves the generation's
+  live counters, and a merge folds it into `leave_rack_progress`.
 - `M-5` A worker whose data digests do not match declines with `missing_data`
   rather than contributing unverified results.
 - `M-6` A worker below the job's version floor declines with `magpie_version`.
@@ -1281,7 +1362,7 @@ They do not call the seed. They construct exactly the state each test needs.
 
 The moment integration tests depend on a realistic fixture, every test is
 coupled to its contents and the cases that matter become unreachable: zero
-active jobs, an empty top priority tier, a worker locked out of every job, a job
+active jobs, every active job at 0%, a worker locked out of every job, a job
 at capacity, a claim one second past its timeout. Those need precise state, not
 plausible state. Tiers 2 and 3 share the migration and the builders, and nothing
 above them.

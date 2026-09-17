@@ -315,7 +315,7 @@ async fn analysed_racks_are_counted_once_per_task_as_they_arrive() {
 
 /// Bug: any error claiming from one job failed the whole claim, so a single
 /// job that could not dispatch -- here, one whose config row is missing --
-/// answered every worker with a 500 for as long as it led the tier.
+/// answered every worker with a 500 for as long as it led the candidate list.
 #[tokio::test]
 async fn a_job_that_cannot_dispatch_does_not_block_the_others() {
     let db = TestDb::new().await;
@@ -632,7 +632,15 @@ async fn an_opening_rack_result_must_answer_the_racks_it_was_given() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body["message"].as_str().unwrap().contains("ZZZZZZZ"), "{body}");
 
-    // Nothing was stored or counted by either attempt, and the claim is still
+    // The right number, all of them dispatched, but one twice -- so one is
+    // missing. A 400 that says so, not the unique index's 409.
+    let mut doubled = racks.clone();
+    doubled[2] = racks[0].clone();
+    let (status, body) = submit_as(&app, &uuid, &token, analysed(&doubled)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("twice"), "{body}");
+
+    // Nothing was stored or counted by any attempt, and the claim is still
     // open for the real answer.
     let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
     assert_eq!(job_row.racks_analyzed, 0);
@@ -799,10 +807,10 @@ async fn redundant_captured_positions_are_recorded_once() {
     }
 
     let (records, moves): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM position_analysis_records r
-                 JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1),
+        "SELECT (SELECT COUNT(*) FROM position_analysis_records r WHERE r.job_id = $1),
                 (SELECT COUNT(*) FROM position_analysis_moves m
-                 JOIN tasks t ON t.id = m.task_id WHERE t.job_id = $1)",
+                 JOIN position_analysis_records r ON r.id = m.record_id
+                 WHERE r.job_id = $1)",
     )
     .bind(job)
     .fetch_one(&db.pool)
@@ -1353,6 +1361,57 @@ async fn a_job_is_not_dispatched_until_its_derived_files_are_built() {
     assert!(derived[0]["sha256"].is_string(), "{body}");
 }
 
+/// Once a job has been found dispatchable, its hashes are answered from memory
+/// for the rest of the process: the query behind them ran for every candidate
+/// job on every claim, and its answer for a dispatchable job cannot change
+/// (see `derived::DerivedCache`). Pinned by removing the rows behind the
+/// answer -- not a path anything real takes, but the one observation that
+/// tells a remembered answer from a re-read one -- and by forgetting the job,
+/// after which the gate is consulted again.
+#[tokio::test]
+async fn a_dispatchable_jobs_hashes_are_remembered_for_the_process() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = deriving_player(&db, "cache-p1", kwg, klv, false).await;
+    let p2 = deriving_player(&db, "cache-p2", kwg, klv, false).await;
+    let job = job_between(&db, p1, p2).await;
+    let worker = registered_worker(&db).await;
+
+    // Waiting is never remembered: the job is dispatched the moment it is built.
+    let (status, _) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(state.derived_ready.get(job).is_none(), "a waiting job is not remembered");
+    db.derived_ready(job).await;
+    let (status, first) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let remembered = state.derived_ready.get(job).expect("a dispatchable job is remembered");
+    assert_eq!(remembered.len(), 1);
+
+    // Submit, so the worker can be handed the job's next task, then take the
+    // rows away: the next claim can only carry the hash if it was remembered.
+    let token = first["claim_token"].as_str().unwrap();
+    let (status, body) = submit_as(&app, &worker, token, games_result(10, 5)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    sqlx::query("DELETE FROM derived_data").execute(&db.pool).await.unwrap();
+    let (status, second) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(
+        second["expected_data"]["derived"], first["expected_data"]["derived"],
+        "the remembered hashes are the ones the claim carries"
+    );
+
+    // Forgotten, the gate is consulted again -- and now finds nothing built.
+    // A second worker asks, since the first has spent its request burst.
+    let token = second["claim_token"].as_str().unwrap();
+    submit_as(&app, &worker, token, games_result(10, 5)).await;
+    state.derived_ready.forget(job);
+    let (status, body) = claim_as(&app, &registered_worker(&db).await).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
 /// A failed build blocks dispatch exactly as an unbuilt one does. "Give up and
 /// send it anyway" is the wrong recovery — the worker would fall back to
 /// whatever is on its disk, unchecked — and must not be reachable by accident.
@@ -1504,4 +1563,453 @@ async fn players_on_different_lexicons_need_a_wordmap_each() {
     let hashes: std::collections::HashSet<&str> =
         derived.iter().map(|d| d["sha256"].as_str().unwrap()).collect();
     assert_eq!(hashes.len(), 2, "{body}");
+}
+
+/// A job's immutable configuration -- its players, its letter distribution,
+/// its `expected_data` -- is read once per process and kept
+/// (`jobs::dispatch::JobTemplates`), so the claim transaction reads only what
+/// changes from claim to claim. A purge deletes results and tasks and leaves
+/// the configuration alone, so the template stands across one; deleting the
+/// job is what forgets it.
+#[tokio::test]
+async fn a_jobs_template_is_read_once_survives_a_purge_and_goes_with_the_job() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let borrowed: Vec<(&str, &str)> =
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    assert!(state.templates.get(job).is_none(), "nothing is read before the first claim");
+    let (first, uuid) = first_claim(&app).await;
+    let template = state.templates.get(job).expect("the first claim reads the template");
+    assert_eq!(
+        template.expected.len(),
+        first["expected_data"]["files"].as_array().unwrap().len(),
+        "the assignment's expected_data is the template's"
+    );
+
+    let (status, body) =
+        send(&app, post_json(&format!("/api/admin/jobs/{job}/purge"), &borrowed, json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(state.templates.get(job).is_some(), "a purge changes no configuration");
+
+    // The purged job starts its space over, and every claim after it carries
+    // exactly what the first did.
+    let (status, again) = claim_as(&app, &uuid).await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(again["task_request"]["seed"], "1");
+    assert_eq!(again["expected_data"]["files"], first["expected_data"]["files"]);
+    assert_eq!(again["task_request"]["player1"], first["task_request"]["player1"]);
+    assert_eq!(again["task_request"]["player2"], first["task_request"]["player2"]);
+    assert_eq!(again["task_request"]["bingo_bonus"], first["task_request"]["bingo_bonus"]);
+
+    let delete = axum::http::Request::delete(format!("/api/admin/jobs/{job}"))
+        .header("cookie", headers[0].1.as_str())
+        .header("x-csrf-token", headers[1].1.as_str())
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let (status, body) = send(&app, delete).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(state.templates.get(job).is_none(), "a deleted job is forgotten");
+}
+
+/// There is no priority: an admin parks a job at 0%, which is offered to
+/// nobody, exactly as an inactive one is. Every claim goes to the active job
+/// above 0% that is furthest behind its share.
+#[tokio::test]
+async fn a_job_at_zero_allocation_is_offered_to_nobody() {
+    let db = TestDb::new().await;
+    let parked = db.games_job(1, 2).await;
+    let running = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+        .bind(parked)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    for _ in 0..3 {
+        let (assignment, _) = first_claim(&app).await;
+        assert_eq!(assignment["job_id"], running.to_string(), "only the job above 0% is offered");
+    }
+
+    // With the running job parked too, active jobs exist and nothing rules
+    // them out, so the answer is "nothing right now" rather than a shutdown.
+    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+        .bind(running)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// Every task carries the seed its games are played from, and every assignment
+/// states it: an opening-rack task's is the index of its first rack, so rack
+/// `i` of the batch is analysed from `seed + i` on every worker alike.
+#[tokio::test]
+async fn every_assignment_states_the_seed_its_task_was_stored_with() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let player = db.static_player("analyser", admin).await;
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 3, 2, 1000)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (first, uuid) = first_claim(&app).await;
+    assert_eq!(first["task_request"]["seed"], "0", "the first slice starts the space");
+    assert_eq!(first["task_request"]["racks"].as_array().unwrap().len(), 3);
+    let (status, second) = claim_as(&app, &uuid).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["task_request"]["seed"], "3", "the next slice's seed is its first rack's index");
+
+    let stored: Vec<i64> = sqlx::query_scalar(
+        "SELECT seed FROM tasks WHERE job_id = $1 ORDER BY created_at",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![0, 3], "the assignment's seed is the task's");
+}
+
+/// Bug: `shutdown_or_idle` counted every active job, parked ones included, so a
+/// job at 0% -- which is offered to nobody, exactly as an inactive one is --
+/// could still get a worker told to shut down: a parked job with a floor above
+/// the worker's MAGPIE answered `magpie_too_old`, and a parked job in its
+/// unsupported set answered `data_out_of_date`. The same job switched to
+/// `inactive` answered `204`. A contributor who exits on that is not there when
+/// the admin raises a job it could have run.
+#[tokio::test]
+async fn a_parked_job_shuts_nobody_down() {
+    let db = TestDb::new().await;
+    let too_new = db.games_job(1, 2).await;
+    sqlx::query(
+        "UPDATE jobs SET allocation = 0, min_magpie_major = 2, min_magpie_minor = 0,
+                         min_magpie_patch = 0
+         WHERE id = $1",
+    )
+    .bind(too_new)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let unsupported = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+        .bind(unsupported)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    // Both axes would rule this worker out, and neither job is on offer.
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[unsupported]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    // Raised above 0%, the same jobs are what the worker is told about.
+    sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = ANY($1)")
+        .bind(vec![too_new, unsupported])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[unsupported]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["shutdown"]["reason"], "both", "{body}");
+}
+
+/// Bug: the admin results stream and the export of an opening-rack job wrote
+/// the `position_analysis_records` row alone -- the rack, how many moves were
+/// ranked, when -- and none of the moves. The artifact PLAN.md names as the
+/// path for analysing the corpus held no move, score or equity at all.
+#[tokio::test]
+async fn an_opening_rack_corpus_carries_each_racks_ranked_moves() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("solver", admin).await;
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 3, 7, 100)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let cfg = db.config();
+    let app = birdtest::app(db.state().await);
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = assignment["claim_token"].as_str().unwrap().to_string();
+    let racks: Vec<String> = assignment["task_request"]["racks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect();
+    let result = json!({
+        "racks": racks.iter().map(|rack| json!({
+            "rack": rack,
+            "num_moves": 40,
+            "moves": [
+                { "move": format!("best-{rack}"), "score": 30, "equity": 32.5,
+                  "win_percentage": 55.0, "blended_utility": 0.6,
+                  "plies": [ { "ply": 0, "bingo_percentage": 1.5, "average_score": 24.0 },
+                             { "ply": 1, "bingo_percentage": 2.5, "average_score": 31.0 } ] },
+            ],
+        })).collect::<Vec<_>>()
+    });
+    let (status, body) = submit_as(&app, &uuid, &token, result).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    let (status, body) = send(&app, get_request(&path, &admin_headers(&cfg, admin))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Newline-delimited, so not one JSON document: the harness hands it back
+    // as text.
+    let text = body.as_str().expect("an NDJSON body").to_string();
+    let lines: Vec<serde_json::Value> =
+        text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    assert_eq!(lines.len(), 3, "one line per analysed rack: {text}");
+    for line in &lines {
+        let rack = line["rack"].as_str().unwrap();
+        assert_eq!(line["num_moves"], 40);
+        let moves = line["moves"].as_array().expect("a record carries its moves");
+        assert_eq!(moves.len(), 1, "{line}");
+        assert_eq!(moves[0]["rank"], 1);
+        assert_eq!(moves[0]["move"], format!("best-{rack}"));
+        assert_eq!(moves[0]["equity"], 32.5);
+        assert_eq!(moves[0]["win_percentage"], 55.0);
+        let plies = moves[0]["plies"].as_array().expect("a move carries its plies");
+        assert_eq!(plies.len(), 2, "{line}");
+        assert_eq!(plies[1]["ply"], 1);
+        assert_eq!(plies[1]["average_score"], 31.0);
+    }
+}
+
+/// Bug: `?worker=` was applied to every row of the job -- a username compare
+/// or a SHA-256 of the claim's UUID per record, behind two joins -- so a page
+/// for a name nobody has read the whole job to find nothing: seconds per
+/// request at a million records, on a public route with no limit on it. The
+/// name is resolved to an identity first now, a name that belongs to nobody is
+/// an empty page without reading the job, and the filter is an equality on the
+/// claim's identity column.
+#[tokio::test]
+async fn the_results_feed_filters_by_who_a_name_is() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let job = db.games_job(1, 2).await;
+
+    // One result from an anonymous worker...
+    let (claim, anon) = first_claim(&app).await;
+    let token = claim["claim_token"].as_str().unwrap();
+    let (_, body) = submit_as(&app, &anon, token, games_result(2, 1)).await;
+    assert_eq!(body["accepted"], true, "{body}");
+    let pseudonym = birdtest::auth::public_anon_id(anon.parse().unwrap());
+
+    // ...and two from an account.
+    let user = db.user("keyed", false).await;
+    let raw_key = "bt_".to_string() + &"b".repeat(64);
+    sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)")
+        .bind(user)
+        .bind(birdtest::auth::api_key::hash_key(&raw_key))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let bearer = format!("Bearer {raw_key}");
+    for _ in 0..2 {
+        let (status, claim) = send(
+            &app,
+            post_json("/api/worker/task", &[("authorization", &bearer)], claim_body("1.0.0", &[])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{claim}");
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/worker/result",
+                &[("authorization", &bearer)],
+                json!({ "claim_token": claim["claim_token"], "result": games_result(2, 2) }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
+    let feed = |worker: &str| get_request(&format!("/api/jobs/{job}/results?worker={worker}"), &[]);
+
+    let (status, body) = send(&app, feed("keyed")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{body}");
+    assert!(items.iter().all(|item| item["username"] == "keyed"), "{body}");
+
+    let (status, body) = send(&app, feed(&pseudonym)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{body}");
+    assert_eq!(items[0]["anon_id"], pseudonym);
+
+    // Nobody: a username that does not exist, and a well-formed pseudonym that
+    // no contributor has.
+    for nobody in ["no-such-contributor", "0123456789abcdef"] {
+        let (status, body) = send(&app, feed(nobody)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["items"].as_array().unwrap().len(), 0, "{nobody}: {body}");
+        assert!(body["next_cursor"].is_null(), "{body}");
+    }
+
+    // Unfiltered, all three.
+    let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}/results"), &[])).await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 3, "{body}");
+}
+
+/// The display pool is what keeps page views off the path workers wait on, and
+/// its statement timeout is what bounds how long any one read holds one of its
+/// connections. A cancelled read is load, not a fault: `503`, not `500`.
+#[tokio::test]
+async fn the_display_pool_bounds_its_reads() {
+    let db = TestDb::new().await;
+    let read_pool = birdtest::db::connect_read(&db.url).await.unwrap();
+
+    let timeout: String =
+        sqlx::query_scalar("SHOW statement_timeout").fetch_one(&read_pool).await.unwrap();
+    assert_eq!(timeout, "15s");
+    // The main pool is unbounded: a purge or a generation's seeding runs on it.
+    let timeout: String =
+        sqlx::query_scalar("SHOW statement_timeout").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(timeout, "0");
+
+    // What a read past the bound turns into, without waiting fifteen seconds.
+    let mut conn = read_pool.acquire().await.unwrap();
+    sqlx::query("SET statement_timeout = '50ms'").execute(&mut *conn).await.unwrap();
+    let cancelled = sqlx::query("SELECT pg_sleep(5)").execute(&mut *conn).await.unwrap_err();
+    let err: birdtest::error::AppError = cancelled.into();
+    assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err.code, "unavailable");
+    drop(conn);
+    read_pool.close().await;
+}
+
+/// Gap: `capture_positions` exists to build a corpus, and a games job's export
+/// and stream were its result rows only -- the positions had no way out of the
+/// database. They are a second artifact of the export, and `?positions=true`
+/// on the admin stream, in the shape an opening-rack line has.
+#[tokio::test]
+async fn a_games_jobs_captured_positions_can_be_streamed_out() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let app = birdtest::app(db.state().await);
+
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([
+        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+          "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
+        { "game_index": 1, "turn_number": 3, "rack": "AEINRSU", "position": "cgp-1",
+          "previous_move": "8D DOG", "previous_move_score": 10,
+          "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
+    ]);
+    let (claim, uuid) = first_claim(&app).await;
+    let (status, body) =
+        submit_as(&app, &uuid, claim["claim_token"].as_str().unwrap(), result).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let headers = admin_headers(&cfg, admin);
+    let ndjson = |body: serde_json::Value| -> Vec<serde_json::Value> {
+        body.as_str()
+            .map(|text| text.lines().map(|line| serde_json::from_str(line).unwrap()).collect())
+            // A single line is one JSON document, which the harness parses.
+            .unwrap_or_else(|| vec![body.clone()])
+    };
+
+    // The results stream is what it always was: the job's result rows.
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    let (status, body) = send(&app, get_request(&path, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = ndjson(body);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["games"], 2);
+    assert!(results[0].get("moves").is_none(), "{results:?}");
+
+    let (status, body) = send(&app, get_request(&format!("{path}?positions=true"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut positions = ndjson(body);
+    positions.sort_by_key(|p| p["game_index"].as_i64());
+    assert_eq!(positions.len(), 2, "{positions:?}");
+    assert_eq!(positions[1]["position"], "cgp-1");
+    assert_eq!(positions[1]["turn_number"], 3);
+    assert_eq!(positions[1]["previous_move"], "8D DOG");
+    assert_eq!(positions[1]["moves"][0]["move"], "8D URINATES");
+
+    // An opening-rack job's stream already is its positions.
+    let player = db.static_player("solver", admin).await;
+    let racks = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 3, 7, 100)",
+    )
+    .bind(racks)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (status, body) = send(
+        &app,
+        get_request(&format!("/api/admin/jobs/{racks}/results/stream?positions=true"), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// PLAN.md singles this error out: a claim with no body is what a MAGPIE older
+/// than the contribute protocol sends, and the answer is what its contributor
+/// reads, so it has to name the fix. It was axum's own plain-text `422` --
+/// outside the API's error shape and its list of statuses, like every other
+/// body that failed to parse.
+#[tokio::test]
+async fn a_claim_without_a_usable_body_is_told_what_to_send() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+
+    for body in ["", "{}", "{\"unsupported_jobs\": []}", "not json"] {
+        let request = axum::http::Request::post("/api/worker/task")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, answer) = send(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}: {answer}");
+        assert_eq!(answer["code"], "bad_request", "{body:?}: {answer}");
+        let message = answer["message"].as_str().expect("a JSON error body");
+        assert!(message.contains("magpie_version"), "{message}");
+        assert!(message.contains("update MAGPIE"), "{message}");
+    }
+
+    // The same shape from a cookie-backed route.
+    let (status, answer) =
+        send(&app, post_json("/api/auth/login", &[], json!({ "username": 5 }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["code"], "bad_request", "{answer}");
 }

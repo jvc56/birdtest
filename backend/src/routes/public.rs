@@ -37,7 +37,6 @@ struct JobListItem {
     id: Uuid,
     job_type: JobType,
     status: String,
-    priority: i32,
     allocation: Option<i32>,
     redundancy: i32,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -64,7 +63,7 @@ async fn list_jobs(
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
     let rows = sqlx::query(
-        "SELECT j.id, j.job_type, j.status::text AS status, j.priority, j.allocation,
+        "SELECT j.id, j.job_type, j.status::text AS status, j.allocation,
                 j.redundancy, j.created_at,
                 -- Running totals, like games_completed below. Counted, these
                 -- were two scans of a job's whole task history for every job on
@@ -98,16 +97,16 @@ async fn list_jobs(
          FROM jobs j
          LEFT JOIN job_game_config gc ON gc.job_id = j.id
          LEFT JOIN job_game_pair_config pc ON pc.job_id = j.id
-         ORDER BY j.priority ASC, j.created_at DESC
+         ORDER BY j.created_at DESC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs")
-        .fetch_one(&state.pool)
+        .fetch_one(&state.read_pool)
         .await?;
 
     let items = rows
@@ -127,7 +126,6 @@ async fn list_jobs(
                 id: row.get("id"),
                 job_type,
                 status: row.get("status"),
-                priority: row.get("priority"),
                 allocation: row.get("allocation"),
                 redundancy: row.get("redundancy"),
                 created_at: row.get("created_at"),
@@ -146,14 +144,14 @@ async fn list_jobs(
 async fn load_job(state: &AppState, id: Uuid) -> AppResult<Job> {
     sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(id)
-        .fetch_optional(&state.pool)
+        .fetch_optional(&state.read_pool)
         .await?
         .ok_or_else(|| AppError::not_found("no such job"))
 }
 
 async fn job_detail(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<JobStats>> {
     let job = load_job(&state, id).await?;
-    Ok(Json(jobstats::compute(&state.pool, &job).await?))
+    Ok(Json(jobstats::compute(&state.read_pool, &job).await?))
 }
 
 #[derive(Deserialize)]
@@ -181,6 +179,29 @@ async fn job_results(
         return Ok(Json(rack_lookup(&state, id, rack).await?));
     }
 
+    // `?worker=` names a contributor; the rows are filtered on who that *is*.
+    // A name that belongs to nobody is an empty page, decided here in two
+    // indexed probes rather than by reading the job to find out.
+    let worker = match query.worker.as_deref() {
+        Some(name) => match resolve_worker(&state, name).await? {
+            Some(worker) => Some(worker),
+            None => {
+                return Ok(Json(super::CursorPage {
+                    items: Vec::new(),
+                    total: -1,
+                    per_page: limit,
+                    next_cursor: None,
+                }))
+            }
+        },
+        None => None,
+    };
+    let (worker_user, worker_anon) = match &worker {
+        Some(w) => (w.user_id, w.anon_uuid),
+        None => (None, None),
+    };
+    let worker_predicate = worker_predicate(worker.as_ref());
+
     // Every branch below reads its rows through the job id the record tables
     // now carry, rather than by joining `tasks` to find out which rows belong
     // to the job — which put the filter on the far side of a join from the
@@ -195,7 +216,7 @@ async fn job_results(
             // to now(), which is transaction time, so every record of one batch
             // shares it exactly and it is not a key on its own.
             let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
-            let rows = sqlx::query(
+            let rows = sqlx::query(&format!(
                 "SELECT r.id, r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
                         m.equity AS best_equity, r.num_moves, r.submitted_at,
                         u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
@@ -205,20 +226,22 @@ async fn job_results(
                      ON m.record_id = r.id AND m.rank = 1
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE r.job_id = $1
-                   AND ($2::text IS NULL
-                        OR u.username = $2
-                        OR left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) = $2)
-                   AND ($3::timestamptz IS NULL
-                        OR (r.submitted_at, r.id) < ($3, $4))
+                   {worker_predicate}
+                   AND ($4::timestamptz IS NULL
+                        OR (r.submitted_at, r.id) < ($4, $5))
                  ORDER BY r.submitted_at DESC, r.id DESC
-                 LIMIT $5",
-            )
+                 LIMIT $6",
+            ))
+            // Planned for the values it is run with, not cached: see
+            // `worker_predicate`.
+            .persistent(worker.is_none())
             .bind(id)
-            .bind(&query.worker)
+            .bind(worker_user)
+            .bind(worker_anon)
             .bind(after_time)
             .bind(after_id)
             .bind(limit)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.read_pool)
             .await?;
 
             if rows.len() as i64 == limit {
@@ -255,7 +278,7 @@ async fn job_results(
             // rather than as the thing that decides which rows belong to the
             // job.
             let (after_time, after_claim) = game_result_cursor(cursor.as_deref());
-            let rows = sqlx::query(
+            let rows = sqlx::query(&format!(
                 "SELECT r.task_claim_id, r.task_id, r.games, r.wins, r.losses, r.ties,
                         r.p1_score_mean, r.p1_score_sd, r.p2_score_mean, r.p2_score_sd,
                         r.divergent_games, r.divergent_wins, r.divergent_losses,
@@ -266,20 +289,20 @@ async fn job_results(
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE r.job_id = $1
-                   AND ($2::text IS NULL
-                        OR u.username = $2
-                        OR left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) = $2)
-                   AND ($3::timestamptz IS NULL
-                        OR (r.submitted_at, r.task_claim_id) < ($3, $4))
+                   {worker_predicate}
+                   AND ($4::timestamptz IS NULL
+                        OR (r.submitted_at, r.task_claim_id) < ($4, $5))
                  ORDER BY r.submitted_at DESC, r.task_claim_id DESC
-                 LIMIT $5",
-            )
+                 LIMIT $6",
+            ))
+            .persistent(worker.is_none())
             .bind(id)
-            .bind(&query.worker)
+            .bind(worker_user)
+            .bind(worker_anon)
             .bind(after_time)
             .bind(after_claim)
             .bind(limit)
-            .fetch_all(&state.pool)
+            .fetch_all(&state.read_pool)
             .await?;
 
             if rows.len() as i64 == limit {
@@ -318,37 +341,61 @@ async fn job_results(
                 .collect()
         }
         JobType::LeaveGeneration => {
-            // Three columns, and the directions differ, so the seek is spelled
-            // out rather than written as a row comparison. `(job_id,
-            // generation, rack)` is the primary key, so the triple is unique
-            // and the cursor cannot land between two identical rows.
-            let (after_generation, after_count, after_rack) = leave_cursor(cursor.as_deref());
-            let rows = sqlx::query(
-                "SELECT rack, generation, occurrence_count,
-                        equity_sum / NULLIF(occurrence_count, 0) AS mean_equity, updated_at
-                 FROM leave_rack_progress
-                 WHERE job_id = $1
-                   AND ($2::int IS NULL
-                        OR generation < $2
-                        OR (generation = $2
-                            AND (occurrence_count > $3
-                                 OR (occurrence_count = $3 AND rack > $4))))
-                 ORDER BY generation DESC, occurrence_count ASC, rack ASC
-                 LIMIT $5",
-            )
-            .bind(id)
-            .bind(after_generation)
-            .bind(after_count)
-            .bind(after_rack)
-            .bind(limit)
-            .fetch_all(&state.pool)
-            .await?;
+            // Newest generation first, and within a generation by rack: the
+            // primary key's order, `(job_id, generation, rack)`, so each read is
+            // a seek into it and a page costs a page. The feed once ran
+            // furthest-from-target first (`occurrence_count`, then `rack`). No
+            // index held that order -- one statement for it sorted every
+            // progress row the job has, 4.0 s a page at one full-size
+            // generation, on a public route -- and an index that did hold it
+            // cost 160 MB a generation (see `leave_rack_progress_pick_idx`).
+            // By rack, a contributor can also find one. It is read a generation
+            // at a time because the two directions differ.
+            let (after_generation, after_rack) = leave_cursor(cursor.as_deref());
+            let mut generation = match after_generation {
+                Some(generation) => Some(generation),
+                // One probe of the primary key's far end.
+                None => sqlx::query_scalar::<_, Option<i32>>(
+                    "SELECT MAX(generation) FROM leave_rack_progress WHERE job_id = $1",
+                )
+                .bind(id)
+                .fetch_one(&state.read_pool)
+                .await?,
+            };
+            // Where in the first generation read to resume; later ones are
+            // read from their start. `''` sorts before every rack, which keeps
+            // the comparison a bare index condition.
+            let mut after = after_rack.unwrap_or_default();
+
+            let mut rows = Vec::new();
+            while let Some(current) = generation.filter(|g| *g >= 1) {
+                let remaining = limit - rows.len() as i64;
+                if remaining <= 0 {
+                    break;
+                }
+                let page = sqlx::query(
+                    "SELECT rack, generation, occurrence_count,
+                            equity_sum / NULLIF(occurrence_count, 0) AS mean_equity,
+                            updated_at
+                     FROM leave_rack_progress
+                     WHERE job_id = $1 AND generation = $2 AND rack > $3
+                     ORDER BY rack ASC
+                     LIMIT $4",
+                )
+                .bind(id)
+                .bind(current)
+                .bind(std::mem::take(&mut after))
+                .bind(remaining)
+                .fetch_all(&state.read_pool)
+                .await?;
+                rows.extend(page);
+                generation = Some(current - 1);
+            }
 
             if rows.len() as i64 == limit {
                 if let Some(last) = rows.last() {
                     next_cursor = Some(super::encode_cursor(&[
                         last.get::<i32, _>("generation").to_string(),
-                        last.get::<i64, _>("occurrence_count").to_string(),
                         last.get::<String, _>("rack"),
                     ]));
                 }
@@ -369,6 +416,80 @@ async fn job_results(
     };
 
     Ok(Json(super::CursorPage { items, total: -1, per_page: limit, next_cursor }))
+}
+
+/// Who `?worker=` names: an account, an anonymous worker, or -- a username may
+/// happen to be sixteen hex characters -- one of each.
+struct WorkerFilter {
+    user_id: Option<Uuid>,
+    anon_uuid: Option<Uuid>,
+}
+
+/// Resolves `?worker=` to the identities it names, or `None` when it names
+/// nobody.
+///
+/// The filter used to be applied to every row of the job instead: `u.username
+/// = $2 OR left(encode(sha256(...claimed_by_anon_uuid...)), 16) = $2`, a hash
+/// per record on the far side of two joins, which no index can serve. A page
+/// for a contributor with few results -- or for a name nobody has -- therefore
+/// read the *whole job* looking for fifty rows that were not there: 2.4 seconds
+/// at a million records, measured, on a public, unauthenticated, unmetered
+/// route, each request holding a pool connection for all of it. Resolved first,
+/// the filter is an equality on an indexed column of `task_claims`, and a name
+/// that matches nothing never reads the job at all.
+///
+/// A pseudonym is matched among contributors only (`tasks_completed > 0`, the
+/// partial index `/api/workers` reads): an identity with results in any job has
+/// completed something, and that set is bounded by work actually done rather
+/// than by how many UUIDs were ever minted. The hash cannot be indexed as it
+/// is defined -- `convert_to` is not immutable.
+async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<WorkerFilter>> {
+    // Deleted accounts included: the contribution table still lists their
+    // results, under the tombstone name, and that name filters like any other.
+    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE username = $1")
+    .bind(name)
+    .fetch_optional(&state.read_pool)
+    .await?;
+
+    let looks_like_a_pseudonym =
+        name.len() == 16 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let anon_uuid = if looks_like_a_pseudonym {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT uuid FROM anonymous_workers
+             WHERE tasks_completed > 0
+               AND left(encode(sha256(convert_to(uuid::text, 'UTF8')), 'hex'), 16) = $1
+             LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&state.read_pool)
+        .await?
+    } else {
+        None
+    };
+
+    Ok((user_id.is_some() || anon_uuid.is_some()).then_some(WorkerFilter { user_id, anon_uuid }))
+}
+
+/// The feed queries' worker clause, over `$2` (an account) and `$3` (an
+/// anonymous worker). Every variant mentions both, typed, so the statement
+/// prepares whichever are NULL.
+///
+/// A filtered feed is sent unprepared (`persistent(false)`), so Postgres plans
+/// it for the identity actually asked about. The right plan differs by two
+/// orders of magnitude with who that is -- a heavy contributor is found at the
+/// head of the job's feed index, a rare one through their own claims -- and a
+/// cached generic plan picks one for everybody.
+fn worker_predicate(worker: Option<&WorkerFilter>) -> &'static str {
+    match worker {
+        None => "AND $2::uuid IS NULL AND $3::uuid IS NULL",
+        Some(WorkerFilter { user_id: Some(_), anon_uuid: None }) => {
+            "AND c.claimed_by_user_id = $2::uuid AND $3::uuid IS NULL"
+        }
+        Some(WorkerFilter { user_id: None, anon_uuid: Some(_) }) => {
+            "AND $2::uuid IS NULL AND c.claimed_by_anon_uuid = $3::uuid"
+        }
+        Some(_) => "AND (c.claimed_by_user_id = $2::uuid OR c.claimed_by_anon_uuid = $3::uuid)",
+    }
 }
 
 /// The three cursor shapes this route uses. Each returns `None`s for a missing
@@ -392,12 +513,10 @@ fn game_result_cursor(
     }
 }
 
-fn leave_cursor(cursor: Option<&[String]>) -> (Option<i32>, Option<i64>, Option<String>) {
+fn leave_cursor(cursor: Option<&[String]>) -> (Option<i32>, Option<String>) {
     match cursor {
-        Some([generation, count, rack]) => {
-            (generation.parse().ok(), count.parse().ok(), Some(rack.clone()))
-        }
-        _ => (None, None, None),
+        Some([generation, rack]) => (generation.parse().ok(), Some(rack.clone())),
+        _ => (None, None),
     }
 }
 
@@ -421,16 +540,21 @@ async fn rack_lookup(
     // of the job's tasks. `game_index IS NULL` is what keeps an incidentally
     // captured in-game position with the same rack out of an opening-rack
     // lookup.
+    //
+    // Ordered by record first: under redundancy above 1 a rack has one record
+    // per accepted claim, and ordering by rank alone interleaved the lists --
+    // two rank-1 rows, then two rank-2 rows -- as if one analysis had ranked
+    // every move twice.
     let rows = sqlx::query(
         "SELECT m.rank, m.move, m.score, m.equity
          FROM position_analysis_records r
          JOIN position_analysis_moves m ON m.record_id = r.id
          WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
-         ORDER BY m.rank ASC",
+         ORDER BY r.id ASC, m.rank ASC",
     )
     .bind(job_id)
     .bind(&canonical)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let items: Vec<serde_json::Value> = rows
@@ -458,7 +582,7 @@ async fn job_stream(
     Path(id): Path<Uuid>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let job = load_job(&state, id).await?;
-    let initial = jobstats::compute(&state.pool, &job).await?;
+    let initial = jobstats::compute(&state.read_pool, &job).await?;
     let initial = serde_json::to_string(&initial).unwrap_or_else(|_| "{}".into());
 
     let receiver = state.sse.subscribe(id);
@@ -482,24 +606,49 @@ async fn job_stream(
 /// operation now; the public gets `GET /api/jobs/:id/results`, which is
 /// paginated. For a completed job this defers to the export, which is the same
 /// corpus read once rather than once per caller.
+#[derive(Deserialize)]
+pub(super) struct StreamQuery {
+    /// Games and game-pairs jobs only: stream the positions the job captured
+    /// while playing, each with its ranked moves, instead of its result rows.
+    #[serde(default)]
+    positions: bool,
+}
+
 pub(super) async fn job_results_stream(
     State(state): State<AppState>,
     _admin: crate::auth::AdminUser,
     Path(id): Path<Uuid>,
+    Query(query): Query<StreamQuery>,
 ) -> AppResult<axum::response::Response> {
     let job = load_job(&state, id).await?;
+    if query.positions && !crate::exports::may_capture_positions(job.job_type) {
+        return Err(AppError::bad_request(
+            "?positions=true is for games and game-pairs jobs, which can capture positions \
+             while playing; an opening-rack job's stream already is its positions",
+        ));
+    }
 
     // A completed job's results are immutable, so an export of them is a stable
     // artifact: read it instead of re-scanning. The redirect is what puts the
     // cheap path in front of a caller without them having to know about it.
     if job.status == crate::models::job::JobStatus::Completed {
-        if let Some((_, key)) = crate::exports::newest_ready(&state.pool, id).await? {
-            let url = state
-                .artifacts
-                .presigned_get(&key, crate::exports::DOWNLOAD_URL_TTL)
-                .await?;
-            return Ok((StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, url)])
-                .into_response());
+        if let Some(ready) = crate::exports::newest_ready(&state.pool, id).await? {
+            // The positions' own artifact when that is what was asked for. An
+            // export with none -- the job captured nothing -- falls through to
+            // the scan below, which streams the same nothing.
+            let key = if query.positions {
+                ready.positions_artifact_key
+            } else {
+                Some(ready.artifact_key)
+            };
+            if let Some(key) = key {
+                let url = state
+                    .artifacts
+                    .presigned_get(&key, crate::exports::DOWNLOAD_URL_TTL)
+                    .await?;
+                return Ok((StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, url)])
+                    .into_response());
+            }
         }
     }
 
@@ -512,25 +661,39 @@ pub(super) async fn job_results_stream(
         .try_acquire_owned()
         .map_err(|_| AppError::rate_limited(30))?;
 
+    // The main pool, not the display one: this cursor is held for as long as
+    // the caller keeps reading, which the display pool's statement timeout
+    // exists to forbid. The permit above is what bounds it instead.
     let pool = state.pool.clone();
     let stream = async_stream::stream! {
         let _permit = permit;
-        let query = match job.job_type {
-            JobType::OpeningRack =>
-                "SELECT to_jsonb(r) AS row FROM position_analysis_records r
-                 WHERE r.job_id = $1",
-            JobType::Games | JobType::GamePairs =>
-                "SELECT to_jsonb(r) AS row FROM game_results r WHERE r.job_id = $1",
-            JobType::LeaveGeneration =>
-                "SELECT to_jsonb(r) AS row FROM leave_rack_progress r WHERE r.job_id = $1",
+        // The export's own queries, so the stream of an active job and the
+        // export of a completed one are the same corpus -- an opening-rack
+        // record with its ranked moves nested in it, not the record alone.
+        let query = if query.positions {
+            crate::exports::positions_query()
+        } else {
+            crate::exports::export_query(job.job_type)
         };
+
+        // A completed leave job may still hold accepted results that no merge
+        // has folded into the rows about to be read (`exports::settle`); an
+        // active one is a moving target either way, and is left to its sweep.
+        if job.status == crate::models::job::JobStatus::Completed {
+            if let Err(err) = crate::exports::settle(&pool, &job).await {
+                tracing::error!(job_id = %id, error = %err.message, "settling a job before streaming it failed");
+            }
+        }
 
         let mut rows = sqlx::query(query).bind(id).fetch(&pool);
         while let Some(row) = rows.next().await {
             match row {
                 Ok(row) => {
-                    let value: serde_json::Value = row.get("row");
-                    yield Ok::<_, std::io::Error>(format!("{value}\n"));
+                    // Already a line of JSON text: the export's queries
+                    // serialize in Postgres, so nothing is parsed here.
+                    let mut line: String = row.get("row");
+                    line.push('\n');
+                    yield Ok::<_, std::io::Error>(line);
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "result stream failed mid-flight");
@@ -576,11 +739,11 @@ async fn list_users(
     )
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")
-        .fetch_one(&state.pool)
+        .fetch_one(&state.read_pool)
         .await?;
 
     Ok(Json(super::Page {
@@ -660,14 +823,14 @@ async fn worker_page(
     )
     .bind(limit)
     .bind(offset)
-    .fetch_all(&state.pool)
+    .fetch_all(&state.read_pool)
     .await?;
 
     let total = sqlx::query_scalar::<_, i64>(
         "SELECT (SELECT COUNT(*) FROM users WHERE tasks_completed > 0)
               + (SELECT COUNT(*) FROM anonymous_workers WHERE tasks_completed > 0)",
     )
-    .fetch_one(&state.pool)
+    .fetch_one(&state.read_pool)
     .await?;
 
     Ok(Json(super::Page {

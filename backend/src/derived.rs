@@ -26,6 +26,8 @@ use crate::error::{AppError, AppResult};
 use crate::magpie::{Builders, Magpie, ScratchData};
 use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Row};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 /// How long a builder holds a row before another builder may take it over.
@@ -288,6 +290,87 @@ pub async fn status_for_job(
         }
     }
     Ok(status)
+}
+
+/// The built hashes of every job this process has found dispatchable, by job.
+///
+/// `status_for_job` used to run on every claim, for every candidate job,
+/// before that job's dispatch lock was taken -- a join over the
+/// job's config, its players, `input_data` and `derived_data` on the path a
+/// worker waits on to get its next task. The answer for a job that is
+/// dispatchable never changes for the life of the process, so it is asked
+/// once:
+///
+/// - what a job needs is fixed when it is created (player configs are
+///   immutable and the job's own config has no update endpoint), so the set of
+///   `derived_data` rows the query looks up cannot grow or shrink;
+/// - a row only ever moves toward `built` -- the builder task writes `built`,
+///   and an admin retry touches `failed` rows only -- and nothing deletes one
+///   (`input_data` refuses a delete while a derived row references it);
+/// - the builder identity the query matches on is a constant of the running
+///   binary, so a deployment with a different MAGPIE starts with an empty
+///   cache and asks again.
+///
+/// Only a dispatchable answer is remembered. A job still waiting on a build
+/// is asked about on every claim, which is what lets it be dispatched the
+/// moment its last file is built.
+#[derive(Clone, Default)]
+pub struct DerivedCache(Arc<Mutex<HashMap<Uuid, Arc<Vec<ExpectedDerived>>>>>);
+
+impl DerivedCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The built hashes for `job_id`, if this process has already found the
+    /// job dispatchable.
+    pub fn get(&self, job_id: Uuid) -> Option<Arc<Vec<ExpectedDerived>>> {
+        self.0.lock().expect("derived cache poisoned").get(&job_id).cloned()
+    }
+
+    /// Remember a dispatchable job's hashes.
+    pub fn remember(&self, job_id: Uuid, ready: Vec<ExpectedDerived>) -> Arc<Vec<ExpectedDerived>> {
+        let ready = Arc::new(ready);
+        self.0.lock().expect("derived cache poisoned").insert(job_id, ready.clone());
+        ready
+    }
+
+    /// Drop a job's entry. Only a deleted job has one that is no longer
+    /// wanted; nothing else can make a remembered answer wrong.
+    pub fn forget(&self, job_id: Uuid) {
+        self.0.lock().expect("derived cache poisoned").remove(&job_id);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.lock().expect("derived cache poisoned").len()
+    }
+}
+
+/// The hashes a claim for `job_id` states, or `None` while the job is waiting
+/// on a build (or a failed one). Answered from [`DerivedCache`] after the
+/// first dispatchable answer; see there for why that is sound.
+pub async fn ready_for_job(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    builders: &Builders,
+    cache: &DerivedCache,
+) -> AppResult<Option<Arc<Vec<ExpectedDerived>>>> {
+    if let Some(ready) = cache.get(job_id) {
+        return Ok(Some(ready));
+    }
+    let status = status_for_job(conn, job_id, builders).await?;
+    if !status.dispatchable() {
+        // Logged at debug: a table takes minutes to build, and every worker
+        // asking during those minutes would otherwise produce a line each.
+        // `GET /api/admin/derived-data` is where an admin looks.
+        tracing::debug!(
+            %job_id, pending = ?status.pending, failed = ?status.failed,
+            "job is waiting on a derived file"
+        );
+        return Ok(None);
+    }
+    Ok(Some(cache.remember(job_id, status.ready)))
 }
 
 /// A row the builder task has taken.
@@ -595,5 +678,19 @@ mod tests {
             failed: vec!["rit NWL23.CSW21".into()]
         }
         .dispatchable());
+    }
+
+    #[test]
+    fn the_cache_remembers_only_what_it_is_told_and_forgets_on_request() {
+        let cache = DerivedCache::new();
+        let job = Uuid::new_v4();
+        assert!(cache.get(job).is_none());
+        let ready = cache.remember(job, vec![]);
+        assert!(ready.is_empty());
+        assert!(cache.get(job).is_some(), "a dispatchable answer is kept");
+        assert_eq!(cache.len(), 1);
+        cache.forget(job);
+        assert!(cache.get(job).is_none());
+        assert_eq!(cache.len(), 0);
     }
 }

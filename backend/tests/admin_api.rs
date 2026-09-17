@@ -114,6 +114,135 @@ async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
     assert_eq!((tasks, issued, games, racks), (0, 0, 0, 0));
 }
 
+/// Captured positions, their moves and their plies go with the job when it is
+/// purged, through the record: `position_analysis_moves` used to carry its own
+/// `task_id` with a cascade of its own, and that column had no index, so every
+/// task a purge deleted scanned the whole moves table -- the largest in the
+/// schema -- to find the rows the record cascade was about to delete anyway.
+#[tokio::test]
+async fn purging_a_job_removes_its_captured_positions_through_the_record() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+
+    let (status, assignment) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    let uuid = assignment["worker_uuid"].as_str().unwrap();
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([
+        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+          "num_moves": 40,
+          "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
+                      "win_percentage": 55.0, "blended_utility": 0.6,
+                      "plies": [{ "ply": 0, "bingo_percentage": 0.0, "average_score": 24.0 }] }] },
+    ]);
+    let (_, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": assignment["claim_token"], "result": result }),
+        ),
+    )
+    .await;
+    assert_eq!(body, json!({ "accepted": true }));
+
+    let counts = || async {
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT (SELECT COUNT(*) FROM position_analysis_records),
+                    (SELECT COUNT(*) FROM position_analysis_moves),
+                    (SELECT COUNT(*) FROM position_analysis_plies)",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    assert_eq!(counts().await, (1, 1, 1));
+
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let (status, body) =
+        send(&app, request("POST", &format!("/api/admin/jobs/{job}/purge"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(counts().await, (0, 0, 0), "record, moves and plies all cascade from the task");
+}
+
+/// A staged import the admin never confirmed is a proposal about a vocabulary
+/// that has since moved on, holding the bytes of every distribution and layout
+/// it staged. After a day it is expired: its rows go, and the import says why,
+/// rather than vanishing from the page.
+#[tokio::test]
+async fn an_unconfirmed_import_expires_after_a_day_and_says_so() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let insert = |state: &'static str, age: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let id: Uuid = sqlx::query_scalar(
+                "INSERT INTO input_data_imports
+                     (tarball_date, commit_sha, state, requested_by, requested_at)
+                 VALUES ('20251004', repeat('a', 40), $1, $2, now() - $3::interval)
+                 RETURNING id",
+            )
+            .bind(state)
+            .bind(admin)
+            .bind(age)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO input_data_import_rows
+                     (import_id, path, role, name, sha256, bytes, disposition, content)
+                 VALUES ($1, 'letterdistributions/english.csv', 'letterdist', 'english',
+                         repeat('b', 64), 5, 'new', 'bytes'::bytea)",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            id
+        }
+    };
+    let stale = insert("staged", "25 hours").await;
+    let fresh = insert("staged", "23 hours").await;
+    let running = insert("running", "25 hours").await;
+    let confirmed = insert("confirmed", "25 hours").await;
+
+    assert_eq!(birdtest::inputdata::expire_unconfirmed_imports(&db.pool).await.unwrap(), 1);
+
+    let state_and_rows = |id: Uuid| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, Option<String>, i64)>(
+                "SELECT state, error,
+                        (SELECT COUNT(*) FROM input_data_import_rows r WHERE r.import_id = i.id)
+                 FROM input_data_imports i WHERE i.id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let (state, error, rows) = state_and_rows(stale).await;
+    assert_eq!((state.as_str(), rows), ("cancelled", 0));
+    assert!(error.unwrap_or_default().contains("24 hours"));
+    // Younger than a day, still running, or already confirmed: untouched.
+    for (id, expected) in [(fresh, "staged"), (running, "running"), (confirmed, "confirmed")] {
+        let (state, _, rows) = state_and_rows(id).await;
+        assert_eq!((state.as_str(), rows), (expected, 1));
+    }
+    // And a second sweep finds nothing left to expire.
+    assert_eq!(birdtest::inputdata::expire_unconfirmed_imports(&db.pool).await.unwrap(), 0);
+}
+
 /// Bug: `audit_log.actor_user_id`, `player_configs.created_by` and
 /// `worker_bans.banned_by` all referenced `users` with no ON DELETE clause, so
 /// a user who had registered (and so has a `user.registered` row), created a
@@ -601,6 +730,106 @@ async fn a_long_rating_history_is_thinned_but_keeps_its_ends() {
     );
 }
 
+/// Runs older than a month are thinned to the last of each day, so a pool's
+/// tables are bounded while its history chart keeps its shape and its ends:
+/// the first run, each old day's last and every recent run survive, and a
+/// deleted run's ratings and residuals go with it.
+#[tokio::test]
+async fn old_rating_runs_are_thinned_to_the_last_of_each_day() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let anchor = db.static_player("anchor", admin).await;
+    let rival = db.static_player("rival", admin).await;
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let pool: Uuid = sqlx::query_scalar(
+        "INSERT INTO rating_pools (name, variant, letterdist_id, layout_id, anchor_player_config_id)
+         VALUES ('pool', 'classic', $1, $2, $3) RETURNING id",
+    )
+    .bind(letterdist)
+    .bind(layout)
+    .bind(anchor)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    // The pool's first run, alone on its day; two old days of three runs each;
+    // and three runs from the last few minutes. Every run carries a rating and
+    // a residual.
+    sqlx::query(
+        "WITH runs AS (
+             INSERT INTO rating_runs (pool_id, computed_at, trigger, iterations, converged,
+                                      pairs_used, jobs_used)
+             SELECT $1, t, 'evidence', 1, true, 0, 1
+             FROM unnest(ARRAY[
+                 timestamptz '2025-12-01 00:00Z',
+                 timestamptz '2026-01-01 10:00Z', timestamptz '2026-01-01 10:02Z',
+                 timestamptz '2026-01-01 10:04Z',
+                 timestamptz '2026-01-02 10:00Z', timestamptz '2026-01-02 10:02Z',
+                 timestamptz '2026-01-02 10:04Z',
+                 now() - interval '6 minutes', now() - interval '4 minutes',
+                 now() - interval '2 minutes'
+             ]) AS t
+             RETURNING id
+         ),
+         rated AS (
+             INSERT INTO player_config_ratings
+                 (run_id, player_config_id, rating, stderr, pairs_played, connected_to_anchor,
+                  is_anchor)
+             SELECT id, $2, 2000, 0, 0, true, true FROM runs
+         )
+         INSERT INTO rating_run_residuals
+             (run_id, row_player_config_id, col_player_config_id, pairs, actual, predicted)
+         SELECT id, $2, $3, 1, 0.5, 0.5 FROM runs",
+    )
+    .bind(pool)
+    .bind(anchor)
+    .bind(rival)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let deleted = birdtest::ratings::thin_old_runs(&db.pool).await.unwrap();
+    assert_eq!(deleted, 4, "two of each old day's three runs");
+
+    let old_kept: Vec<String> = sqlx::query_scalar(
+        "SELECT to_char(computed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI')
+         FROM rating_runs
+         WHERE pool_id = $1 AND computed_at < now() - interval '1 day'
+         ORDER BY computed_at",
+    )
+    .bind(pool)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        old_kept,
+        ["2025-12-01 00:00", "2026-01-01 10:04", "2026-01-02 10:04"],
+        "the first run and each old day's last"
+    );
+    let recent: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rating_runs
+         WHERE pool_id = $1 AND computed_at > now() - interval '1 day'",
+    )
+    .bind(pool)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(recent, 3, "runs inside the window are untouched");
+    let ratings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM player_config_ratings")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let residuals: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rating_run_residuals")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!((ratings, residuals), (6, 6), "a deleted run's ratings and residuals go with it");
+
+    let again = birdtest::ratings::thin_old_runs(&db.pool).await.unwrap();
+    assert_eq!(again, 0, "thinning is idempotent");
+}
+
 /// A games job may pit a static player against a simmer: PLAN.md promises "any
 /// mix", and it is the configuration a strength comparison most often wants.
 ///
@@ -981,4 +1210,220 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
         birdtest::derived::rack_info_table_name("NWL23", "CSW21"),
         "NWL23.CSW21"
     );
+}
+
+/// Bug: reclamation is lazy and runs when a worker asks for work from the
+/// job's candidate list, which never happens for a completed job. A claim whose
+/// worker died therefore stayed `claimed` for good, and the export refused
+/// with "at most the heartbeat timeout" for good.
+#[tokio::test]
+async fn an_export_is_not_blocked_by_a_claim_whose_worker_vanished() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let (status, claim) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let export = || post_json(&format!("/api/admin/jobs/{job}/export"), &headers, json!({}));
+    let (status, body) = send(&app, export()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "a live claim is still in flight: {body}");
+
+    // The worker vanished: its claim is past the heartbeat timeout, and no
+    // claim request will ever reclaim it, since nothing claims from a
+    // completed job.
+    sqlx::query(
+        "UPDATE task_claims SET claimed_at = now() - interval '1 hour', last_heartbeat_at = NULL",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (status, body) = send(&app, export()).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+    // Reclaimed through the same path dispatch uses, so the claim and its
+    // task read as every other lapsed claim does.
+    let (claim_state, active): (String, i32) = sqlx::query_as(
+        "SELECT c.state::text, t.active_claim_count
+         FROM task_claims c JOIN tasks t ON t.id = c.task_id
+         WHERE c.claim_token = $1",
+    )
+    .bind(Uuid::parse_str(claim["claim_token"].as_str().unwrap()).unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!((claim_state.as_str(), active), ("abandoned", 0));
+}
+
+/// Who gets each of `n` claims, as a count per job, claiming as one fresh
+/// anonymous worker after another so no per-identity rule interferes.
+async fn claims_by_job(app: &axum::Router, n: usize) -> std::collections::HashMap<String, usize> {
+    let mut by_job = std::collections::HashMap::new();
+    for _ in 0..n {
+        let (status, body) =
+            send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        *by_job.entry(body["job_id"].as_str().unwrap().to_string()).or_insert(0) += 1;
+    }
+    by_job
+}
+
+/// Bug: the scheduler's deficit was `claims_issued / allocation` over a job's
+/// whole life, so a job activated beside one with a long history had a ratio
+/// of zero and took *every* claim until it had issued as many -- the older job,
+/// at the same 50%, got nothing for as long as that took. A job now joins level
+/// with the job furthest behind (`scheduler::join_at_parity`) and takes its
+/// share from then on.
+#[tokio::test]
+async fn a_newly_activated_job_joins_at_parity_instead_of_taking_everything() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let veteran = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET claims_issued = 100000 WHERE id = $1")
+        .bind(veteran)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let newcomer = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
+        .bind(newcomer)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{newcomer}/activate"), &borrowed, json!({ "allocation": 50 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Twelve at a time: a worker with no identity yet is limited by address,
+    // with a burst of thirty.
+    let shares = claims_by_job(&app, 12).await;
+    assert_eq!(shares.get(&veteran.to_string()), Some(&6), "{shares:?}");
+    assert_eq!(shares.get(&newcomer.to_string()), Some(&6), "{shares:?}");
+
+    // Changing a share is an activation too, and the new share holds from
+    // there: 75/25 over the next twelve claims, not a lurch to make up for
+    // the claims issued under the old one.
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{veteran}/activate"), &borrowed, json!({ "allocation": 25 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{newcomer}/activate"), &borrowed, json!({ "allocation": 75 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let shares = claims_by_job(&app, 12).await;
+    assert_eq!(shares.get(&veteran.to_string()), Some(&3), "{shares:?}");
+    assert_eq!(shares.get(&newcomer.to_string()), Some(&9), "{shares:?}");
+}
+
+/// The same for a purge, which zeroes `claims_issued`: the purged job restarts
+/// level with the others rather than owed every claim it ever had.
+#[tokio::test]
+async fn a_purged_job_rejoins_at_parity() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let steady = db.games_job(1, 2).await;
+    let purged = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET claims_issued = 100000 WHERE id = ANY($1)")
+        .bind(vec![steady, purged])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (status, body) = send(
+        &app,
+        request("POST", &format!("/api/admin/jobs/{purged}/purge"), &admin_headers(&cfg, admin)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let shares = claims_by_job(&app, 20).await;
+    assert_eq!(shares.get(&steady.to_string()), Some(&10), "{shares:?}");
+    assert_eq!(shares.get(&purged.to_string()), Some(&10), "{shares:?}");
+}
+
+/// Parity is with the jobs *being served*, not with every job on offer. A job
+/// can be active and above 0% and still stand still -- its derived files are
+/// building, the fleet cannot run it yet -- and its ratio does not move while
+/// the others' climb. Put level with that job, a newcomer was first in every
+/// candidate list until it had caught up with the jobs that were running: of
+/// the next twelve claims it took twelve, and the veteran none. A job counts as
+/// served when it issued a claim within the heartbeat timeout
+/// (`jobs.last_claimed_at`).
+#[tokio::test]
+async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let veteran = db.games_job(1, 2).await;
+    sqlx::query(
+        "UPDATE jobs SET claims_issued = 100000, allocation = 40, last_claimed_at = now()
+         WHERE id = $1",
+    )
+    .bind(veteran)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // On offer, and out of this fleet's reach: a floor above what the workers
+    // run. It has issued nothing, so its ratio is zero and stays there.
+    let lagging = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET allocation = 20, min_magpie_major = 9 WHERE id = $1")
+        .bind(lagging)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let newcomer = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
+        .bind(newcomer)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{newcomer}/activate"), &borrowed, json!({ "allocation": 40 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let shares = claims_by_job(&app, 12).await;
+    assert_eq!(shares.get(&veteran.to_string()), Some(&6), "{shares:?}");
+    assert_eq!(shares.get(&newcomer.to_string()), Some(&6), "{shares:?}");
+
+    // And a claim is what marks a job as served.
+    let stamped: bool = sqlx::query_scalar(
+        "SELECT last_claimed_at > now() - interval '1 minute' FROM jobs WHERE id = $1",
+    )
+    .bind(newcomer)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(stamped, "issuing a claim stamps jobs.last_claimed_at");
 }

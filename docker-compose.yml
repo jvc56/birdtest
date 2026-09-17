@@ -17,6 +17,13 @@
 #   --profile fake-worker   synthetic results for the **end-to-end suite**.
 #                           Not for development — see TESTING.md.
 #
+# And one service run on demand rather than kept up:
+#   docker compose run --rm derived-builder
+#                           drains the wordmap / rack info table build queue
+#                           once and exits, the way the scheduled ECS task
+#                           does in production. A job whose players ask for
+#                           either file is not dispatched until this has run.
+#
 # Ports are overridable so a host that already has something on 5432 (or 9000,
 # or 5173) does not need the file edited. See .env.example.
 
@@ -99,12 +106,11 @@ services:
       # resolution is 60 calls an hour per IP.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       MAGPIE_DATA_REPO: ${MAGPIE_DATA_REPO:-jvc56/MAGPIE-DATA}
-      # The fleet-wide floor: the oldest MAGPIE whose results do not depend on
-      # its own local settings or build, and which checks a derived file against
-      # the hash the job pins. `birdtest-contribute` reports 0.5.0, which meets
-      # it; scripts/dev.py reads the version out of your checkout and sets this
-      # for you, so an older checkout still runs locally.
-      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.5.0}
+      # The fleet-wide floor. `birdtest-contribute` reports 0.1.0, its
+      # pre-release version, which meets it; scripts/dev.py reads the version
+      # out of your checkout and sets this for you, so a checkout that reports
+      # something else still runs locally.
+      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.1.0}
       # The pinned MAGPIE this process runs. The production image builds one in;
       # locally it comes from the mounted checkout, so a `make magpie` there is
       # picked up by a restart. The backend refuses to start without it.
@@ -168,6 +174,47 @@ services:
       - frontend_node_modules:/app/node_modules
     ports:
       - "${DEV_PORT:-5174}:5173"
+
+  # --- on demand: derived-builder -------------------------------------------
+  # The derived-file builder, as production runs it in a scheduled ECS task
+  # (infra/derived.tf): the backend image with a different entrypoint, which
+  # drains `derived_data` and exits. Nothing else in this stack builds a
+  # wordmap or a rack info table, so a job that asks for one sits undispatched
+  # -- visible at /admin/derived-data -- until this is run:
+  #
+  #   docker compose run --rm derived-builder
+  #
+  # Under a profile so `up` does not start it: it is a one-shot, and the
+  # scheduled task it stands in for is the thing that decides when it runs.
+  # `run` enables the profile on its own. The same mounted MAGPIE the backend
+  # runs, so the builder recorded beside every hash is the server's.
+  derived-builder:
+    profiles: [builder]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: derived-builder
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://birdtest:birdtest@postgres:5432/birdtest
+      # Required by the shared configuration, never used: this process mints
+      # no session.
+      SESSION_SIGNING_KEY: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
+      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.1.0}
+      MAGPIE_BIN: /magpie/bin/magpie
+      MAGPIE_THREADS: "${MAGPIE_THREADS:-2}"
+      S3_BUCKET: birdtest-artifacts
+      S3_ENDPOINT: http://minio:9000
+      AWS_ACCESS_KEY_ID: birdtest
+      AWS_SECRET_ACCESS_KEY: birdtestbirdtest
+      AWS_REGION: us-east-1
+      RUST_LOG: ${RUST_LOG:-birdtest=info}
+    volumes:
+      - ${MAGPIE_ROOT:-../MAGPIE}:/magpie:ro
 
   # --- profile: fake-worker -------------------------------------------------
   # Synthetic results, for the end-to-end suite only. A browser journey needs

@@ -14,6 +14,7 @@ pub mod derived;
 pub mod email;
 pub mod error;
 pub mod exports;
+pub mod extract;
 pub mod inputdata;
 pub mod jobs;
 pub mod jobstats;

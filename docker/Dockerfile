@@ -28,8 +28,12 @@ FROM debian:bookworm-slim AS magpie-build
 
 # The commit this image's hashes are produced by. Passed as a build argument
 # and recorded on the image, so "which MAGPIE built this wordmap" is a `docker
-# inspect` rather than a guess. CI's magpie-contract job pins the same commit.
-ARG MAGPIE_COMMIT=dc007fc5a01bceac9154225454519cd72834d364
+# inspect` rather than a guess. CI's magpie-contract and nightly jobs test the
+# head of `birdtest-contribute` rather than this commit, on purpose: they are
+# what notices a MAGPIE-side change before the pin is moved to it. Moving the
+# pin is a deliberate step, and MIN_MAGPIE_VERSION must never exceed the
+# version this commit reports.
+ARG MAGPIE_COMMIT=0f6a4cb1254057f4875f4eaf3c34f381991922af
 ARG MAGPIE_REPO=https://github.com/jvc56/MAGPIE.git
 
 RUN apt-get update \
@@ -99,7 +103,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=backend-build /usr/local/bin/birdtest /usr/local/bin/birdtest
 COPY --from=magpie-build /src/bin/magpie /usr/local/bin/magpie
-ARG MAGPIE_COMMIT=dc007fc5a01bceac9154225454519cd72834d364
+ARG MAGPIE_COMMIT=0f6a4cb1254057f4875f4eaf3c34f381991922af
 LABEL org.birdtest.magpie-commit="$MAGPIE_COMMIT"
 # Still no data directory. MAGPIE is run against a throwaway directory built
 # per conversion from the bytes the job pins — the object store for lexica and

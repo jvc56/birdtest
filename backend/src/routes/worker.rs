@@ -1,5 +1,6 @@
 use crate::audit;
 use crate::auth::WorkerIdentity;
+use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::jobs::handler::TaskRequest;
 use crate::jobstats;
@@ -133,7 +134,7 @@ struct ExpectedData {
     /// run unverified rather than refusing work: an algorithm change should not
     /// be a fleet-wide outage, and `min_magpie_version` is the lever for that.
     algorithm: &'static str,
-    files: Vec<crate::jobs::ExpectedFile>,
+    files: std::sync::Arc<Vec<crate::jobs::ExpectedFile>>,
     /// The files the worker builds for itself -- a wordmap, a rack info table
     /// -- with the SHA-256 the server's own pinned MAGPIE got from the same
     /// inputs. Neither can be shipped (179 MB and 1.9 GB for CSW24), so the
@@ -143,7 +144,7 @@ struct ExpectedData {
     /// Always serialized, empty included. A missing key would be read by a
     /// client as an older server that checks nothing, which is precisely the
     /// state this replaces; `[]` says "this job needs no derived file".
-    derived: Vec<crate::derived::ExpectedDerived>,
+    derived: std::sync::Arc<Vec<crate::derived::ExpectedDerived>>,
 }
 
 #[derive(Serialize)]
@@ -156,9 +157,26 @@ struct ShutdownResponse {
 async fn claim_task(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    Json(body): Json<ClaimBody>,
+    body: Result<ApiJson<ClaimBody>, AppError>,
 ) -> AppResult<Response> {
     identity.check_rate_limit(&state)?;
+
+    // The one malformed request worth more than the generic answer. A claim
+    // with no body, or without `magpie_version`, is what a MAGPIE older than
+    // the contribute protocol sends, and this message is what its contributor
+    // is shown -- so it names the fix rather than the parser's complaint alone.
+    let ApiJson(body) = body.map_err(|err| {
+        AppError::new(
+            err.status,
+            err.code,
+            format!(
+                "a task claim must carry a JSON body stating `magpie_version` and \
+                 `unsupported_jobs`. A MAGPIE that sends neither predates this protocol: \
+                 update MAGPIE and start contribute again. ({})",
+                err.message
+            ),
+        )
+    })?;
 
     let mut unsupported_jobs = body.unsupported_jobs;
     unsupported_jobs.truncate(MAX_UNSUPPORTED_JOBS);
@@ -242,7 +260,7 @@ fn bounded(text: &str) -> String {
 async fn decline_task(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    Json(body): Json<DeclineBody>,
+    ApiJson(body): ApiJson<DeclineBody>,
 ) -> AppResult<StatusCode> {
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
@@ -345,7 +363,7 @@ struct HeartbeatBody {
 async fn heartbeat(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    Json(body): Json<HeartbeatBody>,
+    ApiJson(body): ApiJson<HeartbeatBody>,
 ) -> AppResult<StatusCode> {
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
@@ -381,7 +399,7 @@ struct ResultAck {
 async fn submit_result(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    Json(body): Json<ResultBody>,
+    ApiJson(body): ApiJson<ResultBody>,
 ) -> AppResult<Json<ResultAck>> {
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
@@ -454,8 +472,14 @@ async fn submit_result(
         .fetch_one(&mut *tx)
         .await?;
 
+    // The job's immutable half: its batch size, its players' reporting caps,
+    // its rack space. Read once per process; a hit costs no round trip inside
+    // the locks held here.
+    let template = state.templates.get_or_load(&mut tx, &job).await?;
+
     crate::jobs::registry::store_result(
         &mut tx,
+        &template,
         &job,
         task_id,
         claim_id,
@@ -553,7 +577,12 @@ async fn submit_result(
     // request now would tell the worker to retry a submission that already
     // landed, so a failure here is logged and the next submission's check
     // picks the job up.
-    if let Err(err) = after_submission(&state, job_id).await {
+    //
+    // `job` is the row read inside the transaction above, before this result
+    // was stored and before the finish check reads any result -- which is the
+    // order `complete_unless_purged`'s witness needs -- so it is reused rather
+    // than read again on the path the worker waits on.
+    if let Err(err) = after_submission(&state, &job).await {
         tracing::error!(job_id = %job_id, error = %err.message, "post-submission bookkeeping failed");
     }
 
@@ -574,16 +603,20 @@ async fn submit_result(
 /// have open. It is coalesced per job (`sse::begin_push`), so a busy job
 /// builds one payload at a time rather than one per submission, and they stay
 /// ordered because one task issues them.
-async fn after_submission(state: &AppState, job_id: Uuid) -> AppResult<()> {
-    let job = jobstats::load_job(&state.pool, job_id).await?;
+async fn after_submission(state: &AppState, job: &Job) -> AppResult<()> {
+    let job_id = job.id;
 
     // Leave generation finishes in its own transition and has no finish
     // condition here, so it skips the in-flight query `should_check_finish`
     // would otherwise run on seven submissions out of eight.
+    //
+    // `job.status` is as of the submit transaction. A job deactivated or
+    // completed since is guarded by `complete_unless_purged`'s own predicate,
+    // so a stale `active` here costs a check and never a wrong write.
     if job.status == JobStatus::Active
         && job.job_type != JobType::LeaveGeneration
         && should_check_finish(state, job_id).await?
-        && finish_condition_met(state, &job).await?
+        && finish_condition_met(state, job).await?
     {
         // `job` was loaded before the results were read, which is what lets
         // its `claims_issued` tell a purge in between from no purge at all.
@@ -612,8 +645,10 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // changed since the submission that asked for this, and a payload
         // saying `active` for a job that just completed is exactly the
         // staleness the dashboard would notice.
-        match jobstats::load_job(&state.pool, job_id).await {
-            Ok(job) => match jobstats::compute(&state.pool, &job).await {
+        // On the display pool: this is a dashboard payload, and must not take
+        // a connection from the pool the submission that asked for it used.
+        match jobstats::load_job(&state.read_pool, job_id).await {
+            Ok(job) => match jobstats::compute(&state.read_pool, &job).await {
                 Ok(stats) => {
                     if let Ok(payload) = serde_json::to_string(&stats) {
                         state.sse.publish(job_id, payload);
@@ -656,7 +691,7 @@ const MIN_STATS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// check is triggered *by* submissions, so a job whose contributors all stop
 /// between checks would not be evaluated again until work resumed — which for a
 /// job that has already reached its stopping point means never, leaving it
-/// `active` and holding allocation in its priority tier. The `EXISTS` below is
+/// `active` and holding its allocation. The `EXISTS` below is
 /// bounded by the number of claims open across the fleet, not by anything that
 /// grows with the job, and it is only reached when the debounce would otherwise
 /// skip.
@@ -820,22 +855,22 @@ mod contract_fixtures {
             min_magpie_version: "1.4.0".into(),
             expected_data: ExpectedData {
                 algorithm: "sha256",
-                files: vec![crate::jobs::ExpectedFile {
+                files: std::sync::Arc::new(vec![crate::jobs::ExpectedFile {
                     role: "kwg".into(),
                     name: "NWL23".into(),
                     path: "lexica/NWL23.kwg".into(),
                     sha256: "3e74af98".into(),
                     bytes: 4_719_596,
                     tarball_date: "20251004".into(),
-                }],
-                derived: vec![crate::derived::ExpectedDerived {
+                }]),
+                derived: std::sync::Arc::new(vec![crate::derived::ExpectedDerived {
                     role: "wmp".into(),
                     name: "NWL23".into(),
                     sha256: "214a46d7".into(),
                     bytes: 104_857_600,
                     builder: "wmp-1".into(),
                     build_target: "nehalem".into(),
-                }],
+                }]),
             },
             // Absent from the fixture: it is sent only to a worker that
             // arrived with no identity at all, which this one did not.

@@ -1,6 +1,7 @@
 //! The job type system: one request / response / record triple plus a creation
 //! strategy per job type.
 
+use super::dispatch::JobTemplate;
 use crate::error::AppResult;
 use crate::models::job::NamedPlayerConfig;
 use serde::de::DeserializeOwned;
@@ -19,18 +20,26 @@ pub trait JobHandler {
 
     /// Read back a stored request. A task whose claim lapsed is re-dispatched
     /// through here rather than regenerated, so the request a worker sees is
-    /// always the one recorded against the task.
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request>;
+    /// always the one recorded against the task. The job's immutable half --
+    /// its players, its letter distribution, its run-wide settings -- comes
+    /// from `template`, read once per process, so only the row that differs
+    /// per task is read here.
+    async fn load_request(
+        conn: &mut PgConnection,
+        template: &JobTemplate,
+        task_id: Uuid,
+    ) -> AppResult<Self::Request>;
 
     /// Normalize a worker submission into its stored form.
     fn process_response(response: Self::Response) -> AppResult<Self::Record>;
 
-    /// `job_id` is passed rather than looked up: every record table carries it
+    /// `template` carries the job id, which every record table stores
     /// denormalized so a job's rows can be read without joining through
-    /// `tasks`, and the caller has the job in hand already.
+    /// `tasks`, and the per-player settings that decide how much of a result
+    /// to keep.
     async fn insert_record(
         conn: &mut PgConnection,
-        job_id: Uuid,
+        template: &JobTemplate,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
@@ -148,6 +157,13 @@ pub struct OpeningRackRequest {
     /// on each, which the per-worker rate limit alone caps at well under a
     /// rack per second.
     pub racks: Vec<String>,
+    /// The seed rack `i` of the batch is analysed from, as `seed + i`: the
+    /// index of the first rack in the job's rack space, as a decimal string
+    /// like [`GameRequest::seed`]. Every task states a seed, this one included,
+    /// so a simulation's sampling depends on the task and not on the worker
+    /// (the executor used to derive one from the rack's letters).
+    #[serde(with = "seed_as_string")]
+    pub seed: u64,
     pub previous_play: Option<String>,
     /// Run-wide settings from the job, stated so no worker supplies its own
     /// build's default: the bingo bonus, and the simulation cutoff.

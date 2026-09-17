@@ -6,7 +6,7 @@ use crate::error::{AppError, AppResult};
 use crate::jobs::handler::TaskRequest;
 use crate::jobs::leave_gen;
 use crate::jobs::registry::{self, Acquired};
-use crate::jobs::{expected_data, ExpectedFile};
+use crate::jobs::ExpectedFile;
 use crate::models::job::{Job, JobType, LeaveConfig};
 use crate::state::AppState;
 use crate::version::Version;
@@ -32,10 +32,13 @@ pub struct TaskClaim {
     pub claim_token: Uuid,
     pub request: TaskRequest,
     pub min_magpie_version: String,
-    pub expected_data: Vec<ExpectedFile>,
+    /// Every file the task loads, with the digest the job pins. Shared with
+    /// the job's template rather than queried per claim: the set is fixed when
+    /// the job is created.
+    pub expected_data: std::sync::Arc<Vec<ExpectedFile>>,
     /// The wordmap and rack info table hashes this job's tasks must reproduce.
     /// Empty for a job whose players ask for neither.
-    pub derived_data: Vec<crate::derived::ExpectedDerived>,
+    pub derived_data: std::sync::Arc<Vec<crate::derived::ExpectedDerived>>,
 }
 
 /// The four answers a claim can get. One decision, not four checks: `204` and
@@ -48,7 +51,8 @@ pub enum ClaimOutcome {
     Task(Box<TaskClaim>),
     /// Work this worker could run exists, but none is available right now.
     Idle,
-    /// No active jobs at all. A quiet server is not the worker's fault.
+    /// No job is offering work at all: none is active, or every active one is
+    /// parked at 0%. A quiet server is not the worker's fault.
     NoWorkExists,
     /// Every active job is ruled out for this worker.
     Shutdown(ShutdownDirective),
@@ -64,10 +68,13 @@ pub struct ShutdownDirective {
     pub download_url: Option<String>,
 }
 
-/// Active jobs in the top priority tier, ordered by how far behind their
-/// allocation share they are.
+/// Active jobs with a share of the fleet, ordered by how far behind that share
+/// they are.
 ///
-/// The deficit is `jobs.claims_issued / allocation`. That counter counts every
+/// The deficit is `(jobs.claims_issued - jobs.claims_baseline) / allocation`:
+/// the claims a job has been issued *since it last joined the jobs on offer*,
+/// against its share (see [`join_at_parity`] for the baseline). The counter
+/// counts every
 /// claim ever issued, abandoned and declined ones included: a claim consumed
 /// dispatch capacity the moment it was inserted, so the count only ever goes up.
 /// Filtering out abandoned claims would let a job with flaky workers quietly
@@ -76,27 +83,24 @@ pub struct ShutdownDirective {
 /// than a `COUNT(*)` over `task_claims` because this query runs on every claim
 /// request, and a count grows with the whole history of every candidate job.
 ///
-/// Both capability filters live in the `eligible_jobs` CTE and the priority is
-/// computed over its output, so "filter before MIN(priority)" is structural
-/// rather than remembered. Applying either filter afterwards would pick the top
-/// tier from jobs the worker cannot run and then hand back nothing, leaving a
-/// worker locked out of tier 0 blind to doable work in tier 1.
+/// There is no priority. Every active job with an allocation above zero is a
+/// candidate, and the worker takes from the one furthest behind its share; a
+/// job at 0% is offered to nobody, which is what `inactive` means too, so an
+/// admin parks a job with either. The two capability filters -- the worker's
+/// MAGPIE version and its unsupported set -- are applied here, so a worker that
+/// cannot run one job is offered the next.
 async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<Vec<Job>> {
     Ok(sqlx::query_as::<_, Job>(
-        "WITH eligible_jobs AS (
-             SELECT j.*
-             FROM jobs j
-             WHERE j.status = 'active'
-               AND (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
-                   <= ($1, $2, $3)
-               AND j.id <> ALL($4)
-         )
-         SELECT e.*
-         FROM eligible_jobs e
-         WHERE e.priority = (SELECT MIN(priority) FROM eligible_jobs)
+        "SELECT j.*
+         FROM jobs j
+         WHERE j.status = 'active'
+           AND j.allocation > 0
+           AND (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
+               <= ($1, $2, $3)
+           AND j.id <> ALL($4)
          ORDER BY
-           e.claims_issued::float / NULLIF(e.allocation, 0) ASC NULLS LAST,
-           e.created_at ASC",
+           (j.claims_issued - j.claims_baseline)::float / j.allocation ASC,
+           j.created_at ASC",
     )
     .bind(caps.magpie_version.major)
     .bind(caps.magpie_version.minor)
@@ -104,6 +108,83 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
     .bind(&caps.unsupported_jobs)
     .fetch_all(pool)
     .await?)
+}
+
+/// Put `job_id` level with the jobs already **being served**: set its
+/// `claims_baseline` so that its deficit ratio equals the lowest ratio among
+/// the other active jobs above 0% that issued a claim within `served_within`
+/// -- or, when none has, among all of them; or zero when there are none.
+///
+/// The deficit the scheduler orders on is a ratio of claims issued to share.
+/// Measured over a job's whole life, that made every change to the set of jobs
+/// a takeover. A job activated beside one that had issued two million claims
+/// had a ratio of zero, so it was first in every candidate list until it had
+/// issued two million of its own -- and the older job, at the same 50%, got
+/// nothing for as long as that took. A purge zeroes `claims_issued`, so a
+/// purged job did the same; so did a job reactivated after a week switched
+/// off; and raising an allocation from 10% to 50% cut a job's ratio to a
+/// fifth, with the same effect. PLAN.md promised "no starvation of any job
+/// above 0%", and the formula it gave did not have that property.
+///
+/// This is start-time fair queuing's rule: a flow that (re)joins starts at the
+/// system's current virtual time, not at zero. Called wherever a job's
+/// standing changes -- activation (which is also how an allocation is changed)
+/// and purge -- inside that operation's transaction, after it has written the
+/// job's new allocation and counters. From then on the job is simply one more
+/// candidate: selection stays deterministic, stays one statement, and still
+/// converges on the configured shares, because every job's numerator counts
+/// from the same moment in the fleet's history.
+///
+/// **Why "being served", and not merely "offering work".** Virtual time is the
+/// position of the flows in service. A job can be active and above 0% and
+/// still not be served: its derived files are building (or failed), it is
+/// pinned to data the fleet does not have yet, its MAGPIE floor is above what
+/// the workers run, its generation is mid-transition. Its ratio stands still
+/// while the others climb -- and a newcomer put level with *that* job was, for
+/// every worker that could not run the lagging one, first in the list until it
+/// had caught up with the jobs that were running: the takeover this function
+/// exists to prevent, by another door. (Demonstrated before this was changed:
+/// a veteran at 100,000 claims, a job nobody could run at zero, a newcomer --
+/// twelve of the next twelve claims went to the newcomer.) `last_claimed_at`
+/// rides the `UPDATE jobs` every claim already makes, and `served_within` is
+/// the heartbeat timeout: a job that has not issued a claim for that long is
+/// not being served in any sense the fleet would notice. With no job served
+/// that recently -- a quiet server, the first activation in a while -- every
+/// job on offer counts, as before.
+///
+/// What this does not cover, deliberately: a job only a *minority* of the
+/// fleet can run is served, recently, and still lags, so a newcomer joining
+/// level with it is ahead of the rest for the majority. No single ratio
+/// describes a fleet that is really two queues; PLAN.md records it as a limit.
+///
+/// The baseline may go negative (a job with no claims joining a busy fleet is
+/// credited the claims that put it level); ratios never do, since the minimum
+/// it copies is itself a ratio of a count that only grows.
+pub async fn join_at_parity(
+    conn: &mut sqlx::PgConnection,
+    job_id: Uuid,
+    served_within: std::time::Duration,
+) -> AppResult<()> {
+    sqlx::query(
+        "WITH others AS (
+             SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
+                    COALESCE(o.last_claimed_at > now() - make_interval(secs => $2), FALSE) AS served
+             FROM jobs o
+             WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1
+         )
+         UPDATE jobs j
+         SET claims_baseline = j.claims_issued - floor(
+                 COALESCE((SELECT MIN(ratio) FROM others WHERE served),
+                          (SELECT MIN(ratio) FROM others), 0)
+                 * COALESCE(j.allocation, 0)
+             )::bigint
+         WHERE j.id = $1",
+    )
+    .bind(job_id)
+    .bind(served_within.as_secs_f64())
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Why a worker that can run nothing can run nothing, and what to tell it.
@@ -117,10 +198,19 @@ async fn shutdown_or_idle(
     state: &AppState,
     caps: &WorkerCapabilities,
 ) -> AppResult<ClaimOutcome> {
-    // An axis counts as blocking only for *active* jobs it actually rules out.
-    // The unsupported set is client-supplied and may name jobs that have since
-    // completed or been deactivated; its mere non-emptiness says nothing about
-    // why the active jobs are out of reach.
+    // An axis counts as blocking only for jobs that are *offering work* --
+    // active and above 0% -- and that it actually rules out. The unsupported
+    // set is client-supplied and may name jobs that have since completed or
+    // been deactivated; its mere non-emptiness says nothing about why the
+    // jobs on offer are out of reach.
+    //
+    // A job parked at 0% is offered to nobody, which is what `inactive` means,
+    // so it is left out exactly as an inactive job is. Counted, a parked job
+    // this worker could not run told the worker to shut down -- "every active
+    // job requires MAGPIE 0.2.0" -- over a job that was handing out nothing to
+    // anyone, where the same job switched to `inactive` answered `204`. A
+    // contributor who exits on that does not come back when the admin raises
+    // the allocation of a job it could have run all along.
     let row = sqlx::query(
         "SELECT COUNT(*) AS total,
                 COUNT(*) FILTER (
@@ -130,7 +220,7 @@ async fn shutdown_or_idle(
                     WHERE (min_magpie_major, min_magpie_minor, min_magpie_patch) <= ($1, $2, $3)
                       AND id = ANY($4)
                 ) AS data_blocked
-         FROM jobs WHERE status = 'active'",
+         FROM jobs WHERE status = 'active' AND allocation > 0",
     )
     .bind(caps.magpie_version.major)
     .bind(caps.magpie_version.minor)
@@ -146,7 +236,7 @@ async fn shutdown_or_idle(
     let version_blocked = row.get::<i64, _>("too_new") > 0;
     let data_blocked = row.get::<i64, _>("data_blocked") > 0;
     if !version_blocked && !data_blocked {
-        // Active jobs exist and nothing rules them out; they simply had no
+        // Jobs are on offer and nothing rules them out; they simply had no
         // task to hand out this instant.
         return Ok(ClaimOutcome::Idle);
     }
@@ -157,7 +247,7 @@ async fn shutdown_or_idle(
         sqlx::query_scalar::<_, String>(
             "SELECT format('%s.%s.%s', min_magpie_major, min_magpie_minor, min_magpie_patch)
              FROM jobs
-             WHERE status = 'active'
+             WHERE status = 'active' AND allocation > 0
                AND (min_magpie_major, min_magpie_minor, min_magpie_patch) > ($1, $2, $3)
              ORDER BY min_magpie_major, min_magpie_minor, min_magpie_patch
              LIMIT 1",
@@ -176,7 +266,7 @@ async fn shutdown_or_idle(
             "SELECT DISTINCT d.tarball_date
              FROM jobs j
              JOIN input_data d ON d.id IN (j.letterdist_id, j.layout_id)
-             WHERE j.id = ANY($1) AND j.status = 'active'
+             WHERE j.id = ANY($1) AND j.status = 'active' AND j.allocation > 0
              ORDER BY d.tarball_date DESC",
         )
         .bind(&caps.unsupported_jobs)
@@ -233,15 +323,15 @@ pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> 
     reclaim_expired_for(pool, &[job_id], timeout_secs).await
 }
 
-/// [`reclaim_expired`] over a whole tier of candidate jobs in one statement.
+/// [`reclaim_expired`] over every candidate job in one statement.
 ///
 /// The scan is the same either way: the planner reaches the expired claims
 /// through the partial index on open claims -- one entry per claim currently in
 /// flight across the fleet -- and filters by job afterwards, because
 /// `task_claims` has no job column to narrow on. Run per job, a claim request
-/// therefore paid that scan once per candidate in its tier, for a set of rows
-/// that does not depend on the job at all. Run once over the tier it is a single
-/// pass and a single round trip.
+/// therefore paid that scan once per candidate, for a set of rows that does not
+/// depend on the job at all. Run once over all of them it is a single pass and
+/// a single round trip.
 pub async fn reclaim_expired_for(
     pool: &PgPool,
     job_ids: &[Uuid],
@@ -280,8 +370,8 @@ pub async fn reclaim_expired_for(
     Ok(result.rows_affected())
 }
 
-/// Walk the priority tier in deficit order and hand out the first available unit
-/// of work.
+/// Walk the candidate jobs in deficit order and hand out the first available
+/// unit of work.
 pub async fn claim(
     state: &AppState,
     identity: &WorkerIdentity,
@@ -314,10 +404,10 @@ pub async fn claim(
             return shutdown_or_idle(state, caps).await;
         }
 
-        // Once for the whole tier, before anything is handed out: a task whose
-        // claim lapsed has to be back to `available` before the loop below
-        // looks for one. Per job this was a round trip per candidate for a
-        // scan that does not depend on the job; one statement covers the tier.
+        // Once for every candidate, before anything is handed out: a task
+        // whose claim lapsed has to be back to `available` before the loop
+        // below looks for one. Per job this was a round trip per candidate for
+        // a scan that does not depend on the job; one statement covers them.
         // A failure here is not fatal -- nothing is reclaimed this time round,
         // so a lapsed task waits for the next claim -- and must not take the
         // whole request down with it.
@@ -332,7 +422,7 @@ pub async fn claim(
             // generation-0 artifact never got written, a config row a bad
             // restore left out -- must not take every other job down with it.
             // Failing the whole claim here would answer every worker with a
-            // 500 for as long as that job sits at the top of the tier, and
+            // 500 for as long as that job sits at the head of the list, and
             // every client retries 500s. It is logged loudly and skipped.
             match try_claim_from_job(state, identity, job, caps).await {
                 Ok(Some(outcome)) => return Ok(ClaimOutcome::Task(Box::new(outcome))),
@@ -376,27 +466,55 @@ async fn try_claim_from_job(
     // worker reads as "this server does not check derived files", falling back
     // to whatever is on its disk -- or carry an empty one. Waiting is the only
     // answer that cannot be mistaken for success.
-    let derived = {
-        let mut conn = state.pool.acquire().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
-        crate::derived::status_for_job(&mut conn, job.id, &state.builders)
-            .await
-            .map_err(JobClaimError::Fatal)?
+    //
+    // Answered from memory once a job has been found dispatchable: this runs
+    // for every candidate job on every claim, and the answer for a
+    // dispatchable job cannot change for the life of the process (see
+    // `derived::DerivedCache`). A job still waiting is asked about each time.
+    //
+    // The job's template -- its config, players, letter distribution and
+    // `expected_data` -- is remembered the same way (`dispatch::JobTemplates`),
+    // so the claim transaction below reads only what changes from claim to
+    // claim. Only a miss on either takes a pool connection: the common case is
+    // a hit, and a connection held for a lookup the cache answers is one a
+    // worker's claim or submission is waiting for.
+    let (derived, template) = match (state.derived_ready.get(job.id), state.templates.get(job.id)) {
+        (Some(derived), Some(template)) => (derived, template),
+        (derived, template) => {
+            let mut conn =
+                state.pool.acquire().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+            let derived = match derived {
+                Some(derived) => derived,
+                None => {
+                    let ready = crate::derived::ready_for_job(
+                        &mut conn,
+                        job.id,
+                        &state.builders,
+                        &state.derived_ready,
+                    )
+                    .await
+                    .map_err(JobClaimError::Fatal)?;
+                    match ready {
+                        Some(ready) => ready,
+                        None => return Ok(None),
+                    }
+                }
+            };
+            let template = match template {
+                Some(template) => template,
+                None => state
+                    .templates
+                    .get_or_load(&mut conn, job)
+                    .await
+                    .map_err(JobClaimError::Fatal)?,
+            };
+            (derived, template)
+        }
     };
-    if !derived.dispatchable() {
-        // Logged at debug: a table takes minutes to build, and every worker
-        // asking during those minutes would otherwise produce a line each.
-        // `GET /api/admin/derived-data` is where an admin looks.
-        tracing::debug!(
-            job_id = %job.id,
-            pending = ?derived.pending, failed = ?derived.failed,
-            "job is waiting on a derived file"
-        );
-        return Ok(None);
-    }
 
     let mut tx = state.pool.begin().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
 
-    let acquired = match registry::acquire(&mut tx, job, identity).await {
+    let acquired = match registry::acquire(&mut tx, job, identity, &template).await {
         Ok(acquired) => acquired,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -410,7 +528,14 @@ async fn try_claim_from_job(
 
     match acquired {
         Acquired::NoWork => {
-            let _ = tx.rollback().await;
+            // Committed rather than rolled back, for the one thing a claim that
+            // hands out nothing may have written: a leave job's sweep deleting
+            // the cursor of a lap it found finished (`leave_gen::sweep`).
+            // Rolled back, the next claim would find the lap finished again,
+            // by the same read to the end of the universe. Nothing else writes
+            // before answering `NoWork`, and a transaction the dispatch lock's
+            // timeout aborted commits as the rollback it already is.
+            let _ = tx.commit().await;
             Ok(None)
         }
         Acquired::JobFinished => {
@@ -447,6 +572,24 @@ async fn try_claim_from_job(
                     tracing::error!(
                         job_id = %spawn_job.id, generation, error = %err.message,
                         "seeding a leave generation's rack universe failed"
+                    );
+                }
+            });
+            Ok(None)
+        }
+        Acquired::NeedsLeaveMerge { generation } => {
+            // Nothing was written. The merge runs on its own task -- a
+            // full-size one is the best part of a minute -- and gives up at
+            // once if another is already running, so a fleet asking together
+            // starts one merge rather than parking a connection each behind
+            // it. This job has nothing to hand out until it lands.
+            let _ = tx.rollback().await;
+            let (pool, job_id) = (state.pool.clone(), job.id);
+            tokio::spawn(async move {
+                if let Err(err) = leave_gen::merge_staged(&pool, job_id, generation, false).await {
+                    tracing::error!(
+                        %job_id, generation, error = %err.message,
+                        "merging staged leave results failed"
                     );
                 }
             });
@@ -503,17 +646,18 @@ async fn try_claim_from_job(
                     Ok(None)
                 }
                 Ok(Some(claim_token)) => {
-                    let expected = expected_data(&mut tx, job)
-                        .await
-                        .map_err(JobClaimError::Fatal)?;
                     tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+                    request_tail_merge(state, job, &template, &request, created);
                     Ok(Some(TaskClaim {
                         job_id: job.id,
                         claim_token,
                         request,
                         min_magpie_version: job.min_magpie_version().to_string(),
-                        expected_data: expected,
-                        derived_data: derived.ready,
+                        // Fixed at job creation, so it is the template's copy
+                        // rather than a union over six tables inside the
+                        // dispatch lock and the job's row lock on every claim.
+                        expected_data: template.expected.clone(),
+                        derived_data: derived,
                     }))
                 }
                 Err(err) => {
@@ -530,6 +674,45 @@ async fn try_claim_from_job(
             }
         }
     }
+}
+
+/// A leave claim that was handed fewer racks than a task holds has found its
+/// generation nearly done -- everything else below target is out with another
+/// claim or waiting in a staged result -- and that is when stale per-rack
+/// counts cost most: tasks go out forcing racks that may already be at target,
+/// and the generation cannot close until a merge shows that they are. Such a
+/// claim asks for a merge, off the request, at most once a minute per job
+/// (`leave_gen::TAIL_MERGE_INTERVAL`). Mid-generation the half-hourly sweep is
+/// enough, and this never fires.
+fn request_tail_merge(
+    state: &AppState,
+    job: &Job,
+    template: &crate::jobs::dispatch::JobTemplate,
+    request: &TaskRequest,
+    created: bool,
+) {
+    let (TaskRequest::LeaveGeneration(request), crate::jobs::dispatch::JobKind::LeaveGeneration { config, .. }) =
+        (request, &template.kind)
+    else {
+        return;
+    };
+    // A re-dispatched task's racks were chosen when it was created, and say
+    // nothing about the generation now.
+    if !created || request.forced_racks.len() >= config.racks_per_task as usize {
+        return;
+    }
+    if !state.leave_merges.due(job.id) {
+        return;
+    }
+    let (pool, job_id, generation) = (state.pool.clone(), job.id, request.generation);
+    tokio::spawn(async move {
+        if let Err(err) = leave_gen::merge_staged(&pool, job_id, generation, false).await {
+            tracing::error!(
+                %job_id, generation, error = %err.message,
+                "merging staged leave results near a generation's end failed"
+            );
+        }
+    });
 }
 
 /// Everything a claim writes, inside the claim transaction.
@@ -605,7 +788,8 @@ async fn issue_claim(
     // for, so a claim that loses that race hands out nothing.
     let still_active = sqlx::query(
         "UPDATE jobs
-         SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $2
+         SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $2,
+             last_claimed_at = now()
          WHERE id = $1 AND status = 'active'",
     )
     .bind(job.id)

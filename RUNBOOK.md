@@ -147,7 +147,7 @@ In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
 | 3 | `task_claims` | `task_id IN (...)` |
 | 4 | `game_results`, `leave_records` | `job_id = :job` / `task_id IN (...)` |
 | 5 | `position_analysis_records` → `_moves` → `_plies` | `job_id = :job`, then by parent id |
-| 6 | `leave_rack_progress`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
+| 6 | `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_selection_cursors`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
 are recomputed from `game_results` (see §2.4).
@@ -157,6 +157,17 @@ artifact row without its transition row would leave the next claim free to
 re-run a transition that already happened, and a transition row without its
 artifact row would stall the job until the takeover timeout. Copy both or
 neither.
+
+`leave_rack_staging` goes with `leave_rack_progress` for the same kind of
+reason: it holds the accepted leave results that have not yet been merged into
+the per-rack totals (`leave_gen::merge_staged`: half-hourly, near a generation's
+end, and before one closes). Progress without its staging rows is a generation
+that silently lost up to half an hour of accepted work, and the tasks that did
+it still read as completed, so nothing would ever redo it. Copy both from the
+same snapshot. `leave_generation_progress` is the dashboard's per-generation
+summary; its rack figures are rebuilt by the next merge
+(`POST /api/admin/jobs/:id/merge-progress` forces one), so only its live
+counters are lost if it is left out.
 
 `game_results` and `position_analysis_records` carry `job_id` as well as
 `task_id`, so those two can be selected by the job directly rather than through
@@ -214,8 +225,10 @@ UPDATE tasks t
  WHERE j.id = t.job_id AND t.job_id = :'job';
 
 -- The job's own counters. claims_issued is the scheduler's deficit numerator,
--- so a restored job that keeps a zero here is dispatched ahead of everything
--- else until it catches up. The rest are the dashboard's progress totals; they
+-- measured from claims_baseline; the statement after this one puts the
+-- restored job level with the jobs beside it, as activation and purge do
+-- (scheduler::join_at_parity), so it neither owes nor is owed a backlog. The
+-- rest are the dashboard's progress totals; they
 -- are maintained one task at a time in the claim and submit paths, so a row
 -- copy leaves them describing the results the job had before. Each is
 -- recomputed here exactly as the read it replaced computed it: one result per
@@ -236,6 +249,22 @@ UPDATE jobs j
        racks_analyzed = (SELECT count(DISTINCT p.rack)
                            FROM position_analysis_records p
                           WHERE p.job_id = j.id)
+ WHERE j.id = :'job';
+
+-- Level with the jobs being *served* -- those that issued a claim within the
+-- heartbeat timeout (300 s unless HEARTBEAT_TIMEOUT_SECONDS says otherwise) --
+-- or, when none has, with every job on offer: scheduler::join_at_parity's rule.
+WITH others AS (
+  SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
+         COALESCE(o.last_claimed_at > now() - interval '300 seconds', FALSE) AS served
+    FROM jobs o
+   WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> :'job'
+)
+UPDATE jobs j
+   SET claims_baseline = j.claims_issued - floor(
+         COALESCE((SELECT MIN(ratio) FROM others WHERE served),
+                  (SELECT MIN(ratio) FROM others), 0)
+         * COALESCE(j.allocation, 0))::bigint
  WHERE j.id = :'job';
 
 COMMIT;
@@ -302,7 +331,9 @@ rows actually support.
   each pool's `game_results`, never applied per submission. Once the results
   are back the two-minute sweep notices the pool's evidence changed and refits
   it; `POST /api/admin/rating-pools/:id/recompute` does it immediately. Nothing
-  to copy.
+  to copy. Runs older than a month are thinned to one a day in any case
+  (PLAN.md, "Ratings"), so a restored history is at that resolution past the
+  month whatever the backup's age.
 - **SPRT**: computed from `game_results` on read, so it corrects itself once
   the results are back.
 - **Leave-generation artifacts**: if any object is missing, use

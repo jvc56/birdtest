@@ -14,6 +14,17 @@ const RATING_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// unused entry lingers in memory, not how anyone is limited.
 const RATE_LIMIT_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How often to expire staged input-data imports nobody confirmed. They
+/// expire after a day (`inputdata::UNCONFIRMED_IMPORT_TTL`), so an hourly
+/// look is plenty.
+const IMPORT_EXPIRY_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How often to thin each pool's rating runs older than
+/// `ratings::RUN_FULL_RESOLUTION` down to one a day. The window is a month, so
+/// an hourly look is plenty; past the first pass each one deletes an hour's
+/// worth of runs.
+const RATING_RUN_THIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Local development reads `.env`; in ECS the same variables arrive from the
@@ -72,13 +83,20 @@ async fn main() -> Result<()> {
     // traffic against an out-of-date schema.
     db::migrate(&pool).await?;
 
+    // After the migration, so its connections never see the old schema.
+    let read_pool = db::connect_read(&cfg.database_url).await?;
+
     let state = AppState {
         pool,
+        read_pool,
         cfg: cfg.clone(),
         magpie,
         builders: Arc::new(builders),
         sse: sse::SseBroadcaster::new(),
         finish_checks: Default::default(),
+        derived_ready: Default::default(),
+        templates: Default::default(),
+        leave_merges: Default::default(),
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,
@@ -104,6 +122,15 @@ async fn main() -> Result<()> {
         Ok(0) => {}
         Ok(n) => tracing::warn!(count = n, "failed job exports left running by a restart"),
         Err(err) => tracing::error!(error = %err.message, "could not reap orphaned exports"),
+    }
+
+    // Likewise a leave-generation transition: it runs on a spawned task, so one
+    // left open belongs to a process that is gone, and the next claim should
+    // take it over now rather than after the half-hour takeover timeout.
+    match birdtest::jobs::leave_gen::release_orphaned_transitions(&state.pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "released generation transitions left open by a restart"),
+        Err(err) => tracing::error!(error = %err.message, "could not release orphaned transitions"),
     }
 
     // Rating fits run on a periodic sweep rather than on result submission: a
@@ -139,6 +166,71 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 limits.retain_recent();
+            }
+        });
+    }
+
+    // A staged import is a proposal an admin was shown and did not act on.
+    // Left forever it holds its staged rows and their bytes, and shows a diff
+    // against a vocabulary that has since moved on.
+    {
+        let db = state.pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(IMPORT_EXPIRY_SWEEP_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match inputdata::expire_unconfirmed_imports(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(count = n, "expired unconfirmed input data imports"),
+                    Err(err) => {
+                        tracing::error!(error = %err.message, "expiring unconfirmed imports failed")
+                    }
+                }
+            }
+        });
+    }
+
+    // Rating runs are snapshots, one per fit, and a pool with an active job
+    // takes one every two minutes for as long as the job runs. Past a month the
+    // last run of each day is all the history chart can show anyway.
+    {
+        let db = state.pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(RATING_RUN_THIN_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match ratings::thin_old_runs(&db).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(runs = n, "thinned old rating runs"),
+                    Err(err) => {
+                        tracing::error!(error = %err.message, "thinning old rating runs failed")
+                    }
+                }
+            }
+        });
+    }
+
+    // Accepted leave results are staged by the submit path and folded into the
+    // per-rack totals here, in one pass per job, rather than by every
+    // submission; see `leave_gen::stage_fold` for what that saves. Claims ask
+    // for a merge themselves near a generation's end, and a transition drains
+    // before it reads, so this interval sets write volume and dashboard lag
+    // and nothing else.
+    {
+        let db = state.pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(birdtest::jobs::leave_gen::MERGE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match birdtest::jobs::leave_gen::merge_all_staged(&db).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(error = %err.message, "merging staged leave results failed")
+                    }
+                }
             }
         });
     }

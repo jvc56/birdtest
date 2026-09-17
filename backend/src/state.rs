@@ -69,7 +69,14 @@ impl FinishCheckCounters {
 
 #[derive(Clone)]
 pub struct AppState {
+    /// The pool claims, submissions, heartbeats, the finish check, admin
+    /// actions and the background sweeps run on.
     pub pool: PgPool,
+    /// The pool the public pages and the live dashboard read from
+    /// (`db::connect_read`): smaller, with a statement timeout, and separate so
+    /// that nothing display-only can hold a connection a worker is waiting
+    /// for. Nothing that decides anything reads through it.
+    pub read_pool: PgPool,
     pub cfg: Arc<Config>,
     /// The pinned MAGPIE binary, and what it says about its own builders.
     ///
@@ -94,4 +101,17 @@ pub struct AppState {
     /// Debounces the per-submission finish-condition check; see
     /// [`SPRT_CHECK_EVERY`].
     pub finish_checks: FinishCheckCounters,
+    /// The built wordmap and rack-info-table hashes of every job this process
+    /// has found dispatchable, so the claim path asks the database once per
+    /// job rather than once per claim; see [`crate::derived::DerivedCache`].
+    pub derived_ready: crate::derived::DerivedCache,
+    /// The immutable configuration of every job this process has dispatched
+    /// from or accepted a result for -- its config row, its players, its
+    /// letter distribution, its `expected_data` -- read once per job rather
+    /// than once per claim inside the dispatch lock; see
+    /// [`crate::jobs::dispatch::JobTemplates`].
+    pub templates: crate::jobs::dispatch::JobTemplates,
+    /// When each leave job's last claim-requested merge started; see
+    /// [`crate::jobs::leave_gen::TailMerges`].
+    pub leave_merges: crate::jobs::leave_gen::TailMerges,
 }

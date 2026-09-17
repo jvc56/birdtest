@@ -439,7 +439,7 @@ impl Progress {
 
 /// Phase 1, off the request thread: fetch, hash, diff, stage.
 pub async fn run_import(state: AppState, import_id: Uuid, tarball_date: String, commit_sha: String) {
-    let progress = Progress::new(state.pool.clone(), import_id);
+    let progress = std::sync::Arc::new(Progress::new(state.pool.clone(), import_id));
     match stage(&state, import_id, &tarball_date, &commit_sha, &progress).await {
         Ok(staged) => {
             progress.flush_entries().await;
@@ -503,10 +503,23 @@ async fn stage(
     import_id: Uuid,
     tarball_date: &str,
     commit_sha: &str,
-    progress: &Progress,
+    progress: &std::sync::Arc<Progress>,
 ) -> AppResult<String> {
     let (body, tarball_sha256) = download(state, commit_sha, tarball_date, progress).await?;
-    let mut files = walk_archive(&body, Some(progress))?;
+    // On the blocking pool: gunzipping, untarring and hashing a whole tarball
+    // is seconds of computation with no `await` in it, and an async worker
+    // thread that does not yield can stall every other request the server has
+    // (see `exports::upload_rows`). The archive goes in and comes back out,
+    // since the uploads below still read from it.
+    let (mut files, body) = {
+        let progress = progress.clone();
+        tokio::task::spawn_blocking(move || {
+            let files = walk_archive(&body, Some(&progress))?;
+            Ok::<_, AppError>((files, body))
+        })
+        .await
+        .map_err(|e| AppError::internal(format!("reading the archive failed: {e}")))??
+    };
     // Before anything is staged: a row that names an object has to be a row
     // whose object is there, or the first derived build from it fails with a
     // missing key rather than a reason. Uploading before the transaction also
@@ -566,6 +579,45 @@ async fn stage(
     tx.commit().await?;
 
     Ok(tarball_sha256)
+}
+
+/// How long a staged import waits for the admin's confirmation before it is
+/// expired. The diff it shows is against `input_data` as it was when the
+/// import ran, so an old one is a proposal about a vocabulary that may have
+/// moved on; and each staged row keeps the bytes of its letter distributions
+/// and layouts, which is storage held for a decision nobody is going to make.
+pub const UNCONFIRMED_IMPORT_TTL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
+/// Expires staged imports older than [`UNCONFIRMED_IMPORT_TTL`]: the staged
+/// rows -- and the bytes they carry -- are deleted, and the import is marked
+/// `cancelled` with a reason, so the admin page says what happened to it
+/// rather than showing a gap. The objects an import uploaded stay: they are
+/// keyed by digest and are exactly what the next import of the same files
+/// would upload anyway.
+///
+/// Returns how many imports were expired.
+pub async fn expire_unconfirmed_imports(pool: &sqlx::PgPool) -> AppResult<u64> {
+    let mut tx = pool.begin().await?;
+    let expired: Vec<Uuid> = sqlx::query_scalar(
+        "UPDATE input_data_imports
+         SET state = 'cancelled',
+             error = 'not confirmed within 24 hours; start the import again to review it'
+         WHERE state = 'staged'
+           AND requested_at < now() - make_interval(secs => $1)
+         RETURNING id",
+    )
+    .bind(UNCONFIRMED_IMPORT_TTL.as_secs_f64())
+    .fetch_all(&mut *tx)
+    .await?;
+    if !expired.is_empty() {
+        sqlx::query("DELETE FROM input_data_import_rows WHERE import_id = ANY($1)")
+            .bind(&expired)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(expired.len() as u64)
 }
 
 /// Startup reaper. Single instance, so a row left `running` belongs to a

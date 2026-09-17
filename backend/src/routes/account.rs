@@ -1,4 +1,5 @@
 use crate::auth::{api_key, csrf, CurrentUser};
+use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::models::user::ApiKeyRow;
 use crate::state::AppState;
@@ -31,12 +32,15 @@ struct Me {
 }
 
 async fn me(State(state): State<AppState>, user: CurrentUser) -> AppResult<Json<Me>> {
-    let tasks_completed = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM task_claims WHERE claimed_by_user_id = $1 AND state = 'completed'",
-    )
-    .bind(user.id)
-    .fetch_one(&state.pool)
-    .await?;
+    // The running total the contributor lists read, rather than a count over
+    // this account's claims: the count walked every claim the account ever
+    // made, and disagreed with `/api/users` whenever a purge had given some
+    // back.
+    let tasks_completed =
+        sqlx::query_scalar::<_, i64>("SELECT tasks_completed FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_one(&state.pool)
+            .await?;
 
     Ok(Json(Me {
         id: user.id,
@@ -82,13 +86,24 @@ async fn create_key(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<CreateKeyBody>,
+    ApiJson(body): ApiJson<CreateKeyBody>,
 ) -> AppResult<(StatusCode, Json<CreatedKey>)> {
     csrf::verify(&method, &headers, &jar)?;
 
+    // Count and insert under the account's row lock. Counted and then inserted
+    // as two statements on the pool, requests arriving together each read the
+    // same count and each inserted, so the limit held only against a caller who
+    // asked one at a time: a hundred concurrent requests at 99 keys left 199.
+    // The limit is enforced here rather than in the schema, so this is the
+    // only thing that enforces it.
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
         .bind(user.id)
-        .fetch_one(&state.pool)
+        .fetch_one(&mut *tx)
         .await?;
     if count >= MAX_API_KEYS {
         return Err(AppError::conflict(format!(
@@ -103,8 +118,9 @@ async fn create_key(
     .bind(user.id)
     .bind(api_key::hash_key(&raw))
     .bind(&body.label)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(CreatedKey { id, label: body.label, key: raw })))
 }
@@ -121,7 +137,7 @@ async fn set_key_active(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<SetActiveBody>,
+    ApiJson(body): ApiJson<SetActiveBody>,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
 

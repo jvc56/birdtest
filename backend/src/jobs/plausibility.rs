@@ -27,9 +27,6 @@
 
 use super::handler::{GameAggregate, MoveEntry, RackOccurrence};
 use crate::error::{AppError, AppResult};
-use crate::models::job::{Job, JobType};
-use sqlx::PgConnection;
-use uuid::Uuid;
 
 /// Tiles on a rack. Matches MAGPIE's `RACK_SIZE`; a submission naming more is
 /// describing something that cannot be dealt.
@@ -210,44 +207,20 @@ pub fn check_rack_occurrences(racks: &[RackOccurrence]) -> AppResult<()> {
     Ok(())
 }
 
-/// What the submission says it did, for checking against what was dispatched.
-pub struct Reported {
-    /// Games for `games`, or twice the pairs for `game_pairs`. `None` for job
-    /// types whose size the request does not fix.
-    pub games: Option<i32>,
-}
-
-/// Checks a submission against the task it answers.
+/// Checks a game batch against the size the task was dispatched with.
 ///
-/// The size rule needs the request, which `process_response` does not have, so
-/// it runs here instead. It is the strongest check available at submission
-/// time and the only one that catches a worker reporting work it did not do:
-/// the batch size was fixed when the task was dispatched, so a result of any
-/// other size is answering a question nobody asked.
-pub async fn check_against_task(
-    conn: &mut PgConnection,
-    job: &Job,
-    task_id: Uuid,
-    reported: &Reported,
-) -> AppResult<()> {
-    let Some(reported_games) = reported.games else {
-        return Ok(());
-    };
-
-    let num_games: i32 = sqlx::query_scalar("SELECT num_games FROM game_requests WHERE task_id = $1")
-        .bind(task_id)
-        .fetch_one(&mut *conn)
-        .await?;
-
-    // A `game_pairs` request counts pairs; each is two games.
-    let expected = match job.job_type {
-        JobType::GamePairs => num_games.saturating_mul(2),
-        _ => num_games,
-    };
-
-    if reported_games != expected {
+/// The size rule needs the job, which `process_response` does not have, so it
+/// runs from `registry::store_result` instead. It is the strongest check
+/// available at submission time and the only one that catches a worker
+/// reporting work it did not do: the batch size was fixed when the task was
+/// dispatched, so a result of any other size is answering a question nobody
+/// asked. `expected_games` is the job's batch size -- doubled for pairs, which
+/// play two games each -- which every request of the job denormalizes and
+/// which the job's template carries, so no request row is read for it.
+pub fn check_batch_size(reported_games: i32, expected_games: i32) -> AppResult<()> {
+    if reported_games != expected_games {
         return Err(AppError::bad_request(format!(
-            "result reports {reported_games} games but this task dispatched {expected}"
+            "result reports {reported_games} games but this task dispatched {expected_games}"
         )));
     }
     Ok(())

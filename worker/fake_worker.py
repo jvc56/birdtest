@@ -12,7 +12,7 @@ It exists so server-side behaviour can be tested at speed and on purpose.
 Real games take real time and produce results nobody chose; almost every
 interesting server property is about something else:
 
-  * scheduling — priority tiers, deficit-based allocation, redundancy
+  * scheduling — deficit-based allocation, redundancy
   * the claim lifecycle — heartbeat timeouts, stale tokens, reclamation
   * SPRT and ratings — which need a *chosen* win rate to reach a known verdict
   * submission validation and the plausibility checks — which need a client

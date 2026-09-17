@@ -1,3 +1,4 @@
+pub mod dispatch;
 pub mod game;
 pub mod game_pair;
 pub mod handler;
@@ -219,17 +220,6 @@ pub async fn load_job_data(conn: &mut PgConnection, job_id: Uuid) -> AppResult<J
     })
 }
 
-pub(crate) async fn load_job_data_for_task(
-    conn: &mut PgConnection,
-    task_id: Uuid,
-) -> AppResult<JobData> {
-    let job_id = sqlx::query_scalar::<_, Uuid>("SELECT job_id FROM tasks WHERE id = $1")
-        .bind(task_id)
-        .fetch_one(&mut *conn)
-        .await?;
-    load_job_data(conn, job_id).await
-}
-
 /// Writes the typed request row for a game or game-pair task.
 ///
 /// The player ids are passed in rather than looked up from the names on the
@@ -265,27 +255,33 @@ pub(crate) async fn insert_game_request(
     Ok(())
 }
 
+/// Reads a game or game-pair task's request back. The row carries what differs
+/// per task; the players and the run-wide settings are the job's, from its
+/// template.
 pub(crate) async fn load_game_request(
     conn: &mut PgConnection,
+    template: &dispatch::JobTemplate,
     task_id: Uuid,
     game_pairs: bool,
 ) -> AppResult<GameRequest> {
+    let (player1, player2) = match &template.kind {
+        dispatch::JobKind::Games { player1, player2, .. }
+        | dispatch::JobKind::GamePairs { player1, player2, .. } => (player1, player2),
+        _ => return Err(template.mismatch("games")),
+    };
     let row = game::load_game_request_row(conn, task_id).await?;
-    let player1 = load_player_spec(conn, row.get("player1_config_id")).await?;
-    let player2 = load_player_spec(conn, row.get("player2_config_id")).await?;
-    let job_data = load_job_data_for_task(conn, task_id).await?;
     Ok(GameRequest {
         variant: row.get("variant"),
         seed: game::seed_from_row(&row),
         num_games: row.get("num_games"),
         game_pairs,
         capture_positions: row.get("capture_positions"),
-        bingo_bonus: job_data.bingo_bonus,
-        sim_cutoff: job_data.sim_cutoff,
+        bingo_bonus: template.data.bingo_bonus,
+        sim_cutoff: template.data.sim_cutoff,
         letter_distribution: row.get("letter_distribution"),
         board_layout: row.get("board_layout"),
-        player1,
-        player2,
+        player1: player1.clone(),
+        player2: player2.clone(),
     })
 }
 
@@ -394,12 +390,11 @@ pub(crate) async fn insert_position_analyses(
     for chunk in pending.chunks(MOVE_ROWS_PER_STATEMENT) {
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_moves
-                 (record_id, task_id, rank, move, score, equity, win_percentage,
+                 (record_id, rank, move, score, equity, win_percentage,
                   blended_utility) ",
         );
         builder.push_values(chunk.iter(), |mut b, (record_id, rank, entry)| {
             b.push_bind(*record_id)
-                .push_bind(task_id)
                 .push_bind(*rank)
                 .push_bind(entry.play.clone())
                 .push_bind(entry.score)
@@ -441,18 +436,19 @@ pub(crate) async fn insert_position_analyses(
 }
 
 /// Rows per multi-row insert, keeping each statement well under Postgres's
-/// 65,535-parameter ceiling (9, 8 and 4 binds per row respectively).
+/// 65,535-parameter ceiling (10, 7 and 4 binds per row respectively).
 const RECORD_ROWS_PER_STATEMENT: usize = 2_000;
 const MOVE_ROWS_PER_STATEMENT: usize = 4_000;
 const PLY_ROWS_PER_STATEMENT: usize = 8_000;
 
 pub(crate) async fn insert_game_results(
     conn: &mut PgConnection,
-    job_id: Uuid,
+    template: &dispatch::JobTemplate,
     task_id: Uuid,
     claim_id: Uuid,
     record: &GameResultsRecord,
 ) -> AppResult<()> {
+    let job_id = template.job_id;
     let all = &record.all_games;
     let divergent = record.divergent_games.as_ref();
     let pentanomial = record.pentanomial.as_ref();
@@ -490,17 +486,21 @@ pub(crate) async fn insert_game_results(
 
     // Deterministic games mean redundant claims replay identical positions, so
     // the first accepted claim records them and the rest are no-ops.
+    //
+    // A job without capture submits no positions, and that is every games job
+    // by default.
+    if record.positions.is_empty() {
+        return Ok(());
+    }
     // How many ranked moves to keep: player 1's num_plays_recorded, which is
-    // also the one MAGPIE reads to decide how many to report.
-    let top_moves = sqlx::query_scalar::<_, i32>(
-        "SELECT p1.num_plays_recorded
-         FROM game_requests r
-         JOIN player_configs p1 ON p1.id = r.player1_config_id
-         WHERE r.task_id = $1",
-    )
-    .bind(task_id)
-    .fetch_one(&mut *conn)
-    .await?;
+    // also the one MAGPIE reads to decide how many to report. From the job's
+    // template: it is a setting of an immutable player config.
+    let top_moves = match &template.kind {
+        dispatch::JobKind::Games { player1, .. } | dispatch::JobKind::GamePairs { player1, .. } => {
+            player1.num_plays_recorded
+        }
+        _ => return Err(template.mismatch("games")),
+    };
 
     insert_position_analyses(conn, job_id, task_id, claim_id, &record.positions, top_moves, true)
         .await
@@ -532,12 +532,12 @@ pub async fn expected_data(
     conn: &mut PgConnection,
     job: &crate::models::job::Job,
 ) -> AppResult<Vec<ExpectedFile>> {
-    // One query, not three. This runs on every claim that hands out a task,
-    // inside the job's dispatch lock, so each round trip here is time no other
-    // worker can be claiming from this job. The union also removes the match
-    // on `job_type` that used to choose between them: a job type simply has no
-    // row in the config tables it does not use, so the branches contribute
-    // nothing rather than needing to be skipped.
+    // One query, not three, and run once per job per process: the answer is
+    // fixed at job creation, so it is part of the job's template
+    // (`dispatch::JobTemplate`) rather than read on every claim. The union
+    // also removes the match on `job_type` that used to choose between them:
+    // a job type simply has no row in the config tables it does not use, so
+    // the branches contribute nothing rather than needing to be skipped.
     let rows = sqlx::query(
         "WITH players AS (
              SELECT unnest(ARRAY[player1_config_id, player2_config_id]) AS id

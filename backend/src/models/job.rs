@@ -25,7 +25,8 @@ pub enum JobStatus {
 pub struct Job {
     pub id: Uuid,
     pub job_type: JobType,
-    pub priority: i32,
+    /// The job's share of the fleet while active; `None` until first
+    /// activated. There is no priority: 0% is what `inactive` means.
     pub allocation: Option<i32>,
     pub redundancy: i32,
     pub status: JobStatus,
@@ -48,6 +49,14 @@ pub struct Job {
     /// Every claim ever issued for this job; the scheduler's deficit
     /// numerator. See `scheduler::candidate_jobs`.
     pub claims_issued: i64,
+    /// Where the job's share is measured from: the scheduler orders on
+    /// `(claims_issued - claims_baseline) / allocation`. Reset to parity with
+    /// the other jobs offering work on activation, on an allocation change and
+    /// on a purge; see `scheduler::join_at_parity`.
+    pub claims_baseline: i64,
+    /// When the job last issued a claim. What `scheduler::join_at_parity` reads
+    /// to tell a job being served from one that is only on offer.
+    pub last_claimed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Games recorded by the first accepted result of each task; the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.

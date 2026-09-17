@@ -353,3 +353,65 @@ pub async fn recompute_stale(db: &PgPool) -> AppResult<usize> {
 async fn recompute_if_stale(db: &PgPool, pool_id: Uuid) -> AppResult<bool> {
     Ok(fit_and_store(db, pool_id, Trigger::Evidence, true).await?.is_some())
 }
+
+/// How long a pool keeps every run. Inside this window the run-by-run diff is
+/// what answers "why did this rating change?". A pool with an active job is
+/// refit every two minutes, so the window holds ~21,600 runs, each with a
+/// rating row per member and a residual row per head-to-head.
+pub const RUN_FULL_RESOLUTION: std::time::Duration =
+    std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// Runs deleted per statement by [`thin_old_runs`]. Each takes its rating and
+/// residual rows with it -- a couple of hundred rows per run for a pool of
+/// twenty -- so a batch is a bounded transaction rather than the whole backlog
+/// in one, and the first pass over a long-lived pool holds no lock for long.
+const THIN_BATCH: i64 = 1_000;
+
+/// Thins every pool's runs older than [`RUN_FULL_RESOLUTION`] to the last run
+/// of each UTC day, keeping each pool's first run whatever its day.
+///
+/// Without this, runs grow for the life of a pool: a twenty-member pool with an
+/// active job stores ~720 runs a day with ~210 residual rows each, ~150,000
+/// rows a day that nothing reads once the run is no longer the newest. Past
+/// the window a day is the resolution the history chart draws at anyway -- it
+/// thins to 500 points over the pool's whole life -- so the chart keeps its
+/// shape and its ends and only runs it never showed are deleted. Deleting
+/// everything past the window would have started the chart's past at the
+/// window's edge instead.
+///
+/// The newest run -- what the ratings page shows -- always survives, however
+/// long the pool has been quiet: it is the last run of its day. Ratings and
+/// residuals go with their run by cascade. No fit lock is taken: a fit inserts
+/// a run stamped `now()`, which is never inside the window this deletes from.
+///
+/// Returns how many runs were deleted.
+pub async fn thin_old_runs(db: &PgPool) -> AppResult<u64> {
+    let mut deleted = 0;
+    loop {
+        let batch = sqlx::query(
+            "WITH old AS (
+                 SELECT id,
+                        row_number() OVER (
+                            PARTITION BY pool_id, (computed_at AT TIME ZONE 'UTC')::date
+                            ORDER BY computed_at DESC, id DESC
+                        ) AS n_in_day,
+                        row_number() OVER (
+                            PARTITION BY pool_id ORDER BY computed_at ASC, id ASC
+                        ) AS n_in_pool
+                 FROM rating_runs
+                 WHERE computed_at < now() - make_interval(secs => $1)
+             )
+             DELETE FROM rating_runs
+             WHERE id IN (SELECT id FROM old WHERE n_in_day > 1 AND n_in_pool > 1 LIMIT $2)",
+        )
+        .bind(RUN_FULL_RESOLUTION.as_secs_f64())
+        .bind(THIN_BATCH)
+        .execute(db)
+        .await?
+        .rows_affected();
+        deleted += batch;
+        if batch < THIN_BATCH as u64 {
+            return Ok(deleted);
+        }
+    }
+}

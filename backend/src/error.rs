@@ -27,6 +27,9 @@ pub const UNIQUE_VIOLATION: &str = "23505";
 pub const FOREIGN_KEY_VIOLATION: &str = "23503";
 /// SQLSTATE for a statement that gave up waiting for a lock (`lock_timeout`).
 pub const LOCK_NOT_AVAILABLE: &str = "55P03";
+/// SQLSTATE for a statement Postgres cancelled, which here means the display
+/// pool's `statement_timeout` (`db::connect_read`): nothing else sets one.
+pub const QUERY_CANCELED: &str = "57014";
 
 #[derive(Serialize)]
 struct ErrorBody {
@@ -137,6 +140,17 @@ impl From<sqlx::Error> for AppError {
                     Some(FOREIGN_KEY_VIOLATION) => {
                         AppError::conflict("that is still referenced by other records")
                     }
+                    // A display read that outran its bound. Not a fault in the
+                    // request and not one a retry is sure to fix, but it is
+                    // load rather than a bug, and a 500 says the opposite.
+                    Some(QUERY_CANCELED) => AppError {
+                        retry_after: Some(30),
+                        ..AppError::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "unavailable",
+                            "that read took too long and was cancelled",
+                        )
+                    },
                     _ => AppError::internal(format!("database error: {db}")),
                 };
                 if error.status.is_server_error() {
@@ -145,7 +159,28 @@ impl From<sqlx::Error> for AppError {
                 error.db_code = code;
                 error
             }
-            other => AppError::internal(format!("database error: {other}")),
+            // Every connection of the pool asked was busy for the whole
+            // acquire timeout. That is load, not a fault, and the honest answer
+            // is "later": MAGPIE's client backs off and retries a 5xx, and a
+            // browser gets a status that says what happened. It used to be a
+            // 500 whose body was sqlx's own message.
+            sqlx::Error::PoolTimedOut => AppError {
+                retry_after: Some(5),
+                ..AppError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "the server is busy; try again shortly",
+                )
+            },
+            // A driver-level failure -- a dropped connection, a protocol
+            // error, a decode mismatch. Logged in full here, because the
+            // response must not carry it: the API conventions promise a client
+            // never sees a database error, and only errors with a SQLSTATE
+            // were being scrubbed.
+            other => {
+                tracing::error!(error = %other, "database driver error");
+                AppError::internal("internal error")
+            }
         }
     }
 }
@@ -157,3 +192,27 @@ impl From<anyhow::Error> for AppError {
 }
 
 pub type AppResult<T> = Result<T, AppError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A saturated pool is load, not a fault: the caller is told to come back,
+    /// and is not shown sqlx's own message.
+    #[test]
+    fn a_pool_timeout_is_a_503_with_retry_after() {
+        let err: AppError = sqlx::Error::PoolTimedOut.into();
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.code, "unavailable");
+        assert_eq!(err.retry_after, Some(5));
+    }
+
+    /// Only errors carrying a SQLSTATE were scrubbed from the response, so a
+    /// driver-level failure reached the client verbatim.
+    #[test]
+    fn a_driver_error_is_not_shown_to_the_client() {
+        let err: AppError = sqlx::Error::Protocol("unexpected message 0x45 at byte 7".into()).into();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.message, "internal error");
+    }
+}

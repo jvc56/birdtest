@@ -325,9 +325,14 @@ CREATE TYPE job_status AS ENUM (
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_type   job_type NOT NULL,
-    -- Lower value = higher priority. Priority 0 outranks priority 1.
-    priority   INT NOT NULL DEFAULT 0,
-    -- NULL until the job is first activated; set by the admin at activation time.
+    -- NULL until the job is first activated; set by the admin at activation
+    -- time. Every active job's share of the fleet: the scheduler hands each
+    -- claim to the active job furthest behind
+    -- `(claims_issued - claims_baseline) / allocation`, and the active jobs
+    -- may allocate at most 100% between them. There is
+    -- no priority: a job that should get nothing for now is set to 0%, which
+    -- is exactly what `inactive` means, and a job that should get everything
+    -- is the only one above 0%.
     allocation INT CHECK (allocation BETWEEN 0 AND 100),
     -- Number of independent workers that must complete each task. Default 1 = single-claim behavior.
     redundancy INT NOT NULL DEFAULT 1 CHECK (redundancy >= 1),
@@ -356,15 +361,19 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.4.0 is the
-    -- first MAGPIE version whose results depend on nothing but the task: 0.1.0
-    -- left the bingo bonus, an opening-rack simulation's settings and a
-    -- leave-generation task's seed to the worker's own settings; before 0.3.0 a
-    -- task's wordmap and rack-info-table flags applied to the next task; and
-    -- before 0.4.0 every setting a request left null came from the worker's
-    -- compile-time defaults.
+    -- so "no floor" is not a state worth being able to express. 0.1.0 is
+    -- `birdtest-contribute`'s pre-release version: neither birdtest nor the
+    -- branch is in production yet, so everything the protocol relies on --
+    -- every result-changing setting stated on the request, input data and
+    -- derived files checked against the hashes the job pins, the word info
+    -- table switched off before every load, a seed on every task -- is in
+    -- 0.1.0, and the version moves only when a release changes what a task
+    -- computes. The default here is the same value as the server's
+    -- MIN_MAGPIE_VERSION, which create_job writes explicitly; the two are kept
+    -- equal so a row written any other way (a restore, a hand insert) does not
+    -- floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 4 CHECK (min_magpie_minor >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
     min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
@@ -372,6 +381,29 @@ CREATE TABLE jobs (
     -- time proportional to the job's whole history. Only ever incremented,
     -- except by a purge, which deletes the claims it counts.
     claims_issued   BIGINT NOT NULL DEFAULT 0 CHECK (claims_issued >= 0),
+    -- Where this job's share is measured *from*. The scheduler orders on
+    -- `(claims_issued - claims_baseline) / allocation`, and the baseline is
+    -- reset -- on activation, on an allocation change, on a purge -- so that
+    -- the job's ratio equals the lowest ratio among the other jobs being
+    -- served (see `last_claimed_at` below): it joins at parity and takes its
+    -- share from then on.
+    --
+    -- Without it the deficit was measured over a job's whole life, so a job
+    -- activated today beside one that had issued two million claims took
+    -- *every* claim until it had issued two million of its own, and the older
+    -- job got nothing for as long as that took; a purge (which zeroes
+    -- claims_issued) and a raised allocation did the same. May be negative: a
+    -- job with no claims yet joining a busy fleet is credited the claims that
+    -- put it level.
+    claims_baseline BIGINT NOT NULL DEFAULT 0,
+    -- When this job last issued a claim; NULL until it has. It rides the
+    -- `UPDATE jobs` every claim already makes, so it costs nothing to keep.
+    -- `join_at_parity` reads it to tell the jobs that are *being served* from
+    -- the ones that are merely on offer: a job whose derived files are still
+    -- building, or that the fleet cannot run yet, stands still while the others
+    -- climb, and a newcomer put level with *it* then took every claim from the
+    -- jobs that were actually running until it had caught up with them.
+    last_claimed_at TIMESTAMPTZ,
     -- Progress totals the dashboard reads, maintained in the submit transaction
     -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
     -- incremented
@@ -617,6 +649,16 @@ CREATE TABLE job_exports (
     -- Rows written. Recorded so a later mismatch against the job is visible
     -- rather than silent -- the same reason the KLV artifacts carry a digest.
     row_count     BIGINT,
+    -- A games or game-pairs job that captured positions gets a second object
+    -- beside its results: the positions, each with its ranked moves, in the
+    -- shape an opening-rack export's lines have. All four are NULL for every
+    -- other export. A second artifact rather than tagged lines in the first,
+    -- so a consumer of a games job's results never meets a line of another
+    -- kind.
+    positions_artifact_key TEXT,
+    positions_bytes        BIGINT,
+    positions_sha256       TEXT,
+    positions_row_count    BIGINT,
     error         TEXT,
     requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
     requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -633,8 +675,16 @@ CREATE TYPE task_state AS ENUM ('available', 'claimed', 'completed');
 CREATE TABLE tasks (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id               UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    -- Seed for seed-based tasks (games, game pairs). NULL for non-seed tasks.
-    seed                 BIGINT,  -- stored as signed int64; interpreted as uint64 at the application layer
+    -- The seed the task's games are played from. Every job type plays games,
+    -- so every task has one, stated on its request: games and game pairs seed
+    -- their batch from it and step by one per game; an opening-rack task's is
+    -- the index of its first rack in the job's rack space, and rack i of the
+    -- batch is analysed from seed + i; a leave-generation task's is drawn
+    -- when the task is created. Stored as signed int64; interpreted as uint64
+    -- at the application layer. For games, pairs and opening racks it is also
+    -- the cursor that tiles the job's space, which is what the unique index
+    -- below serves.
+    seed                 BIGINT NOT NULL,
     state                task_state NOT NULL DEFAULT 'available',
     -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate join/aggregate.
     accepted_count       INT NOT NULL DEFAULT 0,
@@ -643,8 +693,11 @@ CREATE TABLE tasks (
     completed_at         TIMESTAMPTZ
 );
 
--- Prevent duplicate seed-based tasks within the same job.
-CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed) WHERE seed IS NOT NULL;
+-- Prevent two tasks of one job from playing the same seed: for games, pairs
+-- and opening racks that is two workers racing for the same slice of the
+-- space, for leave generation a collision between two randomly drawn seeds
+-- (which the claim path retries).
+CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed);
 
 -- Partial indexes to support efficient SKIP LOCKED task selection and timeout
 -- reclamation.
@@ -715,7 +768,14 @@ CREATE TABLE worker_data_gaps (
     actual       TEXT,                    -- NULL = file absent
     reported_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, role, name);
+-- (job_id, reported_at): the job list asks whether a job has a gap reported in
+-- the last 24 hours, and the admin view groups a job's gaps, so both start at
+-- the job. Ordered by time within it, the first question stops at the newest
+-- row rather than walking every gap the job ever had.
+CREATE INDEX worker_data_gaps_job_idx ON worker_data_gaps (job_id, reported_at DESC);
+-- The cascade from a claim. A purge deletes every claim of a job, and without
+-- this the lookup was a sequential scan of this table per deleted claim.
+CREATE INDEX worker_data_gaps_claim_idx ON worker_data_gaps (claim_id);
 
 -- Task requests (one-to-one with tasks; inserted in the same transaction as the task row)
 
@@ -781,11 +841,13 @@ CREATE TABLE leave_requests (
     use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
 );
 
--- Live per-rack occurrence progress for each generation of a leave-gen job, one row per
+-- Per-rack occurrence progress for each generation of a leave-gen job, one row per
 -- full 7-tile rack the distribution can draw (3,199,724 for English), seeded at zero when
--- the generation opens. Updated transactionally on every accepted leave task result; drives
--- both generation-transition detection (all racks >= target) and the live dashboard figure.
--- Leave values are derived from these full-rack means as MAGPIE's rack_list_write_to_klv does.
+-- the generation opens. Updated by `leave_gen::merge_staged`, which folds the accepted
+-- results staged in `leave_rack_staging` below -- not by each submission; see there for why.
+-- Drives claim-time rack selection and generation-transition detection (all racks >= target,
+-- nothing in flight, nothing staged). Leave values are derived from these full-rack means as
+-- MAGPIE's rack_list_write_to_klv does.
 CREATE TABLE leave_rack_progress (
     job_id           UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     generation       INT NOT NULL,
@@ -794,6 +856,91 @@ CREATE TABLE leave_rack_progress (
     equity_sum       DOUBLE PRECISION NOT NULL DEFAULT 0,  -- occurrence_count-weighted; equity_sum / occurrence_count = mean
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, generation, rack)
+);
+
+-- Accepted leave results waiting to be folded into `leave_rack_progress`: one
+-- row per accepted task, its racks, counts and equity sums as three parallel
+-- arrays (compressed and stored out of line, so a 200,000-rack submission is a
+-- few megabytes and one insert).
+--
+-- A submission used to fold itself: an UPDATE over every rack its games drew,
+-- scattered uniformly across the 3.2 million rows above. Measured, that was
+-- 2.5-5.5 s inside the transaction the worker waits on, 147-409 MB of WAL per
+-- fold (the first touch of a page after a checkpoint writes the whole page),
+-- and no HOT update ever, because `occurrence_count` is indexed. Nothing needs
+-- the per-rack totals that promptly -- selection needs them roughly, closing a
+-- generation and building its KLV need them exactly but only then -- so a
+-- submission appends here and `leave_gen::merge_staged` folds everything
+-- staged in one pass: every half hour, when a claim finds the generation
+-- nearly done, and always before a generation closes.
+--
+-- `task_id` deliberately has no foreign key. A purge deletes every task of a
+-- job, Postgres runs a cascade once per deleted row, and there is no index on
+-- this column to serve one -- the shape that made two earlier purges scan a
+-- table per task. A purge deletes a job's staged rows itself, by `job_id`;
+-- deleting the job cascades through the index below.
+CREATE TABLE leave_rack_staging (
+    id          BIGSERIAL PRIMARY KEY,
+    job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation  INT NOT NULL,
+    -- Whose result this is. Claim-time selection holds the racks this task
+    -- forced out of play until the merge says what they reached.
+    task_id     UUID NOT NULL,
+    racks       TEXT[] NOT NULL,
+    counts      BIGINT[] NOT NULL,
+    equity_sums DOUBLE PRECISION[] NOT NULL,  -- count * mean, per rack
+    staged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT leave_rack_staging_parallel_arrays CHECK (
+        cardinality(racks) = cardinality(counts)
+        AND cardinality(racks) = cardinality(equity_sums)
+    )
+);
+-- What a merge takes, what selection excludes, and the cascade from `jobs`.
+CREATE INDEX leave_rack_staging_job_idx ON leave_rack_staging (job_id, generation);
+
+-- One row per generation a leave job has opened: what the dashboard shows.
+--
+-- `tasks_completed` and `games_played` are live, bumped in the submit
+-- transaction. The rest is a summary of `leave_rack_progress` as of
+-- `merged_at`, recomputed by each merge while the rows are warm; counted on
+-- read it was a pass over the whole generation on every detail view and every
+-- live push. Seeded with `racks_total` when the generation's universe is
+-- written, so there is a denominator before the first merge.
+CREATE TABLE leave_generation_progress (
+    job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation      INT NOT NULL,
+    tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    games_played    BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
+    racks_total     BIGINT NOT NULL DEFAULT 0,
+    racks_at_target BIGINT NOT NULL DEFAULT 0,
+    -- The rack furthest from target, and its count. NULL until a merge.
+    min_rack        TEXT,
+    min_rack_count  BIGINT,
+    merged_at       TIMESTAMPTZ,
+    PRIMARY KEY (job_id, generation)
+);
+
+-- Where a leave generation's selection sweep has got to: the last rack handed
+-- out in the lap under way. A row exists exactly while a lap has racks left to
+-- hand out: the task that takes the last of them deletes it.
+--
+-- While many racks are below target, racks are handed out in primary-key order
+-- from this cursor rather than lowest count first. Everything behind the cursor
+-- has been handed out this lap and nothing ahead of it has -- a lap only starts
+-- with no claim of the generation in flight and nothing staged -- so a claim
+-- needs no list of what is out, and selection costs the same however much is
+-- staged. Lowest-count-first could not say that: between merges the racks of
+-- every staged result are exactly the lowest, and each claim hashed and
+-- skipped all of them inside the job's dispatch lock.
+--
+-- Read and written only under that lock. A row that goes missing (a purge, a
+-- partial restore) is a lap not started, which waits for what is in flight and
+-- staged before it selects anything; nothing is handed out twice.
+CREATE TABLE leave_selection_cursors (
+    job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation  INT NOT NULL,
+    cursor_rack TEXT NOT NULL,
+    PRIMARY KEY (job_id, generation)
 );
 
 -- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
@@ -820,8 +967,7 @@ CREATE TABLE position_analysis_records (
     -- results feed, the rack lookup, the admin stream, the export -- filtered
     -- on the job and could only reach it through `tasks`, which put the filter
     -- on the far side of a join from the sort and made the whole job the unit
-    -- of work. With the column here they are index scans. `position_analysis_
-    -- moves` already carries `task_id` for the same family of reason.
+    -- of work. With the column here they are index scans.
     job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     rack            TEXT NOT NULL,
     -- CGP of the position analysed. NULL for an opening rack, where the board
@@ -864,9 +1010,6 @@ CREATE UNIQUE INDEX position_analysis_records_rack_idx
     ON position_analysis_records (task_claim_id, rack)
     WHERE game_index IS NULL;
 
-CREATE INDEX position_analysis_records_task_idx
-    ON position_analysis_records (task_id, rack);
-
 -- The public results feed, which is newest-first within a job and paginated by
 -- keyset. `id` is in the index because it is the cursor's tiebreaker:
 -- `submitted_at` defaults to now(), which is transaction time, so every record
@@ -880,18 +1023,36 @@ CREATE INDEX position_analysis_records_feed_idx
 CREATE INDEX position_analysis_records_job_rack_idx
     ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
 
+-- The cascade from a claim (`task_claim_id ... ON DELETE CASCADE`). The
+-- partial unique index on (task_claim_id, rack) above cannot serve it: a plain
+-- equality on task_claim_id does not imply `game_index IS NULL`, so the
+-- planner never uses a partial index for it. Without this a purge or a job
+-- delete -- which removes every claim of the job, and Postgres runs the
+-- cascade once per deleted row -- scanned this whole table once per claim: a
+-- full English opening-rack job is ~6,400 claims over ~3.2 million records,
+-- thousands of sequential scans inside one transaction holding the job's
+-- dispatch lock and every open claim's row. One entry per record; the moves
+-- below cascade from the record through their own index.
+CREATE INDEX position_analysis_records_claim_idx
+    ON position_analysis_records (task_claim_id);
+
 -- The top `num_plays_recorded` moves per position, from the player config that
 -- produced them. Storing every move the worker ranked would be untenable:
 -- a job over the full English 7-tile space is roughly 3.2 million racks, and a
 -- 40,000-pair job with capture on is 1.8 million positions.
 CREATE TABLE position_analysis_moves (
     id              BIGSERIAL PRIMARY KEY,
+    -- The record is the only parent. A `task_id` column used to sit here as
+    -- well, with its own ON DELETE CASCADE, kept "for the cascade" after the
+    -- job-wide aggregates that read it were removed. That cascade was the
+    -- problem: the column had no index, so deleting a task -- which a purge or
+    -- a job delete does once per task -- scanned this whole table to find the
+    -- moves to cascade, and this is the largest table in the schema. A full
+    -- English opening-rack job is some 6,400 tasks over 32 million move rows,
+    -- which made its purge thousands of sequential scans of the table, hours
+    -- inside one transaction holding the job's dispatch lock. The record's
+    -- cascade already reaches every move through the index below.
     record_id       BIGINT NOT NULL REFERENCES position_analysis_records(id) ON DELETE CASCADE,
-    -- A second cascade path: moves already go with their record, which goes
-    -- with its task, but deleting a task reaches these directly too. It was
-    -- added to let job-wide aggregates skip the record join; there are no such
-    -- aggregates now, and it is kept for the cascade rather than for reads.
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
     rank            SMALLINT NOT NULL,
     move            TEXT NOT NULL,
     score           INT NOT NULL,
@@ -923,9 +1084,10 @@ CREATE TABLE position_analysis_plies (
     ply              SMALLINT NOT NULL,
     bingo_percentage DOUBLE PRECISION NOT NULL,
     average_score    DOUBLE PRECISION NOT NULL,
+    -- The UNIQUE above is the index the cascade from moves uses: move_id is
+    -- its leading column, so there is deliberately no second index on it.
     UNIQUE (move_id, ply)
 );
-CREATE INDEX position_analysis_plies_move_idx ON position_analysis_plies (move_id);
 
 -- Shared by games and game pairs: one row per accepted claim, holding the
 -- aggregate MAGPIE's autoplay reports. Autoplay does not emit individual games
@@ -1008,8 +1170,9 @@ CREATE TABLE game_results (
 );
 
 -- One row per accepted leave task (a single worker's forced-rack partition of a generation).
--- The full {rack, count, mean} submission is folded into leave_rack_progress and not kept
--- separately — nothing reads it back, so there's no CSV artifact to reference here.
+-- The full {rack, count, mean} submission is staged in leave_rack_staging, folded into
+-- leave_rack_progress by the next merge, and not kept after that — nothing reads it back,
+-- so there's no CSV artifact to reference here.
 CREATE TABLE leave_records (
     task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1130,6 +1293,12 @@ CREATE TABLE rating_pool_members (
 -- One fit. Ratings are snapshotted per run rather than mutated in place, which
 -- is what makes "why did this rating change?" answerable and gives the ratings
 -- page a time axis at no extra cost.
+--
+-- Kept in full for a month, then thinned to the last run of each UTC day, the
+-- pool's first run aside (ratings::thin_old_runs, hourly). A pool with an
+-- active job takes a run every two minutes, and past a month a day is the
+-- resolution the history chart draws at anyway. The ratings and residuals
+-- below go with their run.
 CREATE TABLE rating_runs (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
@@ -1252,6 +1421,15 @@ CREATE TABLE audit_log (
 CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
+-- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
+-- detail view and live push) and the job list's `stalled` flag both ask
+-- "how many of this job's claims completed in the last hour / day", and
+-- task_claims has no job column, so the alternative plan walks every task of
+-- the job and every claim of each -- the job's whole history, for a question
+-- about its last hour. Through this index the scan is bounded by the fleet's
+-- recent completions instead, whatever the job's age.
+CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
+    WHERE state = 'completed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
 -- (job_id, state), not job_id alone: the job list counts a job's tasks and its
@@ -1271,6 +1449,19 @@ CREATE INDEX        position_records_task_idx ON position_analysis_records (task
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);
 CREATE INDEX        audit_log_job_idx         ON audit_log (job_id);
 
--- Drives claim-time rack selection: "the racks furthest from target in this generation".
+-- Drives claim-time rack selection once few racks remain below target: "the
+-- racks furthest from target in this generation" (`leave_gen::furthest_below_target`).
+--
+-- On `occurrence_count` alone, and selection orders on it alone. Counts tie in
+-- their millions -- every rack of a generation starts at zero, and most of the
+-- 3.2 million full racks are rare enough to stay there until they are forced --
+-- so an ORDER BY that also broke ties by rack could not be served by this index
+-- and every leave claim sorted the generation to find its few hundred racks
+-- (4.9 s a claim at full size). Carrying `rack` in the key fixed that at a
+-- price: measured on a full English generation, 180 MB where this index is
+-- 22 MB, because keys that are nearly all equal deduplicate and unique keys
+-- cannot. Nothing needs the tie broken, so the order gave it up instead; while
+-- many racks are below target, selection does not read this index at all (it
+-- sweeps the primary key, see `leave_selection_cursors`).
 CREATE INDEX leave_rack_progress_pick_idx
     ON leave_rack_progress (job_id, generation, occurrence_count);

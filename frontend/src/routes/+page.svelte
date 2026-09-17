@@ -56,7 +56,7 @@ maxtasks 0</code
               <JobStatusBadge status={job.status} />
             </div>
             <p class="mt-1 text-sm text-muted-foreground">
-              priority {job.priority} · {job.allocation ?? 0}% allocation
+              {job.allocation ?? 0}% allocation
             </p>
           </a>
         {/each}

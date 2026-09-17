@@ -62,7 +62,6 @@ pub struct JobSummary {
     pub id: Uuid,
     pub job_type: JobType,
     pub status: String,
-    pub priority: i32,
     pub allocation: Option<i32>,
     pub redundancy: i32,
     pub min_magpie_version: String,
@@ -120,18 +119,32 @@ pub struct OpeningRackStats {
     pub racks_total: i64,
 }
 
+/// Two kinds of figure, and the page says which is which.
+///
+/// `tasks_completed` and `games_played` are **live**: counters for the
+/// in-progress generation, bumped in the submit transaction. Everything about
+/// racks is **as of `progress_as_of`**, the generation's last merge: accepted
+/// results are staged and folded into the per-rack totals in batches
+/// (`leave_gen::merge_staged`), so those figures lag by up to the merge
+/// interval mid-generation and by about a minute near its end. They used to be
+/// counted from `leave_rack_progress` on every view and every live push -- a
+/// pass over 3.2 million rows -- and are now one row read.
 #[derive(Debug, Serialize)]
 pub struct LeaveGenStats {
     pub current_generation: i32,
     pub generation_count: i32,
     pub target_rack_count: i32,
+    /// Accepted tasks of the in-progress generation, and the games they played.
+    pub tasks_completed: i64,
+    pub games_played: i64,
     pub racks_at_target: i64,
     pub racks_total: i64,
-    /// The rack furthest from target in the in-progress generation, live on
-    /// every accepted result — sourced from `leave_rack_progress`, not from any
-    /// single worker's heartbeat.
+    /// The rack furthest from target in the in-progress generation.
     pub min_rack: Option<String>,
     pub min_rack_count: Option<i64>,
+    /// When the rack figures were computed. `None` before the generation's
+    /// universe is seeded.
+    pub progress_as_of: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,7 +238,6 @@ async fn compute_inner(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
             id: job.id,
             job_type: job.job_type,
             status: status_label(job).to_string(),
-            priority: job.priority,
             allocation: job.allocation,
             redundancy: job.redundancy,
             min_magpie_version: job.min_magpie_version().to_string(),
@@ -501,21 +513,12 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
     .await?;
     let current_generation = (completed as i32 + 1).min(config.generation_count);
 
+    // One row, kept by the submit path (the live counters) and by each merge
+    // (the rack summary). Absent until the generation's universe is seeded.
     let row = sqlx::query(
-        "SELECT COUNT(*)::bigint AS total,
-                COUNT(*) FILTER (WHERE occurrence_count >= $3)::bigint AS at_target
-         FROM leave_rack_progress WHERE job_id = $1 AND generation = $2",
-    )
-    .bind(job_id)
-    .bind(current_generation)
-    .bind(config.target_rack_count as i64)
-    .fetch_one(pool)
-    .await?;
-
-    let min = sqlx::query(
-        "SELECT rack, occurrence_count FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = $2
-         ORDER BY occurrence_count ASC, rack ASC LIMIT 1",
+        "SELECT tasks_completed, games_played, racks_total, racks_at_target,
+                min_rack, min_rack_count, merged_at
+         FROM leave_generation_progress WHERE job_id = $1 AND generation = $2",
     )
     .bind(job_id)
     .bind(current_generation)
@@ -526,10 +529,13 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
         current_generation,
         generation_count: config.generation_count,
         target_rack_count: config.target_rack_count,
-        racks_at_target: row.get("at_target"),
-        racks_total: row.get("total"),
-        min_rack: min.as_ref().map(|r| r.get("rack")),
-        min_rack_count: min.as_ref().map(|r| r.get("occurrence_count")),
+        tasks_completed: row.as_ref().map_or(0, |r| r.get("tasks_completed")),
+        games_played: row.as_ref().map_or(0, |r| r.get("games_played")),
+        racks_at_target: row.as_ref().map_or(0, |r| r.get("racks_at_target")),
+        racks_total: row.as_ref().map_or(0, |r| r.get("racks_total")),
+        min_rack: row.as_ref().and_then(|r| r.get("min_rack")),
+        min_rack_count: row.as_ref().and_then(|r| r.get("min_rack_count")),
+        progress_as_of: row.as_ref().and_then(|r| r.get("merged_at")),
     })
 }
 

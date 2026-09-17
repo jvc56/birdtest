@@ -1,5 +1,6 @@
 use crate::auth::{api_key, csrf, session, CurrentUser};
 use crate::clientip::ClientIp;
+use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::ratelimit;
 use crate::state::AppState;
@@ -63,7 +64,7 @@ struct MessageBody {
 async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(body): Json<RegisterBody>,
+    ApiJson(body): ApiJson<RegisterBody>,
 ) -> AppResult<(StatusCode, Json<MessageBody>)> {
     ratelimit::check(&state.limits.register, &ip.to_string())?;
 
@@ -101,7 +102,7 @@ async fn register(
     // Argon2 cost. Returning an identical body for a taken address and then
     // answering in tens of milliseconds less would give the answer back through
     // timing, which is exactly the flaw this branch exists to avoid.
-    let password_hash = api_key::hash_password(&body.password)?;
+    let password_hash = api_key::hash_password_off_the_executor(body.password.clone()).await?;
 
     // A taken username is reported plainly: the user has to choose another one
     // to get anywhere, and `GET /api/users` publishes the whole list anyway, so
@@ -207,7 +208,7 @@ async fn login(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     jar: CookieJar,
-    Json(body): Json<LoginBody>,
+    ApiJson(body): ApiJson<LoginBody>,
 ) -> AppResult<(CookieJar, Json<LoginResponse>)> {
     // Both halves, like password reset: per IP bounds one guesser, per
     // username bounds many guessers aimed at one account. Checked before the
@@ -232,7 +233,7 @@ async fn login(
     let Some((id, username, password_hash, is_admin, confirmed_at, generation)) = row else {
         return Err(invalid());
     };
-    if !api_key::verify_password(&body.password, &password_hash) {
+    if !api_key::verify_password_off_the_executor(body.password.clone(), password_hash.clone()).await {
         return Err(invalid());
     }
     if confirmed_at.is_none() {
@@ -302,7 +303,7 @@ struct ConfirmEmailBody {
 
 async fn confirm_email(
     State(state): State<AppState>,
-    Json(body): Json<ConfirmEmailBody>,
+    ApiJson(body): ApiJson<ConfirmEmailBody>,
 ) -> AppResult<Json<MessageBody>> {
     let code_hash = api_key::hash_code(body.code.trim());
 
@@ -334,7 +335,7 @@ struct ResetRequestBody {
 async fn request_password_reset(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(body): Json<ResetRequestBody>,
+    ApiJson(body): ApiJson<ResetRequestBody>,
 ) -> AppResult<Json<MessageBody>> {
     let email = body.email.trim().to_lowercase();
 
@@ -408,7 +409,7 @@ struct ResetConfirmBody {
 async fn confirm_password_reset(
     State(state): State<AppState>,
     jar: CookieJar,
-    Json(body): Json<ResetConfirmBody>,
+    ApiJson(body): ApiJson<ResetConfirmBody>,
 ) -> AppResult<(CookieJar, Json<MessageBody>)> {
     let entropy = zxcvbn::zxcvbn(&body.password, &[])
         .map_err(|e| AppError::bad_request(format!("could not score password: {e}")))?;
@@ -435,7 +436,7 @@ async fn confirm_password_reset(
         "UPDATE users SET password_hash = $1, session_generation = session_generation + 1
          WHERE id = $2 AND deleted_at IS NULL",
     )
-        .bind(api_key::hash_password(&body.password)?)
+        .bind(api_key::hash_password_off_the_executor(body.password.clone()).await?)
         .bind(user_id)
         .execute(&mut *tx)
         .await?;

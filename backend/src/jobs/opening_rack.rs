@@ -1,3 +1,4 @@
+use super::dispatch::{JobKind, JobTemplate};
 use super::handler::*;
 use super::racks::{LetterDistribution, RackIndex};
 use super::JobData;
@@ -13,39 +14,39 @@ impl JobHandler for OpeningRackHandler {
     type Response = PositionAnalysisResponse;
     type Record = PositionAnalysisRecord;
 
-    async fn load_request(conn: &mut PgConnection, task_id: Uuid) -> AppResult<Self::Request> {
+    async fn load_request(
+        conn: &mut PgConnection,
+        template: &JobTemplate,
+        task_id: Uuid,
+    ) -> AppResult<Self::Request> {
+        let JobKind::OpeningRack { player, index, .. } = &template.kind else {
+            return Err(template.mismatch("opening_rack"));
+        };
         let row = sqlx::query(
-            "SELECT r.variant, r.letter_distribution, r.board_layout, r.rack_start,
-                    r.rack_count, r.previous_play,
-                    r.player_config_id, c.rack_size
-             FROM opening_rack_requests r
-             JOIN tasks t ON t.id = r.task_id
-             JOIN job_opening_rack_config c ON c.job_id = t.job_id
-             WHERE r.task_id = $1",
+            "SELECT variant, letter_distribution, board_layout, rack_start, rack_count,
+                    previous_play
+             FROM opening_rack_requests WHERE task_id = $1",
         )
         .bind(task_id)
         .fetch_one(&mut *conn)
         .await?;
-
-        let job_data = super::load_job_data_for_task(&mut *conn, task_id).await?;
-        let player = super::load_player_spec(conn, row.get("player_config_id")).await?;
         let rack_start: i64 = row.get("rack_start");
         let rack_count: i32 = row.get("rack_count");
-        let rack_size: i32 = row.get("rack_size");
 
         // The racks are not stored, only the range they came from -- which is
         // what makes a job over millions of racks cheap to create. Expanding
-        // is a handful of additions per rack, not a walk over the space.
+        // is a handful of additions per rack, not a walk over the space, and
+        // the table it walks is the template's, built once for the job.
         Ok(OpeningRackRequest {
-            racks: RackRange { rack_size, start: rack_start, count: rack_count }
-                .expand(&job_data.letterdist),
+            racks: index.racks_in_range(rack_start as u64, rack_count as u64),
+            seed: rack_start as u64,
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
             board_layout: row.get("board_layout"),
             previous_play: row.get("previous_play"),
-            bingo_bonus: job_data.bingo_bonus,
-            sim_cutoff: job_data.sim_cutoff,
-            player,
+            bingo_bonus: template.data.bingo_bonus,
+            sim_cutoff: template.data.sim_cutoff,
+            player: player.clone(),
         })
     }
 
@@ -82,7 +83,7 @@ impl JobHandler for OpeningRackHandler {
 
     async fn insert_record(
         conn: &mut PgConnection,
-        job_id: Uuid,
+        template: &JobTemplate,
         task_id: Uuid,
         claim_id: Uuid,
         record: &Self::Record,
@@ -90,28 +91,23 @@ impl JobHandler for OpeningRackHandler {
         // How many ranked moves to keep per rack. Deliberately separate from
         // how many the worker generated or simulated: a simmer may rank
         // hundreds to get the order right while only the leaders are worth
-        // storing for every rack in a space of millions.
-        let row = sqlx::query(
-            "SELECT p.num_plays_recorded
-             FROM tasks t
-             JOIN job_opening_rack_config c ON c.job_id = t.job_id
-             JOIN player_configs p ON p.id = c.player_config_id
-             WHERE t.id = $1",
-        )
-        .bind(task_id)
-        .fetch_one(&mut *conn)
-        .await?;
-        let num_plays_recorded: i32 = row.get("num_plays_recorded");
+        // storing for every rack in a space of millions. The player config's
+        // `num_plays_recorded`, the same number that told the worker how many
+        // to report, from the template rather than a join inside the task's
+        // row lock.
+        let JobKind::OpeningRack { player, .. } = &template.kind else {
+            return Err(template.mismatch("opening_rack"));
+        };
 
         // An opening rack is unique per (claim, rack), so a conflict here would
         // be a duplicate within one submission rather than a redundant claim.
         super::insert_position_analyses(
             conn,
-            job_id,
+            template.job_id,
             task_id,
             claim_id,
             &record.positions,
-            num_plays_recorded,
+            player.num_plays_recorded,
             false,
         )
         .await?;
@@ -123,7 +119,7 @@ impl JobHandler for OpeningRackHandler {
 /// Checks an opening-rack submission against the racks the task dispatched.
 ///
 /// The counterpart of the batch-size rule game jobs get
-/// ([`super::plausibility::check_against_task`]), and the same rule: what was
+/// ([`super::plausibility::check_batch_size`]), and the same rule: what was
 /// asked for was fixed when the task was handed out, so an answer to anything
 /// else is answering a question nobody asked. It is stronger here because the
 /// request names the racks rather than just how many, so the whole set can be
@@ -137,30 +133,27 @@ impl JobHandler for OpeningRackHandler {
 /// counter the dashboard reads.
 ///
 /// Expanding the range costs what dispatching it cost: a handful of additions
-/// per rack, against a batch capped at 10,000.
+/// per rack, against a batch capped at 10,000. One read -- the task's range --
+/// inside the task's row lock, where each round trip is time every other
+/// submission for the task waits.
 pub async fn check_batch_against_task(
     conn: &mut PgConnection,
+    template: &JobTemplate,
     task_id: Uuid,
     reported: &[String],
 ) -> AppResult<()> {
+    let JobKind::OpeningRack { index, .. } = &template.kind else {
+        return Err(template.mismatch("opening_rack"));
+    };
     let row = sqlx::query(
-        "SELECT r.rack_start, r.rack_count, c.rack_size
-         FROM opening_rack_requests r
-         JOIN tasks t ON t.id = r.task_id
-         JOIN job_opening_rack_config c ON c.job_id = t.job_id
-         WHERE r.task_id = $1",
+        "SELECT rack_start, rack_count FROM opening_rack_requests WHERE task_id = $1",
     )
     .bind(task_id)
     .fetch_one(&mut *conn)
     .await?;
-
-    let job_data = super::load_job_data_for_task(&mut *conn, task_id).await?;
-    let expected = RackRange {
-        rack_size: row.get("rack_size"),
-        start: row.get("rack_start"),
-        count: row.get("rack_count"),
-    }
-    .expand(&job_data.letterdist);
+    let rack_start: i64 = row.get("rack_start");
+    let rack_count: i32 = row.get("rack_count");
+    let expected = index.racks_in_range(rack_start as u64, rack_count as u64);
 
     if reported.len() != expected.len() {
         return Err(AppError::bad_request(format!(
@@ -169,9 +162,7 @@ pub async fn check_batch_against_task(
             expected.len()
         )));
     }
-    // Order is not part of the contract, only the set. Duplicates within the
-    // submission are already refused by the unique index on
-    // (task_claim_id, rack), so equal sizes plus containment is equality.
+    // Order is not part of the contract, only the set.
     let dispatched: std::collections::HashSet<&str> =
         expected.iter().map(String::as_str).collect();
     if let Some(stray) = reported.iter().find(|rack| !dispatched.contains(rack.as_str())) {
@@ -179,24 +170,18 @@ pub async fn check_batch_against_task(
             "result analyses rack {stray:?}, which this task did not dispatch"
         )));
     }
-    Ok(())
-}
-
-/// A contiguous slice of the rack space, which is what a task actually is.
-pub struct RackRange {
-    pub rack_size: i32,
-    pub start: i64,
-    pub count: i32,
-}
-
-impl RackRange {
-    /// Expands against the job's pinned letter distribution -- the same bytes
-    /// the worker is checked against, so the racks handed out and the bag they
-    /// are drawn from can never be enumerated from different alphabets.
-    pub fn expand(&self, distribution: &LetterDistribution) -> Vec<String> {
-        let index = RackIndex::new(distribution, self.rack_size as usize);
-        index.racks_in_range(self.start as u64, self.count as u64)
+    // Equal sizes plus containment is equality only if nothing is listed
+    // twice. A duplicate was left for the unique index on (task_claim_id, rack)
+    // to refuse, which it did -- as a `409 that already exists`, after the
+    // batch had been sent to the database, where every other malformed
+    // submission is a `400` that says what is wrong with it.
+    let mut seen = std::collections::HashSet::with_capacity(reported.len());
+    if let Some(twice) = reported.iter().find(|rack| !seen.insert(rack.as_str())) {
+        return Err(AppError::bad_request(format!(
+            "result analyses rack {twice:?} twice, so it leaves out a rack this task dispatched"
+        )));
     }
+    Ok(())
 }
 
 /// How many distinct racks a job over this distribution covers. Recorded at job
@@ -210,12 +195,19 @@ pub fn total_racks(distribution: &LetterDistribution, rack_size: i32) -> i64 {
 ///
 /// Slices tile the space the same way game seeds do, so the `(job_id, seed)`
 /// unique index resolves two workers racing for the same slice -- the loser
-/// retries and takes the next one.
+/// retries and takes the next one. The slice's start is also the task's seed:
+/// rack `i` of the batch is analysed from `seed + i`, its index in the job's
+/// rack space, which is the same on every worker.
+///
+/// `index` is the job's rack space and `player` its analysing player, both from
+/// the job's template: the one read here is the seed cursor.
 pub async fn next_request(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &OpeningRackConfig,
     job_data: &JobData,
+    index: &RackIndex,
+    player: &PlayerSpec,
 ) -> AppResult<Option<(i64, OpeningRackRequest)>> {
     let next_start = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT MAX(seed) FROM tasks WHERE job_id = $1",
@@ -230,17 +222,13 @@ pub async fn next_request(
         return Ok(None);
     }
 
-    let range = RackRange {
-        rack_size: config.rack_size,
-        start: next_start,
-        count: config.racks_per_batch,
-    };
-    let racks = range.expand(&job_data.letterdist);
+    // The final batch of a job comes up short: the range runs off the end of
+    // the space and yields only what exists.
+    let racks = index.racks_in_range(next_start as u64, config.racks_per_batch as u64);
     if racks.is_empty() {
         return Ok(None);
     }
 
-    let player = super::load_player_spec(conn, config.player_config_id).await?;
     Ok(Some((
         next_start,
         OpeningRackRequest {
@@ -248,10 +236,11 @@ pub async fn next_request(
             letter_distribution: job_data.letterdist_name.clone(),
             board_layout: job_data.layout_name.clone(),
             racks,
+            seed: next_start as u64,
             previous_play: None,
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,
-            player,
+            player: player.clone(),
         },
     )))
 }

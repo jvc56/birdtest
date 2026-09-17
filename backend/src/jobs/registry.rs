@@ -2,8 +2,9 @@
 //! exhaustively on `JobType`, so adding a variant fails to compile until all
 //! four components of the new job type exist.
 
+use super::dispatch::{JobKind, JobTemplate};
 use super::handler::*;
-use super::{game, game_pair, leave_gen, load_job_data, opening_rack};
+use super::{game, game_pair, leave_gen, opening_rack};
 use crate::auth::WorkerIdentity;
 use crate::error::{AppError, AppResult};
 use crate::models::job::*;
@@ -30,14 +31,26 @@ pub enum Acquired {
     /// been written yet. It is seeded on its own task, and the job has nothing
     /// to hand out until that commits.
     NeedsUniverse { generation: i32 },
+    /// Leave generation only: nothing is left to hand out or in flight, but
+    /// accepted results are still staged, so whether the generation is complete
+    /// is not yet known. The caller merges them, off the request; this job has
+    /// nothing to hand out until the next claim looks again.
+    NeedsLeaveMerge { generation: i32 },
     /// Leave generation only: all configured generations are done.
     JobFinished,
 }
 
+/// One claim decision for `job`, under its dispatch lock.
+///
+/// `template` is the job's immutable configuration (`dispatch::JobTemplate`),
+/// read once per process rather than once per claim: with it in hand the only
+/// reads made under the lock are the ones that change from claim to claim --
+/// the seed cursor, the available tasks, a stored request.
 pub async fn acquire(
     conn: &mut PgConnection,
     job: &Job,
     identity: &WorkerIdentity,
+    template: &JobTemplate,
 ) -> AppResult<Acquired> {
     // Every claim decision for a job is made under its dispatch lock, the
     // re-dispatch of an existing task included. That path used to skip it, and
@@ -62,7 +75,7 @@ pub async fn acquire(
     // current generation (see `generate_leave_gen`).
     if !matches!(job.job_type, JobType::LeaveGeneration) {
         if let Some(task_id) = next_available(conn, job.id, identity, None).await? {
-            let request = load_request(conn, job.job_type, task_id).await?;
+            let request = load_request(conn, template, task_id).await?;
             return Ok(Acquired::Task { task_id, request, created: false });
         }
     }
@@ -70,34 +83,33 @@ pub async fn acquire(
     // Every job type generates its tasks at claim time; there is no
     // pre-populated strategy any more.
     match job.job_type {
-        JobType::OpeningRack => generate_opening_rack(conn, job).await,
-        JobType::Games => generate_games(conn, job).await,
-        JobType::GamePairs => generate_game_pairs(conn, job).await,
-        JobType::LeaveGeneration => generate_leave_gen(conn, job, identity).await,
+        JobType::OpeningRack => generate_opening_rack(conn, job, template).await,
+        JobType::Games => generate_games(conn, job, template).await,
+        JobType::GamePairs => generate_game_pairs(conn, job, template).await,
+        JobType::LeaveGeneration => generate_leave_gen(conn, job, identity, template).await,
     }
 }
 
-async fn generate_opening_rack(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
+async fn generate_opening_rack(
+    conn: &mut PgConnection,
+    job: &Job,
+    template: &JobTemplate,
+) -> AppResult<Acquired> {
     // `acquire` already holds the job's dispatch lock, which is what this
     // needs: `next_request` addresses the next slice with `MAX(seed)`, which a
     // concurrent claim's uncommitted task is invisible to.
-    let config = sqlx::query_as::<_, OpeningRackConfig>(
-        "SELECT * FROM job_opening_rack_config WHERE job_id = $1",
-    )
-    .bind(job.id)
-    .fetch_one(&mut *conn)
-    .await?;
-
-    let job_data = load_job_data(&mut *conn, job.id).await?;
+    let JobKind::OpeningRack { config, player, index } = &template.kind else {
+        return Err(template.mismatch("opening_rack"));
+    };
     let Some((start, request)) =
-        opening_rack::next_request(conn, job.id, &config, &job_data).await?
+        opening_rack::next_request(conn, job.id, config, &template.data, index, player).await?
     else {
         // The rack space is exhausted; nothing left to hand out.
         return Ok(Acquired::NoWork);
     };
 
-    let task_id = insert_on_demand_task(conn, job.id, Some(start)).await?;
-    opening_rack::insert_range(conn, task_id, &config, &job_data, start, request.racks.len())
+    let task_id = insert_on_demand_task(conn, job.id, start).await?;
+    opening_rack::insert_range(conn, task_id, config, &template.data, start, request.racks.len())
         .await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::OpeningRack(request), created: true })
 }
@@ -146,41 +158,45 @@ async fn next_available(
     .await?)
 }
 
+/// Reads a stored request back, for a task being re-dispatched.
 pub async fn load_request(
     conn: &mut PgConnection,
-    job_type: JobType,
+    template: &JobTemplate,
     task_id: Uuid,
 ) -> AppResult<TaskRequest> {
-    Ok(match job_type {
-        JobType::OpeningRack => TaskRequest::OpeningRack(
-            opening_rack::OpeningRackHandler::load_request(conn, task_id).await?,
+    Ok(match template.kind {
+        JobKind::OpeningRack { .. } => TaskRequest::OpeningRack(
+            opening_rack::OpeningRackHandler::load_request(conn, template, task_id).await?,
         ),
-        JobType::Games => {
-            TaskRequest::Games(game::GameHandler::load_request(conn, task_id).await?)
+        JobKind::Games { .. } => {
+            TaskRequest::Games(game::GameHandler::load_request(conn, template, task_id).await?)
         }
-        JobType::GamePairs => {
-            TaskRequest::GamePairs(game_pair::GamePairHandler::load_request(conn, task_id).await?)
-        }
-        JobType::LeaveGeneration => TaskRequest::LeaveGeneration(
-            leave_gen::LeaveGenHandler::load_request(conn, task_id).await?,
+        JobKind::GamePairs { .. } => TaskRequest::GamePairs(
+            game_pair::GamePairHandler::load_request(conn, template, task_id).await?,
+        ),
+        JobKind::LeaveGeneration { .. } => TaskRequest::LeaveGeneration(
+            leave_gen::LeaveGenHandler::load_request(conn, template, task_id).await?,
         ),
     })
 }
 
-async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
+async fn generate_games(
+    conn: &mut PgConnection,
+    job: &Job,
+    template: &JobTemplate,
+) -> AppResult<Acquired> {
     // See `generate_opening_rack`: the seed cursor is `MAX(seed)`, read under
     // the dispatch lock `acquire` holds.
-    let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
-        .bind(job.id)
-        .fetch_one(&mut *conn)
-        .await?;
-
-    let job_data = load_job_data(&mut *conn, job.id).await?;
-    let Some((seed, request)) = game::next_request(conn, job.id, &config, &job_data).await? else {
+    let JobKind::Games { config, player1, player2 } = &template.kind else {
+        return Err(template.mismatch("games"));
+    };
+    let Some((seed, request)) =
+        game::next_request(conn, job.id, config, &template.data, player1, player2).await?
+    else {
         // Every game up to `max_games` has been handed out.
         return Ok(Acquired::NoWork);
     };
-    let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
+    let task_id = insert_on_demand_task(conn, job.id, seed).await?;
     super::insert_game_request(
         conn,
         task_id,
@@ -192,23 +208,23 @@ async fn generate_games(conn: &mut PgConnection, job: &Job) -> AppResult<Acquire
     Ok(Acquired::Task { task_id, request: TaskRequest::Games(request), created: true })
 }
 
-async fn generate_game_pairs(conn: &mut PgConnection, job: &Job) -> AppResult<Acquired> {
+async fn generate_game_pairs(
+    conn: &mut PgConnection,
+    job: &Job,
+    template: &JobTemplate,
+) -> AppResult<Acquired> {
     // See `generate_opening_rack`: the seed cursor is `MAX(seed)`, read under
     // the dispatch lock `acquire` holds.
-    let config =
-        sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
-            .bind(job.id)
-            .fetch_one(&mut *conn)
-            .await?;
-
-    let job_data = load_job_data(&mut *conn, job.id).await?;
+    let JobKind::GamePairs { config, player1, player2 } = &template.kind else {
+        return Err(template.mismatch("game_pairs"));
+    };
     let Some((seed, request)) =
-        game_pair::next_request(conn, job.id, &config, &job_data).await?
+        game_pair::next_request(conn, job.id, config, &template.data, player1, player2).await?
     else {
         // Every pair up to `max_pairs` has been handed out.
         return Ok(Acquired::NoWork);
     };
-    let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
+    let task_id = insert_on_demand_task(conn, job.id, seed).await?;
     super::insert_game_request(
         conn,
         task_id,
@@ -224,12 +240,11 @@ async fn generate_leave_gen(
     conn: &mut PgConnection,
     job: &Job,
     identity: &WorkerIdentity,
+    template: &JobTemplate,
 ) -> AppResult<Acquired> {
-    let config =
-        sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
-            .bind(job.id)
-            .fetch_one(&mut *conn)
-            .await?;
+    let JobKind::LeaveGeneration { config, lexicon } = &template.kind else {
+        return Err(template.mismatch("leave_generation"));
+    };
 
     // `acquire` holds the job's dispatch lock for the rest of this transaction,
     // taken before anything here is read: what to hand out, and whether the
@@ -243,7 +258,7 @@ async fn generate_leave_gen(
     // follows it, and only for the current generation. A task from a
     // generation that has since closed is left alone; its racks would be
     // played with a KLV that is no longer current, and its result discarded.
-    let Some(generation) = leave_gen::current_generation(&mut *conn, job.id, &config).await? else {
+    let Some(generation) = leave_gen::current_generation(&mut *conn, job.id, config).await? else {
         return Ok(Acquired::JobFinished);
     };
 
@@ -269,21 +284,27 @@ async fn generate_leave_gen(
     if !leave_gen::universe_exists(&mut *conn, job.id, generation).await? {
         return Ok(Acquired::NeedsUniverse { generation });
     }
-    let job_data = load_job_data(&mut *conn, job.id).await?;
 
     if let Some(task_id) = next_available(&mut *conn, job.id, identity, Some(generation)).await? {
-        let request = load_request(conn, job.job_type, task_id).await?;
+        let request = load_request(conn, template, task_id).await?;
         return Ok(Acquired::Task { task_id, request, created: false });
     }
 
-    match leave_gen::next_step(conn, job.id, &config, &job_data).await? {
+    match leave_gen::next_step(conn, job.id, config, &template.data, lexicon).await? {
         leave_gen::LeaveGenStep::Dispatch(request) => {
-            let task_id = insert_on_demand_task(conn, job.id, None).await?;
+            // The seed drawn for the task is its seed on the `tasks` row too:
+            // every task has one, and the unique index on (job_id, seed) turns
+            // the negligible chance of two draws colliding into a retried
+            // claim rather than two tasks replaying each other's games.
+            let task_id = insert_on_demand_task(conn, job.id, request.seed as i64).await?;
             leave_gen::insert_request(conn, task_id, &request).await?;
             Ok(Acquired::Task { task_id, request: TaskRequest::LeaveGeneration(request), created: true })
         }
         leave_gen::LeaveGenStep::Transition { generation } => {
             Ok(Acquired::NeedsGenerationTransition { generation })
+        }
+        leave_gen::LeaveGenStep::NeedsMerge { generation } => {
+            Ok(Acquired::NeedsLeaveMerge { generation })
         }
         leave_gen::LeaveGenStep::Finished => Ok(Acquired::JobFinished),
         // Another worker's request is aggregating the generation. This one has
@@ -296,11 +317,11 @@ async fn generate_leave_gen(
 
 /// On-demand tasks are inserted `available` and immediately claimed by the
 /// caller in the same transaction, so the counter bookkeeping is identical on
-/// every path.
+/// every path. Every task carries the seed its games are played from.
 async fn insert_on_demand_task(
     conn: &mut PgConnection,
     job_id: Uuid,
-    seed: Option<i64>,
+    seed: i64,
 ) -> AppResult<Uuid> {
     Ok(sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO tasks (job_id, seed, state) VALUES ($1, $2, 'available') RETURNING id",
@@ -311,36 +332,20 @@ async fn insert_on_demand_task(
     .await?)
 }
 
-/// Checks a batch against the size the task was dispatched with.
-///
-/// Lives here rather than in `process_response` because it needs the request,
-/// which the pure validation step does not have. It is the one submission-time
-/// check that can catch a worker reporting work it did not do: the batch size
-/// was fixed when the task was handed out, so a result of any other size is
-/// answering a question nobody asked.
-async fn check_batch_size(
-    conn: &mut PgConnection,
-    job: &Job,
-    task_id: Uuid,
-    reported_games: i32,
-) -> AppResult<()> {
-    super::plausibility::check_against_task(
-        conn,
-        job,
-        task_id,
-        &super::plausibility::Reported { games: Some(reported_games) },
-    )
-    .await
-}
-
 /// Validate, normalize and store a worker submission.
 ///
 /// `first_result` says whether this is the first accepted result for its task,
 /// which the caller reads from the task's `accepted_count` under the task's row
 /// lock. Only a first result adds to the job's running totals or folds into a
 /// leave generation: redundant claims replay the same deterministic work.
+///
+/// `template` is the job's immutable configuration, which is where the batch
+/// size a task was dispatched with and the number of moves to keep per
+/// position come from: both are job settings the request rows denormalize, so
+/// reading them from the template costs no round trip inside the task's lock.
 pub async fn store_result(
     conn: &mut PgConnection,
+    template: &JobTemplate,
     job: &Job,
     task_id: Uuid,
     claim_id: Uuid,
@@ -352,13 +357,33 @@ pub async fn store_result(
             .map_err(|e| AppError::bad_request(format!("malformed task response: {e}")))
     }
 
-    match job.job_type {
-        JobType::OpeningRack => {
-            let record = opening_rack::OpeningRackHandler::process_response(decode(payload)?)?;
+    /// Decode and validate a submission on the blocking pool.
+    ///
+    /// A result is up to 64 MiB of JSON: ten thousand racks with their ranked
+    /// moves and plies, or every rack a ten-thousand-game leave task drew.
+    /// Turning that into typed records and running the plausibility rules over
+    /// it is tens to hundreds of milliseconds of computation with no `await`
+    /// in it, and an async worker thread that does not yield can hold up every
+    /// other request the server has (see `exports::upload_rows`). The hop costs
+    /// microseconds, against a transaction of a dozen round trips.
+    async fn normalize<H>(payload: serde_json::Value) -> AppResult<H::Record>
+    where
+        H: JobHandler,
+        H::Response: Send + 'static,
+        H::Record: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(payload)?))
+            .await
+            .map_err(|e| AppError::internal(format!("validating a task response failed: {e}")))?
+    }
+
+    match &template.kind {
+        JobKind::OpeningRack { .. } => {
+            let record = normalize::<opening_rack::OpeningRackHandler>(payload).await?;
             let racks: Vec<String> =
                 record.positions.iter().map(|p| p.rack.clone()).collect();
-            opening_rack::check_batch_against_task(conn, task_id, &racks).await?;
-            opening_rack::OpeningRackHandler::insert_record(conn, job.id, task_id, claim_id, &record)
+            opening_rack::check_batch_against_task(conn, template, task_id, &racks).await?;
+            opening_rack::OpeningRackHandler::insert_record(conn, template, task_id, claim_id, &record)
                 .await?;
             // One row per rack, and the unique index on (task_claim_id, rack)
             // means the insert above would have failed on a duplicate, so the
@@ -374,26 +399,34 @@ pub async fn store_result(
             )
             .await
         }
-        JobType::Games => {
-            let record = game::GameHandler::process_response(decode(payload)?)?;
-            check_batch_size(conn, job, task_id, record.all_games.games).await?;
-            game::GameHandler::insert_record(conn, job.id, task_id, claim_id, &record).await?;
+        JobKind::Games { config, .. } => {
+            let record = normalize::<game::GameHandler>(payload).await?;
+            // The batch size was fixed when the task was handed out -- it is
+            // the job's, denormalized onto every request -- so a result of any
+            // other size is answering a question nobody asked.
+            super::plausibility::check_batch_size(record.all_games.games, config.games_per_batch)?;
+            game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
             count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
                 .await
         }
-        JobType::GamePairs => {
-            let record = game_pair::GamePairHandler::process_response(decode(payload)?)?;
-            check_batch_size(conn, job, task_id, record.all_games.games).await?;
-            game_pair::GamePairHandler::insert_record(conn, job.id, task_id, claim_id, &record).await?;
+        JobKind::GamePairs { config, .. } => {
+            let record = normalize::<game_pair::GamePairHandler>(payload).await?;
+            // A pairs request counts pairs; each is two games.
+            super::plausibility::check_batch_size(
+                record.all_games.games,
+                config.pairs_per_batch.saturating_mul(2),
+            )?;
+            game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
+                .await?;
             // Games, not pairs, for both job types: the pairs count is half of
             // it and is derived where it is displayed.
             count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
                 .await
         }
-        JobType::LeaveGeneration => {
-            let record = leave_gen::LeaveGenHandler::process_response(decode(payload)?)?;
+        JobKind::LeaveGeneration { .. } => {
+            let record = normalize::<leave_gen::LeaveGenHandler>(payload).await?;
             if first_result {
-                leave_gen::LeaveGenHandler::insert_record(conn, job.id, task_id, claim_id, &record)
+                leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
                     .await
             } else {
                 leave_gen::credit_claim(conn, task_id, claim_id, &record).await
@@ -454,7 +487,7 @@ pub async fn initialize_job_artifacts(
         return Ok(());
     }
     let mut conn = state.pool.acquire().await?;
-    let job_data = load_job_data(&mut conn, job.id).await?;
+    let job_data = super::load_job_data(&mut conn, job.id).await?;
     drop(conn);
     leave_gen::seed_zero_generation(
         &state.pool,

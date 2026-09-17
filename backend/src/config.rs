@@ -147,7 +147,7 @@ impl Config {
             other => anyhow::bail!("SECURE_COOKIES must be 'true' or 'false', got {other:?}"),
         };
 
-        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.5.0");
+        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.0");
         if crate::version::Version::parse_or_zero(&min_magpie_version)
             == crate::version::Version::ZERO
             && min_magpie_version.trim() != "0.0.0"
@@ -167,21 +167,16 @@ impl Config {
             heartbeat_timeout: Duration::from_secs(parsed("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            // 0.5.0 is the first MAGPIE version that checks a wordmap or a
-            // rack info table against the hash the job pins, and the first
-            // that will load a table at all. 0.4.0 was the first whose results
-            // depend on nothing but the task; it ran every job with rack info
-            // tables switched off, so raising the floor past it is what lets
-            // `use_rit` mean anything.
-            //
-            // 0.3.0 and 0.2.0 supplied their own compile-time
-            // defaults for every setting a request left null, and refused the
-            // sampling-rule names birdtest sends; 0.2.0 also carried a task's
-            // wordmap and rack-info-table flags into the next task; 0.1.0 left
-            // the bingo bonus, an opening-rack simulation's settings and a
-            // leave-generation task's seed to the worker; 0.0.0 predates the
-            // fixes to simulation settings, distribution and layout. All must be
-            // refused.
+            // 0.1.0 is `birdtest-contribute`'s pre-release version. Neither
+            // birdtest nor the branch is in production yet, so everything the
+            // protocol relies on -- every result-changing setting stated on
+            // the request rather than taken from the worker's build, input
+            // data and derived files checked against the hashes the job pins,
+            // the word info table switched off before every load, a seed on
+            // every task -- is in 0.1.0. The version moves only when a
+            // release changes what a task computes, and this floor moves with
+            // it; until then there is nothing below it to refuse, and the
+            // floor exists so that the first such release can raise it.
             min_magpie_version,
             magpie_download_url: var_or(
                 "MAGPIE_DOWNLOAD_URL",

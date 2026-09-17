@@ -8,8 +8,13 @@ MAGPIE submits are accepted and stored the way the server reads them back:
 - `opening_rack`, static: a best move per rack.
 - `opening_rack`, simming: the simulated statistics (win%, per-ply stats) are
   stored, not just move, score and equity.
-- `leave_generation`: full-rack occurrences fold into the generation's
-  progress, and nothing is written into MAGPIE's data directory.
+- `leave_generation`: full-rack occurrences are staged, a merge folds them
+  into the generation's progress, and nothing is written into MAGPIE's data
+  directory.
+- Derived files: the static opening-rack player and the leave job ask for a
+  wordmap, so both wait until the builder has run (`docker compose run --rm
+  derived-builder`, which this script runs for them), the server publishes
+  its hash, and MAGPIE builds its own copy and finds the bytes agree.
 
 Expects the compose stack (`postgres`, `minio`, `backend`) to be up, with
 MAIL_BACKEND=console, and a built MAGPIE whose `data/` is a real
@@ -121,9 +126,29 @@ def contribute(args, tasks: int) -> str:
     expect(run.returncode == 0, f"magpie contribute failed:\n{output[-3000:]}")
     # MAGPIE exits 0 even when it gives up after repeated task failures, so
     # the output is checked too.
-    for sign in ("task failed", "rejected the result", "gave up"):
+    for sign in ("task failed", "rejected the result", "gave up", "declining this task"):
         expect(sign not in output, f"a task failed ({sign!r}):\n{output[-3000:]}")
     return output
+
+
+def build_derived(args) -> None:
+    """Drains the derived-file build queue once, as the scheduled task does.
+
+    A job whose players ask for a wordmap or a rack info table is not dispatched
+    until the server has built its reference copy and recorded the hash, and
+    nothing in the compose stack does that on its own.
+    """
+    started = time.time()
+    run = subprocess.run(
+        ["docker", "compose", "run", "--rm", "--build", "derived-builder"],
+        cwd=seed.REPO_ROOT, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        timeout=1800,
+    )
+    output = run.stdout + run.stderr
+    expect(run.returncode == 0, f"the derived-file builder failed:\n{output[-3000:]}")
+    unbuilt = psql(args, "SELECT COUNT(*) FROM derived_data WHERE state <> 'built'")
+    expect(unbuilt == "0", f"{unbuilt} derived files are still not built:\n{output[-3000:]}")
+    log(f"derived files built in {time.time() - started:.0f}s")
 
 
 def completed_claims(args, job_id: str) -> int:
@@ -132,9 +157,11 @@ def completed_claims(args, job_id: str) -> int:
         f"WHERE t.job_id = '{job_id}' AND c.state = 'completed'"))
 
 
-def run_job(client, args, data: dict, body: dict, check) -> None:
+def run_job(client, args, data: dict, body: dict, check, needs_build: bool = False) -> None:
     deactivate_everything(client)
     job_id = create_and_activate(client, args, data, body)
+    if needs_build:
+        build_derived(args)
     output = contribute(args, args.tasks)
     claims = completed_claims(args, job_id)
     expect(claims >= args.tasks, f"{body['job_type']}: {claims} accepted claims, "
@@ -189,9 +216,11 @@ def main() -> int:
         "max_iterations": 60, "stopping_pct": 99, "time_limit_secs": 0,
     })
     # The static opening-rack job wants one move per rack, which `best` is
-    # exactly right for -- and is what `num_plays_recorded` 1 says.
+    # exactly right for -- and is what `num_plays_recorded` 1 says. It also
+    # asks for a wordmap, so its job goes through the derived-file path: the
+    # server builds and hashes one, and MAGPIE builds its own and compares.
     static_best = create_player(client, args, data, "e2e-static-best",
-                                {"num_plays_recorded": 1})
+                                {"num_plays_recorded": 1, "use_wordmap": True})
 
     def games_counted(job_id: str) -> None:
         stats = client.json(client.get(f"/api/jobs/{job_id}"), "job stats")
@@ -220,9 +249,11 @@ def main() -> int:
             "       COUNT(*) FILTER (WHERE m.blended_utility IS NOT NULL), "
             "       (SELECT COUNT(*) FROM position_analysis_plies p "
             "        JOIN position_analysis_moves pm ON pm.id = p.move_id "
-            f"       WHERE pm.task_id IN (SELECT id FROM tasks WHERE job_id = '{job_id}')) "
-            "FROM position_analysis_moves m JOIN tasks t ON t.id = m.task_id "
-            f"WHERE t.job_id = '{job_id}'")
+            "        JOIN position_analysis_records pr ON pr.id = pm.record_id "
+            f"       WHERE pr.job_id = '{job_id}') "
+            "FROM position_analysis_moves m "
+            "JOIN position_analysis_records r ON r.id = m.record_id "
+            f"WHERE r.job_id = '{job_id}'")
         win, utility, plies = (int(v) for v in row.split("|"))
         expect(win > 0 and utility > 0 and plies > 0,
                f"simulated statistics missing: win%={win} utility={utility} plies={plies}")
@@ -231,6 +262,27 @@ def main() -> int:
     before = {p.name for p in lexica.iterdir()}
 
     def leave_occurrences(job_id: str) -> None:
+        # An accepted leave result is staged, and folded into the per-rack
+        # totals by a merge -- half-hourly, or when a generation nears its end.
+        # Both halves are asserted: the submissions staged something and moved
+        # the generation's live counters, and a merge folds it in.
+        staged = int(psql(args,
+            f"SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = '{job_id}'"))
+        merged_already = int(psql(args,
+            "SELECT COUNT(*) FROM leave_rack_progress "
+            f"WHERE job_id = '{job_id}' AND generation = 1 AND occurrence_count > 0"))
+        expect(staged > 0 or merged_already > 0, "no leave result was staged or merged")
+        played = int(psql(args,
+            "SELECT COALESCE(SUM(games_played), 0) FROM leave_generation_progress "
+            f"WHERE job_id = '{job_id}'"))
+        expect(played > 0, "the generation's live counters did not move")
+        outcome = client.json(client.post(f"/api/admin/jobs/{job_id}/merge-progress"),
+                              "merge leave progress")
+        expect(outcome["folds_merged"] == staged,
+               f"merged {outcome['folds_merged']} staged results, expected {staged}")
+        left = int(psql(args,
+            f"SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = '{job_id}'"))
+        expect(left == 0, f"{left} results still staged after a merge")
         occurred = int(psql(args,
             "SELECT COUNT(*) FROM leave_rack_progress "
             f"WHERE job_id = '{job_id}' AND generation = 1 AND occurrence_count > 0"))
@@ -249,13 +301,17 @@ def main() -> int:
     run_job(client, args, data, {"job_type": "game_pairs", **common, "pairs_per_batch": 2,
                                  "min_pairs": 1000, "max_pairs": 1000}, pairs_counted)
     run_job(client, args, data, {"job_type": "opening_rack", "player_config_id": static_best,
-                                 "racks_per_batch": 20, "rack_size": 7}, best_moves)
+                                 "racks_per_batch": 20, "rack_size": 7}, best_moves,
+            needs_build=True)
     run_job(client, args, data, {"job_type": "opening_rack", "player_config_id": simming,
                                  "racks_per_batch": 3, "rack_size": 7}, simulated_statistics)
+    # With the wordmap a leave job asks for by default: the second job on the
+    # lexicon, so the builder finds the wordmap already built and the worker
+    # finds its own copy already matching.
     run_job(client, args, data, {"job_type": "leave_generation", "kwg_id": data["kwg"],
                                  "num_iterations": 20, "generation_count": 1,
-                                 "target_rack_count": 1, "racks_per_task": 50,
-                                 "use_wordmap": False}, leave_occurrences)
+                                 "target_rack_count": 1, "racks_per_task": 50},
+            leave_occurrences, needs_build=True)
 
     errors = subprocess.run(
         ["docker", "compose", "logs", "--no-color", args.backend_service],

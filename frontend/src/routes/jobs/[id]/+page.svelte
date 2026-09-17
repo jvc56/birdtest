@@ -59,9 +59,9 @@
 
     <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Priority / allocation</p>
+        <p class="text-xs uppercase text-muted-foreground">Allocation</p>
         <p class="mt-1 text-xl tabular-nums">
-          {stats.job.priority} · {stats.job.allocation === null ? '—' : `${stats.job.allocation}%`}
+          {stats.job.allocation === null ? '—' : `${stats.job.allocation}%`}
         </p>
       </div>
       <div class="card">
@@ -233,6 +233,12 @@
           Generation {lg.current_generation} of {lg.generation_count} — target
           {lg.target_rack_count.toLocaleString()} occurrences per rack
         </h2>
+        <p class="text-sm">
+          <span class="tabular-nums">{lg.tasks_completed.toLocaleString()}</span> tasks and
+          <span class="tabular-nums">{lg.games_played.toLocaleString()}</span> games played this
+          generation
+          <span class="text-muted-foreground">— live, on every accepted result.</span>
+        </p>
         <ProgressBar
           value={lg.racks_at_target}
           max={lg.racks_total}
@@ -242,7 +248,14 @@
           Fewest occurrences so far:
           <span class="font-mono text-foreground">{lg.min_rack ?? '—'}</span>
           at <span class="tabular-nums text-foreground">{lg.min_rack_count?.toLocaleString() ?? '—'}</span>.
-          This updates on every accepted result, not on a worker heartbeat.
+          Rack figures are
+          {#if lg.progress_as_of}
+            as of {new Date(lg.progress_as_of).toLocaleTimeString()}:
+          {:else}
+            not computed yet:
+          {/if}
+          accepted results are merged into the per-rack totals in batches — every half hour, and
+          about once a minute as a generation nears its end.
         </p>
       </div>
     {/if}
