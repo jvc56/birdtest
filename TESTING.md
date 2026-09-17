@@ -470,7 +470,10 @@ The single most important group. Every entry is about a decision made in SQL.
   converge on that ratio over many claims.
 - `I-SCHED-3` A job at 0% is offered to nobody, exactly as an inactive one is:
   every claim goes to the other active job, and with every active job at 0%
-  the answer is `204`, not a shutdown. There is no priority.
+  the answer is `204`, not a shutdown — including when a parked job is too new
+  for the worker or in its unsupported set, which shuts nobody down until the
+  job is raised above 0% (`a_parked_job_shuts_nobody_down`). There is no
+  priority.
 - `I-SCHED-4` `tasks_dispatched` counts abandoned claims. Abandon many claims on
   one job and confirm its share does **not** grow — excluding them would let a
   job with flaky workers accumulate more than its share.

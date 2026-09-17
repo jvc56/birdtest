@@ -2,7 +2,14 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
-  import { api, type ArtifactRebuild, type DataGap, type JobStats } from '$lib/api';
+  import {
+    api,
+    ApiError,
+    type ArtifactRebuild,
+    type DataGap,
+    type JobExport,
+    type JobStats
+  } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { jobTypeLabel, sprtLabel, duration } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
@@ -18,16 +25,54 @@
   let error = '';
   let notice = '';
   let rebuild: ArtifactRebuild[] | null = null;
+  let jobExport: JobExport | null = null;
+  let exportPoll: number | undefined;
 
   async function reload() {
     stats = await api.job(jobId);
     if (stats.job.allocation !== null) allocation = stats.job.allocation;
     gaps = await api.jobDataGaps(jobId);
+    await loadExport();
+  }
+
+  // The export is built on a background task, so the page polls while one is
+  // running. A job that has never been exported answers 404, which is not an
+  // error worth showing.
+  async function loadExport() {
+    window.clearTimeout(exportPoll);
+    try {
+      jobExport = await api.jobExport(jobId);
+    } catch (e) {
+      if (e instanceof ApiError && e.status === 404) jobExport = null;
+      else throw e;
+    }
+    if (jobExport?.state === 'running') {
+      exportPoll = window.setTimeout(() => loadExport().catch((e) => (error = e.message)), 3000);
+    }
+  }
+
+  async function startExport() {
+    error = '';
+    notice = '';
+    try {
+      await api.startExport(jobId);
+      await loadExport();
+    } catch (e) {
+      error = (e as Error).message;
+    }
+  }
+
+  function megabytes(bytes: number | null): string {
+    return bytes === null ? '—' : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   }
 
   onMount(() => {
     reload().catch((e) => (error = e.message));
-    return subscribeToJob<JobStats>(jobId, (value) => (stats = value));
+    const unsubscribe = subscribeToJob<JobStats>(jobId, (value) => (stats = value));
+    return () => {
+      window.clearTimeout(exportPoll);
+      unsubscribe();
+    };
   });
 
   async function run(action: () => Promise<unknown>, message: string) {
@@ -194,6 +239,41 @@
         </p>
       {/if}
     </div>
+
+    {#if stats.job.status === 'completed'}
+      <div class="card space-y-3">
+        <h2 class="text-lg font-medium">Export</h2>
+        <p class="text-xs text-muted-foreground">
+          A completed job's whole corpus as one gzipped NDJSON file, built once on a background
+          task and downloaded straight from the artifact store. An opening-rack line is a rack
+          with its ranked moves. Refused while the job's last claims are still in flight.
+        </p>
+        <div class="flex flex-wrap items-center gap-3">
+          <button
+            class="btn-secondary"
+            on:click={startExport}
+            disabled={jobExport?.state === 'running'}
+          >
+            {jobExport ? 'Export again' : 'Export results'}
+          </button>
+          {#if jobExport}
+            <span class="text-sm">
+              {#if jobExport.state === 'running'}
+                Building…
+              {:else if jobExport.state === 'ready'}
+                {(jobExport.row_count ?? 0).toLocaleString()} rows ·
+                {megabytes(jobExport.bytes)}
+                {#if jobExport.download_url}
+                  · <a href={jobExport.download_url}>download</a> (link valid for an hour)
+                {/if}
+              {:else}
+                <span class="text-destructive">Failed: {jobExport.error ?? 'unknown error'}</span>
+              {/if}
+            </span>
+          {/if}
+        </div>
+      </div>
+    {/if}
 
     <div class="card space-y-3">
       <h2 class="text-lg font-medium">Progress</h2>

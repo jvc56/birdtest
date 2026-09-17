@@ -62,7 +62,7 @@ State is determined by denormalized counters (`accepted_count`, `active_claim_co
 - **claimed**: `accepted_count + active_claim_count = redundancy` but `accepted_count < redundancy` — all slots are filled with in-flight claims; waiting on results.
 - **completed**: `accepted_count = redundancy` — all X results have been submitted and accepted.
 
-Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested and the job is a candidate, not via a background process. A job nobody asks for work from — one that is inactive or completed — therefore keeps a lapsed claim on its books until something reclaims it: activation puts it back in a tier, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
+Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested and the job is a candidate, not via a background process. A job nobody asks for work from — one that is inactive, completed, or parked at 0% — therefore keeps a lapsed claim on its books until something reclaims it: activation above 0% makes it a candidate again, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
 
 #### Task Generation
 
@@ -75,7 +75,7 @@ Every job type generates its tasks **on demand**: the next task request is gener
 1. The worker sends a **task claim** to the server — a minimal message identifying itself and signaling it is ready for work.
 2. The system selects the active job **most behind its configured allocation share** — specifically, among active jobs with an allocation above 0%, the one with the lowest ratio of `claims_issued / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`.
-4. The system acquires the next task (pre-populated or on-demand, depending on the job type), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
+4. The system acquires the next task (one being re-dispatched, or else one generated on demand), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
 6. The worker performs the task and submits a **task response** along with the claim token.
 7. If the claim token matches a `task_claims` row that is not abandoned and was issued to the identity presenting it (a token presented by any other identity is treated as unknown, so bans and audit rows mean what they say), the task response is accepted, a **task record** is stored keyed to the `task_claim_id`, `accepted_count` is incremented, and `active_claim_count` is decremented. When `accepted_count = redundancy` the task is marked **completed**. If the token is stale (the claim was abandoned due to timeout, or this result was already accepted), the submission is answered `{"accepted": false}` and changes nothing. The claim row is locked from lookup to commit, so a timeout reclaiming it concurrently cannot count it as well.
@@ -601,7 +601,7 @@ Users can create an account to track their contributions. Account creation requi
 
 A confirmation code is sent to the email address on registration. Users can generate one or more API keys from their account, which are used to authenticate task submissions.
 
-API keys are stored as hashes (never raw values) in the database. The raw key is shown to the user exactly once at generation time. Users may hold up to **100 API keys**, and a request to create the 101st is refused rather than silently evicting one. Each key can be independently marked **active** or **inactive** — only active keys are accepted for worker authentication. This lets contributors rotate or temporarily disable a key without deleting it. Every worker request authenticated with a key stamps its `last_used_at`, so a contributor can tell which of their keys is actually in use before revoking one.
+API keys are stored as hashes (never raw values) in the database. The raw key is shown to the user exactly once at generation time. Users may hold up to **100 API keys**, and a request to create the 101st is refused rather than silently evicting one. The count and the insert run under the account's row lock: the limit lives in the application rather than the schema, and counted and inserted as two bare statements, requests arriving together each read the same count. Each key can be independently marked **active** or **inactive** — only active keys are accepted for worker authentication. This lets contributors rotate or temporarily disable a key without deleting it. Every worker request authenticated with a key stamps its `last_used_at`, so a contributor can tell which of their keys is actually in use before revoking one.
 
 **v1 account scope**: The sole v1 purpose of a user account is to generate an API token, which attributes task submissions to that account instead of an anonymous UUID. No other feature is gated behind registration. Anonymous workers can complete tasks fully, with no account or API token required.
 
@@ -882,6 +882,22 @@ through `GET`, and answered with a presigned URL once ready, so **the bytes neve
 pass through the backend** and never touch the connection pool the cap exists to
 protect.
 
+**What a line holds** follows the job type: a `game_results` row for games and
+game pairs, a `leave_rack_progress` row for leave generation, and for opening
+racks a `position_analysis_records` row **with its ranked moves and their
+per-ply statistics nested in it** (`moves: [{rank, move, score, equity,
+win_percentage, blended_utility, plies: [...]}]`). The record alone is a header
+— the rack, how many moves were ranked, when — and for a while that was all an
+export held, which made the artifact this document calls the path for analysing
+the corpus an artifact with no move in it. Nested rather than joined, so the
+unit stays one line per record and `row_count` counts records; each record's
+moves come through `(record_id, rank)`, so the cost is an index probe per
+record — about 70 seconds per million records at five moves each on the
+development machine, on a background task. The admin stream runs the same
+queries, so the two are the same corpus. Positions captured *during games*
+(`capture_positions`) are not in a games job's export, which is its result rows;
+see AUDIT_FINDINGS_4.md, U3.
+
 **Only completed jobs can be exported**, and that restriction is what makes the
 artifact worth having: a completed job's results are immutable, so an export is
 built once and reused by every later download, where an export of an active job
@@ -1021,6 +1037,23 @@ What the numbers settled:
   its residuals to `rating_run_residuals` in the same transaction as its
   ratings, and the page reads them: a view costs a read, and the table describes
   the evidence that fit used rather than evidence that has moved on since.
+- **Display reads have a pool of their own.** See [Two connection
+  pools](#two-connection-pools): the reads in this table that still grow with a
+  job's history can no longer take a connection a claim or a submission is
+  waiting for, and each is cancelled at fifteen seconds.
+- **`?worker=` is resolved before the job is read.** The results feed applied
+  its contributor filter to every row of the job — a username compare, or a
+  SHA-256 of the claim's UUID, per record behind two joins, which no index can
+  serve — so a page for a contributor with few results, or for a name nobody
+  has, read the *whole job* to find fifty rows that were not there: 2.4 s a
+  request at a million opening-rack records, on a public route. The name is
+  resolved to an account or an anonymous worker first (two indexed probes; a
+  name that is nobody's is an empty page), and the filter is an equality on
+  `task_claims`' indexed identity columns: 1–3 ms for the same requests. The
+  filtered query is sent unprepared, so it is planned for the identity asked
+  about — a heavy contributor is found at the head of the job's feed index and
+  a rare one through their own claims, and a cached generic plan picks one of
+  those for everybody.
 - **Copying the rack universe to the next generation is the one slow write**, and
   it is slow on an under-provisioned database: a minute here, against about 15
   seconds for a whole transition on the smaller dev database. It runs once per
@@ -1615,8 +1648,8 @@ enforces that every branch is considered — which scattered early returns canno
 |---|---|---|
 | `Task` | Candidate jobs remain after filtering and one has an available task | `200` with the assignment |
 | `Idle` | Candidate jobs remain, none has an available task right now | `204` |
-| `NoWorkExists` | There are no active jobs at all | `204` |
-| `Shutdown` | There are active jobs, but this worker is ruled out of **all** of them | `200` with a `shutdown` object |
+| `NoWorkExists` | No job is offering work: none is active, or every active one is parked at 0% | `204` |
+| `Shutdown` | Jobs are offering work (active, above 0%), but this worker is ruled out of **all** of them | `200` with a `shutdown` object |
 
 `NoWorkExists` is separate from `Idle` because a quiet server is not the worker's
 fault, and telling a contributor to update their data because nothing happens to
@@ -1871,7 +1904,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
    ORDER BY j.claims_issued::float / j.allocation ASC, j.created_at ASC
    ```
 
-3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers the whole candidate tier rather than one per job: `task_claims` has no job column, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all.
+3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: `task_claims` has no job column, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all.
 
 4. **Task acquisition** — strategy-dependent:
    - **Re-dispatch first**, under the job's dispatch lock like everything else here: `SELECT ... FOR UPDATE SKIP LOCKED` on the job's `available` tasks — a lapsed claim's task, or one with redundancy left to fill — **excluding any task this worker already holds a slot on**. Redundancy means independent workers; without the exclusion, a worker holding a slot on the oldest open task is offered it again on every attempt, refused by the per-identity unique index each time, and gets no work at all.
@@ -1997,17 +2030,24 @@ and it is what a decision to raise a job's floor should be made on.
 #### Deciding between shutdown and idle
 
 Reached only when the candidate list came back empty, so the question is whether
-any active job exists at all and, if so, which axis ruled them out.
+any job is offering work at all and, if so, which axis ruled them out. **A job
+offers work when it is active and above 0%**, and every row below counts only
+those: a job parked at 0% is offered to nobody, exactly as an inactive one is,
+so it can no more shut a worker down than an inactive one can. (It could, for a
+day: the queries counted every active job, so a parked job whose floor was above
+a worker's MAGPIE told that worker `magpie_too_old` over a job that was handing
+out nothing to anyone — and a contributor who exits on that is not there when
+the admin raises a job it could have run.)
 
 | Condition | Outcome |
 |---|---|
-| No active jobs anywhere | `NoWorkExists` → `204` |
-| Active jobs exist, nothing rules them out | `Idle` → `204` |
-| Some active job's floor exceeds the worker's version | `magpie_too_old` |
-| Every active job the version does not rule out is in the worker's unsupported set | `data_out_of_date` |
+| No job offering work anywhere | `NoWorkExists` → `204` |
+| Jobs offering work exist, nothing rules them out | `Idle` → `204` |
+| Some offering job's floor exceeds the worker's version | `magpie_too_old` |
+| Every offering job the version does not rule out is in the worker's unsupported set | `data_out_of_date` |
 | Both | `both`, leading with the version |
 
-An unsupported entry naming a job that is no longer active counts for nothing:
+An unsupported entry naming a job that is no longer offering work counts for nothing:
 the set is client-supplied and may be stale, and a worker too old for every
 active job must not be told its data is out of date as well.
 
@@ -2171,11 +2211,11 @@ Each job type defines:
 | **Task request** | Serialized and sent to the worker when it claims a task. Contains everything the worker needs to perform the work. |
 | **Task response** | Deserialized from the worker's submission. The raw output of the work, validated on receipt. |
 | **Task record** | The normalized form stored in a typed record table (one table per record type). Derived from the response; may omit fields, recompute derived values, or canonicalize formats. |
-| **Creation strategy** | How tasks for this job type are generated: **pre-populated** or **on-demand** (see below). |
+| **Creation strategy** | How tasks for this job type are generated. Every type is **on-demand** now (see below); the component survives as each type's claim-time generator. |
 
 ### Task Request Types
 
-A task request is inserted into a typed request table at task creation time (in the same transaction as the `tasks` row). For pre-populated jobs all requests are written at job creation; for on-demand jobs the request is written at claim time.
+A task request is inserted into a typed request table at task creation time (in the same transaction as the `tasks` row), which for every job type is claim time.
 
 Some request types are shared across job types:
 
@@ -3043,9 +3083,14 @@ release ran it, and a version floor — a minimum, not a pin — cannot exclude 
 release that changed a default. Every per-player setting is still reset before a
 request is applied, and so is every run-wide setting no request states — the
 multi-threading mode and small plays — so nothing is inherited from an earlier
-task or the contributor's `settings.txt`. `letter_distribution` and `board_layout` on the request are
-applied the same way: absent means MAGPIE's defaults, not whatever was loaded
-last. `win_pct_model` and
+task or the contributor's `settings.txt`. `letter_distribution` and `board_layout` are
+**required** on every request, like the settings above: both change what a
+task computes, and absent used to mean the build's defaults — a distribution
+inferred from the lexicon's name and the layout named for the compile-time
+board size — which made them the last two settings a request could leave to the
+worker's build. birdtest states both on every request of every job type, so
+MAGPIE refuses one that does not (`config_contribute_validate_common`).
+`win_pct_model` and
 `movegen_margin` are carried on each player object but are really one shared
 MAGPIE setting for the whole run, so birdtest validates that a job's two player
 configs agree on them before the job is created — the win% model only where both
@@ -3821,14 +3866,20 @@ Every failure is JSON with the same shape, whatever the status:
 ```
 
 `code` is a stable machine-readable string (`bad_request`, `unauthorized`,
-`forbidden`, `not_found`, `conflict`, `rate_limited`, `internal`) mapping
-one-to-one onto the status. `fields` is omitted when empty and carries per-field
+`forbidden`, `not_found`, `conflict`, `rate_limited`, `unavailable`, `internal`)
+mapping one-to-one onto the status. `unavailable` is `503` with a `Retry-After`:
+every connection of the pool asked was busy for the whole acquire timeout, or a
+display read outran its statement timeout (see [Two connection
+pools](#two-connection-pools)). That is load rather than a fault, and MAGPIE's
+client already backs off and retries a `5xx`. `fields` is omitted when empty and carries per-field
 messages so form endpoints can mark individual inputs. A `rate_limited`
 response also carries a `Retry-After` header in whole seconds.
 
 Server errors are logged at `error` and everything else at `debug`; the
 message a client sees is the same either way, and never includes a database
-error or a stack trace.
+error or a stack trace — including a driver-level failure that carries no
+SQLSTATE (a dropped connection, a protocol error), which is logged in full and
+answered with the generic message.
 
 A unique or foreign-key violation that reaches the handler maps to `conflict`
 (409), not `internal` (500): "this name is taken" and "something still references
@@ -3914,14 +3965,40 @@ there are, so a background sweep drops buckets that have gone idle (ten
 minutes, against buckets that refill in seconds to an hour). Forgetting a full
 bucket changes no decision: the next request rebuilds it full.
 
+#### Two connection pools
+
+The process holds two pools against the same database, and which one a read
+uses is decided by whether anything *waits on its answer to do work*:
+
+| Pool | Size | Bounds | Used by |
+|---|---|---|---|
+| main (`AppState.pool`, `db::connect`) | 20 | none | Claims, submissions, heartbeats, declines, the finish check, every admin and account route, the background sweeps, exports and the admin results stream |
+| display (`AppState.read_pool`, `db::connect_read`) | 8 | `statement_timeout` 15 s, acquire timeout 5 s | The public pages (`/api/jobs*`, `/api/users`, `/api/workers`, `/api/rating-pools*`), the SSE stream's first payload and every live push |
+
+Every route on the display pool is unauthenticated and unmetered, and several
+of its reads grow with a job's history. On one shared pool that made page views
+a way to stall the fleet: twenty slow reads at once — enough people with a busy
+job's dashboard open, or one caller in a loop — held all twenty connections,
+and every claim and submission queued behind them until sqlx's thirty-second
+acquire timeout failed it. Nothing on the display pool decides anything (no
+statistic is read while dispatching or accepting), so its reads can queue among
+themselves, behind a bound, and leave the path workers wait on alone. The three
+bounds do different jobs: the size caps how many connections display can hold
+at all, the statement timeout caps how long any one read holds one, and the
+short acquire timeout turns a saturated pool into a quick `503` rather than a
+request parked for half a minute. The admin results stream and the exports stay
+on the main pool — they hold a cursor for minutes, which the statement timeout
+exists to forbid — and are bounded by the two-stream cap and by being admin
+actions instead.
+
 #### Health and startup
 
 `GET /health` returns `200 ok` and is what the container healthcheck and the ALB
 use. On startup the process, in order: loads config from the environment
 (`.env` locally, task-definition variables in ECS), connects the pool, **runs
 migrations before binding** so a container never serves traffic against an
-out-of-date schema, fails any input-data import left `running` by a previous
-process, and only then listens.
+out-of-date schema, connects the display pool, fails any input-data import or
+export left `running` by a previous process, and only then listens.
 
 On the way out it **shuts down gracefully**: `SIGTERM` (what ECS sends before it
 escalates to `SIGKILL` at the stop timeout) and `SIGINT` stop it accepting new
@@ -4030,7 +4107,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged, or the failure reason. |
 | `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged **new** rows, in one transaction. |
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
-| `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses, game results, or leave-rack progress. At most two run at once; a completed job with a ready export gets a `303` to it instead. |
+| `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. At most two run at once; a completed job with a ready export gets a `303` to it instead. |
 | `POST` | `/api/admin/jobs/:id/export` | Build a **completed** job's results into one gzipped NDJSON object in the artifact store. `202` with an id; the work runs on a background task. `409` for a job that is not completed, or whose last claims are still in flight. |
 | `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready. |
 | `GET` | `/api/admin/workers` | The contributor list with anonymous workers' real UUIDs, which banning one needs; the public list carries pseudonyms only. |
@@ -4192,7 +4269,7 @@ do not exist.
 |---|---|---|
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics. |
-| `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`). `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
+| `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one a second. |
 
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
@@ -4256,7 +4333,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 |---|---|
 | `/admin` | Admin overview — redirects to `/admin/jobs`. |
 | `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields. |
-| `/admin/jobs/[id]` | Admin job view — same stats as the public detail page plus controls: deactivate, activate, purge, delete. |
+| `/admin/jobs/[id]` | Admin job view — same stats as the public detail page plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form. |
 | `/admin/users` | User account list — delete accounts. (Contribution stats are shown publicly at `/users`.) |
@@ -4318,7 +4395,8 @@ birdtest/
 │                                    # frontend, plus `dev` and `fake-worker` profiles — see Development
 ├── .env.example                     # compose port overrides
 ├── docker/
-│   └── Dockerfile                  # backend + fake-worker targets; neither needs MAGPIE
+│   └── Dockerfile                  # backend (with a pinned MAGPIE built in), derived-builder and
+│                                   # fake-worker targets; only the fake worker needs no MAGPIE
 ├── scripts/                        # backup, restore and local-snapshot shell scripts —
 │                                   # see Backups and Restore
 │   ├── backup.sh                   # the nightly pg_dump, its manifest, and the `backups` row
@@ -4348,7 +4426,7 @@ birdtest/
 │       ├── clientip.rs             # the caller's address behind TRUSTED_PROXY_HOPS proxies
 │       ├── config.rs               # config from env (ECS injects SSM values as env vars)
 │       ├── state.rs                # AppState shared by every handler
-│       ├── db.rs                   # PgPool initialization and migrations
+│       ├── db.rs                   # the two pools (main, and the bounded display pool) and migrations
 │       ├── error.rs                # AppError type, IntoResponse impl
 │       ├── version.rs              # semver parsing and comparison for the MAGPIE floor
 │       ├── compat.rs               # MAGPIE's lexicon/leaves/letter-distribution compatibility

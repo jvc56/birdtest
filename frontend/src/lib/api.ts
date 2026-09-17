@@ -318,6 +318,20 @@ export interface DerivedData {
 }
 
 /** Per generation, what rebuilding a leave job's KLV from the database found. */
+/** A completed job's results as one gzipped NDJSON object; see PLAN.md, "Exports". */
+export interface JobExport {
+  id: string;
+  state: 'running' | 'ready' | 'failed';
+  bytes: number | null;
+  sha256: string | null;
+  row_count: number | null;
+  error: string | null;
+  requested_at: string;
+  completed_at: string | null;
+  /** Present once ready: a presigned URL, valid for an hour, that fetches the object directly. */
+  download_url?: string;
+}
+
 export interface ArtifactRebuild {
   generation: number;
   artifact_key: string;
@@ -432,6 +446,11 @@ export const api = {
   derivedData: () => get<DerivedData[]>('/api/admin/derived-data'),
   retryDerivedData: (role: string, name: string) =>
     post<void>('/api/admin/derived-data/retry', { role, name }),
+  /** `409` unless the job is completed and its last claims have landed. */
+  startExport: (id: string) =>
+    post<{ id: string; state: string }>(`/api/admin/jobs/${id}/export`),
+  /** The newest export; `404` when the job has never been exported. */
+  jobExport: (id: string) => get<JobExport>(`/api/admin/jobs/${id}/export`),
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>
