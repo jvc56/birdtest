@@ -1547,7 +1547,7 @@ async fn activate_job(
     // also how an allocation is changed, and a new allocation rescales the
     // ratio, so this runs every time. Under the activation lock, so two jobs
     // activated together each see the other or neither.
-    crate::scheduler::join_at_parity(&mut tx, id).await?;
+    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     let updated = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(id)
         .fetch_one(&mut *tx)
@@ -1848,7 +1848,7 @@ async fn purge_job(
     .await?;
     // A job back at zero claims would otherwise be first in every candidate
     // list until it had re-issued as many as the jobs beside it.
-    crate::scheduler::join_at_parity(&mut tx, id).await?;
+    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -1864,6 +1864,12 @@ async fn purge_job(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM leave_generation_progress WHERE job_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // The sweep's cursor with them: the purged job's first claim starts a lap
+    // from the beginning of a universe it has yet to seed.
+    sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;

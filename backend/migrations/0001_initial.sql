@@ -395,6 +395,14 @@ CREATE TABLE jobs (
     -- job with no claims yet joining a busy fleet is credited the claims that
     -- put it level.
     claims_baseline BIGINT NOT NULL DEFAULT 0,
+    -- When this job last issued a claim; NULL until it has. It rides the
+    -- `UPDATE jobs` every claim already makes, so it costs nothing to keep.
+    -- `join_at_parity` reads it to tell the jobs that are *being served* from
+    -- the ones that are merely on offer: a job whose derived files are still
+    -- building, or that the fleet cannot run yet, stands still while the others
+    -- climb, and a newcomer put level with *it* then took every claim from the
+    -- jobs that were actually running until it had caught up with them.
+    last_claimed_at TIMESTAMPTZ,
     -- Progress totals the dashboard reads, maintained in the submit transaction
     -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
     -- incremented
@@ -911,6 +919,29 @@ CREATE TABLE leave_generation_progress (
     PRIMARY KEY (job_id, generation)
 );
 
+-- Where a leave generation's selection sweep has got to: the last rack handed
+-- out in the lap under way. A row exists exactly while a lap has racks left to
+-- hand out: the task that takes the last of them deletes it.
+--
+-- While many racks are below target, racks are handed out in primary-key order
+-- from this cursor rather than lowest count first. Everything behind the cursor
+-- has been handed out this lap and nothing ahead of it has -- a lap only starts
+-- with no claim of the generation in flight and nothing staged -- so a claim
+-- needs no list of what is out, and selection costs the same however much is
+-- staged. Lowest-count-first could not say that: between merges the racks of
+-- every staged result are exactly the lowest, and each claim hashed and
+-- skipped all of them inside the job's dispatch lock.
+--
+-- Read and written only under that lock. A row that goes missing (a purge, a
+-- partial restore) is a lap not started, which waits for what is in flight and
+-- staged before it selects anything; nothing is handed out twice.
+CREATE TABLE leave_selection_cursors (
+    job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation  INT NOT NULL,
+    cursor_rack TEXT NOT NULL,
+    PRIMARY KEY (job_id, generation)
+);
+
 -- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
 -- task_id is denormalized here for efficient job-results queries without joining through task_claims.
 
@@ -1417,23 +1448,19 @@ CREATE INDEX        position_records_task_idx ON position_analysis_records (task
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);
 CREATE INDEX        audit_log_job_idx         ON audit_log (job_id);
 
--- Drives claim-time rack selection: "the racks furthest from target in this generation".
+-- Drives claim-time rack selection once few racks remain below target: "the
+-- racks furthest from target in this generation" (`leave_gen::furthest_below_target`).
 --
--- `rack` is in the key because selection orders on `(occurrence_count, rack)`,
--- and counts tie in their millions: every rack of a generation starts at zero,
--- and most of the 3.2 million full racks are rare enough to stay there until
--- they are forced. Without it the index could not supply the order, so every
--- leave claim read the whole generation and sorted it to find its few hundred
--- racks -- inside the job's dispatch lock. With it a claim walks the index from
--- the lowest count and stops when it has enough; the cost no longer depends on
--- the size of the universe (PLAN.md, "What these reads cost").
---
--- What it costs is storage, measured on a full English generation: 180 MB,
--- where the index without `rack` was 22 MB -- its keys were nearly all equal,
--- so Postgres deduplicated them, and unique keys cannot be. That is 590 MB a
--- generation (258 heap, 152 primary key, 180 this) against 432, for every
--- generation of the job's life. The alternative that keeps the small index is
--- to order on `occurrence_count` alone and let ties fall as they may; see
--- PLAN.md, "What a merge costs".
+-- On `occurrence_count` alone, and selection orders on it alone. Counts tie in
+-- their millions -- every rack of a generation starts at zero, and most of the
+-- 3.2 million full racks are rare enough to stay there until they are forced --
+-- so an ORDER BY that also broke ties by rack could not be served by this index
+-- and every leave claim sorted the generation to find its few hundred racks
+-- (4.9 s a claim at full size). Carrying `rack` in the key fixed that at a
+-- price: measured on a full English generation, 180 MB where this index is
+-- 22 MB, because keys that are nearly all equal deduplicate and unique keys
+-- cannot. Nothing needs the tie broken, so the order gave it up instead; while
+-- many racks are below target, selection does not read this index at all (it
+-- sweeps the primary key, see `leave_selection_cursors`).
 CREATE INDEX leave_rack_progress_pick_idx
-    ON leave_rack_progress (job_id, generation, occurrence_count, rack);
+    ON leave_rack_progress (job_id, generation, occurrence_count);

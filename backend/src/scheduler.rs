@@ -110,9 +110,10 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
     .await?)
 }
 
-/// Put `job_id` level with the jobs already offering work: set its
+/// Put `job_id` level with the jobs already **being served**: set its
 /// `claims_baseline` so that its deficit ratio equals the lowest ratio among
-/// the *other* active jobs above 0%, or zero when there are none.
+/// the other active jobs above 0% that issued a claim within `served_within`
+/// -- or, when none has, among all of them; or zero when there are none.
 ///
 /// The deficit the scheduler orders on is a ratio of claims issued to share.
 /// Measured over a job's whole life, that made every change to the set of jobs
@@ -134,21 +135,53 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
 /// converges on the configured shares, because every job's numerator counts
 /// from the same moment in the fleet's history.
 ///
+/// **Why "being served", and not merely "offering work".** Virtual time is the
+/// position of the flows in service. A job can be active and above 0% and
+/// still not be served: its derived files are building (or failed), it is
+/// pinned to data the fleet does not have yet, its MAGPIE floor is above what
+/// the workers run, its generation is mid-transition. Its ratio stands still
+/// while the others climb -- and a newcomer put level with *that* job was, for
+/// every worker that could not run the lagging one, first in the list until it
+/// had caught up with the jobs that were running: the takeover this function
+/// exists to prevent, by another door. (Demonstrated before this was changed:
+/// a veteran at 100,000 claims, a job nobody could run at zero, a newcomer --
+/// twelve of the next twelve claims went to the newcomer.) `last_claimed_at`
+/// rides the `UPDATE jobs` every claim already makes, and `served_within` is
+/// the heartbeat timeout: a job that has not issued a claim for that long is
+/// not being served in any sense the fleet would notice. With no job served
+/// that recently -- a quiet server, the first activation in a while -- every
+/// job on offer counts, as before.
+///
+/// What this does not cover, deliberately: a job only a *minority* of the
+/// fleet can run is served, recently, and still lags, so a newcomer joining
+/// level with it is ahead of the rest for the majority. No single ratio
+/// describes a fleet that is really two queues; PLAN.md records it as a limit.
+///
 /// The baseline may go negative (a job with no claims joining a busy fleet is
 /// credited the claims that put it level); ratios never do, since the minimum
 /// it copies is itself a ratio of a count that only grows.
-pub async fn join_at_parity(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
+pub async fn join_at_parity(
+    conn: &mut sqlx::PgConnection,
+    job_id: Uuid,
+    served_within: std::time::Duration,
+) -> AppResult<()> {
     sqlx::query(
-        "UPDATE jobs j
+        "WITH others AS (
+             SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
+                    COALESCE(o.last_claimed_at > now() - make_interval(secs => $2), FALSE) AS served
+             FROM jobs o
+             WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1
+         )
+         UPDATE jobs j
          SET claims_baseline = j.claims_issued - floor(
-                 COALESCE((SELECT MIN((o.claims_issued - o.claims_baseline)::float8 / o.allocation)
-                           FROM jobs o
-                           WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> j.id), 0)
+                 COALESCE((SELECT MIN(ratio) FROM others WHERE served),
+                          (SELECT MIN(ratio) FROM others), 0)
                  * COALESCE(j.allocation, 0)
              )::bigint
          WHERE j.id = $1",
     )
     .bind(job_id)
+    .bind(served_within.as_secs_f64())
     .execute(conn)
     .await?;
     Ok(())
@@ -495,7 +528,14 @@ async fn try_claim_from_job(
 
     match acquired {
         Acquired::NoWork => {
-            let _ = tx.rollback().await;
+            // Committed rather than rolled back, for the one thing a claim that
+            // hands out nothing may have written: a leave job's sweep deleting
+            // the cursor of a lap it found finished (`leave_gen::sweep`).
+            // Rolled back, the next claim would find the lap finished again,
+            // by the same read to the end of the universe. Nothing else writes
+            // before answering `NoWork`, and a transaction the dispatch lock's
+            // timeout aborted commits as the rollback it already is.
+            let _ = tx.commit().await;
             Ok(None)
         }
         Acquired::JobFinished => {
@@ -748,7 +788,8 @@ async fn issue_claim(
     // for, so a claim that loses that race hands out nothing.
     let still_active = sqlx::query(
         "UPDATE jobs
-         SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $2
+         SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $2,
+             last_claimed_at = now()
          WHERE id = $1 AND status = 'active'",
     )
     .bind(job.id)

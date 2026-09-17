@@ -147,7 +147,7 @@ In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
 | 3 | `task_claims` | `task_id IN (...)` |
 | 4 | `game_results`, `leave_records` | `job_id = :job` / `task_id IN (...)` |
 | 5 | `position_analysis_records` → `_moves` → `_plies` | `job_id = :job`, then by parent id |
-| 6 | `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
+| 6 | `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_selection_cursors`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
 are recomputed from `game_results` (see §2.4).
@@ -251,11 +251,19 @@ UPDATE jobs j
                           WHERE p.job_id = j.id)
  WHERE j.id = :'job';
 
+-- Level with the jobs being *served* -- those that issued a claim within the
+-- heartbeat timeout (300 s unless HEARTBEAT_TIMEOUT_SECONDS says otherwise) --
+-- or, when none has, with every job on offer: scheduler::join_at_parity's rule.
+WITH others AS (
+  SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
+         COALESCE(o.last_claimed_at > now() - interval '300 seconds', FALSE) AS served
+    FROM jobs o
+   WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> :'job'
+)
 UPDATE jobs j
    SET claims_baseline = j.claims_issued - floor(
-         COALESCE((SELECT MIN((o.claims_issued - o.claims_baseline)::float8 / o.allocation)
-                     FROM jobs o
-                    WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> j.id), 0)
+         COALESCE((SELECT MIN(ratio) FROM others WHERE served),
+                  (SELECT MIN(ratio) FROM others), 0)
          * COALESCE(j.allocation, 0))::bigint
  WHERE j.id = :'job';
 

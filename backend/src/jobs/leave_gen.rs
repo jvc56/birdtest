@@ -399,7 +399,7 @@ async fn refresh_summary(conn: &mut PgConnection, job_id: Uuid, generation: i32)
          LEFT JOIN LATERAL (
                SELECT rack, occurrence_count FROM leave_rack_progress
                WHERE job_id = $1 AND generation = $2
-               ORDER BY occurrence_count ASC, rack ASC LIMIT 1) lowest ON TRUE
+               ORDER BY occurrence_count ASC LIMIT 1) lowest ON TRUE
          ON CONFLICT (job_id, generation) DO UPDATE
              SET racks_total = EXCLUDED.racks_total,
                  racks_at_target = EXCLUDED.racks_at_target,
@@ -648,8 +648,39 @@ pub async fn current_generation(
     Ok((completed < config.generation_count as i64).then_some(completed as i32 + 1))
 }
 
-/// Claim-time rack selection: the racks furthest from this generation's target
-/// that no open claim is already playing.
+/// A generation has "many" racks below target -- and is selected by sweep --
+/// while there are more than this many tasks' worth of them, as of the last
+/// merge. The factor is where the two selections cost the same: a sweep skips
+/// at-target rows to find its racks, about `universe / below_target` rows per
+/// rack handed out, and the tail selection hashes every rack that is out, at
+/// most `below_target` of them. At a hundred tasks' worth both are bounded by
+/// about a hundredth of the universe -- some 32,000 rows for English, tens of
+/// milliseconds -- whatever the fleet's size and however much is staged.
+pub const SWEEP_WHILE_TASKS_REMAIN: i64 = 100;
+
+/// Claim-time rack selection, in one of two ways.
+///
+/// **While many racks are below target: a sweep** ([`sweep`]). The generation's
+/// racks are handed out in primary-key order from a cursor that is remembered
+/// between claims (`leave_selection_cursors`), a lap at a time. Everything
+/// behind the cursor has been handed out this lap and nothing ahead of it has,
+/// so no claim needs to be told what is out: selection costs the same with one
+/// result staged as with ten thousand. It was not always so. Racks were taken
+/// lowest count first, and between merges the racks of every staged result --
+/// whose counts have not moved yet -- are exactly the lowest: each claim built
+/// a hash of all of them and walked past them, about a microsecond a rack,
+/// inside the job's dispatch lock. At a hundred workers that is a second a
+/// claim, and the lock's other claimants give up after two.
+///
+/// **Once few remain: lowest count first** ([`furthest_below_target`]), with
+/// everything that is out excluded. A sweep would spend the end of a generation
+/// walking past racks already at target; here the set below target is small by
+/// construction, so the exclusion is too.
+///
+/// Which one is decided from the generation's summary row, which a merge
+/// refreshes -- the same age as the counts both selections read. Going from the
+/// first to the second is safe at any moment, because the second excludes
+/// everything out; nothing goes the other way, since counts only grow.
 ///
 /// `lexicon` is the name of the row the job pins, from its template.
 pub async fn next_step(
@@ -663,140 +694,27 @@ pub async fn next_step(
         return Ok(LeaveGenStep::Finished);
     };
 
-    // Racks named by an open claim are skipped: two concurrent claims would
-    // otherwise both be handed the same lowest-count racks. The anti-join is
-    // over this job's open claims only, a few hundred racks each.
-    //
-    // So are the racks forced by a task whose result is **staged but not yet
-    // merged**. Their counts in `leave_rack_progress` are as they were before
-    // that task played, so ordered on those counts they are still the lowest
-    // in the generation the moment their claim completes -- and would be handed
-    // straight out again, to every claim until the next merge, while racks
-    // nobody has forced yet wait. Held out until the merge says what they
-    // actually reached. A staged row's arrays are stored out of line, so
-    // reading its `task_id` does not read them.
-    //
-    // **The shape of this statement is what keeps it off the whole
-    // generation.** It orders on `(occurrence_count, rack)`, which
-    // `leave_rack_progress_pick_idx` supplies, so the scan starts at the lowest
-    // count and stops once it has `racks_per_task` rows that pass the filter.
-    // Two details make that the plan rather than a hope. The index has to
-    // carry `rack`: counts tie in their millions (every rack starts at zero,
-    // and the rare ones stay there), and without it the order came from
-    // sorting every row below target -- a read of the whole 3.2-million-row
-    // generation on every leave claim, inside the dispatch lock. And the
-    // exclusion is `NOT IN` over an uncorrelated subquery, which Postgres
-    // evaluates as a *hashed subplan*: one pass to build it, one probe per
-    // index entry. Written as `NOT EXISTS` it is an anti-join, which the planner
-    // is free to run as a nested loop over the excluded racks -- and, misled by
-    // its fixed guess of ten elements per `unnest`, did: 3.5 s at a tenth of
-    // full size, against 9 ms this way. `NOT IN` is only safe with no NULL on
-    // its right-hand side, which the subquery guarantees for itself.
-    let racks = sqlx::query_scalar::<_, String>(
-        "WITH out_now AS (
-             SELECT unnest(r.forced_racks) AS rack
-             FROM task_claims c
-             JOIN tasks t ON t.id = c.task_id
-             JOIN leave_requests r ON r.task_id = c.task_id
-             WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'
-             UNION
-             SELECT unnest(r.forced_racks)
-             FROM leave_rack_staging s
-             JOIN leave_requests r ON r.task_id = s.task_id
-             WHERE s.job_id = $1 AND s.generation = $2
-         )
-         SELECT p.rack FROM leave_rack_progress p
-         WHERE p.job_id = $1 AND p.generation = $2 AND p.occurrence_count < $3
-           AND p.rack NOT IN (SELECT o.rack FROM out_now o WHERE o.rack IS NOT NULL)
-         ORDER BY p.occurrence_count ASC, p.rack ASC
-         LIMIT $4",
+    // Absent until the universe is seeded, which the caller has checked; read
+    // as "few" if it is missing anyway, since that selection assumes nothing.
+    let below_target: i64 = sqlx::query_scalar(
+        "SELECT racks_total - racks_at_target FROM leave_generation_progress
+         WHERE job_id = $1 AND generation = $2",
     )
     .bind(job_id)
     .bind(generation)
-    .bind(config.target_rack_count as i64)
-    .bind(config.racks_per_task as i64)
-    .fetch_all(&mut *conn)
-    .await?;
+    .fetch_optional(&mut *conn)
+    .await?
+    .unwrap_or(0);
 
-    if racks.is_empty() {
-        let in_flight = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*)
-             FROM task_claims c
-             JOIN leave_requests r ON r.task_id = c.task_id
-             JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'",
-        )
-        .bind(job_id)
-        .bind(generation)
-        .fetch_one(&mut *conn)
-        .await?;
-
-        if in_flight > 0 {
-            return Ok(LeaveGenStep::NoWorkYet);
-        }
-
-        // With nothing in flight the only racks held out of the selection
-        // above are those of staged tasks, so an empty selection means "no
-        // rack is below target" only once nothing is staged. Until then it is
-        // not known whether the generation is complete, and deciding that it
-        // is would close it on totals that are missing every staged result --
-        // which is safe for the KLV (the transition drains first) but wrong
-        // for the racks those tasks left short of target, which would never
-        // be forced again.
-        let staged = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM leave_rack_staging
-                            WHERE job_id = $1 AND generation = $2)",
-        )
-        .bind(job_id)
-        .bind(generation)
-        .fetch_one(&mut *conn)
-        .await?;
-        if staged {
-            return Ok(LeaveGenStep::NeedsMerge { generation });
-        }
-
-        // The generation is complete. Whoever writes this row owns its
-        // transition; everyone else waits. Safe to test and write without
-        // re-reading because `lock_claim_decisions` holds the job's lock for
-        // the rest of this transaction, so no other claim is between its own
-        // test and its own write.
-        //
-        // A row whose transition never finished is taken over rather than
-        // trusted forever -- see TRANSITION_TAKEOVER_AFTER. Taking over bumps
-        // `attempts`, which is the only place a crash mid-transition is
-        // recorded.
-        let claimed = sqlx::query_scalar::<_, bool>(&format!(
-            "INSERT INTO leave_generation_transitions (job_id, generation)
-             VALUES ($1, $2)
-             ON CONFLICT (job_id, generation) DO UPDATE
-                 SET started_at = now(), attempts = leave_generation_transitions.attempts + 1
-                 WHERE leave_generation_transitions.completed_at IS NULL
-                   AND leave_generation_transitions.started_at
-                       < now() - interval '{TRANSITION_TAKEOVER_AFTER}'
-             RETURNING attempts > 1"
-        ))
-        .bind(job_id)
-        .bind(generation)
-        .fetch_optional(&mut *conn)
-        .await?;
-
-        return Ok(match claimed {
-            Some(taken_over) => {
-                if taken_over {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        generation,
-                        "restarting a generation transition that was started but never finished"
-                    );
-                }
-                LeaveGenStep::Transition { generation }
-            }
-            // Someone else owns it. `completed_at` set with no artifact row is
-            // not a state the transition writes -- both happen in one
-            // transaction -- so this is always a transition still in progress.
-            None => LeaveGenStep::TransitionInProgress { generation },
-        });
-    }
+    let selected = if below_target > SWEEP_WHILE_TASKS_REMAIN * i64::from(config.racks_per_task) {
+        sweep(conn, job_id, generation, config).await?
+    } else {
+        furthest_below_target(conn, job_id, generation, config).await?
+    };
+    let racks = match selected {
+        Selected::Racks(racks) => racks,
+        Selected::Step(step) => return Ok(step),
+    };
 
     // Never optional: generation 1 reads the zeroed KLV written at generation
     // 0 when the job was created, so every generation fetches its leaves the
@@ -832,6 +750,313 @@ pub async fn next_step(
         num_games: config.num_iterations,
         use_wordmap: config.use_wordmap,
         bingo_bonus: job_data.bingo_bonus,
+    }))
+}
+
+/// What a selection came back with: racks to force, or the reason there are
+/// none.
+enum Selected {
+    Racks(Vec<String>),
+    Step(LeaveGenStep),
+}
+
+/// Claims of this generation still `claimed`.
+async fn claims_in_flight(conn: &mut PgConnection, job_id: Uuid, generation: i32) -> AppResult<i64> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+         FROM task_claims c
+         JOIN leave_requests r ON r.task_id = c.task_id
+         JOIN tasks t ON t.id = c.task_id
+         WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// Whether any accepted result of this generation is still waiting for a merge.
+async fn anything_staged(conn: &mut PgConnection, job_id: Uuid, generation: i32) -> AppResult<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM leave_rack_staging WHERE job_id = $1 AND generation = $2)",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// Why nothing can be handed out when no rack was selectable -- or, when the
+/// answer is "because every rack is at target", the start of the transition.
+///
+/// **The order of the two reads is load-bearing.** Submissions are not
+/// serialized with claims, so one may commit between any two statements here.
+/// Claims in flight are read first: a submission that commits after that read
+/// was counted as in flight, and one that committed before it is visible to the
+/// second read as staged. There is no moment at which a result is neither.
+async fn nothing_to_hand_out(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+) -> AppResult<Option<LeaveGenStep>> {
+    if claims_in_flight(conn, job_id, generation).await? > 0 {
+        return Ok(Some(LeaveGenStep::NoWorkYet));
+    }
+    // With nothing in flight, what is staged is all that the per-rack counts
+    // are missing. Until it is merged it is not known whether the generation
+    // is complete, and deciding that it is would close it on totals that are
+    // missing every staged result -- safe for the KLV (the transition drains
+    // first) but wrong for the racks those tasks left short of target, which
+    // would never be forced again.
+    if anything_staged(conn, job_id, generation).await? {
+        return Ok(Some(LeaveGenStep::NeedsMerge { generation }));
+    }
+    Ok(None)
+}
+
+/// The generation is complete. Whoever writes this row owns its transition;
+/// everyone else waits. Safe to test and write without re-reading because
+/// `lock_claim_decisions` holds the job's lock for the rest of this
+/// transaction, so no other claim is between its own test and its own write.
+///
+/// A row whose transition never finished is taken over rather than trusted
+/// forever -- see TRANSITION_TAKEOVER_AFTER. Taking over bumps `attempts`,
+/// which is the only place a crash mid-transition is recorded.
+async fn claim_transition(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+) -> AppResult<LeaveGenStep> {
+    let claimed = sqlx::query_scalar::<_, bool>(&format!(
+        "INSERT INTO leave_generation_transitions (job_id, generation)
+         VALUES ($1, $2)
+         ON CONFLICT (job_id, generation) DO UPDATE
+             SET started_at = now(), attempts = leave_generation_transitions.attempts + 1
+             WHERE leave_generation_transitions.completed_at IS NULL
+               AND leave_generation_transitions.started_at
+                   < now() - interval '{TRANSITION_TAKEOVER_AFTER}'
+         RETURNING attempts > 1"
+    ))
+    .bind(job_id)
+    .bind(generation)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    Ok(match claimed {
+        Some(taken_over) => {
+            if taken_over {
+                tracing::warn!(
+                    job_id = %job_id,
+                    generation,
+                    "restarting a generation transition that was started but never finished"
+                );
+            }
+            LeaveGenStep::Transition { generation }
+        }
+        // Someone else owns it. `completed_at` set with no artifact row is
+        // not a state the transition writes -- both happen in one
+        // transaction -- so this is always a transition still in progress.
+        None => LeaveGenStep::TransitionInProgress { generation },
+    })
+}
+
+/// The next `racks_per_task` racks below target after `after`, in primary-key
+/// order, and whether the lap has any left beyond them. `''` sorts before every
+/// rack, so it stands for the start of a lap -- and keeps the comparison a bare
+/// index condition, which `$3 IS NULL OR ...` would not be.
+///
+/// One rack more than a task holds is read, to learn whether this is the lap's
+/// last task while there is still a task to commit that knowledge with. Found
+/// out by the *next* claim instead, it would be found out by reading from the
+/// cursor to the end of the universe and coming back empty -- in a claim that
+/// hands out nothing and so rolls back, and so by every claim after it, for as
+/// long as the lap's last results take to arrive.
+async fn racks_after(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    config: &LeaveConfig,
+    after: &str,
+) -> AppResult<(Vec<String>, bool)> {
+    let mut racks = sqlx::query_scalar::<_, String>(
+        "SELECT p.rack FROM leave_rack_progress p
+         WHERE p.job_id = $1 AND p.generation = $2 AND p.rack > $3
+           AND p.occurrence_count < $4
+         ORDER BY p.rack ASC
+         LIMIT $5",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .bind(after)
+    .bind(config.target_rack_count as i64)
+    .bind(config.racks_per_task as i64 + 1)
+    .fetch_all(&mut *conn)
+    .await?;
+    let more = racks.len() > config.racks_per_task as usize;
+    racks.truncate(config.racks_per_task as usize);
+    Ok((racks, more))
+}
+
+/// Selection by sweep: the generation's racks in primary-key order, from where
+/// the last claim left off.
+///
+/// A **lap** is one pass over the universe, handing out every rack that is
+/// below target as the pass reaches it. `leave_selection_cursors` holds the
+/// last rack handed out; its row exists exactly while a lap has racks left.
+///
+/// What makes a sweep need no exclusion list is the rule for *starting* a lap:
+/// only with no claim of the generation in flight and nothing staged. From
+/// there, every rack that is out -- forced by an open claim, or by a result not
+/// yet merged -- was handed out during this lap, and so lies behind the cursor;
+/// nothing ahead of it is out. (A task whose claim lapsed is reissued as it
+/// stands, before anything new is selected -- see `registry::generate_leave_gen`
+/// -- so its racks stay behind the cursor with it.) When a lap runs off the end
+/// of the universe the job therefore pauses until the lap's last results are
+/// in and merged, and the next lap selects on exact counts. That pause is one
+/// task's duration and one merge per lap -- some 6,400 tasks for English -- and
+/// it is the same wait that already precedes closing a generation, which is
+/// simply a lap that finds nothing below target.
+///
+/// A cursor row lost to a partial restore, or deleted by a purge, is a lap not
+/// started: the same rule applies, and nothing is handed out twice.
+async fn sweep(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    config: &LeaveConfig,
+) -> AppResult<Selected> {
+    let cursor: Option<String> = sqlx::query_scalar(
+        "SELECT cursor_rack FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    if let Some(cursor) = cursor {
+        let (racks, more) = racks_after(conn, job_id, generation, config, &cursor).await?;
+        if more {
+            sqlx::query(
+                "UPDATE leave_selection_cursors SET cursor_rack = $3
+                 WHERE job_id = $1 AND generation = $2",
+            )
+            .bind(job_id)
+            .bind(generation)
+            .bind(racks.last())
+            .execute(&mut *conn)
+            .await?;
+            return Ok(Selected::Racks(racks));
+        }
+        // The lap ends here: with this task if it found any racks, already if
+        // it did not (a merge since the last claim can put the racks that were
+        // left at target).
+        sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2")
+            .bind(job_id)
+            .bind(generation)
+            .execute(&mut *conn)
+            .await?;
+        if !racks.is_empty() {
+            return Ok(Selected::Racks(racks));
+        }
+    }
+
+    // Starting a lap, which is also how a generation is found complete.
+    if let Some(step) = nothing_to_hand_out(conn, job_id, generation).await? {
+        return Ok(Selected::Step(step));
+    }
+    let (racks, more) = racks_after(conn, job_id, generation, config, "").await?;
+    if racks.is_empty() {
+        return Ok(Selected::Step(claim_transition(conn, job_id, generation).await?));
+    }
+    // A lap of a single task has no cursor: it is over as it begins.
+    if more {
+        sqlx::query(
+            "INSERT INTO leave_selection_cursors (job_id, generation, cursor_rack)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (job_id, generation) DO UPDATE SET cursor_rack = EXCLUDED.cursor_rack",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .bind(racks.last())
+        .execute(&mut *conn)
+        .await?;
+    }
+    Ok(Selected::Racks(racks))
+}
+
+/// Selection once few racks remain below target: the racks furthest from it
+/// that nothing is already playing.
+async fn furthest_below_target(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    config: &LeaveConfig,
+) -> AppResult<Selected> {
+    // Racks named by an open claim are skipped: two concurrent claims would
+    // otherwise both be handed the same lowest-count racks. The anti-join is
+    // over this job's open claims only, a few hundred racks each.
+    //
+    // So are the racks forced by a task whose result is **staged but not yet
+    // merged**. Their counts in `leave_rack_progress` are as they were before
+    // that task played, so ordered on those counts they are still the lowest
+    // in the generation the moment their claim completes -- and would be handed
+    // straight out again, to every claim until the next merge, while racks
+    // nobody has forced yet wait. Held out until the merge says what they
+    // actually reached. A staged row's arrays are stored out of line, so
+    // reading its `task_id` does not read them.
+    //
+    // **The shape of this statement is what keeps it off the whole
+    // generation.** It orders on `occurrence_count` *alone*, which
+    // `leave_rack_progress_pick_idx` supplies, so the scan starts at the lowest
+    // count and stops once it has `racks_per_task` rows that pass the filter;
+    // racks with equal counts come in whatever order the index holds them. It
+    // used to break ties by rack, and counts tie in their millions -- every
+    // rack starts at zero and the rare ones stay there -- so the order came
+    // from sorting every row below target: 4.9 s a claim at full size. Carrying
+    // `rack` in the index fixed that and cost 160 MB a generation, because
+    // unique keys cannot be deduplicated; nothing needs the tie broken. And
+    // the exclusion is `NOT IN` over an uncorrelated subquery, which Postgres
+    // evaluates as a *hashed subplan*: one pass to build it, one probe per
+    // index entry. Written as `NOT EXISTS` it is an anti-join, which the
+    // planner is free to run as a nested loop over the excluded racks -- and,
+    // misled by its fixed guess of ten elements per `unnest`, did. `NOT IN` is
+    // only safe with no NULL on its right-hand side, which the subquery
+    // guarantees for itself.
+    let racks = sqlx::query_scalar::<_, String>(
+        "WITH out_now AS (
+             SELECT unnest(r.forced_racks) AS rack
+             FROM task_claims c
+             JOIN tasks t ON t.id = c.task_id
+             JOIN leave_requests r ON r.task_id = c.task_id
+             WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'
+             UNION
+             SELECT unnest(r.forced_racks)
+             FROM leave_rack_staging s
+             JOIN leave_requests r ON r.task_id = s.task_id
+             WHERE s.job_id = $1 AND s.generation = $2
+         )
+         SELECT p.rack FROM leave_rack_progress p
+         WHERE p.job_id = $1 AND p.generation = $2 AND p.occurrence_count < $3
+           AND p.rack NOT IN (SELECT o.rack FROM out_now o WHERE o.rack IS NOT NULL)
+         ORDER BY p.occurrence_count ASC
+         LIMIT $4",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .bind(config.target_rack_count as i64)
+    .bind(config.racks_per_task as i64)
+    .fetch_all(&mut *conn)
+    .await?;
+    if !racks.is_empty() {
+        return Ok(Selected::Racks(racks));
+    }
+
+    // With nothing in flight the only racks held out of the selection above
+    // are those of staged tasks, so an empty selection means "no rack is below
+    // target" only once nothing is staged.
+    Ok(Selected::Step(match nothing_to_hand_out(conn, job_id, generation).await? {
+        Some(step) => step,
+        None => claim_transition(conn, job_id, generation).await?,
     }))
 }
 
@@ -1060,6 +1285,15 @@ pub async fn close_generation(
     .bind(builder)
     .execute(&mut *tx)
     .await?;
+
+    // A closed generation is never selected from again. (A sweep that ended
+    // deletes its own cursor; one overtaken by the switch to lowest-count-first
+    // selection leaves it behind.)
+    sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2")
+        .bind(job_id)
+        .bind(generation)
+        .execute(&mut *tx)
+        .await?;
 
     if generation >= config.generation_count {
         sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")

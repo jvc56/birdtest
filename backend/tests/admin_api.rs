@@ -1365,3 +1365,65 @@ async fn a_purged_job_rejoins_at_parity() {
     assert_eq!(shares.get(&steady.to_string()), Some(&10), "{shares:?}");
     assert_eq!(shares.get(&purged.to_string()), Some(&10), "{shares:?}");
 }
+
+/// Parity is with the jobs *being served*, not with every job on offer. A job
+/// can be active and above 0% and still stand still -- its derived files are
+/// building, the fleet cannot run it yet -- and its ratio does not move while
+/// the others' climb. Put level with that job, a newcomer was first in every
+/// candidate list until it had caught up with the jobs that were running: of
+/// the next twelve claims it took twelve, and the veteran none. A job counts as
+/// served when it issued a claim within the heartbeat timeout
+/// (`jobs.last_claimed_at`).
+#[tokio::test]
+async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let veteran = db.games_job(1, 2).await;
+    sqlx::query(
+        "UPDATE jobs SET claims_issued = 100000, allocation = 40, last_claimed_at = now()
+         WHERE id = $1",
+    )
+    .bind(veteran)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    // On offer, and out of this fleet's reach: a floor above what the workers
+    // run. It has issued nothing, so its ratio is zero and stays there.
+    let lagging = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET allocation = 20, min_magpie_major = 9 WHERE id = $1")
+        .bind(lagging)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let newcomer = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
+        .bind(newcomer)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{newcomer}/activate"), &borrowed, json!({ "allocation": 40 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let shares = claims_by_job(&app, 12).await;
+    assert_eq!(shares.get(&veteran.to_string()), Some(&6), "{shares:?}");
+    assert_eq!(shares.get(&newcomer.to_string()), Some(&6), "{shares:?}");
+
+    // And a claim is what marks a job as served.
+    let stamped: bool = sqlx::query_scalar(
+        "SELECT last_claimed_at > now() - interval '1 minute' FROM jobs WHERE id = $1",
+    )
+    .bind(newcomer)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(stamped, "issuing a claim stamps jobs.last_claimed_at");
+}

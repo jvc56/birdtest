@@ -341,18 +341,17 @@ async fn job_results(
                 .collect()
         }
         JobType::LeaveGeneration => {
-            // Newest generation first, and within a generation the racks
-            // furthest from target first: `generation DESC, occurrence_count
-            // ASC, rack ASC`. No index runs in that mixed order, so asked for in
-            // one statement it was a sort of every progress row the job has --
-            // 3.2 million a generation -- for each page of fifty, on a public
-            // route. Within *one* generation the order is exactly
-            // `leave_rack_progress_pick_idx`'s, so the page is read a generation
-            // at a time, newest first, each read a seek into that index: a page
-            // costs a page. `(job_id, generation, rack)` is the primary key, so
-            // the cursor's triple is unique and cannot land between two
-            // identical rows.
-            let (after_generation, after_count, after_rack) = leave_cursor(cursor.as_deref());
+            // Newest generation first, and within a generation by rack: the
+            // primary key's order, `(job_id, generation, rack)`, so each read is
+            // a seek into it and a page costs a page. The feed once ran
+            // furthest-from-target first (`occurrence_count`, then `rack`). No
+            // index held that order -- one statement for it sorted every
+            // progress row the job has, 4.0 s a page at one full-size
+            // generation, on a public route -- and an index that did hold it
+            // cost 160 MB a generation (see `leave_rack_progress_pick_idx`).
+            // By rack, a contributor can also find one. It is read a generation
+            // at a time because the two directions differ.
+            let (after_generation, after_rack) = leave_cursor(cursor.as_deref());
             let mut generation = match after_generation {
                 Some(generation) => Some(generation),
                 // One probe of the primary key's far end.
@@ -364,8 +363,9 @@ async fn job_results(
                 .await?,
             };
             // Where in the first generation read to resume; later ones are
-            // read from their start.
-            let mut seek = after_count.zip(after_rack);
+            // read from their start. `''` sorts before every rack, which keeps
+            // the comparison a bare index condition.
+            let mut after = after_rack.unwrap_or_default();
 
             let mut rows = Vec::new();
             while let Some(current) = generation.filter(|g| *g >= 1) {
@@ -373,47 +373,21 @@ async fn job_results(
                 if remaining <= 0 {
                     break;
                 }
-                // Two statements rather than one with an `IS NULL OR` guard: a
-                // row comparison is an index condition only when it stands
-                // alone, and as a filter every page would start at the top of
-                // the generation again.
-                let page = match seek.take() {
-                    Some((count, rack)) => {
-                        sqlx::query(
-                            "SELECT rack, generation, occurrence_count,
-                                    equity_sum / NULLIF(occurrence_count, 0) AS mean_equity,
-                                    updated_at
-                             FROM leave_rack_progress
-                             WHERE job_id = $1 AND generation = $2
-                               AND (occurrence_count, rack) > ($3, $4)
-                             ORDER BY occurrence_count ASC, rack ASC
-                             LIMIT $5",
-                        )
-                        .bind(id)
-                        .bind(current)
-                        .bind(count)
-                        .bind(rack)
-                        .bind(remaining)
-                        .fetch_all(&state.read_pool)
-                        .await?
-                    }
-                    None => {
-                        sqlx::query(
-                            "SELECT rack, generation, occurrence_count,
-                                    equity_sum / NULLIF(occurrence_count, 0) AS mean_equity,
-                                    updated_at
-                             FROM leave_rack_progress
-                             WHERE job_id = $1 AND generation = $2
-                             ORDER BY occurrence_count ASC, rack ASC
-                             LIMIT $3",
-                        )
-                        .bind(id)
-                        .bind(current)
-                        .bind(remaining)
-                        .fetch_all(&state.read_pool)
-                        .await?
-                    }
-                };
+                let page = sqlx::query(
+                    "SELECT rack, generation, occurrence_count,
+                            equity_sum / NULLIF(occurrence_count, 0) AS mean_equity,
+                            updated_at
+                     FROM leave_rack_progress
+                     WHERE job_id = $1 AND generation = $2 AND rack > $3
+                     ORDER BY rack ASC
+                     LIMIT $4",
+                )
+                .bind(id)
+                .bind(current)
+                .bind(std::mem::take(&mut after))
+                .bind(remaining)
+                .fetch_all(&state.read_pool)
+                .await?;
                 rows.extend(page);
                 generation = Some(current - 1);
             }
@@ -422,7 +396,6 @@ async fn job_results(
                 if let Some(last) = rows.last() {
                     next_cursor = Some(super::encode_cursor(&[
                         last.get::<i32, _>("generation").to_string(),
-                        last.get::<i64, _>("occurrence_count").to_string(),
                         last.get::<String, _>("rack"),
                     ]));
                 }
@@ -540,12 +513,10 @@ fn game_result_cursor(
     }
 }
 
-fn leave_cursor(cursor: Option<&[String]>) -> (Option<i32>, Option<i64>, Option<String>) {
+fn leave_cursor(cursor: Option<&[String]>) -> (Option<i32>, Option<String>) {
     match cursor {
-        Some([generation, count, rack]) => {
-            (generation.parse().ok(), count.parse().ok(), Some(rack.clone()))
-        }
-        _ => (None, None, None),
+        Some([generation, rack]) => (generation.parse().ok(), Some(rack.clone())),
+        _ => (None, None),
     }
 }
 

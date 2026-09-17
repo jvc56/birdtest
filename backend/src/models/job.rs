@@ -54,6 +54,9 @@ pub struct Job {
     /// the other jobs offering work on activation, on an allocation change and
     /// on a purge; see `scheduler::join_at_parity`.
     pub claims_baseline: i64,
+    /// When the job last issued a claim. What `scheduler::join_at_parity` reads
+    /// to tell a job being served from one that is only on offer.
+    pub last_claimed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Games recorded by the first accepted result of each task; the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.
