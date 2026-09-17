@@ -1,4 +1,5 @@
 use crate::auth::{api_key, csrf, CurrentUser};
+use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::models::user::ApiKeyRow;
 use crate::state::AppState;
@@ -85,7 +86,7 @@ async fn create_key(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<CreateKeyBody>,
+    ApiJson(body): ApiJson<CreateKeyBody>,
 ) -> AppResult<(StatusCode, Json<CreatedKey>)> {
     csrf::verify(&method, &headers, &jar)?;
 
@@ -136,7 +137,7 @@ async fn set_key_active(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<SetActiveBody>,
+    ApiJson(body): ApiJson<SetActiveBody>,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
 

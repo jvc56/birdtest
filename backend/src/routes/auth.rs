@@ -1,5 +1,6 @@
 use crate::auth::{api_key, csrf, session, CurrentUser};
 use crate::clientip::ClientIp;
+use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::ratelimit;
 use crate::state::AppState;
@@ -63,7 +64,7 @@ struct MessageBody {
 async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(body): Json<RegisterBody>,
+    ApiJson(body): ApiJson<RegisterBody>,
 ) -> AppResult<(StatusCode, Json<MessageBody>)> {
     ratelimit::check(&state.limits.register, &ip.to_string())?;
 
@@ -207,7 +208,7 @@ async fn login(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     jar: CookieJar,
-    Json(body): Json<LoginBody>,
+    ApiJson(body): ApiJson<LoginBody>,
 ) -> AppResult<(CookieJar, Json<LoginResponse>)> {
     // Both halves, like password reset: per IP bounds one guesser, per
     // username bounds many guessers aimed at one account. Checked before the
@@ -302,7 +303,7 @@ struct ConfirmEmailBody {
 
 async fn confirm_email(
     State(state): State<AppState>,
-    Json(body): Json<ConfirmEmailBody>,
+    ApiJson(body): ApiJson<ConfirmEmailBody>,
 ) -> AppResult<Json<MessageBody>> {
     let code_hash = api_key::hash_code(body.code.trim());
 
@@ -334,7 +335,7 @@ struct ResetRequestBody {
 async fn request_password_reset(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
-    Json(body): Json<ResetRequestBody>,
+    ApiJson(body): ApiJson<ResetRequestBody>,
 ) -> AppResult<Json<MessageBody>> {
     let email = body.email.trim().to_lowercase();
 
@@ -408,7 +409,7 @@ struct ResetConfirmBody {
 async fn confirm_password_reset(
     State(state): State<AppState>,
     jar: CookieJar,
-    Json(body): Json<ResetConfirmBody>,
+    ApiJson(body): ApiJson<ResetConfirmBody>,
 ) -> AppResult<(CookieJar, Json<MessageBody>)> {
     let entropy = zxcvbn::zxcvbn(&body.password, &[])
         .map_err(|e| AppError::bad_request(format!("could not score password: {e}")))?;

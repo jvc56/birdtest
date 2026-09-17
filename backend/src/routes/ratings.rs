@@ -7,6 +7,7 @@
 
 use crate::audit;
 use crate::auth::{csrf, AdminUser};
+use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::ratings::{self, Trigger};
 use crate::state::AppState;
@@ -326,7 +327,7 @@ async fn create_pool(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<CreatePoolBody>,
+    ApiJson(body): ApiJson<CreatePoolBody>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     csrf::verify(&method, &headers, &jar)?;
 
@@ -389,7 +390,7 @@ async fn add_member(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<MemberBody>,
+    ApiJson(body): ApiJson<MemberBody>,
 ) -> AppResult<Json<serde_json::Value>> {
     csrf::verify(&method, &headers, &jar)?;
 

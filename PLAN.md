@@ -3503,9 +3503,13 @@ a safe one — and `unsupported_jobs` is every job this worker has found it cann
 run, for any reason. It is attacker-controlled input flowing into a query, so it
 is capped at **200** entries and silently truncated past that (far above any
 honest client, since the list is bounded by the jobs a worker has actually been
-offered) and bound as an array rather than interpolated. A bodyless claim is
-rejected with an error that names the fix rather than a bare `422`, because that
-error is what a stale MAGPIE build will show a contributor after launch.
+offered) and bound as an array rather than interpolated. A claim whose body is
+missing, malformed or without `magpie_version` is rejected `400` with a message
+that names the fix — what to send, and that a MAGPIE which sends neither field
+predates the protocol and needs updating — rather than the parser's complaint
+alone, because that error is what a stale MAGPIE build will show a contributor
+after launch. (For a while it *was* a bare `422`, in plain text: the rejection
+came from the framework, before any handler ran.)
 
 `204` when there is no work right now — no body, so a request that arrived with no
 identity is not assigned a UUID here; it tries again with no identity next time,
@@ -3625,10 +3629,12 @@ pair.
                  "expected": "3e74af98...", "actual": null } ] }
 ```
 
-`204`. `reason` is `missing_data`, `magpie_version`, `unknown_job_type`, or
-`task_failed` — the worker ran the task and could not produce a result the server
-accepted;
-`missing` is present only for the first. `actual: null` means the file was not
+`204`. `reason` is `missing_data`, `magpie_version`, `unknown_job_type`,
+`derived_mismatch` — the worker built the wordmap or rack info table the job pins
+and got different bytes — or `task_failed` — the worker ran the task and could
+not produce a result the server accepted;
+`missing` is present for `missing_data` and `derived_mismatch`, where `actual`
+is the digest of what the worker built. `actual: null` means the file was not
 found at all, and a hex string means it was found with different content.
 
 The server derives the task and job from the token, releases the claim immediately
@@ -3965,14 +3971,25 @@ Every failure is JSON with the same shape, whatever the status:
 ```
 
 `code` is a stable machine-readable string (`bad_request`, `unauthorized`,
-`forbidden`, `not_found`, `conflict`, `rate_limited`, `unavailable`, `internal`)
-mapping one-to-one onto the status. `unavailable` is `503` with a `Retry-After`:
+`forbidden`, `not_found`, `conflict`, `payload_too_large`, `rate_limited`,
+`unavailable`, `internal`) mapping one-to-one onto the status. `unavailable` is `503` with a `Retry-After`:
 every connection of the pool asked was busy for the whole acquire timeout, or a
 display read outran its statement timeout (see [Two connection
 pools](#two-connection-pools)). That is load rather than a fault, and MAGPIE's
 client already backs off and retries a `5xx`. `fields` is omitted when empty and carries per-field
 messages so form endpoints can mark individual inputs. A `rate_limited`
 response also carries a `Retry-After` header in whole seconds.
+
+**A body that does not parse is answered in the same shape.** It never reaches
+a handler, so with axum's own `Json` extractor it was answered by axum: plain
+text, and three statuses — `400` malformed, `415` no content type, `422` wrong
+shape — that are not in the list above, which neither the frontend's error path
+nor MAGPIE's expects. Every JSON route takes its body through
+`extract::ApiJson`, whose rejection is this error type: `400 bad_request` naming
+what the parser found, or `413 payload_too_large` past the route's limit. The
+same extractor parses a body of 256 KiB or more on the blocking pool — a result
+may be 64 MiB, and that much parsing on an async worker thread is the stall
+described under [Exports](#exports).
 
 Server errors are logged at `error` and everything else at `debug`; the
 message a client sees is the same either way, and never includes a database
@@ -4542,6 +4559,8 @@ birdtest/
 │       ├── state.rs                # AppState shared by every handler
 │       ├── db.rs                   # the two pools (main, and the bounded display pool) and migrations
 │       ├── error.rs                # AppError type, IntoResponse impl
+│       ├── extract.rs              # ApiJson: the JSON body with AppError as its rejection,
+│       │                           # large bodies parsed on the blocking pool
 │       ├── version.rs              # semver parsing and comparison for the MAGPIE floor
 │       ├── compat.rs               # MAGPIE's lexicon/leaves/letter-distribution compatibility
 │       │                           # rules, ported to Rust — see Input Data

@@ -1,6 +1,7 @@
 use crate::audit;
 use crate::auth::{csrf, AdminUser};
 use crate::backups::{self, BackupStatus};
+use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::jobs::registry;
 use crate::models::job::{Job, JobStatus, JobType, PlayerConfig};
@@ -162,7 +163,7 @@ async fn start_import(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<StartImportBody>,
+    ApiJson(body): ApiJson<StartImportBody>,
 ) -> AppResult<(StatusCode, Json<StartedImport>)> {
     csrf::verify(&method, &headers, &jar)?;
 
@@ -499,7 +500,7 @@ async fn create_player_config(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<CreatePlayerConfigBody>,
+    ApiJson(body): ApiJson<CreatePlayerConfigBody>,
 ) -> AppResult<(StatusCode, Json<PlayerConfig>)> {
     csrf::verify(&method, &headers, &jar)?;
 
@@ -945,7 +946,7 @@ async fn create_job(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<CreateJobBody>,
+    ApiJson(body): ApiJson<CreateJobBody>,
 ) -> AppResult<(StatusCode, Json<CreatedJob>)> {
     csrf::verify(&method, &headers, &jar)?;
 
@@ -1486,7 +1487,7 @@ async fn activate_job(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<ActivateBody>,
+    ApiJson(body): ApiJson<ActivateBody>,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
 
@@ -2181,7 +2182,7 @@ async fn retry_derived_data(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<RetryDerivedBody>,
+    ApiJson(body): ApiJson<RetryDerivedBody>,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
     let reset = sqlx::query(
@@ -2398,7 +2399,7 @@ async fn ban_worker(
     method: Method,
     headers: HeaderMap,
     jar: CookieJar,
-    Json(body): Json<BanBody>,
+    ApiJson(body): ApiJson<BanBody>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     csrf::verify(&method, &headers, &jar)?;
 

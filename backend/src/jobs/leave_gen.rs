@@ -850,7 +850,7 @@ pub async fn seed_generation(
     generation: i32,
     distribution: &LetterDistribution,
 ) -> AppResult<i64> {
-    let index = RackIndex::new(distribution, RACK_SIZE);
+    let index = std::sync::Arc::new(RackIndex::new(distribution, RACK_SIZE));
     let total = index.total();
 
     // Idempotent: a universe already seeded (a seeding started twice) is left
@@ -878,11 +878,24 @@ pub async fn seed_generation(
         .await?;
     let mut start = 0;
     while start < total {
-        let mut rows = String::with_capacity(CHUNK as usize * 48);
-        for rack in index.racks_in_enumeration_range(start, CHUNK) {
-            rows.push_str(&format!("{job_id}\t{generation}\t{rack}\n"));
-        }
-        copy.send(rows.into_bytes()).await?;
+        // Built on the blocking pool: unranking and formatting fifty thousand
+        // racks is a burst of pure computation, sixty-four times over, and an
+        // async worker that does not yield can hold up every other request
+        // (see `exports::upload_rows`). Measured while a universe was seeded,
+        // `/health` went from 2 ms to as much as 1.3 s in a debug build.
+        let rows = {
+            let index = index.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut rows = String::with_capacity(CHUNK as usize * 48);
+                for rack in index.racks_in_enumeration_range(start, CHUNK) {
+                    rows.push_str(&format!("{job_id}\t{generation}\t{rack}\n"));
+                }
+                rows.into_bytes()
+            })
+            .await
+            .map_err(|e| AppError::internal(format!("enumerating a rack universe failed: {e}")))?
+        };
+        copy.send(rows).await?;
         start += CHUNK;
     }
     copy.finish().await?;

@@ -202,6 +202,13 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
 - `U-ERR-2` The serialized body always carries `code` and `message`, and
   `with_field` errors appear under `fields`.
 - `U-ERR-3` `rate_limited(n)` sets `Retry-After: n`, and never below 1.
+- `U-ERR-5` **A body that does not parse is an API error too**
+  (`extract::ApiJson`): no body, malformed JSON, the wrong shape, a missing
+  field and a missing content type are each `400 bad_request` in the
+  `{code, message}` shape; a body over the route's limit is `413
+  payload_too_large` in the same shape; and a body above the blocking-pool
+  threshold parses to the same value as one below it. *(Covered:
+  `extract::tests::*`.)*
 - `U-ERR-4` A `sqlx::Error` converted into `AppError` becomes a 500 whose public
   message does **not** contain the SQL string or the database URL. A leaked
   query in an error body is the failure this test exists for.
@@ -872,7 +879,11 @@ Write these as one table-driven test each rather than 50 separate functions.
 ### `A-WORKER-*` — `routes/worker.rs`
 
 - `A-WORKER-1` A claim with no body is rejected with a message naming the fix,
-  not a bare 422.
+  not a bare 422. *(Covered:
+  `worker_api::a_claim_without_a_usable_body_is_told_what_to_send` -- no body,
+  `{}`, a body without `magpie_version` and a body that is not JSON are each a
+  `400` in the API's error shape whose message names `magpie_version` and says
+  to update MAGPIE. Until the ninth audit this was axum's plain-text `422`.)*
 - `A-WORKER-2` A claim with a malformed `magpie_version` is rejected rather than
   assumed.
 - `A-WORKER-3` An `unsupported_jobs` list over 200 is **truncated, not

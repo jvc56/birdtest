@@ -1983,3 +1983,33 @@ async fn a_games_jobs_captured_positions_can_be_streamed_out() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
+
+/// PLAN.md singles this error out: a claim with no body is what a MAGPIE older
+/// than the contribute protocol sends, and the answer is what its contributor
+/// reads, so it has to name the fix. It was axum's own plain-text `422` --
+/// outside the API's error shape and its list of statuses, like every other
+/// body that failed to parse.
+#[tokio::test]
+async fn a_claim_without_a_usable_body_is_told_what_to_send() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+
+    for body in ["", "{}", "{\"unsupported_jobs\": []}", "not json"] {
+        let request = axum::http::Request::post("/api/worker/task")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let (status, answer) = send(&app, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}: {answer}");
+        assert_eq!(answer["code"], "bad_request", "{body:?}: {answer}");
+        let message = answer["message"].as_str().expect("a JSON error body");
+        assert!(message.contains("magpie_version"), "{message}");
+        assert!(message.contains("update MAGPIE"), "{message}");
+    }
+
+    // The same shape from a cookie-backed route.
+    let (status, answer) =
+        send(&app, post_json("/api/auth/login", &[], json!({ "username": 5 }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
+    assert_eq!(answer["code"], "bad_request", "{answer}");
+}

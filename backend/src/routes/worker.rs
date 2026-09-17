@@ -1,5 +1,6 @@
 use crate::audit;
 use crate::auth::WorkerIdentity;
+use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::jobs::handler::TaskRequest;
 use crate::jobstats;
@@ -156,9 +157,26 @@ struct ShutdownResponse {
 async fn claim_task(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    Json(body): Json<ClaimBody>,
+    body: Result<ApiJson<ClaimBody>, AppError>,
 ) -> AppResult<Response> {
     identity.check_rate_limit(&state)?;
+
+    // The one malformed request worth more than the generic answer. A claim
+    // with no body, or without `magpie_version`, is what a MAGPIE older than
+    // the contribute protocol sends, and this message is what its contributor
+    // is shown -- so it names the fix rather than the parser's complaint alone.
+    let ApiJson(body) = body.map_err(|err| {
+        AppError::new(
+            err.status,
+            err.code,
+            format!(
+                "a task claim must carry a JSON body stating `magpie_version` and \
+                 `unsupported_jobs`. A MAGPIE that sends neither predates this protocol: \
+                 update MAGPIE and start contribute again. ({})",
+                err.message
+            ),
+        )
+    })?;
 
     let mut unsupported_jobs = body.unsupported_jobs;
     unsupported_jobs.truncate(MAX_UNSUPPORTED_JOBS);
@@ -242,7 +260,7 @@ fn bounded(text: &str) -> String {
 async fn decline_task(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    Json(body): Json<DeclineBody>,
+    ApiJson(body): ApiJson<DeclineBody>,
 ) -> AppResult<StatusCode> {
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
@@ -345,7 +363,7 @@ struct HeartbeatBody {
 async fn heartbeat(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    Json(body): Json<HeartbeatBody>,
+    ApiJson(body): ApiJson<HeartbeatBody>,
 ) -> AppResult<StatusCode> {
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
@@ -381,7 +399,7 @@ struct ResultAck {
 async fn submit_result(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    Json(body): Json<ResultBody>,
+    ApiJson(body): ApiJson<ResultBody>,
 ) -> AppResult<Json<ResultAck>> {
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
