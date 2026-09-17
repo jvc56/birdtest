@@ -1795,6 +1795,13 @@ async fn purge_job(
     // leaving the seed cursor past zero and `claims_issued` at 1 on a job that
     // was supposed to start over. Taken before the census, so the numbers
     // written to the audit log are the ones actually destroyed.
+    //
+    // The merge lock comes first, before anything else is held: a merge of a
+    // leave job's staged results takes the staged rows and then the per-rack
+    // rows, the deletes below take them the other way round, and the two
+    // deadlocked -- see `leave_gen::lock_merges`. Every job type takes it; for
+    // the ones that stage nothing it is an uncontended lock.
+    crate::jobs::leave_gen::lock_merges(&mut tx, id).await?;
     crate::jobs::lock_job_dispatch(&mut tx, id).await?;
     // Before the job's row, for the lock order every submission uses: see
     // `lock_open_claims`.
@@ -1848,9 +1855,9 @@ async fn purge_job(
     // And the accepted results still waiting to be merged into it, with the
     // generations' summaries. Every open claim's submission has either
     // committed its staged row or is held off (`lock_open_claims`), so nothing
-    // staged for the old run survives to be folded into the new one. A merge
-    // running right now holds the rows it took; this waits for it, and then
-    // deletes what it wrote.
+    // staged for the old run survives to be folded into the new one. No merge
+    // is running: this transaction has held the job's merge lock since before
+    // it touched anything (`leave_gen::lock_merges`).
     sqlx::query("DELETE FROM leave_rack_staging WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -1926,7 +1933,9 @@ async fn delete_job(
     // claim and its commit when `release_contributions` counts -- see
     // `lock_open_claims`. The cascade below deletes every claim and task, so
     // without them this deadlocked against a submission in flight just as
-    // purge did.
+    // purge did. The merge lock first, as there: the cascade deletes a leave
+    // job's staged and per-rack rows in an order of its own.
+    crate::jobs::leave_gen::lock_merges(&mut tx, id).await?;
     crate::jobs::lock_job_dispatch(&mut tx, id).await?;
     lock_open_claims(&mut tx, id).await?;
     load_job_for_update(&mut tx, id).await?;

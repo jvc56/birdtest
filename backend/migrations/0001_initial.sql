@@ -1418,5 +1418,16 @@ CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);
 CREATE INDEX        audit_log_job_idx         ON audit_log (job_id);
 
 -- Drives claim-time rack selection: "the racks furthest from target in this generation".
+--
+-- `rack` is in the key because selection orders on `(occurrence_count, rack)`,
+-- and counts tie in their millions: every rack of a generation starts at zero,
+-- and most of the 3.2 million full racks are rare enough to stay there until
+-- they are forced. Without it the index could not supply the order, so every
+-- leave claim read the whole generation and sorted it to find its few hundred
+-- racks -- inside the job's dispatch lock. With it a claim walks the index from
+-- the lowest count and stops when it has enough; the cost no longer depends on
+-- the size of the universe (PLAN.md, "What these reads cost"). It costs a wider
+-- entry in an index every merge already rewrites, since `occurrence_count`
+-- changing is what a merge is.
 CREATE INDEX leave_rack_progress_pick_idx
-    ON leave_rack_progress (job_id, generation, occurrence_count);
+    ON leave_rack_progress (job_id, generation, occurrence_count, rack);

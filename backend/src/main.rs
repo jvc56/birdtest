@@ -124,6 +124,15 @@ async fn main() -> Result<()> {
         Err(err) => tracing::error!(error = %err.message, "could not reap orphaned exports"),
     }
 
+    // Likewise a leave-generation transition: it runs on a spawned task, so one
+    // left open belongs to a process that is gone, and the next claim should
+    // take it over now rather than after the half-hour takeover timeout.
+    match birdtest::jobs::leave_gen::release_orphaned_transitions(&state.pool).await {
+        Ok(0) => {}
+        Ok(n) => tracing::warn!(count = n, "released generation transitions left open by a restart"),
+        Err(err) => tracing::error!(error = %err.message, "could not release orphaned transitions"),
+    }
+
     // Rating fits run on a periodic sweep rather than on result submission: a
     // fit is global to a pool, an active job submits results far faster than
     // any rating needs to move, and nothing in the submission path waits on the

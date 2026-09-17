@@ -654,6 +654,15 @@ pub(super) async fn job_results_stream(
             crate::exports::export_query(job.job_type)
         };
 
+        // A completed leave job may still hold accepted results that no merge
+        // has folded into the rows about to be read (`exports::settle`); an
+        // active one is a moving target either way, and is left to its sweep.
+        if job.status == crate::models::job::JobStatus::Completed {
+            if let Err(err) = crate::exports::settle(&pool, &job).await {
+                tracing::error!(job_id = %id, error = %err.message, "settling a job before streaming it failed");
+            }
+        }
+
         let mut rows = sqlx::query(query).bind(id).fetch(&pool);
         while let Some(row) = rows.next().await {
             match row {

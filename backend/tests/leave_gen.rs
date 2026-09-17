@@ -1196,3 +1196,172 @@ async fn a_purge_discards_staged_results() {
     .unwrap();
     assert_eq!(left, (0, 0));
 }
+
+/// A merge takes the staged rows and then updates the per-rack rows; a purge
+/// deleted the per-rack rows and then the staged ones. Run together the two
+/// deadlocked -- the purge stopped on a rack the merge had updated, holding
+/// racks the merge had yet to reach -- and Postgres failed one of them: the
+/// purge, as a `500` with nothing deleted, or the merge. A purge (and a job
+/// delete) now takes the job's merge lock before anything else, so it waits
+/// for the merge holding nothing.
+///
+/// The merge here is played by hand on its own connection, so the test decides
+/// where it stops: it takes the lock `merge_staged` takes, the staged rows, and
+/// the generation's *last* rack; the purge starts; then it reaches for the
+/// *first* rack, which the old purge had already deleted on its way to the
+/// last.
+#[tokio::test]
+async fn a_purge_waits_for_a_running_merge_instead_of_deadlocking_with_it() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let app = birdtest::app(db.state().await);
+    play_one_task(&app, 5).await;
+
+    let racks: Vec<String> = sqlx::query_scalar(
+        "SELECT rack FROM leave_rack_progress WHERE job_id = $1 AND generation = 1 ORDER BY ctid",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let (first, last) = (racks.first().unwrap().clone(), racks.last().unwrap().clone());
+
+    let mut merge = db.pool.begin().await.unwrap();
+    birdtest::jobs::leave_gen::lock_merges(&mut merge, job).await.unwrap();
+    sqlx::query("DELETE FROM leave_rack_staging WHERE job_id = $1")
+        .bind(job)
+        .execute(&mut *merge)
+        .await
+        .unwrap();
+    let touch = "UPDATE leave_rack_progress SET occurrence_count = occurrence_count + 1
+                 WHERE job_id = $1 AND generation = 1 AND rack = $2";
+    sqlx::query(touch).bind(job).bind(&last).execute(&mut *merge).await.unwrap();
+
+    let mut request = axum::http::Request::post(format!("/api/admin/jobs/{job}/purge"));
+    for (name, value) in admin_headers(&cfg, admin) {
+        request = request.header(name, value);
+    }
+    let purge = {
+        let app = app.clone();
+        let request = request.body(axum::body::Body::empty()).unwrap();
+        tokio::spawn(async move { send(&app, request).await })
+    };
+    // Long enough for the purge to be waiting: on the merge lock now, on the
+    // last rack's row before.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!purge.is_finished(), "the purge did not wait for the merge");
+
+    sqlx::query(touch)
+        .bind(job)
+        .bind(&first)
+        .execute(&mut *merge)
+        .await
+        .expect("the merge deadlocked with the purge");
+    merge.commit().await.unwrap();
+
+    let (status, body) = purge.await.unwrap();
+    // The purge itself commits; rebuilding the generation-0 KLV afterwards
+    // needs an object store, which these tests do not have.
+    assert!(status == StatusCode::OK || status.is_server_error(), "{status}: {body}");
+    let left: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM tasks WHERE job_id = $1),
+                (SELECT COUNT(*) FROM leave_rack_progress WHERE job_id = $1)",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(left, (0, 0), "the purge was the deadlock's victim and deleted nothing");
+}
+
+/// A leave job's corpus is `leave_rack_progress`, and an accepted result only
+/// reaches it at a merge. A job force-completed mid-generation still holds what
+/// was staged -- until the half-hourly sweep -- so reading its corpus then
+/// (an export, or the admin stream a completed job falls back to) missed every
+/// result accepted since the last merge, and an export is what every later
+/// download is redirected to. A completed job's corpus is settled first.
+#[tokio::test]
+async fn a_completed_leave_jobs_corpus_includes_what_was_still_staged() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&cfg, admin);
+    let app = birdtest::app(db.state().await);
+    let forced = play_one_task(&app, 5).await;
+
+    let mut request = axum::http::Request::post(format!("/api/admin/jobs/{job}/complete"));
+    for (name, value) in &headers {
+        request = request.header(name.as_str(), value.as_str());
+    }
+    let (status, body) = send(&app, request.body(axum::body::Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, body) =
+        send(&app, get_request(&format!("/api/admin/jobs/{job}/results/stream"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let occurred: Vec<String> = body
+        .as_str()
+        .expect("an NDJSON body of more than one line")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|row| row["occurrence_count"].as_i64().unwrap() > 0)
+        .map(|row| row["rack"].as_str().unwrap().to_string())
+        .collect();
+    let (mut occurred, mut forced) = (occurred, forced);
+    occurred.sort();
+    forced.sort();
+    assert_eq!(occurred, forced, "the staged result is missing from the completed job's corpus");
+}
+
+/// A transition runs on a spawned task, so a deployment that lands inside one
+/// leaves its row open with nobody working on it, and the job handed out
+/// nothing until the half-hour takeover timeout. birdtest is a single instance
+/// whose old task stops before the new one starts, so at startup every open
+/// transition is an orphan -- like every `running` import and export -- and is
+/// handed to the next claim there and then.
+#[tokio::test]
+async fn a_restart_hands_an_open_transition_to_the_next_claim() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = 1000
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    assert!(matches!(next_step(&db, job).await, Step::Transition));
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::InProgress), "owned by the first claim: {step:?}");
+
+    // The process that owned it is gone.
+    let released = birdtest::jobs::leave_gen::release_orphaned_transitions(&db.pool).await.unwrap();
+    assert_eq!(released, 1);
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::Transition), "taken over at once: {step:?}");
+    let attempts: i32 = sqlx::query_scalar(
+        "SELECT attempts FROM leave_generation_transitions WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(attempts, 2, "and recorded as a takeover");
+
+    // A transition that finished is nobody's orphan.
+    sqlx::query(
+        "UPDATE leave_generation_transitions SET completed_at = now()
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let released = birdtest::jobs::leave_gen::release_orphaned_transitions(&db.pool).await.unwrap();
+    assert_eq!(released, 0);
+}

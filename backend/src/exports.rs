@@ -108,6 +108,28 @@ pub fn export_query(job_type: JobType) -> &'static str {
     }
 }
 
+/// Fold in whatever a leave-generation job still has staged, so that the rows
+/// an export or a stream is about to read are the job's whole corpus.
+///
+/// A leave job's corpus is `leave_rack_progress`, and an accepted result
+/// reaches that table only at a merge (`leave_gen::merge_staged`). A job whose
+/// last generation closed has nothing staged -- the transition drains first --
+/// but a job an admin **force-completed** mid-generation does: its claims
+/// already out are still played and still accepted, and their results sit in
+/// `leave_rack_staging` until the half-hourly sweep. An export started in that
+/// window read totals that were missing them, and every later download of the
+/// completed job is redirected to that export. The rule is the one `start`
+/// applies to claims still in flight: a completed job is exported once its
+/// results have settled, and for a leave job settled includes merged.
+///
+/// Waits for a merge already running. Nothing for any other job type.
+pub async fn settle(pool: &sqlx::PgPool, job: &Job) -> AppResult<()> {
+    if job.job_type == JobType::LeaveGeneration {
+        crate::jobs::leave_gen::merge_staged_for_job(pool, job.id, true).await?;
+    }
+    Ok(())
+}
+
 /// Start an export, returning its id. The work happens on a spawned task.
 ///
 /// Refuses a job that is not completed: an export of a job still taking results
@@ -258,6 +280,10 @@ async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> Ap
 /// Both are written before the row says `ready`, so a download never finds one
 /// without the other.
 async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
+    // Here rather than in `start`: a full-size merge is the best part of a
+    // minute, and this is the background task.
+    settle(&state.pool, job).await?;
+
     let key = format!("exports/{}/{export_id}.ndjson.gz", job.id);
     let results = upload_rows(state, &key, export_query(job.job_type), job.id).await?;
 

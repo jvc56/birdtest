@@ -246,6 +246,33 @@ async fn stage_fold(
 /// the rating fits' (2).
 const MERGE_LOCK_NAMESPACE: i32 = 3;
 
+/// Take `job_id`'s merge lock for the rest of the caller's transaction, waiting
+/// out a merge that is running.
+///
+/// [`merge_staged`] takes it, and so must anything else that writes both
+/// `leave_rack_staging` and `leave_rack_progress` for a job -- which is a purge
+/// and a job delete. A merge takes the staged rows first and then updates the
+/// per-rack rows, in whatever order its plan visits them; a purge deleted the
+/// per-rack rows first and the staged rows after. Run together, the purge
+/// stopped on a rack the merge had updated while holding racks the merge had
+/// yet to reach, and the merge then stopped on one of those: a deadlock, which
+/// Postgres breaks by failing one of the two -- the purge, as a `500` with
+/// nothing deleted, or the merge. A full-size merge runs for a minute or more,
+/// so that window is not small. Taken *before* the job's dispatch lock and
+/// before any row, the purge waits here holding nothing, and no merge starts
+/// until it has committed.
+///
+/// Nothing takes this lock while holding another, so it is first in the lock
+/// order everywhere it appears: merge, then dispatch, then claim, task, job.
+pub async fn lock_merges(conn: &mut PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+        .bind(MERGE_LOCK_NAMESPACE)
+        .bind(job_id)
+        .execute(conn)
+        .await?;
+    Ok(())
+}
+
 /// What one merge did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct MergeOutcome {
@@ -284,11 +311,7 @@ pub async fn merge_staged(
 ) -> AppResult<Option<MergeOutcome>> {
     let mut tx = pool.begin().await?;
     if wait {
-        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
-            .bind(MERGE_LOCK_NAMESPACE)
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?;
+        lock_merges(&mut tx, job_id).await?;
     } else {
         let taken: bool =
             sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, hashtext($2::text))")
@@ -488,6 +511,31 @@ impl TailMerges {
 /// prevent.
 const TRANSITION_TAKEOVER_AFTER: &str = "30 minutes";
 
+/// Startup: hand every transition a previous process left open to the next
+/// claim, instead of leaving it to the takeover timeout.
+///
+/// A transition runs on a spawned task and leaves no heartbeat, so its row is
+/// the only evidence it exists, and [`TRANSITION_TAKEOVER_AFTER`] is what
+/// covers a process that died part-way. But the ordinary way a process dies is
+/// a deployment, and birdtest runs as a single instance whose deployments stop
+/// the old task before starting the new one (PLAN.md, "Decisions settled
+/// before Phase 2") -- so at startup every open transition belongs to a process
+/// that is gone, exactly as every `running` import and export does, and
+/// waiting out the timeout left that job with nothing to hand out for half an
+/// hour after every deploy that happened to land inside one. Backdating
+/// `started_at` is the same hand-back a *failed* transition performs
+/// (`scheduler::run_leave_generation_transition`): the next claim takes it
+/// over through the usual path, and `attempts` records that it happened.
+pub async fn release_orphaned_transitions(pool: &sqlx::PgPool) -> AppResult<u64> {
+    Ok(sqlx::query(
+        "UPDATE leave_generation_transitions SET started_at = to_timestamp(0)
+         WHERE completed_at IS NULL AND started_at > to_timestamp(0)",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 /// Serialize this job's claim decisions against each other.
 ///
 /// Every read `next_step` makes -- which racks are below target, which are out
@@ -627,6 +675,23 @@ pub async fn next_step(
     // nobody has forced yet wait. Held out until the merge says what they
     // actually reached. A staged row's arrays are stored out of line, so
     // reading its `task_id` does not read them.
+    //
+    // **The shape of this statement is what keeps it off the whole
+    // generation.** It orders on `(occurrence_count, rack)`, which
+    // `leave_rack_progress_pick_idx` supplies, so the scan starts at the lowest
+    // count and stops once it has `racks_per_task` rows that pass the filter.
+    // Two details make that the plan rather than a hope. The index has to
+    // carry `rack`: counts tie in their millions (every rack starts at zero,
+    // and the rare ones stay there), and without it the order came from
+    // sorting every row below target -- a read of the whole 3.2-million-row
+    // generation on every leave claim, inside the dispatch lock. And the
+    // exclusion is `NOT IN` over an uncorrelated subquery, which Postgres
+    // evaluates as a *hashed subplan*: one pass to build it, one probe per
+    // index entry. Written as `NOT EXISTS` it is an anti-join, which the planner
+    // is free to run as a nested loop over the excluded racks -- and, misled by
+    // its fixed guess of ten elements per `unnest`, did: 3.5 s at a tenth of
+    // full size, against 9 ms this way. `NOT IN` is only safe with no NULL on
+    // its right-hand side, which the subquery guarantees for itself.
     let racks = sqlx::query_scalar::<_, String>(
         "WITH out_now AS (
              SELECT unnest(r.forced_racks) AS rack
@@ -642,7 +707,7 @@ pub async fn next_step(
          )
          SELECT p.rack FROM leave_rack_progress p
          WHERE p.job_id = $1 AND p.generation = $2 AND p.occurrence_count < $3
-           AND NOT EXISTS (SELECT 1 FROM out_now o WHERE o.rack = p.rack)
+           AND p.rack NOT IN (SELECT o.rack FROM out_now o WHERE o.rack IS NOT NULL)
          ORDER BY p.occurrence_count ASC, p.rack ASC
          LIMIT $4",
     )
