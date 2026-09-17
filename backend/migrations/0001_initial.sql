@@ -327,8 +327,9 @@ CREATE TABLE jobs (
     job_type   job_type NOT NULL,
     -- NULL until the job is first activated; set by the admin at activation
     -- time. Every active job's share of the fleet: the scheduler hands each
-    -- claim to the active job furthest behind `claims_issued / allocation`,
-    -- and the active jobs may allocate at most 100% between them. There is
+    -- claim to the active job furthest behind
+    -- `(claims_issued - claims_baseline) / allocation`, and the active jobs
+    -- may allocate at most 100% between them. There is
     -- no priority: a job that should get nothing for now is set to 0%, which
     -- is exactly what `inactive` means, and a job that should get everything
     -- is the only one above 0%.
@@ -380,6 +381,20 @@ CREATE TABLE jobs (
     -- time proportional to the job's whole history. Only ever incremented,
     -- except by a purge, which deletes the claims it counts.
     claims_issued   BIGINT NOT NULL DEFAULT 0 CHECK (claims_issued >= 0),
+    -- Where this job's share is measured *from*. The scheduler orders on
+    -- `(claims_issued - claims_baseline) / allocation`, and the baseline is
+    -- reset -- on activation, on an allocation change, on a purge -- so that
+    -- the job's ratio equals the lowest ratio among the other jobs offering
+    -- work: it joins at parity and takes its share from then on.
+    --
+    -- Without it the deficit was measured over a job's whole life, so a job
+    -- activated today beside one that had issued two million claims took
+    -- *every* claim until it had issued two million of its own, and the older
+    -- job got nothing for as long as that took; a purge (which zeroes
+    -- claims_issued) and a raised allocation did the same. May be negative: a
+    -- job with no claims yet joining a busy fleet is credited the claims that
+    -- put it level.
+    claims_baseline BIGINT NOT NULL DEFAULT 0,
     -- Progress totals the dashboard reads, maintained in the submit transaction
     -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
     -- incremented
@@ -625,6 +640,16 @@ CREATE TABLE job_exports (
     -- Rows written. Recorded so a later mismatch against the job is visible
     -- rather than silent -- the same reason the KLV artifacts carry a digest.
     row_count     BIGINT,
+    -- A games or game-pairs job that captured positions gets a second object
+    -- beside its results: the positions, each with its ranked moves, in the
+    -- shape an opening-rack export's lines have. All four are NULL for every
+    -- other export. A second artifact rather than tagged lines in the first,
+    -- so a consumer of a games job's results never meets a line of another
+    -- kind.
+    positions_artifact_key TEXT,
+    positions_bytes        BIGINT,
+    positions_sha256       TEXT,
+    positions_row_count    BIGINT,
     error         TEXT,
     requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
     requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -807,11 +832,13 @@ CREATE TABLE leave_requests (
     use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
 );
 
--- Live per-rack occurrence progress for each generation of a leave-gen job, one row per
+-- Per-rack occurrence progress for each generation of a leave-gen job, one row per
 -- full 7-tile rack the distribution can draw (3,199,724 for English), seeded at zero when
--- the generation opens. Updated transactionally on every accepted leave task result; drives
--- both generation-transition detection (all racks >= target) and the live dashboard figure.
--- Leave values are derived from these full-rack means as MAGPIE's rack_list_write_to_klv does.
+-- the generation opens. Updated by `leave_gen::merge_staged`, which folds the accepted
+-- results staged in `leave_rack_staging` below -- not by each submission; see there for why.
+-- Drives claim-time rack selection and generation-transition detection (all racks >= target,
+-- nothing in flight, nothing staged). Leave values are derived from these full-rack means as
+-- MAGPIE's rack_list_write_to_klv does.
 CREATE TABLE leave_rack_progress (
     job_id           UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     generation       INT NOT NULL,
@@ -820,6 +847,68 @@ CREATE TABLE leave_rack_progress (
     equity_sum       DOUBLE PRECISION NOT NULL DEFAULT 0,  -- occurrence_count-weighted; equity_sum / occurrence_count = mean
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (job_id, generation, rack)
+);
+
+-- Accepted leave results waiting to be folded into `leave_rack_progress`: one
+-- row per accepted task, its racks, counts and equity sums as three parallel
+-- arrays (compressed and stored out of line, so a 200,000-rack submission is a
+-- few megabytes and one insert).
+--
+-- A submission used to fold itself: an UPDATE over every rack its games drew,
+-- scattered uniformly across the 3.2 million rows above. Measured, that was
+-- 2.5-5.5 s inside the transaction the worker waits on, 147-409 MB of WAL per
+-- fold (the first touch of a page after a checkpoint writes the whole page),
+-- and no HOT update ever, because `occurrence_count` is indexed. Nothing needs
+-- the per-rack totals that promptly -- selection needs them roughly, closing a
+-- generation and building its KLV need them exactly but only then -- so a
+-- submission appends here and `leave_gen::merge_staged` folds everything
+-- staged in one pass: every half hour, when a claim finds the generation
+-- nearly done, and always before a generation closes.
+--
+-- `task_id` deliberately has no foreign key. A purge deletes every task of a
+-- job, Postgres runs a cascade once per deleted row, and there is no index on
+-- this column to serve one -- the shape that made two earlier purges scan a
+-- table per task. A purge deletes a job's staged rows itself, by `job_id`;
+-- deleting the job cascades through the index below.
+CREATE TABLE leave_rack_staging (
+    id          BIGSERIAL PRIMARY KEY,
+    job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation  INT NOT NULL,
+    -- Whose result this is. Claim-time selection holds the racks this task
+    -- forced out of play until the merge says what they reached.
+    task_id     UUID NOT NULL,
+    racks       TEXT[] NOT NULL,
+    counts      BIGINT[] NOT NULL,
+    equity_sums DOUBLE PRECISION[] NOT NULL,  -- count * mean, per rack
+    staged_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT leave_rack_staging_parallel_arrays CHECK (
+        cardinality(racks) = cardinality(counts)
+        AND cardinality(racks) = cardinality(equity_sums)
+    )
+);
+-- What a merge takes, what selection excludes, and the cascade from `jobs`.
+CREATE INDEX leave_rack_staging_job_idx ON leave_rack_staging (job_id, generation);
+
+-- One row per generation a leave job has opened: what the dashboard shows.
+--
+-- `tasks_completed` and `games_played` are live, bumped in the submit
+-- transaction. The rest is a summary of `leave_rack_progress` as of
+-- `merged_at`, recomputed by each merge while the rows are warm; counted on
+-- read it was a pass over the whole generation on every detail view and every
+-- live push. Seeded with `racks_total` when the generation's universe is
+-- written, so there is a denominator before the first merge.
+CREATE TABLE leave_generation_progress (
+    job_id          UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    generation      INT NOT NULL,
+    tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    games_played    BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
+    racks_total     BIGINT NOT NULL DEFAULT 0,
+    racks_at_target BIGINT NOT NULL DEFAULT 0,
+    -- The rack furthest from target, and its count. NULL until a merge.
+    min_rack        TEXT,
+    min_rack_count  BIGINT,
+    merged_at       TIMESTAMPTZ,
+    PRIMARY KEY (job_id, generation)
 );
 
 -- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
@@ -1049,8 +1138,9 @@ CREATE TABLE game_results (
 );
 
 -- One row per accepted leave task (a single worker's forced-rack partition of a generation).
--- The full {rack, count, mean} submission is folded into leave_rack_progress and not kept
--- separately — nothing reads it back, so there's no CSV artifact to reference here.
+-- The full {rack, count, mean} submission is staged in leave_rack_staging, folded into
+-- leave_rack_progress by the next merge, and not kept after that — nothing reads it back,
+-- so there's no CSV artifact to reference here.
 CREATE TABLE leave_records (
     task_claim_id   UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

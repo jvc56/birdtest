@@ -41,6 +41,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/results/stream", get(super::public::job_results_stream))
         .route("/jobs/:id/export", post(start_export).get(get_export))
         .route("/jobs/:id/rebuild-artifacts", post(rebuild_artifacts))
+        .route("/jobs/:id/merge-progress", post(merge_leave_progress))
         .route("/derived-data", get(list_derived_data))
         .route("/derived-data/retry", post(retry_derived_data))
         .route("/backups", get(backups))
@@ -1535,14 +1536,21 @@ async fn activate_job(
         )));
     }
 
-    let updated = sqlx::query_as::<_, Job>(
-        "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now()
-         WHERE id = $2 RETURNING *",
-    )
-    .bind(body.allocation)
-    .bind(id)
-    .fetch_one(&mut *tx)
-    .await?;
+    sqlx::query("UPDATE jobs SET status = 'active', allocation = $1, activated_at = now() WHERE id = $2")
+        .bind(body.allocation)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // The job joins the others level with the one furthest behind, rather
+    // than with a lifetime deficit to work off at their expense. Activation is
+    // also how an allocation is changed, and a new allocation rescales the
+    // ratio, so this runs every time. Under the activation lock, so two jobs
+    // activated together each see the other or neither.
+    crate::scheduler::join_at_parity(&mut tx, id).await?;
+    let updated = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     audit::log_status_change(
         &mut tx,
@@ -1643,6 +1651,7 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
                WHERE t.job_id = $1)                                                AS leave_records,
              (SELECT count(*) FROM position_analysis_records WHERE job_id = $1)     AS positions,
              (SELECT count(*) FROM leave_rack_progress WHERE job_id = $1)          AS rack_progress,
+             (SELECT count(*) FROM leave_rack_staging WHERE job_id = $1)           AS staged_results,
              (SELECT count(*) FROM leave_generation_artifacts WHERE job_id = $1)   AS artifacts",
     )
     .bind(job_id)
@@ -1651,13 +1660,14 @@ async fn job_census(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<St
 
     Ok(format!(
         "tasks={} claims={} game_results={} leave_records={} positions={} \
-rack_progress={} artifacts={}",
+rack_progress={} staged_results={} artifacts={}",
         row.get::<i64, _>("tasks"),
         row.get::<i64, _>("claims"),
         row.get::<i64, _>("game_results"),
         row.get::<i64, _>("leave_records"),
         row.get::<i64, _>("positions"),
         row.get::<i64, _>("rack_progress"),
+        row.get::<i64, _>("staged_results"),
         row.get::<i64, _>("artifacts"),
     ))
 }
@@ -1828,7 +1838,24 @@ async fn purge_job(
     .bind(id)
     .execute(&mut *tx)
     .await?;
+    // A job back at zero claims would otherwise be first in every candidate
+    // list until it had re-issued as many as the jobs beside it.
+    crate::scheduler::join_at_parity(&mut tx, id).await?;
     sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // And the accepted results still waiting to be merged into it, with the
+    // generations' summaries. Every open claim's submission has either
+    // committed its staged row or is held off (`lock_open_claims`), so nothing
+    // staged for the old run survives to be folded into the new one. A merge
+    // running right now holds the rows it took; this waits for it, and then
+    // deletes what it wrote.
+    sqlx::query("DELETE FROM leave_rack_staging WHERE job_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM leave_generation_progress WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -1946,6 +1973,7 @@ async fn delete_job(
     state.derived_ready.forget(id);
     state.templates.forget(id);
     state.finish_checks.forget(id);
+    state.leave_merges.forget(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1960,6 +1988,11 @@ struct ExportRow {
     bytes: Option<i64>,
     sha256: Option<String>,
     row_count: Option<i64>,
+    /// Set for a games or game-pairs job that captured positions, whose
+    /// export has a second object holding them.
+    positions_bytes: Option<i64>,
+    positions_sha256: Option<String>,
+    positions_row_count: Option<i64>,
     error: Option<String>,
     requested_at: chrono::DateTime<chrono::Utc>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -1973,6 +2006,9 @@ struct ExportDetail {
     /// object directly, so the bytes never pass through this process.
     #[serde(skip_serializing_if = "Option::is_none")]
     download_url: Option<String>,
+    /// The same for the captured positions, when the export has them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    positions_download_url: Option<String>,
 }
 
 /// Build a completed job's results into one downloadable artifact.
@@ -2017,7 +2053,8 @@ async fn get_export(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ExportDetail>> {
     let export = sqlx::query_as::<_, ExportRow>(
-        "SELECT id, state, bytes, sha256, row_count, error, requested_at, completed_at
+        "SELECT id, state, bytes, sha256, row_count, positions_bytes, positions_sha256,
+                positions_row_count, error, requested_at, completed_at
          FROM job_exports WHERE job_id = $1
          ORDER BY requested_at DESC LIMIT 1",
     )
@@ -2026,17 +2063,21 @@ async fn get_export(
     .await?
     .ok_or_else(|| AppError::not_found("this job has never been exported"))?;
 
-    let download_url = match crate::exports::newest_ready(&state.pool, id).await? {
-        Some((ready_id, key)) if ready_id == export.id => Some(
-            state
-                .artifacts
-                .presigned_get(&key, crate::exports::DOWNLOAD_URL_TTL)
-                .await?,
-        ),
-        _ => None,
-    };
+    let (download_url, positions_download_url) =
+        match crate::exports::newest_ready(&state.pool, id).await? {
+            Some(ready) if ready.id == export.id => {
+                let ttl = crate::exports::DOWNLOAD_URL_TTL;
+                let results = state.artifacts.presigned_get(&ready.artifact_key, ttl).await?;
+                let positions = match &ready.positions_artifact_key {
+                    Some(key) => Some(state.artifacts.presigned_get(key, ttl).await?),
+                    None => None,
+                };
+                (Some(results), positions)
+            }
+            _ => (None, None),
+        };
 
-    Ok(Json(ExportDetail { export, download_url }))
+    Ok(Json(ExportDetail { export, download_url, positions_download_url }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2168,6 +2209,30 @@ struct RebuildQuery {
     /// is not on its own a reason to overwrite.
     #[serde(default)]
     force: bool,
+}
+
+/// Fold a leave-generation job's staged results into its per-rack totals now,
+/// rather than at the next half-hourly sweep.
+///
+/// Nothing needs this: claims ask for a merge themselves near a generation's
+/// end and a transition drains before it reads. It is for an admin who wants
+/// the page's "racks at target" to be current, and for the end-to-end suite,
+/// which asserts on the merged rows. Waits for a merge already running, so the
+/// answer describes a generation with nothing staged behind it.
+async fn merge_leave_progress(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> AppResult<Json<crate::jobs::leave_gen::MergeOutcome>> {
+    csrf::verify(&method, &headers, &jar)?;
+    let job = crate::jobstats::load_job(&state.pool, id).await?;
+    if job.job_type != JobType::LeaveGeneration {
+        return Err(AppError::bad_request("only a leave-generation job stages results"));
+    }
+    Ok(Json(crate::jobs::leave_gen::merge_staged_for_job(&state.pool, id, true).await?))
 }
 
 /// Recompute a leave-generation job's KLVs from `leave_rack_progress` and

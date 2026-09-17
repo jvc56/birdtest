@@ -74,6 +74,25 @@ const OPENING_RACK_CORPUS: &str = "
     FROM position_analysis_records r
     WHERE r.job_id = $1";
 
+/// The positions a games or game-pairs job captured while playing
+/// (`capture_positions`), in the same shape as an opening-rack line: the record
+/// -- here with its CGP, game index and turn number -- and its ranked moves.
+/// Every `position_analysis_records` row of such a job is a captured position,
+/// so the corpus query serves unchanged.
+///
+/// A second artifact rather than tagged lines in the first: a games job's
+/// export has always been its result rows, one shape per file, and a consumer
+/// of that file should not start meeting lines of another kind. The corpus
+/// capture exists to build had no way out of the database before this.
+pub fn positions_query() -> &'static str {
+    OPENING_RACK_CORPUS
+}
+
+/// Whether a job type can have captured positions beside its results.
+pub fn may_capture_positions(job_type: JobType) -> bool {
+    matches!(job_type, JobType::Games | JobType::GamePairs)
+}
+
 /// The rows an export contains, per job type. The live stream
 /// (`routes::public::job_results_stream`) runs the same queries, so the two
 /// produce the same corpus.
@@ -168,16 +187,22 @@ async fn run(state: AppState, job: Job, export_id: Uuid) {
     }
 }
 
-/// Stream the job's rows out as gzipped NDJSON, straight into a multipart
-/// upload.
+/// What one uploaded artifact turned out to be.
+struct Uploaded {
+    bytes: i64,
+    sha256: String,
+    rows: i64,
+}
+
+/// Stream one query's rows out as gzipped NDJSON, straight into a multipart
+/// upload at `key`.
 ///
 /// Nothing larger than one part is ever resident: rows are read from a cursor,
 /// written through the encoder, and flushed to S3 whenever the compressed
 /// buffer reaches a part. That is what lets this run against a job whose
 /// results do not fit in memory, which is every job worth exporting.
-async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
-    let key = format!("exports/{}/{export_id}.ndjson.gz", job.id);
-    let mut upload = state.artifacts.start_multipart(&key).await?;
+async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> AppResult<Uploaded> {
+    let mut upload = state.artifacts.start_multipart(key).await?;
 
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     let mut hasher = Sha256::new();
@@ -185,7 +210,7 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
     let mut rows_written: i64 = 0;
 
     let result = async {
-        let mut rows = sqlx::query(export_query(job.job_type)).bind(job.id).fetch(&state.pool);
+        let mut rows = sqlx::query(sql).bind(job_id).fetch(&state.pool);
         while let Some(row) = rows.try_next().await? {
             let value: serde_json::Value = row.get("row");
             writeln!(encoder, "{value}")
@@ -223,6 +248,36 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
         return Err(err);
     }
     upload.finish().await?;
+    Ok(Uploaded { bytes, sha256: hex::encode(hasher.finalize()), rows: rows_written })
+}
+
+/// Build the export's artifacts and mark the row ready.
+///
+/// One artifact for every job type -- its result rows -- and a second for a
+/// games or game-pairs job that captured positions: see [`positions_query`].
+/// Both are written before the row says `ready`, so a download never finds one
+/// without the other.
+async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
+    let key = format!("exports/{}/{export_id}.ndjson.gz", job.id);
+    let results = upload_rows(state, &key, export_query(job.job_type), job.id).await?;
+
+    // Asked of the rows rather than of the job's `capture_positions` setting:
+    // what matters is whether there is anything to export, and a capture job
+    // nobody contributed positions to should not grow an empty artifact.
+    let captured = may_capture_positions(job.job_type)
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM position_analysis_records WHERE job_id = $1)",
+        )
+        .bind(job.id)
+        .fetch_one(&state.pool)
+        .await?;
+    let positions = if captured {
+        let positions_key = format!("exports/{}/{export_id}.positions.ndjson.gz", job.id);
+        let uploaded = upload_rows(state, &positions_key, positions_query(), job.id).await?;
+        Some((positions_key, uploaded))
+    } else {
+        None
+    };
 
     // Guarded on `running`, like the import's: a process starting while this
     // one works reaps rows left `running` as failed, and a rolling deployment
@@ -232,29 +287,48 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
     sqlx::query(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
-             row_count = $5, completed_at = now()
+             row_count = $5, positions_artifact_key = $6, positions_bytes = $7,
+             positions_sha256 = $8, positions_row_count = $9, completed_at = now()
          WHERE id = $1 AND state = 'running'",
     )
     .bind(export_id)
     .bind(&key)
-    .bind(bytes)
-    .bind(hex::encode(hasher.finalize()))
-    .bind(rows_written)
+    .bind(results.bytes)
+    .bind(&results.sha256)
+    .bind(results.rows)
+    .bind(positions.as_ref().map(|(key, _)| key.as_str()))
+    .bind(positions.as_ref().map(|(_, p)| p.bytes))
+    .bind(positions.as_ref().map(|(_, p)| p.sha256.as_str()))
+    .bind(positions.as_ref().map(|(_, p)| p.rows))
     .execute(&state.pool)
     .await?;
     Ok(())
 }
 
+/// A ready export's objects.
+pub struct ReadyExport {
+    pub id: Uuid,
+    pub artifact_key: String,
+    /// The captured positions' artifact, for a games or game-pairs job that
+    /// captured any.
+    pub positions_artifact_key: Option<String>,
+}
+
 /// The newest ready export for a job, if there is one.
-pub async fn newest_ready(pool: &sqlx::PgPool, job_id: Uuid) -> AppResult<Option<(Uuid, String)>> {
-    Ok(sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id, artifact_key FROM job_exports
+pub async fn newest_ready(pool: &sqlx::PgPool, job_id: Uuid) -> AppResult<Option<ReadyExport>> {
+    Ok(sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+        "SELECT id, artifact_key, positions_artifact_key FROM job_exports
          WHERE job_id = $1 AND state = 'ready' AND artifact_key IS NOT NULL
          ORDER BY requested_at DESC LIMIT 1",
     )
     .bind(job_id)
     .fetch_optional(pool)
-    .await?)
+    .await?
+    .map(|(id, artifact_key, positions_artifact_key)| ReadyExport {
+        id,
+        artifact_key,
+        positions_artifact_key,
+    }))
 }
 
 /// Drop a job's exports and the objects behind them.
@@ -263,17 +337,15 @@ pub async fn newest_ready(pool: &sqlx::PgPool, job_id: Uuid) -> AppResult<Option
 /// saying `ready` would then hand an admin a stable-looking artifact of a job
 /// that no longer holds any of it, which is worse than no export at all.
 pub async fn purge(state: &AppState, job_id: Uuid) -> AppResult<()> {
-    let keys: Vec<String> = sqlx::query_scalar(
-        "DELETE FROM job_exports WHERE job_id = $1 AND artifact_key IS NOT NULL
-         RETURNING artifact_key",
+    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+        "DELETE FROM job_exports WHERE job_id = $1
+         RETURNING artifact_key, positions_artifact_key",
     )
     .bind(job_id)
     .fetch_all(&state.pool)
     .await?;
-    sqlx::query("DELETE FROM job_exports WHERE job_id = $1")
-        .bind(job_id)
-        .execute(&state.pool)
-        .await?;
+    let keys: Vec<String> =
+        rows.into_iter().flat_map(|(results, positions)| [results, positions]).flatten().collect();
 
     // Off the request, because purge is a synchronous admin call and this is
     // best-effort cleanup of derived data: the rows are already gone, so an

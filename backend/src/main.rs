@@ -96,6 +96,7 @@ async fn main() -> Result<()> {
         finish_checks: Default::default(),
         derived_ready: Default::default(),
         templates: Default::default(),
+        leave_merges: Default::default(),
         limits: ratelimit::RateLimiters::new(),
         mailer: email::Mailer::new(cfg.clone()).await,
         artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,
@@ -196,6 +197,29 @@ async fn main() -> Result<()> {
                     Ok(n) => tracing::info!(runs = n, "thinned old rating runs"),
                     Err(err) => {
                         tracing::error!(error = %err.message, "thinning old rating runs failed")
+                    }
+                }
+            }
+        });
+    }
+
+    // Accepted leave results are staged by the submit path and folded into the
+    // per-rack totals here, in one pass per job, rather than by every
+    // submission; see `leave_gen::stage_fold` for what that saves. Claims ask
+    // for a merge themselves near a generation's end, and a transition drains
+    // before it reads, so this interval sets write volume and dashboard lag
+    // and nothing else.
+    {
+        let db = state.pool.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(birdtest::jobs::leave_gen::MERGE_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match birdtest::jobs::leave_gen::merge_all_staged(&db).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::error!(error = %err.message, "merging staged leave results failed")
                     }
                 }
             }

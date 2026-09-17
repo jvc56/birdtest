@@ -161,10 +161,15 @@ export interface JobStats {
     current_generation: number;
     generation_count: number;
     target_rack_count: number;
+    /** Live: accepted tasks of the in-progress generation, and the games they played. */
+    tasks_completed: number;
+    games_played: number;
+    /** As of `progress_as_of`: accepted results are merged into the rack totals in batches. */
     racks_at_target: number;
     racks_total: number;
     min_rack: string | null;
     min_rack_count: number | null;
+    progress_as_of: string | null;
   };
   workers: {
     user_id: string | null;
@@ -325,11 +330,20 @@ export interface JobExport {
   bytes: number | null;
   sha256: string | null;
   row_count: number | null;
+  /**
+   * A games or game-pairs job that captured positions has a second object
+   * holding them, each with its ranked moves. Null for every other export.
+   */
+  positions_bytes: number | null;
+  positions_sha256: string | null;
+  positions_row_count: number | null;
   error: string | null;
   requested_at: string;
   completed_at: string | null;
   /** Present once ready: a presigned URL, valid for an hour, that fetches the object directly. */
   download_url?: string;
+  /** The same for the captured positions, when the export has them. */
+  positions_download_url?: string;
 }
 
 export interface ArtifactRebuild {
@@ -451,6 +465,11 @@ export const api = {
     post<{ id: string; state: string }>(`/api/admin/jobs/${id}/export`),
   /** The newest export; `404` when the job has never been exported. */
   jobExport: (id: string) => get<JobExport>(`/api/admin/jobs/${id}/export`),
+  /** Leave generation: fold staged results into the rack totals now rather than at the next sweep. */
+  mergeLeaveProgress: (id: string) =>
+    post<{ folds_merged: number; racks_updated: number }>(
+      `/api/admin/jobs/${id}/merge-progress`
+    ),
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>

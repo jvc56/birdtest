@@ -31,6 +31,11 @@ pub enum Acquired {
     /// been written yet. It is seeded on its own task, and the job has nothing
     /// to hand out until that commits.
     NeedsUniverse { generation: i32 },
+    /// Leave generation only: nothing is left to hand out or in flight, but
+    /// accepted results are still staged, so whether the generation is complete
+    /// is not yet known. The caller merges them, off the request; this job has
+    /// nothing to hand out until the next claim looks again.
+    NeedsLeaveMerge { generation: i32 },
     /// Leave generation only: all configured generations are done.
     JobFinished,
 }
@@ -297,6 +302,9 @@ async fn generate_leave_gen(
         }
         leave_gen::LeaveGenStep::Transition { generation } => {
             Ok(Acquired::NeedsGenerationTransition { generation })
+        }
+        leave_gen::LeaveGenStep::NeedsMerge { generation } => {
+            Ok(Acquired::NeedsLeaveMerge { generation })
         }
         leave_gen::LeaveGenStep::Finished => Ok(Acquired::JobFinished),
         // Another worker's request is aggregating the generation. This one has

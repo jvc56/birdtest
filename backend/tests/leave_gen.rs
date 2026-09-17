@@ -135,8 +135,10 @@ async fn racks_out_with_an_open_claim_are_not_handed_out_again() {
     }
 }
 
-/// A submission adds to its racks' rows, and a rack that is not a full rack of
-/// the distribution neither counts nor creates a row.
+/// A submission is staged, and a merge adds it to its racks' rows; a rack that
+/// is not a full rack of the distribution neither counts nor creates a row. The
+/// submission itself touches no per-rack row: folding in the submit transaction
+/// was seconds of random-access writes and hundreds of megabytes of WAL.
 #[tokio::test]
 async fn a_result_folds_into_the_generation_and_creates_no_rows() {
     let db = TestDb::new().await;
@@ -167,16 +169,65 @@ async fn a_result_folds_into_the_generation_and_creates_no_rows() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let (count, sum): (i64, f64) = sqlx::query_as(
-        "SELECT occurrence_count, equity_sum FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = 1 AND rack = $2",
+    let progress = || async {
+        sqlx::query_as::<_, (i64, f64)>(
+            "SELECT occurrence_count, equity_sum FROM leave_rack_progress
+             WHERE job_id = $1 AND generation = 1 AND rack = $2",
+        )
+        .bind(job)
+        .bind(&racks[0])
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    // Accepted and staged, with the generation's live counters moved -- and
+    // no per-rack row written by the submission.
+    assert_eq!(progress().await, (0, 0.0));
+    let staged: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(staged, 1);
+    let live: (i64, i64) = sqlx::query_as(
+        "SELECT tasks_completed, games_played FROM leave_generation_progress
+         WHERE job_id = $1 AND generation = 1",
     )
     .bind(job)
-    .bind(&racks[0])
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!((count, sum), (3, 30.0));
+    assert_eq!(live, (1, 100), "one task of the job's 100 games");
+
+    let merged = birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!((merged.folds_merged, merged.racks_updated), (1, 2), "ZZZZZZZ updates nothing");
+    assert_eq!(progress().await, (3, 30.0));
+    let staged: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(staged, 0, "a merged result is no longer staged");
+    // A second merge finds nothing and changes nothing.
+    let again = birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap().unwrap();
+    assert_eq!(again.folds_merged, 0);
+    assert_eq!(progress().await, (3, 30.0));
+
+    // The summary the dashboard reads was refreshed by the merge.
+    let summary: (i64, i64, Option<i64>, bool) = sqlx::query_as(
+        "SELECT racks_total, racks_at_target, min_rack_count, merged_at IS NOT NULL
+         FROM leave_generation_progress WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(summary, (seeded, 0, Some(0), true));
 
     let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_progress WHERE job_id = $1")
         .bind(job)
@@ -329,6 +380,14 @@ async fn a_result_for_a_closed_generation_is_credited_but_not_folded() {
     .await
     .unwrap();
     assert_eq!(count, 0, "a closed generation's totals are frozen");
+    // Not by waiting for a merge, either: nothing was staged for it.
+    let staged: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(staged, 0, "a result for a closed generation is not staged");
 
     let credited: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id
@@ -433,6 +492,7 @@ async fn a_transition_that_never_finished_is_taken_over() {
 enum Step {
     Transition,
     InProgress,
+    NeedsMerge,
     Other,
 }
 
@@ -460,6 +520,7 @@ async fn next_step(db: &TestDb, job: Uuid) -> Step {
     let step = match step {
         LeaveGenStep::Transition { .. } => Step::Transition,
         LeaveGenStep::TransitionInProgress { .. } => Step::InProgress,
+        LeaveGenStep::NeedsMerge { .. } => Step::NeedsMerge,
         _ => Step::Other,
     };
     tx.commit().await.unwrap();
@@ -823,6 +884,7 @@ async fn only_the_first_result_for_a_leave_task_is_folded() {
         assert_eq!(body["accepted"], json!(true));
     }
 
+    birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap();
     let count: i64 = sqlx::query_scalar(
         "SELECT occurrence_count FROM leave_rack_progress
          WHERE job_id = $1 AND generation = 1 AND rack = $2",
@@ -880,18 +942,19 @@ async fn generation_ones_universe_is_seeded_by_the_first_claim_too() {
     assert_eq!(assignment["task_request"]["generation"], json!(1));
 }
 
-/// Bug: submissions for different tasks of one generation serialize on
-/// nothing, and they fold into overlapping `leave_rack_progress` rows -- every
-/// game draws common racks. The fold's UPDATE locked rows in the order its plan
-/// visited them, so two submissions could each hold a rack the other needed,
-/// and Postgres failed one with a deadlock. Locked in rack order, the second
-/// submission waits holding nothing.
-///
-/// Deterministic: submission A has already folded the lower rack when B folds
-/// both, listing the higher first; A then touches the higher rack. Taken in
-/// B's order that is a cycle.
+/// Submissions for different tasks of one generation overlap on every commonly
+/// drawn rack. When each folded itself into `leave_rack_progress` they
+/// contended for those rows -- first by deadlocking (an UPDATE locks rows in
+/// whatever order its plan visits them), then, once the rows were locked in
+/// rack order, by queueing behind each other for the seconds a fold took. A
+/// submission now appends one staged row and touches no per-rack row at all.
+/// The one thing two of them share is the generation's counter row, a
+/// single-row update the second waits for exactly as it waits for the job's own
+/// counters a statement later -- so with both transactions open at once and
+/// the racks named in opposite orders, neither fails, and the merge that
+/// follows counts both.
 #[tokio::test]
-async fn overlapping_leave_submissions_wait_instead_of_deadlocking() {
+async fn overlapping_leave_submissions_do_not_wait_on_each_other() {
     use birdtest::jobs::handler::{JobHandler, LeaveRecord, RackOccurrence};
     use birdtest::jobs::leave_gen::LeaveGenHandler;
 
@@ -924,36 +987,6 @@ async fn overlapping_leave_submissions_wait_instead_of_deadlocking() {
     let (low, high) = (racks[0].clone(), racks[1].clone());
     let occurrence = |rack: &str| RackOccurrence { rack: rack.to_string(), count: 1, mean: 2.0 };
 
-    // Give the lower rack's row a later physical position than the higher
-    // rack's. An unordered UPDATE then reaches the higher rack first however it
-    // is planned -- a scan in heap order, or a loop over B's list, which names
-    // the higher rack first -- so without the ordered lock B holds the higher
-    // rack while it waits for the lower one, which is the cycle this pins.
-    sqlx::query(
-        "UPDATE leave_rack_progress SET updated_at = now()
-         WHERE job_id = $1 AND generation = 1 AND rack = $2",
-    )
-    .bind(job)
-    .bind(&low)
-    .execute(&db.pool)
-    .await
-    .unwrap();
-    let low_after_high: bool = sqlx::query_scalar(
-        "SELECT (SELECT ctid FROM leave_rack_progress
-                 WHERE job_id = $1 AND generation = 1 AND rack = $2)
-              > (SELECT ctid FROM leave_rack_progress
-                 WHERE job_id = $1 AND generation = 1 AND rack = $3)",
-    )
-    .bind(job)
-    .bind(&low)
-    .bind(&high)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert!(low_after_high, "the precondition this test relies on did not hold");
-
-    // The handler takes the job's template rather than its id, the way the
-    // submit path hands it in.
     let job_row = sqlx::query_as::<_, birdtest::models::job::Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(job)
         .fetch_one(&db.pool)
@@ -963,69 +996,36 @@ async fn overlapping_leave_submissions_wait_instead_of_deadlocking() {
     let template = birdtest::jobs::dispatch::JobTemplate::load(&mut conn, &job_row).await.unwrap();
     drop(conn);
 
+    // Both transactions open at once, naming the same racks in opposite
+    // orders -- the shape that used to be a lock cycle.
     let mut a = db.pool.begin().await.unwrap();
     LeaveGenHandler::insert_record(
         &mut a, &template, claims[0].1, claims[0].0,
-        &LeaveRecord { racks: vec![occurrence(&low)] },
+        &LeaveRecord { racks: vec![occurrence(&low), occurrence(&high)] },
     )
     .await
     .unwrap();
 
     let mut b = db.pool.begin().await.unwrap();
-    // Planned from the primary key `(job_id, generation, rack)`, an unordered
-    // UPDATE happens to take rows in rack order, and on a small table it is.
-    // Nothing guarantees that plan -- a heap scan or a loop over the submitted
-    // list are equally valid, and the choice moves with table statistics -- so
-    // B is made to read the table without its indexes, which is the order the
-    // deadlock needs. The ordered lock holds under either plan: it sorts before
-    // it locks.
-    sqlx::query("SET LOCAL enable_indexscan = off")
-        .execute(&mut *b)
-        .await
-        .unwrap();
-    sqlx::query("SET LOCAL enable_bitmapscan = off")
-        .execute(&mut *b)
-        .await
-        .unwrap();
     let b_record = LeaveRecord { racks: vec![occurrence(&high), occurrence(&low)] };
-    let b_fold = async {
+    let b_stage = async {
         LeaveGenHandler::insert_record(&mut b, &template, claims[1].1, claims[1].0, &b_record).await
     };
-    let waiter_pool = db.pool.clone();
-    let high_for_a = high.clone();
     let a_finish = async move {
-        // B is now waiting on a rack A holds.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity
-                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
-            )
-            .fetch_one(&waiter_pool)
-            .await
-            .unwrap();
-            if waiting >= 1 {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "B should block on A's rack");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        // A's fold reaches the higher rack, as a second pass over it would,
-        // and commits -- which is what lets B go on.
-        sqlx::query(
-            "UPDATE leave_rack_progress SET occurrence_count = occurrence_count + 1
-             WHERE job_id = $1 AND generation = 1 AND rack = $2",
-        )
-        .bind(job)
-        .bind(&high_for_a)
-        .execute(&mut *a)
-        .await?;
+        // Long enough for B to have reached whatever it is going to wait on.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         a.commit().await
     };
-    let (b_result, a_result) = tokio::join!(b_fold, a_finish);
+    let (b_result, a_result) = tokio::join!(b_stage, a_finish);
     a_result.expect("A must not be chosen as a deadlock victim");
     b_result.expect("B must not be chosen as a deadlock victim");
     b.commit().await.unwrap();
+
+    let merged = birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.folds_merged, 2);
 
     let counts: Vec<(String, i64)> = sqlx::query_as(
         "SELECT rack, occurrence_count FROM leave_rack_progress
@@ -1037,4 +1037,162 @@ async fn overlapping_leave_submissions_wait_instead_of_deadlocking() {
     .await
     .unwrap();
     assert_eq!(counts, vec![(low, 2), (high, 2)]);
+}
+
+/// Claims one leave task and submits `count` occurrences of each rack it was
+/// forced, returning those racks.
+async fn play_one_task(app: &axum::Router, count: i64) -> Vec<String> {
+    let (status, body) =
+        send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let racks = forced_racks(&body);
+    let result = json!({ "racks": racks.iter().map(|rack| json!({
+        "rack": rack, "count": count, "mean": 1.0,
+    })).collect::<Vec<_>>() });
+    let (status, accepted) = send(
+        app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", body["worker_uuid"].as_str().unwrap())],
+            json!({ "claim_token": body["claim_token"], "result": result }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{accepted}");
+    racks
+}
+
+/// Until a merge, `leave_rack_progress` still shows a finished task's racks at
+/// the counts they had before it played -- so, ordered on those counts, they
+/// are the lowest in the generation the moment their claim completes. Handed
+/// out on that basis they would go to every claim until the next merge, while
+/// racks nobody has forced yet waited. They are held out of selection while
+/// their task's result is staged.
+#[tokio::test]
+async fn racks_of_a_staged_result_are_not_handed_out_again_before_the_merge() {
+    let db = TestDb::new().await;
+    let (_job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let first = play_one_task(&app, 5).await;
+    let second = play_one_task(&app, 5).await;
+    assert!(
+        first.iter().all(|rack| !second.contains(rack)),
+        "{first:?} were forced again as {second:?} with their result still staged"
+    );
+}
+
+/// A generation must not close on totals that are missing staged results: the
+/// racks those tasks forced are held out of selection, so "nothing left to hand
+/// out" does not yet mean "every rack is at target". The claim asks for a merge
+/// instead, and the decision is made on exact figures afterwards.
+#[tokio::test]
+async fn a_generation_does_not_close_with_results_still_staged() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    // Every rack at target except the two the first task forces, which its
+    // result then leaves short.
+    let racks = {
+        let (status, body) =
+            send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let racks = forced_racks(&body);
+        sqlx::query(
+            "UPDATE leave_rack_progress SET occurrence_count = 1000
+             WHERE job_id = $1 AND generation = 1 AND NOT (rack = ANY($2))",
+        )
+        .bind(job)
+        .bind(&racks)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let (status, accepted) = send(
+            &app,
+            post_json(
+                "/api/worker/result",
+                &[("x-worker-uuid", body["worker_uuid"].as_str().unwrap())],
+                json!({ "claim_token": body["claim_token"], "result": { "racks": [
+                    { "rack": racks[0], "count": 1000, "mean": 1.0 },
+                    { "rack": racks[1], "count": 10, "mean": 1.0 },
+                ]}}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{accepted}");
+        racks
+    };
+
+    // Nothing to hand out and nothing in flight -- and not complete.
+    let step = next_step(&db, job).await;
+    assert!(matches!(step, Step::NeedsMerge), "{step:?}");
+    let owned: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM leave_generation_transitions WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(owned, 0, "no transition was started on stale totals");
+
+    // Through the worker API the same claim is a `204`, and starts the merge.
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let pool = db.pool.clone();
+    assert!(
+        wait_for(|| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = $1")
+                    .bind(job)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+                    == 0
+            }
+        })
+        .await,
+        "the claim's merge never landed"
+    );
+
+    // On exact figures the second rack is still short, so it is forced again
+    // rather than the generation closing around it.
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(forced_racks(&body), vec![racks[1].clone()]);
+}
+
+/// A purge takes the staged results and the generations' summaries with
+/// everything else, so nothing accepted for the old run is folded into the new
+/// one.
+#[tokio::test]
+async fn a_purge_discards_staged_results() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let app = birdtest::app(db.state().await);
+    play_one_task(&app, 5).await;
+
+    let mut request = axum::http::Request::post(format!("/api/admin/jobs/{job}/purge"));
+    for (name, value) in admin_headers(&cfg, admin) {
+        request = request.header(name, value);
+    }
+    let (status, body) = send(&app, request.body(axum::body::Body::empty()).unwrap()).await;
+    // The purge itself commits; rebuilding the generation-0 KLV afterwards
+    // needs an object store, which these tests do not have.
+    assert!(status == StatusCode::OK || status.is_server_error(), "{status}: {body}");
+
+    let left: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = $1),
+                (SELECT COUNT(*) FROM leave_generation_progress WHERE job_id = $1)",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(left, (0, 0));
 }

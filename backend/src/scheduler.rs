@@ -71,7 +71,10 @@ pub struct ShutdownDirective {
 /// Active jobs with a share of the fleet, ordered by how far behind that share
 /// they are.
 ///
-/// The deficit is `jobs.claims_issued / allocation`. That counter counts every
+/// The deficit is `(jobs.claims_issued - jobs.claims_baseline) / allocation`:
+/// the claims a job has been issued *since it last joined the jobs on offer*,
+/// against its share (see [`join_at_parity`] for the baseline). The counter
+/// counts every
 /// claim ever issued, abandoned and declined ones included: a claim consumed
 /// dispatch capacity the moment it was inserted, so the count only ever goes up.
 /// Filtering out abandoned claims would let a job with flaky workers quietly
@@ -96,7 +99,7 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
                <= ($1, $2, $3)
            AND j.id <> ALL($4)
          ORDER BY
-           j.claims_issued::float / j.allocation ASC,
+           (j.claims_issued - j.claims_baseline)::float / j.allocation ASC,
            j.created_at ASC",
     )
     .bind(caps.magpie_version.major)
@@ -105,6 +108,50 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
     .bind(&caps.unsupported_jobs)
     .fetch_all(pool)
     .await?)
+}
+
+/// Put `job_id` level with the jobs already offering work: set its
+/// `claims_baseline` so that its deficit ratio equals the lowest ratio among
+/// the *other* active jobs above 0%, or zero when there are none.
+///
+/// The deficit the scheduler orders on is a ratio of claims issued to share.
+/// Measured over a job's whole life, that made every change to the set of jobs
+/// a takeover. A job activated beside one that had issued two million claims
+/// had a ratio of zero, so it was first in every candidate list until it had
+/// issued two million of its own -- and the older job, at the same 50%, got
+/// nothing for as long as that took. A purge zeroes `claims_issued`, so a
+/// purged job did the same; so did a job reactivated after a week switched
+/// off; and raising an allocation from 10% to 50% cut a job's ratio to a
+/// fifth, with the same effect. PLAN.md promised "no starvation of any job
+/// above 0%", and the formula it gave did not have that property.
+///
+/// This is start-time fair queuing's rule: a flow that (re)joins starts at the
+/// system's current virtual time, not at zero. Called wherever a job's
+/// standing changes -- activation (which is also how an allocation is changed)
+/// and purge -- inside that operation's transaction, after it has written the
+/// job's new allocation and counters. From then on the job is simply one more
+/// candidate: selection stays deterministic, stays one statement, and still
+/// converges on the configured shares, because every job's numerator counts
+/// from the same moment in the fleet's history.
+///
+/// The baseline may go negative (a job with no claims joining a busy fleet is
+/// credited the claims that put it level); ratios never do, since the minimum
+/// it copies is itself a ratio of a count that only grows.
+pub async fn join_at_parity(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE jobs j
+         SET claims_baseline = j.claims_issued - floor(
+                 COALESCE((SELECT MIN((o.claims_issued - o.claims_baseline)::float8 / o.allocation)
+                           FROM jobs o
+                           WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> j.id), 0)
+                 * COALESCE(j.allocation, 0)
+             )::bigint
+         WHERE j.id = $1",
+    )
+    .bind(job_id)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// Why a worker that can run nothing can run nothing, and what to tell it.
@@ -490,6 +537,24 @@ async fn try_claim_from_job(
             });
             Ok(None)
         }
+        Acquired::NeedsLeaveMerge { generation } => {
+            // Nothing was written. The merge runs on its own task -- a
+            // full-size one is the best part of a minute -- and gives up at
+            // once if another is already running, so a fleet asking together
+            // starts one merge rather than parking a connection each behind
+            // it. This job has nothing to hand out until it lands.
+            let _ = tx.rollback().await;
+            let (pool, job_id) = (state.pool.clone(), job.id);
+            tokio::spawn(async move {
+                if let Err(err) = leave_gen::merge_staged(&pool, job_id, generation, false).await {
+                    tracing::error!(
+                        %job_id, generation, error = %err.message,
+                        "merging staged leave results failed"
+                    );
+                }
+            });
+            Ok(None)
+        }
         Acquired::NeedsGenerationTransition { generation } => {
             // Committed, not rolled back, and this is load-bearing: the only
             // thing this transaction wrote is the
@@ -542,6 +607,7 @@ async fn try_claim_from_job(
                 }
                 Ok(Some(claim_token)) => {
                     tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+                    request_tail_merge(state, job, &template, &request, created);
                     Ok(Some(TaskClaim {
                         job_id: job.id,
                         claim_token,
@@ -568,6 +634,45 @@ async fn try_claim_from_job(
             }
         }
     }
+}
+
+/// A leave claim that was handed fewer racks than a task holds has found its
+/// generation nearly done -- everything else below target is out with another
+/// claim or waiting in a staged result -- and that is when stale per-rack
+/// counts cost most: tasks go out forcing racks that may already be at target,
+/// and the generation cannot close until a merge shows that they are. Such a
+/// claim asks for a merge, off the request, at most once a minute per job
+/// (`leave_gen::TAIL_MERGE_INTERVAL`). Mid-generation the half-hourly sweep is
+/// enough, and this never fires.
+fn request_tail_merge(
+    state: &AppState,
+    job: &Job,
+    template: &crate::jobs::dispatch::JobTemplate,
+    request: &TaskRequest,
+    created: bool,
+) {
+    let (TaskRequest::LeaveGeneration(request), crate::jobs::dispatch::JobKind::LeaveGeneration { config, .. }) =
+        (request, &template.kind)
+    else {
+        return;
+    };
+    // A re-dispatched task's racks were chosen when it was created, and say
+    // nothing about the generation now.
+    if !created || request.forced_racks.len() >= config.racks_per_task as usize {
+        return;
+    }
+    if !state.leave_merges.due(job.id) {
+        return;
+    }
+    let (pool, job_id, generation) = (state.pool.clone(), job.id, request.generation);
+    tokio::spawn(async move {
+        if let Err(err) = leave_gen::merge_staged(&pool, job_id, generation, false).await {
+            tracing::error!(
+                %job_id, generation, error = %err.message,
+                "merging staged leave results near a generation's end failed"
+            );
+        }
+    });
 }
 
 /// Everything a claim writes, inside the claim transaction.

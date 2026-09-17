@@ -49,6 +49,11 @@ pub struct Job {
     /// Every claim ever issued for this job; the scheduler's deficit
     /// numerator. See `scheduler::candidate_jobs`.
     pub claims_issued: i64,
+    /// Where the job's share is measured from: the scheduler orders on
+    /// `(claims_issued - claims_baseline) / allocation`. Reset to parity with
+    /// the other jobs offering work on activation, on an allocation change and
+    /// on a purge; see `scheduler::join_at_parity`.
+    pub claims_baseline: i64,
     /// Games recorded by the first accepted result of each task; the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.

@@ -19,10 +19,50 @@ resource "aws_security_group" "db" {
   tags = local.tags
 }
 
+# Two WAL settings, both about leave generation (PLAN.md, "Leave Generation",
+# "What a merge costs"). A merge folds half an hour of accepted results into a
+# generation's 3.2 million per-rack rows in one pass, and touches most pages of
+# the table and its indexes doing it. The first change to a page after a
+# checkpoint is logged as a whole 8 kB page, so what a merge writes is mostly
+# page images -- and how many times over depends on how many checkpoints it
+# spans, which WAL volume triggers. Measured on a full-size generation, one
+# merge of thirty 200,000-rack results:
+#
+#   max_wal_size 1 GB (Postgres's default)   4.8 GB of WAL, five checkpoints
+#   max_wal_size large enough to span it     1.3 GB
+#   ... and wal_compression on               1.0 GB
+#
+# That WAL is kept for the whole point-in-time recovery window below, so the
+# difference is storage as well as I/O. Both are dynamic; neither needs a
+# reboot.
+resource "aws_db_parameter_group" "main" {
+  name_prefix = "${local.name}-pg16-"
+  family      = "postgres16"
+  description = "birdtest: WAL settings sized for leave-generation merges"
+
+  parameter {
+    name  = "wal_compression"
+    value = "on"
+  }
+
+  parameter {
+    name  = "max_wal_size" # in MB
+    value = tostring(var.db_max_wal_size_mb)
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+
+  tags = local.tags
+}
+
 resource "aws_db_instance" "main" {
   identifier     = local.name
   engine         = "postgres"
   engine_version = "16"
+
+  parameter_group_name = aws_db_parameter_group.main.name
 
   instance_class        = var.db_instance_class
   allocated_storage     = var.db_allocated_storage

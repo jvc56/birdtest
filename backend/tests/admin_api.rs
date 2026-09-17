@@ -1264,3 +1264,104 @@ async fn an_export_is_not_blocked_by_a_claim_whose_worker_vanished() {
     .unwrap();
     assert_eq!((claim_state.as_str(), active), ("abandoned", 0));
 }
+
+/// Who gets each of `n` claims, as a count per job, claiming as one fresh
+/// anonymous worker after another so no per-identity rule interferes.
+async fn claims_by_job(app: &axum::Router, n: usize) -> std::collections::HashMap<String, usize> {
+    let mut by_job = std::collections::HashMap::new();
+    for _ in 0..n {
+        let (status, body) =
+            send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        *by_job.entry(body["job_id"].as_str().unwrap().to_string()).or_insert(0) += 1;
+    }
+    by_job
+}
+
+/// Bug: the scheduler's deficit was `claims_issued / allocation` over a job's
+/// whole life, so a job activated beside one with a long history had a ratio
+/// of zero and took *every* claim until it had issued as many -- the older job,
+/// at the same 50%, got nothing for as long as that took. A job now joins level
+/// with the job furthest behind (`scheduler::join_at_parity`) and takes its
+/// share from then on.
+#[tokio::test]
+async fn a_newly_activated_job_joins_at_parity_instead_of_taking_everything() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let veteran = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET claims_issued = 100000 WHERE id = $1")
+        .bind(veteran)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let newcomer = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
+        .bind(newcomer)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{newcomer}/activate"), &borrowed, json!({ "allocation": 50 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // Twelve at a time: a worker with no identity yet is limited by address,
+    // with a burst of thirty.
+    let shares = claims_by_job(&app, 12).await;
+    assert_eq!(shares.get(&veteran.to_string()), Some(&6), "{shares:?}");
+    assert_eq!(shares.get(&newcomer.to_string()), Some(&6), "{shares:?}");
+
+    // Changing a share is an activation too, and the new share holds from
+    // there: 75/25 over the next twelve claims, not a lurch to make up for
+    // the claims issued under the old one.
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{veteran}/activate"), &borrowed, json!({ "allocation": 25 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{newcomer}/activate"), &borrowed, json!({ "allocation": 75 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let shares = claims_by_job(&app, 12).await;
+    assert_eq!(shares.get(&veteran.to_string()), Some(&3), "{shares:?}");
+    assert_eq!(shares.get(&newcomer.to_string()), Some(&9), "{shares:?}");
+}
+
+/// The same for a purge, which zeroes `claims_issued`: the purged job restarts
+/// level with the others rather than owed every claim it ever had.
+#[tokio::test]
+async fn a_purged_job_rejoins_at_parity() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let steady = db.games_job(1, 2).await;
+    let purged = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET claims_issued = 100000 WHERE id = ANY($1)")
+        .bind(vec![steady, purged])
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (status, body) = send(
+        &app,
+        request("POST", &format!("/api/admin/jobs/{purged}/purge"), &admin_headers(&cfg, admin)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let shares = claims_by_job(&app, 20).await;
+    assert_eq!(shares.get(&steady.to_string()), Some(&10), "{shares:?}");
+    assert_eq!(shares.get(&purged.to_string()), Some(&10), "{shares:?}");
+}

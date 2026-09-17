@@ -584,24 +584,49 @@ async fn job_stream(
 /// operation now; the public gets `GET /api/jobs/:id/results`, which is
 /// paginated. For a completed job this defers to the export, which is the same
 /// corpus read once rather than once per caller.
+#[derive(Deserialize)]
+pub(super) struct StreamQuery {
+    /// Games and game-pairs jobs only: stream the positions the job captured
+    /// while playing, each with its ranked moves, instead of its result rows.
+    #[serde(default)]
+    positions: bool,
+}
+
 pub(super) async fn job_results_stream(
     State(state): State<AppState>,
     _admin: crate::auth::AdminUser,
     Path(id): Path<Uuid>,
+    Query(query): Query<StreamQuery>,
 ) -> AppResult<axum::response::Response> {
     let job = load_job(&state, id).await?;
+    if query.positions && !crate::exports::may_capture_positions(job.job_type) {
+        return Err(AppError::bad_request(
+            "?positions=true is for games and game-pairs jobs, which can capture positions \
+             while playing; an opening-rack job's stream already is its positions",
+        ));
+    }
 
     // A completed job's results are immutable, so an export of them is a stable
     // artifact: read it instead of re-scanning. The redirect is what puts the
     // cheap path in front of a caller without them having to know about it.
     if job.status == crate::models::job::JobStatus::Completed {
-        if let Some((_, key)) = crate::exports::newest_ready(&state.pool, id).await? {
-            let url = state
-                .artifacts
-                .presigned_get(&key, crate::exports::DOWNLOAD_URL_TTL)
-                .await?;
-            return Ok((StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, url)])
-                .into_response());
+        if let Some(ready) = crate::exports::newest_ready(&state.pool, id).await? {
+            // The positions' own artifact when that is what was asked for. An
+            // export with none -- the job captured nothing -- falls through to
+            // the scan below, which streams the same nothing.
+            let key = if query.positions {
+                ready.positions_artifact_key
+            } else {
+                Some(ready.artifact_key)
+            };
+            if let Some(key) = key {
+                let url = state
+                    .artifacts
+                    .presigned_get(&key, crate::exports::DOWNLOAD_URL_TTL)
+                    .await?;
+                return Ok((StatusCode::SEE_OTHER, [(axum::http::header::LOCATION, url)])
+                    .into_response());
+            }
         }
     }
 
@@ -623,7 +648,11 @@ pub(super) async fn job_results_stream(
         // The export's own queries, so the stream of an active job and the
         // export of a completed one are the same corpus -- an opening-rack
         // record with its ranked moves nested in it, not the record alone.
-        let query = crate::exports::export_query(job.job_type);
+        let query = if query.positions {
+            crate::exports::positions_query()
+        } else {
+            crate::exports::export_query(job.job_type)
+        };
 
         let mut rows = sqlx::query(query).bind(id).fetch(&pool);
         while let Some(row) = rows.next().await {

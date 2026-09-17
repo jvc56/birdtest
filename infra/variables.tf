@@ -36,6 +36,19 @@ variable "db_instance_class" {
   default = "db.t4g.micro"
 }
 
+variable "db_max_wal_size_mb" {
+  description = <<-EOT
+    Postgres max_wal_size, in MB: how much WAL may accumulate before a
+    checkpoint is forced. Sized so that one leave-generation merge (about
+    1.3 GB of WAL for a full-size generation) fits inside a single checkpoint
+    cycle; at Postgres's 1 GB default the same merge spans five and writes
+    4.8 GB. It is also an upper bound on the disk WAL occupies, so keep it well
+    under db_allocated_storage.
+  EOT
+  type        = number
+  default     = 4096
+}
+
 variable "db_allocated_storage" {
   type    = number
   default = 20

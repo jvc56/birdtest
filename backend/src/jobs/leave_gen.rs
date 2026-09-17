@@ -89,9 +89,9 @@ impl JobHandler for LeaveGenHandler {
         Ok(LeaveRecord { racks: response.racks })
     }
 
-    /// Credits the claim and folds its occurrences into the generation. Only
-    /// the first accepted result for a task is folded -- see
-    /// [`credit_claim`] for the others.
+    /// Credits the claim and stages its occurrences for the generation's next
+    /// merge ([`stage_fold`]). Only the first accepted result for a task is
+    /// staged -- see [`credit_claim`] for the others.
     async fn insert_record(
         conn: &mut PgConnection,
         template: &JobTemplate,
@@ -100,7 +100,7 @@ impl JobHandler for LeaveGenHandler {
         record: &Self::Record,
     ) -> AppResult<()> {
         credit_claim(conn, task_id, claim_id, record).await?;
-        fold_into_generation(conn, template.job_id, task_id, record).await
+        stage_fold(conn, template.job_id, task_id, record).await
     }
 }
 
@@ -132,22 +132,53 @@ pub async fn credit_claim(
     Ok(())
 }
 
-async fn fold_into_generation(
+/// Record a task's occurrences for its generation, without touching the
+/// generation's per-rack rows.
+///
+/// **Why this is an append and not the fold itself.** A submission used to run
+/// `UPDATE leave_rack_progress ... FROM UNNEST(...)` over every rack its games
+/// drew -- tens to hundreds of thousands of rows scattered uniformly over a
+/// table of 3.2 million. Measured on a seeded generation: 2.5 to 5.5 seconds
+/// inside the transaction the worker waits on, with every other submission of
+/// the generation queued behind its row locks; **147 to 409 MB of WAL for one
+/// fold** of 40,000 racks, because the first touch of each page after a
+/// checkpoint writes the whole page; and not one HOT update, because
+/// `occurrence_count` is an indexed column (claim-time selection orders on it),
+/// so every row written was a new heap tuple, a new entry in both indexes and
+/// a dead tuple for autovacuum. At a fold a minute that is on the order of
+/// ten gigabytes of WAL an hour per leave job.
+///
+/// Nothing needs the per-rack totals that promptly. Selection needs them
+/// roughly; closing a generation and building its KLV need them exactly, but
+/// only at that moment. So a submission writes **one row** here -- its racks,
+/// counts and equity sums as three arrays, which Postgres compresses and
+/// stores out of line -- plus the generation's live counters, and
+/// [`merge_staged`] folds everything staged into `leave_rack_progress` in one
+/// pass: periodically, when a claim finds the generation nearly done, and
+/// always before a generation closes. The submit path drops to milliseconds,
+/// and the only lock it takes that another submission wants is the
+/// generation's one counter row, for a single-row update -- as it already does
+/// on the job's own counters.
+///
+/// A rack that is not a full rack of the job's distribution is staged like
+/// any other and dropped by the merge, which updates rows and creates none.
+async fn stage_fold(
     conn: &mut PgConnection,
     job_id: Uuid,
     task_id: Uuid,
     record: &LeaveRecord,
 ) -> AppResult<()> {
-    let generation: i32 =
-        sqlx::query_scalar("SELECT generation FROM leave_requests WHERE task_id = $1")
-            .bind(task_id)
-            .fetch_one(&mut *conn)
-            .await?;
+    let row = sqlx::query("SELECT generation, num_games FROM leave_requests WHERE task_id = $1")
+        .bind(task_id)
+        .fetch_one(&mut *conn)
+        .await?;
+    let generation: i32 = row.get("generation");
+    let num_games: i32 = row.get("num_games");
 
     // A result for a generation that has already been aggregated is credited
     // to the worker -- it did the work, and the claim completes normally --
-    // but must not be folded in. The generation's KLV is already built and
-    // uploaded, so nothing will ever read these occurrences; adding them would
+    // but must not be staged. The generation's KLV is already built and
+    // uploaded, so nothing will ever read these occurrences; merging them would
     // only make the rows disagree with the artifact built from them, which is
     // the one signal reserved for a corrupted or stale object (see
     // `rebuild_artifacts`).
@@ -180,46 +211,269 @@ async fn fold_into_generation(
     let counts: Vec<i64> = record.racks.iter().map(|o| o.count).collect();
     let sums: Vec<f64> = record.racks.iter().map(|o| o.mean * o.count as f64).collect();
 
-    // Lock the rows first, in rack order. Submissions for different tasks of
-    // one generation do not serialize on anything else -- each holds only its
-    // own claim and task -- and they overlap heavily: every game draws common
-    // racks, whatever the task forced. The UPDATE below locks rows in whatever
-    // order its plan visits them, so two of them could each hold a rack the
-    // other was waiting for, and Postgres broke the deadlock by failing one
-    // submission with a 500 after `deadlock_timeout`. Taken in one order,
-    // the second submission waits for the first instead, holding nothing.
     sqlx::query(
-        "SELECT 1 FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = $2 AND rack = ANY($3::text[])
-         ORDER BY rack
-         FOR UPDATE",
+        "INSERT INTO leave_rack_staging (job_id, generation, task_id, racks, counts, equity_sums)
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(job_id)
     .bind(generation)
-    .bind(&racks)
-    .execute(&mut *conn)
-    .await?;
-
-    // One statement per submission, however many racks it carries. An UPDATE
-    // rather than an upsert: the generation's universe is every full rack,
-    // seeded up front, so a rack with no row is not a rack of this
-    // distribution and must not create one.
-    sqlx::query(
-        "UPDATE leave_rack_progress p SET
-             occurrence_count = p.occurrence_count + u.count,
-             equity_sum       = p.equity_sum + u.equity_sum,
-             updated_at       = now()
-         FROM UNNEST($3::text[], $4::bigint[], $5::float8[]) AS u(rack, count, equity_sum)
-         WHERE p.job_id = $1 AND p.generation = $2 AND p.rack = u.rack",
-    )
-    .bind(job_id)
-    .bind(generation)
+    .bind(task_id)
     .bind(&racks)
     .bind(&counts)
     .bind(&sums)
     .execute(&mut *conn)
     .await?;
+
+    // The generation's live figures: exact, and current to the submission. One
+    // row per generation, so submissions of one generation take turns on it for
+    // a single-row update -- as they already do on the job's own counters.
+    sqlx::query(
+        "INSERT INTO leave_generation_progress (job_id, generation, tasks_completed, games_played)
+         VALUES ($1, $2, 1, $3)
+         ON CONFLICT (job_id, generation) DO UPDATE
+             SET tasks_completed = leave_generation_progress.tasks_completed + 1,
+                 games_played = leave_generation_progress.games_played + EXCLUDED.games_played",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .bind(i64::from(num_games))
+    .execute(&mut *conn)
+    .await?;
     Ok(())
+}
+
+/// The advisory-lock namespace for merges, distinct from dispatch's (1) and
+/// the rating fits' (2).
+const MERGE_LOCK_NAMESPACE: i32 = 3;
+
+/// What one merge did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct MergeOutcome {
+    /// Staged submissions folded in.
+    pub folds_merged: i64,
+    /// `leave_rack_progress` rows they changed.
+    pub racks_updated: i64,
+}
+
+/// Fold everything staged for one generation into `leave_rack_progress`, and
+/// refresh the generation's summary (racks at target, the rack furthest from
+/// it) while the rows are warm.
+///
+/// One statement takes the staged rows and applies their sum, so a staged
+/// submission is either still staged or folded in, never both and never
+/// neither; a submission that commits while this runs is simply not in the
+/// statement's snapshot, and waits for the next merge.
+///
+/// Merges of one job serialize on an advisory lock: two of them would
+/// otherwise each take a disjoint set of staged rows and then update
+/// overlapping racks in whatever order their plans visited them, which is a
+/// deadlock. `wait` decides what a second caller does. The transition **waits**
+/// -- it must not read a generation's totals until everything staged is in
+/// them. Everything else gives up (`None`): whoever holds the lock is doing
+/// the same work, and waiting would hold a pool connection for the minute a
+/// full-size merge can take, once per caller.
+///
+/// A merge rewrites up to every row of the generation and none of them can be
+/// a HOT update, exactly as before -- but once per merge rather than once per
+/// submission, which is the whole saving.
+pub async fn merge_staged(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    generation: i32,
+    wait: bool,
+) -> AppResult<Option<MergeOutcome>> {
+    let mut tx = pool.begin().await?;
+    if wait {
+        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
+            .bind(MERGE_LOCK_NAMESPACE)
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+    } else {
+        let taken: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1, hashtext($2::text))")
+                .bind(MERGE_LOCK_NAMESPACE)
+                .bind(job_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !taken {
+            return Ok(None);
+        }
+    }
+
+    let started = std::time::Instant::now();
+    // An UPDATE rather than an upsert: the generation's universe is every full
+    // rack, seeded up front, so a rack with no row is not a rack of this
+    // distribution and must not create one.
+    let row = sqlx::query(
+        "WITH taken AS (
+             DELETE FROM leave_rack_staging
+             WHERE job_id = $1 AND generation = $2
+             RETURNING racks, counts, equity_sums
+         ),
+         folded AS (
+             SELECT u.rack, SUM(u.count)::bigint AS count, SUM(u.equity_sum) AS equity_sum
+             FROM taken, UNNEST(taken.racks, taken.counts, taken.equity_sums)
+                  AS u(rack, count, equity_sum)
+             GROUP BY u.rack
+         ),
+         applied AS (
+             UPDATE leave_rack_progress p SET
+                 occurrence_count = p.occurrence_count + f.count,
+                 equity_sum       = p.equity_sum + f.equity_sum,
+                 updated_at       = now()
+             FROM folded f
+             WHERE p.job_id = $1 AND p.generation = $2 AND p.rack = f.rack
+             RETURNING 1
+         )
+         SELECT (SELECT COUNT(*) FROM taken) AS folds, (SELECT COUNT(*) FROM applied) AS racks",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *tx)
+    .await?;
+    let outcome =
+        MergeOutcome { folds_merged: row.get("folds"), racks_updated: row.get("racks") };
+
+    // The summary the dashboard reads, recomputed only when the rows moved (or
+    // it has never been computed): a count over the generation, which was the
+    // most expensive read in a leave job's live stats and ran on every push.
+    let summarised: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM leave_generation_progress
+                        WHERE job_id = $1 AND generation = $2 AND merged_at IS NOT NULL)",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_one(&mut *tx)
+    .await?;
+    if outcome.folds_merged > 0 || !summarised {
+        refresh_summary(&mut tx, job_id, generation).await?;
+    }
+    tx.commit().await?;
+
+    if outcome.folds_merged > 0 {
+        tracing::info!(
+            job_id = %job_id, generation, folds = outcome.folds_merged,
+            racks = outcome.racks_updated, elapsed_ms = started.elapsed().as_millis(),
+            "merged staged leave results"
+        );
+    }
+    Ok(Some(outcome))
+}
+
+/// Recompute a generation's summary row from its per-rack rows.
+async fn refresh_summary(conn: &mut PgConnection, job_id: Uuid, generation: i32) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO leave_generation_progress
+             (job_id, generation, racks_total, racks_at_target, min_rack, min_rack_count, merged_at)
+         SELECT $1, $2, totals.total, totals.at_target, lowest.rack, lowest.occurrence_count, now()
+         FROM (SELECT COUNT(*)::bigint AS total,
+                      COUNT(*) FILTER (WHERE p.occurrence_count >= c.target_rack_count)::bigint
+                          AS at_target
+               FROM leave_rack_progress p
+               JOIN job_leave_config c ON c.job_id = p.job_id
+               WHERE p.job_id = $1 AND p.generation = $2) totals
+         LEFT JOIN LATERAL (
+               SELECT rack, occurrence_count FROM leave_rack_progress
+               WHERE job_id = $1 AND generation = $2
+               ORDER BY occurrence_count ASC, rack ASC LIMIT 1) lowest ON TRUE
+         ON CONFLICT (job_id, generation) DO UPDATE
+             SET racks_total = EXCLUDED.racks_total,
+                 racks_at_target = EXCLUDED.racks_at_target,
+                 min_rack = EXCLUDED.min_rack,
+                 min_rack_count = EXCLUDED.min_rack_count,
+                 merged_at = EXCLUDED.merged_at",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// [`merge_staged`] for every generation of `job_id` with anything staged,
+/// which in practice is the current one.
+pub async fn merge_staged_for_job(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    wait: bool,
+) -> AppResult<MergeOutcome> {
+    let generations: Vec<i32> = sqlx::query_scalar(
+        "SELECT DISTINCT generation FROM leave_rack_staging WHERE job_id = $1 ORDER BY 1",
+    )
+    .bind(job_id)
+    .fetch_all(pool)
+    .await?;
+    let mut total = MergeOutcome { folds_merged: 0, racks_updated: 0 };
+    for generation in generations {
+        if let Some(outcome) = merge_staged(pool, job_id, generation, wait).await? {
+            total.folds_merged += outcome.folds_merged;
+            total.racks_updated += outcome.racks_updated;
+        }
+    }
+    Ok(total)
+}
+
+/// The periodic sweep: merge whatever is staged, for every job. One job's
+/// failure does not stop the others.
+pub async fn merge_all_staged(pool: &sqlx::PgPool) -> AppResult<i64> {
+    let jobs: Vec<Uuid> = sqlx::query_scalar("SELECT DISTINCT job_id FROM leave_rack_staging")
+        .fetch_all(pool)
+        .await?;
+    let mut folds = 0;
+    for job_id in jobs {
+        match merge_staged_for_job(pool, job_id, false).await {
+            Ok(outcome) => folds += outcome.folds_merged,
+            Err(err) => tracing::error!(
+                %job_id, error = %err.message, "merging staged leave results failed; skipping job"
+            ),
+        }
+    }
+    Ok(folds)
+}
+
+/// How often the sweep in `main.rs` merges. A merge touches most pages of a
+/// generation whatever it carries, so its cost is per merge, not per
+/// submission, and the interval is what sets the write volume: half an hour is
+/// roughly a gigabyte of WAL an hour for a full-size job, against ten when
+/// every submission folded itself. What it costs is freshness nobody needs:
+/// selection's counts and the dashboard's "racks at target" lag by up to this
+/// long mid-generation (racks a staged task forced are excluded from selection
+/// meanwhile, see [`next_step`]), and near a generation's end claims ask for a
+/// merge themselves ([`TAIL_MERGE_INTERVAL`]).
+pub const MERGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// The shortest gap between merges a *claim* asks for. A claim that is handed
+/// fewer racks than a task holds has found the generation nearly done, which
+/// is when staleness costs most: every task dispatched on old counts forces
+/// racks that may already be at target, and the generation cannot close until
+/// a merge shows that they are.
+pub const TAIL_MERGE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// When each job's last claim-requested merge started, so a busy tail asks
+/// once a minute rather than once a claim. In memory: losing it on a restart
+/// costs one early merge.
+#[derive(Clone, Default)]
+pub struct TailMerges(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>>);
+
+impl TailMerges {
+    /// Whether a claim-requested merge for `job_id` is due, and if so, notes
+    /// that one is starting now.
+    pub fn due(&self, job_id: Uuid) -> bool {
+        let mut last = self.0.lock().expect("tail merge map poisoned");
+        let now = std::time::Instant::now();
+        match last.get(&job_id) {
+            Some(started) if now.duration_since(*started) < TAIL_MERGE_INTERVAL => false,
+            _ => {
+                last.insert(job_id, now);
+                true
+            }
+        }
+    }
+
+    pub fn forget(&self, job_id: Uuid) {
+        self.0.lock().expect("tail merge map poisoned").remove(&job_id);
+    }
 }
 
 /// How long a started transition may go without finishing before another claim
@@ -280,6 +534,12 @@ pub enum LeaveGenStep {
     TransitionInProgress { generation: i32 },
     /// All configured generations are complete.
     Finished,
+    /// Nothing is left to hand out and nothing is in flight, but submissions
+    /// are still staged, so whether the generation is *complete* is not yet
+    /// known: the racks they forced are held out of selection, and their
+    /// occurrences are not in the totals. The caller merges, and the next
+    /// claim decides on exact figures.
+    NeedsMerge { generation: i32 },
     /// Every rack below target is already out with an open claim for this
     /// generation (or every rack has reached target and claims are still in
     /// flight). Their results may yet land, so the generation cannot be
@@ -358,13 +618,27 @@ pub async fn next_step(
     // Racks named by an open claim are skipped: two concurrent claims would
     // otherwise both be handed the same lowest-count racks. The anti-join is
     // over this job's open claims only, a few hundred racks each.
+    //
+    // So are the racks forced by a task whose result is **staged but not yet
+    // merged**. Their counts in `leave_rack_progress` are as they were before
+    // that task played, so ordered on those counts they are still the lowest
+    // in the generation the moment their claim completes -- and would be handed
+    // straight out again, to every claim until the next merge, while racks
+    // nobody has forced yet wait. Held out until the merge says what they
+    // actually reached. A staged row's arrays are stored out of line, so
+    // reading its `task_id` does not read them.
     let racks = sqlx::query_scalar::<_, String>(
         "WITH out_now AS (
-             SELECT DISTINCT unnest(r.forced_racks) AS rack
+             SELECT unnest(r.forced_racks) AS rack
              FROM task_claims c
              JOIN tasks t ON t.id = c.task_id
              JOIN leave_requests r ON r.task_id = c.task_id
              WHERE t.job_id = $1 AND r.generation = $2 AND c.state = 'claimed'
+             UNION
+             SELECT unnest(r.forced_racks)
+             FROM leave_rack_staging s
+             JOIN leave_requests r ON r.task_id = s.task_id
+             WHERE s.job_id = $1 AND s.generation = $2
          )
          SELECT p.rack FROM leave_rack_progress p
          WHERE p.job_id = $1 AND p.generation = $2 AND p.occurrence_count < $3
@@ -394,6 +668,26 @@ pub async fn next_step(
 
         if in_flight > 0 {
             return Ok(LeaveGenStep::NoWorkYet);
+        }
+
+        // With nothing in flight the only racks held out of the selection
+        // above are those of staged tasks, so an empty selection means "no
+        // rack is below target" only once nothing is staged. Until then it is
+        // not known whether the generation is complete, and deciding that it
+        // is would close it on totals that are missing every staged result --
+        // which is safe for the KLV (the transition drains first) but wrong
+        // for the racks those tasks left short of target, which would never
+        // be forced again.
+        let staged = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM leave_rack_staging
+                            WHERE job_id = $1 AND generation = $2)",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .fetch_one(&mut *conn)
+        .await?;
+        if staged {
+            return Ok(LeaveGenStep::NeedsMerge { generation });
         }
 
         // The generation is complete. Whoever writes this row owns its
@@ -527,6 +821,20 @@ pub async fn seed_generation(
         start += CHUNK;
     }
     copy.finish().await?;
+
+    // The generation's summary starts from what was just written, so the
+    // dashboard has a denominator before the first merge.
+    sqlx::query(
+        "INSERT INTO leave_generation_progress (job_id, generation, racks_total, merged_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (job_id, generation) DO UPDATE
+             SET racks_total = EXCLUDED.racks_total, merged_at = EXCLUDED.merged_at",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .bind(total as i64)
+    .execute(&mut *conn)
+    .await?;
     Ok(total as i64)
 }
 
@@ -579,6 +887,17 @@ pub async fn run_transition(
 ) -> AppResult<String> {
     let (pool, artifacts, magpie, builders) =
         (&state.pool, &state.artifacts, &state.magpie, &state.builders);
+    // Drain first, and wait for any merge already running: the KLV is built
+    // from `leave_rack_progress`, and a generation's totals are only complete
+    // once every staged submission is in them. Nothing new can be staged for
+    // this generation meanwhile -- it closes only with no claim in flight, and
+    // nothing is dispatched for it while its transition runs -- so what this
+    // merge leaves behind is nothing. The claim path already refuses to start
+    // a transition with anything staged (`LeaveGenStep::NeedsMerge`); this is
+    // the same rule held where the totals are read, for a takeover and for
+    // any path that reaches here another way.
+    merge_staged(pool, job_id, generation, true).await?;
+
     // Shared with `rebuild_artifacts` rather than written twice: a rebuild is
     // only meaningful if it folds the rows exactly as the original write did,
     // and two copies of this would be free to drift into producing different

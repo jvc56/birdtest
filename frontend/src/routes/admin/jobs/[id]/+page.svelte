@@ -135,6 +135,22 @@
     run(() => api.completeJob(jobId), 'Job force-completed.');
   }
 
+  // Accepted leave results are staged and merged into the per-rack totals in
+  // batches; this merges now, for an admin who wants the rack figures current.
+  async function mergeProgress() {
+    error = '';
+    notice = '';
+    try {
+      const merged = await api.mergeLeaveProgress(jobId);
+      await reload();
+      notice =
+        `Merged ${merged.folds_merged.toLocaleString()} staged results into ` +
+        `${merged.racks_updated.toLocaleString()} racks.`;
+    } catch (e) {
+      error = (e as Error).message;
+    }
+  }
+
   async function remove() {
     if (!confirm('Delete this job and every task and result it holds? This cannot be undone.'))
       return;
@@ -183,6 +199,13 @@
         <button class="btn-secondary" on:click={purge}>Purge results</button>
         {#if stats.job.job_type === 'leave_generation'}
           <button class="btn-secondary" on:click={rebuildArtifacts}>Check artifacts</button>
+          <button
+            class="btn-secondary"
+            title="Fold staged results into the rack totals now, rather than at the next half-hourly merge"
+            on:click={mergeProgress}
+          >
+            Merge progress now
+          </button>
         {/if}
         <button class="btn-destructive" on:click={remove}>Delete job</button>
       </div>
@@ -246,7 +269,8 @@
         <p class="text-xs text-muted-foreground">
           A completed job's whole corpus as one gzipped NDJSON file, built once on a background
           task and downloaded straight from the artifact store. An opening-rack line is a rack
-          with its ranked moves. Refused while the job's last claims are still in flight.
+          with its ranked moves; a games job that captured positions gets those as a second
+          file. Refused while the job's last claims are still in flight.
         </p>
         <div class="flex flex-wrap items-center gap-3">
           <button
@@ -264,8 +288,16 @@
                 {(jobExport.row_count ?? 0).toLocaleString()} rows ·
                 {megabytes(jobExport.bytes)}
                 {#if jobExport.download_url}
-                  · <a href={jobExport.download_url}>download</a> (link valid for an hour)
+                  · <a href={jobExport.download_url}>download</a>
                 {/if}
+                {#if jobExport.positions_row_count !== null}
+                  · {jobExport.positions_row_count.toLocaleString()} captured positions ·
+                  {megabytes(jobExport.positions_bytes)}
+                  {#if jobExport.positions_download_url}
+                    · <a href={jobExport.positions_download_url}>download positions</a>
+                  {/if}
+                {/if}
+                {#if jobExport.download_url}(links valid for an hour){/if}
               {:else}
                 <span class="text-destructive">Failed: {jobExport.error ?? 'unknown error'}</span>
               {/if}

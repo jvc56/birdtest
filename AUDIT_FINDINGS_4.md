@@ -4,9 +4,11 @@ Branch: `audit/birdtest-2026-09-16-pass2`, off `audit/birdtest-2026-09-16` at
 `2a6fe2c` (which is `main` at `6a72333` plus the sixth and seventh audits and the
 commit that implemented the seventh's decisions, none of it merged — see "Where
 this branch sits").
-MAGPIE: `birdtest-contribute`, **one commit added** (`d93dacaf`, section 9). The
-branch is now two commits ahead of `origin`, and **neither is pushed** — which is
-this audit's one deployment blocker (D1, section 10).
+MAGPIE: `birdtest-contribute`, **one commit added** (`d93dacaf`, section 9). When
+this record was first written the branch was two commits ahead of `origin` and
+neither was pushed, which was this audit's one deployment blocker (D1, section
+10); **it has since been pushed** (`origin/birdtest-contribute` is `d93dacaf`,
+checked with `git ls-remote`), so D1 is resolved.
 Date: 2026-09-16/17.
 
 **This is the eighth audit.** It builds on [AUDIT_FINDINGS_3.md](AUDIT_FINDINGS_3.md)
@@ -24,8 +26,9 @@ in this audit, and of the bugs, races, MAGPIE argument gaps, critical-path
 analysis, performance and storage findings behind them.
 
 **Counts: 5 code-wins (PLAN.md updated to match the code), 8 plan-wins (code
-changed), 3 items left for human input (U1–U3), plus one thing only a human can
-do (D1: push MAGPIE).**
+changed), 3 items left for human input (U1–U3) — all three since decided as
+recommended and implemented on this branch, see section 11a — plus one thing
+only a human could do (D1: push MAGPIE), since done.**
 
 The default bias is that the code wins and `PLAN.md` is brought level with it. The
 code was changed only where it was wrong, or where the plan described the
@@ -475,6 +478,11 @@ any other branch; **not pushed**):
 
 ### D1 — the backend image cannot be built: its MAGPIE pin is not published
 
+**Resolved since, by the push this entry asked for:** `git ls-remote origin
+birdtest-contribute` now answers `d93dacaf`, of which the pinned `0f6a4cb1` is
+the parent, so the Dockerfile's shallow fetch of it succeeds. What follows is
+the entry as written.
+
 **Not resolvable from here; needs a push.** `docker/Dockerfile` pins
 `MAGPIE_COMMIT=0f6a4cb1…` and fetches it from `github.com/jvc56/MAGPIE`.
 `origin/birdtest-contribute` is `6308b63c`; `0f6a4cb1` (and now `d93dacaf`) exist
@@ -569,6 +577,98 @@ changes what existing consumers of a games export read; **(c)** leave it until
 there is a consumer. **Recommendation: (a)**, since (b) changes an existing format
 and (c) means the first person to want the corpus needs database access.
 
+## 11a. Decisions taken — implemented
+
+All three were decided as recommended, and built on this branch. PLAN.md, the
+migration (and PLAN.md's schema block, still byte-identical to it), TESTING.md,
+RUNBOOK.md and the Terraform were updated with them.
+
+| # | Decision | What was done |
+|---|---|---|
+| U1 | **(a)** a baseline, reset to parity | `jobs.claims_baseline`; the scheduler orders on `(claims_issued - claims_baseline) / allocation`. `scheduler::join_at_parity` sets the baseline so the job's ratio equals the lowest among the *other* jobs offering work (zero if there are none), and runs inside `activate_job` — which is also how an allocation is changed — and inside `purge_job`, after each has written the job's new allocation or counters. RUNBOOK §2.3's counter recompute gained the same statement. Tests: `admin_api::a_newly_activated_job_joins_at_parity_instead_of_taking_everything` (a job beside one with 100,000 claims splits the next twelve 6/6, and 3/9 after the shares are changed to 25/75), `admin_api::a_purged_job_rejoins_at_parity`. **Deliberately not covered**, and said so in PLAN.md: a job that stays a candidate but hands out nothing for a long stretch still returns owed its share; re-activating it forgives that |
+| U2 | **(b)** stage, then merge — with the progress display reworked rather than dropped | See below |
+| U3 | **(a)** a second artifact | A games or game-pairs export writes `…/<export>.positions.ndjson.gz` beside its results when the job captured anything: each position with its CGP, game index, turn and ranked moves — B2's query unchanged, since every record of such a job is a captured position. `job_exports` gained four `positions_*` columns; `GET …/export` returns `positions_row_count`, `positions_bytes` and `positions_download_url`; a purge deletes both objects; the admin stream takes `?positions=true` (and refuses it for an opening-rack job, whose stream already is its positions); the export panel shows the second link. Test: `worker_api::a_games_jobs_captured_positions_can_be_streamed_out` |
+
+### U2 as built
+
+- **Submit.** `leave_gen::stage_fold` replaces the fold: one row in
+  `leave_rack_staging` (racks, counts and equity sums as three parallel arrays)
+  and a single-row bump of the generation's live counters in
+  `leave_generation_progress`. No per-rack row is touched, and the
+  lock-in-rack-order step is gone with the contention it existed for.
+- **Merge.** `leave_gen::merge_staged`: one statement takes what is staged
+  (`DELETE … RETURNING`), sums it per rack, and applies it (`UPDATE … FROM`), so
+  a staged result is either staged or folded, never both or neither; then it
+  refreshes the generation's summary. Merges of a job serialize on an advisory
+  lock (namespace 3); the transition waits for it, everything else gives up if
+  it is held. It runs: every thirty minutes (`main.rs`, first tick at startup);
+  when a claim is handed fewer racks than a task holds, at most once a minute
+  per job (`scheduler::request_tail_merge`); when a claim finds nothing to hand
+  out, nothing in flight and something staged (`LeaveGenStep::NeedsMerge` →
+  `Acquired::NeedsLeaveMerge`, which answers `204`); in `run_transition` before
+  the totals are read; and on `POST /api/admin/jobs/:id/merge-progress`.
+- **Two things the staging made necessary, both found while designing it
+  rather than after.** (1) Until a merge, a finished task's racks still show
+  their old counts, so they are the *lowest* in the generation the moment their
+  claim completes and would be handed straight out again, to every claim, until
+  the merge. Selection now holds the racks of a staged result's task out of
+  play, like those of an open claim. (2) With that exclusion, "nothing left to
+  hand out and nothing in flight" no longer implies "every rack is at target",
+  so the closing decision refuses to be made with anything staged.
+- **Display.** `LeaveGenStats` gained `tasks_completed`, `games_played` (live)
+  and `progress_as_of`; the rack figures come from the summary row a merge
+  writes. The 210 ms count over the generation is off the display path
+  entirely. The job page says which figures are live and which are as of when.
+- **Purge** deletes staged rows and summaries (after `lock_open_claims`, so no
+  submission of the old run stages into the new one); the census counts them;
+  RUNBOOK §2.3 says to restore staging with progress.
+
+**Measured**, full-size generation, thirty 200,000-rack results:
+
+| | Before | After |
+|---|---|---|
+| Submit transaction | 5.5 s under ~200,000 row locks | one insert + one single-row update |
+| WAL per accepted result | 69–409 MB | **0.76 MB** |
+| Per-rack rows rewritten | 6,000,000 | 2,328,419 |
+| One merge, background | — | 61–88 s |
+| WAL for those thirty results | ≈ 4.6 GB | **4.8 GB** at Postgres's default `max_wal_size` (1 GB); **1.3 GB** with it raised; **1.0 GB** with `wal_compression` too |
+
+**That last row corrects what this record estimated before the decision** ("an
+order of magnitude less WAL"; about 1 GB an hour). A merge rewrites most of the
+generation whatever it carries, so it is mostly full-page images, and at the
+default `max_wal_size` it spans five volume-triggered checkpoints and re-images
+the table each time — no WAL saving at all. The saving is real only with the
+two settings, so the Terraform now sets them (`aws_db_parameter_group.main`:
+`wal_compression = on`, `max_wal_size` = `var.db_max_wal_size_mb`, default
+4096): about **2 GB an hour against about 9**, a factor of four to five rather
+than ten. What does not depend on any setting is the submit path (seconds to
+milliseconds), the contention (gone), and the rows rewritten (down 60%).
+
+**What remains**, recorded in PLAN.md as undecided: a merge still rewrites most
+of a 430 MB relation as non-HOT updates, because selection orders on the indexed
+`occurrence_count`. Removing that means changing the selection policy ("any rack
+below target" through a partial index on a merge-maintained flag, rather than
+"the racks furthest below").
+
+**Verification of 11a.** `cargo clippy --locked --all-targets -- -D warnings`
+clean; `cargo test --locked`: **178 tests** (92 unit and contract, 86
+integration), all passing; `npm run check` and `npm run build` clean;
+`terraform fmt -check` and `terraform validate` clean; PLAN.md's schema block
+byte-identical to the migration. **The real-MAGPIE end-to-end suite was not
+rerun after these three changes**: it needs both Docker images rebuilt (a
+release build of the backend and an `-flto` build of MAGPIE), and an earlier
+heavy build in this session exhausted the development machine's memory. Section
+13's run predates 11a. MAGPIE itself is unchanged by 11a and so is the wire
+contract; what 11a changed on the leave path is covered through the HTTP API by
+`tests/leave_gen.rs`; `scripts/e2e_magpie.py` was updated for staging (it now
+asserts a result is staged, the live counters moved, and a merge folds it) and
+syntax-checked, but has not been executed. Run it once before merging:
+
+```
+docker compose up -d --build --wait postgres minio minio-init backend
+python3 scripts/e2e_magpie.py --magpie ../MAGPIE/bin/magpie --magpie-root ../MAGPIE
+```
+
 ### Smaller, noted rather than asked
 
 - **Identity before rate limit.** `WorkerIdentity` resolves the credential with a
@@ -586,7 +686,7 @@ and (c) means the first person to want the corpus needs database access.
 
 ### To do after merge (not decisions)
 
-1. **Push MAGPIE `birdtest-contribute`** (D1).
+1. ~~Push MAGPIE `birdtest-contribute` (D1).~~ Done.
 2. Dispatch the nightly workflow once, as the seventh audit asked; it has failed
    on `main` every night this week.
 

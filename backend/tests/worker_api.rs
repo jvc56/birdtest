@@ -1905,3 +1905,81 @@ async fn the_display_pool_bounds_its_reads() {
     drop(conn);
     read_pool.close().await;
 }
+
+/// Gap: `capture_positions` exists to build a corpus, and a games job's export
+/// and stream were its result rows only -- the positions had no way out of the
+/// database. They are a second artifact of the export, and `?positions=true`
+/// on the admin stream, in the shape an opening-rack line has.
+#[tokio::test]
+async fn a_games_jobs_captured_positions_can_be_streamed_out() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let app = birdtest::app(db.state().await);
+
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([
+        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+          "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
+        { "game_index": 1, "turn_number": 3, "rack": "AEINRSU", "position": "cgp-1",
+          "previous_move": "8D DOG", "previous_move_score": 10,
+          "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
+    ]);
+    let (claim, uuid) = first_claim(&app).await;
+    let (status, body) =
+        submit_as(&app, &uuid, claim["claim_token"].as_str().unwrap(), result).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let headers = admin_headers(&cfg, admin);
+    let ndjson = |body: serde_json::Value| -> Vec<serde_json::Value> {
+        body.as_str()
+            .map(|text| text.lines().map(|line| serde_json::from_str(line).unwrap()).collect())
+            // A single line is one JSON document, which the harness parses.
+            .unwrap_or_else(|| vec![body.clone()])
+    };
+
+    // The results stream is what it always was: the job's result rows.
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    let (status, body) = send(&app, get_request(&path, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let results = ndjson(body);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["games"], 2);
+    assert!(results[0].get("moves").is_none(), "{results:?}");
+
+    let (status, body) = send(&app, get_request(&format!("{path}?positions=true"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut positions = ndjson(body);
+    positions.sort_by_key(|p| p["game_index"].as_i64());
+    assert_eq!(positions.len(), 2, "{positions:?}");
+    assert_eq!(positions[1]["position"], "cgp-1");
+    assert_eq!(positions[1]["turn_number"], 3);
+    assert_eq!(positions[1]["previous_move"], "8D DOG");
+    assert_eq!(positions[1]["moves"][0]["move"], "8D URINATES");
+
+    // An opening-rack job's stream already is its positions.
+    let player = db.static_player("solver", admin).await;
+    let racks = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 3, 7, 100)",
+    )
+    .bind(racks)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (status, body) = send(
+        &app,
+        get_request(&format!("/api/admin/jobs/{racks}/results/stream?positions=true"), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}

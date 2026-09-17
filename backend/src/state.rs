@@ -111,4 +111,7 @@ pub struct AppState {
     /// than once per claim inside the dispatch lock; see
     /// [`crate::jobs::dispatch::JobTemplates`].
     pub templates: crate::jobs::dispatch::JobTemplates,
+    /// When each leave job's last claim-requested merge started; see
+    /// [`crate::jobs::leave_gen::TailMerges`].
+    pub leave_merges: crate::jobs::leave_gen::TailMerges,
 }

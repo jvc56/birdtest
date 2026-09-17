@@ -8,8 +8,9 @@ MAGPIE submits are accepted and stored the way the server reads them back:
 - `opening_rack`, static: a best move per rack.
 - `opening_rack`, simming: the simulated statistics (win%, per-ply stats) are
   stored, not just move, score and equity.
-- `leave_generation`: full-rack occurrences fold into the generation's
-  progress, and nothing is written into MAGPIE's data directory.
+- `leave_generation`: full-rack occurrences are staged, a merge folds them
+  into the generation's progress, and nothing is written into MAGPIE's data
+  directory.
 - Derived files: the static opening-rack player and the leave job ask for a
   wordmap, so both wait until the builder has run (`docker compose run --rm
   derived-builder`, which this script runs for them), the server publishes
@@ -261,6 +262,27 @@ def main() -> int:
     before = {p.name for p in lexica.iterdir()}
 
     def leave_occurrences(job_id: str) -> None:
+        # An accepted leave result is staged, and folded into the per-rack
+        # totals by a merge -- half-hourly, or when a generation nears its end.
+        # Both halves are asserted: the submissions staged something and moved
+        # the generation's live counters, and a merge folds it in.
+        staged = int(psql(args,
+            f"SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = '{job_id}'"))
+        merged_already = int(psql(args,
+            "SELECT COUNT(*) FROM leave_rack_progress "
+            f"WHERE job_id = '{job_id}' AND generation = 1 AND occurrence_count > 0"))
+        expect(staged > 0 or merged_already > 0, "no leave result was staged or merged")
+        played = int(psql(args,
+            "SELECT COALESCE(SUM(games_played), 0) FROM leave_generation_progress "
+            f"WHERE job_id = '{job_id}'"))
+        expect(played > 0, "the generation's live counters did not move")
+        outcome = client.json(client.post(f"/api/admin/jobs/{job_id}/merge-progress"),
+                              "merge leave progress")
+        expect(outcome["folds_merged"] == staged,
+               f"merged {outcome['folds_merged']} staged results, expected {staged}")
+        left = int(psql(args,
+            f"SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = '{job_id}'"))
+        expect(left == 0, f"{left} results still staged after a merge")
         occurred = int(psql(args,
             "SELECT COUNT(*) FROM leave_rack_progress "
             f"WHERE job_id = '{job_id}' AND generation = 1 AND occurrence_count > 0"))

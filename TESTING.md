@@ -474,6 +474,12 @@ The single most important group. Every entry is about a decision made in SQL.
   for the worker or in its unsupported set, which shuts nobody down until the
   job is raised above 0% (`a_parked_job_shuts_nobody_down`). There is no
   priority.
+- `I-SCHED-3a` **A job joins at parity.** A job activated beside one with a
+  long claim history splits the next claims by allocation rather than taking
+  all of them, a changed allocation holds from the moment it is set, and a
+  purged job rejoins level (`claims_baseline`, `scheduler::join_at_parity`).
+  *(Covered: `admin_api::a_newly_activated_job_joins_at_parity_instead_of_taking_everything`,
+  `admin_api::a_purged_job_rejoins_at_parity`.)*
 - `I-SCHED-4` `tasks_dispatched` counts abandoned claims. Abandon many claims on
   one job and confirm its share does **not** grow — excluding them would let a
   job with flaky workers accumulate more than its share.
@@ -584,10 +590,20 @@ job creation touches needs one caller here.
   7-tile rack for the pinned distribution, the count matches
   `enumerate_racks(7)`, and a claim's forced racks are full racks.
   *(Covered: `leave_gen::the_universe_and_the_forced_racks_are_full_racks`.)*
-- `I-LEAVE-2` The bulk update **sums** occurrences and accumulates equity under
-  concurrent submissions from several workers, and a rack outside the universe
-  creates no row. *(Single-submission half covered:
-  `leave_gen::a_result_folds_into_the_generation_and_creates_no_rows`.)*
+- `I-LEAVE-2` A submission is **staged** — one row, the generation's live
+  counters bumped, no per-rack row touched — and a merge **sums** what is
+  staged into `leave_rack_progress`, exactly once, with a rack outside the
+  universe creating no row. Two submissions open at once, naming the same racks
+  in opposite orders, neither deadlock nor lose an occurrence. *(Covered:
+  `leave_gen::a_result_folds_into_the_generation_and_creates_no_rows`,
+  `leave_gen::overlapping_leave_submissions_do_not_wait_on_each_other`.)*
+- `I-LEAVE-2a` The racks a staged result's task forced are held out of
+  selection until the merge, and a generation does not close with anything
+  staged: the claim asks for a merge and the next one decides on exact figures.
+  A purge discards what is staged. *(Covered:
+  `leave_gen::racks_of_a_staged_result_are_not_handed_out_again_before_the_merge`,
+  `leave_gen::a_generation_does_not_close_with_results_still_staged`,
+  `leave_gen::a_purge_discards_staged_results`.)*
 - `I-LEAVE-3` Rack selection picks the racks furthest below target, skips racks
   an open claim is already forcing, and returns nothing once all are at target
   with no claim in flight. *(Skipping covered:
@@ -1074,7 +1090,8 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   MAGPIE's pentanomial and birdtest's validation agree; it has been run by hand
   and must not stay manual.
 - `M-3` One `opening_rack` task lands, with one analysis per requested rack.
-- `M-4` One `leave_generation` task lands and folds into `leave_rack_progress`.
+- `M-4` One `leave_generation` task lands, is staged, moves the generation's
+  live counters, and a merge folds it into `leave_rack_progress`.
 - `M-5` A worker whose data digests do not match declines with `missing_data`
   rather than contributing unverified results.
 - `M-6` A worker below the job's version floor declines with `magpie_version`.
