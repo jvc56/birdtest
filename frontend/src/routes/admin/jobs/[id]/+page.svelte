@@ -130,8 +130,9 @@
         <button class="btn-destructive" on:click={remove}>Delete job</button>
       </div>
       <p class="text-xs text-muted-foreground">
-        Active jobs in a priority tier must allocate 100% between them; activation is rejected if
-        this job's share would push the tier over.
+        The active jobs may allocate at most 100% between them; activation is rejected if this
+        job's share would push the total over. A share of 0% is the same as inactive: the job
+        is offered to nobody until it is raised.
       </p>
 
       {#if rebuild}

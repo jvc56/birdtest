@@ -33,7 +33,7 @@
     <table class="table">
       <thead>
         <tr>
-          <th>Type</th><th>Status</th><th>Priority</th><th>Allocation</th>
+          <th>Type</th><th>Status</th><th>Allocation</th>
           <th>Redundancy</th><th class="text-right">Progress</th>
         </tr>
       </thead>
@@ -53,7 +53,6 @@
                 </span>
               {/if}
             </td>
-            <td class="tabular-nums">{job.priority}</td>
             <td class="tabular-nums">{job.allocation === null ? '—' : `${job.allocation}%`}</td>
             <td class="tabular-nums">{job.redundancy}×</td>
             <td class="text-right tabular-nums">

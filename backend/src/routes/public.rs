@@ -37,7 +37,6 @@ struct JobListItem {
     id: Uuid,
     job_type: JobType,
     status: String,
-    priority: i32,
     allocation: Option<i32>,
     redundancy: i32,
     created_at: chrono::DateTime<chrono::Utc>,
@@ -64,7 +63,7 @@ async fn list_jobs(
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
     let rows = sqlx::query(
-        "SELECT j.id, j.job_type, j.status::text AS status, j.priority, j.allocation,
+        "SELECT j.id, j.job_type, j.status::text AS status, j.allocation,
                 j.redundancy, j.created_at,
                 -- Running totals, like games_completed below. Counted, these
                 -- were two scans of a job's whole task history for every job on
@@ -98,7 +97,7 @@ async fn list_jobs(
          FROM jobs j
          LEFT JOIN job_game_config gc ON gc.job_id = j.id
          LEFT JOIN job_game_pair_config pc ON pc.job_id = j.id
-         ORDER BY j.priority ASC, j.created_at DESC
+         ORDER BY j.created_at DESC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
@@ -127,7 +126,6 @@ async fn list_jobs(
                 id: row.get("id"),
                 job_type,
                 status: row.get("status"),
-                priority: row.get("priority"),
                 allocation: row.get("allocation"),
                 redundancy: row.get("redundancy"),
                 created_at: row.get("created_at"),

@@ -123,7 +123,7 @@ async fn ensure_template() {
 /// and the contract fixtures move together.
 pub fn test_builders() -> birdtest::magpie::Builders {
     birdtest::magpie::Builders {
-        magpie_version: "0.5.1".into(),
+        magpie_version: "0.1.0".into(),
         build_target: "nehalem".into(),
         wmp_builder_version: 1,
         rit_builder_version: 1,
@@ -181,7 +181,7 @@ impl TestDb {
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
-            min_magpie_version: "0.5.1".into(),
+            min_magpie_version: "0.1.0".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
             // A path that is not a binary. Nothing below tier 6 runs a
             // conversion, and a test that reached one should fail loudly
@@ -328,7 +328,7 @@ impl TestDb {
         .unwrap()
     }
 
-    /// An active `games` job at priority 0, with its config row.
+    /// An active `games` job at 50% allocation, with its config row.
     pub async fn games_job(&self, redundancy: i32, games_per_batch: i32) -> Uuid {
         let admin = self.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
         let p1 = self.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
@@ -349,14 +349,14 @@ impl TestDb {
         job
     }
 
-    /// A `jobs` row and nothing else: active, allocation 50, floor 0.5.1.
+    /// A `jobs` row and nothing else: active, allocation 50, floor 0.1.0.
     pub async fn bare_job(&self, job_type: &str, redundancy: i32, created_by: Uuid) -> Uuid {
         let ld = self.input_data("letterdist", "english").await;
         let layout = self.input_data("layout", "standard15").await;
         sqlx::query_scalar(
-            "INSERT INTO jobs (job_type, priority, allocation, redundancy, status, created_by,
+            "INSERT INTO jobs (job_type, allocation, redundancy, status, created_by,
                                variant, letterdist_id, layout_id, bingo_bonus, sim_cutoff)
-             VALUES ($1::job_type, 0, 50, $2, 'active', $3, 'classic', $4, $5, 50, 0.005)
+             VALUES ($1::job_type, 50, $2, 'active', $3, 'classic', $4, $5, 50, 0.005)
              RETURNING id",
         )
         .bind(job_type)

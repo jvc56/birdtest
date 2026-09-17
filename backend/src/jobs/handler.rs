@@ -157,6 +157,13 @@ pub struct OpeningRackRequest {
     /// on each, which the per-worker rate limit alone caps at well under a
     /// rack per second.
     pub racks: Vec<String>,
+    /// The seed rack `i` of the batch is analysed from, as `seed + i`: the
+    /// index of the first rack in the job's rack space, as a decimal string
+    /// like [`GameRequest::seed`]. Every task states a seed, this one included,
+    /// so a simulation's sampling depends on the task and not on the worker
+    /// (the executor used to derive one from the rack's letters).
+    #[serde(with = "seed_as_string")]
+    pub seed: u64,
     pub previous_play: Option<String>,
     /// Run-wide settings from the job, stated so no worker supplies its own
     /// build's default: the bingo bonus, and the simulation cutoff.

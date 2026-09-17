@@ -10,7 +10,6 @@
   let busy = false;
 
   let jobType: JobType = 'game_pairs';
-  let priority = 0;
   let redundancy = 1;
   // Pre-filled from the server-wide floor rather than left blank: a default
   // nobody sees is how every new job quietly inherits a floor that is too low.
@@ -84,7 +83,6 @@
   function body(): Record<string, unknown> {
     const common = {
       job_type: jobType,
-      priority,
       // Leave generation runs at redundancy 1 only: the server refuses more.
       redundancy: jobType === 'leave_generation' ? 1 : redundancy,
       variant,
@@ -154,11 +152,7 @@
     </select>
   </div>
 
-  <div class="grid grid-cols-3 gap-3">
-    <div>
-      <label class="label" for="priority">Priority (lower wins)</label>
-      <input id="priority" type="number" class="input" bind:value={priority} />
-    </div>
+  <div class="grid grid-cols-2 gap-3">
     <div>
       <label class="label" for="redundancy">Redundancy</label>
       <input id="redundancy" type="number" min="1" class="input" bind:value={redundancy} disabled={jobType === 'leave_generation'} />

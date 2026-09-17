@@ -87,7 +87,7 @@ export interface JobListItem {
   id: string;
   job_type: JobType;
   status: JobStatus;
-  priority: number;
+  /** The job's share of the fleet while active; null until first activated. 0% means what inactive means. */
   allocation: number | null;
   redundancy: number;
   created_at: string;
@@ -137,7 +137,6 @@ export interface JobStats {
     id: string;
     job_type: JobType;
     status: JobStatus;
-    priority: number;
     allocation: number | null;
     redundancy: number;
     min_magpie_version: string;

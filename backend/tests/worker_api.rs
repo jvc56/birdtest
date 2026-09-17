@@ -1607,3 +1607,73 @@ async fn a_jobs_template_is_read_once_survives_a_purge_and_goes_with_the_job() {
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     assert!(state.templates.get(job).is_none(), "a deleted job is forgotten");
 }
+
+/// There is no priority: an admin parks a job at 0%, which is offered to
+/// nobody, exactly as an inactive one is. Every claim goes to the active job
+/// above 0% that is furthest behind its share.
+#[tokio::test]
+async fn a_job_at_zero_allocation_is_offered_to_nobody() {
+    let db = TestDb::new().await;
+    let parked = db.games_job(1, 2).await;
+    let running = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+        .bind(parked)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    for _ in 0..3 {
+        let (assignment, _) = first_claim(&app).await;
+        assert_eq!(assignment["job_id"], running.to_string(), "only the job above 0% is offered");
+    }
+
+    // With the running job parked too, active jobs exist and nothing rules
+    // them out, so the answer is "nothing right now" rather than a shutdown.
+    sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
+        .bind(running)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, body) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// Every task carries the seed its games are played from, and every assignment
+/// states it: an opening-rack task's is the index of its first rack, so rack
+/// `i` of the batch is analysed from `seed + i` on every worker alike.
+#[tokio::test]
+async fn every_assignment_states_the_seed_its_task_was_stored_with() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let player = db.static_player("analyser", admin).await;
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
+         VALUES ($1, $2, 3, 2, 1000)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let (first, uuid) = first_claim(&app).await;
+    assert_eq!(first["task_request"]["seed"], "0", "the first slice starts the space");
+    assert_eq!(first["task_request"]["racks"].as_array().unwrap().len(), 3);
+    let (status, second) = claim_as(&app, &uuid).await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    assert_eq!(second["task_request"]["seed"], "3", "the next slice's seed is its first rack's index");
+
+    let stored: Vec<i64> = sqlx::query_scalar(
+        "SELECT seed FROM tasks WHERE job_id = $1 ORDER BY created_at",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![0, 3], "the assignment's seed is the task's");
+}

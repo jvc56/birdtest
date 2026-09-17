@@ -75,7 +75,7 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
     // are fixed.
     //
     // Reclamation is lazy: a lapsed claim is flipped to `abandoned` when a
-    // worker next asks for work from the job's priority tier, and nothing ever
+    // worker next asks for work and the job is a candidate, and nothing ever
     // asks for work from a completed job. So a claim whose worker died stayed
     // `claimed` for good, and refused every export of the job for good --
     // where the design says a claim lapses at the heartbeat timeout. Reclaimed

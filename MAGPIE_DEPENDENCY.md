@@ -394,9 +394,10 @@ both existed.
   zero.
 - `klvwmp2rit` takes the KLV's and the wordmap's names separately.
 - `BUILD=portable_release`.
-- `MAGPIE_VERSION` 0.5.0; then 0.5.1 once `config_contribute_load_lexicon_and_variant`
-  switched the word info table off before every lexical load (the sixth audit's
-  M1), and the floor moved with it.
+- `MAGPIE_VERSION` 0.1.0, the branch's pre-release version. It was incremented
+  through 0.5.1 as birdtest and MAGPIE changed together, but none of that is in
+  production, so it is 0.1.0 until the first release; the floor is the same
+  value and moves with it.
 
 **birdtest**
 

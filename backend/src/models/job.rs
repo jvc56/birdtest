@@ -25,7 +25,8 @@ pub enum JobStatus {
 pub struct Job {
     pub id: Uuid,
     pub job_type: JobType,
-    pub priority: i32,
+    /// The job's share of the fleet while active; `None` until first
+    /// activated. There is no priority: 0% is what `inactive` means.
     pub allocation: Option<i32>,
     pub redundancy: i32,
     pub status: JobStatus,

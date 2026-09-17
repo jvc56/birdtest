@@ -822,8 +822,6 @@ async fn require_role(
 #[derive(Deserialize)]
 struct CreateJobBody {
     job_type: JobType,
-    #[serde(default)]
-    priority: i32,
     #[serde(default = "one")]
     redundancy: i32,
     /// Rules setting shared by every job type.
@@ -966,13 +964,12 @@ async fn create_job(
     let mut tx = state.pool.begin().await?;
     let job = sqlx::query_as::<_, Job>(
         "INSERT INTO jobs
-             (job_type, priority, redundancy, variant, letterdist_id, layout_id,
+             (job_type, redundancy, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
               sim_cutoff, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
     )
     .bind(body.job_type)
-    .bind(body.priority)
     .bind(body.redundancy)
     .bind(&body.variant)
     .bind(body.letterdist_id)
@@ -1476,10 +1473,11 @@ struct ActivateBody {
     allocation: i32,
 }
 
-/// Activation sets the allocation. Active jobs in a priority tier must sum to
-/// 100%, which is checked here rather than in the schema — the intermediate
-/// states an admin passes through while rebalancing would violate a DB
-/// constraint even when the end state is fine.
+/// Activation sets the allocation. The active jobs must sum to at most 100%,
+/// which is checked here rather than in the schema — the intermediate states
+/// an admin passes through while rebalancing would violate a DB constraint
+/// even when the end state is fine. An allocation of 0 is accepted and means
+/// what `inactive` means: the job is offered to nobody until it is raised.
 async fn activate_job(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -1515,30 +1513,25 @@ async fn activate_job(
         return Err(AppError::conflict("a completed job cannot be reactivated"));
     }
 
-    // Serializes activations within one priority tier. The row lock above
-    // covers only this job, so two jobs activated at once in the same tier
-    // would each read the other's allocation as absent and together exceed
-    // 100%.
-    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate_tier'), $1)")
-        .bind(job.priority)
+    // Serializes activations. The row lock above covers only this job, so two
+    // jobs activated at once would each read the other's allocation as absent
+    // and together exceed 100%.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
         .execute(&mut *tx)
         .await?;
 
-    let tier_total = sqlx::query_scalar::<_, Option<i64>>(
-        "SELECT SUM(allocation) FROM jobs
-         WHERE status = 'active' AND priority = $1 AND id <> $2",
+    let others = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> $1",
     )
-    .bind(job.priority)
     .bind(id)
     .fetch_one(&mut *tx)
     .await?
     .unwrap_or(0);
 
-    if tier_total + body.allocation as i64 > 100 {
+    if others + body.allocation as i64 > 100 {
         return Err(AppError::conflict(format!(
-            "priority tier {} already allocates {tier_total}% — {}% is the most this job can take",
-            job.priority,
-            100 - tier_total
+            "the other active jobs already allocate {others}% — {}% is the most this job can take",
+            100 - others
         )));
     }
 

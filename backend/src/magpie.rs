@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn builder_ids_are_role_and_version() {
         let builders = Builders {
-            magpie_version: "0.5.1".into(),
+            magpie_version: "0.1.0".into(),
             build_target: "nehalem".into(),
             wmp_builder_version: 1,
             rit_builder_version: 2,
@@ -395,9 +395,9 @@ mod tests {
     /// this is what says so, rather than every build request failing at once.
     #[test]
     fn the_builders_json_magpie_prints_parses() {
-        let printed = r#"{"magpie_version":"0.5.1","build_target":"nehalem","wmp_builder_version":1,"rit_builder_version":1,"klv_builder_version":1}"#;
+        let printed = r#"{"magpie_version":"0.1.0","build_target":"nehalem","wmp_builder_version":1,"rit_builder_version":1,"klv_builder_version":1}"#;
         let builders: Builders = serde_json::from_str(printed).unwrap();
-        assert_eq!(builders.magpie_version, "0.5.1");
+        assert_eq!(builders.magpie_version, "0.1.0");
         assert_eq!(builders.build_target, "nehalem");
         assert_eq!(builders.wmp(), "wmp-1");
     }

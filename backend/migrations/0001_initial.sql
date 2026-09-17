@@ -325,9 +325,13 @@ CREATE TYPE job_status AS ENUM (
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_type   job_type NOT NULL,
-    -- Lower value = higher priority. Priority 0 outranks priority 1.
-    priority   INT NOT NULL DEFAULT 0,
-    -- NULL until the job is first activated; set by the admin at activation time.
+    -- NULL until the job is first activated; set by the admin at activation
+    -- time. Every active job's share of the fleet: the scheduler hands each
+    -- claim to the active job furthest behind `claims_issued / allocation`,
+    -- and the active jobs may allocate at most 100% between them. There is
+    -- no priority: a job that should get nothing for now is set to 0%, which
+    -- is exactly what `inactive` means, and a job that should get everything
+    -- is the only one above 0%.
     allocation INT CHECK (allocation BETWEEN 0 AND 100),
     -- Number of independent workers that must complete each task. Default 1 = single-claim behavior.
     redundancy INT NOT NULL DEFAULT 1 CHECK (redundancy >= 1),
@@ -356,24 +360,20 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.5.1 is the
-    -- first MAGPIE version that switches a word info table off before every
-    -- task's lexicon loads -- an accelerator birdtest neither offers nor
-    -- checks, which built from an older lexicon prunes plays that exist: 0.1.0
-    -- left the bingo bonus, an opening-rack simulation's settings and a
-    -- leave-generation task's seed to the worker's own settings; before 0.3.0 a
-    -- task's wordmap and rack-info-table flags applied to the next task;
-    -- before 0.4.0 every setting a request left null came from the worker's
-    -- compile-time defaults; 0.4.0 played with whatever wordmap sat on the
-    -- worker's disk, checked against nothing; and 0.5.0, the first to check a
-    -- wordmap or a rack info table against the hash the job pins, left a
-    -- contributor's own word info table in force. The default here is the same
-    -- value as the server's MIN_MAGPIE_VERSION, which create_job writes
-    -- explicitly; the two are kept equal so a row written any other way
-    -- (a restore, a hand insert) does not floor a job below the server.
+    -- so "no floor" is not a state worth being able to express. 0.1.0 is
+    -- `birdtest-contribute`'s pre-release version: neither birdtest nor the
+    -- branch is in production yet, so everything the protocol relies on --
+    -- every result-changing setting stated on the request, input data and
+    -- derived files checked against the hashes the job pins, the word info
+    -- table switched off before every load, a seed on every task -- is in
+    -- 0.1.0, and the version moves only when a release changes what a task
+    -- computes. The default here is the same value as the server's
+    -- MIN_MAGPIE_VERSION, which create_job writes explicitly; the two are kept
+    -- equal so a row written any other way (a restore, a hand insert) does not
+    -- floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 5 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -641,8 +641,16 @@ CREATE TYPE task_state AS ENUM ('available', 'claimed', 'completed');
 CREATE TABLE tasks (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id               UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    -- Seed for seed-based tasks (games, game pairs). NULL for non-seed tasks.
-    seed                 BIGINT,  -- stored as signed int64; interpreted as uint64 at the application layer
+    -- The seed the task's games are played from. Every job type plays games,
+    -- so every task has one, stated on its request: games and game pairs seed
+    -- their batch from it and step by one per game; an opening-rack task's is
+    -- the index of its first rack in the job's rack space, and rack i of the
+    -- batch is analysed from seed + i; a leave-generation task's is drawn
+    -- when the task is created. Stored as signed int64; interpreted as uint64
+    -- at the application layer. For games, pairs and opening racks it is also
+    -- the cursor that tiles the job's space, which is what the unique index
+    -- below serves.
+    seed                 BIGINT NOT NULL,
     state                task_state NOT NULL DEFAULT 'available',
     -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate join/aggregate.
     accepted_count       INT NOT NULL DEFAULT 0,
@@ -651,8 +659,11 @@ CREATE TABLE tasks (
     completed_at         TIMESTAMPTZ
 );
 
--- Prevent duplicate seed-based tasks within the same job.
-CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed) WHERE seed IS NOT NULL;
+-- Prevent two tasks of one job from playing the same seed: for games, pairs
+-- and opening racks that is two workers racing for the same slice of the
+-- space, for leave generation a collision between two randomly drawn seeds
+-- (which the claim path retries).
+CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed);
 
 -- Partial indexes to support efficient SKIP LOCKED task selection and timeout
 -- reclamation.

@@ -59,9 +59,9 @@
 
     <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Priority / allocation</p>
+        <p class="text-xs uppercase text-muted-foreground">Allocation</p>
         <p class="mt-1 text-xl tabular-nums">
-          {stats.job.priority} · {stats.job.allocation === null ? '—' : `${stats.job.allocation}%`}
+          {stats.job.allocation === null ? '—' : `${stats.job.allocation}%`}
         </p>
       </div>
       <div class="card">

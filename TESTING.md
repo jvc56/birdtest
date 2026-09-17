@@ -466,18 +466,18 @@ The single most important group. Every entry is about a decision made in SQL.
 
 - `I-SCHED-1` A claim against one active job returns a task, inserts a
   `task_claims` row, and increments `active_claim_count`.
-- `I-SCHED-2` Deficit selection: two active jobs at equal priority with
-  allocations 75/25 converge on that ratio over many claims.
-- `I-SCHED-3` Priority tiers: a job at priority 0 is always chosen over one at
-  priority 1, regardless of allocation deficit.
+- `I-SCHED-2` Deficit selection: two active jobs with allocations 75/25
+  converge on that ratio over many claims.
+- `I-SCHED-3` A job at 0% is offered to nobody, exactly as an inactive one is:
+  every claim goes to the other active job, and with every active job at 0%
+  the answer is `204`, not a shutdown. There is no priority.
 - `I-SCHED-4` `tasks_dispatched` counts abandoned claims. Abandon many claims on
   one job and confirm its share does **not** grow — excluding them would let a
   job with flaky workers accumulate more than its share.
 - `I-SCHED-5` Ties break on `created_at ASC`.
-- `I-SCHED-6` **Both capability filters run before `MIN(priority)`.** A worker
-  whose `unsupported_jobs` covers the entire top tier is offered work from the
-  next tier, not shut down. Filtering afterwards produces exactly this bug and
-  looks correct in isolation.
+- `I-SCHED-6` **Both capability filters are part of candidate selection.** A
+  worker whose `unsupported_jobs` covers the job furthest behind its share is
+  offered the next one in deficit order, not shut down.
 - `I-SCHED-7` Version filtering: a worker on `1.9.0` is offered a job requiring
   `1.9.0` and not one requiring `1.10.0`. Include the `1.9.0` vs `1.10.0` pair
   specifically — lexical comparison passes every other case.
@@ -1049,8 +1049,8 @@ round-trip tests bought: there is no longer a second implementation to check
 against MAGPIE, because there is no second implementation.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.5.1`, the shipped `MIN_MAGPIE_VERSION` default,
-and a checkout from before the audits' fixes reports `0.5.0` or lower and is refused. The
+`birdtest-contribute` reports `0.1.0`, the shipped `MIN_MAGPIE_VERSION` default
+and the branch's pre-release version; a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -1281,7 +1281,7 @@ They do not call the seed. They construct exactly the state each test needs.
 
 The moment integration tests depend on a realistic fixture, every test is
 coupled to its contents and the cases that matter become unreachable: zero
-active jobs, an empty top priority tier, a worker locked out of every job, a job
+active jobs, every active job at 0%, a worker locked out of every job, a job
 at capacity, a claim one second past its timeout. Those need precise state, not
 plausible state. Tiers 2 and 3 share the migration and the builders, and nothing
 above them.

@@ -103,7 +103,7 @@ async fn generate_opening_rack(
         return Ok(Acquired::NoWork);
     };
 
-    let task_id = insert_on_demand_task(conn, job.id, Some(start)).await?;
+    let task_id = insert_on_demand_task(conn, job.id, start).await?;
     opening_rack::insert_range(conn, task_id, config, &template.data, start, request.racks.len())
         .await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::OpeningRack(request), created: true })
@@ -191,7 +191,7 @@ async fn generate_games(
         // Every game up to `max_games` has been handed out.
         return Ok(Acquired::NoWork);
     };
-    let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
+    let task_id = insert_on_demand_task(conn, job.id, seed).await?;
     super::insert_game_request(
         conn,
         task_id,
@@ -219,7 +219,7 @@ async fn generate_game_pairs(
         // Every pair up to `max_pairs` has been handed out.
         return Ok(Acquired::NoWork);
     };
-    let task_id = insert_on_demand_task(conn, job.id, Some(seed)).await?;
+    let task_id = insert_on_demand_task(conn, job.id, seed).await?;
     super::insert_game_request(
         conn,
         task_id,
@@ -287,7 +287,11 @@ async fn generate_leave_gen(
 
     match leave_gen::next_step(conn, job.id, config, &template.data, lexicon).await? {
         leave_gen::LeaveGenStep::Dispatch(request) => {
-            let task_id = insert_on_demand_task(conn, job.id, None).await?;
+            // The seed drawn for the task is its seed on the `tasks` row too:
+            // every task has one, and the unique index on (job_id, seed) turns
+            // the negligible chance of two draws colliding into a retried
+            // claim rather than two tasks replaying each other's games.
+            let task_id = insert_on_demand_task(conn, job.id, request.seed as i64).await?;
             leave_gen::insert_request(conn, task_id, &request).await?;
             Ok(Acquired::Task { task_id, request: TaskRequest::LeaveGeneration(request), created: true })
         }
@@ -305,11 +309,11 @@ async fn generate_leave_gen(
 
 /// On-demand tasks are inserted `available` and immediately claimed by the
 /// caller in the same transaction, so the counter bookkeeping is identical on
-/// every path.
+/// every path. Every task carries the seed its games are played from.
 async fn insert_on_demand_task(
     conn: &mut PgConnection,
     job_id: Uuid,
-    seed: Option<i64>,
+    seed: i64,
 ) -> AppResult<Uuid> {
     Ok(sqlx::query_scalar::<_, Uuid>(
         "INSERT INTO tasks (job_id, seed, state) VALUES ($1, $2, 'available') RETURNING id",

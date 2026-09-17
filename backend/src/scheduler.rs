@@ -67,8 +67,8 @@ pub struct ShutdownDirective {
     pub download_url: Option<String>,
 }
 
-/// Active jobs in the top priority tier, ordered by how far behind their
-/// allocation share they are.
+/// Active jobs with a share of the fleet, ordered by how far behind that share
+/// they are.
 ///
 /// The deficit is `jobs.claims_issued / allocation`. That counter counts every
 /// claim ever issued, abandoned and declined ones included: a claim consumed
@@ -79,27 +79,24 @@ pub struct ShutdownDirective {
 /// than a `COUNT(*)` over `task_claims` because this query runs on every claim
 /// request, and a count grows with the whole history of every candidate job.
 ///
-/// Both capability filters live in the `eligible_jobs` CTE and the priority is
-/// computed over its output, so "filter before MIN(priority)" is structural
-/// rather than remembered. Applying either filter afterwards would pick the top
-/// tier from jobs the worker cannot run and then hand back nothing, leaving a
-/// worker locked out of tier 0 blind to doable work in tier 1.
+/// There is no priority. Every active job with an allocation above zero is a
+/// candidate, and the worker takes from the one furthest behind its share; a
+/// job at 0% is offered to nobody, which is what `inactive` means too, so an
+/// admin parks a job with either. The two capability filters -- the worker's
+/// MAGPIE version and its unsupported set -- are applied here, so a worker that
+/// cannot run one job is offered the next.
 async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<Vec<Job>> {
     Ok(sqlx::query_as::<_, Job>(
-        "WITH eligible_jobs AS (
-             SELECT j.*
-             FROM jobs j
-             WHERE j.status = 'active'
-               AND (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
-                   <= ($1, $2, $3)
-               AND j.id <> ALL($4)
-         )
-         SELECT e.*
-         FROM eligible_jobs e
-         WHERE e.priority = (SELECT MIN(priority) FROM eligible_jobs)
+        "SELECT j.*
+         FROM jobs j
+         WHERE j.status = 'active'
+           AND j.allocation > 0
+           AND (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
+               <= ($1, $2, $3)
+           AND j.id <> ALL($4)
          ORDER BY
-           e.claims_issued::float / NULLIF(e.allocation, 0) ASC NULLS LAST,
-           e.created_at ASC",
+           j.claims_issued::float / j.allocation ASC,
+           j.created_at ASC",
     )
     .bind(caps.magpie_version.major)
     .bind(caps.magpie_version.minor)
@@ -150,7 +147,7 @@ async fn shutdown_or_idle(
     let data_blocked = row.get::<i64, _>("data_blocked") > 0;
     if !version_blocked && !data_blocked {
         // Active jobs exist and nothing rules them out; they simply had no
-        // task to hand out this instant.
+        // task to hand out this instant, or every one of them is at 0%.
         return Ok(ClaimOutcome::Idle);
     }
 
@@ -236,15 +233,15 @@ pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> 
     reclaim_expired_for(pool, &[job_id], timeout_secs).await
 }
 
-/// [`reclaim_expired`] over a whole tier of candidate jobs in one statement.
+/// [`reclaim_expired`] over every candidate job in one statement.
 ///
 /// The scan is the same either way: the planner reaches the expired claims
 /// through the partial index on open claims -- one entry per claim currently in
 /// flight across the fleet -- and filters by job afterwards, because
 /// `task_claims` has no job column to narrow on. Run per job, a claim request
-/// therefore paid that scan once per candidate in its tier, for a set of rows
-/// that does not depend on the job at all. Run once over the tier it is a single
-/// pass and a single round trip.
+/// therefore paid that scan once per candidate, for a set of rows that does not
+/// depend on the job at all. Run once over all of them it is a single pass and
+/// a single round trip.
 pub async fn reclaim_expired_for(
     pool: &PgPool,
     job_ids: &[Uuid],
@@ -283,8 +280,8 @@ pub async fn reclaim_expired_for(
     Ok(result.rows_affected())
 }
 
-/// Walk the priority tier in deficit order and hand out the first available unit
-/// of work.
+/// Walk the candidate jobs in deficit order and hand out the first available
+/// unit of work.
 pub async fn claim(
     state: &AppState,
     identity: &WorkerIdentity,
@@ -317,10 +314,10 @@ pub async fn claim(
             return shutdown_or_idle(state, caps).await;
         }
 
-        // Once for the whole tier, before anything is handed out: a task whose
-        // claim lapsed has to be back to `available` before the loop below
-        // looks for one. Per job this was a round trip per candidate for a
-        // scan that does not depend on the job; one statement covers the tier.
+        // Once for every candidate, before anything is handed out: a task
+        // whose claim lapsed has to be back to `available` before the loop
+        // below looks for one. Per job this was a round trip per candidate for
+        // a scan that does not depend on the job; one statement covers them.
         // A failure here is not fatal -- nothing is reclaimed this time round,
         // so a lapsed task waits for the next claim -- and must not take the
         // whole request down with it.
@@ -335,7 +332,7 @@ pub async fn claim(
             // generation-0 artifact never got written, a config row a bad
             // restore left out -- must not take every other job down with it.
             // Failing the whole claim here would answer every worker with a
-            // 500 for as long as that job sits at the top of the tier, and
+            // 500 for as long as that job sits at the head of the list, and
             // every client retries 500s. It is logged loudly and skipped.
             match try_claim_from_job(state, identity, job, caps).await {
                 Ok(Some(outcome)) => return Ok(ClaimOutcome::Task(Box::new(outcome))),

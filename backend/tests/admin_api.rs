@@ -1213,7 +1213,7 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
 }
 
 /// Bug: reclamation is lazy and runs when a worker asks for work from the
-/// job's priority tier, which never happens for a completed job. A claim whose
+/// job's candidate list, which never happens for a completed job. A claim whose
 /// worker died therefore stayed `claimed` for good, and the export refused
 /// with "at most the heartbeat timeout" for good.
 #[tokio::test]

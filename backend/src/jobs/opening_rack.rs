@@ -39,6 +39,7 @@ impl JobHandler for OpeningRackHandler {
         // the table it walks is the template's, built once for the job.
         Ok(OpeningRackRequest {
             racks: index.racks_in_range(rack_start as u64, rack_count as u64),
+            seed: rack_start as u64,
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
             board_layout: row.get("board_layout"),
@@ -185,7 +186,9 @@ pub fn total_racks(distribution: &LetterDistribution, rack_size: i32) -> i64 {
 ///
 /// Slices tile the space the same way game seeds do, so the `(job_id, seed)`
 /// unique index resolves two workers racing for the same slice -- the loser
-/// retries and takes the next one.
+/// retries and takes the next one. The slice's start is also the task's seed:
+/// rack `i` of the batch is analysed from `seed + i`, its index in the job's
+/// rack space, which is the same on every worker.
 ///
 /// `index` is the job's rack space and `player` its analysing player, both from
 /// the job's template: the one read here is the seed cursor.
@@ -224,6 +227,7 @@ pub async fn next_request(
             letter_distribution: job_data.letterdist_name.clone(),
             board_layout: job_data.layout_name.clone(),
             racks,
+            seed: next_start as u64,
             previous_play: None,
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,

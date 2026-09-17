@@ -17,14 +17,14 @@ Jobs are long-running research goals defined and managed by admins. The followin
 - **Run game pairs** — same as games but run as matched pairs (same seed, players swapped) to reduce variance.
 - **Leave generation**
 
-Each job has a **priority** and a **percentage allocation**. Priority takes precedence: workers are only assigned tasks from lower-priority jobs when no tasks remain at any higher-priority level. **A lower integer value means higher priority** — priority `0` outranks priority `1`. Allocation percentages govern how work is distributed among jobs at the same priority level; active jobs within a tier may allocate at most 100% between them (enforced at the application layer, not via a DB constraint, and serialized so two concurrent activations cannot jointly exceed it). Jobs, their priorities, and their allocations are managed by admins only.
+Each job has a **percentage allocation**, and nothing else decides who gets work: every claim goes to the active job furthest behind its share, and the active jobs may allocate at most 100% between them (enforced at the application layer, not via a DB constraint, and serialized so two concurrent activations cannot jointly exceed it). There is no priority. A job that should get nothing for now is set to **0%**, which is exactly what the inactive state means, and a job that should get everything is the only one above 0% — so allocation alone expresses every ordering an admin needs, without a second axis to keep coherent with it. Jobs and their allocations are managed by admins only.
 
 #### Job Lifecycle Controls
 
 Jobs are created by admins in the **inactive** state and only start receiving work once explicitly activated. The following states are supported:
 
 - **active** — workers are assigned tasks from this job normally.
-- **inactive** — the job exists and retains all its tasks and results, but workers are not assigned tasks from it. Admins can reactivate it at any time.
+- **inactive** — the job exists and retains all its tasks and results, but workers are not assigned tasks from it. Admins can reactivate it at any time. An active job at **0% allocation** is in the same position — offered to nobody — so the two are interchangeable ways of parking a job; the state is what records that an admin switched it off, and 0% is what an admin sets while rebalancing the others.
 - **completed** — all tasks have been completed, either automatically when the finish condition is met or manually by an admin.
 
 Jobs are created in the **inactive** state. Allocation is not set at creation time — it is supplied by the admin when they activate the job. This keeps the allocation budget coherent: an admin reviews the full set of active jobs, decides the new job's share, and activates it with a specific percentage in a single action.
@@ -44,7 +44,7 @@ Tasks are the atomic units of work that workers execute. The following task type
 - Play a batch of game pairs from a given starting seed
 - Play a batch of leave-generation games over a forced subset of racks
 
-All game-based tasks (games, game pairs) are identified by a **seed** — a `uint64` value. The combination of `(job_id, seed)` must be unique; duplicate tasks are prevented at the database level. Opening-rack tasks reuse the `seed` column as the start of their rack range, so the same index tiles their space. Leave-generation tasks leave `seed` null and are not deduplicated by request content: what keeps two of them apart is that a claim is never handed a rack another open claim is already forcing (see claim step 2 under Leave Generation).
+Every task carries a **seed** — a `uint64` value — because every job type plays games, and what a game samples must be a function of the task and never of the worker. The combination of `(job_id, seed)` must be unique; duplicate tasks are prevented at the database level. Games and game pairs seed their batch from it and step by one per game, so the seed is also the cursor that tiles the job's seed space. An opening-rack task's seed is the index of its first rack in the job's rack space — rack `i` of the batch is analysed from `seed + i`, the same number on every worker — so the same column and the same index tile that space too. A leave-generation task's seed is drawn when the task is created and stored with it, so a reissued task replays it; two leave tasks are otherwise kept apart by the rule that a claim is never handed a rack another open claim is already forcing (see claim step 2 under Leave Generation), and a collision between two random draws is a unique violation the claim path retries.
 
 #### Task States
 
@@ -62,7 +62,7 @@ State is determined by denormalized counters (`accepted_count`, `active_claim_co
 - **claimed**: `accepted_count + active_claim_count = redundancy` but `accepted_count < redundancy` — all slots are filled with in-flight claims; waiting on results.
 - **completed**: `accepted_count = redundancy` — all X results have been submitted and accepted.
 
-Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested from the job's priority tier, not via a background process. A job nobody asks for work from — one that is inactive or completed — therefore keeps a lapsed claim on its books until something reclaims it: activation puts it back in a tier, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
+Individual claims are rows in `task_claims`. When a claim's heartbeat times out, that claim row is flipped to `abandoned`, `active_claim_count` is decremented, and if the task was at capacity it returns to **available**. Reclamation is lazy — it runs at the moment the next task is requested and the job is a candidate, not via a background process. A job nobody asks for work from — one that is inactive or completed — therefore keeps a lapsed claim on its books until something reclaims it: activation puts it back in a tier, and starting an [export](#exports) reclaims the job's lapsed claims first, since a completed job is never claimed from again.
 
 #### Task Generation
 
@@ -73,7 +73,7 @@ Every job type generates its tasks **on demand**: the next task request is gener
 ### Workflow
 
 1. The worker sends a **task claim** to the server — a minimal message identifying itself and signaling it is ready for work.
-2. The system selects a job by priority tier (lowest integer value = highest priority, descending). Within the top available tier, the job chosen is the one **most behind its configured allocation share** — specifically, the active job with the lowest ratio of `claims_issued / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
+2. The system selects the active job **most behind its configured allocation share** — specifically, among active jobs with an allocation above 0%, the one with the lowest ratio of `claims_issued / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`.
 4. The system acquires the next task (pre-populated or on-demand, depending on the job type), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
@@ -304,7 +304,7 @@ The unconditional check when nothing is in flight is a correctness cover rather
 than an optimisation. The check is triggered *by* submissions, so a job whose
 contributors all stop between checks would not be evaluated again until work
 resumed — which, for a job that has already reached its stopping point, means
-never: it would sit `active` holding allocation in its priority tier.
+never: it would sit `active` holding its allocation.
 
 #### How the LLR is computed
 
@@ -398,6 +398,42 @@ rating.
 
 Everything below lives in four `rating_*` tables and one module. See
 [Rating pools](#rating-pools) for the schema and the fit.
+
+#### In one place: when a rating is computed, and where it is shown
+
+A rating is never updated by a result landing. It is recomputed for a whole
+pool, from scratch, by `ratings::fit_and_store`, on exactly three triggers:
+
+| Trigger | When | Who | What is written |
+|---|---|---|---|
+| **evidence** | Every two minutes, from a sweep started by `main.rs` (`ratings::recompute_stale`), for each pool whose count of eligible pairs differs from its last run's `pairs_used` | The server, unattended | A new `rating_runs` row with a `player_config_ratings` row per member and a `rating_run_residuals` row per head-to-head — or nothing, if the evidence has not moved |
+| **membership** | Immediately, inside the request, when an admin adds or removes a member (`POST`/`DELETE /api/admin/rating-pools/:id/members`) | An admin | The same, unconditionally |
+| **manual** | Immediately, on `POST /api/admin/rating-pools/:id/recompute` | An admin | The same, unconditionally |
+
+So a result submitted now is in a rating within two minutes, and a job that
+finishes at 03:00 is rated by 03:02 without anyone doing anything. Nothing on
+the claim or submit path reads or writes a rating, and no job decision depends
+on one; SPRT is a separate, per-job stopping rule.
+
+Ratings are **displayed on the ratings pages and nowhere else**:
+
+- `/ratings` (`GET /api/rating-pools`) — every pool with its conditions,
+  member count and the time of its last fit.
+- `/ratings/[id]` (`GET /api/rating-pools/:id`) — the pool's **newest run**:
+  each member's rating with its standard error as a dot plot and a table, the
+  run's provenance (trigger, iterations, convergence, evidence consumed), and
+  the residual table showing where the fit disagrees with the games. A config
+  with no path of games to the anchor is listed as unrated rather than drawn.
+  Admin membership controls appear inline here for admins.
+- The **history chart** on the same page (`GET /api/rating-pools/:id/history`)
+  — one line per rated member across the stored runs, thinned to at most 500
+  evenly spaced points with the first and newest always kept.
+
+A job's own pages (`/jobs/[id]`) show its SPRT verdict, win rate and
+pentanomial, and **no rating**: a rating belongs to a pool, not to a job, and a
+`games` job (unpaired) feeds no pool at all. Runs are kept in full for a month
+and then thinned to one a day (see below), so the history is bounded while the
+run-by-run diff stays available for as long as it is useful.
 
 #### Nothing is incremental, and nothing is frozen
 
@@ -659,7 +695,7 @@ Live updates are delivered via **Server-Sent Events (SSE)**. The client subscrib
 
 #### Job List Page
 
-Shows all jobs with: job type, status, priority, allocation, and a completion counter (tasks completed / total, or games completed / max for on-demand jobs).
+Shows all jobs with: job type, status, allocation, and a completion counter (tasks completed / total, or games completed / max for on-demand jobs).
 
 #### Job Detail Page — Common Elements (all job types)
 
@@ -707,7 +743,7 @@ push use it, so a live update is byte-for-byte what a page reload would produce.
 
 ```
 JobStats {
-  job:               { id, job_type, status, priority, allocation, redundancy,
+  job:               { id, job_type, status, allocation, redundancy,
                        min_magpie_version, created_at, created_by, lexicon, variant }
   tasks_total, tasks_completed, tasks_available, tasks_claimed, results_accepted
   games?:            { unit: "game" | "pair", wins, losses, draws,
@@ -860,8 +896,8 @@ later download was redirected to it. So an export is refused (`409`) while any
 claim of the job is still open; no claim can be issued against a completed job,
 so once none is open the results are fixed. The job's lapsed claims are
 reclaimed first, through the same statement dispatch uses: reclamation is
-otherwise lazy, running only when a worker asks for work from the job's
-priority tier, and nothing ever asks for work from a completed job — so a
+otherwise lazy, running only when a worker asks for work and the job is a
+candidate, and nothing ever asks for work from a completed job — so a
 claim whose worker vanished would have stayed `claimed`, and refused the
 export, for good.
 
@@ -1056,7 +1092,7 @@ start. The process has no SSM code path of its own.
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
-| `MIN_MAGPIE_VERSION` | `0.5.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
+| `MIN_MAGPIE_VERSION` | `0.1.0` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
 | `MAGPIE_BIN` | `/usr/local/bin/magpie` | The pinned MAGPIE the server runs for every derived file and every leave-generation KLV. The backend image builds one in; locally, a checkout's `bin/magpie`. Startup fails without a working one. |
 | `MAGPIE_THREADS` | `1` | Threads given to a conversion. The web task keeps 1; the derived-file builder task sets its vCPU count. |
 | `MAGPIE_SCRATCH_DIR` | the system temp directory | Where a conversion's throwaway data directory goes. The builder task points it at its ephemeral volume, since a rack info table is 1.9 GB. |
@@ -1082,7 +1118,7 @@ what the workers are checked against.
 
 | Decision | Rationale |
 |---|---|
-| Priority-then-allocation job scheduling | Priority gives admins hard ordering guarantees; allocation within a tier gives proportional distribution without needing to touch priorities |
+| Allocation-only job scheduling | One axis: every claim goes to the active job furthest behind its share. A priority tier was a second axis that expressed nothing allocation cannot — a job at 0% gets nothing, exactly as an inactive one does, and a job alone above 0% gets everything — while adding a rule (100% per tier) that had to be kept coherent with it |
 | Admin-only job management | Avoids abuse prevention and quota complexity in v1 |
 | Seed uniqueness for seed-based tasks | `(job_id, seed)` unique index prevents duplicate work at the DB level; uint64 seed stored as signed BIGINT, reinterpreted at the application layer |
 | No JSONB in schema | All `config` and audit `metadata` are expanded into typed columns and per-job-type config tables; avoids schema-less data and keeps queries typed |
@@ -1094,7 +1130,7 @@ what the workers are checked against.
 | Batch Bradley-Terry instead of incremental Elo/Glicko | Player configs have fixed strength, so there is no drift for a sequential filter to track; a batch fit is order-independent and makes add/remove a refit rather than an unwind |
 | Named `player_configs` table | Reusable across jobs; maps directly to MAGPIE per-player arguments (`-r1`/`-r2`, `-s1`/`-s2`, etc.); **immutable once created** — no update endpoint exists; deletion only if no job references the config |
 | Frontend dark mode only | Single theme simplifies the component library configuration; no light/dark toggle in v1 |
-| Deficit-based job selection | Deterministic; guarantees long-run allocation accuracy regardless of claim timing; no randomness means reproducible behavior and no starvation |
+| Deficit-based job selection | Deterministic; guarantees long-run allocation accuracy regardless of claim timing; no randomness means reproducible behavior and no starvation of any job above 0% |
 | Seed gap of batch size | Prevents two tasks from covering overlapping game seeds; `next_seed = MAX(seed) + batch_size` so seeds tile without gaps or overlaps |
 | Ratings pooled across jobs, scoped by (variant, letterdist, layout) | A rating is only comparable under fixed conditions, but it is not a property of one job; pooling is what lets a config's whole record produce one number |
 | Only paired jobs feed ratings | `-gp` swaps seats on every seed, so a pair is side-balanced; unpaired games would need an explicit side-advantage term to avoid biasing every rating |
@@ -1565,13 +1601,11 @@ costs one wasted claim per job on the next run.
 
 `candidate_jobs` ([`scheduler.rs`](backend/src/scheduler.rs)) takes the
 unsupported set *and* the worker's MAGPIE version and excludes every job either
-rules out — and it must do so **before** computing `MIN(priority)`, not after.
-Both filters feed a single `eligible_jobs` CTE and the priority is computed over
-its output, so the ordering is structural rather than remembered. Filtering
-afterwards would compute the top priority tier from jobs the worker cannot do and
-then hand back nothing, so a worker locked out of tier 0 would never see doable
-work in tier 1. The worker's tier must be the top tier *among jobs it can
-actually run*.
+rules out, in the same `WHERE` clause that excludes inactive jobs and jobs at
+0%. What is left is ordered by deficit, so a worker that cannot run the job
+furthest behind its share is simply offered the next one: the list is *the
+jobs this worker can actually run*, in the order the scheduler would have
+offered them to anyone.
 
 The answers are one decision rather than four checks: `scheduler::claim` returns
 a `ClaimOutcome` and the HTTP mapping happens once at the edge, so the compiler
@@ -1639,9 +1673,8 @@ server dispatched work and the client discovered afterwards that it could not ru
 it.
 
 The claim carries `magpie_version`, and the scheduler excludes any job whose
-minimum exceeds it, in the same pass and with the same ordering requirement as
-the unsupported set — **before** `MIN(priority)`, so a worker locked out of the
-top tier still sees work below it.
+minimum exceeds it, in the same pass as the unsupported set, so a worker
+locked out of one job is offered the next in deficit order.
 
 `min_magpie_version` is three integer columns rather than one `TEXT`, because
 semver in `TEXT` compares lexically, where `'1.10.0' < '1.9.0'` — a bug that
@@ -1658,25 +1691,23 @@ WHERE (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
 distribution and a layout — and a client too old to understand `expected_data`
 will contribute unverified rather than decline. "No floor" is not a state worth
 being able to express once every job depends on the client honouring a protocol,
-so the columns are `NOT NULL` and default to **`0.5.1`**, the same value as the
-server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly: the first
-MAGPIE version that switches a word info table off before every task's lexicon
-loads (`birdtest-contribute`). `0.5.0` was the first that checks a wordmap or a
-rack info table against the hash the job pins, and the first that loads a table
-at all, but it left a contributor's own `-wit` setting in force — an accelerator
-birdtest neither offers nor checks, which built from an older lexicon prunes
-plays that exist.
-`0.4.0` was the first whose results depended on nothing but the task's stated
-settings, but it played with whatever wordmap sat on the worker's disk, checked
-against nothing. Builds reporting `0.3.0` and `0.2.0` supplied their own
-compile-time defaults for every setting a request left null, and refused the
-sampling-rule names birdtest sends; `0.2.0` also applied a task's wordmap and
-rack-info-table flags to the next task; `0.1.0` still left the bingo bonus, an
-opening-rack simulation's settings and a leave-generation task's seed to the
-worker; and `0.0.0` predates the fixes to simulation settings, distribution and
-layout. All must be refused. The one place the floor lives is the server's
-configuration: the column default, the Terraform variable, the compose file and
-the env examples all carry the same value so no path writes a lower one.
+so the columns are `NOT NULL` and default to **`0.1.0`**, the same value as the
+server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly.
+
+`0.1.0` is `birdtest-contribute`'s **pre-release version**. Neither birdtest
+nor the branch is in production yet, so everything the protocol relies on —
+every result-changing setting stated on the request rather than taken from the
+worker's build, input data and derived files checked against the hashes the job
+pins, the word info table switched off before every load, a seed on every task
+— is in `0.1.0`. The version was incremented through `0.5.1` as birdtest and
+MAGPIE changed together during development; none of those numbers ever
+shipped, so they carry no meaning a floor could use, and it is `0.1.0` until
+the first release. From then on the version moves only when a release changes
+what a task computes, and the floor moves with it: a floor is a minimum, not a
+pin, so it exists precisely so that the first such release can raise it. The
+one place the floor lives is the server's configuration: the column default,
+the Terraform variable, the compose file and the env examples all carry the
+same value so no path writes a lower one.
 
 The floor and the backend image's pinned MAGPIE (`docker/Dockerfile`'s
 `MAGPIE_COMMIT`) move together: the server refuses to start with a pinned MAGPIE
@@ -1829,19 +1860,15 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
 
 1. **Auth and verification**: The server reads the worker identity from request headers (`Authorization: Bearer <api-key>` for authenticated workers, `X-Worker-UUID` for anonymous workers). It verifies the worker is not banned. Resolving the identity, stamping its throttled `last_used_at` / `last_seen_at`, and checking the ban list are **one statement**, not three: this runs on every worker request, so each round trip here is on the critical path of getting a worker its next task. An anonymous identity is only ever *created* by a claim that hands out a task (see [Workers](#workers)).
 
-2. **Job selection**: The server filters to active jobs this worker can run — its MAGPIE version and its unsupported set, see [Scheduler side](#scheduler-side) — takes the lowest priority value among them, and orders that tier by `claims_issued / allocation`, most behind its share first. `jobs.claims_issued` counts every claim ever issued for the job, **including abandoned and declined ones**, so it only ever goes up; excluding abandoned claims would let it shrink as timeouts accrue and would unfairly favour jobs with flaky workers. Ties break on `created_at ASC`. No randomness is involved.
+2. **Job selection**: The server filters to active jobs above 0% that this worker can run — its MAGPIE version and its unsupported set, see [Scheduler side](#scheduler-side) — and orders them by `claims_issued / allocation`, most behind its share first. `jobs.claims_issued` counts every claim ever issued for the job, **including abandoned and declined ones**, so it only ever goes up; excluding abandoned claims would let it shrink as timeouts accrue and would unfairly favour jobs with flaky workers. Ties break on `created_at ASC`. No randomness is involved, and no priority: a job at 0% is offered to nobody, which is what inactive means.
 
    ```sql
-   WITH eligible_jobs AS (
-       SELECT j.* FROM jobs j
-       WHERE j.status = 'active'
-         AND (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch) <= ($1, $2, $3)
-         AND j.id <> ALL($4)
-   )
-   SELECT e.* FROM eligible_jobs e
-   WHERE e.priority = (SELECT MIN(priority) FROM eligible_jobs)
-   ORDER BY e.claims_issued::float / NULLIF(e.allocation, 0) ASC NULLS LAST,
-            e.created_at ASC
+   SELECT j.* FROM jobs j
+   WHERE j.status = 'active'
+     AND j.allocation > 0
+     AND (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch) <= ($1, $2, $3)
+     AND j.id <> ALL($4)
+   ORDER BY j.claims_issued::float / j.allocation ASC, j.created_at ASC
    ```
 
 3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers the whole candidate tier rather than one per job: `task_claims` has no job column, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all.
@@ -1899,7 +1926,7 @@ Then, up to **three attempts**:
 
    A candidate that fails outright — a missing config row, a leave-generation job
    with no generation-0 KLV — is logged and skipped rather than failing the claim.
-   Otherwise one broken job at the top of the tier answers every worker with a
+   Otherwise one broken job at the head of the list answers every worker with a
    `500` for as long as it stays there, and every client retries those.
 3. If no candidate produced work and nothing asked for a restart, return `Idle`.
 
@@ -2204,9 +2231,9 @@ The unranking order must stay stable: results are recorded against racks expande
 At claim time (all in one transaction):
 1. Compute the next start: `SELECT COALESCE(MAX(seed) + $racks_per_batch, 0) FROM tasks WHERE job_id = $job_id`. If it has reached `total_racks`, the job has no work left.
 2. Unrank that range into racks.
-3. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $next_start, 'available')`.
+3. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $next_start, 'available')` — the range's start is the task's seed: rack `i` of the batch is analysed from `seed + i`, its index in the job's rack space, which is the same number on every worker.
 4. `INSERT INTO opening_rack_requests (task_id, variant, letter_distribution, board_layout, rack_start, rack_count, player_config_id)` — the range, not the racks. There is no lexicon column: the player config carries it.
-5. Return the expanded racks and a claim token.
+5. Return the expanded racks, the seed, and a claim token.
 
 #### Games — On-demand
 
@@ -2263,7 +2290,7 @@ At claim time:
    **The whole of step 2 runs under a per-job advisory lock** (`pg_advisory_xact_lock`, taken before anything is read and released when the claim transaction ends). Without it every read here is made against a view of the job that a concurrent claim may be in the middle of changing, and two races follow: a claim still being issued is not yet visible as in flight, so a generation could be closed while a task for it was going out — work that lands in a generation whose KLV is already built — and two claims could both find the generation complete and both start its transition, each streaming millions of rows and uploading a KLV. The lock is per job, so claims for other jobs never wait on it, and it is *not* held across the transition itself: a transaction held open across an S3 upload is what step 2 of the transition exists to avoid.
 
    **Reopened tasks are reissued here, not before.** For every other job type a task whose claim timed out is re-dispatched before anything new is generated. For leave generation that happens only after the lock is taken and the current generation determined, and only for a task whose `leave_requests.generation` is that generation *and* only while no transition for that generation is running; step 2 runs when there is none. The transition check is separate from the generation check and both are needed: a generation does not read as *closed* until its transition commits the artifact row, so throughout the tens of seconds a transition takes, the current generation is still the closing one and a reopened task of it would otherwise be handed straight back out — its occurrences folded into the very rows the transition is streaming, leaving the uploaded KLV irreproducible from the database. A transition past the takeover timeout does not count, or a job whose transition process died would stall forever instead of being taken over. Reissued before the lock, a claim would be invisible to the in-flight check exactly as a new one was. Reissued for any generation, a task from a generation that has since closed would be handed out again, played with an outdated KLV, and its result discarded. A task left over from a closed generation stays `available` and is never dispatched again, so the job list's task counts for a leave job can show a few such tasks as never completed.
-3. `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, NULL, 'available') RETURNING id`, claimed in the same transaction.
+3. Draw the task's seed and `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $seed, 'available') RETURNING id`, claimed in the same transaction.
 4. `INSERT INTO leave_requests (task_id, lexicon, variant, letter_distribution, board_layout, generation, seed, forced_racks, num_games, previous_artifact_key, use_wordmap)` — `seed` is drawn fresh for the task, and stored so a reissued task replays it; `forced_racks` is the chosen rack subset (see Schema); `previous_artifact_key` is the prior generation's combined KLV, which for generation 1 is the server-built zeroed KLV stored at generation 0, so it is never NULL.
 5. `INSERT INTO task_claims (...)`.
 6. Return the request and claim token.
@@ -2918,7 +2945,7 @@ not silently inherit whatever a user last set for simulation.
    **required** and carries this build's `magpie_version` plus
    `unsupported_jobs`, the in-memory set of jobs this worker has already found it
    cannot run. The server filters on both before it picks a job, so a worker that
-   cannot run the top-priority job still gets offered work below it.
+   cannot run the job furthest behind its share still gets offered the next.
    - `204`: sleep `idlewait`, repeat. This means "nothing right now", nothing
      more.
    - `200` with a `shutdown` object: every active job is out of reach until this
@@ -3029,8 +3056,8 @@ whichever player states it.
   single player config to both seats (the opponent a simulation plays out needs its
   leaves and settings as much as the analysed player does), copy its simulation
   settings into the run-wide ones `impl_move_gen` and `impl_sim` read — those entry
-  points ignore per-player settings — seed the simulation from the rack itself so
-  the seed is the same on every machine, run move generation (and simulation when the player's
+  points ignore per-player settings — seed rack `i`'s simulation from the request's
+  `seed + i`, run move generation (and simulation when the player's
   `num_plies` is above 0), and read the ranked moves out of `MoveList` /
   `SimResults` — in the simulation's ranking for a simming player — including
   win%, blended utility and per-ply `bingo_percentage` and `average_score` up to
@@ -3393,6 +3420,7 @@ the worker applies both rather than whatever its own settings last loaded.
 { "job_type": "opening_rack",
   "variant": "classic", "letter_distribution": "english", "board_layout": "standard15",
   "racks": ["AABCELT", "AABCELU"],
+  "seed": "0",
   "previous_play": null,
   "player": { "name": "static", "recorder_type": "best", "sort_strategy": "equity",
               "lexicon": "NWL23", "leaves": "NWL23", "win_pct_model": null,
@@ -3438,8 +3466,10 @@ filled still produce coverage the server uses. The target belongs to the server,
 which owns the running per-rack totals across every task in the generation and
 decides on its own when the generation closes.
 
-`seed` is a **decimal string** on both requests that carry one (games and leave
-generation), because it is a `uint64` and JSON numbers are doubles. For `game_pairs`, `num_games` counts *pairs*; MAGPIE plays two games per
+`seed` is a **decimal string** on every request, because it is a `uint64` and
+JSON numbers are doubles. Every task states one: games and pairs play their
+batch from it, an opening-rack task analyses rack `i` from `seed + i`, and a
+leave-generation task seeds its games from it. For `game_pairs`, `num_games` counts *pairs*; MAGPIE plays two games per
 pair.
 
 #### `POST /api/worker/decline`
@@ -4063,7 +4093,6 @@ the body omits them:
 
 | Field | Default |
 |---|---|
-| `priority` | 0 |
 | `redundancy` | 1 |
 | `min_magpie_version` | the server-wide floor |
 | `games_per_batch` / `pairs_per_batch` | 1 |
@@ -4120,13 +4149,14 @@ Job creation also writes generation 1's zeroed KLV, **after** the transaction
 commits rather than inside it: it is a multi-megabyte build and an object-store
 write, and holding a transaction open across it would be wrong.
 
-**Activating a job** sets its allocation and requires that the active jobs in its
-priority tier still sum to at most 100% — checked here rather than as a database
-constraint, because the intermediate states an admin passes through while
-rebalancing would violate a constraint even when the end state is fine. The error
-names how much room is left. A completed job cannot be reactivated. Activations
-in one tier are serialized with an advisory lock, so two at once cannot jointly
-exceed 100%. Activating a leave-generation job whose generation-0 KLV was never
+**Activating a job** sets its allocation and requires that the active jobs
+still sum to at most 100% — checked here rather than as a database constraint,
+because the intermediate states an admin passes through while rebalancing would
+violate a constraint even when the end state is fine. The error names how much
+room is left. An allocation of 0 is accepted and means what inactive means: the
+job is offered to nobody until it is raised. A completed job cannot be
+reactivated. Activations are serialized with an advisory lock, so two at once
+cannot jointly exceed 100%. Activating a leave-generation job whose generation-0 KLV was never
 written — creation writes it after committing, so an object-store failure there
 leaves the job without one — builds it first.
 
@@ -4192,7 +4222,7 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 | Route | Page |
 |---|---|
 | `/` | Landing page — brief description of birdtest, links to the job list and the worker setup guide. |
-| `/jobs` | Job list — all jobs with type, status, priority, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
+| `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
 | `/jobs/[id]` | Job detail — job-type-specific stats and per-worker contribution table. Live-updated via SSE. |
 | `/users` | Registered user list — all user accounts with contribution stats. |
 | `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by tasks completed. |
@@ -4813,9 +4843,13 @@ CREATE TYPE job_status AS ENUM (
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_type   job_type NOT NULL,
-    -- Lower value = higher priority. Priority 0 outranks priority 1.
-    priority   INT NOT NULL DEFAULT 0,
-    -- NULL until the job is first activated; set by the admin at activation time.
+    -- NULL until the job is first activated; set by the admin at activation
+    -- time. Every active job's share of the fleet: the scheduler hands each
+    -- claim to the active job furthest behind `claims_issued / allocation`,
+    -- and the active jobs may allocate at most 100% between them. There is
+    -- no priority: a job that should get nothing for now is set to 0%, which
+    -- is exactly what `inactive` means, and a job that should get everything
+    -- is the only one above 0%.
     allocation INT CHECK (allocation BETWEEN 0 AND 100),
     -- Number of independent workers that must complete each task. Default 1 = single-claim behavior.
     redundancy INT NOT NULL DEFAULT 1 CHECK (redundancy >= 1),
@@ -4844,24 +4878,20 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.5.1 is the
-    -- first MAGPIE version that switches a word info table off before every
-    -- task's lexicon loads -- an accelerator birdtest neither offers nor
-    -- checks, which built from an older lexicon prunes plays that exist: 0.1.0
-    -- left the bingo bonus, an opening-rack simulation's settings and a
-    -- leave-generation task's seed to the worker's own settings; before 0.3.0 a
-    -- task's wordmap and rack-info-table flags applied to the next task;
-    -- before 0.4.0 every setting a request left null came from the worker's
-    -- compile-time defaults; 0.4.0 played with whatever wordmap sat on the
-    -- worker's disk, checked against nothing; and 0.5.0, the first to check a
-    -- wordmap or a rack info table against the hash the job pins, left a
-    -- contributor's own word info table in force. The default here is the same
-    -- value as the server's MIN_MAGPIE_VERSION, which create_job writes
-    -- explicitly; the two are kept equal so a row written any other way
-    -- (a restore, a hand insert) does not floor a job below the server.
+    -- so "no floor" is not a state worth being able to express. 0.1.0 is
+    -- `birdtest-contribute`'s pre-release version: neither birdtest nor the
+    -- branch is in production yet, so everything the protocol relies on --
+    -- every result-changing setting stated on the request, input data and
+    -- derived files checked against the hashes the job pins, the word info
+    -- table switched off before every load, a seed on every task -- is in
+    -- 0.1.0, and the version moves only when a release changes what a task
+    -- computes. The default here is the same value as the server's
+    -- MIN_MAGPIE_VERSION, which create_job writes explicitly; the two are kept
+    -- equal so a row written any other way (a restore, a hand insert) does not
+    -- floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
-    min_magpie_minor INT NOT NULL DEFAULT 5 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
+    min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -5129,8 +5159,16 @@ CREATE TYPE task_state AS ENUM ('available', 'claimed', 'completed');
 CREATE TABLE tasks (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     job_id               UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
-    -- Seed for seed-based tasks (games, game pairs). NULL for non-seed tasks.
-    seed                 BIGINT,  -- stored as signed int64; interpreted as uint64 at the application layer
+    -- The seed the task's games are played from. Every job type plays games,
+    -- so every task has one, stated on its request: games and game pairs seed
+    -- their batch from it and step by one per game; an opening-rack task's is
+    -- the index of its first rack in the job's rack space, and rack i of the
+    -- batch is analysed from seed + i; a leave-generation task's is drawn
+    -- when the task is created. Stored as signed int64; interpreted as uint64
+    -- at the application layer. For games, pairs and opening racks it is also
+    -- the cursor that tiles the job's space, which is what the unique index
+    -- below serves.
+    seed                 BIGINT NOT NULL,
     state                task_state NOT NULL DEFAULT 'available',
     -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate join/aggregate.
     accepted_count       INT NOT NULL DEFAULT 0,
@@ -5139,8 +5177,11 @@ CREATE TABLE tasks (
     completed_at         TIMESTAMPTZ
 );
 
--- Prevent duplicate seed-based tasks within the same job.
-CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed) WHERE seed IS NOT NULL;
+-- Prevent two tasks of one job from playing the same seed: for games, pairs
+-- and opening racks that is two workers racing for the same slice of the
+-- space, for leave generation a collision between two randomly drawn seeds
+-- (which the claim path retries).
+CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed);
 
 -- Partial indexes to support efficient SKIP LOCKED task selection and timeout
 -- reclamation.

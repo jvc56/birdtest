@@ -671,7 +671,7 @@ const MIN_STATS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// check is triggered *by* submissions, so a job whose contributors all stop
 /// between checks would not be evaluated again until work resumed — which for a
 /// job that has already reached its stopping point means never, leaving it
-/// `active` and holding allocation in its priority tier. The `EXISTS` below is
+/// `active` and holding its allocation. The `EXISTS` below is
 /// bounded by the number of claims open across the fleet, not by anything that
 /// grows with the job, and it is only reached when the debounce would otherwise
 /// skip.
