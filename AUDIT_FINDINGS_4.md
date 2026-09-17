@@ -56,7 +56,7 @@ closest reading. Three of this audit's findings (B1, K9, D1) come from it.
 |---|---|---|
 | Seventh audit, U1 — lapsed claims of jobs nobody claims from; recommendation (a), leave it | Stands, and has a third case: `2a6fe2c` made **0% allocation** a way to park an active job, and a job at 0% is never a candidate either, so its lapsed claims also wait for activation above 0% or an export. PLAN.md's Task States sentence now names it | Read `scheduler::candidate_jobs`; no code change |
 | Seventh audit — "dispatch the nightly workflow once after merge" | **Not yet possible.** The branch is unmerged, so the nightly still runs `main`'s workflow and has failed every night (`gh run list`: 09-14, 09-15, 09-16, all `failure`, 30–100 s — the `BUILD=release` step the seventh audit fixed on this branch). It will keep failing until this branch merges **and** MAGPIE is pushed (D1) | `gh run list --workflow nightly.yml` |
-| Sixth audit, U1 — publish the MAGPIE pin | **Recurred.** `2a6fe2c` moved `docker/Dockerfile`'s pin to `0f6a4cb1`, which exists only in the local checkout: `origin/birdtest-contribute` is `6308b63c`. See D1 | `git ls-remote origin birdtest-contribute`; and the end-to-end run hit it (section 11) |
+| Sixth audit, U1 — publish the MAGPIE pin | **Recurred.** `2a6fe2c` moved `docker/Dockerfile`'s pin to `0f6a4cb1`, which exists only in the local checkout: `origin/birdtest-contribute` is `6308b63c`. See D1 | `git ls-remote origin birdtest-contribute`; and the end-to-end run hit it (section 13) |
 | Sixth audit — `tasks_claimed_idx` unused, left alone as tiny | Left alone again; decided | — |
 | Fifth audit, U4 — leave-generation throughput; decided (a), leave it, with batch size as the knob | The *contention* decision stands. This audit measured something that decision did not have in front of it — the write volume of a fold — and flags it separately as U2 | Section 7 |
 | Every K-item of the prior three records | Hold | Spot-checked against the code while reading it; the schema block in PLAN.md is byte-identical to the migration (`diff`) |
@@ -95,7 +95,7 @@ closest reading. Three of this audit's findings (B1, K9, D1) come from it.
   `./bin/magpie_test contribute`, passing; `clang-format --dry-run -Werror` clean.
 - End to end: `scripts/e2e_magpie.py` with the checkout's `portable_release` MAGPIE
   at `d93dacaf` against an isolated compose project built from this branch
-  (section 11).
+  (section 13).
 
 ---
 
