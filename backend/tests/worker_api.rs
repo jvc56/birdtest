@@ -632,7 +632,15 @@ async fn an_opening_rack_result_must_answer_the_racks_it_was_given() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body["message"].as_str().unwrap().contains("ZZZZZZZ"), "{body}");
 
-    // Nothing was stored or counted by either attempt, and the claim is still
+    // The right number, all of them dispatched, but one twice -- so one is
+    // missing. A 400 that says so, not the unique index's 409.
+    let mut doubled = racks.clone();
+    doubled[2] = racks[0].clone();
+    let (status, body) = submit_as(&app, &uuid, &token, analysed(&doubled)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("twice"), "{body}");
+
+    // Nothing was stored or counted by any attempt, and the claim is still
     // open for the real answer.
     let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
     assert_eq!(job_row.racks_analyzed, 0);

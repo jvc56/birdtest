@@ -162,14 +162,23 @@ pub async fn check_batch_against_task(
             expected.len()
         )));
     }
-    // Order is not part of the contract, only the set. Duplicates within the
-    // submission are already refused by the unique index on
-    // (task_claim_id, rack), so equal sizes plus containment is equality.
+    // Order is not part of the contract, only the set.
     let dispatched: std::collections::HashSet<&str> =
         expected.iter().map(String::as_str).collect();
     if let Some(stray) = reported.iter().find(|rack| !dispatched.contains(rack.as_str())) {
         return Err(AppError::bad_request(format!(
             "result analyses rack {stray:?}, which this task did not dispatch"
+        )));
+    }
+    // Equal sizes plus containment is equality only if nothing is listed
+    // twice. A duplicate was left for the unique index on (task_claim_id, rack)
+    // to refuse, which it did -- as a `409 that already exists`, after the
+    // batch had been sent to the database, where every other malformed
+    // submission is a `400` that says what is wrong with it.
+    let mut seen = std::collections::HashSet::with_capacity(reported.len());
+    if let Some(twice) = reported.iter().find(|rack| !seen.insert(rack.as_str())) {
+        return Err(AppError::bad_request(format!(
+            "result analyses rack {twice:?} twice, so it leaves out a rack this task dispatched"
         )));
     }
     Ok(())
