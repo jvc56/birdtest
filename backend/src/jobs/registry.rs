@@ -357,9 +357,29 @@ pub async fn store_result(
             .map_err(|e| AppError::bad_request(format!("malformed task response: {e}")))
     }
 
+    /// Decode and validate a submission on the blocking pool.
+    ///
+    /// A result is up to 64 MiB of JSON: ten thousand racks with their ranked
+    /// moves and plies, or every rack a ten-thousand-game leave task drew.
+    /// Turning that into typed records and running the plausibility rules over
+    /// it is tens to hundreds of milliseconds of computation with no `await`
+    /// in it, and an async worker thread that does not yield can hold up every
+    /// other request the server has (see `exports::upload_rows`). The hop costs
+    /// microseconds, against a transaction of a dozen round trips.
+    async fn normalize<H>(payload: serde_json::Value) -> AppResult<H::Record>
+    where
+        H: JobHandler,
+        H::Response: Send + 'static,
+        H::Record: Send + 'static,
+    {
+        tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(payload)?))
+            .await
+            .map_err(|e| AppError::internal(format!("validating a task response failed: {e}")))?
+    }
+
     match &template.kind {
         JobKind::OpeningRack { .. } => {
-            let record = opening_rack::OpeningRackHandler::process_response(decode(payload)?)?;
+            let record = normalize::<opening_rack::OpeningRackHandler>(payload).await?;
             let racks: Vec<String> =
                 record.positions.iter().map(|p| p.rack.clone()).collect();
             opening_rack::check_batch_against_task(conn, template, task_id, &racks).await?;
@@ -380,7 +400,7 @@ pub async fn store_result(
             .await
         }
         JobKind::Games { config, .. } => {
-            let record = game::GameHandler::process_response(decode(payload)?)?;
+            let record = normalize::<game::GameHandler>(payload).await?;
             // The batch size was fixed when the task was handed out -- it is
             // the job's, denormalized onto every request -- so a result of any
             // other size is answering a question nobody asked.
@@ -390,7 +410,7 @@ pub async fn store_result(
                 .await
         }
         JobKind::GamePairs { config, .. } => {
-            let record = game_pair::GamePairHandler::process_response(decode(payload)?)?;
+            let record = normalize::<game_pair::GamePairHandler>(payload).await?;
             // A pairs request counts pairs; each is two games.
             super::plausibility::check_batch_size(
                 record.all_games.games,
@@ -404,7 +424,7 @@ pub async fn store_result(
                 .await
         }
         JobKind::LeaveGeneration { .. } => {
-            let record = leave_gen::LeaveGenHandler::process_response(decode(payload)?)?;
+            let record = normalize::<leave_gen::LeaveGenHandler>(payload).await?;
             if first_result {
                 leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
                     .await

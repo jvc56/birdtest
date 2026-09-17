@@ -902,7 +902,11 @@ read as text Postgres has already serialized, gathered a mebibyte at a time,
 and compressed and hashed through `spawn_blocking`; the same export finishes in
 34 s with `/health` at 2 ms median and 8 ms at worst throughout. The rule is
 general, and the other computations of that size follow it: an import's
-gunzip-untar-hash of a whole tarball, and every Argon2 hash and verify.
+gunzip-untar-hash of a whole tarball; every Argon2 hash and verify; each
+50,000-rack chunk of a universe's `COPY` (`/health` reached 1.3 s while one was
+seeded, 3.6 ms after); the parse of a request body of 256 KiB or more; and the
+decoding and validation of every submission, which for a full batch is tens to
+hundreds of milliseconds.
 
 **What a line holds** follows the job type: a `game_results` row for games and
 game pairs, a `leave_rack_progress` row for leave generation, and for opening
