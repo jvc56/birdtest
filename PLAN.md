@@ -75,7 +75,7 @@ Every job type generates its tasks **on demand**: the next task request is gener
 1. The worker sends a **task claim** to the server — a minimal message identifying itself and signaling it is ready for work.
 2. The system selects the active job **most behind its configured allocation share** — specifically, among active jobs with an allocation above 0%, the one with the lowest ratio of `(claims_issued - claims_baseline) / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 
-   **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on activation, which is also how an allocation is changed, and on a purge — so that the job's ratio equals the **lowest ratio among the other jobs offering work** (`scheduler::join_at_parity`): it joins level with the job furthest behind and takes its share from then on. This is start-time fair queuing's rule, and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level); ratios never are. One thing it deliberately does not cover: a job that stays a candidate but hands out nothing for a long stretch — waiting on a derived-file build, or on workers that can run it — still returns behind its share and is favoured until it catches up. That is a job being owed work it was offered and could not take, which is what a deficit is for; re-activating it forgives the debt if an admin would rather.
+   **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on activation, which is also how an allocation is changed, and on a purge — so that the job's ratio equals the **lowest ratio among the other jobs being served** (`scheduler::join_at_parity`): it joins level with the job furthest behind and takes its share from then on. *Being served* is narrower than *offering work*, and the difference matters: a job can be active and above 0% and still stand still — its derived files are building or failed, it is pinned to data the fleet does not have yet, its MAGPIE floor is above what the workers run, its generation is mid-transition — and its ratio does not move while the others' climb. Put level with *that* job, a newcomer was, for every worker that could not run the lagging one, first in the list until it had caught up with the jobs that were running: a veteran at 100,000 claims, a job nobody could run at zero, and a newcomer took twelve of the next twelve claims. So a job counts toward parity only if it issued a claim within the heartbeat timeout — `jobs.last_claimed_at`, which rides the `UPDATE jobs` every claim already makes — and when no job has (a quiet server, the first activation in a while) every job on offer counts, as before. One case this does not reach, and no single ratio can: a job only a *minority* of the fleet can run is served, recently, and still lags, so a newcomer level with it is ahead of the rest for the majority. A fleet split that way is two queues, and the scheduler has one. This is start-time fair queuing's rule, and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level); ratios never are. One thing it deliberately does not cover: a job that stays a candidate but hands out nothing for a long stretch — waiting on a derived-file build, or on workers that can run it — still returns behind its share and is favoured until it catches up. That is a job being owed work it was offered and could not take, which is what a deficit is for; re-activating it forgives the debt if an admin would rather.
 3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`.
 4. The system acquires the next task (one being re-dispatched, or else one generated on demand), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
@@ -1003,7 +1003,7 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | `worker_contributions`, 44,000 claims | job detail and every SSE push | 136 ms |
 | Public worker list, all claims | page view | 93 ms |
 | Leave `next_step` rack selection — **as it was**, ordering on `(occurrence_count, rack)` through an index without `rack` | every leave claim, inside the dispatch lock | 225–390 ms at **400,000** racks (an eighth of English; a scan and sort of the generation, so linear from there — 2–3 s at full size). The 47 ms first recorded here was measured on counts that rarely tied |
-| Leave `next_step` rack selection **as it is now** — the index carries `rack`, the exclusion is a hashed `NOT IN` | every leave claim | 9 ms with 20 results staged, 160–290 ms with 400 (200,000 racks held out): the universe's size no longer enters, what is staged does |
+| Leave `next_step` rack selection **as it is now** — a sweep of the primary key from a cursor while many racks are below target, lowest count first on the narrow index once few are | every leave claim | sweep: 3.9 ms at 400,000 racks with 97% of them at target (16,000 rows stepped over for 501 racks; nearer 0.1 ms early in a generation), and the same with nothing staged or ten thousand results staged; tail: 0.5 ms |
 | `leave_gen_stats` — **as it was**, counting the generation's racks at target | job detail and every SSE push | 210 ms |
 | `leave_gen_stats` **as it is now** — the generation's summary row | job detail and every SSE push | one single-row read |
 | Transition: stream generation 1 by rack | once per generation | 674 ms |
@@ -1103,27 +1103,36 @@ What the numbers settled:
   about — a heavy contributor is found at the head of the job's feed index and
   a rare one through their own claims, and a cached generic plan picks one of
   those for everybody.
-- **A leave claim walks its index instead of sorting the generation.**
-  Selection orders on `(occurrence_count, rack)` and counts tie in their
-  millions — every rack starts at zero and the rare ones stay there — so an
-  index on the count alone could not supply the order, and every leave claim
-  read and sorted the whole generation inside the job's dispatch lock, whose
-  other claimants give up after two seconds. `leave_rack_progress_pick_idx`
-  carries `rack` now. The index alone was not enough, and for a while made it
-  worse: with the order available the planner ran the `NOT EXISTS` exclusion as
-  a nested loop over the held-out racks (it guesses ten elements per `unnest`),
-  3.5 s at a tenth of full size. The exclusion is `NOT IN` over an
-  uncorrelated subquery, which Postgres evaluates as a hashed subplan — one
-  pass to build, one probe per index entry — and which is safe because the
-  subquery filters its own NULLs. What is left grows with what is *staged*, not
-  with the universe: about a microsecond per held-out rack, which is the
-  undecided half of [What a merge costs](#what-a-merge-costs).
-- **The public results feed of a leave job is read a generation at a time.**
-  Its order — newest generation first, then the racks furthest from target —
-  is one no index runs in, so as one statement each page of fifty was a sort of
-  every progress row the job has (53 ms at 400,000 rows, seconds at a few
-  full-size generations) on a public route. Within one generation the order is
-  the selection index's, so a page is a seek into it: 0.07 ms.
+- **A leave claim neither sorts the generation nor reads what is staged.**
+  Selection used to order on `(occurrence_count, rack)` through an index on the
+  count alone. Counts tie in their millions — every rack starts at zero and the
+  rare ones stay there — so the index could not supply the order, and every
+  leave claim read and sorted the whole generation inside the job's dispatch
+  lock, whose other claimants give up after two seconds: 4.9 s a claim at full
+  size. Two fixes were measured. Carrying `rack` in the index made the claim
+  0.2 ms and the index 180 MB a generation instead of 22 (unique keys cannot be
+  deduplicated), and left a cost that grew with what was *staged*: between
+  merges the racks of every staged result are exactly the lowest, and each
+  claim hashed and stepped over all of them, a microsecond a rack — 160–290 ms
+  with 400 results staged. What is built instead keeps the small index and has
+  neither cost; see claim step 2 under [Leave
+  Generation](#leave-generation--on-demand-partitioned-generations). While
+  many racks are below target they are handed out by **sweep**, in primary-key
+  order from a remembered cursor, and a claim needs no list of what is out;
+  once few remain, selection is lowest count first on `occurrence_count`
+  *alone*, ties falling as the index holds them, with everything out excluded —
+  a set that is small because the set below target is. Two details of that
+  second statement are load-bearing. The exclusion is `NOT IN` over an
+  uncorrelated subquery, which Postgres evaluates as a hashed subplan; as
+  `NOT EXISTS` the planner ran it as a nested loop over the held-out racks (it
+  guesses ten elements per `unnest`), 3.5 s at a tenth of full size. And it is
+  only safe because the subquery filters its own NULLs.
+- **The public results feed of a leave job is a seek into the primary key.**
+  It used to run newest generation first and then furthest from target — an
+  order no index runs in, so as one statement each page of fifty was a sort of
+  every progress row the job has: 4.0 s a page over HTTP at one full-size
+  generation, on a public route. It runs newest generation first and then by
+  rack, read a generation at a time because the two directions differ: 7 ms.
 - **Copying the rack universe to the next generation is the one slow write**, and
   it is slow on an under-provisioned database: a minute here, against about 15
   seconds for a whole transition on the smaller dev database. It runs once per
@@ -2400,7 +2409,15 @@ keep-alives every 15 seconds.
 
 At claim time:
 1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and `configured_generation_count` generations are already done, return "no work."
-2. Check that the generation's rack universe exists — every generation's, the first included, is written by a task the first claim to find it missing starts. That check is one indexed `EXISTS`. A claim that finds the universe missing rolls back, starts the seeding on its own task, and treats the job as having no work yet: the seeding takes the job's lock without waiting and holds it while it writes, so no claim reads a half-written universe, and a seeding a client or a deploy interrupts rolls back whole and is started again by the next claim. (It used to run inside the claim itself, where MAGPIE's 120-second request timeout could cancel it — on a database slower than that at writing 3.2 million rows, every claim restarted it and none finished.) Then query `leave_rack_progress` for `(job_id, current_generation)`, ordered by `occurrence_count ASC`, and pick up to `racks_per_task` racks below `target_rack_count` (racks with no row yet count as 0). Racks named in the `forced_racks` of an open claim for this generation are excluded, so concurrent claims are not handed overlapping subsets — **and so are the racks forced by a task whose result is staged but not yet merged**. Until the merge, `leave_rack_progress` shows those racks at the counts they had before the task played, so ordered on those counts they are the lowest in the generation the moment their claim completes, and would be handed straight back out, to every claim until the next merge, while racks nobody has forced yet wait. If no rack is left to hand out *and* no `task_claims` row for this generation is still `claimed`: with results still staged, whether the generation is complete is **not yet known** — the claim starts a merge, off the request, and is told there is nothing here right now (`NeedsLeaveMerge`), and the next claim decides on exact figures; with nothing staged, the generation is complete — run generation transition (below) instead of dispatching a task. A claim that *is* handed racks, but fewer than `racks_per_task`, has found the generation nearly done, and asks for a merge too, at most once a minute per job: that is when stale counts cost most, since tasks go out forcing racks that may already be at target and the generation cannot close until a merge shows that they are.
+2. Check that the generation's rack universe exists — every generation's, the first included, is written by a task the first claim to find it missing starts. That check is one indexed `EXISTS`. A claim that finds the universe missing rolls back, starts the seeding on its own task, and treats the job as having no work yet: the seeding takes the job's lock without waiting and holds it while it writes, so no claim reads a half-written universe, and a seeding a client or a deploy interrupts rolls back whole and is started again by the next claim. (It used to run inside the claim itself, where MAGPIE's 120-second request timeout could cancel it — on a database slower than that at writing 3.2 million rows, every claim restarted it and none finished.) Then select up to `racks_per_task` racks below `target_rack_count`, in one of two ways (`leave_gen::next_step`), chosen from the generation's summary row — how many racks were below target as of the last merge, the same age as the counts both selections read.
+
+   **While many racks are below target — more than a hundred tasks' worth (`SWEEP_WHILE_TASKS_REMAIN`) — a sweep.** The generation's racks are handed out in primary-key order from a cursor remembered between claims (`leave_selection_cursors`, one row per generation, read and written only under the job's lock), one *lap* over the universe at a time, skipping racks already at target. A lap **starts only with no claim of the generation in flight and nothing staged**. From there every rack that is out — forced by an open claim, or by a result not yet merged — was handed out during this lap and so lies behind the cursor, and nothing ahead of it is out: a claim needs no list of what is out, and selection costs the same with one result staged as with ten thousand. (A task whose claim lapsed is reissued as it stands, before anything new is selected, so its racks stay behind the cursor with it.) Each selection reads one rack more than a task holds, so the task that takes a lap's last racks knows it and deletes the cursor in its own transaction; after that the job hands out nothing until the lap's last results are in and merged, and the next lap selects on exact counts. That pause is one task's duration and one merge per lap — some 6,400 tasks for English — and it is the wait that already precedes closing a generation, which is simply a lap that starts and finds nothing below target. A cursor lost to a purge or a partial restore is a lap not started: the same rule applies and nothing is handed out twice. A claim that hands out nothing commits rather than rolls back, so a lap found finished stays found.
+
+   This replaced lowest-count-first selection for the bulk of a generation because of what that costs between merges: `leave_rack_progress` shows a finished task's racks at the counts they had before it played, so they are the *lowest* in the generation the moment their claim completes. They have to be held out — or they are handed straight back out, to every claim until the next merge — and holding them out meant every claim hashing and stepping over every staged rack, about a microsecond each, inside the dispatch lock: 160–290 ms with 400 results staged, a second at a hundred workers, where the lock's other claimants give up after two.
+
+   **Once few remain, lowest count first**: `ORDER BY occurrence_count ASC` — on the count *alone*, ties falling in whatever order the index holds them (see [What a merge costs](#what-a-merge-costs) for why not by rack) — excluding the racks named in the `forced_racks` of an open claim for this generation, so concurrent claims are not handed overlapping subsets, **and the racks forced by a task whose result is staged but not yet merged**, for the reason above. A sweep would spend the end of a generation stepping over racks already at target; here the set below target is small by construction, so the excluded set is too. Going from the first selection to the second is safe at any moment, because the second excludes everything that is out; nothing goes the other way, since counts only grow.
+
+   Either way, if no rack is left to hand out *and* no `task_claims` row for this generation is still `claimed`: with results still staged, whether the generation is complete is **not yet known** — the claim starts a merge, off the request, and is told there is nothing here right now (`NeedsLeaveMerge`), and the next claim decides on exact figures; with nothing staged, the generation is complete — run generation transition (below) instead of dispatching a task. Claims in flight are read *before* what is staged, and the order matters: submissions are not serialized with claims, and read that way round a result is always one or the other. A claim that *is* handed racks, but fewer than `racks_per_task`, has found the generation (or the lap) nearly done, and asks for a merge too, at most once a minute per job: that is when stale counts cost most, since tasks go out forcing racks that may already be at target and the generation cannot close until a merge shows that they are.
 
    **The whole of step 2 runs under a per-job advisory lock** (`pg_advisory_xact_lock`, taken before anything is read and released when the claim transaction ends). Without it every read here is made against a view of the job that a concurrent claim may be in the middle of changing, and two races follow: a claim still being issued is not yet visible as in flight, so a generation could be closed while a task for it was going out — work that lands in a generation whose KLV is already built — and two claims could both find the generation complete and both start its transition, each streaming millions of rows and uploading a KLV. The lock is per job, so claims for other jobs never wait on it, and it is *not* held across the transition itself: a transaction held open across an S3 upload is what step 2 of the transition exists to avoid.
 
@@ -2441,7 +2458,7 @@ The generation-0 zeroed KLV is `magpie createdata klv`, which builds exactly tha
 
 #### What a merge costs
 
-A submission used to fold itself: `UPDATE leave_rack_progress … FROM UNNEST(…)` over every rack its games drew, tens to hundreds of thousands of rows scattered uniformly over a generation's 3,199,724 (258 MB of heap, 174 MB of indexes then; 332 MB now that the selection index carries `rack`). Measured on a seeded full-size generation:
+A submission used to fold itself: `UPDATE leave_rack_progress … FROM UNNEST(…)` over every rack its games drew, tens to hundreds of thousands of rows scattered uniformly over a generation's 3,199,724 (258 MB of heap, 174 MB of indexes). Measured on a seeded full-size generation:
 
 | One submission folding itself | Time in the submit transaction | WAL |
 |---|---|---|
@@ -2464,9 +2481,9 @@ Nothing needs the per-rack totals that promptly. Selection needs them roughly; c
 
 The merge interval (`leave_gen::MERGE_INTERVAL`, thirty minutes) sets that volume and the dashboard's lag, and nothing else: selection holds a staged task's racks out of play rather than trusting stale counts, claims near a generation's end ask for a merge themselves (`TAIL_MERGE_INTERVAL`, a minute), and a generation never closes with anything staged. A process that stops with results staged loses nothing — they are rows — and the sweep's first tick, at startup, merges them.
 
-**The selection index is a second storage decision bound up with this one.** Selection orders on `(occurrence_count, rack)`, and to walk that order rather than sort the generation for it the index has to carry `rack` (see [What these reads cost](#what-these-reads-cost-measured)). Measured on a full English generation that index is **180 MB where the one without `rack` was 22 MB** — nearly all its keys were equal, so Postgres deduplicated them, and unique keys cannot be — which makes a generation 590 MB (258 heap, 152 primary key, 180 selection index) rather than 432, kept for the life of the job. The alternative keeps the small index: order on `occurrence_count` alone, let ties fall in whatever order the index holds them, and page the public feed by rack through the primary key. It gives up a deterministic dispatch order and the feed's furthest-from-target order for about 160 MB a generation, and has not been chosen.
+**The selection index stays small, by giving up an order nothing needed.** For a while `leave_rack_progress_pick_idx` carried `rack`, so that selection's `(occurrence_count, rack)` order was an index walk rather than a sort of the generation. Measured on a full English generation that index was **180 MB where the one on the count alone is 22 MB** — nearly all of the narrow index's keys are equal, so Postgres deduplicates them, and unique keys cannot be — which made a generation 590 MB rather than 432, for the life of the job. Selection now orders on `occurrence_count` alone and lets ties fall in whatever order the index holds them, and the public feed pages by rack through the primary key; dispatch order among tied racks is no longer reproducible, and nothing depended on it.
 
-What is left unsolved is that a merge still rewrites most of a 590 MB relation as non-HOT updates. Removing that means taking `occurrence_count` out of the index selection uses — for instance selecting "any rack below target" through a partial index on a flag the merge maintains, rather than "the racks furthest below" — which changes the selection policy, and has not been decided.
+What is left unsolved is that a merge still rewrites most of a 432 MB relation as non-HOT updates. Removing that means taking `occurrence_count` out of the index selection uses — for instance selecting "any rack below target" through a partial index on a flag the merge maintains, rather than "the racks furthest below" — which changes the selection policy, and has not been decided.
 
 ### Position Capture From Games
 
@@ -4035,11 +4052,10 @@ the beginning" rather than as an error, since a caller cannot repair a token it
 cannot read.
 
 A leave-generation job's feed is its per-rack progress, newest generation
-first and within one the racks furthest from target (`occurrence_count`, then
-`rack`), and its cursor is that triple. No index runs in that mixed order, so
-the page is read one generation at a time, each read a seek into
-`leave_rack_progress_pick_idx`, rather than as one statement that sorted every
-progress row of the job per page.
+first and within one by rack, and its cursor is that pair: the primary key's
+order, so each read is a seek. It is read one generation at a time because the
+two directions differ. (It once ran furthest-from-target first, which no index
+held; see [What these reads cost](#what-these-reads-cost-measured).)
 
 Its key is worth stating, because the obvious one is wrong: `submitted_at`
 defaults to `now()`, which is transaction time, so every record of one batch
@@ -4229,7 +4245,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. |
-| `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. |
+| `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. |
 | `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account: anonymize it in place, keeping its claims and records so no donated compute is lost (see Admin API semantics). |
 | `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. One ban per identity: a second is `409`, so that unban means what it says. |
@@ -5122,8 +5138,9 @@ CREATE TABLE jobs (
     -- Where this job's share is measured *from*. The scheduler orders on
     -- `(claims_issued - claims_baseline) / allocation`, and the baseline is
     -- reset -- on activation, on an allocation change, on a purge -- so that
-    -- the job's ratio equals the lowest ratio among the other jobs offering
-    -- work: it joins at parity and takes its share from then on.
+    -- the job's ratio equals the lowest ratio among the other jobs being
+    -- served (see `last_claimed_at` below): it joins at parity and takes its
+    -- share from then on.
     --
     -- Without it the deficit was measured over a job's whole life, so a job
     -- activated today beside one that had issued two million claims took

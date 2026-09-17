@@ -384,8 +384,9 @@ CREATE TABLE jobs (
     -- Where this job's share is measured *from*. The scheduler orders on
     -- `(claims_issued - claims_baseline) / allocation`, and the baseline is
     -- reset -- on activation, on an allocation change, on a purge -- so that
-    -- the job's ratio equals the lowest ratio among the other jobs offering
-    -- work: it joins at parity and takes its share from then on.
+    -- the job's ratio equals the lowest ratio among the other jobs being
+    -- served (see `last_claimed_at` below): it joins at parity and takes its
+    -- share from then on.
     --
     -- Without it the deficit was measured over a job's whole life, so a job
     -- activated today beside one that had issued two million claims took

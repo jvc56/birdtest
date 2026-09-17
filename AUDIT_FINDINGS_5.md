@@ -24,7 +24,9 @@ made in this audit, and of the bugs, races, MAGPIE argument trace, critical-path
 analysis, performance and storage findings behind them.
 
 **Counts: 4 code-wins (PLAN.md or TESTING.md updated to match the code), 8
-plan-wins (code changed), 3 items left for human input (U1–U3).**
+plan-wins (code changed), 3 items left for human input (U1–U3) — all three
+since decided (U1 (a), U2 (b), U3 (b)) and implemented on this branch, see
+section 11a.**
 
 The default bias is that the code wins and `PLAN.md` is brought level with it.
 The code was changed only where it was wrong, or where the plan described the
@@ -644,8 +646,92 @@ predecessor was 22 MB.
 **Recommendation: (a)** until storage is the constraint; (b) is a small change
 if it becomes one.
 
+## 11a. Decisions taken — implemented
+
+U1 **(a)**, U2 **(b)**, U3 **(b)**. All three are built on this branch; PLAN.md,
+the migration (and PLAN.md's schema block, still byte-identical to it),
+TESTING.md and RUNBOOK.md were updated with them. Sections 7 and 11 above are
+left as they were written, as the record of what was decided *from*.
+
+| # | Decision | What was done |
+|---|---|---|
+| U1 | **(a)** parity with the jobs being served | `jobs.last_claimed_at`, set by the `UPDATE jobs` every claim already makes. `scheduler::join_at_parity` takes a `served_within` (the heartbeat timeout, from both callers) and copies the lowest ratio among the other offering jobs that issued a claim within it — falling back to all of them when none has, and to zero when there are none. RUNBOOK §2.3's counter repair carries the same statement. The probe from section 11 is now a test: veteran, unrunnable job, newcomer → **6/6** where it was 12/0. The minority-fleet case is recorded in PLAN.md as the limit it is |
+| U2 | **(b)** a selection cursor — **on the primary key, not on `(count, rack)` as proposed** | See below |
+| U3 | **(b)** the narrow index | `leave_rack_progress_pick_idx` is `(job_id, generation, occurrence_count)` again: **20 MB** on the full-size generation the last end-to-end run seeded, where the wide one was 180. Lowest-count-first selection and the summary's lowest-rack probe order on the count alone; the public feed runs newest generation first and then by `rack`, a seek into the primary key, with a two-part cursor (an old three-part cursor reads as "start at the beginning", as any foreign cursor does). Dispatch order among tied racks is no longer reproducible; nothing depended on it, and no test needed loosening |
+
+### U2 as built, and why it is not what was proposed
+
+The proposal was a cursor over `(occurrence_count, rack)`. U3 (b) removes the
+index that order needs, and on the narrow index ties have no order a statement
+can resume from. So the two decisions were reconciled rather than implemented
+side by side, keeping what each was *for*: U3's small index, and U2's selection
+that does not grow with what is staged.
+
+- **While many racks are below target, a sweep** (`leave_gen::sweep`): racks in
+  primary-key order from `leave_selection_cursors` (one row per generation,
+  touched only under the dispatch lock), a *lap* over the universe at a time,
+  stepping over racks at target. **A lap starts only with nothing in flight and
+  nothing staged**, so everything that is out lies behind the cursor and a claim
+  carries no exclusion list at all — not even the open-claims one. The pause
+  that rule costs is one task's duration and one merge per lap (≈6,400 tasks for
+  English), and it is the barrier that already precedes closing a generation,
+  which became "a lap that starts and finds nothing".
+- **Once fewer than a hundred tasks' worth remain**
+  (`SWEEP_WHILE_TASKS_REMAIN`), lowest count first with everything out excluded,
+  as before (`furthest_below_target`). A sweep would spend a generation's end
+  stepping over racks at target; here the excluded set is bounded by the set
+  below target. The factor is where the two cost the same — both bounded by
+  about a hundredth of the universe, whatever the fleet and whatever is staged.
+  The switch reads the generation's summary row, which is as old as the counts.
+  First-to-second is safe at any moment (the second excludes everything out);
+  nothing goes back, since counts only grow.
+- **Two things found while building it.** (1) A lap's end has to be recorded by
+  a transaction that commits. Found by the next claim instead, it was found by a
+  read from the cursor to the end of the universe, in a claim that hands out
+  nothing and so rolled back — and so by every claim after it for as long as the
+  lap's last results took. Each selection therefore reads one rack more than a
+  task holds, and the task that takes the last racks deletes the cursor itself;
+  and a claim answering `NoWork` now commits rather than rolls back, for the
+  remaining case (a merge putting the leftover racks at target between two
+  claims). (2) `'' < rack` stands for "from the top", because `$3 IS NULL OR
+  rack > $3` is a filter and not an index condition — the same lesson as the
+  feed's.
+- **What "reset whenever a claim lapses" became.** Nothing: a lapsed task is
+  reissued as it stands before anything new is selected, so its racks stay
+  behind the cursor with it. A cursor lost to a purge or a partial restore is a
+  lap not started, which waits for what is in flight and staged; a purge deletes
+  it, a closed generation's is deleted with the close.
+- **Measured.** Forced generic plans, 400,000 racks with 97% at target (far
+  past what the sweep phase sees): sweep 3.9 ms stepping over 16,012 rows for
+  501 racks; lowest-count-first 0.45 ms; the summary's probe 0.02 ms. On the
+  real full-size generation: sweep **0.36 ms**, against 4.9 s before this audit
+  and against a cost that reached 160–290 ms with 400 results staged under the
+  interim fix. It does not read `leave_rack_staging` at all, so there is no
+  staged volume to measure it against.
+
+**Verification of 11a.** `cargo clippy --locked --all-targets -- -D warnings`
+clean; `cargo test --locked`: **191 tests** (96 unit and contract, 95
+integration), all passing; PLAN.md's schema block byte-identical to the
+migration. **A fourth real-MAGPIE end-to-end run passed on this code**, every job
+type, no `ERROR` or `WARN` line: the leave job ran by sweep (50 racks a task
+against a 3.2-million-rack universe), its two tasks took `??AAAAA`–`AAAAABV` and
+`AAAAABW`–`AAAAADW`, and the cursor read `AAAAADW` afterwards. MAGPIE is still
+unchanged: none of the three touches the wire.
+
+Tests added: `admin_api::a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity`;
+`leave_gen::a_sweep_hands_out_the_racks_in_order_whatever_is_staged`,
+`…::a_lap_ends_with_its_results_in_and_merged_before_the_next_begins`,
+`…::a_sweep_that_finds_nothing_below_target_closes_the_generation`;
+`…::the_leave_results_feed_pages_through_every_generation_in_order` rewritten
+for the feed's new order.
+
 ### Smaller, noted rather than asked
 
+- **A sweep visits racks in key order, not rarest first.** Within a lap that is
+  immaterial — every rack below target is visited — and across laps the racks
+  still short are simply what the next lap finds. What it gives up is forcing
+  the *rarest* racks first within a lap, which lowest-count-first only ever did
+  to the resolution of the last merge.
 - **A submission's validation now runs on the blocking pool while the claim and
   task rows are locked.** It ran inside the same locks before, on an async
   worker. Decoding *before* taking the locks would shorten them, but needs the

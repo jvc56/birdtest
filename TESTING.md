@@ -487,6 +487,12 @@ The single most important group. Every entry is about a decision made in SQL.
   purged job rejoins level (`claims_baseline`, `scheduler::join_at_parity`).
   *(Covered: `admin_api::a_newly_activated_job_joins_at_parity_instead_of_taking_everything`,
   `admin_api::a_purged_job_rejoins_at_parity`.)*
+- `I-SCHED-3b` **Parity is with the jobs being served.** Beside a veteran and a
+  job on offer that this fleet cannot run (and so has issued nothing), a
+  newcomer splits the next twelve claims 6/6 with the veteran rather than
+  taking all twelve; and issuing a claim stamps `jobs.last_claimed_at`, which
+  is what "served" reads. *(Covered:
+  `admin_api::a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity`.)*
 - `I-SCHED-4` `tasks_dispatched` counts abandoned claims. Abandon many claims on
   one job and confirm its share does **not** grow — excluding them would let a
   job with flaky workers accumulate more than its share.
@@ -628,6 +634,21 @@ job creation touches needs one caller here.
   an open claim is already forcing, and returns nothing once all are at target
   with no claim in flight. *(Skipping covered:
   `leave_gen::racks_out_with_an_open_claim_are_not_handed_out_again`.)*
+- `I-LEAVE-3a` **Selection by sweep.** While more than
+  `SWEEP_WHILE_TASKS_REMAIN` tasks' worth of racks are below target, racks are
+  handed out in primary-key order from `leave_selection_cursors`, with no list
+  of what is out: twelve tasks take the first twelve racks, none twice, with
+  all twelve results still staged, and a merge does not move the cursor. A lap
+  that runs off the end of the universe deletes its cursor with its last task,
+  hands out nothing while a claim of the lap is still open, asks for a merge
+  once only staged results remain, and then selects on exact counts -- a rack
+  its result left short is forced again. A pass from the top that finds nothing
+  below target, with nothing in flight or staged, starts the transition.
+  *(Covered: `leave_gen::a_sweep_hands_out_the_racks_in_order_whatever_is_staged`,
+  `leave_gen::a_lap_ends_with_its_results_in_and_merged_before_the_next_begins`,
+  `leave_gen::a_sweep_that_finds_nothing_below_target_closes_the_generation`.
+  The other leave tests run two racks a task, which keeps the 149-rack test
+  universe under the threshold and on lowest-count-first selection.)*
 - `I-LEAVE-4` Generation transition folds progress into a KLV, uploads it,
   records the digest, and marks the generation complete.
 - `I-LEAVE-5` `ON CONFLICT DO NOTHING` on the artifact row keeps the **first**
@@ -676,10 +697,10 @@ job creation touches needs one caller here.
   `leave_gen::a_reclaimed_task_is_reissued_only_while_its_generation_is_open`.)*
 
 - `I-LEAVE-16` **The public results feed of a leave job tiles it.** Read a
-  generation at a time through the selection index rather than as one sort of
-  every progress row, the pages still return every row once, newest generation
-  first and in the database's `(occurrence_count, rack)` order within one,
-  across the boundary between two generations. *(Covered:
+  generation at a time through the primary key rather than as one sort of
+  every progress row, the pages return every row once, newest generation first
+  and in the database's `rack` order within one, across the boundary between
+  two generations. *(Covered:
   `leave_gen::the_leave_results_feed_pages_through_every_generation_in_order`.)*
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
