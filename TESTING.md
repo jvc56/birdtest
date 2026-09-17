@@ -261,7 +261,10 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
 
 ### `U-PLAUS-*` — plausibility gaps (`jobs/plausibility.rs`)
 
-Twelve rules are covered. What is missing:
+Thirteen rules are covered -- the thirteenth, that a leave batch reports no more
+rack occurrences than its games could draw, by
+`plausibility::tests::a_leave_batch_cannot_report_more_occurrences_than_its_games_drew`.
+What is missing:
 
 - `U-PLAUS-1` `check_against_task` doubles the dispatched count for
   `game_pairs` and does not for `games` — the pairs-versus-games unit confusion
@@ -531,6 +534,13 @@ The single most important group. Every entry is about a decision made in SQL.
 - `I-SCHED-18` `release_claim` returns the task to `available` and decrements
   the counter.
 - `I-SCHED-19` An inactive or completed job is never selected.
+- `I-SCHED-20` **A restarted server does not judge a fleet it has not heard
+  from.** A claim an hour past its heartbeat is *not* reclaimed by a process
+  younger than the heartbeat timeout — the workers were heartbeating to a server
+  that was not there — and the worker's heartbeat and result are then accepted
+  (`worker_api::a_restarted_server_does_not_abandon_claims_it_could_not_have_heard_from`).
+  Once the grace has passed, a claim that stayed silent is reclaimed as ever
+  (`worker_api::a_claim_still_silent_after_the_grace_is_reclaimed`).
 
 ### `I-EXPECT-*` — capability negotiation (`jobs/mod.rs::expected_data`)
 
@@ -702,6 +712,12 @@ job creation touches needs one caller here.
   and in the database's `rack` order within one, across the boundary between
   two generations. *(Covered:
   `leave_gen::the_leave_results_feed_pages_through_every_generation_in_order`.)*
+- `I-LEAVE-17` **A count no game could produce is refused, because staged it
+  wedges the generation.** A result reporting `i64::MAX` occurrences is a `400`
+  and stages nothing, and an honest result for the same claim is then accepted
+  and merges; the same number staged by hand makes `merge_staged` fail, twice
+  running. *(Covered:
+  `leave_gen::a_count_no_game_could_produce_is_refused_before_it_can_wedge_the_merge`.)*
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -981,6 +997,10 @@ Write these as one table-driven test each rather than 50 separate functions.
 - `A-PUBLIC-5` The SSE stream emits an event after a result is accepted, and the
   event body is byte-identical to what a page reload would fetch.
 - `A-PUBLIC-6` The SSE stream ends cleanly when the client disconnects.
+- `A-PUBLIC-6a` The SSE stream ends when the process is told to stop: it has no
+  end of its own, and graceful shutdown waits for every open response, so an
+  open dashboard used to hold every deployment until the runtime's `SIGKILL`
+  (`worker_api::a_live_stats_stream_ends_when_the_server_is_told_to_stop`).
 - `A-PUBLIC-7` User and worker lists paginate and do not leak email addresses or
   key hashes.
 

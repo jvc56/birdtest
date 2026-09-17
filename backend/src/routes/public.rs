@@ -589,9 +589,15 @@ async fn job_stream(
     let updates = tokio_stream::wrappers::BroadcastStream::new(receiver)
         .filter_map(|msg| async move { msg.ok() });
 
+    // Ended when the process is told to stop. The stream has no end of its
+    // own, and graceful shutdown waits for every open response: see
+    // `state::Shutdown`. The page subscribes again by itself
+    // (`frontend/src/lib/sse.ts`).
+    let shutdown = state.shutdown.clone();
     let stream = futures::stream::once(async move { initial })
         .chain(updates)
-        .map(|payload| Ok(Event::default().event("stats").data(payload)));
+        .map(|payload| Ok(Event::default().event("stats").data(payload)))
+        .take_until(async move { shutdown.triggered().await });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

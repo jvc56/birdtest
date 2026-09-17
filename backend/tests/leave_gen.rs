@@ -261,6 +261,83 @@ async fn a_leave_result_of_partial_racks_is_rejected() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
+/// Bug: a leave result's counts were bounded from below and not from above, and
+/// occurrences are *summed* -- into `bigint` columns, by one statement that
+/// folds everything staged for the generation. A count out of a broken client's
+/// uninitialised buffer was accepted and staged, and from then on every merge
+/// of the generation failed with `bigint out of range`: the periodic one, the
+/// one a claim asks for, and the drain no transition closes without. The
+/// generation could never close. A count no game could produce is refused at
+/// the door, and the second half of this test is why it has to be: the same
+/// number, staged by hand, still wedges the merge.
+#[tokio::test]
+async fn a_count_no_game_could_produce_is_refused_before_it_can_wedge_the_merge() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (_, body) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    let uuid = body["worker_uuid"].as_str().unwrap();
+    let token = body["claim_token"].as_str().unwrap();
+    let racks = forced_racks(&body);
+    let (status, refusal) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": token, "result": { "racks": [
+                { "rack": racks[0], "count": i64::MAX, "mean": 1.0 },
+                { "rack": racks[1], "count": i64::MAX, "mean": 1.0 }
+            ]}}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+    let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_staging")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(staged, 0, "a refused result staged something");
+
+    // The task dispatched a hundred games; an honest result of it is accepted.
+    let (status, accepted) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": token, "result": { "racks": [
+                { "rack": racks[0], "count": 40, "mean": 1.0 },
+                { "rack": racks[1], "count": 35, "mean": 1.0 }
+            ]}}),
+        ),
+    )
+    .await;
+    assert_eq!((status, accepted), (StatusCode::OK, json!({ "accepted": true })));
+    let merged = birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap();
+    assert_eq!(merged.map(|m| m.folds_merged), Some(1));
+
+    // What the refusal prevents. Staged as it used to be, the same count makes
+    // the merge fail -- and go on failing, since a failed merge leaves the row
+    // staged for the next one.
+    sqlx::query(
+        "INSERT INTO leave_rack_staging (job_id, generation, task_id, racks, counts, equity_sums)
+         VALUES ($1, 1, gen_random_uuid(), $2, $3, $4)",
+    )
+    .bind(job)
+    .bind(vec![racks[0].clone()])
+    .bind(vec![i64::MAX])
+    .bind(vec![1.0f64])
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        assert!(
+            birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.is_err(),
+            "an overflowing count merged after all"
+        );
+    }
+}
+
 /// Bug: a leave task whose claim timed out went back to `available`, and every
 /// claim re-dispatched available tasks before reaching the leave-generation
 /// path -- so before the job's claim lock was taken, and whatever generation the

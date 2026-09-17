@@ -1,4 +1,11 @@
 /**
+ * How long to wait before opening a new stream after the browser gave up on
+ * the old one. Long enough not to hammer a server that is restarting, short
+ * enough that a dashboard is live again soon after it is back.
+ */
+const RESUBSCRIBE_MS = 5000;
+
+/**
  * Subscribe to a job's live stat stream. The server pushes the same payload
  * `GET /api/jobs/:id` returns after every accepted result, so the handler can
  * simply replace local state rather than merging deltas.
@@ -8,18 +15,48 @@
  * outside component initialization and throw.
  */
 export function subscribeToJob<T>(jobId: string, onUpdate: (stats: T) => void): () => void {
-  const source = new EventSource(`/api/jobs/${jobId}/stream`);
+  let source: EventSource | null = null;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let unsubscribed = false;
 
-  source.addEventListener('stats', (event) => {
-    try {
-      onUpdate(JSON.parse((event as MessageEvent).data) as T);
-    } catch (error) {
-      console.error('could not parse SSE payload', error);
+  const open = () => {
+    retry = null;
+    const opened = new EventSource(`/api/jobs/${jobId}/stream`);
+    source = opened;
+
+    opened.addEventListener('stats', (event) => {
+      try {
+        onUpdate(JSON.parse((event as MessageEvent).data) as T);
+      } catch (error) {
+        console.error('could not parse SSE payload', error);
+      }
+    });
+
+    // EventSource reconnects on its own after a dropped connection -- but only
+    // then. A reconnect that is answered with anything but a 200 ends it for
+    // good (readyState CLOSED), and that is what every deployment produces: the
+    // server ends the stream as it stops, the browser reconnects a few seconds
+    // later, and the load balancer answers 503 until the new task is in
+    // service. The page then sat there looking live and never updated again.
+    // So a stream the browser has given up on is opened afresh, which also
+    // re-sends the current stats as its first event.
+    opened.addEventListener('error', () => {
+      if (opened.readyState === EventSource.CLOSED && !unsubscribed && retry === null) {
+        console.debug('job stream closed; subscribing again shortly');
+        retry = setTimeout(open, RESUBSCRIBE_MS);
+      } else {
+        console.debug('job stream interrupted; retrying');
+      }
+    });
+  };
+  open();
+
+  return () => {
+    unsubscribed = true;
+    if (retry !== null) {
+      clearTimeout(retry);
+      retry = null;
     }
-  });
-
-  // EventSource reconnects on its own; this only fires for the surfaced error.
-  source.addEventListener('error', () => console.debug('job stream interrupted; retrying'));
-
-  return () => source.close();
+    source?.close();
+  };
 }

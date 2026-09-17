@@ -423,8 +423,13 @@ pub async fn store_result(
             count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
                 .await
         }
-        JobKind::LeaveGeneration { .. } => {
+        JobKind::LeaveGeneration { config, .. } => {
             let record = normalize::<leave_gen::LeaveGenHandler>(payload).await?;
+            // Against the games the task was dispatched with, which is the
+            // job's `num_iterations` on every request: occurrences are summed
+            // on receipt, and an impossible count does not only mislead, it
+            // overflows the merge that sums it.
+            super::plausibility::check_rack_occurrence_total(&record.racks, config.num_iterations)?;
             if first_result {
                 leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
                     .await

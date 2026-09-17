@@ -165,6 +165,121 @@ async fn submissions_for_reclaimed_or_already_accepted_claims_change_nothing() {
     assert_eq!(body, json!({ "accepted": false }));
 }
 
+/// Bug: a claim lapses when no heartbeat has arrived for the timeout, and
+/// nothing asked whether the server had been there to receive one. After an
+/// outage longer than the timeout -- a deployment that went badly, a database
+/// maintenance window -- every open claim in the fleet looked that old, however
+/// alive its worker, and the first claim request after the restart abandoned
+/// all of them: every task in flight was handed out again and every result
+/// being computed came back `accepted: false`. A process reclaims nothing until
+/// it has been up for the timeout itself; a live worker's next heartbeat
+/// arrives well inside that, and a claim still silent afterwards is reclaimed
+/// as before.
+#[tokio::test]
+async fn a_restarted_server_does_not_abandon_claims_it_could_not_have_heard_from() {
+    let db = TestDb::new().await;
+    db.games_job(1, 2).await;
+
+    // The outage: a worker claimed, and the server was away for an hour.
+    let before = birdtest::app(db.state().await);
+    let (assignment, uuid) = first_claim(&before).await;
+    let token = assignment["claim_token"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE task_claims SET claimed_at = now() - interval '1 hour'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    // The process that comes back has heard from nobody yet.
+    let mut restarted = db.state().await;
+    restarted.reclaim_from = std::time::Instant::now() + restarted.cfg.heartbeat_timeout;
+    let app = birdtest::app(restarted);
+
+    let (other, _) = first_claim(&app).await;
+    assert_ne!(
+        other["task_request"]["seed"], assignment["task_request"]["seed"],
+        "the first claim after a restart re-dispatched a task whose worker is still playing it"
+    );
+    let open: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_claims WHERE state = 'claimed'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(open, 2, "both claims are still live");
+
+    // The worker that played through the outage is heard from, and its result
+    // lands.
+    let (status, _) = send(
+        &app,
+        post_json("/api/worker/heartbeat", &[("x-worker-uuid", &uuid)], json!({ "claim_token": token })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, body) = submit_as(&app, &uuid, &token, games_result(2, 1)).await;
+    assert_eq!(body, json!({ "accepted": true }), "the work done through the outage was thrown away");
+}
+
+/// The other half: the grace is a delay, not an amnesty. Once the process has
+/// been up for the timeout, a claim that never spoke is reclaimed by the next
+/// claim request, exactly as before.
+#[tokio::test]
+async fn a_claim_still_silent_after_the_grace_is_reclaimed() {
+    let db = TestDb::new().await;
+    db.games_job(1, 2).await;
+    let mut state = db.state().await;
+    state.reclaim_from = std::time::Instant::now() + std::time::Duration::from_millis(300);
+    let app = birdtest::app(state);
+
+    let (assignment, _) = first_claim(&app).await;
+    sqlx::query("UPDATE task_claims SET claimed_at = now() - interval '1 hour'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (during, _) = first_claim(&app).await;
+    assert_ne!(during["task_request"]["seed"], assignment["task_request"]["seed"]);
+
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    let (after, _) = first_claim(&app).await;
+    assert_eq!(
+        after["task_request"]["seed"], assignment["task_request"]["seed"],
+        "a claim that stayed silent past the grace was never handed out again"
+    );
+}
+
+/// Bug: a dashboard's SSE stream has no end of its own, and graceful shutdown
+/// waits for every open response -- so with one job page open anywhere, SIGTERM
+/// was followed by nothing until the container runtime's SIGKILL, thirty
+/// seconds later, on a service whose old task has to be gone before the new
+/// one starts. The stream ends when the process is told to stop.
+#[tokio::test]
+async fn a_live_stats_stream_ends_when_the_server_is_told_to_stop() {
+    use tower::ServiceExt;
+
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+
+    let response = app
+        .oneshot(get_request(&format!("/api/jobs/{job}/stream"), &[]))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = tokio::spawn(axum::body::to_bytes(response.into_body(), 1024 * 1024));
+
+    // Still open: nothing but a shutdown ends it.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!body.is_finished(), "the stream ended by itself");
+
+    state.shutdown.trigger();
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), body)
+        .await
+        .expect("the stream outlived the shutdown signal")
+        .unwrap()
+        .unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("event: stats"), "the first payload was sent before the end: {text}");
+}
+
 /// Bug: SPRT, progress and ratings summed every `game_results` row. With
 /// redundancy 2 each seeded batch is played twice with identical outcomes, so
 /// every game counted twice and SPRT saw double the evidence it had.

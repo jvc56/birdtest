@@ -67,6 +67,41 @@ impl FinishCheckCounters {
     }
 }
 
+/// Says when the process has been asked to stop, to the responses that would
+/// otherwise never end.
+///
+/// `axum::serve`'s graceful shutdown stops accepting connections and then waits
+/// for every open one to finish. A dashboard's SSE stream never finishes -- it
+/// is a keep-alive every fifteen seconds for as long as the tab stays open --
+/// so with one page open anywhere, `SIGTERM` was followed by nothing until the
+/// container runtime gave up and sent `SIGKILL` (ECS: thirty seconds). The
+/// service is a single instance whose old task must be gone before the new one
+/// starts, so that was thirty seconds added to every deployment's gap, for a
+/// wait that could only ever time out. A stream ends when this is triggered;
+/// the page's `EventSource` reconnects by itself, to the new process.
+#[derive(Clone)]
+pub struct Shutdown(Arc<tokio::sync::watch::Sender<bool>>);
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::watch::channel(false).0))
+    }
+}
+
+impl Shutdown {
+    pub fn trigger(&self) {
+        self.0.send_replace(true);
+    }
+
+    /// Resolves once [`Shutdown::trigger`] has been called, at once if it
+    /// already has. The sender lives in `self`, so the channel cannot close
+    /// under a waiter.
+    pub async fn triggered(&self) {
+        let mut stop = self.0.subscribe();
+        let _ = stop.wait_for(|stop| *stop).await;
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     /// The pool claims, submissions, heartbeats, the finish check, admin
@@ -114,4 +149,11 @@ pub struct AppState {
     /// When each leave job's last claim-requested merge started; see
     /// [`crate::jobs::leave_gen::TailMerges`].
     pub leave_merges: crate::jobs::leave_gen::TailMerges,
+    /// Ends the responses that never end on their own when the process is told
+    /// to stop; see [`Shutdown`].
+    pub shutdown: Shutdown,
+    /// No claim is reclaimed for a missed heartbeat before this instant: the
+    /// process's start plus the heartbeat timeout. See
+    /// [`crate::scheduler::reclaim_lapsed`] for what that protects.
+    pub reclaim_from: std::time::Instant,
 }

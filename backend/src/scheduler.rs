@@ -370,6 +370,33 @@ pub async fn reclaim_expired_for(
     Ok(result.rows_affected())
 }
 
+/// [`reclaim_expired_for`], as the running server calls it: not before this
+/// process has been up for the heartbeat timeout.
+///
+/// A claim lapses when no heartbeat has arrived for the timeout -- and a
+/// heartbeat can only arrive at a server that is there to receive it. After an
+/// outage longer than the timeout (a deployment that went badly, a database
+/// maintenance window, a host that would not come back) every open claim in
+/// the fleet has a `last_heartbeat_at` that old, however alive its worker: the
+/// workers went on sending heartbeats, to nothing. The first claim request
+/// after the restart then abandoned all of them in one statement. Every task
+/// in flight was handed out again, and every result the fleet had been
+/// computing through the outage -- hours of it, at a task each -- came back to
+/// `accepted: false`.
+///
+/// So the clock starts when the process does. A worker that is alive
+/// heartbeats every thirty seconds and refreshes its claim within the first
+/// minute; a claim still silent a full timeout after startup has had the same
+/// chance to speak as any other and is reclaimed as before. What this costs is
+/// that a claim whose worker really did die during the outage is handed out
+/// again up to one timeout later than it might have been.
+pub async fn reclaim_lapsed(state: &AppState, job_ids: &[Uuid]) -> AppResult<u64> {
+    if std::time::Instant::now() < state.reclaim_from {
+        return Ok(0);
+    }
+    reclaim_expired_for(&state.pool, job_ids, state.cfg.heartbeat_timeout.as_secs_f64()).await
+}
+
 /// Walk the candidate jobs in deficit order and hand out the first available
 /// unit of work.
 pub async fn claim(
@@ -377,8 +404,6 @@ pub async fn claim(
     identity: &WorkerIdentity,
     caps: &WorkerCapabilities,
 ) -> AppResult<ClaimOutcome> {
-    let timeout_secs = state.cfg.heartbeat_timeout.as_secs_f64();
-
     // The global floor short-circuits everything: a client below it cannot run
     // any job that could ever exist, so no job needs consulting.
     let floor = Version::parse_or_zero(&state.cfg.min_magpie_version);
@@ -412,7 +437,7 @@ pub async fn claim(
         // so a lapsed task waits for the next claim -- and must not take the
         // whole request down with it.
         let job_ids: Vec<Uuid> = jobs.iter().map(|job| job.id).collect();
-        if let Err(err) = reclaim_expired_for(&state.pool, &job_ids, timeout_secs).await {
+        if let Err(err) = reclaim_lapsed(state, &job_ids).await {
             tracing::error!(error = %err.message, "reclaiming expired claims failed");
         }
 
@@ -578,12 +603,20 @@ async fn try_claim_from_job(
             Ok(None)
         }
         Acquired::NeedsLeaveMerge { generation } => {
-            // Nothing was written. The merge runs on its own task -- a
-            // full-size one is the best part of a minute -- and gives up at
-            // once if another is already running, so a fleet asking together
-            // starts one merge rather than parking a connection each behind
-            // it. This job has nothing to hand out until it lands.
-            let _ = tx.rollback().await;
+            // Committed, like `NoWork` and for the same reason: the one thing
+            // this transaction may have written is a sweep deleting the cursor
+            // of a lap it found finished, on its way to finding that lap's
+            // results staged. Rolled back, every claim until the merge landed
+            // read from the cursor to the end of the universe to find that out
+            // again -- the read `NoWork` commits to avoid. Committing also
+            // releases the job's lock before the merge starts.
+            //
+            // The merge runs on its own task -- a full-size one is the best
+            // part of a minute -- and gives up at once if another is already
+            // running, so a fleet asking together starts one merge rather
+            // than parking a connection each behind it. This job has nothing
+            // to hand out until it lands.
+            let _ = tx.commit().await;
             let (pool, job_id) = (state.pool.clone(), job.id);
             tokio::spawn(async move {
                 if let Err(err) = leave_gen::merge_staged(&pool, job_id, generation, false).await {

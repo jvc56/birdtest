@@ -230,6 +230,11 @@ impl TestDb {
             derived_ready: Default::default(),
             templates: Default::default(),
             leave_merges: Default::default(),
+            shutdown: Default::default(),
+            // As a process that has been up for longer than the heartbeat
+            // timeout, which is the state every reclamation test is about; the
+            // grace a fresh process gives is tested by moving this.
+            reclaim_from: std::time::Instant::now(),
             limits: birdtest::ratelimit::RateLimiters::new(),
             mailer: birdtest::email::Mailer::new(cfg.clone()).await,
             artifacts: birdtest::artifacts::ArtifactStore::new(cfg.clone()).await,

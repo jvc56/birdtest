@@ -207,6 +207,47 @@ pub fn check_rack_occurrences(racks: &[RackOccurrence]) -> AppResult<()> {
     Ok(())
 }
 
+/// The most rack occurrences one game can report. MAGPIE's leave generation
+/// records the rack of the player on turn, and on a turn where it forces a rare
+/// rack, that rack as well: two a turn. At the 400-turn ceiling a captured
+/// position's `turn_number` is held to (`game::MAX_TURNS_PER_GAME`), that is
+/// 800, rounded up. A real game is some twenty-odd turns.
+const MAX_RACK_OCCURRENCES_PER_GAME: i64 = 1000;
+
+/// A leave batch cannot report more rack occurrences than its games drew
+/// racks.
+///
+/// [`check_rack_occurrences`] bounds a count from below and nothing bounded it
+/// from above, and this is the one job type where that is not only wrong data
+/// but a wedge. Occurrences are **summed** -- into `bigint` columns, by a merge
+/// that folds every staged result of the generation in one statement. A count
+/// out of an uninitialised buffer is as likely to be near 2^63 as anywhere:
+/// staged, it made that statement fail with `bigint out of range`, every time,
+/// for every merge of the generation -- the periodic one, the one a claim asks
+/// for, and the drain a transition will not close without. The generation could
+/// never close and nothing short of deleting the staged row by hand fixed it.
+/// A smaller lie was quieter and as permanent: a rack reported a million times
+/// is at target for good, on coverage nobody played, and a fold cannot be
+/// subtracted back out.
+///
+/// Like the batch-size rule it needs the task -- the games it was dispatched
+/// with -- so it runs from `registry::store_result`. The bound is on the total,
+/// which bounds every count in it.
+pub fn check_rack_occurrence_total(racks: &[RackOccurrence], num_games: i32) -> AppResult<()> {
+    let ceiling = i64::from(num_games.max(0)).saturating_mul(MAX_RACK_OCCURRENCES_PER_GAME);
+    let mut total: i64 = 0;
+    for occurrence in racks {
+        total = total.saturating_add(occurrence.count);
+        if total > ceiling {
+            return Err(AppError::bad_request(format!(
+                "leave result: more than {ceiling} rack occurrences reported for a task of \
+                 {num_games} games; a game cannot draw that many racks"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Checks a game batch against the size the task was dispatched with.
 ///
 /// The size rule needs the job, which `process_response` does not have, so it
@@ -355,6 +396,27 @@ mod tests {
     #[test]
     fn a_rack_that_did_not_occur_is_rejected() {
         assert!(check_rack_occurrences(&[occurrence("AEINRST", 0)]).is_err());
+    }
+
+    /// Occurrences are summed into `bigint` columns by one statement per
+    /// generation, so a count no game could produce is not only wrong: near
+    /// 2^63 it overflows that statement on every merge, and the generation can
+    /// never close.
+    #[test]
+    fn a_leave_batch_cannot_report_more_occurrences_than_its_games_drew() {
+        // Twenty-odd turns a game, two racks a turn at most: an honest
+        // hundred-game task is a few thousand occurrences.
+        let honest: Vec<_> = (0..500).map(|i| occurrence(&format!("R{i:06}"), 9)).collect();
+        assert!(check_rack_occurrence_total(&honest, 100).is_ok());
+        assert!(check_rack_occurrence_total(&[occurrence("AEINRST", 100_000)], 100).is_ok());
+
+        assert!(check_rack_occurrence_total(&[occurrence("AEINRST", 100_001)], 100).is_err());
+        assert!(check_rack_occurrence_total(&[occurrence("AEINRST", i64::MAX)], 100).is_err());
+        // The total, not each count: and adding them up must not itself wrap.
+        let garbage = [occurrence("AEINRST", i64::MAX), occurrence("AEINRSU", i64::MAX)];
+        assert!(check_rack_occurrence_total(&garbage, 100).is_err());
+        let spread: Vec<_> = (0..101).map(|i| occurrence(&format!("R{i:06}"), 1_000)).collect();
+        assert!(check_rack_occurrence_total(&spread, 100).is_err());
     }
 }
 
