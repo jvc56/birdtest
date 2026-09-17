@@ -23,6 +23,12 @@ pub fn hash_key(raw: &str) -> String {
 
 /// Passwords, unlike API keys, are low entropy and are only ever verified for a
 /// single known row, so they get Argon2 with a per-user salt.
+///
+/// Argon2 is tens of milliseconds of pure computation by design, so request
+/// handlers call the `_off_the_executor` forms below: run inline it occupies an
+/// async worker thread for all of it, and a worker that does not yield can be
+/// the one the whole runtime's socket events are waiting on (see
+/// `exports::upload_rows`, where that was found).
 pub fn hash_password(password: &str) -> AppResult<String> {
     let salt = SaltString::generate(&mut rand::rngs::OsRng);
     Argon2::default()
@@ -38,6 +44,21 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
             .is_ok(),
         Err(_) => false,
     }
+}
+
+/// [`hash_password`] on the blocking pool.
+pub async fn hash_password_off_the_executor(password: String) -> AppResult<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| AppError::internal(format!("password hashing task failed: {e}")))?
+}
+
+/// [`verify_password`] on the blocking pool. A task that fails verifies
+/// nothing.
+pub async fn verify_password_off_the_executor(password: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+        .await
+        .unwrap_or(false)
 }
 
 /// Single-use codes emailed to the user (confirmation, password reset). Stored

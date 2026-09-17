@@ -101,7 +101,7 @@ async fn register(
     // Argon2 cost. Returning an identical body for a taken address and then
     // answering in tens of milliseconds less would give the answer back through
     // timing, which is exactly the flaw this branch exists to avoid.
-    let password_hash = api_key::hash_password(&body.password)?;
+    let password_hash = api_key::hash_password_off_the_executor(body.password.clone()).await?;
 
     // A taken username is reported plainly: the user has to choose another one
     // to get anywhere, and `GET /api/users` publishes the whole list anyway, so
@@ -232,7 +232,7 @@ async fn login(
     let Some((id, username, password_hash, is_admin, confirmed_at, generation)) = row else {
         return Err(invalid());
     };
-    if !api_key::verify_password(&body.password, &password_hash) {
+    if !api_key::verify_password_off_the_executor(body.password.clone(), password_hash.clone()).await {
         return Err(invalid());
     }
     if confirmed_at.is_none() {
@@ -435,7 +435,7 @@ async fn confirm_password_reset(
         "UPDATE users SET password_hash = $1, session_generation = session_generation + 1
          WHERE id = $2 AND deleted_at IS NULL",
     )
-        .bind(api_key::hash_password(&body.password)?)
+        .bind(api_key::hash_password_off_the_executor(body.password.clone()).await?)
         .bind(user_id)
         .execute(&mut *tx)
         .await?;

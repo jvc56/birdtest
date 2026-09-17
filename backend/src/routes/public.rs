@@ -341,31 +341,82 @@ async fn job_results(
                 .collect()
         }
         JobType::LeaveGeneration => {
-            // Three columns, and the directions differ, so the seek is spelled
-            // out rather than written as a row comparison. `(job_id,
-            // generation, rack)` is the primary key, so the triple is unique
-            // and the cursor cannot land between two identical rows.
+            // Newest generation first, and within a generation the racks
+            // furthest from target first: `generation DESC, occurrence_count
+            // ASC, rack ASC`. No index runs in that mixed order, so asked for in
+            // one statement it was a sort of every progress row the job has --
+            // 3.2 million a generation -- for each page of fifty, on a public
+            // route. Within *one* generation the order is exactly
+            // `leave_rack_progress_pick_idx`'s, so the page is read a generation
+            // at a time, newest first, each read a seek into that index: a page
+            // costs a page. `(job_id, generation, rack)` is the primary key, so
+            // the cursor's triple is unique and cannot land between two
+            // identical rows.
             let (after_generation, after_count, after_rack) = leave_cursor(cursor.as_deref());
-            let rows = sqlx::query(
-                "SELECT rack, generation, occurrence_count,
-                        equity_sum / NULLIF(occurrence_count, 0) AS mean_equity, updated_at
-                 FROM leave_rack_progress
-                 WHERE job_id = $1
-                   AND ($2::int IS NULL
-                        OR generation < $2
-                        OR (generation = $2
-                            AND (occurrence_count > $3
-                                 OR (occurrence_count = $3 AND rack > $4))))
-                 ORDER BY generation DESC, occurrence_count ASC, rack ASC
-                 LIMIT $5",
-            )
-            .bind(id)
-            .bind(after_generation)
-            .bind(after_count)
-            .bind(after_rack)
-            .bind(limit)
-            .fetch_all(&state.read_pool)
-            .await?;
+            let mut generation = match after_generation {
+                Some(generation) => Some(generation),
+                // One probe of the primary key's far end.
+                None => sqlx::query_scalar::<_, Option<i32>>(
+                    "SELECT MAX(generation) FROM leave_rack_progress WHERE job_id = $1",
+                )
+                .bind(id)
+                .fetch_one(&state.read_pool)
+                .await?,
+            };
+            // Where in the first generation read to resume; later ones are
+            // read from their start.
+            let mut seek = after_count.zip(after_rack);
+
+            let mut rows = Vec::new();
+            while let Some(current) = generation.filter(|g| *g >= 1) {
+                let remaining = limit - rows.len() as i64;
+                if remaining <= 0 {
+                    break;
+                }
+                // Two statements rather than one with an `IS NULL OR` guard: a
+                // row comparison is an index condition only when it stands
+                // alone, and as a filter every page would start at the top of
+                // the generation again.
+                let page = match seek.take() {
+                    Some((count, rack)) => {
+                        sqlx::query(
+                            "SELECT rack, generation, occurrence_count,
+                                    equity_sum / NULLIF(occurrence_count, 0) AS mean_equity,
+                                    updated_at
+                             FROM leave_rack_progress
+                             WHERE job_id = $1 AND generation = $2
+                               AND (occurrence_count, rack) > ($3, $4)
+                             ORDER BY occurrence_count ASC, rack ASC
+                             LIMIT $5",
+                        )
+                        .bind(id)
+                        .bind(current)
+                        .bind(count)
+                        .bind(rack)
+                        .bind(remaining)
+                        .fetch_all(&state.read_pool)
+                        .await?
+                    }
+                    None => {
+                        sqlx::query(
+                            "SELECT rack, generation, occurrence_count,
+                                    equity_sum / NULLIF(occurrence_count, 0) AS mean_equity,
+                                    updated_at
+                             FROM leave_rack_progress
+                             WHERE job_id = $1 AND generation = $2
+                             ORDER BY occurrence_count ASC, rack ASC
+                             LIMIT $3",
+                        )
+                        .bind(id)
+                        .bind(current)
+                        .bind(remaining)
+                        .fetch_all(&state.read_pool)
+                        .await?
+                    }
+                };
+                rows.extend(page);
+                generation = Some(current - 1);
+            }
 
             if rows.len() as i64 == limit {
                 if let Some(last) = rows.last() {
@@ -667,8 +718,11 @@ pub(super) async fn job_results_stream(
         while let Some(row) = rows.next().await {
             match row {
                 Ok(row) => {
-                    let value: serde_json::Value = row.get("row");
-                    yield Ok::<_, std::io::Error>(format!("{value}\n"));
+                    // Already a line of JSON text: the export's queries
+                    // serialize in Postgres, so nothing is parsed here.
+                    let mut line: String = row.get("row");
+                    line.push('\n');
+                    yield Ok::<_, std::io::Error>(line);
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "result stream failed mid-flight");

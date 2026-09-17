@@ -29,7 +29,7 @@ Jobs are created by admins in the **inactive** state and only start receiving wo
 
 Jobs are created in the **inactive** state. Allocation is not set at creation time — it is supplied by the admin when they activate the job. This keeps the allocation budget coherent: an admin reviews the full set of active jobs, decides the new job's share, and activates it with a specific percentage in a single action.
 
-Admins can deactivate, reactivate, purge, force-complete, or delete a job at any time. **Purge deletes tasks outright** rather than returning them to `available`: every job type generates its tasks on demand, so a purged job regenerates them from the start of its space at the next claim. Leaving the rows behind would advance the seed cursor past work that was never done. Purging also rebuilds the generation-0 zeroed KLV a leave-generation job needs before it can dispatch; the generation-1 rack universe it deleted is seeded again by the first claim, as every generation's is. It takes the job's dispatch lock first, the same one every claim takes: a claim in flight has already read the seed cursor and is about to insert its task, which the purge's deletes cannot see, so without the lock the purge finishes and the claim then commits a task into the job it just emptied. It then waits out every open claim's in-flight submission before taking the job's row, which is the order every submission locks in (claim, then task, then job): taken the other way round, a submission arriving mid-purge deadlocked against it, and one that committed between the purge counting contributions and deleting claims was never handed back. Delete takes the same two locks for the same reasons.
+Admins can deactivate, reactivate, purge, force-complete, or delete a job at any time. **Purge deletes tasks outright** rather than returning them to `available`: every job type generates its tasks on demand, so a purged job regenerates them from the start of its space at the next claim. Leaving the rows behind would advance the seed cursor past work that was never done. Purging also rebuilds the generation-0 zeroed KLV a leave-generation job needs before it can dispatch; the generation-1 rack universe it deleted is seeded again by the first claim, as every generation's is. It takes the job's **merge lock** before anything else — a merge of a leave job's staged results takes the staged rows and then the per-rack rows, a purge deletes them the other way round, and run together the two deadlocked, with the purge the likelier victim: a `500` and nothing deleted (`leave_gen::lock_merges`; it is first in the lock order everywhere, because nothing takes it while holding another lock). Then the job's dispatch lock, the same one every claim takes: a claim in flight has already read the seed cursor and is about to insert its task, which the purge's deletes cannot see, so without the lock the purge finishes and the claim then commits a task into the job it just emptied. It then waits out every open claim's in-flight submission before taking the job's row, which is the order every submission locks in (claim, then task, then job): taken the other way round, a submission arriving mid-purge deadlocked against it, and one that committed between the purge counting contributions and deleting claims was never handed back. Delete takes the same three locks for the same reasons.
 
 A completed job cannot be reactivated, and for the same reason cannot be deactivated: deactivate-then-activate would otherwise restart it. Force-completion is unconditional.
 
@@ -887,6 +887,23 @@ through `GET`, and answered with a presigned URL once ready, so **the bytes neve
 pass through the backend** and never touch the connection pool the cap exists to
 protect.
 
+**The compression runs on the blocking pool, not on the async executor.**
+Compressing and hashing are the whole cost of an export — a corpus is gigabytes
+of JSON — and the database delivers rows faster than they compress, so done
+inline the loop's `await` never had to wait and the task never yielded. A Tokio
+worker that does not yield stops more than its own task: the worker that last
+polled the I/O driver is the one new socket events wait on, and when that is
+the worker doing the compressing, nothing is accepted, read or written — by the
+whole server — until it comes up for air. Found with one full-size leave
+generation exporting: eleven worker threads parked, one at 100%, and `/health`,
+claims and submissions unanswered for as long as the export ran (minutes, in a
+debug build; shorter bursts of the same thing in a release one). Rows are now
+read as text Postgres has already serialized, gathered a mebibyte at a time,
+and compressed and hashed through `spawn_blocking`; the same export finishes in
+34 s with `/health` at 2 ms median and 8 ms at worst throughout. The rule is
+general, and the other computations of that size follow it: an import's
+gunzip-untar-hash of a whole tarball, and every Argon2 hash and verify.
+
 **What a line holds** follows the job type: a `game_results` row for games and
 game pairs, a `leave_rack_progress` row for leave generation, and for opening
 racks a `position_analysis_records` row **with its ranked moves and their
@@ -934,6 +951,15 @@ candidate, and nothing ever asks for work from a completed job — so a
 claim whose worker vanished would have stayed `claimed`, and refused the
 export, for good.
 
+**For a leave-generation job, settled includes merged.** Its corpus is
+`leave_rack_progress`, and an accepted result reaches that table only at a
+merge. A job whose last generation closed has nothing staged — the transition
+drains first — but one an admin force-completed mid-generation does, until the
+half-hourly sweep, and an export built in that window was short by every result
+accepted since the last merge, for good. The export's background task merges
+what is staged (waiting for a merge already running) before it reads a row, and
+the admin stream of a completed job does the same (`exports::settle`).
+
 Exports are derived data and are treated differently from the leave-generation
 KLVs in every way that matters: a purge deletes a job's exports with the results
 they describe (a row left saying `ready` would hand an admin a stable-looking
@@ -972,7 +998,8 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | Rating sweep `build_matrix`, 600,000 paired results | every two minutes, and on every public read of a pool | 452 ms |
 | `worker_contributions`, 44,000 claims | job detail and every SSE push | 136 ms |
 | Public worker list, all claims | page view | 93 ms |
-| Leave `next_step` rack selection | every leave claim | 47 ms |
+| Leave `next_step` rack selection — **as it was**, ordering on `(occurrence_count, rack)` through an index without `rack` | every leave claim, inside the dispatch lock | 225–390 ms at **400,000** racks (an eighth of English; a scan and sort of the generation, so linear from there — 2–3 s at full size). The 47 ms first recorded here was measured on counts that rarely tied |
+| Leave `next_step` rack selection **as it is now** — the index carries `rack`, the exclusion is a hashed `NOT IN` | every leave claim | 9 ms with 20 results staged, 160–290 ms with 400 (200,000 racks held out): the universe's size no longer enters, what is staged does |
 | `leave_gen_stats` — **as it was**, counting the generation's racks at target | job detail and every SSE push | 210 ms |
 | `leave_gen_stats` **as it is now** — the generation's summary row | job detail and every SSE push | one single-row read |
 | Transition: stream generation 1 by rack | once per generation | 674 ms |
@@ -1072,6 +1099,27 @@ What the numbers settled:
   about — a heavy contributor is found at the head of the job's feed index and
   a rare one through their own claims, and a cached generic plan picks one of
   those for everybody.
+- **A leave claim walks its index instead of sorting the generation.**
+  Selection orders on `(occurrence_count, rack)` and counts tie in their
+  millions — every rack starts at zero and the rare ones stay there — so an
+  index on the count alone could not supply the order, and every leave claim
+  read and sorted the whole generation inside the job's dispatch lock, whose
+  other claimants give up after two seconds. `leave_rack_progress_pick_idx`
+  carries `rack` now. The index alone was not enough, and for a while made it
+  worse: with the order available the planner ran the `NOT EXISTS` exclusion as
+  a nested loop over the held-out racks (it guesses ten elements per `unnest`),
+  3.5 s at a tenth of full size. The exclusion is `NOT IN` over an
+  uncorrelated subquery, which Postgres evaluates as a hashed subplan — one
+  pass to build, one probe per index entry — and which is safe because the
+  subquery filters its own NULLs. What is left grows with what is *staged*, not
+  with the universe: about a microsecond per held-out rack, which is the
+  undecided half of [What a merge costs](#what-a-merge-costs).
+- **The public results feed of a leave job is read a generation at a time.**
+  Its order — newest generation first, then the racks furthest from target —
+  is one no index runs in, so as one statement each page of fifty was a sort of
+  every progress row the job has (53 ms at 400,000 rows, seconds at a few
+  full-size generations) on a public route. Within one generation the order is
+  the selection index's, so a page is a seek into it: 0.07 ms.
 - **Copying the rack universe to the next generation is the one slow write**, and
   it is slow on an under-provisioned database: a minute here, against about 15
   seconds for a whole transition on the smaller dev database. It runs once per
@@ -2372,7 +2420,7 @@ The reported list covers **every rack that occurred during the batch, forced or 
 
 The transition **does not write the next generation's rack universe.** That is millions of rows (3.2 million for English); inside the closing transaction it made every worker on the job wait the write out, and made the close and the copy stand or fall together, so anything that failed cost a full re-derive and re-upload as well. The universe is seeded when its generation *opens* instead — on a task of its own, started by the first claim that finds it missing, under the job's lock so two seedings cannot both do it — from the pinned letter distribution, through the same `seed_generation` for every generation, the first included. One implementation of what a generation's universe *is*, derived from the source of truth rather than from the previous generation's rows, and off the critical path.
 
-The transition takes tens of seconds and runs *outside* the claim transaction, on its own task so that a worker or proxy giving up on the request cannot cancel it part-way. That leaves the deciding claim holding no lock while it works, so ownership is recorded instead: the claim transaction that finds the generation complete inserts `leave_generation_transitions (job_id, generation)` and **commits** — its only write is that row, and committing is both what makes the row visible to everyone else and what releases the job's advisory lock before the upload starts. The row's primary key is what means every other claim arriving meanwhile is told there is no work yet rather than starting the same transition again. `completed_at` is set in the same transaction as the artifact row, and setting it is **conditional on the row still being there and still open** — that is how a transition finds out it no longer owns anything. A purge deletes the transitions row along with the artifacts and progress rows, so a transition spawned before it would otherwise hand the purged job a generation-1 KLV derived from results it no longer has. When the close is refused nothing is written and the uploaded object is left behind; it is keyed by job and generation, so a later transition of the same generation overwrites it, and `GET /api/worker/artifact` serves no key that no `leave_generation_artifacts` row names. A transition that never finishes — the process died, or the object store refused the upload — is taken over by a later claim once `started_at` is older than the takeover timeout (30 minutes, far longer than any measured transition), and `attempts` records that it happened; a failure the server survives hands ownership back immediately instead of waiting out the timeout.
+The transition takes tens of seconds and runs *outside* the claim transaction, on its own task so that a worker or proxy giving up on the request cannot cancel it part-way. That leaves the deciding claim holding no lock while it works, so ownership is recorded instead: the claim transaction that finds the generation complete inserts `leave_generation_transitions (job_id, generation)` and **commits** — its only write is that row, and committing is both what makes the row visible to everyone else and what releases the job's advisory lock before the upload starts. The row's primary key is what means every other claim arriving meanwhile is told there is no work yet rather than starting the same transition again. `completed_at` is set in the same transaction as the artifact row, and setting it is **conditional on the row still being there and still open** — that is how a transition finds out it no longer owns anything. A purge deletes the transitions row along with the artifacts and progress rows, so a transition spawned before it would otherwise hand the purged job a generation-1 KLV derived from results it no longer has. When the close is refused nothing is written and the uploaded object is left behind; it is keyed by job and generation, so a later transition of the same generation overwrites it, and `GET /api/worker/artifact` serves no key that no `leave_generation_artifacts` row names. A transition that never finishes — the process died, or the object store refused the upload — is taken over by a later claim once `started_at` is older than the takeover timeout (30 minutes, far longer than any measured transition), and `attempts` records that it happened; a failure the server survives hands ownership back immediately instead of waiting out the timeout. So does a **restart**: a transition runs on a spawned task, the service is a single instance whose old task stops before the new one starts, and so at startup every open transition belongs to a process that is gone — exactly as every `running` import and export does. Startup backdates them (`leave_gen::release_orphaned_transitions`) and the next claim takes over; without that, every deployment that landed inside a transition left its job with nothing to hand out for half an hour.
 
 The derivation is MAGPIE's own `rack_list_write_to_klv`. Each full rack `R` has a mean `m(R)` — `equity_sum / occurrence_count`, or 0 if it never occurred — and a weight, the ways to draw it from a full bag (the product over letters of `C(dist, R)`). The average is the weighted mean of `m(R)` over every full rack. Every proper, non-empty sub-multiset `L` of `R` receives `m(R)` weighted by the ways to draw the rest of `R` once `L` is held (the product of `C(dist − L, R − L)`), and a leave's value is its weighted mean minus the average, or 0 if nothing contributed.
 
@@ -3960,6 +4008,13 @@ sort key, hex-encoded — and one this server did not produce reads as "start at
 the beginning" rather than as an error, since a caller cannot repair a token it
 cannot read.
 
+A leave-generation job's feed is its per-rack progress, newest generation
+first and within one the racks furthest from target (`occurrence_count`, then
+`rack`), and its cursor is that triple. No index runs in that mixed order, so
+the page is read one generation at a time, each read a seek into
+`leave_rack_progress_pick_idx`, rather than as one statement that sorted every
+progress row of the job per page.
+
 Its key is worth stating, because the obvious one is wrong: `submitted_at`
 defaults to `now()`, which is transaction time, so every record of one batch
 shares it exactly and it is not a key on its own. The tiebreaker is
@@ -4049,7 +4104,9 @@ use. On startup the process, in order: loads config from the environment
 (`.env` locally, task-definition variables in ECS), connects the pool, **runs
 migrations before binding** so a container never serves traffic against an
 out-of-date schema, connects the display pool, fails any input-data import or
-export left `running` by a previous process, and only then listens.
+export left `running` by a previous process, releases any leave-generation
+transition one left open (so the next claim takes it over rather than the
+half-hour takeover timeout), and only then listens.
 
 On the way out it **shuts down gracefully**: `SIGTERM` (what ECS sends before it
 escalates to `SIGKILL` at the stop timeout) and `SIGINT` stop it accepting new

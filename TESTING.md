@@ -604,6 +604,19 @@ job creation touches needs one caller here.
   `leave_gen::racks_of_a_staged_result_are_not_handed_out_again_before_the_merge`,
   `leave_gen::a_generation_does_not_close_with_results_still_staged`,
   `leave_gen::a_purge_discards_staged_results`.)*
+- `I-LEAVE-2b` **A purge waits for a running merge rather than deadlocking with
+  it.** A merge takes the staged rows and then the per-rack rows; a purge that
+  deleted them the other way round stopped on a rack the merge had updated
+  while holding racks the merge had yet to reach, and Postgres failed one of
+  the two. Purge and delete take the job's merge lock before anything else.
+  *(Covered:
+  `leave_gen::a_purge_waits_for_a_running_merge_instead_of_deadlocking_with_it`,
+  which fails against a purge without the lock: the purge is the deadlock's
+  victim and deletes nothing.)*
+- `I-LEAVE-2c` **A completed leave job's corpus includes what was still
+  staged.** Force-completed mid-generation, a job holds accepted results no
+  merge has folded in; its stream and its export settle it first. *(Covered:
+  `leave_gen::a_completed_leave_jobs_corpus_includes_what_was_still_staged`.)*
 - `I-LEAVE-3` Rack selection picks the racks furthest below target, skips racks
   an open claim is already forcing, and returns nothing once all are at target
   with no claim in flight. *(Skipping covered:
@@ -632,6 +645,11 @@ job creation touches needs one caller here.
   takeover timeout, and the takeover is recorded in `attempts`; a *completed*
   transition is never restarted however old it is. *(Covered:
   `leave_gen::a_transition_that_never_finished_is_taken_over`.)*
+- `I-LEAVE-12a` **A restart hands an open transition to the next claim.** A
+  transition runs on a spawned task, so one left open at startup belongs to a
+  process that is gone; it is released there and then, not after the takeover
+  timeout, and a completed one is left alone. *(Covered:
+  `leave_gen::a_restart_hands_an_open_transition_to_the_next_claim`.)*
 - `I-LEAVE-13` **The transition owner's row is committed** before the transition
   runs -- the claim transaction that decides a generation is complete commits
   rather than rolls back, or the row that stops a second transition would be
@@ -649,6 +667,13 @@ job creation touches needs one caller here.
   generation has closed, the next claim gets a task for the new generation
   instead. *(Covered:
   `leave_gen::a_reclaimed_task_is_reissued_only_while_its_generation_is_open`.)*
+
+- `I-LEAVE-16` **The public results feed of a leave job tiles it.** Read a
+  generation at a time through the selection index rather than as one sort of
+  every progress row, the pages still return every row once, newest generation
+  first and in the database's `(occurrence_count, rack)` order within one,
+  across the boundary between two generations. *(Covered:
+  `leave_gen::the_leave_results_feed_pages_through_every_generation_in_order`.)*
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 

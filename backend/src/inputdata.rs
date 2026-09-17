@@ -439,7 +439,7 @@ impl Progress {
 
 /// Phase 1, off the request thread: fetch, hash, diff, stage.
 pub async fn run_import(state: AppState, import_id: Uuid, tarball_date: String, commit_sha: String) {
-    let progress = Progress::new(state.pool.clone(), import_id);
+    let progress = std::sync::Arc::new(Progress::new(state.pool.clone(), import_id));
     match stage(&state, import_id, &tarball_date, &commit_sha, &progress).await {
         Ok(staged) => {
             progress.flush_entries().await;
@@ -503,10 +503,23 @@ async fn stage(
     import_id: Uuid,
     tarball_date: &str,
     commit_sha: &str,
-    progress: &Progress,
+    progress: &std::sync::Arc<Progress>,
 ) -> AppResult<String> {
     let (body, tarball_sha256) = download(state, commit_sha, tarball_date, progress).await?;
-    let mut files = walk_archive(&body, Some(progress))?;
+    // On the blocking pool: gunzipping, untarring and hashing a whole tarball
+    // is seconds of computation with no `await` in it, and an async worker
+    // thread that does not yield can stall every other request the server has
+    // (see `exports::upload_rows`). The archive goes in and comes back out,
+    // since the uploads below still read from it.
+    let (mut files, body) = {
+        let progress = progress.clone();
+        tokio::task::spawn_blocking(move || {
+            let files = walk_archive(&body, Some(&progress))?;
+            Ok::<_, AppError>((files, body))
+        })
+        .await
+        .map_err(|e| AppError::internal(format!("reading the archive failed: {e}")))??
+    };
     // Before anything is staged: a row that names an object has to be a row
     // whose object is there, or the first derived build from it fails with a
     // missing key rather than a reason. Uploading before the transaction also

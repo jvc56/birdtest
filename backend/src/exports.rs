@@ -53,7 +53,7 @@ pub const DOWNLOAD_URL_TTL: std::time::Duration = std::time::Duration::from_secs
 /// record and per simmed move, on a background task (or under the two-stream
 /// cap) rather than on anything a worker waits for.
 const OPENING_RACK_CORPUS: &str = "
-    SELECT to_jsonb(r) || jsonb_build_object('moves', COALESCE((
+    SELECT (to_jsonb(r) || jsonb_build_object('moves', COALESCE((
                SELECT jsonb_agg(
                           jsonb_build_object(
                               'rank', m.rank, 'move', m.move, 'score', m.score,
@@ -70,7 +70,7 @@ const OPENING_RACK_CORPUS: &str = "
                               ), '[]'::jsonb))
                           ORDER BY m.rank)
                FROM position_analysis_moves m WHERE m.record_id = r.id
-           ), '[]'::jsonb)) AS row
+           ), '[]'::jsonb)))::text AS row
     FROM position_analysis_records r
     WHERE r.job_id = $1";
 
@@ -96,14 +96,19 @@ pub fn may_capture_positions(job_type: JobType) -> bool {
 /// The rows an export contains, per job type. The live stream
 /// (`routes::public::job_results_stream`) runs the same queries, so the two
 /// produce the same corpus.
+///
+/// Every query returns its line **as text**, already serialized by Postgres.
+/// As `jsonb` each row was parsed into a `serde_json::Value` and written out
+/// again, per row, on the async executor: twice the work of the copy this is
+/// now, on threads whose job is answering workers (see [`upload_rows`]).
 pub fn export_query(job_type: JobType) -> &'static str {
     match job_type {
         JobType::OpeningRack => OPENING_RACK_CORPUS,
         JobType::Games | JobType::GamePairs => {
-            "SELECT to_jsonb(r) AS row FROM game_results r WHERE r.job_id = $1"
+            "SELECT to_jsonb(r)::text AS row FROM game_results r WHERE r.job_id = $1"
         }
         JobType::LeaveGeneration => {
-            "SELECT to_jsonb(r) AS row FROM leave_rack_progress r WHERE r.job_id = $1"
+            "SELECT to_jsonb(r)::text AS row FROM leave_rack_progress r WHERE r.job_id = $1"
         }
     }
 }
@@ -216,6 +221,57 @@ struct Uploaded {
     rows: i64,
 }
 
+/// How much NDJSON is gathered before it is handed to the blocking pool to be
+/// compressed. Small enough that memory stays flat, large enough that the hop
+/// to another thread is noise beside the compression it buys.
+const COMPRESS_BATCH_BYTES: usize = 1024 * 1024;
+
+/// The gzip stream and the digest of what it has produced, moved onto the
+/// blocking pool and back for each batch.
+struct Compressor {
+    encoder: GzEncoder<Vec<u8>>,
+    hasher: Sha256,
+    bytes: i64,
+}
+
+impl Compressor {
+    /// Compress `batch`, and hand back a part for the upload once a whole one
+    /// has accumulated.
+    fn push(mut self, batch: Vec<u8>) -> AppResult<(Self, Option<Vec<u8>>)> {
+        self.encoder
+            .write_all(&batch)
+            .map_err(|e| AppError::internal(format!("export encode failed: {e}")))?;
+        let part = (self.encoder.get_ref().len() >= MultipartUpload::PART_SIZE).then(|| {
+            let part = std::mem::take(self.encoder.get_mut());
+            self.hasher.update(&part);
+            self.bytes += part.len() as i64;
+            part
+        });
+        Ok((self, part))
+    }
+
+    /// Close the stream: the encoder's trailer has to go out with the final
+    /// part, so it is finished before the last flush rather than after it.
+    fn finish(mut self) -> AppResult<(Vec<u8>, i64, String)> {
+        let tail = self
+            .encoder
+            .finish()
+            .map_err(|e| AppError::internal(format!("export finalize failed: {e}")))?;
+        self.hasher.update(&tail);
+        self.bytes += tail.len() as i64;
+        Ok((tail, self.bytes, hex::encode(self.hasher.finalize())))
+    }
+}
+
+/// Run `work` on the blocking pool.
+async fn off_the_executor<T: Send + 'static>(
+    work: impl FnOnce() -> AppResult<T> + Send + 'static,
+) -> AppResult<T> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| AppError::internal(format!("export compression task failed: {e}")))?
+}
+
 /// Stream one query's rows out as gzipped NDJSON, straight into a multipart
 /// upload at `key`.
 ///
@@ -223,54 +279,83 @@ struct Uploaded {
 /// written through the encoder, and flushed to S3 whenever the compressed
 /// buffer reaches a part. That is what lets this run against a job whose
 /// results do not fit in memory, which is every job worth exporting.
+///
+/// **The compression and the digest run on the blocking pool, not here.** They
+/// are the whole cost of an export -- a corpus is gigabytes of JSON -- and done
+/// inline they were one long computation on an async worker thread: the
+/// database delivers rows faster than they compress, so the loop's `await`
+/// never had to wait and never yielded. A Tokio worker that does not yield
+/// stops more than its own task. Whichever worker last polled the I/O driver
+/// is the one new socket events are waiting on, and if that is the worker doing
+/// the compressing, nothing is accepted, read or written until it next comes
+/// up for air -- by the whole server: `/health`, and every claim, heartbeat
+/// and submission. Found with an export of one full-size leave generation
+/// running: every other worker thread parked, one at 100%, and `/health`
+/// unanswered for as long as the export ran. What is left on the executor is a
+/// copy of each row's text into the next batch.
 async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> AppResult<Uploaded> {
     let mut upload = state.artifacts.start_multipart(key).await?;
-
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    let mut hasher = Sha256::new();
-    let mut bytes: i64 = 0;
     let mut rows_written: i64 = 0;
 
     let result = async {
+        let mut compressor = Compressor {
+            encoder: GzEncoder::new(Vec::new(), Compression::default()),
+            hasher: Sha256::new(),
+            bytes: 0,
+        };
+        let mut batch: Vec<u8> = Vec::with_capacity(COMPRESS_BATCH_BYTES + 64 * 1024);
+
         let mut rows = sqlx::query(sql).bind(job_id).fetch(&state.pool);
         while let Some(row) = rows.try_next().await? {
-            let value: serde_json::Value = row.get("row");
-            writeln!(encoder, "{value}")
-                .map_err(|e| AppError::internal(format!("export encode failed: {e}")))?;
+            let line: String = row.get("row");
+            batch.extend_from_slice(line.as_bytes());
+            batch.push(b'\n');
             rows_written += 1;
 
-            if encoder.get_ref().len() >= MultipartUpload::PART_SIZE {
-                let part = std::mem::take(encoder.get_mut());
-                hasher.update(&part);
-                bytes += part.len() as i64;
-                upload.upload_part(part).await?;
+            if batch.len() >= COMPRESS_BATCH_BYTES {
+                let full = std::mem::replace(
+                    &mut batch,
+                    Vec::with_capacity(COMPRESS_BATCH_BYTES + 64 * 1024),
+                );
+                let (next, part) = off_the_executor(move || compressor.push(full)).await?;
+                compressor = next;
+                if let Some(part) = part {
+                    upload.upload_part(part).await?;
+                }
             }
         }
         drop(rows);
 
-        // The encoder's trailer has to go out with the final part, so the
-        // stream is finished before the last flush rather than after it.
-        let tail = encoder
-            .finish()
-            .map_err(|e| AppError::internal(format!("export finalize failed: {e}")))?;
-        hasher.update(&tail);
-        bytes += tail.len() as i64;
-        // S3 rejects a zero-length part, and an empty job is a legitimate
-        // export: gzip's own trailer means `tail` is never actually empty, but
-        // the guard costs nothing and says so.
-        if !tail.is_empty() {
-            upload.upload_part(tail).await?;
+        let (tail, bytes, sha256) = off_the_executor(move || {
+            let (compressor, part) = compressor.push(batch)?;
+            // A part that filled on the very last batch still has to precede
+            // the trailer, so both come back, in order.
+            let (tail, bytes, sha256) = compressor.finish()?;
+            Ok((part.into_iter().chain([tail]).collect::<Vec<_>>(), bytes, sha256))
+        })
+        .await?;
+        for part in tail {
+            // S3 rejects a zero-length part, and an empty job is a legitimate
+            // export: gzip's own trailer means the last part is never actually
+            // empty, but the guard costs nothing and says so.
+            if !part.is_empty() {
+                upload.upload_part(part).await?;
+            }
         }
-        Ok::<(), AppError>(())
+        Ok::<(i64, String), AppError>((bytes, sha256))
     }
     .await;
 
-    if let Err(err) = result {
-        upload.abort().await;
-        return Err(err);
+    match result {
+        Ok((bytes, sha256)) => {
+            upload.finish().await?;
+            Ok(Uploaded { bytes, sha256, rows: rows_written })
+        }
+        Err(err) => {
+            upload.abort().await;
+            Err(err)
+        }
     }
-    upload.finish().await?;
-    Ok(Uploaded { bytes, sha256: hex::encode(hasher.finalize()), rows: rows_written })
 }
 
 /// Build the export's artifacts and mark the row ready.
@@ -404,4 +489,51 @@ pub async fn fail_orphaned(pool: &sqlx::PgPool) -> AppResult<u64> {
     .execute(pool)
     .await?
     .rows_affected())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::RngCore;
+    use std::io::Read;
+
+    /// The compressor is moved to the blocking pool and back once per batch,
+    /// and hands out a part whenever a whole one has accumulated. What the
+    /// upload receives -- every part, then the tail -- has to be one gzip
+    /// stream of exactly the lines pushed, and the digest and byte count
+    /// recorded on the export have to describe those bytes.
+    #[test]
+    fn the_parts_are_one_gzip_stream_of_what_was_pushed() {
+        let mut compressor = Compressor {
+            encoder: GzEncoder::new(Vec::new(), Compression::default()),
+            hasher: Sha256::new(),
+            bytes: 0,
+        };
+        // Incompressible, so the compressed stream passes a part's size.
+        let mut rng = rand::thread_rng();
+        let mut pushed = Vec::new();
+        let mut uploaded = Vec::new();
+        let mut parts = 0;
+        for _ in 0..10 {
+            let mut batch = vec![0u8; COMPRESS_BATCH_BYTES];
+            rng.fill_bytes(&mut batch);
+            pushed.extend_from_slice(&batch);
+            let (next, part) = compressor.push(batch).unwrap();
+            compressor = next;
+            if let Some(part) = part {
+                assert!(part.len() >= MultipartUpload::PART_SIZE, "S3 refuses a short part");
+                uploaded.extend_from_slice(&part);
+                parts += 1;
+            }
+        }
+        assert_eq!(parts, 1, "ten incompressible mebibytes are one 8 MiB part and a tail");
+        let (tail, bytes, sha256) = compressor.finish().unwrap();
+        uploaded.extend_from_slice(&tail);
+
+        assert_eq!(bytes as usize, uploaded.len());
+        assert_eq!(sha256, hex::encode(Sha256::digest(&uploaded)));
+        let mut read_back = Vec::new();
+        flate2::read::GzDecoder::new(&uploaded[..]).read_to_end(&mut read_back).unwrap();
+        assert!(read_back == pushed, "the artifact decompresses to the lines that were pushed");
+    }
 }

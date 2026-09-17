@@ -1365,3 +1365,69 @@ async fn a_restart_hands_an_open_transition_to_the_next_claim() {
     let released = birdtest::jobs::leave_gen::release_orphaned_transitions(&db.pool).await.unwrap();
     assert_eq!(released, 0);
 }
+
+/// The public results feed of a leave job runs newest generation first and,
+/// within one, from the racks furthest from target. No index has that mixed
+/// order, so one statement for it sorted every progress row of the job for
+/// each page. It is read a generation at a time instead, each read a seek into
+/// the selection index; what this pins is that the pages still tile the job --
+/// every row once, in order, across the boundary between two generations.
+#[tokio::test]
+async fn the_leave_results_feed_pages_through_every_generation_in_order() {
+    let db = TestDb::new().await;
+    let (job, universe) = leave_job(&db, 2).await;
+    {
+        let mut conn = db.pool.acquire().await.unwrap();
+        let data = birdtest::jobs::load_job_data(&mut conn, job).await.unwrap();
+        birdtest::jobs::leave_gen::seed_generation(&mut conn, job, 2, &data.letterdist)
+            .await
+            .unwrap();
+    }
+    // Counts that tie often, so the rack is what orders most neighbours.
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = abs(hashtext(rack || generation::text)) % 4
+         WHERE job_id = $1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let mut seen: Vec<(i64, i64, String)> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..200 {
+        let path = match &cursor {
+            Some(cursor) => format!("/api/jobs/{job}/results?per_page=37&cursor={cursor}"),
+            None => format!("/api/jobs/{job}/results?per_page=37"),
+        };
+        let (status, body) = send(&app, get_request(&path, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for item in body["items"].as_array().unwrap() {
+            seen.push((
+                item["generation"].as_i64().unwrap(),
+                item["occurrence_count"].as_i64().unwrap(),
+                item["rack"].as_str().unwrap().to_string(),
+            ));
+        }
+        cursor = body["next_cursor"].as_str().map(str::to_string);
+        if cursor.is_none() {
+            break;
+        }
+    }
+
+    assert_eq!(seen.len() as i64, universe * 2, "every row of both generations, once");
+    // The order is the database's, collation included, so the database states
+    // it: the one statement the feed used to run, which is still what it means.
+    let expected: Vec<(i32, i64, String)> = sqlx::query_as(
+        "SELECT generation, occurrence_count, rack FROM leave_rack_progress WHERE job_id = $1
+         ORDER BY generation DESC, occurrence_count ASC, rack ASC",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let expected: Vec<(i64, i64, String)> =
+        expected.into_iter().map(|(g, count, rack)| (i64::from(g), count, rack)).collect();
+    assert_eq!(seen, expected, "newest generation first, then by count, then by rack");
+}
