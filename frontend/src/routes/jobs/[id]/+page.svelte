@@ -8,6 +8,7 @@
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import OutcomeChart from '$lib/components/OutcomeChart.svelte';
+  import { pentanomialRows } from '$lib/charts/pentanomial';
 
   // The [id] route only matches when the param is present.
   const jobId = $page.params.id as string;
@@ -144,19 +145,11 @@
                 </tr>
               </thead>
               <tbody>
-                {#each ['P1 lost both', 'Lost one, drew one', 'Split 1-1', 'Won one, drew one', 'P1 won both'] as label, i}
+                {#each pentanomialRows(stats.games.pentanomial, stats.games.units_completed) as bucket}
                   <tr>
-                    <td>{label}</td>
-                    <td class="text-right tabular-nums"
-                      >{stats.games.pentanomial[i].toLocaleString()}</td
-                    >
-                    <td class="text-right tabular-nums">
-                      {stats.games.units_completed
-                        ? ((100 * stats.games.pentanomial[i]) / stats.games.units_completed).toFixed(
-                            1
-                          )
-                        : '0.0'}%
-                    </td>
+                    <td>{bucket.label}</td>
+                    <td class="text-right tabular-nums">{bucket.pairs.toLocaleString()}</td>
+                    <td class="text-right tabular-nums">{bucket.share}%</td>
                   </tr>
                 {/each}
               </tbody>
