@@ -157,3 +157,47 @@ pub struct AppState {
     /// [`crate::scheduler::reclaim_lapsed`] for what that protects.
     pub reclaim_from: std::time::Instant,
 }
+
+impl AppState {
+    /// The state the server runs with, built from what `main` establishes
+    /// first: the configuration, both pools (after migrating), and the pinned
+    /// MAGPIE with its builder versions. Everything else starts empty.
+    ///
+    /// Here rather than inline in `main` so that a freshly started process --
+    /// its restart grace above all -- can be tested as the binary builds it.
+    pub async fn new(
+        cfg: Arc<Config>,
+        pool: PgPool,
+        read_pool: PgPool,
+        magpie: crate::magpie::Magpie,
+        builders: crate::magpie::Builders,
+    ) -> Self {
+        AppState {
+            pool,
+            read_pool,
+            cfg: cfg.clone(),
+            magpie,
+            builders: Arc::new(builders),
+            sse: SseBroadcaster::new(),
+            finish_checks: Default::default(),
+            derived_ready: Default::default(),
+            templates: Default::default(),
+            leave_merges: Default::default(),
+            shutdown: Default::default(),
+            // A claim's only evidence of life is a heartbeat this process
+            // received, and it has received none yet: see
+            // `scheduler::reclaim_lapsed`.
+            reclaim_from: std::time::Instant::now() + cfg.heartbeat_timeout,
+            limits: RateLimiters::new(),
+            mailer: Mailer::new(cfg.clone()).await,
+            artifacts: ArtifactStore::new(cfg.clone()).await,
+            result_streams: Arc::new(Semaphore::new(MAX_CONCURRENT_RESULT_STREAMS)),
+            http: reqwest::Client::builder()
+                .user_agent("birdtest")
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .read_timeout(std::time::Duration::from_secs(120))
+                .build()
+                .expect("HTTP client"),
+        }
+    }
+}
