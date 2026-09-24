@@ -150,6 +150,11 @@ async fn game_stats(db: &TestDb, job: Uuid) -> jobstats::GameStats {
     jobstats::game_stats(&db.pool, &row).await.unwrap().expect("a games or pairs job")
 }
 
+/// `got` equals a value computed independently of the code under test.
+fn close(got: f64, want: f64) {
+    assert!((got - want).abs() < 1e-12, "{got} != {want}");
+}
+
 async fn stats(db: &TestDb, job: Uuid) -> jobstats::JobStats {
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
     jobstats::compute(&db.pool, &row).await.unwrap()
@@ -183,6 +188,12 @@ async fn a_games_jobs_stats_sum_every_result_and_test_the_games() {
     assert_eq!(games.sprt.llr, expected);
     assert_eq!((games.sprt.lower_bound, games.sprt.upper_bound), sprt::bounds(0.05, 0.05));
     assert_eq!(games.sprt.status, SprtStatus::Running, "below min_games");
+    // And the numbers themselves, computed outside the code from PLAN.md's
+    // formulas, so a job that read the right rows through the wrong maths
+    // fails here too.
+    close(games.sprt.llr, 1.125_953_543_425_981_8);
+    close(games.sprt.upper_bound, 2.944_438_979_166_440_5);
+    close(games.sprt.lower_bound, -2.944_438_979_166_440_5);
 }
 
 /// Two paired batches: 16 pairs, 7 of which diverged.
@@ -226,6 +237,10 @@ async fn divergent_pairs_are_reported_but_not_tested() {
         (over_pairs - over_divergent).abs() > 0.1,
         "the two samples must disagree for this to prove anything: {over_pairs} vs {over_divergent}"
     );
+    // Computed outside the code: the 16 pairs scored i/4 give 0.2074996702…,
+    // the 14 divergent games alone would have given 0.6836092355…
+    close(games.sprt.llr, 0.207_499_670_225_107_38);
+    close(over_divergent, 0.683_609_235_523_814_9);
 }
 
 /// I-STATS-4: a job with no results reports zeros and an LLR of 0 -- finite,
@@ -538,4 +553,49 @@ async fn a_crossed_llr_below_min_games_does_not_complete_the_job() {
     assert!(games.sprt.llr > games.sprt.upper_bound, "the LLR has crossed: {:?}", games.sprt);
     assert_eq!(games.sprt.status, SprtStatus::Running);
     assert_eq!(job_status(&db, job).await, "active");
+}
+
+/// I-STATS-9 (at the bound): the job completes on the submission that takes
+/// its LLR past the upper bound, and not on one that leaves it just short.
+/// 71-29 over 100 games is 2.9347 against a bound of 2.9444: at `min_games`,
+/// checked, and still running. Another 54-46 makes 125-75 over 200, 3.0693:
+/// past it, and the job completes. (Both computed outside the code.)
+#[tokio::test]
+async fn a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before() {
+    let db = TestDb::new().await;
+    let job = gated_games_job(&db, 100, 1_000_000).await;
+    let app = birdtest::app(db.state().await);
+
+    play_batch(&app, 71).await;
+    let games = game_stats(&db, job).await;
+    close(games.sprt.llr, 2.934_734_021_233_334_5);
+    assert_eq!(games.sprt.status, SprtStatus::Running, "just inside the bound");
+    assert_eq!(job_status(&db, job).await, "active");
+
+    play_batch(&app, 54).await;
+    let games = game_stats(&db, job).await;
+    assert_eq!((games.wins, games.losses), (125, 75));
+    close(games.sprt.llr, 3.069_265_955_413_046_7);
+    assert_eq!(games.sprt.status, SprtStatus::Passed);
+    assert_eq!(job_status(&db, job).await, "completed");
+}
+
+/// I-STATS-9 (H0): a job whose player 1 is losing completes too, with its
+/// verdict failed (H0 accepted) rather than passed. 28-72 over 100 games is
+/// an LLR of -3.1401, past the lower bound of -2.9444 (computed outside the
+/// code).
+#[tokio::test]
+async fn a_job_driven_to_h0_completes_with_its_sprt_failed() {
+    let db = TestDb::new().await;
+    let job = gated_games_job(&db, 100, 1_000_000).await;
+    let app = birdtest::app(db.state().await);
+
+    play_batch(&app, 28).await;
+    let games = game_stats(&db, job).await;
+    close(games.sprt.llr, -3.140_060_036_229_865_5);
+    assert_eq!(games.sprt.status, SprtStatus::Failed);
+    assert_eq!(job_status(&db, job).await, "completed");
+
+    let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
+    assert_eq!(body["games"]["sprt"]["status"], json!("failed"), "{body}");
 }
