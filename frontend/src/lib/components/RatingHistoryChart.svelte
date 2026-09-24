@@ -10,63 +10,25 @@
    * series and say so, rather than invent hues nobody can tell apart.
    */
   import type { RatingHistoryPoint } from '$lib/api';
+  import {
+    groupHistory,
+    HEIGHT,
+    historyDomain,
+    PAD,
+    seriesPath,
+    historyX as sx,
+    historyY as sy
+  } from '$lib/charts/ratingHistory';
 
   export let history: RatingHistoryPoint[] = [];
 
-  const SERIES_CAP = 6;
-  // Validated for this surface (dark, #151922) at all-pairs CVD separation.
-  // See scripts/validate_palette.js in the dataviz reference.
-  const PALETTE = ['#027FD1', '#BF2001', '#7902F0', '#03856D', '#E103AE', '#A09100'];
-
-  const PAD = { top: 12, right: 132, bottom: 28, left: 52 };
-  const HEIGHT = 260;
   let width = 720;
 
-  interface Series {
-    id: string;
-    name: string;
-    color: string;
-    points: { t: number; rating: number }[];
-  }
-
-  $: grouped = (() => {
-    const byConfig = new Map<string, RatingHistoryPoint[]>();
-    for (const point of history) {
-      const list = byConfig.get(point.player_config_id) ?? [];
-      list.push(point);
-      byConfig.set(point.player_config_id, list);
-    }
-    // Rank by latest rating so the cap keeps the configs a reader is looking
-    // for, and colour follows the config rather than its rank in this view.
-    const ranked = [...byConfig.entries()].sort(
-      (a, b) => (b[1].at(-1)?.rating ?? 0) - (a[1].at(-1)?.rating ?? 0)
-    );
-    return {
-      series: ranked.slice(0, SERIES_CAP).map(([id, points], i): Series => ({
-        id,
-        name: points[0].name,
-        color: PALETTE[i],
-        points: points.map((p) => ({ t: Date.parse(p.computed_at), rating: p.rating }))
-      })),
-      hidden: Math.max(0, ranked.length - SERIES_CAP)
-    };
-  })();
-
-  $: domain = (() => {
-    const all = grouped.series.flatMap((s) => s.points);
-    if (all.length < 2) return null;
-    const ts = all.map((p) => p.t);
-    const rs = all.map((p) => p.rating);
-    const lo = Math.min(...rs);
-    const hi = Math.max(...rs);
-    const pad = Math.max(5, (hi - lo) * 0.1);
-    return { t0: Math.min(...ts), t1: Math.max(...ts), r0: lo - pad, r1: hi + pad };
-  })();
-
-  const sx = (t: number, d: NonNullable<typeof domain>, w: number) =>
-    PAD.left + (d.t1 === d.t0 ? 0 : ((t - d.t0) / (d.t1 - d.t0)) * (w - PAD.left - PAD.right));
-  const sy = (r: number, d: NonNullable<typeof domain>) =>
-    PAD.top + (1 - (r - d.r0) / (d.r1 - d.r0)) * (HEIGHT - PAD.top - PAD.bottom);
+  // Ranked by latest rating so the cap keeps the configs a reader is looking
+  // for; colour follows the config's identity rather than its rank in this
+  // view (see assignColors).
+  $: grouped = groupHistory(history);
+  $: domain = historyDomain(grouped.series);
 </script>
 
 <div class="w-full" bind:clientWidth={width}>
@@ -91,9 +53,7 @@
 
       {#each grouped.series as series}
         <path
-          d={series.points
-            .map((p, i) => `${i === 0 ? 'M' : 'L'}${sx(p.t, domain, width)},${sy(p.rating, domain)}`)
-            .join(' ')}
+          d={seriesPath(series, domain, width)}
           fill="none"
           stroke={series.color}
           stroke-width="2"
