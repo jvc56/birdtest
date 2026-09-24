@@ -218,13 +218,20 @@ protocol.
 ```bash
 cd backend && cargo test --lib --bins     # unit and contract tests; no services
 cd backend && TEST_DATABASE_URL=postgres://birdtest:birdtest@localhost:5432/birdtest \
-  cargo test                              # plus the integration tests in backend/tests/
-cd frontend && npm run check
+  TEST_S3_ENDPOINT=http://localhost:9000 \
+  cargo nextest run                       # plus the integration and API tests in backend/tests/
+cd frontend && npm run check && npm test
+MAGPIE_ROOT=../MAGPIE e2e/run.sh          # the Playwright journeys, on a stack of their own
+MAGPIE_ROOT=../MAGPIE scripts/e2e_magpie_native.sh   # real `magpie contribute` tasks (tier 6)
 ```
 
 The integration tests clone a template database per test on the server
 `TEST_DATABASE_URL` points at (any database there will do; they never write to
-it), so the compose Postgres is enough. They fail rather than skip without it.
+it), and the object-store tests make a bucket each on the MinIO at
+`TEST_S3_ENDPOINT`, so the compose Postgres and MinIO are enough. They fail
+rather than skip without them. `cargo test` works too; `cargo nextest run` adds
+a ten-minute ceiling per test. [TESTING.md](TESTING.md) has what each tier
+needs, including the opt-in tests that run a real MAGPIE.
 
 ### Frontend hot reload
 
