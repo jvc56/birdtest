@@ -13,9 +13,11 @@ export function workerLabel(worker: {
 
 export function duration(seconds: number | null): string {
   if (seconds === null || !isFinite(seconds)) return '—';
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`;
+  // Each unit is chosen by the value as it will be displayed, after rounding,
+  // so 59.6 s reads "1m" rather than "60s", and 3599 s "1.0h" rather than "60m".
+  if (Math.round(seconds) < 60) return `${Math.round(seconds)}s`;
+  if (Math.round(seconds / 60) < 60) return `${Math.round(seconds / 60)}m`;
+  if (Math.round(seconds / 360) < 240) return `${(seconds / 3600).toFixed(1)}h`;
   return `${(seconds / 86400).toFixed(1)}d`;
 }
 
@@ -24,24 +26,33 @@ export function datetime(value: string | null): string {
   return new Date(value).toLocaleString();
 }
 
-export function jobTypeLabel(type: string): string {
-  return (
-    {
-      opening_rack: 'Opening rack analysis',
-      games: 'Games',
-      game_pairs: 'Game pairs',
-      leave_generation: 'Leave generation'
-    }[type] ?? type
-  );
+/**
+ * Look a key up in a label table, falling back to the key itself. An own-
+ * property check rather than `table[key] ?? key`, which would hand back
+ * `Object.prototype.toString` for the key "toString".
+ */
+function lookup(table: Record<string, string>, key: string): string {
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : key;
 }
 
+const JOB_TYPE_LABELS: Record<string, string> = {
+  opening_rack: 'Opening rack analysis',
+  games: 'Games',
+  game_pairs: 'Game pairs',
+  leave_generation: 'Leave generation'
+};
+
+export function jobTypeLabel(type: string): string {
+  return lookup(JOB_TYPE_LABELS, type);
+}
+
+const SPRT_LABELS: Record<string, string> = {
+  running: 'running',
+  passed: 'passed (H1 accepted)',
+  failed: 'failed (H0 accepted)',
+  terminated_at_max: 'terminated at max games'
+};
+
 export function sprtLabel(status: string): string {
-  return (
-    {
-      running: 'running',
-      passed: 'passed (H1 accepted)',
-      failed: 'failed (H0 accepted)',
-      terminated_at_max: 'terminated at max games'
-    }[status] ?? status
-  );
+  return lookup(SPRT_LABELS, status);
 }
