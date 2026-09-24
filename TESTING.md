@@ -69,8 +69,8 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 151 | `#[cfg(test)]` in `jobs::plausibility` (22), `inputdata` (17), `stats::sprt` (12), `stats::bradley_terry` (12), `jobs::racks` (12), `error` (7), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `magpie` (3), `models::job` (3), `jobs::opening_rack` (3), `version` (3), `email` (2), `sse` (2), `exports`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair` (1 each) |
-| 1F Frontend unit | 92 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (13), `auth.test.ts` (8), `sse.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (10), `pentanomial.test.ts` (6) |
-| 2 Integration | 132 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (22), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (10), `derived.rs` (7), `leave_generation.rs` (7), `exports.rs` (6), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 1F Frontend unit | 93 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (13), `auth.test.ts` (9), `sse.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (10), `pentanomial.test.ts` (6) |
+| 2 Integration | 134 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (22), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (6), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 147 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (25), `worker_routes.rs` (15), `auth_routes.rs` (14), `boundaries.rs` (11), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 457 backend tests.
+--run-ignored all` runs 459 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -107,7 +107,7 @@ incidentally by higher tiers.
 | `version.rs` | 1 | Covered |
 | `compat.rs` | 1 | Covered |
 | `jobs/racks.rs` | 1 | Covered (`U-RACK-*`) |
-| `derived.rs` | 1 + 2 (+ 6) | Covered — naming and the gate at tier 1, the queue at tier 2 (`I-DERIVED-*`); the build itself at tier 6 (`magpie_smoke.rs`, `M-10`). `I-DERIVED-2` is Partial |
+| `derived.rs` | 1 + 2 (+ 6) | Covered — naming and the gate at tier 1, the queue at tier 2 (`I-DERIVED-*`); the build itself at tier 6 (`magpie_smoke.rs`, `M-10`) |
 | `magpie.rs` | 1 (+ 6) | Covered — the `builders` JSON contract and error bounding at tier 1; the subprocess in the opt-in `magpie_smoke.rs` |
 | `jobs/plausibility.rs` | 1 | Covered |
 | `inputdata.rs` (archive walk) | 1 | Covered (`U-ARCHIVE-*`) |
@@ -555,9 +555,8 @@ Test the pure functions; do not snapshot the SVG.
   "not yet known" (`undefined`). Not `null` only on 401, as this entry first
   said: the layout guards wait while the store is `undefined`, so leaving it
   there during an outage would leave every guarded page waiting forever; `null`
-  lets them resolve. *(Covered: `auth.test.ts` — 200, 401, in flight, and a
-  later 401 replacing a user; the 5xx and network cases share the one `catch`
-  but have no case of their own.)*
+  lets them resolve. *(Covered: `auth.test.ts` — 200, 401, a 503 and a
+  network failure, in flight, and a later 401 replacing a user.)*
 - `F-AUTH-2` `signOut` clears the store even if the request fails, so the UI
   cannot be left showing a session that is gone. *(Covered: `auth.test.ts`.)*
 
@@ -862,12 +861,14 @@ job creation touches needs one caller here.
   `jobs::an_allocation_outside_0_to_100_is_refused`; the sum across jobs is
   `A-BOUND-7`.)*
 - `I-JOB-8` `purge_job` deletes tasks and claims, leaves the job row, and lets
-  task generation resume cleanly from the right seed. **Partial.** *(Covered:
+  task generation resume cleanly from the right seed -- the start of its
+  space, which is what PLAN.md specifies. *(Covered:
+  `jobs::a_purged_job_hands_out_its_seed_space_again_from_the_start` — seeds
+  1, 3, 5 before and again after —
   `admin_api::a_job_can_be_purged_and_its_dispatch_counter_resets` — no task,
   no claim, zeroed counters, the job row kept —
   `admin_api::purging_a_job_removes_its_captured_positions_through_the_record`,
-  and `admin_api::a_purged_job_rejoins_at_parity`, which claims from the purged
-  job again. Which seed a resumed job starts from is not asserted.)*
+  and `admin_api::a_purged_job_rejoins_at_parity`.)*
 - `I-JOB-9` `delete_job` cascades to tasks, claims, results and configs, and
   leaves no orphans in any table. *(Covered:
   `jobs::deleting_a_job_leaves_nothing_anywhere_that_points_at_it`,
@@ -1294,10 +1295,10 @@ runs against a real MinIO.
   `wmp` row it is built from. *(Covered:
   `derived::a_shared_lexicon_queues_one_wordmap_and_a_table_queues_its_wordmap_too`.)*
 - `I-DERIVED-2` A leave-generation job queues a wordmap and never a table.
-  **Partial.** *(Exercised only as a precondition: every leave-job fixture in
-  `leave_gen.rs` and `leave_generation.rs` asserts `derived_ready(job) == 1`,
-  one wordmap. No test of its own creates a leave job through the API and
-  asserts the queue.)*
+  *(Covered: `derived::a_leave_job_queues_its_wordmap_and_never_a_table`,
+  including when a player on the same lexicon elsewhere asks for a table; and
+  as a precondition by every leave-job fixture in `leave_gen.rs` and
+  `leave_generation.rs`, which asserts `derived_ready(job) == 1`.)*
 - `I-DERIVED-3` A job with any unbuilt derived file is not dispatched, and the
   same job dispatches once the row says `built`. The single most important test
   here: without it, dispatching early sends a worker no `derived` entry, which

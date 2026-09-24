@@ -521,3 +521,56 @@ async fn two_distributions_with_one_name_size_two_different_rack_spaces() {
     }
     assert_ne!(totals[0], totals[1], "{totals:?}");
 }
+
+/// I-DERIVED-2: a leave-generation job queues the wordmap its lexicon needs
+/// and never a rack info table -- its leaves change every generation, so a
+/// table would be built against values that are gone by the next one --
+/// however the lexicon is used elsewhere: a player on the same lexicon that
+/// asks for a table queues one for its own job, not for the leave job.
+#[tokio::test]
+async fn a_leave_job_queues_its_wordmap_and_never_a_table() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let leave = db.bare_job("leave_generation", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_leave_config (job_id, kwg_id, num_iterations, target_rack_count, racks_per_task)
+         VALUES ($1, $2, 10, 10, 2)",
+    )
+    .bind(leave)
+    .bind(kwg)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let mut conn = db.pool.acquire().await.unwrap();
+    let needs = birdtest::derived::needs_for_job(&mut conn, leave).await.unwrap();
+    drop(conn);
+    let needs: Vec<(String, String, Uuid, Option<Uuid>)> =
+        needs.into_iter().map(|n| (n.role, n.name, n.kwg_id, n.klv_id)).collect();
+    assert_eq!(needs, vec![("wmp".into(), "NWL23".into(), kwg, None)]);
+    assert_eq!(request_for(&db, leave).await, 1);
+
+    // A games job on the same lexicon whose player wants a table: that job
+    // queues the table, and the leave job still needs only its wordmap.
+    let (ld, layout): (Uuid, Uuid) =
+        sqlx::query_as("SELECT letterdist_id, layout_id FROM jobs WHERE id = $1")
+            .bind(leave)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    let table = player(&db, kwg, klv, false, true).await;
+    let plain = player(&db, kwg, klv, false, false).await;
+    let games = games_job_on(&db, ld, layout, table, plain).await;
+    assert_eq!(request_for(&db, games).await, 1, "the table; the wordmap is already queued");
+    assert_eq!(request_for(&db, leave).await, 0);
+    let mut conn = db.pool.acquire().await.unwrap();
+    let roles: Vec<String> = birdtest::derived::needs_for_job(&mut conn, leave)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|n| n.role)
+        .collect();
+    assert_eq!(roles, ["wmp"]);
+}

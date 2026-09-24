@@ -936,3 +936,53 @@ async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
         admin.call("DELETE", &format!("/api/admin/player-configs/{}", configs[0]), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
+
+/// The seed an anonymous claim was handed, or `None` for a 204.
+async fn claimed_seed(app: &Router) -> Option<String> {
+    let (status, body) = send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    match status {
+        StatusCode::OK => Some(body["task_request"]["seed"].as_str().unwrap().to_string()),
+        StatusCode::NO_CONTENT => None,
+        other => panic!("claim answered {other}: {body}"),
+    }
+}
+
+/// I-JOB-8: a purge deletes the job's tasks and claims, keeps the job row and
+/// its configuration, and task generation starts its space over -- the next
+/// claims get seeds 1, 1 + batch, ... again, not a continuation past the
+/// deleted tasks (which would leave the start of the space never played) and
+/// not a collision with them.
+#[tokio::test]
+async fn a_purged_job_hands_out_its_seed_space_again_from_the_start() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let admin = Admin::new(&db, db.state().await).await;
+
+    let mut before = Vec::new();
+    for _ in 0..3 {
+        before.push(claimed_seed(&admin.app).await.expect("a task"));
+    }
+    assert_eq!(before, ["1", "3", "5"]);
+    assert_eq!(task_count(&db, job).await, 3);
+
+    let (status, body) = admin.post(&format!("/api/admin/jobs/{job}/purge"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tasks_reset"], 3, "{body}");
+    assert_eq!(task_count(&db, job).await, 0);
+    let claims: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM task_claims c JOIN tasks t ON t.id = c.task_id WHERE t.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(claims, 0);
+    let (status, row) = admin.call("GET", &format!("/api/jobs/{job}"), None).await;
+    assert_eq!(status, StatusCode::OK, "the job row survives: {row}");
+
+    let mut after = Vec::new();
+    for _ in 0..3 {
+        after.push(claimed_seed(&admin.app).await.expect("a task"));
+    }
+    assert_eq!(after, before, "the space is handed out again from its start");
+}

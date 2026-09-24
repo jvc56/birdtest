@@ -62,6 +62,22 @@ describe('F-AUTH-1 refreshSession', () => {
     expect(get(session)).not.toBeUndefined();
   });
 
+  // Deliberate: any failure resolves the store to null, not only a 401. Left
+  // undefined, the layout guards that wait on "not yet known" would wait for
+  // ever during an outage; null sends a signed-in user to the login page
+  // instead, which is the recoverable failure of the two.
+  it('resolves to null on a server error and on a network failure, never staying unknown', async () => {
+    const { session, refreshSession } = await freshAuth();
+    fetchMock.mockResolvedValueOnce(json(503, { code: 'unavailable', message: 'busy' }));
+    await expect(refreshSession()).resolves.toBeNull();
+    expect(get(session)).toBeNull();
+
+    const again = await freshAuth();
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await expect(again.refreshSession()).resolves.toBeNull();
+    expect(get(again.session)).toBeNull();
+  });
+
   it('stays undefined while the request is in flight', async () => {
     const { session, refreshSession } = await freshAuth();
     let answer!: (response: Response) => void;
