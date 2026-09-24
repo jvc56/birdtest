@@ -297,6 +297,7 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
     // path).
     let mut links: Vec<(String, String, String, String, String)> = Vec::new();
     let mut total_uncompressed: u64 = 0;
+    let mut entry_count: usize = 0;
 
     let entries = archive
         .entries()
@@ -306,7 +307,10 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         let mut entry =
             entry.map_err(|e| AppError::bad_request(format!("malformed tar entry: {e}")))?;
 
-        if files.len() >= limits::ENTRIES {
+        // Every entry, not every pinned file: directories, symlinks and
+        // unrecognised paths are what a hostile archive would multiply.
+        entry_count += 1;
+        if entry_count > limits::ENTRIES {
             return Err(AppError::bad_request(format!(
                 "archive has more than {} entries",
                 limits::ENTRIES
@@ -988,5 +992,157 @@ mod tests {
         let archive = tarball(&[("data/lexica/BOMB.kwg", payload.as_slice())]);
         let err = walk_archive(&archive, None).unwrap_err();
         assert!(err.message.contains("expands"), "{}", err.message);
+    }
+
+    /// Gzips a raw tar stream built by the caller, header by header.
+    fn gzip(tar: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A header of the given type, path and claimed size, checksummed.
+    fn header(path: &str, entry_type: tar::EntryType, size: u64) -> tar::Header {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_entry_type(entry_type);
+        header.set_cksum();
+        header
+    }
+
+    /// PLAN.md, "Limits, all enforced during the walk": single entry 128 MiB.
+    /// Judged from the header, before a byte of the entry is read: the archive
+    /// here is a header claiming one byte over the cap and *no data at all*,
+    /// so a walk that read first would fail on the truncation instead.
+    #[test]
+    fn an_entry_whose_header_claims_more_than_the_per_entry_cap_is_refused_unread() {
+        let claimed = limits::ENTRY_BYTES + 1;
+        let archive = gzip(header("data/lexica/HUGE.kwg", tar::EntryType::Regular, claimed).as_bytes());
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(err.message.contains("per-entry cap"), "{}", err.message);
+        assert!(err.message.contains("data/lexica/HUGE.kwg"), "{}", err.message);
+
+        // Exactly at the cap is not refused by that rule: the same truncated
+        // archive then fails on the missing bytes, which is what proves the
+        // refusal above came before the read.
+        let archive = gzip(
+            header("data/lexica/HUGE.kwg", tar::EntryType::Regular, limits::ENTRY_BYTES).as_bytes(),
+        );
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(!err.message.contains("per-entry cap"), "{}", err.message);
+    }
+
+    /// PLAN.md's allowlist: regular files only (plus aliases resolved inside
+    /// the archive). A hard link, a character or block device and a FIFO are
+    /// each refused rather than skipped, even at a path birdtest ignores.
+    #[test]
+    fn hard_link_and_device_entries_are_refused() {
+        for (entry_type, path) in [
+            (tar::EntryType::Link, "data/lexica/NWL23.kwg"),
+            (tar::EntryType::Link, "data/quackle/linked.dat"),
+            (tar::EntryType::Char, "data/lexica/tty.kwg"),
+            (tar::EntryType::Block, "data/quackle/sda"),
+            (tar::EntryType::Fifo, "data/layouts/pipe.txt"),
+        ] {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut regular = header("data/lexica/REAL.kwg", tar::EntryType::Regular, 3);
+            builder.append_data(&mut regular, "data/lexica/REAL.kwg", b"kwg" as &[u8]).unwrap();
+            let mut odd = header(path, entry_type, 0);
+            if entry_type == tar::EntryType::Link {
+                odd.set_link_name("data/lexica/REAL.kwg").unwrap();
+                odd.set_cksum();
+            }
+            builder.append(&odd, std::io::empty()).unwrap();
+            let archive = gzip(&builder.into_inner().unwrap());
+
+            let err = walk_archive(&archive, None).unwrap_err();
+            assert!(
+                err.message.contains(&format!("non-regular entry ({entry_type:?})")),
+                "{entry_type:?} at {path}: {}",
+                err.message
+            );
+        }
+    }
+
+    /// PLAN.md: total uncompressed bytes 1 GiB. Every entry's size counts,
+    /// pinned or not, and the cap holds where the ratio does not catch it --
+    /// here nine unpinned entries of zeros total 1 GiB and a byte, and the
+    /// compressed input is padded past 1/20th of that (trailing bytes after
+    /// the gzip member, which the decoder never reads), so only the total can
+    /// refuse it.
+    #[test]
+    fn an_archive_expanding_past_the_total_cap_is_refused() {
+        let entry = limits::ENTRY_BYTES;
+        let entries = limits::UNCOMPRESSED_BYTES / entry;
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let zeros = vec![0u8; 1024 * 1024];
+        for i in 0..entries {
+            let head = header(&format!("data/quackle/part{i}.dat"), tar::EntryType::Regular, entry);
+            std::io::Write::write_all(&mut encoder, head.as_bytes()).unwrap();
+            for _ in 0..entry / zeros.len() as u64 {
+                std::io::Write::write_all(&mut encoder, &zeros).unwrap();
+            }
+        }
+        // One byte more, at a path birdtest pins.
+        let last = header("data/lexica/LAST.kwg", tar::EntryType::Regular, 1);
+        std::io::Write::write_all(&mut encoder, last.as_bytes()).unwrap();
+        std::io::Write::write_all(&mut encoder, &[b'x'; 512]).unwrap();
+        std::io::Write::write_all(&mut encoder, &[0u8; 1024]).unwrap();
+        let mut archive = encoder.finish().unwrap();
+        let ratio_floor = (limits::UNCOMPRESSED_BYTES + 1) / limits::EXPANSION_RATIO + 1;
+        archive.resize(ratio_floor as usize, 0);
+
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(err.message.contains("GiB cap"), "{}", err.message);
+    }
+
+    /// PLAN.md: entry count 5,000 -- entries, not pinned files. Directories,
+    /// symlinks and files at paths birdtest ignores are all entries a hostile
+    /// archive could multiply, and they once went uncounted: the check read
+    /// the number of pinned files, so any number of the rest walked through.
+    #[test]
+    fn an_archive_of_more_than_the_entry_cap_is_refused_whatever_the_entries_are() {
+        fn archive_of(unpinned: usize) -> Vec<u8> {
+            let mut builder = tar::Builder::new(Vec::new());
+            for i in 0..unpinned {
+                let (path, entry_type) = match i % 3 {
+                    0 => (format!("data/quackle/d{i}/"), tar::EntryType::Directory),
+                    1 => (format!("data/quackle/f{i}.dat"), tar::EntryType::Regular),
+                    _ => (format!("data/quackle/l{i}.dat"), tar::EntryType::Symlink),
+                };
+                let mut head = header(&path, entry_type, 0);
+                if entry_type == tar::EntryType::Symlink {
+                    head.set_link_name("f1.dat").unwrap();
+                    head.set_cksum();
+                }
+                builder.append(&head, std::io::empty()).unwrap();
+            }
+            let mut pinned = header("data/lexica/NWL23.kwg", tar::EntryType::Regular, 3);
+            builder.append_data(&mut pinned, "data/lexica/NWL23.kwg", b"kwg" as &[u8]).unwrap();
+            gzip(&builder.into_inner().unwrap())
+        }
+
+        // 5,000 entries, one of them pinned: at the cap, accepted.
+        let files = walk_archive(&archive_of(limits::ENTRIES - 1), None).unwrap();
+        assert_eq!(files.len(), 1);
+
+        // 5,001: refused, although only one of them is a pinned file.
+        let err = walk_archive(&archive_of(limits::ENTRIES), None).unwrap_err();
+        assert!(err.message.contains("more than 5000 entries"), "{}", err.message);
+    }
+
+    /// The limits are PLAN.md's table; a change to one is a design change.
+    #[test]
+    fn the_walk_limits_are_the_ones_the_design_states() {
+        assert_eq!(limits::COMPRESSED_BYTES, 512 * 1024 * 1024);
+        assert_eq!(limits::CHUNKS, 64);
+        assert_eq!(limits::UNCOMPRESSED_BYTES, 1024 * 1024 * 1024);
+        assert_eq!(limits::EXPANSION_RATIO, 20);
+        assert_eq!(limits::ENTRY_BYTES, 128 * 1024 * 1024);
+        assert_eq!(limits::ENTRIES, 5_000);
     }
 }
