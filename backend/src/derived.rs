@@ -417,6 +417,26 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
     .await?;
     let Some(row) = row else {
         tx.rollback().await?;
+        // Rows for a builder this binary lacks are skipped above rather than
+        // failed, so without this they would sit pending with nothing in any
+        // log. Said once per drain, when there is nothing else to do.
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM derived_data
+             WHERE state = 'pending'
+               AND builder <> CASE role WHEN 'wmp' THEN $1 WHEN 'rit' THEN $2 END",
+        )
+        .bind(builders.wmp())
+        .bind(builders.rit())
+        .fetch_one(pool)
+        .await?;
+        if waiting > 0 {
+            tracing::warn!(
+                waiting,
+                wmp = %builders.wmp(),
+                rit = %builders.rit(),
+                "derived files are queued for a builder this MAGPIE does not have"
+            );
+        }
         return Ok(None);
     };
     let lease = Lease {

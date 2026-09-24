@@ -133,13 +133,22 @@ snapshot_out="${SNAPSHOT_SESSION[0]}"
 # its answer into the variable named $1. Not a command substitution: that
 # would run in a subshell, which does not share the coprocess's pipes.
 snapshot_val() {
+  # Checked before writing: a write into a session that has gone would raise
+  # SIGPIPE, which kills this shell before the EXIT trap can record the
+  # failure in `backups`.
+  if ! kill -0 "${snapshot_pid}" 2>/dev/null; then
+    log "the snapshot session is gone"
+    return 1
+  fi
   printf '%s;\n' "$2" >&"${snapshot_in}"
   if ! IFS= read -r "$1" <&"${snapshot_out}"; then
     log "the snapshot session ended unexpectedly"
     return 1
   fi
-  # psql reports an error on the same pipe and then exits.
-  if [[ "${!1}" == *ERROR:* || "${!1}" == psql:* ]]; then
+  # psql reports an error on the same pipe and then exits -- FATAL when the
+  # server ended the session, say an idle-in-transaction timeout during a
+  # long dump.
+  if [[ "${!1}" == *ERROR:* || "${!1}" == *FATAL:* || "${!1}" == psql:* ]]; then
     log "snapshot session: ${!1}"
     return 1
   fi
