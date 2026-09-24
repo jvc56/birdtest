@@ -32,7 +32,9 @@ async fn leave_job(
     generation_count: i32,
     num_iterations: i32,
 ) -> (Uuid, i64) {
-    let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
+    let admin = db
+        .user(&format!("admin{}", Uuid::new_v4().simple()), true)
+        .await;
     let job = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
     sqlx::query(
@@ -59,7 +61,11 @@ async fn leave_job(
     .execute(&db.pool)
     .await
     .unwrap();
-    assert_eq!(db.derived_ready(job).await, 1, "a leave job needs one wordmap");
+    assert_eq!(
+        db.derived_ready(job).await,
+        1,
+        "a leave job needs one wordmap"
+    );
     let seeded = seed(db, job, 1).await;
     (job, seeded)
 }
@@ -68,7 +74,9 @@ async fn leave_job(
 async fn seed(db: &TestDb, job: Uuid, generation: i32) -> i64 {
     let mut conn = db.pool.acquire().await.unwrap();
     let data = birdtest::jobs::load_job_data(&mut conn, job).await.unwrap();
-    leave_gen::seed_generation(&mut conn, job, generation, &data.letterdist).await.unwrap()
+    leave_gen::seed_generation(&mut conn, job, generation, &data.letterdist)
+        .await
+        .unwrap()
 }
 
 async fn config(db: &TestDb, job: Uuid) -> LeaveConfig {
@@ -106,7 +114,11 @@ fn forced_racks(assignment: &serde_json::Value) -> Vec<String> {
 
 /// One claim through the worker API: the status and the body.
 async fn claim(app: &axum::Router) -> (StatusCode, serde_json::Value) {
-    send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await
+    send(
+        app,
+        post_json("/api/worker/task", &[], claim_body("1.0.0", &[])),
+    )
+    .await
 }
 
 async fn claim_one(app: &axum::Router) -> serde_json::Value {
@@ -136,7 +148,11 @@ async fn submit(app: &axum::Router, assignment: &serde_json::Value, racks: &[(&s
 /// What `next_step` decided.
 #[derive(Debug, PartialEq)]
 enum Step {
-    Dispatch { generation: i32, racks: Vec<String>, previous_artifact_key: String },
+    Dispatch {
+        generation: i32,
+        racks: Vec<String>,
+        previous_artifact_key: String,
+    },
     Transition(i32),
     InProgress(i32),
     NeedsMerge(i32),
@@ -149,13 +165,16 @@ enum Step {
 /// transaction that commits -- but without inserting a task for a dispatch.
 async fn try_next_step(db: &TestDb, job: Uuid) -> birdtest::error::AppResult<Step> {
     let mut tx = db.pool.begin().await.unwrap();
-    let config = sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
-        .bind(job)
-        .fetch_one(&mut *tx)
+    let config =
+        sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
+            .bind(job)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    let job_data = birdtest::jobs::load_job_data(&mut tx, job).await.unwrap();
+    let lexicon = leave_gen::lexicon_name(&mut tx, config.kwg_id)
         .await
         .unwrap();
-    let job_data = birdtest::jobs::load_job_data(&mut tx, job).await.unwrap();
-    let lexicon = leave_gen::lexicon_name(&mut tx, config.kwg_id).await.unwrap();
     assert!(leave_gen::lock_claim_decisions(&mut tx, job).await.unwrap());
     let step = match leave_gen::next_step(&mut tx, job, &config, &job_data, &lexicon).await? {
         LeaveGenStep::Dispatch(request) => Step::Dispatch {
@@ -284,7 +303,16 @@ async fn selection_hands_out_the_racks_furthest_below_target_first() {
     let (job, _) = leave_job(&db, 2, 1000, 2, 100).await;
     let order = racks_in_order(&db, job, 1).await;
     set_all_counts(&db, job, 1, 1000).await;
-    let scattered = [(100, 5), (40, 10), (140, 20), (20, 500), (50, 500), (80, 500), (120, 500), (7, 999)];
+    let scattered = [
+        (100, 5),
+        (40, 10),
+        (140, 20),
+        (20, 500),
+        (50, 500),
+        (80, 500),
+        (120, 500),
+        (7, 999),
+    ];
     for (i, count) in scattered {
         set_count(&db, job, 1, &order[i], count).await;
     }
@@ -356,7 +384,9 @@ async fn nothing_is_handed_out_once_every_rack_is_at_target() {
     // counts, so the claim asks for a merge rather than closing the generation.
     submit(&app, &out, &[(short, 1)]).await;
     assert_eq!(next_step(&db, job).await, Step::NeedsMerge(1));
-    leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap();
+    leave_gen::merge_staged(&db.pool, job, 1, true)
+        .await
+        .unwrap();
     assert_eq!(count_of(&db, job, 1, short).await, 1000);
 
     // Every rack at target, nothing in flight, nothing staged: nothing is
@@ -383,9 +413,14 @@ async fn every_dispatched_generation_carries_its_predecessors_klv() {
 
     let first = claim_one(&app).await;
     assert_eq!(first["task_request"]["generation"], json!(1));
-    assert_eq!(first["task_request"]["previous_artifact_key"], json!(GEN0_KEY));
+    assert_eq!(
+        first["task_request"]["previous_artifact_key"],
+        json!(GEN0_KEY)
+    );
     submit(&app, &first, &[(&forced_racks(&first)[0], 3)]).await;
-    leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap();
+    leave_gen::merge_staged(&db.pool, job, 1, true)
+        .await
+        .unwrap();
 
     // Generation 1 closes; generation 2's tasks name its KLV.
     set_all_counts(&db, job, 1, 1000).await;
@@ -424,8 +459,14 @@ async fn every_dispatched_generation_carries_its_predecessors_klv() {
         .execute(&db.pool)
         .await
         .unwrap();
-    let err = try_next_step(&db, job).await.expect_err("dispatched with no generation-0 KLV");
-    assert!(err.message.contains("no generation-0 KLV"), "{}", err.message);
+    let err = try_next_step(&db, job)
+        .await
+        .expect_err("dispatched with no generation-0 KLV");
+    assert!(
+        err.message.contains("no generation-0 KLV"),
+        "{}",
+        err.message
+    );
     let (status, body) = claim(&birdtest::app(db.state().await)).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE job_id = $1")
@@ -447,7 +488,9 @@ async fn a_two_generation_job_advances_and_finishes_after_its_last() {
     let app = birdtest::app(db.state().await);
     let current = || async {
         let mut conn = db.pool.acquire().await.unwrap();
-        leave_gen::current_generation(&mut conn, job, &config(&db, job).await).await.unwrap()
+        leave_gen::current_generation(&mut conn, job, &config(&db, job).await)
+            .await
+            .unwrap()
     };
     assert_eq!(current().await, Some(1));
 
@@ -455,7 +498,11 @@ async fn a_two_generation_job_advances_and_finishes_after_its_last() {
     assert_eq!(next_step(&db, job).await, Step::Transition(1));
     close(&db, job, 1, &"1".repeat(64)).await;
     assert_eq!(current().await, Some(2), "generation 2 is open");
-    assert_eq!(job_status(&db, job).await, "active", "one generation of two is not the job");
+    assert_eq!(
+        job_status(&db, job).await,
+        "active",
+        "one generation of two is not the job"
+    );
 
     // Generation 2's universe is seeded by the first claim to find it missing,
     // and then its tasks flow.
@@ -470,22 +517,35 @@ async fn a_two_generation_job_advances_and_finishes_after_its_last() {
         .await
         .unwrap()
     };
-    assert!(wait_for(|| async { universe().await == seeded }).await, "generation 2 was seeded");
+    assert!(
+        wait_for(|| async { universe().await == seeded }).await,
+        "generation 2 was seeded"
+    );
     let task = claim_one(&app).await;
     assert_eq!(task["task_request"]["generation"], json!(2));
     let racks = forced_racks(&task);
     submit(&app, &task, &[(&racks[0], 1000), (&racks[1], 1000)]).await;
-    leave_gen::merge_staged(&db.pool, job, 2, true).await.unwrap();
+    leave_gen::merge_staged(&db.pool, job, 2, true)
+        .await
+        .unwrap();
 
     set_all_counts(&db, job, 2, 1000).await;
     assert_eq!(next_step(&db, job).await, Step::Transition(2));
     close(&db, job, 2, &"2".repeat(64)).await;
-    assert_eq!(job_status(&db, job).await, "completed", "the last generation completes the job");
+    assert_eq!(
+        job_status(&db, job).await,
+        "completed",
+        "the last generation completes the job"
+    );
     assert_eq!(current().await, None);
     assert_eq!(next_step(&db, job).await, Step::Finished);
 
     let (status, body) = claim(&app).await;
-    assert_eq!(status, StatusCode::NO_CONTENT, "a finished job hands out nothing: {body}");
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "a finished job hands out nothing: {body}"
+    );
     let generations: Vec<i32> = sqlx::query_scalar(
         "SELECT generation FROM leave_generation_artifacts WHERE job_id = $1 ORDER BY 1",
     )
@@ -493,7 +553,11 @@ async fn a_two_generation_job_advances_and_finishes_after_its_last() {
     .fetch_all(&db.pool)
     .await
     .unwrap();
-    assert_eq!(generations, vec![0, 1, 2], "no third generation was started");
+    assert_eq!(
+        generations,
+        vec![0, 1, 2],
+        "no third generation was started"
+    );
 }
 
 /// Every key anywhere in `value`, and every number or string it holds, for
@@ -530,9 +594,18 @@ async fn the_rack_target_is_not_sent_to_the_worker() {
     assert_eq!(
         fields,
         vec![
-            "bingo_bonus", "board_layout", "forced_racks", "generation", "job_type",
-            "letter_distribution", "lexicon", "num_games", "previous_artifact_key", "seed",
-            "use_wordmap", "variant",
+            "bingo_bonus",
+            "board_layout",
+            "forced_racks",
+            "generation",
+            "job_type",
+            "letter_distribution",
+            "lexicon",
+            "num_games",
+            "previous_artifact_key",
+            "seed",
+            "use_wordmap",
+            "variant",
         ],
         "a leave task's request is exactly these fields"
     );
@@ -543,11 +616,15 @@ async fn the_rack_target_is_not_sent_to_the_worker() {
     // `build_target` is the CPU target a derived file was built for, which
     // every assignment with a wordmap carries; nothing else may say "target".
     assert!(
-        !keys.iter().any(|key| key.contains("target") && key != "build_target"),
+        !keys
+            .iter()
+            .any(|key| key.contains("target") && key != "build_target"),
         "the assignment names a target: {keys:?}"
     );
     assert!(
-        !leaves.iter().any(|v| *v == json!(7919) || *v == json!("7919")),
+        !leaves
+            .iter()
+            .any(|v| *v == json!(7919) || *v == json!("7919")),
         "the rack target reached the worker: {assignment}"
     );
 
@@ -558,7 +635,10 @@ async fn the_rack_target_is_not_sent_to_the_worker() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    assert_eq!(stored, 37, "the stored request, reissued as it stands, says the same");
+    assert_eq!(
+        stored, 37,
+        "the stored request, reissued as it stands, says the same"
+    );
 }
 
 /// I-LEAVE-5: the artifact row keeps the **first** digest written for a
@@ -603,7 +683,11 @@ async fn a_generations_first_digest_is_the_one_kept() {
     .fetch_all(&db.pool)
     .await
     .unwrap();
-    assert_eq!(rows, vec![(first, "klv-1".to_string())], "the first digest and builder stand");
+    assert_eq!(
+        rows,
+        vec![(first, "klv-1".to_string())],
+        "the first digest and builder stand"
+    );
 }
 
 /// A letter distribution row named `name` with exactly `content`.
@@ -633,7 +717,9 @@ async fn seeding_reads_the_jobs_pinned_distribution_not_its_name() {
     let (job_a, _) = leave_job(&db, 2, 1000, 2, 100).await;
     let (job_b, _) = leave_job(&db, 2, 1000, 2, 100).await;
     // One more A: the same name, a larger bag.
-    let text = std::str::from_utf8(TESTDIST).unwrap().replacen("A,a,3,", "A,a,4,", 1);
+    let text = std::str::from_utf8(TESTDIST)
+        .unwrap()
+        .replacen("A,a,3,", "A,a,4,", 1);
     assert_ne!(text.as_bytes(), TESTDIST);
     let (ld_a, ld_b) = (
         letterdist(&db, "english", TESTDIST).await,
@@ -662,7 +748,10 @@ async fn seeding_reads_the_jobs_pinned_distribution_not_its_name() {
         racks.sort();
         racks
     };
-    let (mut a, mut b) = (racks_in_order(&db, job_a, 1).await, racks_in_order(&db, job_b, 1).await);
+    let (mut a, mut b) = (
+        racks_in_order(&db, job_a, 1).await,
+        racks_in_order(&db, job_b, 1).await,
+    );
     a.sort();
     b.sort();
     assert_eq!(a, expected(TESTDIST));
