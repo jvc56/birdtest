@@ -85,7 +85,9 @@ services:
       - "0"
       - --p1-win-rate
       - "0.6"
+      # The per-identity limit is a request a second; polling faster only
+      # collects 429s.
       - --idle-wait
-      - "0.5"
+      - "1"
       - --seed
       - e2e

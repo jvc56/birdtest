@@ -57,8 +57,13 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await expect(header.getByRole('heading', { name: 'Game pairs' })).toBeVisible();
   await expect(header.getByText('inactive', { exact: true })).toBeVisible();
 
+  // Activating refetches the job once, after the action; wait that out.
+  const isJobFetch = (url: string, method: string) =>
+    method === 'GET' && new URL(url).pathname === `/api/jobs/${jobId}`;
+  const refetched = page.waitForResponse((r) => isJobFetch(r.url(), r.request().method()));
   await page.getByLabel('Allocation %').fill('20');
   await page.getByRole('button', { name: 'Activate', exact: true }).click();
+  await refetched;
   await expect(page.getByText('Job activated.')).toBeVisible();
   await expect(header.getByText('active', { exact: true })).toBeVisible();
 
@@ -67,9 +72,7 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   // numbers moving while none happens is the stream at work.
   const refetches: string[] = [];
   page.on('request', (req) => {
-    if (req.method() === 'GET' && new URL(req.url()).pathname === `/api/jobs/${jobId}`) {
-      refetches.push(req.url());
-    }
+    if (isJobFetch(req.url(), req.method())) refetches.push(req.url());
   });
 
   const first = await pairsCompleted(page);
