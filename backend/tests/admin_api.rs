@@ -1579,3 +1579,41 @@ async fn a_locked_identity_row_does_not_hold_up_its_requests() {
     assert_eq!(heartbeat.0, StatusCode::NO_CONTENT, "{}", heartbeat.1);
     holder.rollback().await.unwrap();
 }
+
+/// A-ADMIN-18: a deleted account's tombstone address cannot be squatted. It
+/// was `<id>@deleted.invalid`, and ids are public: anyone who registered that
+/// address first made the account impossible to delete (the address is
+/// unique). And the bans in force are listed with the id lifting one takes.
+#[tokio::test]
+async fn a_deleted_accounts_tombstone_cannot_be_squatted_and_bans_are_listed() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let target = db.user("target", false).await;
+    sqlx::query(
+        "INSERT INTO users (username, email, password_hash) VALUES ('squatter', $1, 'x')",
+    )
+    .bind(format!("{target}@deleted.invalid"))
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+
+    let (status, body) =
+        send(&app, request("DELETE", &format!("/api/admin/users/{target}"), &headers)).await;
+    assert!(status.is_success(), "{body}");
+
+    let borrowed: Vec<(&str, &str)> =
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, ban) = send(
+        &app,
+        post_json("/api/admin/workers/ban", &borrowed, json!({ "user_id": admin, "reason": "test" })),
+    )
+    .await;
+    assert!(status.is_success(), "{ban}");
+    let (status, bans) = send(&app, get_request("/api/admin/workers/bans", &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{bans}");
+    assert_eq!(bans[0]["id"], ban["id"], "{bans}");
+    assert_eq!(bans[0]["username"], "root", "{bans}");
+}

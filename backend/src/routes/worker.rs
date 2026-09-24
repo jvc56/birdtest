@@ -481,6 +481,8 @@ async fn submit_result(
     identity.require_registered()?;
 
     refuse_if_claims_held(&state, body.claim_token).await?;
+    // Held until the handler returns, after the commit.
+    let _turn = crate::jobs::registry::large_result_turn(body.result.get().len()).await?;
     let mut tx = state.pool.begin().await?;
 
     // The claim is looked up and locked inside the transaction that completes

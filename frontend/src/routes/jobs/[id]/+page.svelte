@@ -3,6 +3,7 @@
   import { page } from '$app/stores';
   import { api, type JobStats } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
+  import { session } from '$lib/auth';
   import { duration, datetime, jobTypeLabel, sprtLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
@@ -56,6 +57,11 @@
       <span class="text-sm text-muted-foreground">
         {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}
       </span>
+      <!-- The admin page (activate, purge, export, artifacts) was reachable
+           only by the redirect after creating the job. -->
+      {#if $session?.is_admin}
+        <a href="/admin/jobs/{stats.job.id}" class="btn-secondary ml-auto no-underline">Manage</a>
+      {/if}
     </header>
 
     <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">

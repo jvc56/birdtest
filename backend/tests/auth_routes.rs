@@ -373,6 +373,19 @@ async fn an_expired_unconfirmed_account_gives_up_its_address_and_username() {
     assert_eq!(name.status, StatusCode::CREATED, "{name:?}");
 }
 
+/// A-AUTH-4c: a username is taken whatever its case -- "Josh" and "josh" side
+/// by side on a public list is an impersonation.
+#[tokio::test]
+async fn a_username_is_taken_whatever_its_case() {
+    let db = TestDb::new().await;
+    let (state, _outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+    let first = register(&app, "Josh", "josh@example.invalid", PASSWORD, "").await;
+    assert_eq!(first.status, StatusCode::CREATED, "{first:?}");
+    let second = register(&app, "josh", "other@example.invalid", PASSWORD, "").await;
+    assert_eq!(second.status, StatusCode::CONFLICT, "{second:?}");
+}
+
 /// A-AUTH-5: a weak password is refused, and so is one derived from the
 /// username or the email address -- each of which would score as strong
 /// without them as context, so it is the context that refuses it.

@@ -344,6 +344,16 @@ export interface DerivedData {
 }
 
 /** Per generation, what rebuilding a leave job's KLV from the database found. */
+/** A ban in force; `id` is what lifting it takes. */
+export interface WorkerBan {
+  id: string;
+  user_id: string | null;
+  username: string | null;
+  anon_uuid: string | null;
+  reason: string | null;
+  created_at: string;
+}
+
 /** A completed job's results as one gzipped NDJSON object; see PLAN.md, "Exports". */
 export interface JobExport {
   id: string;
@@ -509,6 +519,7 @@ export const api = {
   banWorker: (body: { user_id?: string; anon_uuid?: string; reason?: string }) =>
     post<{ id: string }>('/api/admin/workers/ban', body),
   unbanWorker: (id: string) => del<void>(`/api/admin/workers/ban/${id}`),
+  workerBans: () => get<WorkerBan[]>('/api/admin/workers/bans'),
   auditLog: (params: Record<string, string | number> = {}) =>
     get<Page<Record<string, unknown>>>(
       `/api/admin/audit-log?${new URLSearchParams(

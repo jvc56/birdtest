@@ -10,7 +10,11 @@
 
   async function load(next: number) {
     page = next;
-    result = await api.users(next);
+    try {
+      result = await api.users(next);
+    } catch (e) {
+      error = `Could not load the accounts: ${e instanceof Error ? e.message : String(e)}`;
+    }
   }
   onMount(() => load(0));
 
@@ -18,7 +22,7 @@
     error = '';
     if (
       !confirm(
-        `Delete ${user.username}? Their claims and results are removed and task counters are rolled back.`
+        `Delete ${user.username}? The account is anonymized and signed out everywhere, and its API keys stop working. Its results stay, under the tombstone name; to discard them, ban the worker or purge the jobs.`
       )
     )
       return;
@@ -33,13 +37,18 @@
 
 <h1 class="mb-2 text-2xl font-semibold">User accounts</h1>
 <p class="mb-4 text-sm text-muted-foreground">
-  Contribution stats are shown publicly at <a href="/users">/users</a>. Deleting an account rolls
-  back its task counters at the application layer, so tasks it held can be claimed again.
+  Contribution stats are shown publicly at <a href="/users">/users</a>. Deleting an account
+  anonymizes it — its name, address, password and keys go, and every session ends — but keeps
+  its claims and results, so no donated work is lost. Its open claims lapse by timeout. It does not
+  take results out of SPRT or ratings: banning the worker stops further work, and purging a job
+  discards what it holds.
 </p>
 {#if error}<p class="mb-4 text-destructive">{error}</p>{/if}
 
-{#if !result}
+{#if !result && !error}
   <p class="text-muted-foreground">Loading…</p>
+{:else if !result}
+  <p class="text-muted-foreground">Nothing to show.</p>
 {:else}
   <div class="card overflow-x-auto p-0">
     <table class="table">

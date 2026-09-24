@@ -11,7 +11,12 @@
   let error = '';
 
   async function load() {
-    keys = await api.apiKeys();
+    try {
+      keys = await api.apiKeys();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      return;
+    }
   }
   onMount(load);
 
@@ -29,7 +34,12 @@
   }
 
   async function toggle(key: ApiKey) {
-    await api.setApiKeyActive(key.id, !key.is_active);
+    error = '';
+    try {
+      await api.setApiKeyActive(key.id, !key.is_active);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
     await load();
   }
 
@@ -49,7 +59,12 @@
   async function revoke(key: ApiKey) {
     if (!confirm('Permanently revoke this key? Workers using it will stop being authenticated.'))
       return;
-    await api.revokeApiKey(key.id);
+    error = '';
+    try {
+      await api.revokeApiKey(key.id);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
     await load();
   }
 </script>

@@ -208,6 +208,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("DELETE", "/api/admin/jobs/:id", Admin, ""),
     ("DELETE", "/api/admin/users/:id", Admin, ""),
     ("GET", "/api/admin/workers", Admin, ""),
+    ("GET", "/api/admin/workers/bans", Admin, ""),
     ("POST", "/api/admin/workers/ban", Admin, r#"{"user_id":"00000000-0000-4000-8000-000000000001"}"#),
     ("DELETE", "/api/admin/workers/ban/:id", Admin, ""),
     ("GET", "/api/admin/audit-log", Admin, ""),

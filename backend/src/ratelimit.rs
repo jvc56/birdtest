@@ -41,6 +41,10 @@ pub struct RateLimiters {
     /// bound on a guesser spread over many addresses. Ten times `login`, so
     /// that one address cannot lock an account out.
     pub login_account: Arc<Keyed>,
+    /// 10 requests per second, burst 50, across every API key of one account:
+    /// the bound on an account once `worker` is per key, since revoking a key
+    /// and making another is a fresh bucket each time.
+    pub worker_account: Arc<Keyed>,
 }
 
 impl RateLimiters {
@@ -53,6 +57,8 @@ impl RateLimiters {
         let resets_per_hour = Quota::per_hour(NonZeroU32::new(5).unwrap());
         let logins_per_minute = Quota::per_minute(NonZeroU32::new(10).unwrap());
         let account_logins_per_minute = Quota::per_minute(NonZeroU32::new(100).unwrap());
+        let account_workers = Quota::per_second(NonZeroU32::new(10).unwrap())
+            .allow_burst(NonZeroU32::new(50).unwrap());
         Self {
             register: Arc::new(RateLimiter::keyed(per_hour)),
             worker: Arc::new(RateLimiter::keyed(per_second)),
@@ -60,6 +66,7 @@ impl RateLimiters {
             reset: Arc::new(RateLimiter::keyed(resets_per_hour)),
             login: Arc::new(RateLimiter::keyed(logins_per_minute)),
             login_account: Arc::new(RateLimiter::keyed(account_logins_per_minute)),
+            worker_account: Arc::new(RateLimiter::keyed(account_workers)),
         }
     }
 
@@ -82,6 +89,7 @@ impl RateLimiters {
             &self.reset,
             &self.login,
             &self.login_account,
+            &self.worker_account,
         ] {
             limiter.retain_recent();
         }

@@ -186,14 +186,29 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
     .bind(job.id)
     .bind(requested_by)
     .fetch_one(&state.pool)
-    .await?;
+    .await
+    .map_err(|err| {
+        let err: AppError = err.into();
+        if err.is_unique_violation() {
+            AppError::conflict("an export of this job is already running")
+        } else {
+            err
+        }
+    })?;
 
     let (state, job) = (state.clone(), job.clone());
     tokio::spawn(async move { run(state, job, id).await });
     Ok(id)
 }
 
+/// How many exports build at once. Each holds a main-pool connection for the
+/// whole of its corpus read -- minutes, for a full opening-rack job -- on the
+/// pool claims and submissions share; beyond these, an export waits its turn
+/// `running`.
+static EXPORT_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 async fn run(state: AppState, job: Job, export_id: Uuid) {
+    let _turn = EXPORT_BUILDS.acquire().await;
     match build(&state, &job, export_id).await {
         Ok(()) => tracing::info!(job_id = %job.id, %export_id, "job export ready"),
         Err(err) => {

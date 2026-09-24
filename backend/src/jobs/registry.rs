@@ -376,30 +376,6 @@ pub async fn store_result(
         H::Response: Send + 'static,
         H::Record: Send + 'static,
     {
-        // A large result is decoded a few at a time. At the 64 MiB ceiling
-        // one submission holds the body, its text, the typed response and the
-        // record -- a quarter of a gigabyte -- and nothing else bounded how
-        // many ran at once on the one 2 GB task. Small ones, the ordinary
-        // case, never wait.
-        let _permit = if payload.get().len() >= LARGE_RESULT_BYTES {
-            let permit = tokio::time::timeout(
-                LARGE_RESULT_WAIT,
-                LARGE_RESULT_DECODES.acquire(),
-            )
-            .await
-            .map_err(|_| AppError {
-                retry_after: Some(30),
-                ..AppError::new(
-                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                    "unavailable",
-                    "the server is decoding other large results; try again shortly",
-                )
-            })?
-            .map_err(|e| AppError::internal(format!("large-result semaphore closed: {e}")))?;
-            Some(permit)
-        } else {
-            None
-        };
         tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(&payload)?))
             .await
             .map_err(|e| AppError::internal(format!("validating a task response failed: {e}")))?
@@ -463,7 +439,37 @@ pub async fn store_result(
     }
 }
 
-/// A result at least this large is decoded under [`LARGE_RESULT_DECODES`].
+/// A turn to store a large result, taken by the submit path *before* it opens
+/// its transaction and held until it commits; `None` for an ordinary result,
+/// which never waits.
+///
+/// At the 64 MiB ceiling one submission holds the body, its text, the typed
+/// response and the record -- a quarter of a gigabyte -- and nothing bounded
+/// how many ran at once on the one 2 GB task. The wait is outside the
+/// transaction because inside it, as it first was, each waiter held a pool
+/// connection and its claim and task rows for up to thirty seconds, and the
+/// permit ended before the insert that still held the record.
+pub async fn large_result_turn(
+    bytes: usize,
+) -> AppResult<Option<tokio::sync::SemaphorePermit<'static>>> {
+    if bytes < LARGE_RESULT_BYTES {
+        return Ok(None);
+    }
+    let permit = tokio::time::timeout(LARGE_RESULT_WAIT, LARGE_RESULT_DECODES.acquire())
+        .await
+        .map_err(|_| AppError {
+            retry_after: Some(30),
+            ..AppError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "the server is storing other large results; try again shortly",
+            )
+        })?
+        .map_err(|e| AppError::internal(format!("large-result semaphore closed: {e}")))?;
+    Ok(Some(permit))
+}
+
+/// A result at least this large takes a [`large_result_turn`].
 const LARGE_RESULT_BYTES: usize = 8 * 1024 * 1024;
 /// How many large results are decoded at once.
 static LARGE_RESULT_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);

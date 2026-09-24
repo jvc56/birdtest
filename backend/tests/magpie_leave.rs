@@ -597,6 +597,32 @@ async fn a_rebuild_reproduces_every_generations_bytes() {
         "the stored KLV was left alone"
     );
 
+    // Forced, it writes the new bytes -- and what workers are told to check
+    // the object against follows them, while the first hash stays as evidence.
+    // Left behind, every task of the next generation failed its check.
+    let report = rebuild(true).await.unwrap();
+    assert_eq!(summary(&report)[1], (1, false, true, true, true));
+    let (first, served): (String, Option<String>) = sqlx::query_as(
+        "SELECT sha256, served_sha256 FROM leave_generation_artifacts
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(first, report[1].stored_sha256);
+    assert_eq!(served.as_deref(), Some(report[1].rebuilt_sha256.as_str()));
+    assert_eq!(sha256(&state.artifacts.get(&key).await.unwrap()), report[1].rebuilt_sha256);
+    assert!(report[0].rewritten);
+    let unchanged: Option<String> = sqlx::query_scalar(
+        "SELECT served_sha256 FROM leave_generation_artifacts WHERE job_id = $1 AND generation = 0",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, None, "rewritten with the same bytes, it still serves the first hash");
+
     drop(state);
     scratch_root.assert_clean();
 }

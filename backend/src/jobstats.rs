@@ -573,8 +573,7 @@ pub async fn worker_contributions(
     pool: &PgPool,
     job_id: Uuid,
 ) -> AppResult<(Vec<WorkerContribution>, i64)> {
-    // One more than the cap, so "are there others" needs no second query when
-    // the job has few contributors -- which is the common case.
+    // One more than the cap, as the list was always read.
     //
     // Grouped by the raw identity first and hashed after the limit: grouped by
     // the pseudonym, the SHA-256 was computed for every completed claim of the
@@ -584,42 +583,34 @@ pub async fn worker_contributions(
         "SELECT w.user_id,
                 left(encode(sha256(convert_to(w.anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
-                w.tasks_completed
+                w.tasks_completed, w.contributors
          FROM (
              SELECT c.claimed_by_user_id AS user_id, c.claimed_by_anon_uuid AS anon_uuid,
-                    COUNT(*)::bigint AS tasks_completed
+                    COUNT(*)::bigint AS tasks_completed,
+                    COUNT(*) OVER ()::bigint AS contributors
              FROM task_claims c
              JOIN tasks t ON t.id = c.task_id
              WHERE t.job_id = $1 AND c.state = 'completed'
              GROUP BY 1, 2
-             ORDER BY 3 DESC
+             ORDER BY 3 DESC, 1, 2
              LIMIT $2
          ) w
          LEFT JOIN users u ON u.id = w.user_id
-         ORDER BY w.tasks_completed DESC",
+         ORDER BY w.tasks_completed DESC, w.user_id, w.anon_uuid",
     )
     .bind(job_id)
     .bind(MAX_WORKER_CONTRIBUTIONS + 1)
     .fetch_all(pool)
     .await?;
 
-    // Only when the cap was actually reached is a full count worth paying for.
-    let other_workers = if rows.len() as i64 > MAX_WORKER_CONTRIBUTIONS {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM (
-                 SELECT 1 FROM task_claims c
-                 JOIN tasks t ON t.id = c.task_id
-                 WHERE t.job_id = $1 AND c.state = 'completed'
-                 GROUP BY c.claimed_by_user_id, c.claimed_by_anon_uuid
-             ) w",
-        )
-        .bind(job_id)
-        .fetch_one(pool)
-        .await?
-            - MAX_WORKER_CONTRIBUTIONS
-    } else {
-        0
-    };
+    // How many contributors there are in all, from the same scan: the window
+    // count is taken before the LIMIT. (A second grouped scan of the job's
+    // claims used to answer it, on every view of a popular job.)
+    let other_workers = rows
+        .first()
+        .map(|r| r.get::<i64, _>("contributors") - MAX_WORKER_CONTRIBUTIONS)
+        .unwrap_or(0)
+        .max(0);
 
     Ok((
         rows.into_iter()
@@ -663,6 +654,28 @@ async fn estimate_eta(
         return Ok(None);
     }
     let per_second = recent as f64 / 3600.0;
+
+    // Tasks are made on demand, so `tasks_total - tasks_completed` is only what
+    // is in flight: a 3.2-million-rack job 1% done read "three minutes left".
+    // An opening-rack job counts what is left of its rack space instead, at
+    // the rate racks have been finishing; a leave job's remaining work is
+    // generations whose size depends on the draws, so it has no estimate.
+    if job.job_type == crate::models::job::JobType::LeaveGeneration {
+        return Ok(None);
+    }
+    if job.job_type == crate::models::job::JobType::OpeningRack {
+        let (total_racks, racks_per_batch): (i64, i32) = sqlx::query_as(
+            "SELECT total_racks, racks_per_batch FROM job_opening_rack_config WHERE job_id = $1",
+        )
+        .bind(job.id)
+        .fetch_one(pool)
+        .await?;
+        let remaining_racks = (total_racks - job.racks_analyzed).max(0) as f64;
+        // A claim is one copy of a task, and a task's racks count once.
+        let racks_per_second = per_second * f64::from(racks_per_batch.max(1))
+            / f64::from(job.redundancy.max(1));
+        return Ok(Some(remaining_racks / racks_per_second));
+    }
 
     let remaining = match games {
         Some(stats) => {

@@ -161,13 +161,18 @@ impl WorkerIdentity {
         }
     }
 
-    /// Applies the right per-worker rate limit for this identity.
+    /// Applies the right per-worker rate limit for this identity: per key or
+    /// UUID, and for an account's keys a looser one across all of them.
     pub fn check_rate_limit(&self, state: &AppState) -> AppResult<()> {
         let limiter = match self {
             WorkerIdentity::Unregistered { .. } => &state.limits.unregistered_worker,
             _ => &state.limits.worker,
         };
-        crate::ratelimit::check(limiter, &self.rate_key())
+        crate::ratelimit::check(limiter, &self.rate_key())?;
+        if let WorkerIdentity::User { user_id, .. } = self {
+            crate::ratelimit::check(&state.limits.worker_account, &format!("u:{user_id}"))?;
+        }
+        Ok(())
     }
 }
 

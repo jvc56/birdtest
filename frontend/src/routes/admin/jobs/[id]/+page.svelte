@@ -27,6 +27,9 @@
   let rebuild: ArtifactRebuild[] | null = null;
   let jobExport: JobExport | null = null;
   let exportPoll: number | undefined;
+  // Set when the page goes, so a poll whose request was in flight then does
+  // not schedule another one on a page nobody has open.
+  let destroyed = false;
 
   async function reload() {
     stats = await api.job(jobId);
@@ -46,7 +49,7 @@
       if (e instanceof ApiError && e.status === 404) jobExport = null;
       else throw e;
     }
-    if (jobExport?.state === 'running') {
+    if (jobExport?.state === 'running' && !destroyed) {
       exportPoll = window.setTimeout(() => loadExport().catch((e) => (error = e.message)), 3000);
     }
   }
@@ -70,6 +73,7 @@
     reload().catch((e) => (error = e.message));
     const unsubscribe = subscribeToJob<JobStats>(jobId, (value) => (stats = value));
     return () => {
+      destroyed = true;
       window.clearTimeout(exportPoll);
       unsubscribe();
     };

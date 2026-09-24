@@ -632,7 +632,9 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
 
 1. User fills out the registration form (`/register`) with username, email, and password.
 2. The server validates, and returns `400` with field-level errors listing **every** problem at once rather than the first:
-   - Username is 3–32 characters, trimmed.
+   - Username is 3–32 characters, trimmed, and unique whatever its case (a
+     unique index on `lower(username)`): "Josh" and "josh" side by side on the
+     public lists is an impersonation.
    - Email contains `@` and is at least 3 characters, trimmed and lowercased — so
      case is not a way to register the same address twice.
    - Password scores at least **3** on zxcvbn, with the username and email passed
@@ -854,8 +856,14 @@ decision on evidence rather than on a guess about when it starts to matter.
 an inactive job and `null` when nothing completed in that window — there is
 nothing to extrapolate from, and a fabricated number is worse than a blank. For
 SPRT jobs the remaining work is measured in units against `max_units`, converted
-into tasks using the observed units-per-completed-task ratio; for everything else
-it is remaining tasks. A job already past its cap reports 0.
+into tasks using the observed units-per-completed-task ratio. For an opening-rack
+job it is the racks left of its rack space, at the rate racks have been finishing
+(claims × batch ÷ redundancy). A leave job has no ETA: its generations' size
+depends on the draws. A job already past its cap reports 0. Tasks are made on
+demand, so "remaining tasks" was only what was in flight — a 3.2-million-rack
+job 1% done read three minutes left — and the job list's progress bar likewise
+counts each type's own units (games or pairs, racks analysed, generations
+closed) rather than tasks handed out so far.
 
 #### Live updates
 
@@ -908,7 +916,10 @@ caller per scan is one connection per scan against a pool of twenty. So bulk
 reads are admin-only, at most **two streams run at once** (a semaphore permit
 held for the life of the response body, released when a caller disconnects as
 well as when one reads to the end), and a completed job is served from an
-artifact instead.
+artifact instead. Building an export reads the corpus through the same pool, so
+a job has **one export running at a time** (a partial unique index) and at most
+**two build at once** across the server; beyond that an export waits its turn
+`running`.
 
 `POST /api/admin/jobs/:id/export` spawns a task that streams the job's rows out
 as gzipped NDJSON straight into an S3 multipart upload — nothing larger than one
@@ -2266,9 +2277,12 @@ a `serde_json::Value` first, which holds every object as a B-tree node and every
 key as its own allocation — ten to twenty times the JSON's size, so a result near
 the 64 MiB ceiling became most of a gigabyte on a 2 GB task, and a few at once
 were enough to have it killed. A result of 8 MiB or more also waits for one of
-three decoding slots (a quarter of a gigabyte each at the ceiling), for up to
-thirty seconds before its worker is answered `503`; ordinary results never
-wait.
+three slots (a quarter of a gigabyte each at the ceiling), for up to thirty
+seconds before its worker is answered `503`; ordinary results never wait. The
+wait is before the submission's transaction opens and the slot is held until
+it commits — waited for inside it, as the twelfth audit first had it, each
+waiter held a pool connection and its claim and task rows, and the slot ended
+before the insert that still held the record.
 
 **Captured positions**, when present:
 
@@ -3382,8 +3396,9 @@ a new MAGPIE setting has a table it visibly is not in.
 caches loaded lexical data by *name*: a load that finds a KLV of the requested
 name already loaded keeps it and never opens the file. Every check on this
 path, though, is of the file on disk — its digest against the job's pin, or, for
-a leave task's KLV, the artifact just fetched and written under a fixed name.
-Until the eleventh audit the two could disagree, and for leave generation they
+a leave task's KLV, the artifact just fetched and written to disk (under one
+fixed name then; named by its content since the twelfth audit, see the Worker
+API Contract). Until the eleventh audit the two could disagree, and for leave generation they
 always did: from the second leave task in a process the new generation's KLV was
 written over the old one and the old one, still in memory under the same name,
 was played — the task's games, its per-rack counts and its mean equities all
@@ -3441,9 +3456,12 @@ via `rack_list_get_rack_equity_json`.
 the task's JSON request and go back in its JSON response. The one file a
 leave-generation task does write is the *previous generation's* KLV, which is
 fetched from `GET /api/worker/artifact` and has to be on disk for MAGPIE to
-load it as leaves: it goes to `lexica/<lexicon>_birdtest_previous.klv2`, under
-the same directory the shipped lexicon data lives in, overwritten per task. The
-name starts with the lexicon's because MAGPIE checks leaves against their
+load it as leaves: it goes to `lexica/<lexicon>_birdtest_<16 hex>.klv2`, under
+the same directory the shipped lexicon data lives in — named by the first 16
+hex digits of its verified SHA-256, written to a per-process temporary name and
+renamed into place, so a name always means the same bytes. One file stays per
+generation a worker plays (3.6 MB for English); nothing removes old ones, and
+none is ever wrong. The name starts with the lexicon's because MAGPIE checks leaves against their
 lexicon by inferring a letter distribution from each name's prefix, and a bare
 name was refused before a single game was played. So `./data` must be writable
 for leave generation as well as for wordmap provisioning. The `-writerackequitycsv`
@@ -3838,8 +3856,10 @@ rack per task would spend a claim/submit round trip on each.
 `previous_artifact_key` is **never null**, generation 1 included: the server
 builds a zeroed KLV for it at `generation-0` when the job is created, so every
 generation fetches its leaves the same way and the client has no first-generation
-branch. `previous_artifact_sha256` is the hash the server recorded when it built
-that KLV (`leave_generation_artifacts.sha256`); MAGPIE checks the fetched bytes
+branch. `previous_artifact_sha256` is the hash of the bytes the object store
+holds for that KLV — `leave_generation_artifacts.served_sha256`, which a rebuild
+that rewrites the object sets, else `sha256`, the hash recorded when it was
+built; MAGPIE checks the fetched bytes
 against it before playing a game, and writes them under a name made from it
 (`<lexicon>_birdtest_<16 hex>`), so a name always means the same bytes — the
 load's name-keyed cache cannot mix generations, and two `contribute` processes
@@ -4307,7 +4327,7 @@ In-memory token buckets, per process, reset on restart.
 | `POST /api/auth/register` | 10 / hour | Client IP |
 | `POST /api/auth/login` | 10 / minute, and 100 / minute | Client IP; and, separately, the username tried from anywhere — ten times the address's, so that one address cannot lock an account out |
 | `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
-| `POST /api/worker/{task,result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Worker identity: the API key (`k:<key-id>`) or the anonymous UUID (`a:<uuid>`). Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all |
+| `POST /api/worker/{task,result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5**; and 10 / second, burst 50, per account | Worker identity: the API key (`k:<key-id>`) or the anonymous UUID (`a:<uuid>`). Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. The account-wide bucket bounds an account's keys together, since revoking a key and making another is a fresh bucket |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
 
 "Client IP" is the `X-Forwarded-For` entry `TRUSTED_PROXY_HOPS` from the right —
@@ -4471,6 +4491,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account: anonymize it in place, keeping its claims and records so no donated compute is lost (see Admin API semantics). |
 | `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. One ban per identity: a second is `409`, so that unban means what it says. |
+| `GET` | `/api/admin/workers/bans` | Every ban in force, newest first, with the id lifting it takes. (Nothing listed them before the thirteenth audit; a mistaken ban needed SQL.) |
 | `DELETE` | `/api/admin/workers/ban/:id` | Remove a ban, and with it the identity's only ban. |
 | `GET` | `/api/admin/audit-log` | Query the audit log with filtering and pagination. |
 | `GET` | `/api/admin/input-data` | List known input data rows — path, role, name, digest, tarball date. |
@@ -4617,7 +4638,9 @@ leaves the job without one — builds it first.
 
 **Deleting a user** anonymizes the account rather than removing it. Personal
 data and credentials go: the username becomes `deleted-<id>`, the email
-`<id>@deleted.invalid`, the password hash an unusable value, `is_admin` false,
+`<random uuid>@deleted.invalid` (random, not the id: ids are public and the
+address is unique, so a registered `<id>@deleted.invalid` made the account
+impossible to delete), the password hash an unusable value, `is_admin` false,
 API keys, confirmation codes and reset tokens are deleted, `session_generation`
 is incremented so every session ends, and `deleted_at` is set. Login, password
 reset and `CurrentUser` all refuse a deleted account, and `/api/users` omits it.
@@ -5035,6 +5058,20 @@ CREATE TABLE password_reset_tokens (
     used_at     TIMESTAMPTZ,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+-- Confirmation and reset look a token up by its hash, and the stale-account
+-- release (and a user's delete) reaches both tables by user through the
+-- cascade; neither table is reaped, so each was a sequential scan growing
+-- without bound, on unauthenticated routes.
+CREATE INDEX email_confirmations_code_idx   ON email_confirmations (code_hash);
+CREATE INDEX email_confirmations_user_idx   ON email_confirmations (user_id);
+CREATE INDEX password_reset_tokens_hash_idx ON password_reset_tokens (token_hash);
+CREATE INDEX password_reset_tokens_user_idx ON password_reset_tokens (user_id);
+
+-- One account per username whatever its case: "Josh" and "josh" side by side
+-- on a public leaderboard is an impersonation. (Login looks names up exactly,
+-- as they were registered.)
+CREATE UNIQUE INDEX users_username_lower_idx ON users (lower(username));
 
 CREATE TABLE api_keys (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -5659,6 +5696,10 @@ CREATE TABLE job_exports (
 -- The newest ready export for a job, which is what a download resolves to.
 CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
 
+-- One export of a job at a time. Only the page's disabled button stopped a
+-- second, and each holds a pool connection for the whole corpus read.
+CREATE UNIQUE INDEX job_exports_one_running_idx ON job_exports (job_id) WHERE state = 'running';
+
 -- Tasks
 
 CREATE TYPE task_state AS ENUM ('available', 'claimed', 'completed');
@@ -6205,6 +6246,15 @@ CREATE TABLE leave_generation_artifacts (
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    -- SHA-256 of the bytes the object store holds *now*, when a rebuild has
+    -- rewritten the object with different ones (`rebuild_artifacts`); NULL
+    -- while it still holds the bytes first written. Workers are sent this
+    -- (or `sha256` when it is NULL) and refuse bytes that do not match, so it
+    -- has to follow the object: a rebuild under a changed builder wrote new
+    -- bytes, the row kept the old hash, and every task of the next generation
+    -- failed its check on every worker. `sha256` stays the first hash, as the
+    -- evidence it is.
+    served_sha256 TEXT CHECK (served_sha256 ~ '^[0-9a-f]{64}$'),
     -- The MAGPIE KLV builder that wrote these bytes ('klv-1').
     --
     -- MAGPIE builds these artifacts, so an upgrade can legitimately change the
@@ -6442,11 +6492,12 @@ CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
--- The job's tasks: the detail page's counts by state (`jobstats`), the census
--- a purge or delete writes, and the job-scoped task scans of the finish check
--- and the exports. (The job list counted from it too, until it read
--- `jobs.tasks_total`/`tasks_completed` instead.)
-CREATE INDEX        tasks_job_idx             ON tasks (job_id, state);
+-- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
+-- detail page's counts, which sum `accepted_count` and so read the heap
+-- anyway; the census; the opening-rack finish check, which needs `seed` --
+-- is served as well by `tasks_seed_unique_idx (job_id, seed)`, and a state
+-- index cost an entry on every task insert and every state change, on the
+-- claim and submit paths, for no reader that needed it.
 -- (task_id, submitted_at) rather than task_id alone: the per-task "first
 -- accepted result" read that every aggregate uses orders on both.
 CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);
@@ -6483,7 +6534,8 @@ CREATE INDEX leave_rack_progress_pick_idx
 
 Ten audits of this repository each left a findings record (`AUDIT_FINDINGS*.md`,
 now deleted; they are in the git history up to the commit that removed them).
-The eleventh's is `AUDIT_FINDINGS_7.md` and the twelfth's `AUDIT_FINDINGS_8.md`.
+The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md` and
+the thirteenth's `AUDIT_FINDINGS_9.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -6534,6 +6586,24 @@ what would make it worth revisiting.
   leaderboards' counters cannot drift. The job's own progress totals are one
   `UPDATE jobs`, the transaction's last statement, since it takes the row lock
   every claim for the job also takes.
+- **Large results waiting their turn are still resident.** The three-slot bound
+  on storing results of 8 MiB or more is taken after the body has been read, so
+  each waiter keeps its body in memory for up to thirty seconds; some twenty-five
+  maximum-size submissions waiting at once would still fill the web task. Taking
+  the turn from `Content-Length` before the body is read (a layer on the result
+  route) is the fix if capture jobs that large are ever run; and above three at
+  a time a submitter can be answered `503` and re-upload.
+- **`task_claims` is stored at fillfactor 85**, for its heartbeats to be HOT
+  updates: some 15% of every claim page is kept free for good (about 6.5 MB a
+  day at 288,000 claims a day), and while the nightly dump holds its snapshot,
+  HOT pruning cannot reclaim dead versions, so heartbeats are non-HOT again for
+  the backup window.
+- **A leave task fetches its KLV every time**, 3.6 MB from the store and a
+  buffered copy on the server, even when the worker already has those bytes
+  under their content name. Writing it afresh each task is what guarantees the
+  process reads it again (a new file identity), which matters if an aborted
+  leave run left its in-memory copy altered; skipping the fetch when the file
+  matches would need that guarantee some other way.
 - **A leave generation's progress row is taken mid-submission.** `stage_fold`'s
   upsert of `leave_generation_progress` (display counters) locks the
   generation's row from there to the commit, serializing that generation's
@@ -6559,12 +6629,15 @@ what would make it worth revisiting.
 - **A purge or delete of a large job is one request, in one transaction.** Claims
   skip the job while it runs and nothing waits on the claims or contributor rows
   it holds (see [Job Lifecycle Controls](#job-lifecycle-controls)), so it no
-  longer stalls the rest of the fleet. What remains is its own length: the cascades are tens of millions
-  of rows for a full simming opening-rack job — minutes on the production
-  instance class — and past the load balancer's 300-second idle timeout the
-  request is dropped and the whole transaction rolls back, so it can never
-  finish through the API; and a finished one leaves that many dead tuples to
-  vacuum. *Open (eleventh audit):* a purge that commits the job's state change
+  longer stalls the rest of the fleet, and it runs on a task of its own, so a
+  request the load balancer drops at its 300-second idle timeout no longer
+  takes the transaction with it: the purge finishes, and the hold on the job
+  lasts exactly as long as its locks. What remains is its own length: the
+  cascades are tens of millions of rows for a full simming opening-rack job —
+  minutes on the production instance class, the job's claims held throughout,
+  and the admin told nothing past the load balancer's timeout (the audit log and
+  the job's page say when it is done) — and a finished one leaves that many dead
+  tuples to vacuum. *Open (eleventh audit):* a purge that commits the job's state change
   at once and deletes bottom-up in batches on a spawned task with a status row,
   like an export; or the result tables partitioned by job, so a purge is a
   `TRUNCATE` and a delete a `DROP`. Both are real redesigns; neither is needed
@@ -6722,6 +6795,10 @@ what would make it worth revisiting.
   display pool, under its fifteen-second statement timeout. A stored pseudonym
   column with an index is the fix when that many exist.
 
+- **Usernames are unique whatever their case, and otherwise free text.** Any
+  3–32-byte string is accepted, so look-alike and zero-width variants of a name
+  can sit side by side on the public lists; a character-set rule is a product
+  decision (international names) left open.
 - **A rating pool cannot be edited or deleted once created.** Its anchor and
   scope are fixed (creation now validates them: a variant a job can have,
   input-data rows of the right roles, an anchor rating whose scale does not
@@ -6743,6 +6820,12 @@ what would make it worth revisiting.
 
 ### Deployment
 
+- **The restore drill's disk stops at Fargate's 200 GiB**, which holds a
+  database a little over 150 GiB with its dump beside it. Past that the drill
+  refuses to start, naming the alternative: a hand-run drill with
+  `DRILL_TARGET=server` against a scratch instance restored from a snapshot.
+  The ops task's scratch restore (RUNBOOK.md §2.1) has the same ceiling; a PITR
+  scratch instance is the way past it.
 - **Fargate's provisioning time is the floor on a deployment's gap** — a minute
   or so that Terraform cannot shorten. Getting under it means two tasks alive at
   once, which is the [primary/secondary split](#scaling) and everything the
@@ -7040,6 +7123,11 @@ restore uses when a DB restored to time *T* references keys that no longer exist
 
 Two details a rebuild has to respect:
 
+- **A rebuild that rewrites an object records what it wrote**:
+  `served_sha256`, which workers are sent and check the object against, while
+  `sha256` keeps the hash first written as the evidence it is. Left on the first
+  hash, a rebuild under a changed builder (or `force`) had every task of the
+  next generation refused by every worker.
 - `seed_zero_generation` writes generation 0 as a zeroed KLV; a rebuild must
   reproduce generation 0 the same way rather than from `leave_rack_progress`, which
   for generation 0 does not exist.
@@ -7267,9 +7355,9 @@ add a client to the failure surface without adding a row shape.)
 - **`multi_az` is a variable defaulting to false**, not a change. It doubles the
   instance cost, and it is availability rather than backup — the call belongs to
   whoever pays for it.
-- The **round-trip test is a script, not CI**: `.github/workflows/ci.yml` runs the
-  per-pull-request tiers only, and the round trip belongs with the nightly jobs
-  TESTING.md describes, which do not exist yet.
+- The **round-trip test is a script, run nightly rather than per pull request**:
+  `.github/workflows/nightly.yml` runs `restore-roundtrip` and `backup-drill`
+  beside tier 6 (TESTING.md, "Nightly").
 - `scripts/backup.sh` and `scripts/restore-drill.sh` honour **`AWS_S3_ENDPOINT`**, so
   both run against the local MinIO. That is how they were tested — a real dump of the
   real schema, uploaded, downloaded, restored and verified.

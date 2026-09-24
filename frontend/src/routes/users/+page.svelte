@@ -5,16 +5,24 @@
   import Pagination from '$lib/components/Pagination.svelte';
 
   let result: Page<Record<string, any>> | null = null;
+  let loadError = '';
 
   async function load(page: number) {
-    result = await api.users(page);
+    loadError = '';
+    try {
+      result = await api.users(page);
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   }
   onMount(() => load(0));
 </script>
 
 <h1 class="mb-6 text-2xl font-semibold">Registered users</h1>
 
-{#if !result}
+{#if loadError}
+  <p class="text-sm text-destructive">Could not load the users: {loadError}</p>
+{:else if !result}
   <p class="text-muted-foreground">Loading…</p>
 {:else}
   <div class="card overflow-x-auto p-0">

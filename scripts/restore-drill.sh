@@ -10,7 +10,8 @@
 #
 # By default the drill restores into a Postgres of its own, started inside
 # this container -- the task runs the postgres image, whose major version is
-# the dump's by construction, with 100 GiB of ephemeral storage -- and never
+# the dump's by construction, with restore_ephemeral_storage_gib (200 GiB by
+# default) of ephemeral storage -- and never
 # touches the production instance. (DRILL_TARGET=server restores into a second
 # database on the server DATABASE_URL names instead, as it once always did.)
 #
@@ -155,7 +156,7 @@ if [[ "${DRILL_TARGET}" == local ]]; then
     "${WORKDIR}/manifest.json")"
   free="$(df --output=avail -B1 "${WORKDIR}" | tail -1 | tr -d ' ')"
   if (( free < need )); then
-    log "NOT ENOUGH DISK: the restore needs about $(( need / 2**30 )) GiB and ${WORKDIR} has $(( free / 2**30 )) GiB free; raise restore_ephemeral_storage_gib"
+    log "NOT ENOUGH DISK: the restore needs about $(( need / 2**30 )) GiB and ${WORKDIR} has $(( free / 2**30 )) GiB free. Raise restore_ephemeral_storage_gib if it is below Fargate's 200; past that, run this drill by hand with DRILL_TARGET=server against a scratch RDS instance restored from a snapshot (RUNBOOK.md, 6)"
     exit 1
   fi
   log "starting the drill's own server"

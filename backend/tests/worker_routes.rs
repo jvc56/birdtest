@@ -888,6 +888,39 @@ async fn worker_requests_are_limited_per_identity() {
     assert_eq!(heartbeat_as(&app, &other, &token).await, StatusCode::NO_CONTENT, "another identity is unaffected");
 }
 
+/// A-WORKER-14b: an account's worker is limited per API key, so two machines
+/// on one account each have their own bucket -- keyed on the account, six idle
+/// machines used it all -- and a key's sixth request in a burst is still 429.
+#[tokio::test]
+async fn an_accounts_workers_are_limited_per_key() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let user = db.user("contributor", false).await;
+    let mut headers = Vec::new();
+    for machine in ["machine-one", "machine-two"] {
+        sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)")
+            .bind(user)
+            .bind(birdtest::auth::api_key::hash_key(machine))
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        headers.push(format!("Bearer {machine}"));
+    }
+    let token = json!(Uuid::new_v4());
+    let heartbeat = |auth: &str| {
+        post_json("/api/worker/heartbeat", &[("authorization", auth)], json!({ "claim_token": token }))
+    };
+
+    for i in 1..=5 {
+        let (status, _, _) = raw(&app, heartbeat(&headers[0])).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "request {i}");
+    }
+    let (status, _, _) = raw(&app, heartbeat(&headers[0])).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the key's own burst is spent");
+    let (status, _, _) = raw(&app, heartbeat(&headers[1])).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "the account's other key is not");
+}
+
 /// A-WORKER-15: `client-version` reports the configured floor and where to get
 /// MAGPIE, to anyone: a contributor asks before it has an identity.
 #[tokio::test]

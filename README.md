@@ -270,8 +270,13 @@ minio minio-init` gives you one without the rest of the stack.
 
 ## Deploying
 
-`infra/` is a complete Terraform description of the AWS side. Two values must
-be set out of band right after the first `terraform apply` — Terraform manages
+`infra/` is a complete Terraform description of the AWS side. Keep the stack's
+variables in `infra/prod.tfvars` (not committed: it names the account's
+certificate and addresses) and pass `-var-file=prod.tfvars` to every `apply`,
+`plan` and `import` — RUNBOOK.md's recovery steps assume it, and a command run
+without it evaluates the configuration in the default region, prompting for
+eight variables. Two values must be set out of band right after the first
+`terraform apply` — Terraform manages
 the parameter *names* but never their values.
 
 The database master password is set by hand, not managed by RDS (RDS rotation

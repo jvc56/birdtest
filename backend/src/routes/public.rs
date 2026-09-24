@@ -45,7 +45,7 @@ struct JobListItem {
     /// For on-demand SPRT jobs the meaningful denominator is `max_games` /
     /// `max_pairs`, not a task count that grows as work is handed out.
     units_completed: Option<i64>,
-    max_units: Option<i32>,
+    max_units: Option<i64>,
     /// Workers are declining this job and none is completing it.
     ///
     /// A job pinned to data nobody has does not announce itself: the workers
@@ -77,6 +77,13 @@ async fn list_jobs(
                 -- from the rows.
                 j.games_completed AS game_rows,
                 gc.max_games, pc.max_pairs,
+                -- Tasks are made on demand, so for opening racks and leave
+                -- generation a task count is no denominator: it is only what
+                -- has been handed out so far. Their own units instead: racks
+                -- analysed of the rack space, generations closed of the count.
+                j.racks_analyzed, rc.total_racks, lc.generation_count,
+                (SELECT COUNT(*) FROM leave_generation_artifacts a
+                  WHERE a.job_id = j.id AND a.generation >= 1) AS generations_closed,
                 -- Stalled: at least one decline and no submission in the last
                 -- 24 hours, with nothing currently claimed. Long enough not to
                 -- flap overnight, short enough that an admin sees it the next
@@ -97,6 +104,8 @@ async fn list_jobs(
          FROM jobs j
          LEFT JOIN job_game_config gc ON gc.job_id = j.id
          LEFT JOIN job_game_pair_config pc ON pc.job_id = j.id
+         LEFT JOIN job_opening_rack_config rc ON rc.job_id = j.id
+         LEFT JOIN job_leave_config lc ON lc.job_id = j.id
          ORDER BY j.created_at DESC, j.id DESC
          LIMIT $1 OFFSET $2",
     )
@@ -118,9 +127,15 @@ async fn list_jobs(
             let max_games: Option<i32> = row.get("max_games");
             let max_pairs: Option<i32> = row.get("max_pairs");
             let (units_completed, max_units) = match job_type {
-                JobType::Games => (Some(game_rows), max_games),
-                JobType::GamePairs => (Some(game_rows / 2), max_pairs),
-                _ => (None, None),
+                JobType::Games => (Some(game_rows), max_games.map(i64::from)),
+                JobType::GamePairs => (Some(game_rows / 2), max_pairs.map(i64::from)),
+                JobType::OpeningRack => {
+                    (Some(row.get::<i64, _>("racks_analyzed")), row.get::<Option<i64>, _>("total_racks"))
+                }
+                JobType::LeaveGeneration => (
+                    Some(row.get::<i64, _>("generations_closed")),
+                    row.get::<Option<i32>, _>("generation_count").map(i64::from),
+                ),
             };
             JobListItem {
                 id: row.get("id"),
@@ -819,19 +834,29 @@ async fn worker_page(
     // to order a tie differently for each LIMIT, so paging through the list
     // showed some contributors twice and others never. A row has exactly one of
     // the two ids, so together they are a total order.
+    //
+    // The pseudonym is hashed after the page is chosen, for its rows only:
+    // computed inside the anonymous arm, it was a SHA-256 of every contributing
+    // anonymous identity on every view of a public, unmetered page.
     let rows = sqlx::query(
-        "SELECT * FROM (
-             SELECT u.id AS user_id, NULL::uuid AS anon_uuid, NULL::text AS anon_id,
-                    u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
-             FROM users u WHERE u.tasks_completed > 0
-             UNION ALL
-             SELECT NULL::uuid, w.uuid,
-                    left(encode(sha256(convert_to(w.uuid::text, 'UTF8')), 'hex'), 16),
-                    NULL::text, w.tasks_completed, w.last_completed_at
-             FROM anonymous_workers w WHERE w.tasks_completed > 0
-         ) contributors
-         ORDER BY tasks_completed DESC, user_id, anon_uuid
-         LIMIT $1 OFFSET $2",
+        "SELECT c.user_id, c.anon_uuid,
+                CASE WHEN c.anon_uuid IS NOT NULL
+                     THEN left(encode(sha256(convert_to(c.anon_uuid::text, 'UTF8')), 'hex'), 16)
+                END AS anon_id,
+                c.username, c.tasks_completed, c.last_seen_at
+         FROM (
+             SELECT * FROM (
+                 SELECT u.id AS user_id, NULL::uuid AS anon_uuid,
+                        u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
+                 FROM users u WHERE u.tasks_completed > 0
+                 UNION ALL
+                 SELECT NULL::uuid, w.uuid, NULL::text, w.tasks_completed, w.last_completed_at
+                 FROM anonymous_workers w WHERE w.tasks_completed > 0
+             ) contributors
+             ORDER BY tasks_completed DESC, user_id, anon_uuid
+             LIMIT $1 OFFSET $2
+         ) c
+         ORDER BY c.tasks_completed DESC, c.user_id, c.anon_uuid",
     )
     .bind(limit)
     .bind(offset)

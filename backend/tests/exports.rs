@@ -366,6 +366,28 @@ async fn export_state(db: &TestDb, id: Uuid) -> (String, Option<String>, bool) {
     .unwrap()
 }
 
+/// I-EXPORT-8: one export of a job runs at a time. Only the page's disabled
+/// button stopped a second, and each holds a pool connection for its whole
+/// corpus read.
+#[tokio::test]
+async fn a_job_has_one_export_running_at_a_time() {
+    let db = TestDb::new().await;
+    let (state, _bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+    complete(&db, job).await;
+    export_row(&db, job, "running").await;
+
+    let borrowed: Vec<(&str, &str)> =
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) =
+        send(&app, post_json(&format!("/api/admin/jobs/{job}/export"), &borrowed, json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("already running"), "{body}");
+}
+
 /// PLAN.md, "Exports" and the schema's comment on `job_exports`: birdtest is a
 /// single instance, so at startup an export still `running` belongs to a
 /// process that is gone. `fail_orphaned` marks it failed with a reason and

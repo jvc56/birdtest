@@ -23,9 +23,14 @@ sql=${1:-$(cat)}
 [[ -n "$sql" ]] || { echo "usage: $0 'SQL' (or SQL on stdin)" >&2; exit 2; }
 
 tf() { terraform -chdir="${INFRA_DIR:-infra}" output "$@"; }
+# Every AWS call in the stack's own region, not the CLI's default -- which,
+# during a region loss, is usually the region that was lost.
+export AWS_REGION AWS_DEFAULT_REGION
+AWS_REGION=$(tf -raw region)
+AWS_DEFAULT_REGION=$AWS_REGION
 cluster=$(tf -raw cluster_name)
 # After a region-loss drill the workspace may still be the DR stack's.
-echo "workspace $(terraform -chdir="${INFRA_DIR:-infra}" workspace show), cluster $cluster" >&2
+echo "workspace $(terraform -chdir="${INFRA_DIR:-infra}" workspace show), region $AWS_REGION, cluster $cluster" >&2
 task_definition=$(tf -raw ops_task_definition)
 subnets=$(tf -json service_subnet_ids | jq -r 'join(",")')
 security_group=$(tf -raw service_security_group_id)
@@ -50,7 +55,13 @@ if [[ -z "$task_arn" ]]; then
   exit 1
 fi
 echo "running $task_arn" >&2
-aws ecs wait tasks-stopped --cluster "$cluster" --tasks "$task_arn"
+# Polled without a cap. `aws ecs wait tasks-stopped` gives up after ten
+# minutes and exits, with no output, while the SQL goes on running and
+# commits -- and running it again would run it twice.
+while [[ "$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
+    --query 'tasks[0].lastStatus' --output text)" != STOPPED ]]; do
+  sleep 10
+done
 
 # All of psql's output, page by page: one call returns at most 10,000 events
 # or 1 MB. A task that never started its container has no stream at all, and

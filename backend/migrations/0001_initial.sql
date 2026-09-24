@@ -55,6 +55,20 @@ CREATE TABLE password_reset_tokens (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Confirmation and reset look a token up by its hash, and the stale-account
+-- release (and a user's delete) reaches both tables by user through the
+-- cascade; neither table is reaped, so each was a sequential scan growing
+-- without bound, on unauthenticated routes.
+CREATE INDEX email_confirmations_code_idx   ON email_confirmations (code_hash);
+CREATE INDEX email_confirmations_user_idx   ON email_confirmations (user_id);
+CREATE INDEX password_reset_tokens_hash_idx ON password_reset_tokens (token_hash);
+CREATE INDEX password_reset_tokens_user_idx ON password_reset_tokens (user_id);
+
+-- One account per username whatever its case: "Josh" and "josh" side by side
+-- on a public leaderboard is an impersonation. (Login looks names up exactly,
+-- as they were registered.)
+CREATE UNIQUE INDEX users_username_lower_idx ON users (lower(username));
+
 CREATE TABLE api_keys (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -678,6 +692,10 @@ CREATE TABLE job_exports (
 -- The newest ready export for a job, which is what a download resolves to.
 CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
 
+-- One export of a job at a time. Only the page's disabled button stopped a
+-- second, and each holds a pool connection for the whole corpus read.
+CREATE UNIQUE INDEX job_exports_one_running_idx ON job_exports (job_id) WHERE state = 'running';
+
 -- Tasks
 
 CREATE TYPE task_state AS ENUM ('available', 'claimed', 'completed');
@@ -1224,6 +1242,15 @@ CREATE TABLE leave_generation_artifacts (
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    -- SHA-256 of the bytes the object store holds *now*, when a rebuild has
+    -- rewritten the object with different ones (`rebuild_artifacts`); NULL
+    -- while it still holds the bytes first written. Workers are sent this
+    -- (or `sha256` when it is NULL) and refuse bytes that do not match, so it
+    -- has to follow the object: a rebuild under a changed builder wrote new
+    -- bytes, the row kept the old hash, and every task of the next generation
+    -- failed its check on every worker. `sha256` stays the first hash, as the
+    -- evidence it is.
+    served_sha256 TEXT CHECK (served_sha256 ~ '^[0-9a-f]{64}$'),
     -- The MAGPIE KLV builder that wrote these bytes ('klv-1').
     --
     -- MAGPIE builds these artifacts, so an upgrade can legitimately change the
@@ -1461,11 +1488,12 @@ CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
--- The job's tasks: the detail page's counts by state (`jobstats`), the census
--- a purge or delete writes, and the job-scoped task scans of the finish check
--- and the exports. (The job list counted from it too, until it read
--- `jobs.tasks_total`/`tasks_completed` instead.)
-CREATE INDEX        tasks_job_idx             ON tasks (job_id, state);
+-- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
+-- detail page's counts, which sum `accepted_count` and so read the heap
+-- anyway; the census; the opening-rack finish check, which needs `seed` --
+-- is served as well by `tasks_seed_unique_idx (job_id, seed)`, and a state
+-- index cost an entry on every task insert and every state change, on the
+-- claim and submit paths, for no reader that needed it.
 -- (task_id, submitted_at) rather than task_id alone: the per-task "first
 -- accepted result" read that every aggregate uses orders on both.
 CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);

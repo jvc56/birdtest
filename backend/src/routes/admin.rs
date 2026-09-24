@@ -26,6 +26,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id", delete(delete_job))
         .route("/users/:id", delete(delete_user))
         .route("/workers", get(super::public::list_workers_admin))
+        .route("/workers/bans", get(list_bans))
         .route("/workers/ban", post(ban_worker))
         .route("/workers/ban/:id", delete(unban_worker))
         .route("/audit-log", get(audit_log))
@@ -1783,7 +1784,7 @@ impl Contributions {
              FROM task_claims c JOIN tasks t ON t.id = c.task_id
              WHERE t.job_id = $1 AND c.state = 'completed'
                AND c.claimed_by_user_id IS NOT NULL
-             GROUP BY 1",
+             GROUP BY 1 ORDER BY 1",
         )
         .bind(job_id)
         .fetch_all(&mut *conn)
@@ -1793,7 +1794,7 @@ impl Contributions {
              FROM task_claims c JOIN tasks t ON t.id = c.task_id
              WHERE t.job_id = $1 AND c.state = 'completed'
                AND c.claimed_by_anon_uuid IS NOT NULL
-             GROUP BY 1",
+             GROUP BY 1 ORDER BY 1",
         )
         .bind(job_id)
         .fetch_all(&mut *conn)
@@ -1802,7 +1803,9 @@ impl Contributions {
     }
 
     /// The caller's last statement before it commits, so the rows are held
-    /// for milliseconds.
+    /// for milliseconds. In id order (the counts are read sorted), so two
+    /// purges sharing contributors lock them in the same order rather than
+    /// deadlocking at the end of both.
     async fn give_back(self, conn: &mut sqlx::PgConnection) -> AppResult<()> {
         let (ids, counts): (Vec<Uuid>, Vec<i64>) = self.users.into_iter().unzip();
         sqlx::query(
@@ -1867,7 +1870,28 @@ async fn purge_job(
     jar: CookieJar,
 ) -> AppResult<Json<PurgeResult>> {
     csrf::verify(&method, &headers, &jar)?;
+    run_to_completion(purge_body(state, admin.0.id, id)).await
+}
 
+/// Runs a purge or a delete on a task of its own, and waits for it.
+///
+/// Spawned so that a request dropped mid-way -- the load balancer's idle
+/// timeout, the admin closing the tab -- does not drop the transaction with
+/// it. Dropped with the request, the transaction's rollback waited on its
+/// connection for the running statement (minutes, for a large job's
+/// cascade), while its `DispatchHold`, dropped at once, told claims and
+/// submissions the job was free and started the reclaim grace on a job whose
+/// claims were still locked. On its own task the operation finishes whatever
+/// happens to the request, and the hold lasts exactly as long as its locks.
+async fn run_to_completion<T: Send + 'static>(
+    operation: impl std::future::Future<Output = AppResult<T>> + Send + 'static,
+) -> AppResult<T> {
+    tokio::spawn(operation)
+        .await
+        .map_err(|e| AppError::internal(format!("the operation's task failed: {e}")))?
+}
+
+async fn purge_body(state: AppState, admin_id: Uuid, id: Uuid) -> AppResult<Json<PurgeResult>> {
     // Claims skip the job while this runs rather than each waiting on its
     // dispatch lock with a pool connection held, and submissions for its
     // claims are answered at once: see `jobs::DispatchHolds`.
@@ -1904,7 +1928,7 @@ async fn purge_job(
     audit::log_detail(
         &mut tx,
         "job.purged.census",
-        admin.0.id,
+        admin_id,
         "job",
         id.to_string(),
         Some(id),
@@ -2001,7 +2025,7 @@ async fn purge_job(
     audit::log(
         &mut tx,
         "job.purged",
-        Some(admin.0.id),
+        Some(admin_id),
         None,
         Some("job"),
         Some(id.to_string()),
@@ -2033,7 +2057,11 @@ async fn delete_job(
     jar: CookieJar,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
+    run_to_completion(delete_body(state, admin.0.id, id)).await
+}
 
+/// See [`run_to_completion`].
+async fn delete_body(state: AppState, admin_id: Uuid, id: Uuid) -> AppResult<StatusCode> {
     let mut hold = state.dispatch_holds.hold(
         id,
         crate::jobs::HoldKind::Claims,
@@ -2058,7 +2086,7 @@ async fn delete_job(
     audit::log(
         &mut tx,
         "job.deleted",
-        Some(admin.0.id),
+        Some(admin_id),
         None,
         Some("job"),
         Some(id.to_string()),
@@ -2068,7 +2096,7 @@ async fn delete_job(
     audit::log_detail(
         &mut tx,
         "job.deleted.census",
-        admin.0.id,
+        admin_id,
         "job",
         id.to_string(),
         None,
@@ -2470,7 +2498,10 @@ async fn delete_user(
     let anonymized = sqlx::query(
         "UPDATE users SET
              username = 'deleted-' || id::text,
-             email = id::text || '@deleted.invalid',
+             -- Random, not the id: ids are public (`GET /api/users`), and
+             -- `email` is unique, so anyone who registered `<id>@deleted.invalid`
+             -- first made the account impossible to delete.
+             email = gen_random_uuid()::text || '@deleted.invalid',
              password_hash = '!',
              email_confirmed_at = NULL,
              is_admin = false,
@@ -2503,6 +2534,32 @@ async fn delete_user(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+struct BanRow {
+    id: Uuid,
+    user_id: Option<Uuid>,
+    username: Option<String>,
+    anon_uuid: Option<Uuid>,
+    reason: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Every ban in force, newest first -- what lifting one needs, since
+/// `DELETE /workers/ban/:id` takes the ban's id and nothing else listed them:
+/// a mistaken ban could be lifted only with SQL. One row per banned identity,
+/// so this is bounded by the bans an admin has made.
+async fn list_bans(State(state): State<AppState>, _admin: AdminUser) -> AppResult<Json<Vec<BanRow>>> {
+    Ok(Json(
+        sqlx::query_as::<_, BanRow>(
+            "SELECT b.id, b.user_id, u.username, b.anon_uuid, b.reason, b.created_at
+             FROM worker_bans b LEFT JOIN users u ON u.id = b.user_id
+             ORDER BY b.created_at DESC",
+        )
+        .fetch_all(&state.pool)
+        .await?,
+    ))
 }
 
 #[derive(Deserialize)]

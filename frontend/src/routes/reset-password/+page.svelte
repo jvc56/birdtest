@@ -4,15 +4,22 @@
   let email = '';
   let sent = false;
   let busy = false;
+  let error = '';
 
   async function submit() {
     busy = true;
+    error = '';
     try {
       await api.requestPasswordReset(email);
-    } finally {
       // The server answers 200 either way so this page cannot be used to find
       // out which addresses have accounts.
       sent = true;
+    } catch (e) {
+      // A refusal (a rate limit, the server down) says nothing about the
+      // address -- the limiter answers the same for every one -- and claiming
+      // a link is on its way when none was sent would be a lie.
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
       busy = false;
     }
   }
@@ -28,6 +35,7 @@
       </p>
     </div>
   {:else}
+    {#if error}<p class="field-error mb-4">{error}</p>{/if}
     <form class="card space-y-4" on:submit|preventDefault={submit}>
       <div>
         <label class="label" for="email">Email</label>

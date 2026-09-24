@@ -73,3 +73,8 @@ output "ops_task_definition" {
   description = "The task scripts/prod-sql.sh and scripts/prod-shell.sh run: psql inside the VPC."
   value       = aws_ecs_task_definition.ops.family
 }
+
+output "region" {
+  description = "The stack's region, which scripts/prod-sql.sh and prod-shell.sh run every AWS call in."
+  value       = var.region
+}

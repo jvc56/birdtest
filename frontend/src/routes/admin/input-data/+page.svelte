@@ -17,7 +17,11 @@
   $: knownRows = current?.files.filter((f) => f.disposition === 'known') ?? [];
 
   async function load() {
-    files = await api.inputData();
+    try {
+      files = await api.inputData();
+    } catch (e) {
+      error = `Could not load the input data: ${e instanceof Error ? e.message : String(e)}`;
+    }
   }
   onMount(load);
   onDestroy(() => poll && clearInterval(poll));

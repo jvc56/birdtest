@@ -21,7 +21,11 @@
 
   onMount(() => load(0));
 
-  /** On-demand SPRT jobs count games or pairs; everything else counts tasks. */
+  /**
+   * Every job type counts its own units -- games or pairs, racks analysed,
+   * generations closed -- because tasks are made on demand and a task count is
+   * only what has been handed out so far. Tasks are the fallback.
+   */
   function progress(job: JobListItem): { value: number; max: number; unit: string } {
     if (job.units_completed !== null && job.max_units !== null) {
       return { value: job.units_completed, max: job.max_units, unit: 'units' };

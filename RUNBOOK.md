@@ -109,8 +109,12 @@ renamed birdtest
 # Terraform's state holds the damaged instance by its resource id (db-...),
 # not by name, so it would follow the damaged one under its new name. Point it
 # at the restored one instead; import takes the identifier.
+# With the stack's variables (README.md "Deploying" keeps them in
+# infra/prod.tfvars): import evaluates the whole configuration, in the
+# stack's region. The import must succeed before going on -- after the
+# `state rm`, a failed import leaves nothing in state for the next apply.
 terraform -chdir=infra state rm aws_db_instance.main
-terraform -chdir=infra import aws_db_instance.main birdtest
+terraform -chdir=infra import -var-file=prod.tfvars aws_db_instance.main birdtest
 ```
 
 Left under its restore name, or left out of the state, the next `terraform
@@ -204,7 +208,9 @@ skip.
 Either a PITR instance from just before the mistake (fresher, §1 steps 2–3 with
 a `-scratch-` identifier and no repointing), or the latest nightly dump
 restored into a Postgres of the ops shell's own (`scripts/prod-shell.sh`), the
-way the monthly drill does it:
+way the monthly drill does it. The shell's task stops itself after
+`SHELL_HOURS` (default 4); a large dump on the task's one vCPU can take longer,
+so start it with `SHELL_HOURS=12 scripts/prod-shell.sh` for anything big:
 
 ```bash
 # Inside scripts/prod-shell.sh.
@@ -213,8 +219,13 @@ STAMP=2026-09-07T03-00-00Z
 aws s3 cp "s3://$BACKUP_BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
 mkdir -p /tmp/scratch /tmp/sock && chown postgres /tmp/scratch /tmp/sock
 gosu postgres initdb -D /tmp/scratch -U postgres --auth=trust >/dev/null
+# As the drill starts its own (scripts/restore-drill.sh): no parallel query,
+# whose workers share memory through the task's small /dev/shm and fail a big
+# join part-way, and no durability, which a scratch copy does not need.
 gosu postgres pg_ctl -D /tmp/scratch -w -l /tmp/scratch.log start \
-  -o "-c listen_addresses='' -c unix_socket_directories=/tmp/sock"
+  -o "-c listen_addresses='' -c unix_socket_directories=/tmp/sock \
+      -c max_parallel_workers_per_gather=0 -c fsync=off -c full_page_writes=off \
+      -c synchronous_commit=off"
 SCRATCH_URL="postgresql:///birdtest_scratch?host=/tmp/sock&user=postgres"
 createdb -h /tmp/sock -U postgres birdtest_scratch
 pg_restore -d "$SCRATCH_URL" -j4 --no-owner --no-privileges --exit-on-error /tmp/dump
@@ -346,7 +357,7 @@ UPDATE jobs j
                           ) g),
        racks_analyzed = (SELECT count(DISTINCT p.rack)
                            FROM position_analysis_records p
-                          WHERE p.job_id = j.id)
+                          WHERE p.job_id = j.id AND p.game_index IS NULL)
  WHERE j.id = :'job';
 
 -- Level with the jobs being *served* -- those that issued a claim within the
@@ -382,12 +393,16 @@ completed on, and neither is a row the copy brings back. Put both back from the
 scratch copy's `jobs` row (for a deleted job, the whole row came back in §2.0):
 
 ```sql
-UPDATE jobs SET status = :'old_status', sprt_decided_status = :'old_verdict',
-               sprt_decided_llr = :'old_llr', sprt_decided_units = :'old_units'
+-- Set each variable from the scratch copy's row
+--   SELECT status, sprt_decided_status, sprt_decided_llr, sprt_decided_units
+--   FROM jobs WHERE id = :'job';
+-- and to the empty string where it is NULL (a job an admin completed has no
+-- verdict): :'var' always quotes, so NULLIF is what turns empty back into NULL.
+UPDATE jobs SET status = :'old_status',
+               sprt_decided_status = NULLIF(:'old_verdict', ''),
+               sprt_decided_llr    = NULLIF(:'old_llr', '')::float8,
+               sprt_decided_units  = NULLIF(:'old_units', '')::bigint
  WHERE id = :'job';
--- (from: SELECT status, sprt_decided_status, sprt_decided_llr,
---         sprt_decided_units FROM jobs WHERE id = :'job'  -- in the scratch copy;
---  NULL verdict columns stay NULL.)
 ```
 
 Activating it instead would dispatch more work on a job that had finished.
@@ -579,8 +594,10 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    copy replicates into it as the original did — not the one that was lost.
    `$CLUSTER` below is then `birdtest-dr`.
 2. Set the new instance's master password and the two SSM parameters by hand,
-   exactly as README.md "Deploying" does for a first deploy — Terraform creates
-   the instance with a placeholder password and manages the parameters' names,
+   as README.md "Deploying" does for a first deploy — but in `$DR_REGION`
+   (`--region $DR_REGION` on every command; the CLI's default is likely the
+   lost region) and with `DB_INSTANCE=birdtest-dr`. Terraform creates the
+   instance with a placeholder password and manages the parameters' names,
    never their values. `SESSION_SIGNING_KEY` may be a fresh
    `openssl rand -hex 32`; every session cookie is invalidated, which costs a
    round of logins.

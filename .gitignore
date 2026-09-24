@@ -16,6 +16,8 @@ __pycache__/
 .terraform/
 *.tfstate
 *.tfstate.*
+# The stack's variables (README.md, "Deploying"): account-specific.
+*.tfvars
 
 # Local snapshots taken by scripts/dev-dump.sh
 .dev-backups/

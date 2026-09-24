@@ -11,9 +11,14 @@
 set -euo pipefail
 
 tf() { terraform -chdir="${INFRA_DIR:-infra}" output "$@"; }
+# Every AWS call in the stack's own region, not the CLI's default -- which,
+# during a region loss, is usually the region that was lost.
+export AWS_REGION AWS_DEFAULT_REGION
+AWS_REGION=$(tf -raw region)
+AWS_DEFAULT_REGION=$AWS_REGION
 cluster=$(tf -raw cluster_name)
 # After a region-loss drill the workspace may still be the DR stack's.
-echo "workspace $(terraform -chdir="${INFRA_DIR:-infra}" workspace show), cluster $cluster" >&2
+echo "workspace $(terraform -chdir="${INFRA_DIR:-infra}" workspace show), region $AWS_REGION, cluster $cluster" >&2
 task_definition=$(tf -raw ops_task_definition)
 subnets=$(tf -json service_subnet_ids | jq -r 'join(",")')
 security_group=$(tf -raw service_security_group_id)
@@ -21,10 +26,16 @@ seconds=$(( ${SHELL_HOURS:-4} * 3600 ))
 
 overrides=$(jq -n --arg command "sleep $seconds" \
   '{containerOverrides: [{name: "ops", command: [$command]}]}')
-task_arn=$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" \
+started=$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" \
   --launch-type FARGATE --enable-execute-command \
   --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=ENABLED}" \
-  --overrides "$overrides" --query 'tasks[0].taskArn' --output text)
+  --overrides "$overrides" --output json)
+task_arn=$(jq -r '.tasks[0].taskArn // empty' <<<"$started")
+if [[ -z "$task_arn" ]]; then
+  echo "the task did not start:" >&2
+  jq '.failures' <<<"$started" >&2
+  exit 1
+fi
 trap 'aws ecs stop-task --cluster "$cluster" --task "$task_arn" >/dev/null' EXIT
 echo "starting $task_arn" >&2
 aws ecs wait tasks-running --cluster "$cluster" --tasks "$task_arn"

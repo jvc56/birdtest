@@ -120,7 +120,7 @@ async fn register(
     // an admin is never released this way.
     sqlx::query(
         "DELETE FROM users u
-         WHERE (u.username = $1 OR u.email = $2)
+         WHERE (lower(u.username) = lower($1) OR u.email = $2)
            AND u.email_confirmed_at IS NULL AND u.deleted_at IS NULL AND NOT u.is_admin
            AND NOT EXISTS (
                SELECT 1 FROM email_confirmations c
@@ -133,7 +133,7 @@ async fn register(
     .await?;
 
     let taken = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT EXISTS (SELECT 1 FROM users WHERE username = $1),
+        "SELECT EXISTS (SELECT 1 FROM users WHERE lower(username) = lower($1)),
                 EXISTS (SELECT 1 FROM users WHERE email = $2),
                 EXISTS (SELECT 1 FROM users WHERE email = $2 AND email_confirmed_at IS NOT NULL)",
     )

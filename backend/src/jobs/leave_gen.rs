@@ -63,7 +63,7 @@ impl JobHandler for LeaveGenHandler {
         let row = sqlx::query(
             "SELECT r.lexicon, r.variant, r.letter_distribution, r.board_layout, r.generation,
                     r.seed, r.forced_racks, r.num_games, r.previous_artifact_key, r.use_wordmap,
-                    a.sha256 AS previous_artifact_sha256
+                    COALESCE(a.served_sha256, a.sha256) AS previous_artifact_sha256
              FROM leave_requests r
              JOIN leave_generation_artifacts a ON a.artifact_key = r.previous_artifact_key
              WHERE r.task_id = $1",
@@ -726,7 +726,7 @@ pub async fn next_step(
     // 0 when the job was created, so every generation fetches its leaves the
     // same way.
     let (previous_artifact_key, previous_artifact_sha256) = sqlx::query_as::<_, (String, String)>(
-        "SELECT artifact_key, sha256 FROM leave_generation_artifacts
+        "SELECT artifact_key, COALESCE(served_sha256, sha256) FROM leave_generation_artifacts
          WHERE job_id = $1 AND generation = $2",
     )
     .bind(job_id)
@@ -1471,6 +1471,18 @@ pub async fn rebuild_artifacts(
         let rewritten = !object_present || force;
         if rewritten {
             artifacts.put(&artifact_key, klv).await?;
+            // What workers are sent to check the object against has to be
+            // what the object now holds; `sha256` keeps the first hash.
+            sqlx::query(
+                "UPDATE leave_generation_artifacts
+                 SET served_sha256 = NULLIF($3, sha256)
+                 WHERE job_id = $1 AND generation = $2",
+            )
+            .bind(job_id)
+            .bind(generation)
+            .bind(&rebuilt_sha256)
+            .execute(pool)
+            .await?;
         }
 
         report.push(ArtifactRebuild {

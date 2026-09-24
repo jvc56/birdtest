@@ -70,8 +70,8 @@ at tier 5 names a symptom.
 |---|---|---|
 | 1 Unit | 154 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `stats::sprt` (12), `stats::bradley_terry` (12), `jobs::racks` (13), `error` (7), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `magpie` (3), `models::job` (3), `jobs::opening_rack` (3), `version` (3), `email` (2), `sse` (2), `exports`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes` (1 each) |
 | 1F Frontend unit | 94 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (13), `auth.test.ts` (9), `sse.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 137 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (24), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (6), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 152 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (28), `worker_routes.rs` (15), `auth_routes.rs` (15), `boundaries.rs` (12), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
+| 2 Integration | 138 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (24), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 155 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (29), `worker_routes.rs` (16), `auth_routes.rs` (16), `boundaries.rs` (12), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 13 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 13 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (6), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 470 backend tests.
+--run-ignored all` runs 474 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -475,7 +475,7 @@ path, nothing recognisable, and a bomb by compression ratio.)
 - `U-ARCHIVE-7` A file whose name MAGPIE would refuse as a path — a `.`, a
   space, an empty name — is not importable, so no job can be pinned to it and
   stop every worker it reaches. *(Covered:
-  `inputdata::tests::classifies_the_paths_birdtest_pins`.)* (Twelfth audit.)
+  `inputdata::tests::ignores_what_birdtest_does_not_pin`.)* (Twelfth audit.)
 
 ---
 
@@ -1021,8 +1021,10 @@ job creation touches needs one caller here.
   `leave_generation::every_dispatched_generation_carries_its_predecessors_klv`.)*
 - `I-LEAVE-8` **`rebuild_artifacts` reproduces bytes.** `run_transition` and
   `rebuild_artifacts` share `generation_means` precisely so a rebuild cannot
-  drift; fold, rebuild, compare digests. *(Covered, tier 6 opt-in:
-  `magpie_leave::a_rebuild_reproduces_every_generations_bytes`.)*
+  drift; fold, rebuild, compare digests. And a forced rebuild that writes
+  different bytes records them as `served_sha256` — what workers are told to
+  check the object against — while `sha256` keeps the first hash. *(Covered,
+  tier 6 opt-in: `magpie_leave::a_rebuild_reproduces_every_generations_bytes`.)*
 - `I-LEAVE-9` A job with `generation_count > 1` advances to the next generation
   and finishes after the last. *(Covered:
   `leave_generation::a_two_generation_job_advances_and_finishes_after_its_last`;
@@ -1313,6 +1315,9 @@ runs against a real MinIO.
 - `I-EXPORT-7` The uploaded parts are one gzip stream of exactly the lines
   pushed, and the recorded digest and size describe those bytes. *(Covered:
   `exports::tests::the_parts_are_one_gzip_stream_of_what_was_pushed`.)*
+- `I-EXPORT-8` One export of a job runs at a time: a second request while one
+  is `running` is a 409. *(Covered:
+  `exports::a_job_has_one_export_running_at_a_time`.)* (Thirteenth audit.)
 
 ### `I-DATA-*` — the pinned-row invariant
 
@@ -1444,6 +1449,8 @@ below.
   after, the next registration takes both. *(Covered:
   `auth_routes::an_expired_unconfirmed_account_gives_up_its_address_and_username`.)*
   (Eleventh audit.)
+- `A-AUTH-4c` A username is taken whatever its case. *(Covered:
+  `auth_routes::a_username_is_taken_whatever_its_case`.)* (Thirteenth audit.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
   scored the new password without the account's context. *(Covered:
@@ -1547,6 +1554,10 @@ below.
 - `A-WORKER-14` Worker endpoints are rate limited per identity: the 6th request
   in a second is 429, and a different identity is unaffected. *(Covered:
   `worker_routes::worker_requests_are_limited_per_identity`.)*
+- `A-WORKER-14b` An account's worker is limited per API key: a key's sixth
+  request in a burst is 429 and the account's other key is not. *(Covered:
+  `worker_routes::an_accounts_workers_are_limited_per_key`.)* (Thirteenth
+  audit.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*
@@ -1617,6 +1628,11 @@ below.
   committing). *(Covered:
   `admin_api::a_locked_identity_row_does_not_hold_up_its_requests`.)* (Twelfth
   audit.)
+- `A-ADMIN-18` A deleted account's tombstone address cannot be squatted (a
+  registered `<id>@deleted.invalid` no longer blocks the delete), and the bans
+  in force are listed with the id lifting one takes. *(Covered:
+  `admin_api::a_deleted_accounts_tombstone_cannot_be_squatted_and_bans_are_listed`.)*
+  (Thirteenth audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
