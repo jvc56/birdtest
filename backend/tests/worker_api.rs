@@ -294,16 +294,19 @@ async fn redundant_results_for_one_task_count_once() {
     let (b, uuid_b) = first_claim(&app).await;
     assert_eq!(a["task_request"]["seed"], b["task_request"]["seed"], "same task, two slots");
 
-    for (assignment, uuid) in [(&a, &uuid_a), (&b, &uuid_b)] {
+    // The two copies disagree -- a replay should not, but nothing checks at
+    // submission -- so which one counts is visible: the first accepted, a 2-0,
+    // and not the 0-2 after it.
+    for (assignment, uuid, wins) in [(&a, &uuid_a, 2), (&b, &uuid_b, 0)] {
         let token = assignment["claim_token"].as_str().unwrap();
-        let (_, body) = submit_as(&app, uuid, token, games_result(2, 2)).await;
+        let (_, body) = submit_as(&app, uuid, token, games_result(2, wins)).await;
         assert_eq!(body, json!({ "accepted": true }));
     }
 
     let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
     let games = birdtest::jobstats::game_stats(&db.pool, &job_row).await.unwrap().unwrap();
     assert_eq!(games.units_completed, 2, "two games were played, not four");
-    assert_eq!(games.wins, 2);
+    assert_eq!((games.wins, games.losses), (2, 0), "the first accepted copy, not the second");
 
     // The job list reads a running total instead of re-deriving this on
     // every page view, and it has to answer 2 for the same reason.
@@ -370,6 +373,59 @@ async fn concurrent_redundant_results_count_once() {
 
     let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
     assert_eq!(job_row.games_completed, 2, "two games were played, not four");
+}
+
+/// I-STATS-5b: "first accepted" is acceptance order -- the task's
+/// `accepted_count` read as zero under its row lock -- and every aggregate
+/// must read the same copy the running total counted.
+///
+/// Bug: the aggregates took the copy with the earliest `submitted_at`, which
+/// defaulted to `now()`, the time the submitting *transaction began*. A
+/// submission that began first but reached the task's lock second was
+/// accepted second and still read as first, so SPRT and the ratings used one
+/// copy while the running total had counted the other.
+///
+/// Deterministic: B's submission begins and is held on its own claim row by an
+/// outside lock; A's submission then begins, is accepted, and commits; only
+/// then is B let through. The copies differ (2-0 and 0-2) so the choice shows.
+#[tokio::test]
+async fn the_copy_every_aggregate_reads_is_the_first_accepted_not_the_first_begun() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (a, uuid_a) = first_claim(&app).await;
+    let (b, uuid_b) = first_claim(&app).await;
+    assert_eq!(a["task_request"]["seed"], b["task_request"]["seed"], "same task, two slots");
+    let token_a = a["claim_token"].as_str().unwrap();
+    let token_b = b["claim_token"].as_str().unwrap();
+
+    let mut blocker = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM task_claims WHERE claim_token = $1::uuid FOR UPDATE")
+        .bind(token_b)
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+
+    let overtake = async {
+        // B has begun its transaction and is waiting on its claim row.
+        wait_for_lock_waiters(&db, 1).await;
+        let (status, body) = submit_as(&app, &uuid_a, token_a, games_result(2, 2)).await;
+        assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })));
+        blocker.commit().await.unwrap();
+    };
+    let ((status_b, body_b), ()) =
+        tokio::join!(submit_as(&app, &uuid_b, token_b, games_result(2, 0)), overtake);
+    assert_eq!((status_b, &body_b), (StatusCode::OK, &json!({ "accepted": true })));
+
+    let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(job_row.games_completed, 2, "the running total counted one copy");
+    let games = birdtest::jobstats::game_stats(&db.pool, &job_row).await.unwrap().unwrap();
+    assert_eq!(
+        (games.wins, games.losses),
+        (2, 0),
+        "SPRT reads A's copy, accepted first, not B's, begun first"
+    );
 }
 
 /// The opening-rack detail page reads a running count of analysed racks

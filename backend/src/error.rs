@@ -81,9 +81,13 @@ impl AppError {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 
+    /// A 429 telling the caller to wait `retry_after_secs`. Never less than
+    /// one second: `Retry-After: 0` reads as "retry now", which is the opposite
+    /// of what a rate limit means, and a limiter that computes a sub-second
+    /// wait rounds down to exactly that.
     pub fn rate_limited(retry_after_secs: u64) -> Self {
         Self {
-            retry_after: Some(retry_after_secs),
+            retry_after: Some(retry_after_secs.max(1)),
             ..Self::new(StatusCode::TOO_MANY_REQUESTS, "rate_limited", "too many requests")
         }
     }
@@ -199,6 +203,149 @@ mod tests {
 
     /// A saturated pool is load, not a fault: the caller is told to come back,
     /// and is not shown sqlx's own message.
+    use axum::body::to_bytes;
+    use std::borrow::Cow;
+
+    /// What the client actually receives: status, headers and the JSON body.
+    async fn rendered(err: AppError) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+        let response = err.into_response();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, headers, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// A Postgres error as sqlx reports one, carrying the query text and the
+    /// connection string the way a real driver message can.
+    #[derive(Debug)]
+    struct FakeDbError {
+        code: &'static str,
+        message: String,
+    }
+
+    impl std::fmt::Display for FakeDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for FakeDbError {}
+
+    impl sqlx::error::DatabaseError for FakeDbError {
+        fn message(&self) -> &str {
+            &self.message
+        }
+        fn code(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(self.code))
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn db_error(code: &'static str, message: &str) -> sqlx::Error {
+        sqlx::Error::Database(Box::new(FakeDbError { code, message: message.to_string() }))
+    }
+
+    /// U-ERR-1: every constructor answers with its documented status and code.
+    #[tokio::test]
+    async fn each_constructor_maps_to_its_documented_status() {
+        let cases = [
+            (AppError::bad_request("x"), StatusCode::BAD_REQUEST, "bad_request"),
+            (AppError::unauthorized("x"), StatusCode::UNAUTHORIZED, "unauthorized"),
+            (AppError::forbidden("x"), StatusCode::FORBIDDEN, "forbidden"),
+            (AppError::not_found("x"), StatusCode::NOT_FOUND, "not_found"),
+            (AppError::conflict("x"), StatusCode::CONFLICT, "conflict"),
+            (AppError::rate_limited(3), StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+            (AppError::internal("x"), StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        ];
+        for (err, status, code) in cases {
+            let (got_status, _, body) = rendered(err).await;
+            assert_eq!(got_status, status, "{code}");
+            assert_eq!(body["code"], code);
+        }
+    }
+
+    /// U-ERR-2: the body always carries `code` and `message`, and field
+    /// errors appear under `fields` -- and only when there are some.
+    #[tokio::test]
+    async fn the_body_carries_code_message_and_any_field_errors() {
+        let (_, _, body) = rendered(AppError::bad_request("check the form")).await;
+        assert_eq!(body["code"], "bad_request");
+        assert_eq!(body["message"], "check the form");
+        assert!(body.get("fields").is_none(), "no empty `fields` array: {body}");
+
+        let err = AppError::bad_request("check the form")
+            .with_field("username", "is taken")
+            .with_field("password", "is too short");
+        let (_, _, body) = rendered(err).await;
+        assert_eq!(body["code"], "bad_request");
+        assert_eq!(body["message"], "check the form");
+        assert_eq!(
+            body["fields"],
+            serde_json::json!([
+                {"field": "username", "message": "is taken"},
+                {"field": "password", "message": "is too short"},
+            ])
+        );
+    }
+
+    /// U-ERR-3: `rate_limited(n)` sets `Retry-After: n`, never below 1.
+    #[tokio::test]
+    async fn a_rate_limit_sets_retry_after_and_never_below_one_second() {
+        let (_, headers, _) = rendered(AppError::rate_limited(7)).await;
+        assert_eq!(headers[axum::http::header::RETRY_AFTER], "7");
+        let (_, headers, _) = rendered(AppError::rate_limited(0)).await;
+        assert_eq!(headers[axum::http::header::RETRY_AFTER], "1");
+        let (_, headers, _) = rendered(AppError::bad_request("x")).await;
+        assert!(headers.get(axum::http::header::RETRY_AFTER).is_none());
+    }
+
+    /// U-ERR-4: a database failure is a 500 whose public message carries
+    /// neither the SQL nor the database URL, while the server-side message
+    /// (what is logged) keeps the detail.
+    #[tokio::test]
+    async fn a_database_error_does_not_leak_the_query_or_the_url() {
+        let secret = "syntax error at or near \"SELEC\" in SELEC * FROM users \
+                      (postgres://birdtest:hunter2@db.internal:5432/birdtest)";
+        let err: AppError = db_error("42601", secret).into();
+        assert_eq!(err.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(err.message.contains("SELEC"), "the log keeps the detail: {}", err.message);
+        let (status, _, body) = rendered(err).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], "internal");
+        let text = body.to_string();
+        for leak in ["SELEC", "users", "postgres://", "hunter2", "db.internal"] {
+            assert!(!text.contains(leak), "{leak:?} leaked in {text}");
+        }
+    }
+
+    /// The two violations callers treat as ordinary outcomes keep their
+    /// SQLSTATE, and neither says more than that something conflicted.
+    #[tokio::test]
+    async fn constraint_violations_are_conflicts_without_the_constraint_text() {
+        let unique: AppError =
+            db_error(UNIQUE_VIOLATION, "duplicate key value violates \"users_email_key\"").into();
+        assert!(unique.is_unique_violation());
+        let (status, _, body) = rendered(unique).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!body.to_string().contains("users_email_key"), "{body}");
+
+        let fk: AppError = db_error(FOREIGN_KEY_VIOLATION, "violates \"jobs_config_fk\"").into();
+        let (status, _, body) = rendered(fk).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(!body.to_string().contains("jobs_config_fk"), "{body}");
+    }
+
     #[test]
     fn a_pool_timeout_is_a_503_with_retry_after() {
         let err: AppError = sqlx::Error::PoolTimedOut.into();

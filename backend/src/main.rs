@@ -1,6 +1,6 @@
 use anyhow::Result;
 use birdtest::state::AppState;
-use birdtest::{artifacts, config, db, email, inputdata, ratelimit, ratings, sse};
+use birdtest::{config, db, inputdata, ratings};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -86,35 +86,7 @@ async fn main() -> Result<()> {
     // After the migration, so its connections never see the old schema.
     let read_pool = db::connect_read(&cfg.database_url).await?;
 
-    let state = AppState {
-        pool,
-        read_pool,
-        cfg: cfg.clone(),
-        magpie,
-        builders: Arc::new(builders),
-        sse: sse::SseBroadcaster::new(),
-        finish_checks: Default::default(),
-        derived_ready: Default::default(),
-        templates: Default::default(),
-        leave_merges: Default::default(),
-        shutdown: Default::default(),
-        // A claim's only evidence of life is a heartbeat this process
-        // received, and it has received none yet: see
-        // `scheduler::reclaim_lapsed`.
-        reclaim_from: std::time::Instant::now() + cfg.heartbeat_timeout,
-        limits: ratelimit::RateLimiters::new(),
-        mailer: email::Mailer::new(cfg.clone()).await,
-        artifacts: artifacts::ArtifactStore::new(cfg.clone()).await,
-        result_streams: std::sync::Arc::new(tokio::sync::Semaphore::new(
-            birdtest::state::MAX_CONCURRENT_RESULT_STREAMS,
-        )),
-        http: reqwest::Client::builder()
-            .user_agent("birdtest")
-            .connect_timeout(std::time::Duration::from_secs(30))
-            .read_timeout(std::time::Duration::from_secs(120))
-            .build()
-            .expect("HTTP client"),
-    };
+    let state = AppState::new(cfg.clone(), pool, read_pool, magpie, builders).await;
 
     // Single instance: an import row left `running` belongs to a process that
     // is gone, so nothing else can be working on it.

@@ -489,6 +489,11 @@ both existed.
   prompt to rebuild; an admin creates a new job against the new row, and the old
   derived rows are never collected. Nothing reads them, and each is a row plus a
   hash.
-- **An end-to-end rack info table.** No test builds a real 1.9 GB table through
-  a real `magpie contribute` against a real server. `M-10` and `M-11` in
-  TESTING.md's tier 6 are where that belongs, and both are unwritten.
+- **An end-to-end rack info table at full size.** Tier 6's `M-10`
+  (`scripts/e2e_magpie.py`) runs a `use_rit` job through a real server and a
+  real `magpie contribute`: the job waits for its table, and the worker builds
+  one whose hash is the server's and plays with it. It does so on MAGPIE's
+  two-letter test distribution (`CSW21_ab`, `english_ab`), so the table is
+  tiny; no test builds a real 1.9 GB one. `M-11` forces a `derived_mismatch`
+  by altering the recorded wordmap hash, which stands in for a server whose
+  builder differs.

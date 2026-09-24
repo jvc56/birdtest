@@ -1,5 +1,5 @@
 import { sveltekit } from '@sveltejs/kit/vite';
-import { defineConfig } from 'vite';
+import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
   plugins: [sveltekit()],
@@ -13,5 +13,14 @@ export default defineConfig({
         changeOrigin: true
       }
     }
+  },
+  // Tier 1F (TESTING.md): pure TypeScript, no browser. The globals a module
+  // touches — fetch, document.cookie, EventSource — are stubbed per test, so
+  // the plain Node environment is enough and no DOM library is needed.
+  test: {
+    include: ['src/**/*.test.ts'],
+    environment: 'node',
+    pool: 'threads',
+    poolOptions: { threads: { maxThreads: 2, minThreads: 1 } }
   }
 });

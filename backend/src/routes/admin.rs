@@ -98,7 +98,7 @@ async fn list_input_data(
 /// though, so it is translated into what an admin needs to know.
 async fn delete_input_data(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Path(id): Path<Uuid>,
     method: Method,
     headers: HeaderMap,
@@ -125,13 +125,39 @@ async fn delete_input_data(
         )));
     }
 
+    // Logged in the same transaction as the delete, like every other
+    // destructive admin action: the row it names is gone once this commits.
+    let mut tx = state.pool.begin().await?;
+    // What was built from it goes with it. Nothing pins the file any more, so
+    // no job can need those wordmaps or tables, and nothing else ever reads
+    // them -- but they hold foreign keys to it, and left in place they made
+    // every file anything was ever built from undeletable. Should a job pin
+    // the file between the count above and here, its foreign key fails the
+    // delete below and this goes back with it.
+    sqlx::query(
+        "DELETE FROM derived_data WHERE kwg_id = $1 OR klv_id = $1 OR letterdist_id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     let deleted = sqlx::query("DELETE FROM input_data WHERE id = $1")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
     if deleted.rows_affected() == 0 {
         return Err(AppError::not_found("no such input data row"));
     }
+    audit::log(
+        &mut tx,
+        "input_data.deleted",
+        Some(admin.0.id),
+        None,
+        Some("input_data"),
+        Some(id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -752,7 +778,7 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
 /// only allowed while nothing references the config.
 async fn delete_player_config(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Path(id): Path<Uuid>,
     method: Method,
     headers: HeaderMap,
@@ -783,13 +809,25 @@ async fn delete_player_config(
         ));
     }
 
+    let mut tx = state.pool.begin().await?;
     let deleted = sqlx::query("DELETE FROM player_configs WHERE id = $1")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
     if deleted.rows_affected() == 0 {
         return Err(AppError::not_found("no such player config"));
     }
+    audit::log(
+        &mut tx,
+        "player_config.deleted",
+        Some(admin.0.id),
+        None,
+        Some("player_config"),
+        Some(id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1340,7 +1378,7 @@ async fn insert_job_config(
             // universe the workers never play in.
             let job_data = crate::jobs::load_job_data(&mut *conn, job.id).await?;
             let total_racks =
-                crate::jobs::opening_rack::total_racks(&job_data.letterdist, *rack_size);
+                crate::jobs::opening_rack::total_racks(&job_data.letterdist, *rack_size)?;
             sqlx::query(
                 "INSERT INTO job_opening_rack_config
                      (job_id, player_config_id,
@@ -1453,6 +1491,11 @@ async fn insert_job_config(
                     lexicon.1
                 )));
             }
+            // Every generation seeds and hands out full racks over the pinned
+            // distribution, so one whose racks cannot be spelt is refused now
+            // rather than at the first claim.
+            let job_data = crate::jobs::load_job_data(&mut *conn, job.id).await?;
+            crate::jobs::racks::RackIndex::new(&job_data.letterdist, crate::jobs::leave_gen::RACK_SIZE)?;
             sqlx::query(
                 "INSERT INTO job_leave_config
                      (job_id, kwg_id, num_iterations,

@@ -30,7 +30,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import requests
 
@@ -282,16 +282,21 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
     raise ValueError(f"unknown job type {job_type!r}")
 
 
-def _corrupt(result: dict, rng: random.Random) -> dict:
+# Every way `malformed` mode breaks a submission. Each violates a different rule,
+# so a run with enough tasks exercises all of them.
+CORRUPTIONS = [
+    "wrong_type", "missing_field", "inconsistent_counts", "odd_pair_count", "empty",
+]
+
+
+def _corrupt(result: dict, rng: random.Random, choice: Optional[str] = None) -> dict:
     """Produce a submission the server should reject with 400.
 
-    Each variant violates a different rule, so a run with enough tasks
-    exercises all of them.
+    `choice` names one of `CORRUPTIONS`; left out, one is drawn from `rng`,
+    which is what `malformed` mode does. `--emit-fixture` names each in turn.
     """
-    variants = [
-        "wrong_type", "missing_field", "inconsistent_counts", "odd_pair_count", "empty",
-    ]
-    choice = rng.choice(variants)
+    if choice is None:
+        choice = rng.choice(CORRUPTIONS)
 
     if choice == "empty":
         return {}
@@ -312,6 +317,71 @@ def _corrupt(result: dict, rng: random.Random) -> dict:
         broken["wins"] += 1
         return {**result, "all_games": broken}
     return {"unexpected": True}
+
+
+def _submission(assignment: dict, mode: str, rng: random.Random,
+                p1_win_probability: float) -> Optional[Tuple[str, dict]]:
+    """What a worker in `mode` submits for `assignment`: a claim token and a
+    result, or None when the mode submits nothing at all (`abandon`).
+
+    The one place a submission is built, shared by the running worker and by
+    `--emit-fixture`, so a captured fixture is exactly what a run would send.
+    """
+    if mode == "abandon":
+        # Claim and never submit, so the heartbeat timeout has to reclaim the
+        # task. Pair with a short HEARTBEAT_TIMEOUT_SECONDS.
+        return None
+    token = assignment["claim_token"]
+    result = _result_for(assignment["task_request"], rng, p1_win_probability)
+    if mode == "malformed":
+        result = _corrupt(result, rng)
+    if mode == "stale":
+        # A token that was never issued must be ignored, not accepted. Drawn
+        # from `rng` rather than uuid4() so the mode stays deterministic.
+        token = str(uuid.UUID(int=rng.getrandbits(128), version=4))
+    return token, result
+
+
+def emit_fixture(args: argparse.Namespace) -> None:
+    """Print, without contacting a server, what one worker in `--mode` would
+    submit for the assignment in the file `--emit-fixture` names.
+
+    This is how the server's captured-submission fixtures in
+    `backend/src/jobs/testdata/` are made -- see the README there. The
+    assignment is a claim response (`contract-fixtures/assignment-*.json`);
+    each `--override KEY=JSON` replaces one field of its `task_request` first,
+    which is how a `game_pairs` or position-capturing request is derived from
+    the games assignment. The random stream is worker 0's under `--seed`, so
+    the output is the first submission a `--workers 1` run would make.
+
+    What is printed depends on the mode:
+      normal     the result, as posted under `result`
+      stale      the whole body, `{"claim_token": ..., "result": ...}`
+      malformed  `{variant: result}` for every entry of CORRUPTIONS, rather
+                 than the one a run draws at random
+      abandon    null: the mode submits nothing
+    """
+    with open(args.emit_fixture) as f:
+        assignment = json.load(f)
+    for override in args.override:
+        key, _, value = override.partition("=")
+        assignment["task_request"][key] = json.loads(value)
+    rng = random.Random(f"{args.seed}:0")
+
+    if args.mode == "malformed":
+        result = _result_for(assignment["task_request"], rng, args.p1_win_rate)
+        output = {choice: _corrupt(result, rng, choice) for choice in CORRUPTIONS}
+    elif args.mode in ("normal", "stale", "abandon"):
+        submission = _submission(assignment, args.mode, rng, args.p1_win_rate)
+        if submission is None:
+            output = None
+        elif args.mode == "stale":
+            output = {"claim_token": submission[0], "result": submission[1]}
+        else:
+            output = submission[1]
+    else:
+        raise SystemExit(f"--emit-fixture has nothing to capture for --mode {args.mode}")
+    print(json.dumps(output))
 
 
 # ---------------------------------------------------------------------------
@@ -496,27 +566,19 @@ class FakeWorker:
                 completed += 1
                 continue
 
-            token = assignment["claim_token"]
-            request = assignment["task_request"]
-
-            if self.args.mode == "abandon":
-                # Claim and never submit, so the heartbeat timeout has to
-                # reclaim the task. Pair with a short HEARTBEAT_TIMEOUT_SECONDS.
-                completed += 1
-                continue
-
             try:
-                result = _result_for(request, self.rng, self.args.p1_win_rate)
+                submission = _submission(
+                    assignment, self.args.mode, self.rng, self.args.p1_win_rate
+                )
             except Exception:
                 self.stats.bump("errors")
                 logger.exception("could not build a synthetic result")
                 continue
 
-            if self.args.mode == "malformed":
-                result = _corrupt(result, self.rng)
-            if self.args.mode == "stale":
-                # A token that was never issued must be ignored, not accepted.
-                token = str(uuid.uuid4())
+            if submission is None:
+                completed += 1
+                continue
+            token, result = submission
 
             if self.args.work_seconds:
                 time.sleep(self.args.work_seconds)
@@ -586,7 +648,22 @@ def main() -> None:
     )
     parser.add_argument("--timeout", type=float, default=0.0, help="give up after N seconds")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--emit-fixture", metavar="ASSIGNMENT_JSON",
+        help=(
+            "print what one worker in --mode would submit for this assignment "
+            "and exit, without contacting a server; see emit_fixture()"
+        ),
+    )
+    parser.add_argument(
+        "--override", action="append", default=[], metavar="KEY=JSON",
+        help="with --emit-fixture: replace one task_request field first",
+    )
     args = parser.parse_args()
+
+    if args.emit_fixture:
+        emit_fixture(args)
+        return
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,

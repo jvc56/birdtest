@@ -471,7 +471,16 @@ database never issued is rejected the same way any stale claim is.
 
 - `./scripts/restore-roundtrip.sh` — proves a dump of the current schema
   restores byte-identically into an empty database. Run it after any schema
-  change.
+  change; nightly CI runs it too.
+- `./scripts/backup-drill-check.sh` — runs `backup.sh` and `restore-drill.sh`
+  exactly as their Fargate tasks do (the `postgres:16` image, the script as
+  `bash -c`) against the local stack's Postgres and MinIO: a backup taken while
+  another session keeps writing, the drill of that backup, and a backup that
+  cannot upload. Needs `docker compose up -d --wait postgres minio minio-init`
+  and the schema applied; nightly CI runs it. It contacts no AWS endpoint:
+  both scripts skip their CloudWatch metrics when `AWS_S3_ENDPOINT` names a
+  stand-in object store, and `BACKUP_METRICS=false` (or `=true`) overrides that
+  either way.
 - `scripts/restore-drill.sh` runs monthly in production and restores the newest
   dump into a throwaway database. A failure means the backups are not
   restorable and is the loudest alarm in the system.

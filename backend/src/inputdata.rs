@@ -114,8 +114,8 @@ pub fn input_object_key(sha256: &str) -> String {
 /// the record names a commit rather than a branch.
 pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
     let url = format!(
-        "https://api.github.com/repos/{}/commits/{}",
-        state.cfg.magpie_data_repo, git_ref
+        "{}/repos/{}/commits/{}",
+        state.cfg.github_api_url, state.cfg.magpie_data_repo, git_ref
     );
     let mut request = state
         .http
@@ -194,8 +194,8 @@ async fn download(
     progress: &Progress,
 ) -> AppResult<(Vec<u8>, String)> {
     let base = format!(
-        "https://raw.githubusercontent.com/{}/{}/versioned-tarballs/data-{}.tgz",
-        state.cfg.magpie_data_repo, commit_sha, tarball_date
+        "{}/{}/{}/versioned-tarballs/data-{}.tgz",
+        state.cfg.github_raw_url, state.cfg.magpie_data_repo, commit_sha, tarball_date
     );
 
     let mut body = Vec::new();
@@ -292,7 +292,12 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
     let decoder = flate2::read::GzDecoder::new(compressed);
     let mut archive = tar::Archive::new(decoder);
     let mut files = Vec::new();
+    // Symlinks at pinned paths, resolved once every regular file is read:
+    // (link's mapped path, role, name, target as written, target's archive
+    // path).
+    let mut links: Vec<(String, String, String, String, String)> = Vec::new();
     let mut total_uncompressed: u64 = 0;
+    let mut entry_count: usize = 0;
 
     let entries = archive
         .entries()
@@ -302,7 +307,10 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         let mut entry =
             entry.map_err(|e| AppError::bad_request(format!("malformed tar entry: {e}")))?;
 
-        if files.len() >= limits::ENTRIES {
+        // Every entry, not every pinned file: directories, symlinks and
+        // unrecognised paths are what a hostile archive would multiply.
+        entry_count += 1;
+        if entry_count > limits::ENTRIES {
             return Err(AppError::bad_request(format!(
                 "archive has more than {} entries",
                 limits::ENTRIES
@@ -310,13 +318,14 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         }
 
         let entry_type = entry.header().entry_type();
-        if !entry_type.is_file() {
-            if entry_type.is_dir() {
-                continue;
-            }
-            // A symlink, device or hard link has no business in a data
-            // tarball, and skipping it quietly would make a hostile archive
-            // look ordinary.
+        if entry_type.is_dir() {
+            continue;
+        }
+        // A device or hard link has no business in a data tarball, and
+        // skipping it quietly would make a hostile archive look ordinary. A
+        // symlink is resolved below, within the archive, or refused the same
+        // way.
+        if !entry_type.is_file() && !entry_type.is_symlink() {
             return Err(AppError::bad_request(format!(
                 "archive contains a non-regular entry ({entry_type:?})"
             )));
@@ -331,6 +340,29 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
             return Err(AppError::bad_request(format!(
                 "archive contains an unsafe path: {path:?}"
             )));
+        }
+
+        // MAGPIE-DATA ships aliases as symlinks -- `CSW24_super21.klv2 ->
+        // CSW21_super21.klv2` -- and `download_data.sh` extracts them as such,
+        // so a worker hashing the alias reads the target's bytes. The alias
+        // is pinned with those bytes too. One outside a pinned directory is
+        // skipped like any other unpinned entry; one that points anywhere but
+        // at a pinned file of the same kind in this archive is refused.
+        if entry_type.is_symlink() {
+            let Some((mapped_path, role, name)) = classify(&path) else {
+                continue;
+            };
+            let target = entry
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|target| target.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let Some(resolved) = resolve_link(&path, &target) else {
+                return Err(unresolvable_link(&path, &target));
+            };
+            links.push((mapped_path, role, name, target, resolved));
+            continue;
         }
 
         let size = entry.header().size().unwrap_or(0);
@@ -376,12 +408,78 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         }
     }
 
+    for (mapped_path, role, name, written, target) in &links {
+        // A chain of aliases is followed a few hops, never round a cycle.
+        let mut target = target.clone();
+        let mut resolved = None;
+        for _ in 0..8 {
+            let Some((target_mapped, target_role, _)) = classify(&target) else {
+                break;
+            };
+            if &target_role != role {
+                break;
+            }
+            if let Some(file) = files.iter().find(|f| f.path == target_mapped) {
+                resolved = Some(file);
+                break;
+            }
+            match links.iter().find(|(link, ..)| *link == target_mapped) {
+                Some((.., next)) => target = next.clone(),
+                None => break,
+            }
+        }
+        let Some(file) = resolved else {
+            return Err(unresolvable_link(&format!("data/{mapped_path}"), written));
+        };
+        let alias = ImportedFile {
+            path: mapped_path.clone(),
+            role: role.clone(),
+            name: name.clone(),
+            sha256: file.sha256.clone(),
+            bytes: file.bytes,
+            content: file.content.clone(),
+            object_key: file.object_key.clone(),
+            // The target's own row uploads the bytes; the key is the digest.
+            stored: None,
+        };
+        files.push(alias);
+    }
+
     if files.is_empty() {
         return Err(AppError::bad_request(
             "archive contained no recognisable data files",
         ));
     }
     Ok(files)
+}
+
+/// A symlink's target as an archive path, when it stays inside the archive's
+/// `data/` tree. Relative to the link's own directory, as the filesystem
+/// `download_data.sh` extracts into would read it.
+fn resolve_link(link_path: &str, target: &str) -> Option<String> {
+    if target.is_empty() || target.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = link_path.split('/').collect();
+    parts.pop();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    let resolved = parts.join("/");
+    resolved.starts_with("data/").then_some(resolved)
+}
+
+fn unresolvable_link(path: &str, target: &str) -> AppError {
+    AppError::bad_request(format!(
+        "archive contains a non-regular entry (Symlink) at {path} whose target {target:?} \
+         is not a data file of the same kind in the archive"
+    ))
 }
 
 fn check_expansion(uncompressed: u64, compressed: u64) -> AppResult<()> {
@@ -775,6 +873,85 @@ mod tests {
         assert!(err.message.contains("non-regular"), "{}", err.message);
     }
 
+    /// A tar of regular files and then symlinks, as (path, target) pairs --
+    /// the order MAGPIE-DATA's own tarball happens to put the targets in last
+    /// is covered by listing a link before its target.
+    fn tarball_with_links(files: &[(&str, &[u8])], links: &[(&str, &str)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, target) in links {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            builder.append_link(&mut header, path, target).unwrap();
+        }
+        for (path, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *bytes).unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// data-20251004.tgz, as re-cut upstream, carries aliases as symlinks
+    /// (`data/lexica/CSW24_super21.klv2 -> CSW21_super21.klv2`, and a chain
+    /// of them) and refusing them refused the whole release. An alias is
+    /// pinned with the bytes `download_data.sh` leaves a worker reading
+    /// through it: its target's.
+    #[test]
+    fn a_symlink_alias_is_pinned_with_its_targets_bytes() {
+        let archive = tarball_with_links(
+            &[("data/lexica/CSW21_super21.klv2", b"klv-bytes" as &[u8])],
+            &[
+                ("data/lexica/CSW24_super21.klv2", "CSW21_super21.klv2"),
+                ("data/lexica/CSW15_super21.klv2", "./CSW24_super21.klv2"),
+                ("data/lexica/CSW12_super21.klv2", "../lexica/CSW21_super21.klv2"),
+                // Outside anything birdtest pins: skipped, as a file there is.
+                ("data/strategy/NWL23_super21.pat", "CSW24_super21.pat"),
+            ],
+        );
+        let files = walk_archive(&archive, None).unwrap();
+        assert_eq!(files.len(), 4, "{files:?}");
+        let digest = hex::encode(Sha256::digest(b"klv-bytes"));
+        for name in ["CSW21_super21", "CSW24_super21", "CSW15_super21", "CSW12_super21"] {
+            let file = files.iter().find(|f| f.name == name).unwrap();
+            assert_eq!((file.role.as_str(), file.sha256.as_str()), ("klv", digest.as_str()));
+            assert_eq!(file.path, format!("lexica/{name}.klv2"));
+            assert_eq!(file.object_key.as_deref(), Some(input_object_key(&digest).as_str()));
+        }
+        // One upload for the one set of bytes.
+        assert_eq!(files.iter().filter(|f| f.stored.is_some()).count(), 1);
+    }
+
+    /// A symlink at a pinned path that leaves the archive, dangles, loops, or
+    /// names a file of another kind is refused rather than skipped: it is
+    /// exactly what a hostile archive would use to look ordinary.
+    #[test]
+    fn a_symlink_that_is_not_an_alias_inside_the_archive_is_refused() {
+        let files: &[(&str, &[u8])] =
+            &[("data/lexica/NWL23.kwg", b"kwg"), ("data/lexica/NWL23.klv2", b"klv")];
+        for (link, target) in [
+            ("data/lexica/evil.klv2", "../../../etc/passwd"),
+            ("data/lexica/evil.klv2", "/etc/passwd"),
+            ("data/lexica/evil.klv2", "missing.klv2"),
+            ("data/lexica/evil.klv2", "NWL23.kwg"),
+            ("data/lexica/evil.klv2", "evil.klv2"),
+            ("data/lexica/evil.klv2", "../strategy/winpct.csv"),
+        ] {
+            let archive = tarball_with_links(files, &[(link, target)]);
+            let err = walk_archive(&archive, None).unwrap_err();
+            assert!(err.message.contains("non-regular"), "{target}: {}", err.message);
+            assert!(err.message.contains(target), "{target}: {}", err.message);
+        }
+    }
+
     #[test]
     fn rejects_a_traversing_path() {
         // The name is written into the header directly: `Builder::append_data`
@@ -815,5 +992,157 @@ mod tests {
         let archive = tarball(&[("data/lexica/BOMB.kwg", payload.as_slice())]);
         let err = walk_archive(&archive, None).unwrap_err();
         assert!(err.message.contains("expands"), "{}", err.message);
+    }
+
+    /// Gzips a raw tar stream built by the caller, header by header.
+    fn gzip(tar: &[u8]) -> Vec<u8> {
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// A header of the given type, path and claimed size, checksummed.
+    fn header(path: &str, entry_type: tar::EntryType, size: u64) -> tar::Header {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_entry_type(entry_type);
+        header.set_cksum();
+        header
+    }
+
+    /// PLAN.md, "Limits, all enforced during the walk": single entry 128 MiB.
+    /// Judged from the header, before a byte of the entry is read: the archive
+    /// here is a header claiming one byte over the cap and *no data at all*,
+    /// so a walk that read first would fail on the truncation instead.
+    #[test]
+    fn an_entry_whose_header_claims_more_than_the_per_entry_cap_is_refused_unread() {
+        let claimed = limits::ENTRY_BYTES + 1;
+        let archive = gzip(header("data/lexica/HUGE.kwg", tar::EntryType::Regular, claimed).as_bytes());
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(err.message.contains("per-entry cap"), "{}", err.message);
+        assert!(err.message.contains("data/lexica/HUGE.kwg"), "{}", err.message);
+
+        // Exactly at the cap is not refused by that rule: the same truncated
+        // archive then fails on the missing bytes, which is what proves the
+        // refusal above came before the read.
+        let archive = gzip(
+            header("data/lexica/HUGE.kwg", tar::EntryType::Regular, limits::ENTRY_BYTES).as_bytes(),
+        );
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(!err.message.contains("per-entry cap"), "{}", err.message);
+    }
+
+    /// PLAN.md's allowlist: regular files only (plus aliases resolved inside
+    /// the archive). A hard link, a character or block device and a FIFO are
+    /// each refused rather than skipped, even at a path birdtest ignores.
+    #[test]
+    fn hard_link_and_device_entries_are_refused() {
+        for (entry_type, path) in [
+            (tar::EntryType::Link, "data/lexica/NWL23.kwg"),
+            (tar::EntryType::Link, "data/quackle/linked.dat"),
+            (tar::EntryType::Char, "data/lexica/tty.kwg"),
+            (tar::EntryType::Block, "data/quackle/sda"),
+            (tar::EntryType::Fifo, "data/layouts/pipe.txt"),
+        ] {
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut regular = header("data/lexica/REAL.kwg", tar::EntryType::Regular, 3);
+            builder.append_data(&mut regular, "data/lexica/REAL.kwg", b"kwg" as &[u8]).unwrap();
+            let mut odd = header(path, entry_type, 0);
+            if entry_type == tar::EntryType::Link {
+                odd.set_link_name("data/lexica/REAL.kwg").unwrap();
+                odd.set_cksum();
+            }
+            builder.append(&odd, std::io::empty()).unwrap();
+            let archive = gzip(&builder.into_inner().unwrap());
+
+            let err = walk_archive(&archive, None).unwrap_err();
+            assert!(
+                err.message.contains(&format!("non-regular entry ({entry_type:?})")),
+                "{entry_type:?} at {path}: {}",
+                err.message
+            );
+        }
+    }
+
+    /// PLAN.md: total uncompressed bytes 1 GiB. Every entry's size counts,
+    /// pinned or not, and the cap holds where the ratio does not catch it --
+    /// here nine unpinned entries of zeros total 1 GiB and a byte, and the
+    /// compressed input is padded past 1/20th of that (trailing bytes after
+    /// the gzip member, which the decoder never reads), so only the total can
+    /// refuse it.
+    #[test]
+    fn an_archive_expanding_past_the_total_cap_is_refused() {
+        let entry = limits::ENTRY_BYTES;
+        let entries = limits::UNCOMPRESSED_BYTES / entry;
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let zeros = vec![0u8; 1024 * 1024];
+        for i in 0..entries {
+            let head = header(&format!("data/quackle/part{i}.dat"), tar::EntryType::Regular, entry);
+            std::io::Write::write_all(&mut encoder, head.as_bytes()).unwrap();
+            for _ in 0..entry / zeros.len() as u64 {
+                std::io::Write::write_all(&mut encoder, &zeros).unwrap();
+            }
+        }
+        // One byte more, at a path birdtest pins.
+        let last = header("data/lexica/LAST.kwg", tar::EntryType::Regular, 1);
+        std::io::Write::write_all(&mut encoder, last.as_bytes()).unwrap();
+        std::io::Write::write_all(&mut encoder, &[b'x'; 512]).unwrap();
+        std::io::Write::write_all(&mut encoder, &[0u8; 1024]).unwrap();
+        let mut archive = encoder.finish().unwrap();
+        let ratio_floor = (limits::UNCOMPRESSED_BYTES + 1) / limits::EXPANSION_RATIO + 1;
+        archive.resize(ratio_floor as usize, 0);
+
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(err.message.contains("GiB cap"), "{}", err.message);
+    }
+
+    /// PLAN.md: entry count 5,000 -- entries, not pinned files. Directories,
+    /// symlinks and files at paths birdtest ignores are all entries a hostile
+    /// archive could multiply, and they once went uncounted: the check read
+    /// the number of pinned files, so any number of the rest walked through.
+    #[test]
+    fn an_archive_of_more_than_the_entry_cap_is_refused_whatever_the_entries_are() {
+        fn archive_of(unpinned: usize) -> Vec<u8> {
+            let mut builder = tar::Builder::new(Vec::new());
+            for i in 0..unpinned {
+                let (path, entry_type) = match i % 3 {
+                    0 => (format!("data/quackle/d{i}/"), tar::EntryType::Directory),
+                    1 => (format!("data/quackle/f{i}.dat"), tar::EntryType::Regular),
+                    _ => (format!("data/quackle/l{i}.dat"), tar::EntryType::Symlink),
+                };
+                let mut head = header(&path, entry_type, 0);
+                if entry_type == tar::EntryType::Symlink {
+                    head.set_link_name("f1.dat").unwrap();
+                    head.set_cksum();
+                }
+                builder.append(&head, std::io::empty()).unwrap();
+            }
+            let mut pinned = header("data/lexica/NWL23.kwg", tar::EntryType::Regular, 3);
+            builder.append_data(&mut pinned, "data/lexica/NWL23.kwg", b"kwg" as &[u8]).unwrap();
+            gzip(&builder.into_inner().unwrap())
+        }
+
+        // 5,000 entries, one of them pinned: at the cap, accepted.
+        let files = walk_archive(&archive_of(limits::ENTRIES - 1), None).unwrap();
+        assert_eq!(files.len(), 1);
+
+        // 5,001: refused, although only one of them is a pinned file.
+        let err = walk_archive(&archive_of(limits::ENTRIES), None).unwrap_err();
+        assert!(err.message.contains("more than 5000 entries"), "{}", err.message);
+    }
+
+    /// The limits are PLAN.md's table; a change to one is a design change.
+    #[test]
+    fn the_walk_limits_are_the_ones_the_design_states() {
+        assert_eq!(limits::COMPRESSED_BYTES, 512 * 1024 * 1024);
+        assert_eq!(limits::CHUNKS, 64);
+        assert_eq!(limits::UNCOMPRESSED_BYTES, 1024 * 1024 * 1024);
+        assert_eq!(limits::EXPANSION_RATIO, 20);
+        assert_eq!(limits::ENTRY_BYTES, 128 * 1024 * 1024);
+        assert_eq!(limits::ENTRIES, 5_000);
     }
 }

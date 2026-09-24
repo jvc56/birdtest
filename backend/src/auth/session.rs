@@ -73,3 +73,77 @@ pub fn verify(cfg: &Config, token: &str) -> AppResult<SessionClaims> {
         .ok_or_else(|| AppError::unauthorized("session has no generation; sign in again"))?;
     Ok(SessionClaims { user_id, generation })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(key: &str, ttl_seconds: &str) -> Config {
+        let pairs = [
+            ("DATABASE_URL", "postgres://a:b@c/d".to_string()),
+            ("SESSION_SIGNING_KEY", key.to_string()),
+            ("SESSION_TTL_SECONDS", ttl_seconds.to_string()),
+        ];
+        Config::from_lookup(&move |k: &str| {
+            pairs.iter().find(|(name, _)| *name == k).map(|(_, v)| v.clone())
+        })
+        .unwrap()
+    }
+
+    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+    const OTHER_KEY: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
+
+    /// U-AUTH-4: a token carries its subject and generation through a round
+    /// trip, and any altered byte makes it fail. (Username and the admin flag
+    /// are in the token too, but nothing trusts them: the extractor reads the
+    /// user's row, which is what lets a demotion take effect at once.)
+    #[test]
+    fn a_session_round_trips_and_any_altered_byte_fails() {
+        let cfg = config(KEY, "3600");
+        let user = Uuid::new_v4();
+        let token = issue(&cfg, user, "alice", true, 7).unwrap();
+        let claims = verify(&cfg, &token).unwrap();
+        assert_eq!(claims.user_id, user);
+        assert_eq!(claims.generation, 7);
+
+        let prefix = "v4.local.".len();
+        for i in (prefix..token.len()).step_by(7) {
+            let mut bytes = token.clone().into_bytes();
+            bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
+            let altered = String::from_utf8(bytes).unwrap();
+            if altered == token {
+                continue;
+            }
+            let err = verify(&cfg, &altered).unwrap_err();
+            assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED, "byte {i}");
+        }
+    }
+
+    /// U-AUTH-5: a token minted under another key is not a session here.
+    #[test]
+    fn a_session_signed_with_another_key_fails() {
+        let token = issue(&config(OTHER_KEY, "3600"), Uuid::new_v4(), "bob", false, 0).unwrap();
+        let err = verify(&config(KEY, "3600"), &token).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// U-AUTH-6: an expired session is refused. Issued with a zero TTL it has
+    /// expired by the time it is checked; no waiting.
+    #[test]
+    fn an_expired_session_is_rejected() {
+        let cfg = config(KEY, "0");
+        let token = issue(&cfg, Uuid::new_v4(), "carol", false, 0).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let err = verify(&cfg, &token).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+        assert!(err.message.contains("expired"), "{}", err.message);
+    }
+
+    #[test]
+    fn garbage_is_not_a_session() {
+        let cfg = config(KEY, "3600");
+        for token in ["", "v4.local.", "v4.public.abc", "not-a-token"] {
+            assert!(verify(&cfg, token).is_err(), "{token:?}");
+        }
+    }
+}

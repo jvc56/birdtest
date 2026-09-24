@@ -38,6 +38,17 @@ fn session_cookie(state: &AppState, value: String) -> Cookie<'static> {
     cookie
 }
 
+/// The removal of a cookie set by the two functions around this one. A
+/// browser replaces a cookie only with one of the same path, and gives a
+/// cookie that names none the directory of the request that set it -- here
+/// `/api/auth` -- so a removal without `Path=/` removed nothing and the
+/// session cookie outlived the logout.
+fn removal(name: &'static str) -> Cookie<'static> {
+    let mut cookie = Cookie::from(name);
+    cookie.set_path("/");
+    cookie
+}
+
 /// Readable by JavaScript on purpose — the frontend echoes it back in the
 /// `X-CSRF-Token` header, which is what makes the double-submit check work.
 fn csrf_cookie(state: &AppState, value: String) -> Cookie<'static> {
@@ -61,6 +72,19 @@ struct MessageBody {
     message: &'static str,
 }
 
+/// Whether `password` scores below the minimum, given the account's username
+/// and address as context. The address's local part is context of its own:
+/// zxcvbn matches each input whole, so the address alone let `jsmith` through
+/// for `jsmith@example.com`.
+fn too_weak(password: &str, username: &str, email: &str) -> AppResult<bool> {
+    let local_part = email.split('@').next().unwrap_or_default();
+    let context: Vec<&str> =
+        [username, email, local_part].into_iter().filter(|c| !c.is_empty()).collect();
+    let entropy = zxcvbn::zxcvbn(password, &context)
+        .map_err(|e| AppError::bad_request(format!("could not score password: {e}")))?;
+    Ok(entropy.score() < MIN_PASSWORD_SCORE)
+}
+
 async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -79,9 +103,7 @@ async fn register(
         err = err.with_field("email", "must be a valid email address");
     }
     // Scored server-side; the client shows the same feedback but is not trusted.
-    let entropy = zxcvbn::zxcvbn(&body.password, &[username.as_str(), email.as_str()])
-        .map_err(|e| AppError::bad_request(format!("could not score password: {e}")))?;
-    if entropy.score() < MIN_PASSWORD_SCORE {
+    if too_weak(&body.password, &username, &email)? {
         err = err.with_field("password", "too weak — choose a longer, less predictable password");
     }
     if !err.fields.is_empty() {
@@ -258,8 +280,8 @@ async fn logout(
 ) -> AppResult<(CookieJar, StatusCode)> {
     csrf::verify(&method, &headers, &jar)?;
     let jar = jar
-        .remove(Cookie::from(session::SESSION_COOKIE))
-        .remove(Cookie::from(csrf::CSRF_COOKIE));
+        .remove(removal(session::SESSION_COOKIE))
+        .remove(removal(csrf::CSRF_COOKIE));
     let _ = state;
     Ok((jar, StatusCode::NO_CONTENT))
 }
@@ -291,8 +313,8 @@ async fn sign_out_everywhere(
     .await?;
     tx.commit().await?;
     let jar = jar
-        .remove(Cookie::from(session::SESSION_COOKIE))
-        .remove(Cookie::from(csrf::CSRF_COOKIE));
+        .remove(removal(session::SESSION_COOKIE))
+        .remove(removal(csrf::CSRF_COOKIE));
     Ok((jar, StatusCode::NO_CONTENT))
 }
 
@@ -411,11 +433,14 @@ async fn confirm_password_reset(
     jar: CookieJar,
     ApiJson(body): ApiJson<ResetConfirmBody>,
 ) -> AppResult<(CookieJar, Json<MessageBody>)> {
-    let entropy = zxcvbn::zxcvbn(&body.password, &[])
-        .map_err(|e| AppError::bad_request(format!("could not score password: {e}")))?;
-    if entropy.score() < MIN_PASSWORD_SCORE {
-        return Err(AppError::bad_request("password is invalid")
-            .with_field("password", "too weak — choose a longer, less predictable password"));
+    let weak = || {
+        AppError::bad_request("password is invalid")
+            .with_field("password", "too weak — choose a longer, less predictable password")
+    };
+    // Scored once before the token is looked at, so a weak password costs no
+    // database work, and again below against the account it resets.
+    if too_weak(&body.password, "", "")? {
+        return Err(weak());
     }
 
     let mut tx = state.pool.begin().await?;
@@ -428,6 +453,18 @@ async fn confirm_password_reset(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| AppError::bad_request("that reset link is invalid or has expired"))?;
+
+    // The same rule registration applies: not the username, not the address.
+    // Returning here rolls the transaction back, so the link still works for
+    // a better password.
+    let (username, email) =
+        sqlx::query_as::<_, (String, String)>("SELECT username, email FROM users WHERE id = $1")
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if too_weak(&body.password, &username, &email)? {
+        return Err(weak());
+    }
 
     // The generation bump signs out every existing session, an attacker's
     // included: resetting a password is what someone does when they suspect
@@ -454,6 +491,6 @@ async fn confirm_password_reset(
 
     // Every session was revoked above; dropping the cookie just tidies the
     // caller's browser.
-    let jar = jar.remove(Cookie::from(session::SESSION_COOKIE));
+    let jar = jar.remove(removal(session::SESSION_COOKIE));
     Ok((jar, Json(MessageBody { message: "password updated" })))
 }

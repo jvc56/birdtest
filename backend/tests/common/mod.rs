@@ -131,6 +131,26 @@ pub fn test_builders() -> birdtest::magpie::Builders {
     }
 }
 
+/// Credentials are resolved lazily, on the first S3 call. Without these the
+/// SDK walks the whole default chain -- including the EC2 instance metadata
+/// endpoint, which is unroutable here and takes about a minute to give up on
+/// -- so a test that touched the object store at all hung for that long
+/// before failing.
+fn aws_env() {
+    for (key, value) in [
+        // The compose MinIO's root credentials, which is what
+        // `state_with_object_store` talks to; nothing else sends them.
+        ("AWS_ACCESS_KEY_ID", "birdtest"),
+        ("AWS_SECRET_ACCESS_KEY", "birdtestbirdtest"),
+        ("AWS_REGION", "us-east-1"),
+        ("AWS_EC2_METADATA_DISABLED", "true"),
+    ] {
+        if std::env::var_os(key).is_none() {
+            std::env::set_var(key, value);
+        }
+    }
+}
+
 pub struct TestDb {
     pub pool: PgPool,
     pub url: String,
@@ -174,6 +194,7 @@ impl TestDb {
             session_ttl: Duration::from_secs(3600),
             secure_cookies: false,
             mail_backend: MailBackend::Console,
+            mail_outbox_dir: None,
             mail_from: "test@birdtest.local".into(),
             public_url: "http://localhost".into(),
             heartbeat_timeout: Duration::from_secs(300),
@@ -192,28 +213,47 @@ impl TestDb {
             magpie_threads: 1,
             magpie_data_repo: "example/data".into(),
             github_token: None,
+            // Unreachable for the same reason as the object store above.
+            github_api_url: "http://127.0.0.1:9".into(),
+            github_raw_url: "http://127.0.0.1:9".into(),
             trusted_proxy_hops: 0,
         }
     }
 
     pub async fn state(&self) -> AppState {
-        // Credentials are resolved lazily, on the first S3 call. Without these
-        // the SDK walks the whole default chain -- including the EC2 instance
-        // metadata endpoint, which is unroutable here and takes about a minute
-        // to give up on -- so a test that touches the object store at all hung
-        // for that long before failing. The endpoint above is closed, so these
-        // are never used for anything.
-        for (key, value) in [
-            ("AWS_ACCESS_KEY_ID", "test"),
-            ("AWS_SECRET_ACCESS_KEY", "test"),
-            ("AWS_REGION", "us-east-1"),
-            ("AWS_EC2_METADATA_DISABLED", "true"),
-        ] {
-            if std::env::var_os(key).is_none() {
-                std::env::set_var(key, value);
-            }
-        }
-        let cfg = Arc::new(self.config());
+        self.state_with(self.config()).await
+    }
+
+    /// A state whose object store is real: a fresh bucket on the MinIO named
+    /// by `TEST_S3_ENDPOINT`, emptied and removed when the returned
+    /// `TestBucket` is dropped. For the tests that are *about* the object
+    /// store -- an artifact's bytes, an input file's key -- and only those;
+    /// everything else keeps the closed endpoint, so an accidental upload
+    /// fails instead of passing silently.
+    ///
+    /// Like `TEST_DATABASE_URL`, a missing `TEST_S3_ENDPOINT` fails the test
+    /// rather than skipping it. Against the compose stack:
+    /// `TEST_S3_ENDPOINT=http://localhost:9000` (its MinIO's credentials are
+    /// the defaults below).
+    pub async fn state_with_object_store(&self) -> (AppState, TestBucket) {
+        let endpoint = std::env::var("TEST_S3_ENDPOINT").expect(
+            "TEST_S3_ENDPOINT is required for object-store tests (see TESTING.md, tier 2), \
+             e.g. http://localhost:9000 against the compose MinIO",
+        );
+        let mut cfg = self.config();
+        cfg.s3_endpoint = Some(endpoint.clone());
+        cfg.s3_bucket = format!("bt-{}", &Uuid::new_v4().simple().to_string()[..20]);
+        aws_env();
+        let bucket = TestBucket::create(&endpoint, &cfg.s3_bucket).await;
+        (self.state_with(cfg).await, bucket)
+    }
+
+    /// A state built from `cfg`, for a test that needs a setting `config()`
+    /// does not have -- a mail outbox, a heartbeat timeout, a version floor.
+    /// Start from `self.config()` and change what the test is about.
+    pub async fn state_with(&self, cfg: Config) -> AppState {
+        aws_env();
+        let cfg = Arc::new(cfg);
         AppState {
             result_streams: std::sync::Arc::new(tokio::sync::Semaphore::new(
                 birdtest::state::MAX_CONCURRENT_RESULT_STREAMS,
@@ -456,4 +496,79 @@ pub fn get_request(path: &str, headers: &[(String, String)]) -> Request<Body> {
         builder = builder.header(name.as_str(), value.as_str());
     }
     builder.body(Body::empty()).unwrap()
+}
+
+/// A bucket that exists for one test. Dropping it deletes every object in it
+/// and then the bucket, on a thread of its own because `Drop` cannot await --
+/// blocking, so a test that ends does not leave its objects behind it.
+pub struct TestBucket {
+    pub name: String,
+    endpoint: String,
+}
+
+fn s3_client(endpoint: &str, config: &aws_config::SdkConfig) -> aws_sdk_s3::Client {
+    let conf = aws_sdk_s3::config::Builder::from(config)
+        .endpoint_url(endpoint)
+        .force_path_style(true)
+        .build();
+    aws_sdk_s3::Client::from_conf(conf)
+}
+
+impl TestBucket {
+    async fn create(endpoint: &str, name: &str) -> Self {
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        s3_client(endpoint, &config)
+            .create_bucket()
+            .bucket(name)
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("could not create a test bucket on {endpoint}: {e:?}"));
+        TestBucket { name: name.to_string(), endpoint: endpoint.to_string() }
+    }
+
+    /// Every key in the bucket, for asserting what a test left there.
+    pub async fn keys(&self) -> Vec<String> {
+        let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+        list_keys(&s3_client(&self.endpoint, &config), &self.name).await
+    }
+}
+
+async fn list_keys(client: &aws_sdk_s3::Client, bucket: &str) -> Vec<String> {
+    let mut keys = Vec::new();
+    let mut pages = client.list_objects_v2().bucket(bucket).into_paginator().send();
+    while let Some(page) = pages.next().await {
+        let page = page.expect("list the test bucket");
+        keys.extend(page.contents().iter().filter_map(|o| o.key().map(str::to_string)));
+    }
+    keys
+}
+
+impl Drop for TestBucket {
+    fn drop(&mut self) {
+        let (endpoint, name) = (self.endpoint.clone(), self.name.clone());
+        let cleanup = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async {
+                let config = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
+                let client = s3_client(&endpoint, &config);
+                for key in list_keys(&client, &name).await {
+                    let _ = client.delete_object().bucket(&name).key(key).send().await;
+                }
+                let uploads = client.list_multipart_uploads().bucket(&name).send().await;
+                if let Ok(uploads) = uploads {
+                    for upload in uploads.uploads() {
+                        let _ = client
+                            .abort_multipart_upload()
+                            .bucket(&name)
+                            .key(upload.key().unwrap_or_default())
+                            .upload_id(upload.upload_id().unwrap_or_default())
+                            .send()
+                            .await;
+                    }
+                }
+                let _ = client.delete_bucket().bucket(&name).send().await;
+            });
+        });
+        let _ = cleanup.join();
+    }
 }

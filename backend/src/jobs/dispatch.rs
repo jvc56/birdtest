@@ -80,7 +80,7 @@ impl JobTemplate {
                 .fetch_one(&mut *conn)
                 .await?;
                 let player = super::load_player_spec(conn, config.player_config_id).await?;
-                let index = RackIndex::new(&data.letterdist, config.rack_size as usize);
+                let index = RackIndex::new(&data.letterdist, config.rack_size as usize)?;
                 JobKind::OpeningRack { config, player, index }
             }
             JobType::Games => {

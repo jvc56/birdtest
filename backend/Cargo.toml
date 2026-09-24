@@ -41,3 +41,14 @@ tar = "0.4"
 [dev-dependencies]
 # `ServiceExt::oneshot`, so integration tests drive the real router in-process.
 tower = { version = "0.4", features = ["util"] }
+
+# Argon2 unoptimised takes over a second a hash. The rate-limit tests make
+# ten or eleven attempts inside a limiter that refills a token every six
+# seconds, and at that speed a CI runner's window closed before the last
+# attempt landed. Optimising the hashing crates alone keeps a debug build
+# quick to compile and makes each hash a few milliseconds.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

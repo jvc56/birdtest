@@ -258,6 +258,17 @@ pub fn check_rack_occurrence_total(racks: &[RackOccurrence], num_games: i32) -> 
 /// asked. `expected_games` is the job's batch size -- doubled for pairs, which
 /// play two games each -- which every request of the job denormalizes and
 /// which the job's template carries, so no request row is read for it.
+/// The games a game task was dispatched to play, which is what
+/// [`check_batch_size`] holds its result to: the job's batch size, which counts
+/// pairs -- two games each -- when `game_pairs` is set, as on the request.
+pub fn games_dispatched(batch_size: i32, game_pairs: bool) -> i32 {
+    if game_pairs {
+        batch_size.saturating_mul(2)
+    } else {
+        batch_size
+    }
+}
+
 pub fn check_batch_size(reported_games: i32, expected_games: i32) -> AppResult<()> {
     if reported_games != expected_games {
         return Err(AppError::bad_request(format!(
@@ -418,31 +429,337 @@ mod tests {
         let spread: Vec<_> = (0..101).map(|i| occurrence(&format!("R{i:06}"), 1_000)).collect();
         assert!(check_rack_occurrence_total(&spread, 100).is_err());
     }
+
+    /// U-PLAUS-1: a pairs job's batch size counts pairs, so the games it
+    /// dispatched are twice that; a games job's batch is already games. The
+    /// confusion the `min_pairs`/`max_pairs` naming exists to prevent.
+    /// (TESTING.md calls this `check_against_task`; the rule is
+    /// `check_batch_size` against `games_dispatched`, which `registry::
+    /// store_result` runs for both job types.)
+    #[test]
+    fn a_pairs_batch_dispatches_two_games_a_pair_and_a_games_batch_does_not() {
+        assert_eq!(games_dispatched(10, true), 20);
+        assert_eq!(games_dispatched(10, false), 10);
+
+        // Ten pairs are answered with twenty games, never ten.
+        assert!(check_batch_size(20, games_dispatched(10, true)).is_ok());
+        assert!(check_batch_size(10, games_dispatched(10, true)).is_err());
+        // Ten games are answered with ten, never twenty.
+        assert!(check_batch_size(10, games_dispatched(10, false)).is_ok());
+        assert!(check_batch_size(20, games_dispatched(10, false)).is_err());
+
+        // A batch size at the top of i32 cannot wrap into a small target.
+        assert_eq!(games_dispatched(i32::MAX, true), i32::MAX);
+    }
+
+    /// U-PLAUS-2: exactly the dispatched count passes; one more or one fewer,
+    /// for either job type, is refused and says why.
+    #[test]
+    fn a_batch_one_game_off_in_either_direction_is_rejected() {
+        for (batch, pairs) in [(10, false), (10, true), (1, false), (1, true)] {
+            let dispatched = games_dispatched(batch, pairs);
+            assert!(check_batch_size(dispatched, dispatched).is_ok());
+            for reported in [dispatched - 1, dispatched + 1] {
+                let error = check_batch_size(reported, dispatched).unwrap_err();
+                assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+                assert!(
+                    error.message.contains(&format!(
+                        "reports {reported} games but this task dispatched {dispatched}"
+                    )),
+                    "{}",
+                    error.message
+                );
+            }
+        }
+    }
 }
 
+/// Captured `worker/fake_worker.py` submissions, checked against what the
+/// server runs on a submission before storing it.
+///
+/// The fake worker is the only client below tier 6, so a shape drift there is
+/// invisible until a job of that type is actually run: its opening-rack
+/// submission once read a `position` field the request does not have and
+/// answered with a bare `{"moves": [...]}`, which no opening-rack job could
+/// ever accept. Every fixture here is the worker's own output, never written
+/// by hand: `testdata/README.md` has the command that regenerates each one,
+/// and each test repeats its own.
 #[cfg(test)]
 mod fixture_tests {
-    use super::super::handler::PositionAnalysisResponse;
+    use super::super::game::GameHandler;
+    use super::super::game_pair::GamePairHandler;
+    use super::super::handler::{
+        GameResultsRecord, JobHandler, LeaveRecord, LeaveResponse, PositionAnalysisResponse,
+    };
+    use super::super::leave_gen::LeaveGenHandler;
+    use super::super::opening_rack::OpeningRackHandler;
+    use super::{check_batch_size, check_rack_occurrence_total, games_dispatched};
+    use crate::error::{AppError, AppResult};
+    use crate::stats::sprt::Pentanomial;
+    use serde_json::Value;
 
-    /// A real `fake_worker.py` opening-rack submission, captured verbatim.
+    const GAMES: &str = include_str!("testdata/fake_worker_games.json");
+    const GAMES_CAPTURED: &str = include_str!("testdata/fake_worker_games_captured.json");
+    const GAME_PAIRS: &str = include_str!("testdata/fake_worker_game_pairs.json");
+    const OPENING_RACK: &str = include_str!("testdata/fake_worker_opening_rack.json");
+    const LEAVE_GENERATION: &str = include_str!("testdata/fake_worker_leave_generation.json");
+    const STALE: &str = include_str!("testdata/fake_worker_stale.json");
+    const ABANDON: &str = include_str!("testdata/fake_worker_abandon.json");
+    const MALFORMED: [(&str, &str); 4] = [
+        ("games", include_str!("testdata/fake_worker_malformed_games.json")),
+        ("game_pairs", include_str!("testdata/fake_worker_malformed_game_pairs.json")),
+        ("opening_rack", include_str!("testdata/fake_worker_malformed_opening_rack.json")),
+        (
+            "leave_generation",
+            include_str!("testdata/fake_worker_malformed_leave_generation.json"),
+        ),
+    ];
+
+    /// The batch every fixture was captured against: the contract
+    /// assignments' `num_games` (10 games, or 10 pairs, and 10,000 games for
+    /// leave generation), which is the job setting `store_result` reads.
+    const BATCH: i32 = 10;
+    const LEAVE_GAMES: i32 = 10_000;
+
+    fn decode<T: serde::de::DeserializeOwned>(payload: Value) -> AppResult<T> {
+        serde_json::from_value(payload)
+            .map_err(|e| AppError::bad_request(format!("malformed task response: {e}")))
+    }
+
+    // What `registry::store_result` runs on a submission before it stores it,
+    // one job type each, in its order: decode, `process_response`, then the
+    // checks against the task. Everything short of the database -- which for
+    // an opening-rack batch is also `check_batch_against_task`, comparing the
+    // racks with the task's range.
+
+    fn games(payload: Value, batch: i32) -> AppResult<GameResultsRecord> {
+        let record = GameHandler::process_response(decode(payload)?)?;
+        check_batch_size(record.all_games.games, games_dispatched(batch, false))?;
+        Ok(record)
+    }
+
+    fn game_pairs(payload: Value, batch: i32) -> AppResult<GameResultsRecord> {
+        let record = GamePairHandler::process_response(decode(payload)?)?;
+        check_batch_size(record.all_games.games, games_dispatched(batch, true))?;
+        Ok(record)
+    }
+
+    fn leave_generation(payload: Value, num_games: i32) -> AppResult<LeaveRecord> {
+        let record = LeaveGenHandler::process_response(decode(payload)?)?;
+        check_rack_occurrence_total(&record.racks, num_games)?;
+        Ok(record)
+    }
+
+    fn validate(job_type: &str, payload: Value) -> AppResult<()> {
+        match job_type {
+            "games" => games(payload, BATCH).map(drop),
+            "game_pairs" => game_pairs(payload, BATCH).map(drop),
+            "opening_rack" => OpeningRackHandler::process_response(decode(payload)?).map(drop),
+            "leave_generation" => leave_generation(payload, LEAVE_GAMES).map(drop),
+            other => panic!("no job type {other}"),
+        }
+    }
+
+    fn json(fixture: &str) -> Value {
+        serde_json::from_str(fixture).expect("a fixture is JSON")
+    }
+
+    /// U-FAKE-1: a `games` submission, plain and with captured positions.
     ///
-    /// The fake worker previously read a `position` field the request does not
-    /// have and answered with a bare `{"moves": [...]}`, which no opening-rack
-    /// job could ever accept. Pinning one of its submissions here means the two
-    /// sides cannot drift apart again without a test failing.
-    const OPENING_RACK_SUBMISSION: &str = include_str!("testdata/fake_worker_opening_rack.json");
+    /// Regenerate with:
+    /// `python3 worker/fake_worker.py --emit-fixture contract-fixtures/assignment-games.json`
+    /// and, for the captured one, the same with
+    /// `--override capture_positions=true --override num_games=1`.
+    #[test]
+    fn the_fake_workers_games_submission_passes_validation() {
+        let record = games(json(GAMES), BATCH).unwrap();
+        assert_eq!(record.all_games.games, BATCH);
+        assert!(record.pentanomial.is_none() && record.positions.is_empty());
 
+        let record = games(json(GAMES_CAPTURED), 1).unwrap();
+        assert!(record.positions.len() >= 18, "about twenty turns a game");
+        assert!(record.positions.iter().all(|p| p.game_index == Some(0) && !p.moves.is_empty()));
+        assert!(record.positions[0].previous_move.is_none(), "turn 0 follows nothing");
+        assert!(record.positions[1].previous_move.is_some());
+    }
+
+    /// U-FAKE-2: a `game_pairs` submission, including the pentanomial
+    /// cross-checks -- which the fixture is shown to be exercising, not
+    /// skipping, by breaking each one.
+    ///
+    /// Regenerate with:
+    /// `python3 worker/fake_worker.py --emit-fixture contract-fixtures/assignment-games.json
+    /// --override job_type='"game_pairs"' --override game_pairs=true`
+    #[test]
+    fn the_fake_workers_game_pairs_submission_passes_the_pentanomial_cross_checks() {
+        let record = game_pairs(json(GAME_PAIRS), BATCH).unwrap();
+        let pentanomial = record.pentanomial.expect("a pairs result carries a pentanomial");
+        let counts = Pentanomial { counts: pentanomial.map(|c| c as u64) };
+        assert_eq!(counts.pairs(), BATCH as u64);
+        assert_eq!(counts.pairs() * 2, record.all_games.games as u64);
+        assert_eq!(
+            counts.half_points(),
+            2 * record.all_games.wins as u64 + record.all_games.ties as u64
+        );
+        let divergent = record.divergent_games.expect("the fake worker reports the subset");
+        assert!(divergent.games % 2 == 0 && divergent.games <= record.all_games.games);
+
+        // One split pair turned into a 3-1: the pair count still agrees, player
+        // 1's half-points no longer do.
+        assert!(pentanomial[2] > 0, "the fixture should have a split pair to move");
+        let mut shifted = json(GAME_PAIRS);
+        shifted["pentanomial"][2] = (pentanomial[2] - 1).into();
+        shifted["pentanomial"][3] = (pentanomial[3] + 1).into();
+        let error = game_pairs(shifted, BATCH).unwrap_err();
+        assert!(error.message.contains("about player 1's score"), "{}", error.message);
+
+        // One pair too many, in the bucket worth no half-points: only the pair
+        // count disagrees.
+        let mut extra = json(GAME_PAIRS);
+        extra["pentanomial"][0] = (pentanomial[0] + 1).into();
+        let error = game_pairs(extra, BATCH).unwrap_err();
+        assert!(error.message.contains("exactly half the games"), "{}", error.message);
+    }
+
+    /// U-FAKE-3: an `opening_rack` submission answers every requested rack.
+    ///
+    /// Regenerate with:
+    /// `python3 worker/fake_worker.py --emit-fixture contract-fixtures/assignment-opening-rack.json`
     #[test]
     fn the_fake_worker_speaks_the_opening_rack_response_shape() {
         let response: PositionAnalysisResponse =
-            serde_json::from_str(OPENING_RACK_SUBMISSION).expect("should deserialize");
-        assert_eq!(response.racks.len(), 2);
-        assert_eq!(response.racks[0].rack, "AEINRST");
-        assert!(!response.racks[0].moves.is_empty());
+            serde_json::from_str(OPENING_RACK).expect("should deserialize");
+        let racks: Vec<&str> = response.racks.iter().map(|r| r.rack.as_str()).collect();
+        // The racks of the assignment it answered, in order.
+        assert_eq!(racks, ["AEINRST", "?AEILNT", "AABBCDE"]);
+        assert!(response.racks.iter().all(|r| !r.moves.is_empty() && r.num_moves.is_some()));
         // And it must satisfy the plausibility rules it will be checked against.
-        for analysis in &response.racks {
-            super::check_rack(&analysis.rack, "fixture").unwrap();
-            super::check_moves(&analysis.moves, None, "fixture").unwrap();
+        let record = OpeningRackHandler::process_response(response).unwrap();
+        assert_eq!(record.positions.len(), 3);
+    }
+
+    /// U-FAKE-4: a `leave_generation` submission passes the occurrence rules,
+    /// both the per-rack ones and the total against the task's games.
+    ///
+    /// Regenerate with:
+    /// `python3 worker/fake_worker.py --emit-fixture contract-fixtures/assignment-leave-generation.json`
+    #[test]
+    fn the_fake_workers_leave_submission_passes_the_occurrence_rules() {
+        let response: LeaveResponse = serde_json::from_str(LEAVE_GENERATION).unwrap();
+        super::check_rack_occurrences(&response.racks).unwrap();
+        let record = leave_generation(json(LEAVE_GENERATION), LEAVE_GAMES).unwrap();
+        // It reports the forced racks it was sent.
+        let racks: Vec<&str> = record.racks.iter().map(|r| r.rack.as_str()).collect();
+        assert_eq!(racks, ["AEINRST", "?AEGLNT"]);
+    }
+
+    /// U-FAKE-5, `--mode malformed`: every corruption, against every job
+    /// type, is refused by the server's validation, each by the rule it was
+    /// written to break. `odd_pair_count` is a consistent tally of eleven
+    /// games, so for a plain games job it is the batch-size rule that catches
+    /// it; the variants that only make sense for a game result fall back to a
+    /// body with no `racks` for the other two types.
+    ///
+    /// Regenerate with, for each assignment (`game_pairs` from the games one,
+    /// with the two `--override`s above):
+    /// `python3 worker/fake_worker.py --mode malformed --emit-fixture
+    /// contract-fixtures/assignment-<type>.json`
+    #[test]
+    fn every_malformed_submission_is_rejected_for_the_rule_it_breaks() {
+        const DECODE: &str = "malformed task response";
+        let expected: [(&str, [(&str, &str); 5]); 4] = [
+            (
+                "games",
+                [
+                    ("wrong_type", DECODE),
+                    ("missing_field", "missing field `wins`"),
+                    ("inconsistent_counts", "wins + losses + ties must equal games"),
+                    ("odd_pair_count", "reports 11 games but this task dispatched 10"),
+                    ("empty", "missing field `all_games`"),
+                ],
+            ),
+            (
+                "game_pairs",
+                [
+                    ("wrong_type", DECODE),
+                    ("missing_field", "missing field `wins`"),
+                    ("inconsistent_counts", "wins + losses + ties must equal games"),
+                    ("odd_pair_count", "an even, non-zero number of games"),
+                    ("empty", "missing field `all_games`"),
+                ],
+            ),
+            (
+                "opening_rack",
+                [
+                    ("wrong_type", DECODE),
+                    ("missing_field", "missing field `racks`"),
+                    ("inconsistent_counts", "missing field `racks`"),
+                    ("odd_pair_count", "missing field `racks`"),
+                    ("empty", "missing field `racks`"),
+                ],
+            ),
+            (
+                "leave_generation",
+                [
+                    ("wrong_type", DECODE),
+                    ("missing_field", "missing field `racks`"),
+                    ("inconsistent_counts", "missing field `racks`"),
+                    ("odd_pair_count", "missing field `racks`"),
+                    ("empty", "missing field `racks`"),
+                ],
+            ),
+        ];
+
+        for ((job_type, fixture), (expected_type, reasons)) in MALFORMED.iter().zip(expected) {
+            assert_eq!(*job_type, expected_type);
+            let variants = json(fixture);
+            let variants = variants.as_object().unwrap();
+            assert_eq!(variants.len(), reasons.len(), "{job_type}: a corruption is missing");
+            for (variant, reason) in reasons {
+                let payload = variants[variant].clone();
+                let error = validate(job_type, payload)
+                    .expect_err("a malformed submission must be rejected");
+                assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+                assert!(
+                    error.message.contains(reason),
+                    "{job_type}/{variant}: {}",
+                    error.message
+                );
+            }
         }
+    }
+
+    /// U-FAKE-5, `--mode stale`: the result is a perfectly valid one -- so
+    /// what the server refuses is the token alone -- under a claim token that
+    /// is not the one the assignment issued. What the server then does with a
+    /// token it never issued (`accepted: false`, nothing stored) needs the
+    /// database, and is `tests/fake_worker.rs`, which posts this fixture.
+    ///
+    /// Regenerate with:
+    /// `python3 worker/fake_worker.py --mode stale --emit-fixture contract-fixtures/assignment-games.json`
+    #[test]
+    fn a_stale_submission_differs_from_a_valid_one_only_in_its_token() {
+        let body = json(STALE);
+        let assignment: Value =
+            serde_json::from_str(include_str!("../../../contract-fixtures/assignment-games.json"))
+                .unwrap();
+        let issued = assignment["claim_token"].as_str().unwrap();
+        let token = body["claim_token"].as_str().unwrap();
+        // A well-formed UUID, so the route reaches the claim lookup instead of
+        // failing to parse the body -- and not the one that was issued.
+        assert!(uuid::Uuid::parse_str(token).is_ok(), "{token}");
+        assert_ne!(token, issued);
+        games(body["result"].clone(), BATCH).unwrap();
+    }
+
+    /// U-FAKE-5, `--mode abandon`: the worker submits nothing at all, so the
+    /// only server-side outcome is the heartbeat timeout reclaiming the claim
+    /// (`worker_api::a_claim_still_silent_after_the_grace_is_reclaimed`).
+    ///
+    /// Regenerate with:
+    /// `python3 worker/fake_worker.py --mode abandon --emit-fixture contract-fixtures/assignment-games.json`
+    #[test]
+    fn an_abandoning_worker_submits_nothing() {
+        assert_eq!(json(ABANDON), Value::Null);
     }
 }

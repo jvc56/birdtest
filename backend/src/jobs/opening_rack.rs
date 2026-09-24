@@ -187,8 +187,8 @@ pub async fn check_batch_against_task(
 /// How many distinct racks a job over this distribution covers. Recorded at job
 /// creation so the scheduler knows when the space is exhausted without
 /// re-deriving it on every claim.
-pub fn total_racks(distribution: &LetterDistribution, rack_size: i32) -> i64 {
-    RackIndex::new(distribution, rack_size as usize).total() as i64
+pub fn total_racks(distribution: &LetterDistribution, rack_size: i32) -> AppResult<i64> {
+    Ok(RackIndex::new(distribution, rack_size as usize)?.total() as i64)
 }
 
 /// Claim-time task creation: the next unclaimed slice of the rack space.

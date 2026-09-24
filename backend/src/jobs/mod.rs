@@ -453,13 +453,21 @@ pub(crate) async fn insert_game_results(
     let divergent = record.divergent_games.as_ref();
     let pentanomial = record.pentanomial.as_ref();
     let bucket = |i: usize| pentanomial.map(|p| p[i] as i32);
+    // `submitted_at` is what every "first accepted result per task" read orders
+    // on, so it is the time of this insert, taken under the task's row lock,
+    // rather than the column's `now()` default: that is when the transaction
+    // *began*, and a submission that began first but reached the lock second
+    // -- accepted second -- would read as the first, so the aggregates would
+    // use one copy while the running totals had counted the other.
     sqlx::query(
         "INSERT INTO game_results
              (task_claim_id, task_id, job_id, games, wins, losses, ties,
               p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
               pent_0, pent_1, pent_2, pent_3, pent_4,
-              divergent_games, divergent_wins, divergent_losses, divergent_ties)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)",
+              divergent_games, divergent_wins, divergent_losses, divergent_ties,
+              submitted_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,
+                 clock_timestamp())",
     )
     .bind(claim_id)
     .bind(task_id)

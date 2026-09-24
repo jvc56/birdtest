@@ -11,6 +11,7 @@
   import RatingDotPlot from '$lib/components/RatingDotPlot.svelte';
   import RatingHistoryChart from '$lib/components/RatingHistoryChart.svelte';
   import ResidualMatrix from '$lib/components/ResidualMatrix.svelte';
+  import { ratingCell, stderrCell } from '$lib/charts/ratingDotPlot';
 
   let pool: RatingPoolDetail | null = null;
   let history: RatingHistoryPoint[] = [];
@@ -111,16 +112,8 @@
                   <span class="ml-1 text-xs text-warning">anchor</span>
                 {/if}
               </td>
-              <td class="text-right tabular-nums">
-                {row.connected_to_anchor ? row.rating.toFixed(1) : '—'}
-              </td>
-              <td class="text-right tabular-nums text-muted-foreground">
-                {row.is_anchor
-                  ? 'fixed'
-                  : row.connected_to_anchor
-                    ? `±${row.stderr.toFixed(1)}`
-                    : 'unrated'}
-              </td>
+              <td class="text-right tabular-nums">{ratingCell(row)}</td>
+              <td class="text-right tabular-nums text-muted-foreground">{stderrCell(row)}</td>
               <td class="text-right tabular-nums">{row.pairs_played.toLocaleString()}</td>
               {#if isAdmin}
                 <td class="text-right">

@@ -1075,7 +1075,7 @@ pub async fn seed_generation(
     generation: i32,
     distribution: &LetterDistribution,
 ) -> AppResult<i64> {
-    let index = std::sync::Arc::new(RackIndex::new(distribution, RACK_SIZE));
+    let index = std::sync::Arc::new(RackIndex::new(distribution, RACK_SIZE)?);
     let total = index.total();
 
     // Idempotent: a universe already seeded (a seeding started twice) is left
@@ -1210,7 +1210,7 @@ pub async fn run_transition(
     // Hashed as written, not read back: the object store holds the only copy
     // of these bytes, and this is what a later rebuild is compared against.
     let sha256 = hex::encode(Sha256::digest(&klv));
-    let key = format!("leaves/{job_id}/generation-{generation}.klv2");
+    let key = artifact_key(job_id, generation);
     artifacts.put(&key, klv).await?;
     close_generation(pool, job_id, generation, &key, &sha256, &builders.klv(), config).await?;
     Ok(key)
@@ -1344,7 +1344,7 @@ pub async fn seed_zero_generation(
 ) -> AppResult<String> {
     let klv = zero_klv(magpie, distribution).await?;
     let sha256 = hex::encode(Sha256::digest(&klv));
-    let key = format!("leaves/{job_id}/generation-0.klv2");
+    let key = artifact_key(job_id, 0);
     artifacts.put(&key, klv).await?;
 
     sqlx::query(
@@ -1549,7 +1549,7 @@ async fn generation_klv(
     // so this is a second check rather than the only one -- but it fails with
     // the job and generation in the message, where MAGPIE's failure would only
     // name a path inside a directory that no longer exists.
-    let expected = RackIndex::new(distribution, RACK_SIZE).total();
+    let expected = RackIndex::new(distribution, RACK_SIZE)?.total();
     if written != expected {
         return Err(AppError::internal(format!(
             "leave job {job_id} generation {generation} has {written} progress rows, but the \
@@ -1595,4 +1595,13 @@ async fn read_built_klv(scratch: &ScratchData, name: &str) -> AppResult<Vec<u8>>
     tokio::fs::read(&path).await.map_err(|e| {
         AppError::internal(format!("MAGPIE reported no error but wrote no KLV: {e}"))
     })
+}
+
+/// Where a generation's KLV lives in the object store: under its job, named
+/// for its generation, so no two jobs and no two generations of one job can
+/// write the same object. Every artifact key is minted here -- the worker
+/// artifact route serves only keys the server recorded, and this is the only
+/// shape those take.
+pub fn artifact_key(job_id: Uuid, generation: i32) -> String {
+    format!("leaves/{job_id}/generation-{generation}.klv2")
 }

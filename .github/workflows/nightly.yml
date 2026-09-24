@@ -2,7 +2,7 @@
 # Every contract bug the audit found in MAGPIE was invisible to both
 # repositories' unit tests and obvious the first time a real task ran
 # This runs one small job of every type and asserts
-# the results land.
+# the results land, then the M-5..M-11 cases (see scripts/e2e_magpie.py).
 name: Nightly MAGPIE end-to-end
 
 on:
@@ -18,6 +18,12 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # The checkout the compose file mounts into the backend (and the
+    # derived-builder) as /magpie. Unset, compose falls back to ../MAGPIE,
+    # which does not exist here, and the backend exits at start with no
+    # MAGPIE to read its builder versions from.
+    env:
+      MAGPIE_ROOT: ${{ github.workspace }}/magpie
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -42,15 +48,28 @@ jobs:
       # the same as the server's. Not `BUILD=release`: MAGPIE's Makefile
       # refuses that spelling outright (`release` is a PGO target that needs
       # clang and a training run), which made every nightly run fail at this
-      # step before a single task ran.
+      # step before a single task ran. Built in the backend image's own
+      # Debian, as CI's e2e job does: the binary runs inside that image, whose
+      # glibc is older than the runner's, and one built against the runner's
+      # would not start there; built on the older glibc it still runs on the
+      # runner for the contributors.
       - name: Build MAGPIE
-        working-directory: magpie
-        run: make magpie BUILD=portable_release
+        run: |
+          docker run --rm -v "$PWD/magpie:/src" -w /src debian:bookworm-slim sh -c \
+            'apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential >/dev/null \
+             && make magpie BUILD=portable_release -j"$(nproc)"'
 
       - name: Start the stack
         env:
           # Input-data imports resolve MAGPIE-DATA refs through the GitHub API.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the stand-in e2e_magpie.py serves on the host: it hands
+          # out the small test tarball M-10 imports and passes everything else
+          # -- the real data-YYYYMMDD.tgz import included -- on to GitHub.
+          # Not GITHUB_API_URL: Actions refuses to override its own GITHUB_*
+          # variables, so docker-compose.yml reads these names instead.
+          BIRDTEST_GITHUB_API_URL: http://host.docker.internal:8481/api
+          BIRDTEST_GITHUB_RAW_URL: http://host.docker.internal:8481/raw
         run: docker compose up -d --build --wait postgres minio minio-init backend
 
       - uses: actions/setup-python@v5
@@ -58,12 +77,79 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
 
-      - name: One real task of every job type
+      - name: Every tier-6 case (M-1 to M-11)
         run: >-
           python3 scripts/e2e_magpie.py
           --magpie magpie/bin/magpie
           --magpie-root magpie
+          --github-fixture-port 8481
+          --github-fixture-host 0.0.0.0
+
+      # The opt-in Rust tests (#[ignore]: magpie_smoke, magpie_leave,
+      # magpie_routes), which need this MAGPIE and its testdata as well as a
+      # Postgres and a MinIO -- the stack's, which is still up. Nothing else
+      # runs them.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+      - uses: taiki-e/install-action@nextest
+      - name: The opt-in Rust tests against this MAGPIE
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgres://birdtest:birdtest@localhost:5432/birdtest
+          TEST_S3_ENDPOINT: http://localhost:9000
+          MAGPIE_BIN: ${{ github.workspace }}/magpie/bin/magpie
+          MAGPIE_ROOT: ${{ github.workspace }}/magpie
+        run: cargo nextest run --locked --run-ignored ignored-only --no-fail-fast
 
       - name: Backend log
         if: always()
         run: docker compose logs --no-color backend | tail -n 300
+
+  # TESTING.md's other two nightly checks, together: the schema applied to an
+  # empty database, and scripts/restore-roundtrip.sh -- dump, drop, restore,
+  # verify -- against it. Nothing ran the round trip before this, and its seed
+  # had fallen three NOT NULL columns behind the schema without anyone
+  # noticing. Only Postgres is needed; the script runs inside its container.
+  restore-roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Postgres
+        run: docker compose up -d --wait postgres
+      - name: Apply the schema to the empty database
+        run: |
+          docker compose exec -T postgres \
+            psql -U birdtest -d birdtest -v ON_ERROR_STOP=1 -q \
+            < backend/migrations/0001_initial.sql
+      - name: Dump, drop, restore, verify
+        run: ./scripts/restore-roundtrip.sh
+      - if: always()
+        run: docker compose down -v
+
+  # scripts/backup.sh and scripts/restore-drill.sh, each run the way its
+  # Fargate task runs it (the official postgres:16 image, the script as
+  # `bash -c`), against the stack's Postgres and MinIO: a backup taken while
+  # another session keeps committing rows, the drill of that backup, and a
+  # backup that cannot upload. Nothing ran either script before this except
+  # production itself, and the drill of any backup taken under load failed --
+  # the row counts were read outside the dump's snapshot. No AWS endpoint is
+  # contacted (see scripts/backup-drill-check.sh).
+  backup-drill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Postgres and MinIO
+        run: docker compose up -d --wait postgres minio minio-init
+      - name: Apply the schema to the empty database
+        run: |
+          docker compose exec -T postgres \
+            psql -U birdtest -d birdtest -v ON_ERROR_STOP=1 -q \
+            < backend/migrations/0001_initial.sql
+      - name: Back up under writes, drill the restore, fail a backup
+        run: timeout 600 ./scripts/backup-drill-check.sh
+      - if: always()
+        run: docker compose down -v

@@ -17,6 +17,9 @@ pub struct Config {
     pub session_ttl: Duration,
     pub secure_cookies: bool,
     pub mail_backend: MailBackend,
+    /// Where `MAIL_BACKEND=file` writes one file per message. Required by that
+    /// backend and read by nothing else.
+    pub mail_outbox_dir: Option<std::path::PathBuf>,
     pub mail_from: String,
     pub public_url: String,
     pub heartbeat_timeout: Duration,
@@ -52,6 +55,12 @@ pub struct Config {
     /// Optional in development, set in production: unauthenticated GitHub ref
     /// resolution is 60 calls an hour per IP.
     pub github_token: Option<String>,
+    /// The GitHub API and raw-content hosts import resolves refs and fetches
+    /// tarballs from. Configuration for the same reason `magpie_data_repo`
+    /// is; overridden only by the end-to-end suite, which serves a fixture
+    /// tarball from a static-file container so import runs offline.
+    pub github_api_url: String,
+    pub github_raw_url: String,
     /// How many reverse proxies sit in front of this process and append to
     /// `X-Forwarded-For`. 0 trusts nothing and keys per-IP limits on the TCP
     /// peer; 1 is right behind the ALB and behind the local Nginx. See
@@ -64,6 +73,11 @@ pub enum MailBackend {
     /// Log the message body to stdout. The local default: there is no local SES.
     Console,
     Ses,
+    /// One file per message in `MAIL_OUTBOX_DIR`, named for its recipient.
+    /// For the end-to-end suite: a journey reads the confirmation code sent to
+    /// its own address, which the single stream of `console` cannot tell apart
+    /// when journeys run in parallel. Never production.
+    File,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -73,15 +87,23 @@ fn var(key: &str) -> Option<String> {
     }
 }
 
-fn var_or(key: &str, default: &str) -> String {
-    var(key).unwrap_or_else(|| default.to_string())
+/// Where settings come from: the environment in the process, a table in the
+/// tests. An empty value counts as unset, as it does for `var`.
+pub type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
+
+fn get(lookup: Lookup, key: &str) -> Option<String> {
+    lookup(key).filter(|v| !v.is_empty())
+}
+
+fn get_or(lookup: Lookup, key: &str, default: &str) -> String {
+    get(lookup, key).unwrap_or_else(|| default.to_string())
 }
 
 /// A numeric setting that is wrong fails startup rather than silently becoming
 /// the default: a heartbeat timeout typed as `5m` would otherwise run the whole
 /// deployment on 300 seconds with nothing to say so.
-fn parsed<T: std::str::FromStr>(key: &str, default: T) -> Result<T> {
-    match var(key) {
+fn parsed<T: std::str::FromStr>(lookup: Lookup, key: &str, default: T) -> Result<T> {
+    match get(lookup, key) {
         None => Ok(default),
         Some(raw) => raw
             .trim()
@@ -124,6 +146,16 @@ fn resolve_database_url(get: impl Fn(&str) -> Option<String>) -> Result<String> 
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        Self::from_lookup(&var)
+    }
+
+    /// The configuration `lookup` describes. `from_env` is this over the
+    /// process environment; taking the source as a function is what lets every
+    /// default and every refusal be tested without touching global state.
+    pub fn from_lookup(lookup: Lookup) -> Result<Self> {
+        let var = |key: &str| get(lookup, key);
+        let var_or = |key: &str, default: &str| get_or(lookup, key, default);
+        let parsed_u64 = |key: &str, default: u64| parsed(lookup, key, default);
         let raw_key = var_or("SESSION_SIGNING_KEY", "");
         let key_bytes = if raw_key.is_empty() {
             anyhow::bail!("SESSION_SIGNING_KEY is required (32 bytes hex-encoded)");
@@ -138,8 +170,15 @@ impl Config {
         let mail_backend = match var_or("MAIL_BACKEND", "console").as_str() {
             "ses" => MailBackend::Ses,
             "console" => MailBackend::Console,
-            other => anyhow::bail!("unknown MAIL_BACKEND {other:?} (expected 'console' or 'ses')"),
+            "file" => MailBackend::File,
+            other => anyhow::bail!(
+                "unknown MAIL_BACKEND {other:?} (expected 'console', 'ses' or 'file')"
+            ),
         };
+        let mail_outbox_dir = var("MAIL_OUTBOX_DIR").map(std::path::PathBuf::from);
+        if mail_backend == MailBackend::File && mail_outbox_dir.is_none() {
+            anyhow::bail!("MAIL_BACKEND=file needs MAIL_OUTBOX_DIR, the directory to write to");
+        }
 
         let secure_cookies = match var_or("SECURE_COOKIES", "false").as_str() {
             "true" => true,
@@ -159,12 +198,13 @@ impl Config {
             database_url: resolve_database_url(var)?,
             bind_addr: var_or("BIND_ADDR", "0.0.0.0:8080"),
             session_signing_key,
-            session_ttl: Duration::from_secs(parsed("SESSION_TTL_SECONDS", 604_800)?),
+            session_ttl: Duration::from_secs(parsed_u64("SESSION_TTL_SECONDS", 604_800)?),
             secure_cookies,
             mail_backend,
+            mail_outbox_dir,
             mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
             public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
-            heartbeat_timeout: Duration::from_secs(parsed("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
+            heartbeat_timeout: Duration::from_secs(parsed_u64("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
             // 0.1.0 is `birdtest-contribute`'s pre-release version. Neither
@@ -183,10 +223,16 @@ impl Config {
                 "https://github.com/jvc56/MAGPIE",
             ),
             magpie_bin: var_or("MAGPIE_BIN", crate::magpie::DEFAULT_MAGPIE_BIN),
-            magpie_threads: parsed("MAGPIE_THREADS", 1usize)?,
+            magpie_threads: parsed(lookup, "MAGPIE_THREADS", 1usize)?,
             magpie_data_repo: var_or("MAGPIE_DATA_REPO", "jvc56/MAGPIE-DATA"),
             github_token: var("GITHUB_TOKEN"),
-            trusted_proxy_hops: parsed("TRUSTED_PROXY_HOPS", 0)?,
+            github_api_url: var_or("GITHUB_API_URL", "https://api.github.com")
+                .trim_end_matches('/')
+                .to_string(),
+            github_raw_url: var_or("GITHUB_RAW_URL", "https://raw.githubusercontent.com")
+                .trim_end_matches('/')
+                .to_string(),
+            trusted_proxy_hops: parsed(lookup, "TRUSTED_PROXY_HOPS", 0usize)?,
         })
     }
 }
@@ -200,6 +246,120 @@ mod tests {
         let map: HashMap<String, String> =
             pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         move |key| map.get(key).cloned()
+    }
+
+    const KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+    /// The two settings nothing can default: where the database is, and the
+    /// key sessions are signed with.
+    const REQUIRED: [(&str, &str); 2] =
+        [("DATABASE_URL", "postgres://a:b@c/d"), ("SESSION_SIGNING_KEY", KEY)];
+
+    fn config(extra: &[(&str, &str)]) -> Result<Config> {
+        let mut pairs = REQUIRED.to_vec();
+        pairs.extend_from_slice(extra);
+        Config::from_lookup(&env(&pairs))
+    }
+
+    /// U-CFG-1: every setting with a default takes it when unset and the
+    /// given value when set. Each row names the variable, so a renamed one
+    /// that silently fell back to its default fails here by name.
+    #[test]
+    fn every_default_applies_when_unset_and_yields_to_a_value() {
+        type Read = fn(&Config) -> String;
+        let rows: &[(&str, &str, &str, Read)] = &[
+            ("BIND_ADDR", "0.0.0.0:8080", "127.0.0.1:9", |c| c.bind_addr.clone()),
+            ("SESSION_TTL_SECONDS", "604800", "60", |c| c.session_ttl.as_secs().to_string()),
+            ("SECURE_COOKIES", "false", "true", |c| c.secure_cookies.to_string()),
+            ("MAIL_BACKEND", "Console", "ses", |c| format!("{:?}", c.mail_backend)),
+            ("MAIL_FROM", "no-reply@birdtest.local", "a@b.c", |c| c.mail_from.clone()),
+            ("PUBLIC_URL", "http://localhost:5173", "https://x.y", |c| c.public_url.clone()),
+            ("HEARTBEAT_TIMEOUT_SECONDS", "300", "70", |c| {
+                c.heartbeat_timeout.as_secs().to_string()
+            }),
+            ("S3_BUCKET", "birdtest-artifacts", "other", |c| c.s3_bucket.clone()),
+            ("S3_ENDPOINT", "None", "http://minio:9000", |c| {
+                c.s3_endpoint.clone().unwrap_or_else(|| "None".into())
+            }),
+            ("MIN_MAGPIE_VERSION", "0.1.0", "1.10.0", |c| c.min_magpie_version.clone()),
+            ("MAGPIE_DOWNLOAD_URL", "https://github.com/jvc56/MAGPIE", "https://d", |c| {
+                c.magpie_download_url.clone()
+            }),
+            ("MAGPIE_BIN", crate::magpie::DEFAULT_MAGPIE_BIN, "/opt/magpie", |c| {
+                c.magpie_bin.clone()
+            }),
+            ("MAGPIE_THREADS", "1", "8", |c| c.magpie_threads.to_string()),
+            ("MAGPIE_DATA_REPO", "jvc56/MAGPIE-DATA", "me/data", |c| c.magpie_data_repo.clone()),
+            ("GITHUB_TOKEN", "None", "ghp_x", |c| {
+                c.github_token.clone().unwrap_or_else(|| "None".into())
+            }),
+            ("TRUSTED_PROXY_HOPS", "0", "2", |c| c.trusted_proxy_hops.to_string()),
+            ("GITHUB_API_URL", "https://api.github.com", "http://fixtures:80", |c| {
+                c.github_api_url.clone()
+            }),
+            ("GITHUB_RAW_URL", "https://raw.githubusercontent.com", "http://fixtures:80", |c| {
+                c.github_raw_url.clone()
+            }),
+            ("MAIL_OUTBOX_DIR", "None", "/outbox", |c| {
+                c.mail_outbox_dir.as_ref().map_or("None".into(), |p| p.display().to_string())
+            }),
+        ];
+        for (key, default, set, read) in rows {
+            let unset = config(&[]).unwrap();
+            assert_eq!(read(&unset), *default, "{key} unset");
+            // An empty value is unset, not an empty setting.
+            let empty = config(&[(key, "")]).unwrap();
+            assert_eq!(read(&empty), *default, "{key} empty");
+            let given = config(&[(key, set)]).unwrap();
+            let expected = if *key == "MAIL_BACKEND" { "Ses" } else { set };
+            assert_eq!(read(&given), expected, "{key} set");
+        }
+    }
+
+    /// U-CFG-2: a required setting that is missing is a startup error that
+    /// names it, not a panic and not an empty value.
+    #[test]
+    fn a_missing_required_setting_is_an_error_naming_it() {
+        let err = Config::from_lookup(&env(&[("DATABASE_URL", "postgres://a:b@c/d")])).unwrap_err();
+        assert!(err.to_string().contains("SESSION_SIGNING_KEY"), "{err}");
+        let err = Config::from_lookup(&env(&[("SESSION_SIGNING_KEY", KEY)])).unwrap_err();
+        assert!(err.to_string().contains("DB_HOST"), "{err}");
+        let err = config(&[("SESSION_SIGNING_KEY", "abcd")]).unwrap_err();
+        assert!(err.to_string().contains("SESSION_SIGNING_KEY"), "{err}");
+    }
+
+    /// A value that is present but wrong fails startup too, naming the
+    /// setting, rather than becoming the default.
+    #[test]
+    fn a_malformed_value_is_refused_rather_than_defaulted() {
+        for (key, value) in [
+            ("HEARTBEAT_TIMEOUT_SECONDS", "5m"),
+            ("SESSION_TTL_SECONDS", "-1"),
+            ("MAGPIE_THREADS", "two"),
+            ("TRUSTED_PROXY_HOPS", "one"),
+            ("SECURE_COOKIES", "yes"),
+            ("MAIL_BACKEND", "smtp"),
+            // The file backend with nowhere to write.
+            ("MAIL_BACKEND", "file"),
+        ] {
+            let err = config(&[(key, value)]).unwrap_err();
+            assert!(err.to_string().contains(key), "{key}={value}: {err}");
+        }
+        let file = config(&[("MAIL_BACKEND", "file"), ("MAIL_OUTBOX_DIR", "/outbox")]).unwrap();
+        assert_eq!(file.mail_backend, MailBackend::File);
+    }
+
+    /// U-CFG-3: `MIN_MAGPIE_VERSION` goes through `Version`, so a malformed
+    /// floor fails at startup instead of becoming 0.0.0 and admitting every
+    /// client; an explicit 0.0.0 is still a floor someone chose.
+    #[test]
+    fn a_malformed_version_floor_fails_startup() {
+        for bad in ["latest", "v1", "1.x", "one.two.three"] {
+            let err = config(&[("MIN_MAGPIE_VERSION", bad)]).unwrap_err();
+            assert!(err.to_string().contains("MIN_MAGPIE_VERSION"), "{bad}: {err}");
+        }
+        assert_eq!(config(&[("MIN_MAGPIE_VERSION", "0.0.0")]).unwrap().min_magpie_version, "0.0.0");
+        assert_eq!(config(&[("MIN_MAGPIE_VERSION", "1.10.0")]).unwrap().min_magpie_version, "1.10.0");
     }
 
     #[test]

@@ -37,7 +37,21 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
   if (response.status === 204) return undefined as T;
 
   const text = await response.text();
-  const payload = text ? JSON.parse(text) : undefined;
+  // A body that is not JSON — a proxy's HTML error page, a truncated response —
+  // must still surface as an ApiError, never as a bare SyntaxError that the
+  // call sites' error handling does not expect.
+  let payload: any;
+  let parsed = true;
+  try {
+    payload = text ? JSON.parse(text) : undefined;
+  } catch {
+    payload = undefined;
+    parsed = false;
+  }
+
+  if (response.ok && !parsed) {
+    throw new ApiError(response.status, 'invalid_response', 'The server sent an unreadable response.');
+  }
 
   if (!response.ok) {
     const fields: Record<string, string> = {};

@@ -404,7 +404,10 @@ pub async fn store_result(
             // The batch size was fixed when the task was handed out -- it is
             // the job's, denormalized onto every request -- so a result of any
             // other size is answering a question nobody asked.
-            super::plausibility::check_batch_size(record.all_games.games, config.games_per_batch)?;
+            super::plausibility::check_batch_size(
+                record.all_games.games,
+                super::plausibility::games_dispatched(config.games_per_batch, false),
+            )?;
             game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
             count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
                 .await
@@ -414,7 +417,7 @@ pub async fn store_result(
             // A pairs request counts pairs; each is two games.
             super::plausibility::check_batch_size(
                 record.all_games.games,
-                config.pairs_per_batch.saturating_mul(2),
+                super::plausibility::games_dispatched(config.pairs_per_batch, true),
             )?;
             game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
                 .await?;

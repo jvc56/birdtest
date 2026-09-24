@@ -67,11 +67,11 @@ VALUES ('letterdistributions/roundtrip.csv', 'letterdist', 'roundtrip',
 ON CONFLICT (path, sha256) DO NOTHING;
 
 INSERT INTO jobs (job_type, status, allocation, redundancy, variant,
-                  letterdist_id, layout_id, created_by)
+                  letterdist_id, layout_id, created_by, bingo_bonus, sim_cutoff)
 SELECT 'games', 'active', 100, 1, 'classic',
        (SELECT id FROM input_data WHERE name = 'roundtrip' AND role = 'letterdist'),
        (SELECT id FROM input_data WHERE name = 'roundtrip' AND role = 'layout'),
-       (SELECT id FROM users WHERE username = 'roundtrip')
+       (SELECT id FROM users WHERE username = 'roundtrip'), 50, 0.1
 WHERE NOT EXISTS (SELECT 1 FROM jobs);
 
 INSERT INTO tasks (job_id, seed, state, accepted_count)
@@ -84,10 +84,11 @@ SELECT t.id, gen_random_uuid(), 'completed',
 FROM tasks t
 WHERE NOT EXISTS (SELECT 1 FROM task_claims);
 
-INSERT INTO game_results (task_claim_id, task_id, games, wins, losses, ties,
+INSERT INTO game_results (task_claim_id, task_id, job_id, games, wins, losses, ties,
                           p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd)
-SELECT c.id, c.task_id, 10, 6, 4, 0, 412.5, 55.25, 398.0, 61.5
+SELECT c.id, c.task_id, t.job_id, 10, 6, 4, 0, 412.5, 55.25, 398.0, 61.5
 FROM task_claims c
+JOIN tasks t ON t.id = c.task_id
 WHERE NOT EXISTS (SELECT 1 FROM game_results);
 
 -- A backups row, so the jsonb column is exercised too.

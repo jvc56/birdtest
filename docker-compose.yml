@@ -24,6 +24,10 @@
 #                           does in production. A job whose players ask for
 #                           either file is not dispatched until this has run.
 #
+# The end-to-end suite runs this file plus docker-compose.e2e.yml as its own
+# project (file mail, a stand-in for GitHub, the fake workers); use
+# e2e/run.sh, which brings it up and tears it down.
+#
 # Ports are overridable so a host that already has something on 5432 (or 9000,
 # or 5173) does not need the file edited. See .env.example.
 
@@ -46,8 +50,15 @@ services:
       timeout: 3s
       retries: 20
 
+  # Chainguard's builds of MinIO: MinIO stopped publishing its own images
+  # (minio/minio and minio/mc are gone from Docker Hub and quay.io), and every
+  # pull of them now fails. The server image is distroless; the client is the
+  # -dev variant because the bucket loop below needs a shell.
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
+    # Root, as MinIO's own image ran: this one defaults to uid 65532, which
+    # cannot write a miniodata volume that image created, and refuses to start.
+    user: "0"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: birdtest
@@ -62,7 +73,7 @@ services:
   # KLVs into. Retries rather than relying on a MinIO healthcheck, since the
   # server image does not ship a reliable one.
   minio-init:
-    image: minio/mc:latest
+    image: cgr.dev/chainguard/minio-client:latest-dev
     depends_on:
       - minio
     entrypoint:
@@ -99,6 +110,9 @@ services:
       SECURE_COOKIES: "false"
       # Confirmation codes and reset links go to this container's stdout:
       #   docker compose logs -f backend
+      # The third backend, `file`, writes one file per message into
+      # MAIL_OUTBOX_DIR, named by time and recipient, so a test reads the mail
+      # addressed to it; docker-compose.e2e.yml switches to it for tier 5.
       MAIL_BACKEND: console
       MAIL_FROM: no-reply@birdtest.local
       PUBLIC_URL: http://localhost:${WEB_PORT:-5173}
@@ -106,6 +120,17 @@ services:
       # resolution is 60 calls an hour per IP.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       MAGPIE_DATA_REPO: ${MAGPIE_DATA_REPO:-jvc56/MAGPIE-DATA}
+      # Import talks to GitHub unless these move it elsewhere: the e2e stack
+      # points both at a static server of fixtures/, so import runs offline,
+      # and the nightly MAGPIE smoke tier at the stand-in scripts/e2e_magpie.py
+      # serves on the host (--github-fixture-port), which hands out a small
+      # test tarball and passes every other request on to GitHub. Read from
+      # BIRDTEST_-prefixed host variables, not the backend's own names: GitHub
+      # Actions sets GITHUB_API_URL on every runner and refuses to let a
+      # workflow override any GITHUB_* variable, so the nightly's stand-in
+      # was silently replaced by the real API.
+      GITHUB_API_URL: ${BIRDTEST_GITHUB_API_URL:-https://api.github.com}
+      GITHUB_RAW_URL: ${BIRDTEST_GITHUB_RAW_URL:-https://raw.githubusercontent.com}
       # The fleet-wide floor. `birdtest-contribute` reports 0.1.0, its
       # pre-release version, which meets it; scripts/dev.py reads the version
       # out of your checkout and sets this for you, so a checkout that reports
@@ -129,6 +154,10 @@ services:
       AWS_SECRET_ACCESS_KEY: birdtestbirdtest
       AWS_REGION: us-east-1
       RUST_LOG: ${RUST_LOG:-birdtest=debug,tower_http=info}
+    # So BIRDTEST_GITHUB_API_URL can name a server on the host, as the nightly
+    # smoke tier's does.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Read-only: the container runs the binary and reads nothing else from
       # the checkout. Every conversion gets a throwaway data directory written
