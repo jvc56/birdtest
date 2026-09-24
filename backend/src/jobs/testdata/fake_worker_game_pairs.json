@@ -1,0 +1,1 @@
+{"all_games": {"games": 20, "wins": 9, "losses": 11, "ties": 0, "p1_score_mean": 402.491278, "p1_score_sd": 55.376921, "p2_score_mean": 406.50323, "p2_score_sd": 49.050808}, "pentanomial": [1, 0, 9, 0, 0], "divergent_games": {"games": 4, "wins": 1, "losses": 3, "ties": 0, "p1_score_mean": 402.491278, "p1_score_sd": 55.376921, "p2_score_mean": 406.50323, "p2_score_sd": 49.050808}}
