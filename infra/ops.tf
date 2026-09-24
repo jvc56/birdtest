@@ -60,7 +60,7 @@ resource "aws_ecs_task_definition" "ops" {
 
   # Room for a nightly dump and a scratch restore of it (RUNBOOK.md §2.1).
   ephemeral_storage {
-    size_in_gib = var.backup_ephemeral_storage_gib
+    size_in_gib = var.restore_ephemeral_storage_gib
   }
 
   container_definitions = jsonencode([

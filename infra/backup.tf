@@ -613,7 +613,7 @@ resource "aws_ecs_task_definition" "restore_drill" {
   task_role_arn            = aws_iam_role.drill_task.arn
 
   ephemeral_storage {
-    size_in_gib = var.backup_ephemeral_storage_gib
+    size_in_gib = var.restore_ephemeral_storage_gib
   }
 
   container_definitions = jsonencode([

@@ -97,10 +97,21 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
     }
     assert_eq!(job_status(&db, job).await, "completed");
     assert_eq!(claim_state(&db, &held).await, "claimed", "the held claim is still open");
+    let decided = jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(decided.sprt_decided_status.as_deref(), Some("passed"));
+    assert_eq!(decided.sprt_decided_units, Some(100 * SPRT_CHECK_EVERY as i64));
+    let decided_llr = decided.sprt_decided_llr.unwrap();
 
-    submit(&app, &held_uuid, &held, games_result(100, 90)).await;
+    // I-STATS-9e: the result in flight at completion lands and moves the live
+    // figures -- a losing batch -- and the verdict the job stopped on stays.
+    submit(&app, &held_uuid, &held, games_result(100, 10)).await;
     assert_eq!(claim_state(&db, &held).await, "completed");
     assert_eq!(job_status(&db, job).await, "completed");
+    let row = jobstats::load_job(&db.pool, job).await.unwrap();
+    let games = jobstats::game_stats(&db.pool, &row).await.unwrap().unwrap();
+    assert!(games.sprt.llr < decided_llr, "the live LLR moved: {} vs {decided_llr}", games.sprt.llr);
+    let stored = games.decided.expect("the stored verdict is reported");
+    assert_eq!((stored.status.as_str(), stored.llr), ("passed", decided_llr));
 }
 
 // ---------------------------------------------------------------------------

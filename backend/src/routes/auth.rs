@@ -192,10 +192,12 @@ async fn register(
             )
         };
         if ratelimit::check(&state.limits.reset, &format!("reg-em:{email}")).is_ok() {
-            state
-                .mailer
-                .send(&email, "Someone tried to register with your email address", &notice)
-                .await?;
+            send_in_background(
+                &state,
+                email.clone(),
+                "Someone tried to register with your email address",
+                notice,
+            );
         }
         return Ok((
             StatusCode::CREATED,
@@ -240,17 +242,30 @@ async fn register(
     // rather than relying on that alphabet implicitly forever.
     let encoded_code = utf8_percent_encode(&raw_code, NON_ALPHANUMERIC);
     let link = format!("{}/confirm-email?code={encoded_code}", state.cfg.public_url);
-    state
-        .mailer
-        .send(
-            &email,
-            "Confirm your birdtest account",
-            &format!("Welcome to birdtest.\n\nConfirm your account:\n{link}\n"),
-        )
-        .await?;
+    send_in_background(
+        &state,
+        email,
+        "Confirm your birdtest account",
+        format!("Welcome to birdtest.\n\nConfirm your account:\n{link}\n"),
+    );
 
     // No session is created yet — email is confirmed before the first login.
     Ok((StatusCode::CREATED, Json(MessageBody { message: "check your email to confirm" })))
+}
+
+/// Registration's mail, sent off the request as password reset's is. Both
+/// branches of a registration -- a new account's confirmation, a taken
+/// address's notice -- used to await their send, except that a notice skipped
+/// by its per-address limit awaited nothing, and answered that much sooner:
+/// the timing gave back what the identical bodies hide. A failed send is
+/// logged; the caller was told the same thing either way.
+fn send_in_background(state: &AppState, to: String, subject: &'static str, body: String) {
+    let mailer = state.mailer.clone();
+    tokio::spawn(async move {
+        if let Err(err) = mailer.send(&to, subject, &body).await {
+            tracing::error!(error = %err.message, subject, "registration email failed to send");
+        }
+    });
 }
 
 #[derive(Deserialize)]
@@ -275,16 +290,16 @@ async fn login(
     // username bounds many guessers aimed at one account. Checked before the
     // lookup, so a limited attempt costs no Argon2 verify.
     //
-    // The username half is keyed on the username *and* the caller's address,
-    // with a looser cap on the username alone. Keyed on the username alone at
-    // the per-IP rate, one caller trying a wrong password every six seconds
-    // held any account -- an admin's, whose name `GET /api/users` publishes --
-    // out of signing in for as long as it kept going, correct password or not.
-    // Now a lockout takes a fleet of addresses, and the account-wide cap still
-    // bounds how fast a distributed guesser can try.
+    // The username half is ten times the address half. At the per-address
+    // rate it let one caller trying a wrong password every six seconds hold
+    // any account -- an admin's, whose name `GET /api/users` publishes -- out
+    // of signing in for as long as it kept going, correct password or not; at
+    // this rate a lockout takes a fleet of addresses, and the cap still bounds
+    // how fast a distributed guesser can try. (A per-username-per-address
+    // bucket at the address's own rate was tried and could never trip: it
+    // only ever saw requests the address's bucket had already let through.)
     let account = body.username.trim().to_lowercase();
     ratelimit::check(&state.limits.login, &format!("ip:{ip}"))?;
-    ratelimit::check(&state.limits.login, &format!("user:{account}|ip:{ip}"))?;
     ratelimit::check(&state.limits.login_account, &format!("user:{account}"))?;
 
     let row = sqlx::query_as::<_, (Uuid, String, String, bool, Option<chrono::DateTime<Utc>>, i32)>(

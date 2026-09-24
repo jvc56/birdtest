@@ -241,6 +241,11 @@ pub struct LeaveRequest {
     /// generation fetches its leaves the same way and the client has no
     /// first-generation branch.
     pub previous_artifact_key: String,
+    /// The SHA-256 the server recorded when it built that KLV, for the worker
+    /// to check the bytes it fetched against before it plays a game with them.
+    /// Every other file a task loads is checked by digest; this one, the one
+    /// file the task's statistics are computed *from*, was taken on trust.
+    pub previous_artifact_sha256: String,
     /// The task plays this many games and stops. The generation's rack target
     /// is deliberately not sent: every rack a game touches counts toward the
     /// generation's totals, not just this task's forced subset, so stopping

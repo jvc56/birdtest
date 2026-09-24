@@ -409,7 +409,14 @@ pub async fn reclaim_lapsed(state: &AppState, job_ids: &[Uuid]) -> AppResult<u64
     if std::time::Instant::now() < state.reclaim_from {
         return Ok(0);
     }
-    reclaim_expired_for(&state.pool, job_ids, state.cfg.heartbeat_timeout.as_secs_f64()).await
+    // Nor the claims of a job a purge or delete held and then let go without
+    // committing: their heartbeats were skipped while it held them, not missed
+    // (`jobs::DispatchHolds`).
+    let job_ids = state.dispatch_holds.reclaimable(job_ids);
+    if job_ids.is_empty() {
+        return Ok(0);
+    }
+    reclaim_expired_for(&state.pool, &job_ids, state.cfg.heartbeat_timeout.as_secs_f64()).await
 }
 
 /// Walk the candidate jobs in deficit order and hand out the first available
@@ -982,7 +989,11 @@ async fn seed_leave_universe(state: &AppState, job: &Job, generation: i32) -> Ap
         return Ok(());
     }
     // Until the commit below releases the lock.
-    let _hold = state.dispatch_holds.hold(job.id);
+    let _hold = state.dispatch_holds.hold(
+        job.id,
+        crate::jobs::HoldKind::DispatchOnly,
+        state.cfg.heartbeat_timeout,
+    );
     let job_data = crate::jobs::load_job_data(&mut tx, job.id).await?;
     leave_gen::ensure_universe(&mut tx, job.id, generation, &job_data.letterdist).await?;
     tx.commit().await?;

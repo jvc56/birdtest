@@ -1747,49 +1747,87 @@ struct PurgeResult {
 /// Clear every result and return the job's tasks to `available`. On-demand tasks
 /// are deleted outright — they are regenerated at claim time, and keeping them
 /// would leave the seed cursor advanced past work that was never done.
-/// Give back the contribution each identity earned on this job, before its
-/// claims are destroyed.
+/// What each identity earned on this job, to be given back when its claims
+/// are destroyed.
 ///
 /// The counters on `jobs` belong to the job, so a purge simply zeroes them. The
 /// ones on `users` and `anonymous_workers` do not: they span every job an
 /// identity ever worked on, so a job whose claims are about to disappear has to
 /// hand back exactly what it contributed, or the contributor lists read high
-/// for good and nothing says why. Must run *before* the claims go, since it
-/// counts them.
+/// for good and nothing says why. Must be read *before* the claims go, since it
+/// counts them; and it is exact up to the commit, because the caller holds the
+/// job's dispatch lock and every open claim (`lock_open_claims`), so no claim
+/// of the job can complete in between.
+///
+/// Read here and written by [`Contributions::give_back`] as the caller's last
+/// statement. Written here, as it once was, the update held every
+/// contributor's row for the whole of the deletes that follow -- minutes for a
+/// large job -- and every request those identities made meanwhile waited on
+/// it with a pool connection held: an anonymous worker's `last_seen_at` touch
+/// runs on every worker request, and a submission for *any* job bumps its
+/// contributor's counter. The fleet stalled exactly as it had on the claims.
 ///
 /// `last_completed_at` is deliberately not rewound. Finding the new maximum
 /// means the scan these counters exist to avoid, and it is a display figure
 /// that only ever moves forward; a purge can leave it pointing at a time whose
 /// task is gone.
-async fn release_contributions(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE users u
-         SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
-         FROM (SELECT c.claimed_by_user_id AS id, COUNT(*)::bigint AS n
-               FROM task_claims c JOIN tasks t ON t.id = c.task_id
-               WHERE t.job_id = $1 AND c.state = 'completed'
-                 AND c.claimed_by_user_id IS NOT NULL
-               GROUP BY 1) d
-         WHERE u.id = d.id",
-    )
-    .bind(job_id)
-    .execute(&mut *conn)
-    .await?;
+struct Contributions {
+    users: Vec<(Uuid, i64)>,
+    anonymous: Vec<(Uuid, i64)>,
+}
 
-    sqlx::query(
-        "UPDATE anonymous_workers w
-         SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
-         FROM (SELECT c.claimed_by_anon_uuid AS uuid, COUNT(*)::bigint AS n
-               FROM task_claims c JOIN tasks t ON t.id = c.task_id
-               WHERE t.job_id = $1 AND c.state = 'completed'
-                 AND c.claimed_by_anon_uuid IS NOT NULL
-               GROUP BY 1) d
-         WHERE w.uuid = d.uuid",
-    )
-    .bind(job_id)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
+impl Contributions {
+    async fn count(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Self> {
+        let users = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT c.claimed_by_user_id, COUNT(*)::bigint
+             FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'completed'
+               AND c.claimed_by_user_id IS NOT NULL
+             GROUP BY 1",
+        )
+        .bind(job_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let anonymous = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT c.claimed_by_anon_uuid, COUNT(*)::bigint
+             FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'completed'
+               AND c.claimed_by_anon_uuid IS NOT NULL
+             GROUP BY 1",
+        )
+        .bind(job_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(Contributions { users, anonymous })
+    }
+
+    /// The caller's last statement before it commits, so the rows are held
+    /// for milliseconds.
+    async fn give_back(self, conn: &mut sqlx::PgConnection) -> AppResult<()> {
+        let (ids, counts): (Vec<Uuid>, Vec<i64>) = self.users.into_iter().unzip();
+        sqlx::query(
+            "UPDATE users u
+             SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
+             FROM UNNEST($1::uuid[], $2::bigint[]) AS d(id, n)
+             WHERE u.id = d.id",
+        )
+        .bind(&ids)
+        .bind(&counts)
+        .execute(&mut *conn)
+        .await?;
+        let (uuids, counts): (Vec<Uuid>, Vec<i64>) = self.anonymous.into_iter().unzip();
+        sqlx::query(
+            "UPDATE anonymous_workers w
+             SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
+             FROM UNNEST($1::uuid[], $2::bigint[]) AS d(uuid, n)
+             WHERE w.uuid = d.uuid",
+        )
+        .bind(&uuids)
+        .bind(&counts)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Wait out every submission, decline and heartbeat in flight on this job's
@@ -1800,12 +1838,12 @@ async fn release_contributions(conn: &mut sqlx::PgConnection, job_id: Uuid) -> A
 /// opposite order -- so a submission arriving mid-purge waited on the job's row
 /// while the purge waited on that submission's claim: a deadlock, which
 /// Postgres breaks by failing one of the two. And a submission that committed
-/// after `release_contributions` had counted, but before the delete, credited
+/// after `Contributions::count` had counted, but before the delete, credited
 /// its identity for a claim the purge then destroyed, so that contributor's
 /// total read high for good.
 ///
 /// Locking the open claims first, before the job's row, puts destruction in
-/// the order every submission uses, and means `release_contributions` sees
+/// the order every submission uses, and means `Contributions::count` sees
 /// every submission that got in ahead of it. The caller takes the dispatch lock
 /// before this, which is what stops new claims appearing meanwhile.
 async fn lock_open_claims(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
@@ -1831,8 +1869,13 @@ async fn purge_job(
     csrf::verify(&method, &headers, &jar)?;
 
     // Claims skip the job while this runs rather than each waiting on its
-    // dispatch lock with a pool connection held: see `jobs::DispatchHolds`.
-    let _hold = state.dispatch_holds.hold(id);
+    // dispatch lock with a pool connection held, and submissions for its
+    // claims are answered at once: see `jobs::DispatchHolds`.
+    let mut hold = state.dispatch_holds.hold(
+        id,
+        crate::jobs::HoldKind::Claims,
+        state.cfg.heartbeat_timeout,
+    );
     let mut tx = state.pool.begin().await?;
     // The same lock every claim takes before deciding what to hand out, and
     // for the same reason. A claim in flight has already read the seed cursor
@@ -1870,8 +1913,8 @@ async fn purge_job(
     .await?;
 
     // Before the claims go, and for the same reason the census is taken first:
-    // it counts what is about to be destroyed.
-    release_contributions(&mut tx, id).await?;
+    // it counts what is about to be destroyed. Given back last, below.
+    let contributions = Contributions::count(&mut tx, id).await?;
 
     // Records and claims cascade from tasks; leave-gen progress is keyed on
     // the job directly. Ratings are not touched: they belong to rating pools,
@@ -1965,7 +2008,9 @@ async fn purge_job(
         Some(id),
     )
     .await?;
+    contributions.give_back(&mut tx).await?;
     tx.commit().await?;
+    hold.committed();
 
     // Exports describe results this purge has just deleted. A row left saying
     // `ready` would hand an admin a stable-looking artifact of a job that no
@@ -1989,11 +2034,15 @@ async fn delete_job(
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
 
-    let _hold = state.dispatch_holds.hold(id);
+    let mut hold = state.dispatch_holds.hold(
+        id,
+        crate::jobs::HoldKind::Claims,
+        state.cfg.heartbeat_timeout,
+    );
     let mut tx = state.pool.begin().await?;
     // The same locks a purge takes, in the same order and for the same
     // reasons: no claim is issued meanwhile, and no submission is between its
-    // claim and its commit when `release_contributions` counts -- see
+    // claim and its commit when `Contributions::count` counts -- see
     // `lock_open_claims`. The cascade below deletes every claim and task, so
     // without them this deadlocked against a submission in flight just as
     // purge did. The merge lock first, as there: the cascade deletes a leave
@@ -2027,10 +2076,10 @@ async fn delete_job(
     )
     .await?;
 
-    // Deleting the job cascades its tasks and their claims away, so the
-    // identities that earned them have to be paid back first -- see
-    // `release_contributions`.
-    release_contributions(&mut tx, id).await?;
+    // Deleting the job cascades its tasks and their claims away, so what the
+    // identities earned is counted first and given back last -- see
+    // `Contributions`.
+    let contributions = Contributions::count(&mut tx, id).await?;
 
     let deleted = sqlx::query("DELETE FROM jobs WHERE id = $1")
         .bind(id)
@@ -2039,7 +2088,9 @@ async fn delete_job(
     if deleted.rows_affected() == 0 {
         return Err(AppError::not_found("no such job"));
     }
+    contributions.give_back(&mut tx).await?;
     tx.commit().await?;
+    hold.committed();
     // Tidiness only: a remembered answer for a job that no longer exists is
     // never asked for, but there is no reason to keep it.
     state.derived_ready.forget(id);

@@ -14,8 +14,6 @@
 # Optional profiles:
 #   --profile dev           the Vite dev server with hot reload, alongside the
 #                           production-style Nginx frontend
-#   --profile fake-worker   synthetic results for the **end-to-end suite**.
-#                           Not for development — see TESTING.md.
 #
 # And one service run on demand rather than kept up:
 #   docker compose run --rm derived-builder
@@ -25,8 +23,9 @@
 #                           either file is not dispatched until this has run.
 #
 # The end-to-end suite runs this file plus docker-compose.e2e.yml as its own
-# project (file mail, a stand-in for GitHub, the fake workers); use
-# e2e/run.sh, which brings it up and tears it down.
+# project (file mail, a stand-in for GitHub, and the fake workers, which are
+# defined there and only there); use e2e/run.sh, which brings it up and tears
+# it down.
 #
 # Ports are overridable so a host that already has something on 5432 (or 9000,
 # or 5173) does not need the file edited. See .env.example.
@@ -244,33 +243,6 @@ services:
       RUST_LOG: ${RUST_LOG:-birdtest=info}
     volumes:
       - ${MAGPIE_ROOT:-../MAGPIE}:/magpie:ro
-
-  # --- profile: fake-worker -------------------------------------------------
-  # Synthetic results, for the end-to-end suite only. A browser journey needs
-  # contributions to arrive on cue at predictable values, and needs to run on
-  # every pull request without a C toolchain — both properties of an assertion
-  # harness rather than of a place to develop. Local development and the MAGPIE
-  # smoke tier both use a real engine; see TESTING.md.
-  fake-worker:
-    profiles: [fake-worker]
-    build:
-      context: .
-      dockerfile: docker/Dockerfile
-      target: fake-worker
-    depends_on:
-      backend:
-        condition: service_healthy
-    command:
-      - --server-url
-      - http://backend:8080
-      - --workers
-      - "${FAKE_WORKERS:-2}"
-      - --tasks
-      - "${FAKE_TASKS:-0}"
-      - --p1-win-rate
-      - "${FAKE_P1_WIN_RATE:-0.5}"
-      - --mode
-      - "${FAKE_MODE:-normal}"
 
 volumes:
   pgdata:

@@ -249,6 +249,23 @@ async fn a_completed_jobs_stream_redirects_to_its_ready_export() {
         assert!(location.contains(&key), "{query}: {location} is not {key}");
         assert_eq!(download(location).await, state.artifacts.get(&key).await.unwrap());
     }
+
+    // Past the lifetime the bucket keeps an export for, the stream goes back to
+    // the database rather than redirect to an object that is gone, and the
+    // admin page says so rather than offer a dead download.
+    sqlx::query("UPDATE job_exports SET completed_at = completed_at - interval '30 days' WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send_raw(&app, get_request(&stream, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "an expired export is not redirected to");
+    assert_eq!(body.lines().count(), 1);
+    let (status, detail) =
+        send(&app, get_request(&format!("/api/admin/jobs/{job}/export"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["state"], "expired", "{detail}");
+    assert!(detail["download_url"].is_null(), "{detail}");
 }
 
 /// PLAN.md, "Exports": only a games job that captured something grows a

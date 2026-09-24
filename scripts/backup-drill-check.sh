@@ -13,8 +13,10 @@
 # 1. A backup taken while another session keeps writing (audit_log rows, as
 #    claims and admin actions do in production) succeeds and records an ok=true
 #    `backups` row whose sha256 and row counts are the manifest's.
-# 2. The restore drill of that backup passes: the restored row counts equal
-#    the manifest's even though the database moved on while it was dumped.
+# 2. The restore drill of that backup passes, in both modes (its own server,
+#    as production runs it, and a second database on the stack's server): the
+#    restored row counts equal the manifest's even though the database moved
+#    on while it was dumped.
 #    The counts were once taken after pg_dump finished, outside its snapshot,
 #    so any write during the dump failed every drill.
 # 3. A backup that cannot upload exits non-zero and leaves an ok=false row.
@@ -182,11 +184,24 @@ print(f"backups row matches the manifest: sha256 {sha}, audit_log {counts['audit
 PY
 
 # --- 2. The drill of that backup -------------------------------------------
+# As production runs it: into a Postgres of its own, inside the container.
 log "restore-drill.sh"
 run_script restore-drill.sh "BACKUP_PREFIX=${PREFIX}" "DRILL_DB=${DRILL_DB}" \
   || fail "restore-drill.sh exited $?"
+# Live processes only: this container's PID 1 is `sleep`, which never reaps
+# the drill's exited server, so its zombies stay listed.
+tools "${TOOLS}" bash -c '! cat /proc/[0-9]*/stat 2>/dev/null | awk "\$2 == \"(postgres)\" && \$3 != \"Z\"" | grep -q . && [[ ! -e /tmp/birdtest-drill ]]' \
+  || fail "the drill left its own server or its work directory behind"
 [[ "$(sql "SELECT count(*) FROM pg_database WHERE datname = '${DRILL_DB}'")" == 0 ]] \
-  || fail "the drill left ${DRILL_DB} behind"
+  || fail "the local drill created ${DRILL_DB} on the stack's server"
+
+# And the hand-run mode RUNBOOK keeps, into a second database on the server
+# DATABASE_URL names, which it must drop again.
+log "restore-drill.sh, DRILL_TARGET=server"
+run_script restore-drill.sh "BACKUP_PREFIX=${PREFIX}" "DRILL_DB=${DRILL_DB}" "DRILL_TARGET=server" \
+  || fail "restore-drill.sh (server) exited $?"
+[[ "$(sql "SELECT count(*) FROM pg_database WHERE datname = '${DRILL_DB}'")" == 0 ]] \
+  || fail "the server drill left ${DRILL_DB} behind"
 
 # --- 3. A backup that cannot upload ------------------------------------------
 log "backup.sh to a bucket that does not exist (expected to fail)"

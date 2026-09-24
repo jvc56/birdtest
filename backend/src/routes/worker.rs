@@ -288,6 +288,7 @@ async fn decline_task(
         ));
     }
 
+    refuse_if_claims_held(&state, body.claim_token).await?;
     let mut tx = state.pool.begin().await?;
     // Locked, so a timeout reclaiming this claim concurrently cannot release
     // it a second time.
@@ -366,6 +367,39 @@ async fn decline_task(
 /// `Retry-After`, which MAGPIE backs off and retries, and its retry after the
 /// purge finds the claim gone and is answered `accepted: false`.
 const CLAIM_LOCK_WAIT: &str = "5s";
+
+/// A purge or delete of this claim's job is running, and it holds the claim:
+/// answer `503` now rather than wait out [`CLAIM_LOCK_WAIT`] on a connection.
+/// MAGPIE backs a 5xx off by itself, starting at a second, so each worker
+/// finishing a task mid-purge would otherwise spend most of the purge holding
+/// a connection in five-second waits -- a few hundred workers on the job would
+/// hold the pool.
+///
+/// Free when nothing is being purged: the job is looked up (without a lock,
+/// which never waits) only while some job's claims are held.
+async fn refuse_if_claims_held(state: &AppState, claim_token: Uuid) -> AppResult<()> {
+    if !state.dispatch_holds.any_claims_held() {
+        return Ok(());
+    }
+    let job_id: Option<Uuid> = sqlx::query_scalar(
+        "SELECT t.job_id FROM task_claims c JOIN tasks t ON t.id = c.task_id
+         WHERE c.claim_token = $1",
+    )
+    .bind(claim_token)
+    .fetch_optional(&state.pool)
+    .await?;
+    if job_id.is_some_and(|job_id| state.dispatch_holds.claims_held(job_id)) {
+        return Err(AppError {
+            retry_after: Some(30),
+            ..AppError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "this claim's job is being purged or deleted; try again shortly",
+            )
+        });
+    }
+    Ok(())
+}
 
 async fn bound_claim_lock_wait(tx: &mut sqlx::PgConnection) -> AppResult<()> {
     sqlx::query(&format!("SET LOCAL lock_timeout = '{CLAIM_LOCK_WAIT}'"))
@@ -446,6 +480,7 @@ async fn submit_result(
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
 
+    refuse_if_claims_held(&state, body.claim_token).await?;
     let mut tx = state.pool.begin().await?;
 
     // The claim is looked up and locked inside the transaction that completes

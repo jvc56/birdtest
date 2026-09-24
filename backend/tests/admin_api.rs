@@ -1427,3 +1427,155 @@ async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
     .unwrap();
     assert!(stamped, "issuing a claim stamps jobs.last_claimed_at");
 }
+
+/// A-ADMIN-15: purging a completed job returns it to inactive and clears the
+/// verdict it was completed on. Left completed, it was an empty job nothing
+/// could ever run again -- activation refuses a completed job -- where a purge
+/// is meant to start it over.
+#[tokio::test]
+async fn purging_a_completed_job_returns_it_to_inactive() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    with_history(&app).await;
+    sqlx::query(
+        "UPDATE jobs SET status = 'completed', sprt_decided_status = 'passed',
+                         sprt_decided_llr = 3.1, sprt_decided_units = 200
+         WHERE id = $1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+
+    let (status, body) =
+        send(&app, request("POST", &format!("/api/admin/jobs/{job}/purge"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (job_status, verdict): (String, Option<String>) =
+        sqlx::query_as("SELECT status::text, sprt_decided_status FROM jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!((job_status.as_str(), verdict), ("inactive", None));
+
+    let borrowed: Vec<(&str, &str)> =
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{job}/activate"), &borrowed, json!({ "allocation": 50 })),
+    )
+    .await;
+    assert!(status.is_success(), "and it can run again: {body}");
+}
+
+/// A-ADMIN-16: while a purge or delete holds a job's claims, a submission for
+/// one of them is answered `503` at once rather than waiting out its lock
+/// timeout on a pool connection; and a hold that ends without committing --
+/// the request dropped, a deadlock -- spares the job's claims from
+/// reclamation for a heartbeat timeout, since their heartbeats were skipped
+/// while it held them, not missed.
+#[tokio::test]
+async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+
+    let (status, claim) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    let token = claim["claim_token"].as_str().unwrap().to_string();
+    let uuid = claim["worker_uuid"].as_str().unwrap().to_string();
+
+    let hold = state.dispatch_holds.hold(
+        job,
+        birdtest::jobs::HoldKind::Claims,
+        std::time::Duration::from_secs(300),
+    );
+    let started = std::time::Instant::now();
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": token, "result": games_result(2, 1) }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "answered at once");
+
+    // The hold ends without a commit, and the claim looks long lapsed.
+    drop(hold);
+    sqlx::query(
+        "UPDATE task_claims SET last_heartbeat_at = now() - interval '1 hour',
+                                claimed_at = now() - interval '1 hour'
+         WHERE claim_token = $1::uuid",
+    )
+    .bind(&token)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(birdtest::scheduler::reclaim_lapsed(&state, &[job]).await.unwrap(), 0);
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": token, "result": games_result(2, 1) }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["accepted"], true, "the claim survived the failed purge: {body}");
+}
+
+/// A-ADMIN-17: a worker request's `last_seen_at` touch does not wait on its
+/// identity's row. A purge gives back what a job's contributors earned, and a
+/// submission bumps its contributor's counter; a touch that waited on either
+/// held a pool connection for as long -- for a purge, minutes, for every
+/// anonymous contributor to the job.
+#[tokio::test]
+async fn a_locked_identity_row_does_not_hold_up_its_requests() {
+    let db = TestDb::new().await;
+    db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let (status, claim) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    let token = claim["claim_token"].as_str().unwrap().to_string();
+    let uuid: Uuid = claim["worker_uuid"].as_str().unwrap().parse().unwrap();
+    sqlx::query("UPDATE anonymous_workers SET last_seen_at = now() - interval '1 hour' WHERE uuid = $1")
+        .bind(uuid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM anonymous_workers WHERE uuid = $1 FOR UPDATE")
+        .bind(uuid)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let uuid_text = uuid.to_string();
+    let heartbeat = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        send(
+            &app,
+            post_json(
+                "/api/worker/heartbeat",
+                &[("x-worker-uuid", uuid_text.as_str())],
+                json!({ "claim_token": token }),
+            ),
+        ),
+    )
+    .await
+    .expect("the heartbeat waited on its identity's row");
+    assert_eq!(heartbeat.0, StatusCode::NO_CONTENT, "{}", heartbeat.1);
+    holder.rollback().await.unwrap();
+}

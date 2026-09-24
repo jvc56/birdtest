@@ -27,9 +27,15 @@
     (c) => !pool?.ratings.some((r) => r.player_config_id === c.id)
   );
 
+  // Both before either is shown: assigned one at a time, a failed history
+  // left the pool on screen with an empty chart and the error nowhere.
   async function load() {
-    pool = await api.ratingPool(poolId);
-    history = await api.ratingHistory(poolId);
+    const [loadedPool, loadedHistory] = await Promise.all([
+      api.ratingPool(poolId),
+      api.ratingHistory(poolId)
+    ]);
+    pool = loadedPool;
+    history = loadedHistory;
   }
 
   onMount(async () => {

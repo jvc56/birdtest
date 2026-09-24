@@ -150,12 +150,29 @@ variable "backup_task_memory" {
 
 variable "backup_ephemeral_storage_gib" {
   description = <<-EOT
-    Scratch space for the dump before it is uploaded. Must exceed the
+    Scratch space for the nightly dump before it is uploaded. Must exceed the
     compressed dump size; the results tables compress well, but
     position_analysis_moves is the table that will outgrow a default.
   EOT
   type        = number
   default     = 100
+}
+
+variable "restore_ephemeral_storage_gib" {
+  description = <<-EOT
+    Disk for the monthly restore drill and the ops task (RUNBOOK.md §2.1), each
+    of which holds a downloaded dump *and* a full restored copy of the database
+    side by side, with WAL. Fargate's ceiling is 200 GiB, which covers a
+    database a little over 150 GiB; the drill refuses to start, naming this
+    variable, when the manifest says the database will not fit.
+  EOT
+  type        = number
+  default     = 200
+
+  validation {
+    condition     = var.restore_ephemeral_storage_gib >= 21 && var.restore_ephemeral_storage_gib <= 200
+    error_message = "Fargate ephemeral storage is 21 to 200 GiB."
+  }
 }
 
 variable "backup_dump_jobs" {
@@ -166,10 +183,9 @@ variable "backup_dump_jobs" {
 
 variable "restore_drill_enabled" {
   description = <<-EOT
-    Run the monthly restore drill. It restores the newest dump into a second
-    database on the production instance, which needs storage headroom for a
-    transient second copy of the corpus; turn it off if that becomes tight and
-    run scripts/restore-drill.sh against a scratch instance instead.
+    Run the monthly restore drill. It restores the newest dump into a Postgres
+    of its own, inside the drill task, on restore_ephemeral_storage_gib of disk;
+    it never touches the production instance.
   EOT
   type        = bool
   default     = true

@@ -168,6 +168,13 @@ async fn a_pairs_result_stores_its_pentanomial_and_the_schema_refuses_a_contradi
         "game_results_pentanomial_all_or_nothing",
         "the half-point clause"
     );
+    // The right pair count and half-points, but two win-and-draw pairs where
+    // the counts hold no draw.
+    assert_eq!(
+        violated_constraint(&db, job, "pent_2 = 0, pent_3 = 2, pent_4 = 0").await,
+        "game_results_pentanomial_all_or_nothing",
+        "the draw clause"
+    );
     // And a partial pentanomial is refused by the same constraint.
     assert_eq!(
         violated_constraint(&db, job, "pent_4 = NULL").await,
@@ -177,6 +184,7 @@ async fn a_pairs_result_stores_its_pentanomial_and_the_schema_refuses_a_contradi
     for (pentanomial, message) in [
         (json!([0, 0, 2, 0, 1]), "pentanomial pair count must be exactly half the games played"),
         (json!([1, 0, 0, 0, 1]), "pentanomial disagrees with the game counts about player 1's score"),
+        (json!([0, 0, 0, 2, 0]), "pentanomial disagrees with the game counts about the draws"),
     ] {
         let mut result = pairs_result();
         result["pentanomial"] = pentanomial;

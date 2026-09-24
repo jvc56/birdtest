@@ -575,18 +575,28 @@ pub async fn worker_contributions(
 ) -> AppResult<(Vec<WorkerContribution>, i64)> {
     // One more than the cap, so "are there others" needs no second query when
     // the job has few contributors -- which is the common case.
+    //
+    // Grouped by the raw identity first and hashed after the limit: grouped by
+    // the pseudonym, the SHA-256 was computed for every completed claim of the
+    // job -- a hundred thousand of them for a long job, on every detail view
+    // and every live push -- to name at most fifty-one.
     let rows = sqlx::query(
-        "SELECT c.claimed_by_user_id AS user_id,
-                left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
+        "SELECT w.user_id,
+                left(encode(sha256(convert_to(w.anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
-                COUNT(*)::bigint AS tasks_completed
-         FROM task_claims c
-         JOIN tasks t ON t.id = c.task_id
-         LEFT JOIN users u ON u.id = c.claimed_by_user_id
-         WHERE t.job_id = $1 AND c.state = 'completed'
-         GROUP BY 1, 2, 3
-         ORDER BY 4 DESC
-         LIMIT $2",
+                w.tasks_completed
+         FROM (
+             SELECT c.claimed_by_user_id AS user_id, c.claimed_by_anon_uuid AS anon_uuid,
+                    COUNT(*)::bigint AS tasks_completed
+             FROM task_claims c
+             JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'completed'
+             GROUP BY 1, 2
+             ORDER BY 3 DESC
+             LIMIT $2
+         ) w
+         LEFT JOIN users u ON u.id = w.user_id
+         ORDER BY w.tasks_completed DESC",
     )
     .bind(job_id)
     .bind(MAX_WORKER_CONTRIBUTIONS + 1)

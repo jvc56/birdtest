@@ -68,18 +68,78 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
 /// queued. In-process is enough because the service is a single instance
 /// (`desired_count` is validated to at most one); the advisory lock is still
 /// what makes the hold safe, and this only spares the wait.
+///
+/// A purge or a delete also holds every open claim of the job
+/// ([`HoldKind::Claims`]), so a submission or decline for one of them is
+/// answered at once rather than waiting out its lock timeout on a connection;
+/// and if it ends without committing -- the request dropped at the load
+/// balancer's timeout, a deadlock -- the job's claims are not reclaimed for a
+/// heartbeat timeout afterwards: their heartbeats were skipped while it held
+/// them, not missed.
 #[derive(Clone, Default)]
-pub struct DispatchHolds(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>>);
+pub struct DispatchHolds(std::sync::Arc<std::sync::Mutex<HoldsInner>>);
+
+#[derive(Default)]
+struct HoldsInner {
+    /// Per job, how many holds of each kind: `[dispatch only, claims]`.
+    held: std::collections::HashMap<Uuid, [usize; 2]>,
+    /// Jobs whose claims-holding hold ended without committing, and until
+    /// when their claims are not reclaimed.
+    reclaim_not_before: std::collections::HashMap<Uuid, std::time::Instant>,
+}
+
+/// What a [`DispatchHold`] holds besides the job's dispatch lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HoldKind {
+    /// Nothing else: a seeding. Submissions go ahead.
+    DispatchOnly,
+    /// Every open claim of the job as well: a purge or a delete.
+    Claims,
+}
 
 impl DispatchHolds {
-    /// Marks the job held until the returned guard is dropped.
-    pub fn hold(&self, job_id: Uuid) -> DispatchHold {
-        *self.0.lock().expect("dispatch holds poisoned").entry(job_id).or_insert(0) += 1;
-        DispatchHold { holds: self.clone(), job_id }
+    /// Marks the job held until the returned guard is dropped. `grace` is how
+    /// long the job's claims are spared reclamation if a [`HoldKind::Claims`]
+    /// hold is dropped without [`DispatchHold::committed`].
+    pub fn hold(&self, job_id: Uuid, kind: HoldKind, grace: std::time::Duration) -> DispatchHold {
+        let mut inner = self.0.lock().expect("dispatch holds poisoned");
+        inner.held.entry(job_id).or_insert([0, 0])[kind as usize] += 1;
+        DispatchHold { holds: self.clone(), job_id, kind, grace, committed: false }
     }
 
+    /// Whether claims should skip the job.
     pub fn is_held(&self, job_id: Uuid) -> bool {
-        self.0.lock().expect("dispatch holds poisoned").contains_key(&job_id)
+        self.0.lock().expect("dispatch holds poisoned").held.contains_key(&job_id)
+    }
+
+    /// Whether the job's open claims are held, so a submission or decline for
+    /// one would only wait.
+    pub fn claims_held(&self, job_id: Uuid) -> bool {
+        self.0
+            .lock()
+            .expect("dispatch holds poisoned")
+            .held
+            .get(&job_id)
+            .is_some_and(|counts| counts[HoldKind::Claims as usize] > 0)
+    }
+
+    /// Whether any job's claims are held at all -- the cheap check that lets a
+    /// submission skip looking up its job the rest of the time.
+    pub fn any_claims_held(&self) -> bool {
+        self.0
+            .lock()
+            .expect("dispatch holds poisoned")
+            .held
+            .values()
+            .any(|counts| counts[HoldKind::Claims as usize] > 0)
+    }
+
+    /// `job_ids` less the jobs whose claims are in their post-hold grace.
+    pub fn reclaimable(&self, job_ids: &[Uuid]) -> Vec<Uuid> {
+        let mut inner = self.0.lock().expect("dispatch holds poisoned");
+        let now = std::time::Instant::now();
+        inner.reclaim_not_before.retain(|_, until| *until > now);
+        job_ids.iter().copied().filter(|id| !inner.reclaim_not_before.contains_key(id)).collect()
     }
 }
 
@@ -87,16 +147,31 @@ impl DispatchHolds {
 pub struct DispatchHold {
     holds: DispatchHolds,
     job_id: Uuid,
+    kind: HoldKind,
+    grace: std::time::Duration,
+    committed: bool,
+}
+
+impl DispatchHold {
+    /// The holder's transaction committed: its claims are gone, not spared.
+    pub fn committed(&mut self) {
+        self.committed = true;
+    }
 }
 
 impl Drop for DispatchHold {
     fn drop(&mut self) {
-        let mut holds = self.holds.0.lock().expect("dispatch holds poisoned");
-        if let Some(count) = holds.get_mut(&self.job_id) {
-            *count -= 1;
-            if *count == 0 {
-                holds.remove(&self.job_id);
+        let mut inner = self.holds.0.lock().expect("dispatch holds poisoned");
+        if let Some(counts) = inner.held.get_mut(&self.job_id) {
+            counts[self.kind as usize] -= 1;
+            if counts == &[0, 0] {
+                inner.held.remove(&self.job_id);
             }
+        }
+        if self.kind == HoldKind::Claims && !self.committed {
+            inner
+                .reclaim_not_before
+                .insert(self.job_id, std::time::Instant::now() + self.grace);
         }
     }
 }

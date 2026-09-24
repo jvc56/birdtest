@@ -58,10 +58,15 @@ impl JobHandler for LeaveGenHandler {
         template: &JobTemplate,
         task_id: Uuid,
     ) -> AppResult<Self::Request> {
+        // The artifact's hash is read from the row that names it rather than
+        // stored with the request: one source, whichever path sends the task.
         let row = sqlx::query(
-            "SELECT lexicon, variant, letter_distribution, board_layout, generation, seed,
-                    forced_racks, num_games, previous_artifact_key, use_wordmap
-             FROM leave_requests WHERE task_id = $1",
+            "SELECT r.lexicon, r.variant, r.letter_distribution, r.board_layout, r.generation,
+                    r.seed, r.forced_racks, r.num_games, r.previous_artifact_key, r.use_wordmap,
+                    a.sha256 AS previous_artifact_sha256
+             FROM leave_requests r
+             JOIN leave_generation_artifacts a ON a.artifact_key = r.previous_artifact_key
+             WHERE r.task_id = $1",
         )
         .bind(task_id)
         .fetch_one(&mut *conn)
@@ -76,6 +81,7 @@ impl JobHandler for LeaveGenHandler {
             forced_racks: row.get("forced_racks"),
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
+            previous_artifact_sha256: row.get("previous_artifact_sha256"),
             use_wordmap: row.get("use_wordmap"),
             bingo_bonus: template.data.bingo_bonus,
         })
@@ -719,8 +725,8 @@ pub async fn next_step(
     // Never optional: generation 1 reads the zeroed KLV written at generation
     // 0 when the job was created, so every generation fetches its leaves the
     // same way.
-    let previous_artifact_key = sqlx::query_scalar::<_, String>(
-        "SELECT artifact_key FROM leave_generation_artifacts
+    let (previous_artifact_key, previous_artifact_sha256) = sqlx::query_as::<_, (String, String)>(
+        "SELECT artifact_key, sha256 FROM leave_generation_artifacts
          WHERE job_id = $1 AND generation = $2",
     )
     .bind(job_id)
@@ -747,6 +753,7 @@ pub async fn next_step(
         seed: rand::random(),
         forced_racks: racks,
         previous_artifact_key,
+        previous_artifact_sha256,
         num_games: config.num_iterations,
         use_wordmap: config.use_wordmap,
         bingo_bonus: job_data.bingo_bonus,
@@ -1232,6 +1239,14 @@ pub async fn close_generation(
     config: &LeaveConfig,
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
+    // The merge lock first, as a purge and a delete take it: they hold it for
+    // their whole transaction, so this waits holding nothing and then finds its
+    // transition row gone. Without it the close locked that row and then
+    // waited on the job's row (the artifact insert's foreign-key check) while
+    // the purge, holding the job's row, waited on the transition row -- a
+    // deadlock Postgres resolved by aborting the purge after it had run for
+    // its whole length.
+    lock_merges(&mut tx, job_id).await?;
     // Claiming ownership back, and the one place this transition can find out
     // it no longer has any. A purge deletes the transitions row along with the
     // artifacts and progress rows -- all while a transition spawned before it
@@ -1295,8 +1310,12 @@ pub async fn close_generation(
         .execute(&mut *tx)
         .await?;
 
+    // Guarded on `active`, as every other automatic completion is: an admin
+    // who deactivated the job during its last transition decided something,
+    // and it stands. Reactivated, its first claim finds the last generation
+    // closed and completes it then.
     if generation >= config.generation_count {
-        sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
             .bind(job_id)
             .execute(&mut *tx)
             .await?;

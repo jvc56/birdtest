@@ -12,6 +12,8 @@ set -euo pipefail
 
 tf() { terraform -chdir="${INFRA_DIR:-infra}" output "$@"; }
 cluster=$(tf -raw cluster_name)
+# After a region-loss drill the workspace may still be the DR stack's.
+echo "workspace $(terraform -chdir="${INFRA_DIR:-infra}" workspace show), cluster $cluster" >&2
 task_definition=$(tf -raw ops_task_definition)
 subnets=$(tf -json service_subnet_ids | jq -r 'join(",")')
 security_group=$(tf -raw service_security_group_id)

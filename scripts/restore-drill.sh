@@ -147,17 +147,32 @@ log "checksum matches"
 
 # --- Restore ---------------------------------------------------------------
 if [[ "${DRILL_TARGET}" == local ]]; then
+  # The restored database lands on the same disk as the dump just downloaded,
+  # with WAL on top. Checked now, with the size the manifest recorded, rather
+  # than found an hour into the restore as ENOSPC: a drill failing for want of
+  # disk says nothing about the backup it was drilling.
+  need="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["database_bytes"] + 5 * 2**30)' \
+    "${WORKDIR}/manifest.json")"
+  free="$(df --output=avail -B1 "${WORKDIR}" | tail -1 | tr -d ' ')"
+  if (( free < need )); then
+    log "NOT ENOUGH DISK: the restore needs about $(( need / 2**30 )) GiB and ${WORKDIR} has $(( free / 2**30 )) GiB free; raise restore_ephemeral_storage_gib"
+    exit 1
+  fi
   log "starting the drill's own server"
   mkdir -p "${LOCAL_PGDATA}" "${LOCAL_SOCKET}"
   if [[ "$(id -u)" == 0 ]]; then chown -R postgres:postgres "${LOCAL_DIR}"; fi
   as_postgres initdb --pgdata="${LOCAL_PGDATA}" --username=postgres --auth=trust \
     --encoding=UTF8 >/dev/null
   # Durability is worth nothing to a database dropped in an hour, and the
-  # restore is the whole of the drill's run time.
+  # restore is the whole of the drill's run time. No parallel query: its
+  # workers share memory through /dev/shm, which a container may give only
+  # 64 MB, and a verification query that tripped on it would fail the drill
+  # for a reason that has nothing to do with the backup.
   as_postgres pg_ctl -D "${LOCAL_PGDATA}" -w -l "${LOCAL_DIR}/postgres.log" start -o \
     "-c listen_addresses='' -c unix_socket_directories='${LOCAL_SOCKET}' \
      -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
-     -c maintenance_work_mem=256MB -c max_wal_size=4GB" >/dev/null
+     -c maintenance_work_mem=256MB -c max_wal_size=4GB \
+     -c max_parallel_workers_per_gather=0" >/dev/null
 fi
 psql "${ADMIN_URL}" --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
   --command "CREATE DATABASE \"${DRILL_DB}\""

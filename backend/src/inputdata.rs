@@ -79,6 +79,17 @@ fn classify(entry_path: &str) -> Option<(String, String, String)> {
         _ => return None,
     };
     let name = basename.strip_suffix(suffix)?.to_string();
+    // A name MAGPIE would refuse is not importable. Every name a task carries
+    // becomes a path on the worker, which checks it against one rule
+    // (`[A-Za-z0-9_-]+`; a rack info table joins a lexicon and leaves with one
+    // `.`) and fails the task otherwise -- after claiming it, as a failure, so
+    // a job pinned to `CSW24.v2` would have stopped every worker it reached.
+    // Skipped like any file birdtest does not pin, so no job can be made on it.
+    if name.is_empty()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
     Some((format!("{dir}/{basename}"), role.to_string(), name))
 }
 
@@ -777,6 +788,11 @@ mod tests {
         // Unrecognised directories and suffixes are ignored rather than
         // rejected: MAGPIE-DATA carries more than birdtest pins.
         assert_eq!(classify("data/quackle/whatever.dat"), None);
+        // A name the worker would refuse as a path is not importable.
+        assert_eq!(classify("data/lexica/CSW24.v2.kwg"), None);
+        assert_eq!(classify("data/lexica/CSW 24.kwg"), None);
+        assert_eq!(classify("data/lexica/.kwg"), None);
+        assert!(classify("data/lexica/CSW21_ab-2.kwg").is_some());
         assert_eq!(classify("data/lexica/NWL23.wmp"), None);
         assert_eq!(classify("testdata/lexica/NWL23.kwg"), None);
         assert_eq!(classify("data/lexica/nested/NWL23.kwg"), None);

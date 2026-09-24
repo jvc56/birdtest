@@ -40,7 +40,7 @@ async fn anon(db: &TestDb) -> WorkerIdentity {
 /// A worker authenticated by an API key, i.e. by its account.
 async fn registered(db: &TestDb) -> WorkerIdentity {
     let user_id = db.user(&format!("w{}", Uuid::new_v4().simple()), false).await;
-    WorkerIdentity::User { user_id }
+    WorkerIdentity::User { user_id, key_id: Uuid::nil() }
 }
 
 fn outcome_kind(outcome: &ClaimOutcome) -> &'static str {

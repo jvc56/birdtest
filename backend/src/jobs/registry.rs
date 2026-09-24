@@ -376,6 +376,30 @@ pub async fn store_result(
         H::Response: Send + 'static,
         H::Record: Send + 'static,
     {
+        // A large result is decoded a few at a time. At the 64 MiB ceiling
+        // one submission holds the body, its text, the typed response and the
+        // record -- a quarter of a gigabyte -- and nothing else bounded how
+        // many ran at once on the one 2 GB task. Small ones, the ordinary
+        // case, never wait.
+        let _permit = if payload.get().len() >= LARGE_RESULT_BYTES {
+            let permit = tokio::time::timeout(
+                LARGE_RESULT_WAIT,
+                LARGE_RESULT_DECODES.acquire(),
+            )
+            .await
+            .map_err(|_| AppError {
+                retry_after: Some(30),
+                ..AppError::new(
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "the server is decoding other large results; try again shortly",
+                )
+            })?
+            .map_err(|e| AppError::internal(format!("large-result semaphore closed: {e}")))?;
+            Some(permit)
+        } else {
+            None
+        };
         tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(&payload)?))
             .await
             .map_err(|e| AppError::internal(format!("validating a task response failed: {e}")))?
@@ -438,6 +462,14 @@ pub async fn store_result(
         }
     }
 }
+
+/// A result at least this large is decoded under [`LARGE_RESULT_DECODES`].
+const LARGE_RESULT_BYTES: usize = 8 * 1024 * 1024;
+/// How many large results are decoded at once.
+static LARGE_RESULT_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
+/// How long a large result waits for a turn before its worker is told to come
+/// back (`503`, which MAGPIE retries).
+const LARGE_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What one accepted result adds to its job's running progress totals: games
 /// played, opening racks analysed. Returned rather than written, so the submit

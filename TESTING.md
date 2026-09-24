@@ -71,7 +71,7 @@ at tier 5 names a symptom.
 | 1 Unit | 154 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `stats::sprt` (12), `stats::bradley_terry` (12), `jobs::racks` (13), `error` (7), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `magpie` (3), `models::job` (3), `jobs::opening_rack` (3), `version` (3), `email` (2), `sse` (2), `exports`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes` (1 each) |
 | 1F Frontend unit | 94 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (13), `auth.test.ts` (9), `sse.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 137 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (24), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (6), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 149 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (25), `worker_routes.rs` (15), `auth_routes.rs` (15), `boundaries.rs` (12), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
+| 3 API | 152 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (28), `worker_routes.rs` (15), `auth_routes.rs` (15), `boundaries.rs` (12), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 13 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 13 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (6), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 467 backend tests.
+--run-ignored all` runs 470 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -472,6 +472,10 @@ path, nothing recognisable, and a bomb by compression ratio.)
   `inputdata::tests::a_symlink_that_is_not_an_alias_inside_the_archive_is_refused`.)*
 - `U-ARCHIVE-6` The limits are PLAN.md's table; changing one is a design change.
   *(Covered: `inputdata::tests::the_walk_limits_are_the_ones_the_design_states`.)*
+- `U-ARCHIVE-7` A file whose name MAGPIE would refuse as a path — a `.`, a
+  space, an empty name — is not importable, so no job can be pinned to it and
+  stop every worker it reaches. *(Covered:
+  `inputdata::tests::classifies_the_paths_birdtest_pins`.)* (Twelfth audit.)
 
 ---
 
@@ -914,8 +918,10 @@ job creation touches needs one caller here.
   `submissions::a_games_result_stores_one_row_with_no_pair_columns`.)*
 - `I-SUBMIT-2` A `game_pairs` result inserts the pentanomial, and the database
   CHECK rejects a row whose buckets disagree with the counts: on the pair count,
-  and separately on player 1's half-points with the pair count right. The two
-  rules are clauses of one named constraint,
+  separately on player 1's half-points with the pair count right, and on the
+  draws with both right (two win-and-draw pairs beside no ties); the route
+  refuses each with its own message. The rules are clauses of one named
+  constraint,
   `game_results_pentanomial_all_or_nothing`, not two constraints, so each is
   shown to fire on its own. *(Covered:
   `submissions::a_pairs_result_stores_its_pentanomial_and_the_schema_refuses_a_contradiction`.)*
@@ -1172,12 +1178,14 @@ permanent.
   `stats::a_job_completes_at_its_hard_cap_without_a_verdict`,
   `stats::a_crossed_llr_below_min_games_does_not_complete_the_job`; the
   bounds themselves by `U-STATS-1`, `-3`.)*
-- `I-STATS-9b` The verdict a job completed on is stored with the completion —
-  status, LLR and units — and reported beside the live figures, which results
-  in flight at completion can still move. *(Covered:
+- `I-STATS-9e` The verdict a job completed on is stored with the completion —
+  status, LLR and units — and reported beside the live figures; a result in
+  flight at completion lands and moves the live LLR, and the stored verdict
+  stays. *(Covered:
   `stats::a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before`,
-  `stats::a_job_driven_to_h0_completes_with_its_sprt_failed`.)* (Eleventh
-  audit.)
+  `stats::a_job_driven_to_h0_completes_with_its_sprt_failed`,
+  `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`.)*
+  (Eleventh audit; the in-flight half, twelfth.)
 - `I-STATS-9a` **Debounced under load.** With a claim held open the whole time,
   so the job is never idle, the check runs on the `SPRT_CHECK_EVERY`th
   submission and not before, and the open claim's result is still accepted
@@ -1282,7 +1290,10 @@ runs against a real MinIO.
   URL, both under `exports/`. *(Covered:
   `exports::a_completed_jobs_export_is_its_stream_and_its_positions_behind_presigned_urls`.)*
 - `I-EXPORT-2` A completed job's stream answers `303` to its newest ready
-  export, and with `?positions=true` to the positions object. *(Covered:
+  export, and with `?positions=true` to the positions object — until the
+  export is older than the bucket keeps it (`EXPORT_LIFETIME_DAYS`), when the
+  stream goes back to the database and the admin detail says `expired`.
+  *(Covered:
   `exports::a_completed_jobs_stream_redirects_to_its_ready_export`.)*
 - `I-EXPORT-3` A job with nothing captured exports one object, and an empty
   corpus is still a valid export — one gzip stream of nothing, `row_count` 0.
@@ -1591,6 +1602,21 @@ below.
 - `A-ADMIN-14` `delete_user` over HTTP. *(Covered:
   `admin_api::a_user_with_history_can_be_deleted`; an admin cannot delete
   themself, `A-BOUND-8`.)*
+- `A-ADMIN-15` Purging a completed job returns it to inactive, clears its
+  stored verdict, and it can be activated again. *(Covered:
+  `admin_api::purging_a_completed_job_returns_it_to_inactive`.)* (Eleventh
+  audit's fix, twelfth audit's test.)
+- `A-ADMIN-16` While a purge or delete holds a job's claims, a submission for
+  one is answered `503` at once; and a hold that ends without committing spares
+  the job's claims from reclamation, so the submission lands afterwards.
+  *(Covered:
+  `admin_api::a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims`.)*
+  (Twelfth audit.)
+- `A-ADMIN-17` A worker request's `last_seen_at` touch does not wait on its
+  identity's locked row (a purge giving back contributions, a submission
+  committing). *(Covered:
+  `admin_api::a_locked_identity_row_does_not_hold_up_its_requests`.)* (Twelfth
+  audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -1791,7 +1817,9 @@ tier 6's `M-4`, one generation long, could not see) and the `Retry-After`
 clamp in `test_http_retries_outlast_a_server_deployment` (a `429` was waited
 out for the connect time in microseconds, read as seconds); and
 `test_a_request_must_state_its_distribution_and_layout` now also refuses a
-path-escaping name in any player object.
+path-escaping name in any player object; and `test_a_player_must_state_every_setting`
+refuses a player without its leaves (twelfth audit), which a load would
+otherwise take from whatever was loaded last.
 
 **Capture** is `scripts/capture_contract.py`, a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and

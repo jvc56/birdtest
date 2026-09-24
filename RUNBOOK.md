@@ -87,21 +87,35 @@ aws rds modify-db-instance --region "$REGION" \
   --backup-retention-period 30 --deletion-protection --apply-immediately
 ```
 
-Swap the names, so the restored instance is the one Terraform manages. Terraform
-tracks the instance by its identifier, `birdtest`; left under its restore name,
-the next `terraform apply` would find `birdtest` missing once the damaged one was
-retired and create a new, empty database in its place. The rename moves the
-endpoint with it, which is why it comes before repointing:
+Swap the names, and hand the restored instance to Terraform. The rename moves
+the endpoint with it, which is why it comes before repointing. A rename returns
+before it takes effect, and `wait db-instance-available` on a name that does not
+exist yet fails at once rather than waiting, so each wait is preceded by a poll
+for the new name:
 
 ```bash
+renamed() {  # wait until instance $1 exists under its new name, then until it is available
+  until aws rds describe-db-instances --region "$REGION" --db-instance-identifier "$1" \
+      >/dev/null 2>&1; do sleep 10; done
+  aws rds wait db-instance-available --region "$REGION" --db-instance-identifier "$1"
+}
 aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
   --new-db-instance-identifier "birdtest-damaged-$STAMP" --apply-immediately
-aws rds wait db-instance-available --region "$REGION" \
-  --db-instance-identifier "birdtest-damaged-$STAMP"
+renamed "birdtest-damaged-$STAMP"
 aws rds modify-db-instance --region "$REGION" --db-instance-identifier "birdtest-restore-$STAMP" \
   --new-db-instance-identifier birdtest --apply-immediately
-aws rds wait db-instance-available --region "$REGION" --db-instance-identifier birdtest
+renamed birdtest
+
+# Terraform's state holds the damaged instance by its resource id (db-...),
+# not by name, so it would follow the damaged one under its new name. Point it
+# at the restored one instead; import takes the identifier.
+terraform -chdir=infra state rm aws_db_instance.main
+terraform -chdir=infra import aws_db_instance.main birdtest
 ```
+
+Left under its restore name, or left out of the state, the next `terraform
+apply` would find `birdtest` missing once the damaged one was retired and
+create a new, empty database in its place.
 
 Repoint the application. The master password is set by hand and lives only in
 the `DATABASE_URL` parameter, so keep it and swap the host. A PITR copy keeps
@@ -362,6 +376,22 @@ Run `tasks_total`/`tasks_completed` before §2.4's state repair or after it, but
 not between the two `UPDATE tasks` statements above: `tasks_completed` counts
 tasks whose `state` is `completed`, which the second of those recomputes.
 
+**A purged job that had completed** comes back inactive with no verdict: a
+purge returns a completed job to inactive and clears the SPRT verdict it was
+completed on, and neither is a row the copy brings back. Put both back from the
+scratch copy's `jobs` row (for a deleted job, the whole row came back in §2.0):
+
+```sql
+UPDATE jobs SET status = :'old_status', sprt_decided_status = :'old_verdict',
+               sprt_decided_llr = :'old_llr', sprt_decided_units = :'old_units'
+ WHERE id = :'job';
+-- (from: SELECT status, sprt_decided_status, sprt_decided_llr,
+--         sprt_decided_units FROM jobs WHERE id = :'job'  -- in the scratch copy;
+--  NULL verdict columns stay NULL.)
+```
+
+Activating it instead would dispatch more work on a job that had finished.
+
 ### 2.3b Repair the contributor counters
 
 The counters on `users` and `anonymous_workers` are not scoped to one job — they
@@ -529,11 +559,13 @@ region's still hold theirs — as do the DR replicas the rebuild restores from �
 so the copy is named apart with `name_suffix`, and kept in state of its own.
 
 1. `terraform apply` the copy, in its own workspace so the lost region's state
-   is left as it was:
+   is left as it was, and with the service at **zero tasks**: the backend
+   migrates its database before it binds, and a schema made in the empty new
+   instance would stop the restore in step 3 at its first object:
 
    ```bash
    terraform -chdir=infra workspace new dr
-   terraform -chdir=infra apply \
+   terraform -chdir=infra apply -var desired_count=0 \
      -var region=$DR_REGION -var 'azs=["'$DR_REGION'a","'$DR_REGION'b"]' \
      -var name_suffix=-dr -var dr_region=$THIRD_REGION \
      -var acm_certificate_arn=<a certificate issued in $DR_REGION> \
@@ -546,23 +578,35 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    one in `$DR_REGION` first. `dr_region` must be a region that is up — the
    copy replicates into it as the original did — not the one that was lost.
    `$CLUSTER` below is then `birdtest-dr`.
-2. Set the two SSM parameters by hand — Terraform manages their names, never
-   their values. `SESSION_SIGNING_KEY` may be a fresh `openssl rand -hex 32`;
-   every session cookie is invalidated, which costs a round of logins.
+2. Set the new instance's master password and the two SSM parameters by hand,
+   exactly as README.md "Deploying" does for a first deploy — Terraform creates
+   the instance with a placeholder password and manages the parameters' names,
+   never their values. `SESSION_SIGNING_KEY` may be a fresh
+   `openssl rand -hex 32`; every session cookie is invalidated, which costs a
+   round of logins.
 3. Restore the database from the replicated dump in
    `birdtest-backups-dr-<account>`, from `scripts/prod-shell.sh` against the
    new stack: the dump into the new instance, as in §2.1 but with
    `pg_restore -d "$DATABASE_URL"`. The new ops task reads the new stack's
    backups bucket, so fetch the dump with the credentials of an operator who
    can read the replica, or copy it across first.
-4. Artifacts are already in `birdtest-artifacts-dr-<account>`; sync them into
-   the new stack's artifact bucket (`birdtest-dr-artifacts-<account>`), or
-   point `S3_BUCKET` at the replica.
+4. The leave-generation KLVs (`leaves/`) and the imported input data
+   (`inputs/`) are in `birdtest-artifacts-dr-<account>`; sync both prefixes
+   into the new stack's artifact bucket (`birdtest-dr-artifacts-<account>`)
+   with `aws s3 sync`. The service reads only its own bucket. (Input data
+   imported before the `input-data` replication rule existed was never
+   replicated: re-import those tarballs from the admin page instead —
+   importing is idempotent.) Then `terraform apply` again with
+   `desired_count=1`, the same variables otherwise.
 5. Re-verify the SES domain identity and add the DKIM CNAMEs — account mail is
    dead until this is done, which means no confirmations and no password
    resets. SES production access is per region: request it again.
 6. Point DNS at the new ALB.
 7. Run §4.
+8. `terraform -chdir=infra workspace select default` when done. The workspace
+   is remembered in `infra/.terraform`, and `scripts/prod-sql.sh`,
+   `scripts/prod-shell.sh` and §1's outputs would otherwise go on reading the
+   DR stack's state (both scripts print the workspace they are using).
 
 ---
 

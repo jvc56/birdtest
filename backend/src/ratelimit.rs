@@ -33,14 +33,13 @@ pub struct RateLimiters {
     /// bury a known contributor in reset emails at the operator's expense.
     /// Limiting by IP alone stops neither, since IPs are cheap.
     pub reset: Arc<Keyed>,
-    /// 10 login attempts per minute, checked against the caller's IP and,
-    /// separately, the username tried from that IP. Each attempt costs an Argon2 verify, so
+    /// 10 login attempts per minute from one IP. Each attempt costs an Argon2 verify, so
     /// an unlimited login endpoint is both an online password-guessing oracle
     /// and a cheap way to pin the server's CPU.
     pub login: Arc<Keyed>,
     /// 100 login attempts per minute against one username from anywhere: the
-    /// bound on a guesser spread over many addresses, now that `login`'s
-    /// username half is per address as well.
+    /// bound on a guesser spread over many addresses. Ten times `login`, so
+    /// that one address cannot lock an account out.
     pub login_account: Arc<Keyed>,
 }
 

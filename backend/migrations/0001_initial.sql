@@ -751,7 +751,14 @@ CREATE TABLE task_claims (
     CONSTRAINT claim_has_single_owner CHECK (
         (claimed_by_user_id IS NOT NULL)::int + (claimed_by_anon_uuid IS NOT NULL)::int = 1
     )
-);
+)
+-- Room on each page for a claim's heartbeats. A heartbeat changes only
+-- `last_heartbeat_at`, which no index covers, so it can be a HOT update -- an
+-- in-page rewrite that touches none of this table's nine indexes -- but only
+-- if the row's page has space, and claims are appended, so at the default
+-- fillfactor of 100 a claim's first heartbeat found its page full and wrote a
+-- new entry into every index: two a minute for every claim in flight.
+WITH (fillfactor = 85);
 
 -- Prevent a single identity from filling more than one live slot on the same
 -- task. 'declined' must be excluded alongside 'abandoned': a worker that
@@ -1164,7 +1171,11 @@ CREATE TABLE game_results (
              -- player 1 either way. A worker that miscounts fails here rather
              -- than silently biasing a rating pool.
              AND (pent_0 + pent_1 + pent_2 + pent_3 + pent_4) * 2 = games
-             AND pent_1 + 2 * pent_2 + 3 * pent_3 + 4 * pent_4 = 2 * wins + ties)
+             AND pent_1 + 2 * pent_2 + 3 * pent_3 + 4 * pent_4 = 2 * wins + ties
+             -- And on the draws: a pair scoring one or three half-points holds
+             -- exactly one, a pair scoring two holds none or two.
+             AND ties - pent_1 - pent_3 BETWEEN 0 AND 2 * pent_2
+             AND (ties - pent_1 - pent_3) % 2 = 0)
     ),
 
     -- The divergent subset: pairs whose two games did not play identically.
@@ -1450,9 +1461,10 @@ CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
 CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
 CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
--- (job_id, state), not job_id alone: the job list counts a job's tasks and its
--- completed tasks for every job on the page, and with state in the index both
--- are index-only rather than a heap visit per task.
+-- The job's tasks: the detail page's counts by state (`jobstats`), the census
+-- a purge or delete writes, and the job-scoped task scans of the finish check
+-- and the exports. (The job list counted from it too, until it read
+-- `jobs.tasks_total`/`tasks_completed` instead.)
 CREATE INDEX        tasks_job_idx             ON tasks (job_id, state);
 -- (task_id, submitted_at) rather than task_id alone: the per-task "first
 -- accepted result" read that every aggregate uses orders on both.

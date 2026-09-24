@@ -83,7 +83,12 @@ pub fn public_anon_id(uuid: Uuid) -> String {
 #[derive(Debug, Clone)]
 pub enum WorkerIdentity {
     /// An API key tied to an account.
-    User { user_id: Uuid },
+    User {
+        user_id: Uuid,
+        /// The API key presented: the unit a worker's requests are rate
+        /// limited by (see [`WorkerIdentity::rate_key`]).
+        key_id: Uuid,
+    },
     /// A UUID the server issued earlier, presented in `X-Worker-UUID`.
     Anonymous { uuid: Uuid },
     /// No identity presented at all: a contributor that has never been issued
@@ -103,7 +108,7 @@ pub enum WorkerIdentity {
 impl WorkerIdentity {
     pub fn user_id(&self) -> Option<Uuid> {
         match self {
-            WorkerIdentity::User { user_id } => Some(*user_id),
+            WorkerIdentity::User { user_id, .. } => Some(*user_id),
             WorkerIdentity::Anonymous { .. } | WorkerIdentity::Unregistered { .. } => None,
         }
     }
@@ -129,9 +134,16 @@ impl WorkerIdentity {
     /// Stable string used to key per-worker rate limits. An unregistered
     /// worker has no stable identity yet, so it is limited by address -- keying
     /// on its freshly drawn UUID would give every request its own bucket.
+    ///
+    /// An account's worker is limited per API key, not per account. Keyed on
+    /// the account, every machine a contributor ran under one account shared a
+    /// request a second: six idle machines polling every five seconds used it
+    /// all, and MAGPIE, which gives up on a claim or a submission after a run
+    /// of `429`s, stopped or threw away finished work. A machine is a key, and
+    /// an account's keys are capped.
     pub fn rate_key(&self) -> String {
         match self {
-            WorkerIdentity::User { user_id } => format!("u:{user_id}"),
+            WorkerIdentity::User { key_id, .. } => format!("k:{key_id}"),
             WorkerIdentity::Anonymous { uuid } => format!("a:{uuid}"),
             WorkerIdentity::Unregistered { client_ip, .. } => format!("ip:{client_ip}"),
         }
@@ -181,8 +193,9 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             //
             // The touch is throttled: `last_used_at` answers "is this key in
             // use", which a minute's resolution answers as well as a write per
-            // request does.
-            let row = sqlx::query_as::<_, (Uuid, bool)>(
+            // request does. And it skips a locked row rather than waiting on
+            // it, like the anonymous touch below.
+            let row = sqlx::query_as::<_, (Uuid, Uuid, bool)>(
                 "WITH found AS (
                      SELECT k.id AS key_id, u.id AS user_id, k.last_used_at
                      FROM api_keys k JOIN users u ON u.id = k.user_id
@@ -190,13 +203,15 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                  ),
                  touched AS (
                      UPDATE api_keys k SET last_used_at = now()
-                     FROM found
-                     WHERE k.id = found.key_id
-                       AND (found.last_used_at IS NULL
-                            OR found.last_used_at < now() - interval '60 seconds')
+                     WHERE k.id = (
+                         SELECT k2.id FROM api_keys k2 JOIN found ON found.key_id = k2.id
+                         WHERE found.last_used_at IS NULL
+                            OR found.last_used_at < now() - interval '60 seconds'
+                         FOR NO KEY UPDATE OF k2 SKIP LOCKED
+                     )
                      RETURNING 1
                  )
-                 SELECT found.user_id,
+                 SELECT found.user_id, found.key_id,
                         EXISTS (SELECT 1 FROM worker_bans b
                                 WHERE b.user_id = found.user_id) AS banned
                  FROM found",
@@ -206,10 +221,10 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             .await?
             .ok_or_else(|| AppError::unauthorized("unknown or inactive API key"))?;
 
-            if row.1 {
+            if row.2 {
                 return Err(AppError::forbidden("this worker identity is banned"));
             }
-            WorkerIdentity::User { user_id: row.0 }
+            WorkerIdentity::User { user_id: row.0, key_id: row.1 }
         } else {
             let raw = parts
                 .headers
@@ -229,15 +244,25 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     // at most once a minute, and the ban check rides along in
                     // the same statement rather than costing a second round
                     // trip on every worker request.
+                    //
+                    // The touch skips a row somebody holds locked rather than
+                    // waiting: it is observational, and it runs on every worker
+                    // request. A submission holds its contributor's row while it
+                    // commits, and a purge or delete gives back what a job's
+                    // contributors earned at its end; a touch that waited held a
+                    // pool connection for as long as either did.
                     let banned = sqlx::query_scalar::<_, bool>(
                         "WITH known AS (
                              SELECT uuid, last_seen_at FROM anonymous_workers WHERE uuid = $1
                          ),
                          touched AS (
                              UPDATE anonymous_workers w SET last_seen_at = now()
-                             FROM known
-                             WHERE w.uuid = known.uuid
-                               AND known.last_seen_at < now() - interval '60 seconds'
+                             WHERE w.uuid = (
+                                 SELECT a.uuid FROM anonymous_workers a
+                                 WHERE a.uuid = $1
+                                   AND a.last_seen_at < now() - interval '60 seconds'
+                                 FOR NO KEY UPDATE SKIP LOCKED
+                             )
                              RETURNING 1
                          )
                          SELECT EXISTS (SELECT 1 FROM worker_bans b

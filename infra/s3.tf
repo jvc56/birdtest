@@ -178,8 +178,9 @@ resource "aws_s3_bucket_replication_configuration" "artifacts" {
   bucket = aws_s3_bucket.artifacts.id
 
   rule {
-    id     = "leave-generation-artifacts"
-    status = "Enabled"
+    id       = "leave-generation-artifacts"
+    priority = 1
+    status   = "Enabled"
 
     # Everything except job exports. The KLVs are replicated because losing one
     # costs a rebuild that needs the database; an export is regenerable from a
@@ -196,6 +197,31 @@ resource "aws_s3_bucket_replication_configuration" "artifacts" {
     # store that is allowed to be *newer* than the database (PLAN.md's "Backups and Restore"
     # 5.1), and a replicated delete would be the one direction that breaks a
     # restored database.
+    delete_marker_replication {
+      status = "Disabled"
+    }
+
+    destination {
+      bucket        = aws_s3_bucket.artifacts_dr.arn
+      storage_class = "STANDARD_IA"
+    }
+  }
+
+  # Imported input data -- every lexicon and leaves file a job pins, under
+  # `inputs/<sha256>`. The database restored in another region names these
+  # objects, and without them no derived file builds and no job that needs
+  # one dispatches. Re-importing every tarball would bring them back, but only
+  # for as long as GitHub still serves those tarballs; a copy here does not
+  # depend on that. Content-addressed and deduplicated, so it is small.
+  rule {
+    id       = "input-data"
+    priority = 2
+    status   = "Enabled"
+
+    filter {
+      prefix = "inputs/"
+    }
+
     delete_marker_replication {
       status = "Disabled"
     }

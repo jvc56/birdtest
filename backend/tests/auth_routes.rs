@@ -500,8 +500,10 @@ async fn a_reset_request_answers_the_same_for_known_and_unknown_addresses() {
 
 /// A-AUTH-8, the timing half: the reset mail is sent off the request path. With
 /// a mailer that cannot send at all, the request still answers exactly as it
-/// does for an unknown address -- where registration, which does wait on its
-/// mail, fails -- so the response cannot depend on how long the send takes.
+/// does for an unknown address, so the response cannot depend on how long the
+/// send takes. Registration's mail goes the same way now: it waited on its
+/// send, except for a taken address whose notice its per-address limit
+/// skipped, which answered that much sooner.
 #[tokio::test]
 async fn a_reset_request_does_not_wait_on_the_mail_it_sends() {
     let db = TestDb::new().await;
@@ -515,8 +517,8 @@ async fn a_reset_request_does_not_wait_on_the_mail_it_sends() {
     let app = birdtest::app(db.state_with(cfg).await);
     confirmed_user(&db, "forgetful", PASSWORD).await;
 
-    let control = register(&app, "newcomer", "newcomer@example.invalid", PASSWORD, "").await;
-    assert_eq!(control.status, StatusCode::INTERNAL_SERVER_ERROR, "the mailer fails: {control:?}");
+    let registered = register(&app, "newcomer", "newcomer@example.invalid", PASSWORD, "").await;
+    assert_eq!(registered.status, StatusCode::CREATED, "not held up by its mail: {registered:?}");
 
     let unknown = reset_request(&app, "nobody@example.invalid", "").await;
     let known = reset_request(&app, "forgetful@example.invalid", "").await;
