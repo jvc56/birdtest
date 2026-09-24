@@ -33,8 +33,18 @@ jobs:
       # The integration tests clone a template database per test on this
       # server; they fail rather than skip without it.
       TEST_DATABASE_URL: postgres://birdtest:birdtest@localhost:5432/birdtest
+      # The tests that are about the object store make a bucket each here.
+      TEST_S3_ENDPOINT: http://localhost:9000
     steps:
       - uses: actions/checkout@v4
+      # Not a service container: MinIO's image needs `server <dir>` as its
+      # command, which `services` cannot pass.
+      - name: MinIO for the object-store tests
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=birdtest -e MINIO_ROOT_PASSWORD=birdtestbirdtest \
+            minio/minio:latest server /data
+          until curl -fsS http://localhost:9000/minio/health/live; do sleep 1; done
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
