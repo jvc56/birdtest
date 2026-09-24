@@ -248,7 +248,10 @@ impl TestDb {
         (self.state_with(cfg).await, bucket)
     }
 
-    async fn state_with(&self, cfg: Config) -> AppState {
+    /// A state built from `cfg`, for a test that needs a setting `config()`
+    /// does not have -- a mail outbox, a heartbeat timeout, a version floor.
+    /// Start from `self.config()` and change what the test is about.
+    pub async fn state_with(&self, cfg: Config) -> AppState {
         aws_env();
         let cfg = Arc::new(cfg);
         AppState {
