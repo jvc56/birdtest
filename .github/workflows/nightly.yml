@@ -18,6 +18,12 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    # The checkout the compose file mounts into the backend (and the
+    # derived-builder) as /magpie. Unset, compose falls back to ../MAGPIE,
+    # which does not exist here, and the backend exits at start with no
+    # MAGPIE to read its builder versions from.
+    env:
+      MAGPIE_ROOT: ${{ github.workspace }}/magpie
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
@@ -42,10 +48,16 @@ jobs:
       # the same as the server's. Not `BUILD=release`: MAGPIE's Makefile
       # refuses that spelling outright (`release` is a PGO target that needs
       # clang and a training run), which made every nightly run fail at this
-      # step before a single task ran.
+      # step before a single task ran. Built in the backend image's own
+      # Debian, as CI's e2e job does: the binary runs inside that image, whose
+      # glibc is older than the runner's, and one built against the runner's
+      # would not start there; built on the older glibc it still runs on the
+      # runner for the contributors.
       - name: Build MAGPIE
-        working-directory: magpie
-        run: make magpie BUILD=portable_release
+        run: |
+          docker run --rm -v "$PWD/magpie:/src" -w /src debian:bookworm-slim sh -c \
+            'apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential >/dev/null \
+             && make magpie BUILD=portable_release -j"$(nproc)"'
 
       - name: Start the stack
         env:
