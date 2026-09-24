@@ -24,6 +24,10 @@
 #                           does in production. A job whose players ask for
 #                           either file is not dispatched until this has run.
 #
+# The end-to-end suite runs this file plus docker-compose.e2e.yml as its own
+# project (file mail, a stand-in for GitHub, the fake workers); use
+# e2e/run.sh, which brings it up and tears it down.
+#
 # Ports are overridable so a host that already has something on 5432 (or 9000,
 # or 5173) does not need the file edited. See .env.example.
 
@@ -99,6 +103,9 @@ services:
       SECURE_COOKIES: "false"
       # Confirmation codes and reset links go to this container's stdout:
       #   docker compose logs -f backend
+      # The third backend, `file`, writes one file per message into
+      # MAIL_OUTBOX_DIR, named by time and recipient, so a test reads the mail
+      # addressed to it; docker-compose.e2e.yml switches to it for tier 5.
       MAIL_BACKEND: console
       MAIL_FROM: no-reply@birdtest.local
       PUBLIC_URL: http://localhost:${WEB_PORT:-5173}
@@ -106,6 +113,10 @@ services:
       # resolution is 60 calls an hour per IP.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       MAGPIE_DATA_REPO: ${MAGPIE_DATA_REPO:-jvc56/MAGPIE-DATA}
+      # Unset here, so import talks to GitHub. GITHUB_API_URL (default
+      # https://api.github.com) and GITHUB_RAW_URL (default
+      # https://raw.githubusercontent.com) move it elsewhere: the e2e stack
+      # points both at a static server of fixtures/, so import runs offline.
       # The fleet-wide floor. `birdtest-contribute` reports 0.1.0, its
       # pre-release version, which meets it; scripts/dev.py reads the version
       # out of your checkout and sets this for you, so a checkout that reports

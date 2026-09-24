@@ -5,8 +5,11 @@ Drives the **real HTTP API** rather than writing SQL, so seeding is itself a
 smoke test of registration, confirmation, input-data import, validation and job
 creation. Two things have no endpoint and are done against the database
 directly, both deliberately: promoting a user to admin (`is_admin` is settable
-through no endpoint, by design) and reading the emailed confirmation code
-(MAIL_BACKEND=console writes it to the backend's log).
+through no endpoint, by design) and reading the emailed confirmation code:
+from the outbox file addressed to the seeded user when the stack writes mail
+to files (MAIL_BACKEND=file, as the end-to-end suite's does; pass
+--mail-outbox), and otherwise from the backend's log (MAIL_BACKEND=console, as
+the development stack and the MAGPIE smoke tier use).
 
 Re-running is safe: an existing user is logged into rather than re-registered,
 an already-imported tarball is skipped, and player configs and jobs are reused
@@ -20,6 +23,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -60,13 +64,44 @@ def psql(compose_service: str, sql: str) -> str:
     return result.stdout.strip()
 
 
-def confirmation_code(backend_service: str, email: str) -> str:
+CONFIRM_LINK = re.compile(r"confirm-email\?code=([0-9A-Za-z%]+)")
+
+
+def outbox_suffix(email: str) -> str:
+    """How MAIL_BACKEND=file names a message to `email`, after its timestamp:
+    `backend/src/email.rs::outbox_file_name`, which lowercases ASCII, spells
+    `@` as `-at-` and replaces anything else outside `[a-z0-9-]` with `-`."""
+    recipient = "".join(c.lower() if c.isascii() else c for c in email).replace("@", "-at-")
+    return "-" + re.sub(r"[^a-z0-9-]", "-", recipient) + ".txt"
+
+
+def outbox_confirmation_code(outbox: Path, email: str, timeout: float = 15.0) -> str:
+    """The code in the newest confirmation message to `email` in the outbox.
+
+    Found by recipient, which is the point of the file backend: nothing else
+    writing mail into the same directory at the same time can be mistaken for
+    this registration. Names start with a timestamp, so the newest sorts last.
+    """
+    suffix = outbox_suffix(email)
+    deadline = time.time() + timeout
+    while True:
+        for path in sorted(outbox.glob(f"*{suffix}"), reverse=True):
+            codes = CONFIRM_LINK.findall(path.read_text())
+            if codes:
+                return urllib.parse.unquote(codes[-1])
+        if time.time() > deadline:
+            raise SeedError(f"no confirmation message for {email} in {outbox}")
+        time.sleep(0.5)
+
+
+def log_confirmation_code(backend_service: str, email: str) -> str:
     """The code the console mail backend printed, scraped from the backend log.
 
     It cannot come from the database: `email_confirmations` stores only a hash,
     which is the point — a leaked database dump must not hand out working
-    confirmation links. So the log is the only place the plaintext exists, and
-    that is true only because MAIL_BACKEND=console.
+    confirmation links. So the mail is the only place the plaintext exists: a
+    file under MAIL_BACKEND=file (see `outbox_confirmation_code`, which should
+    be preferred wherever the stack can use it), this log under console.
     """
     result = subprocess.run(
         ["docker", "compose", "logs", "--no-color", backend_service],
@@ -125,7 +160,10 @@ class Client:
 
 
 def confirm_email(client: Client, args) -> None:
-    code = confirmation_code(args.backend_service, args.email)
+    if args.mail_outbox:
+        code = outbox_confirmation_code(args.mail_outbox, args.email)
+    else:
+        code = log_confirmation_code(args.backend_service, args.email)
     client.json(
         client.session.post(
             f"{client.api}/api/auth/confirm-email", json={"code": code}, timeout=30
@@ -143,7 +181,7 @@ def sign_in(client: Client, args) -> None:
     taken, so its response cannot be used to tell "new user" from "seeded
     already". The login is what decides, and an unconfirmed account is a
     recoverable state rather than a failure: the code is still sitting in the
-    backend's log.
+    outbox or the backend's log.
     """
     registered = client.session.post(
         f"{client.api}/api/auth/register",
@@ -362,7 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="compose service holding the database (default: %(default)s)")
     parser.add_argument("--backend-service", default="backend",
                         help="compose service whose log carries the confirmation code "
-                             "(default: %(default)s)")
+                             "when mail goes to the console (default: %(default)s)")
+    parser.add_argument("--mail-outbox", type=Path,
+                        default=os.environ.get("BIRDTEST_MAIL_OUTBOX") or None,
+                        help="host directory the backend's MAIL_BACKEND=file writes into; "
+                             "the confirmation code is read from there rather than the "
+                             "backend log (default: $BIRDTEST_MAIL_OUTBOX)")
 
     parser.add_argument("--username", default="dev")
     parser.add_argument("--email", default="dev@example.invalid")

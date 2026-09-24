@@ -1,0 +1,91 @@
+# The end-to-end suite's stack (TESTING.md tier 5): docker-compose.yml with
+# the changes a browser journey needs. Brought up, used and torn down by
+# e2e/run.sh -- run that rather than this file by hand:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.e2e.yml ...
+#
+# Its own project, ports and images, so it runs beside a development stack (or
+# another e2e run's leftovers) without touching either:
+#
+#   project   birdtest-e2e
+#   ports     postgres 5645, minio 9302/9303, backend 8280, web 5280
+#   images    birdtest-e2e-backend, birdtest-e2e-frontend,
+#             birdtest-e2e-fake-worker (built by e2e/run.sh)
+#
+# What differs from development:
+#   * mail goes to files, one per message, in E2E_OUTBOX_DIR on the host, so a
+#     journey reads its own confirmation code by address (MAIL_BACKEND=file;
+#     TESTING.md, "Reading confirmation codes");
+#   * GitHub is a static-file server holding the fixture tarballs
+#     (fixtures/build.sh), so an import runs offline and on known bytes;
+#   * the fake worker supplies results. Test tooling only -- see
+#     worker/fake_worker.py -- and never pointed at anything but this stack.
+
+name: birdtest-e2e
+
+services:
+  postgres:
+    ports: !override
+      - "5645:5432"
+
+  minio:
+    ports: !override
+      - "9302:9000"
+      - "9303:9001"
+
+  # GitHub, for input-data import: `GET /api/repos/<repo>/commits/main` answers
+  # the fixture sha, and `/raw/<repo>/<sha>/versioned-tarballs/` holds the
+  # tarballs, one chunked and one not.
+  fixtures:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./fixtures:/srv/fixtures:ro
+      - ./fixtures/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+  backend:
+    image: birdtest-e2e-backend
+    depends_on:
+      fixtures:
+        condition: service_started
+    environment:
+      MAIL_BACKEND: file
+      MAIL_OUTBOX_DIR: /outbox
+      PUBLIC_URL: http://localhost:5280
+      GITHUB_API_URL: http://fixtures/api
+      GITHUB_RAW_URL: http://fixtures/raw
+      GITHUB_TOKEN: ""
+      # Must match fixtures/build.sh's REPO. Not a real repository, on purpose.
+      MAGPIE_DATA_REPO: birdtest/fixtures
+      MIN_MAGPIE_VERSION: 0.1.0
+      RUST_LOG: birdtest=info,tower_http=warn
+    volumes:
+      # Written by the backend's uid 10001, so e2e/run.sh makes it world-
+      # writable; the host reads the files and removes the directory on exit.
+      - ${E2E_OUTBOX_DIR:?set E2E_OUTBOX_DIR, or run e2e/run.sh}:/outbox
+    ports: !override
+      - "8280:8080"
+
+  frontend:
+    image: birdtest-e2e-frontend
+    ports: !override
+      - "5280:80"
+
+  # Four workers, so the per-identity rate limit (one request a second) still
+  # leaves a dashboard visibly moving. Player 1 wins 60% of divergent games,
+  # which drives every game-pairs job the suite makes to an SPRT verdict soon
+  # after its minimum and gives the ratings journey decisive evidence.
+  fake-worker:
+    image: birdtest-e2e-fake-worker
+    command:
+      - --server-url
+      - http://backend:8080
+      - --workers
+      - "4"
+      - --tasks
+      - "0"
+      - --p1-win-rate
+      - "0.6"
+      - --idle-wait
+      - "0.5"
+      - --seed
+      - e2e
