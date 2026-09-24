@@ -98,7 +98,7 @@ async fn list_input_data(
 /// though, so it is translated into what an admin needs to know.
 async fn delete_input_data(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Path(id): Path<Uuid>,
     method: Method,
     headers: HeaderMap,
@@ -125,13 +125,27 @@ async fn delete_input_data(
         )));
     }
 
+    // Logged in the same transaction as the delete, like every other
+    // destructive admin action: the row it names is gone once this commits.
+    let mut tx = state.pool.begin().await?;
     let deleted = sqlx::query("DELETE FROM input_data WHERE id = $1")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
     if deleted.rows_affected() == 0 {
         return Err(AppError::not_found("no such input data row"));
     }
+    audit::log(
+        &mut tx,
+        "input_data.deleted",
+        Some(admin.0.id),
+        None,
+        Some("input_data"),
+        Some(id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -752,7 +766,7 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
 /// only allowed while nothing references the config.
 async fn delete_player_config(
     State(state): State<AppState>,
-    _admin: AdminUser,
+    admin: AdminUser,
     Path(id): Path<Uuid>,
     method: Method,
     headers: HeaderMap,
@@ -783,13 +797,25 @@ async fn delete_player_config(
         ));
     }
 
+    let mut tx = state.pool.begin().await?;
     let deleted = sqlx::query("DELETE FROM player_configs WHERE id = $1")
         .bind(id)
-        .execute(&state.pool)
+        .execute(&mut *tx)
         .await?;
     if deleted.rows_affected() == 0 {
         return Err(AppError::not_found("no such player config"));
     }
+    audit::log(
+        &mut tx,
+        "player_config.deleted",
+        Some(admin.0.id),
+        None,
+        Some("player_config"),
+        Some(id.to_string()),
+        None,
+    )
+    .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
