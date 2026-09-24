@@ -1,7 +1,8 @@
 # Per pull request, cheapest first (TESTING.md, "Per pull request"): the
 # backend's lint, unit, contract and integration tests against a Postgres
 # service, the frontend's type check and build, both images the deployment
-# runs, the Terraform, and MAGPIE's half of the contract fixtures.
+# runs, the end-to-end journeys, the Terraform, and MAGPIE's half of the
+# contract fixtures.
 name: CI
 
 on:
@@ -96,6 +97,56 @@ jobs:
         run: docker build -f docker/Dockerfile --target derived-builder -t birdtest-derived-builder .
       - name: Frontend image
         run: docker build -t birdtest-frontend frontend
+
+  # Tier 5: the whole stack in Docker and a real browser against the built
+  # frontend, with fake workers supplying results (TESTING.md section 5).
+  # e2e/run.sh builds the three images, brings the stack up as its own compose
+  # project, seeds it, runs Playwright and tears it all down.
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # The backend refuses to start without a MAGPIE to run, and mounts the
+      # one in MAGPIE_ROOT. No data: the server runs it in scratch
+      # directories it fills itself. Built in the backend image's own base,
+      # so the binary links against the glibc it will run on rather than the
+      # runner's newer one.
+      - uses: actions/checkout@v4
+        with:
+          repository: jvc56/MAGPIE
+          ref: birdtest-contribute
+          path: magpie
+      - name: Build MAGPIE
+        run: |
+          docker run --rm -v "$PWD/magpie:/src" -w /src debian:bookworm-slim sh -c \
+            'apt-get update -qq && apt-get install -y -qq --no-install-recommends build-essential >/dev/null \
+             && make magpie BUILD=portable_release -j"$(nproc)"'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: e2e/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the seed's and Playwright's dependencies
+        run: |
+          pip install requests
+          cd e2e && npm ci && npx playwright install --with-deps --only-shell chromium
+      - name: End-to-end journeys
+        run: e2e/run.sh
+        env:
+          MAGPIE_ROOT: ${{ github.workspace }}/magpie
+          CARGO_BUILD_JOBS: "4"
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: e2e-results
+          path: |
+            e2e/test-results
+            e2e/playwright-report
+          if-no-files-found: ignore
 
   # Formatting and validation need no AWS credentials: `init -backend=false`
   # fetches the providers and nothing else. This is what caught a string with

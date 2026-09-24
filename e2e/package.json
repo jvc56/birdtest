@@ -1,0 +1,11 @@
+{
+  "name": "birdtest-e2e",
+  "private": true,
+  "description": "Tier 5: Playwright journeys against the full stack. Run ./run.sh (TESTING.md, section 5).",
+  "scripts": {
+    "test": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0"
+  }
+}
