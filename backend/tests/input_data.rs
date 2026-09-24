@@ -830,3 +830,68 @@ async fn an_input_file_in_use_cannot_be_deleted() {
     expected.sort();
     assert_eq!(left, expected, "every pinned file survived its refused delete");
 }
+
+/// I-INPUT-6, A-ADMIN-7: once nothing pins a file, what was built from it is
+/// no reason to keep it. A wordmap and a rack info table hold foreign keys to
+/// their lexicon, leaves and distribution, and are never collected; before
+/// this, every file anything had ever been built from was undeletable, with a
+/// generic "still referenced" 409 against a file the list said had no
+/// references. The derived rows go with the file, and only those rows.
+#[tokio::test]
+async fn a_file_only_derived_data_refers_to_can_be_deleted_and_takes_that_data_with_it() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let ld = db.input_data("letterdist", "english").await;
+    let other_kwg = db.input_data("kwg", "CSW21").await;
+    for (role, name, kwg_id, klv_id) in [
+        ("wmp", "NWL23", kwg, None),
+        ("rit", "NWL23.NWL23", kwg, Some(klv)),
+        ("wmp", "CSW21", other_kwg, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO derived_data (role, name, builder, kwg_id, klv_id, letterdist_id,
+                                       state, sha256, bytes, build_target, built_at)
+             VALUES ($1, $2, $3, $4, $5, $6, 'built', repeat('a', 64), 1, 'nehalem', now())",
+        )
+        .bind(role)
+        .bind(name)
+        .bind(format!("{role}-1"))
+        .bind(kwg_id)
+        .bind(klv_id)
+        .bind(ld)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let (_, list) = admin.call("GET", "/api/admin/input-data", None).await;
+    let row = list.as_array().unwrap().iter().find(|r| r["id"] == kwg.to_string()).unwrap();
+    assert_eq!(row["references"], 0, "derived data pins nothing: {row}");
+
+    let (status, body) = admin.call("DELETE", &format!("/api/admin/input-data/{kwg}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let left: Vec<String> = sqlx::query_scalar("SELECT name FROM derived_data ORDER BY name")
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, ["CSW21"], "the file's wordmap and table went with it, and nothing else");
+
+    // The distribution is still shared with CSW21's wordmap; deleting it takes
+    // that too, since no job pins it either.
+    let (status, body) = admin.call("DELETE", &format!("/api/admin/input-data/{ld}"), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let left: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM derived_data").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(left, 0);
+    for id in [kwg, ld] {
+        let audited: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log WHERE action = 'input_data.deleted' AND target_id = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(audited, 1);
+    }
+}

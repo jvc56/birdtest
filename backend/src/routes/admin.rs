@@ -128,6 +128,18 @@ async fn delete_input_data(
     // Logged in the same transaction as the delete, like every other
     // destructive admin action: the row it names is gone once this commits.
     let mut tx = state.pool.begin().await?;
+    // What was built from it goes with it. Nothing pins the file any more, so
+    // no job can need those wordmaps or tables, and nothing else ever reads
+    // them -- but they hold foreign keys to it, and left in place they made
+    // every file anything was ever built from undeletable. Should a job pin
+    // the file between the count above and here, its foreign key fails the
+    // delete below and this goes back with it.
+    sqlx::query(
+        "DELETE FROM derived_data WHERE kwg_id = $1 OR klv_id = $1 OR letterdist_id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     let deleted = sqlx::query("DELETE FROM input_data WHERE id = $1")
         .bind(id)
         .execute(&mut *tx)
