@@ -81,7 +81,9 @@ cleanup() {
     fi
     tools "${TOOLS}" psql "${DATABASE_URL%/*}/postgres" --no-psqlrc -q \
       -c "DROP DATABASE IF EXISTS \"${DRILL_DB}\" WITH (FORCE)" >/dev/null 2>&1 || true
-    docker rm -f "${TOOLS}" >/dev/null 2>&1 || true
+    # -v: the postgres image declares a data VOLUME, which an explicit rm of
+    # even a --rm container leaves behind unless asked.
+    docker rm -f -v "${TOOLS}" >/dev/null 2>&1 || true
   fi
   if (( status == 0 )); then log "backup drill check passed"; else log "backup drill check FAILED"; fi
   exit "${status}"

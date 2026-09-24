@@ -79,7 +79,9 @@ cleanup() {
         kill "$BACKEND_PID" 2>/dev/null || true
         wait "$BACKEND_PID" 2>/dev/null || true
     fi
-    "$REAL_DOCKER" rm -f "$PG" "$MINIO" >/dev/null 2>&1 || true
+    # -v: both images declare a data VOLUME, and after a leave-generation case
+    # the database's alone holds 1.6 GB -- without it every run left that behind.
+    "$REAL_DOCKER" rm -f -v "$PG" "$MINIO" >/dev/null 2>&1 || true
     rm -rf "$WORK"
     exit "$status"
 }
