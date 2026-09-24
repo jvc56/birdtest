@@ -17,6 +17,9 @@ pub struct Config {
     pub session_ttl: Duration,
     pub secure_cookies: bool,
     pub mail_backend: MailBackend,
+    /// Where `MAIL_BACKEND=file` writes one file per message. Required by that
+    /// backend and read by nothing else.
+    pub mail_outbox_dir: Option<std::path::PathBuf>,
     pub mail_from: String,
     pub public_url: String,
     pub heartbeat_timeout: Duration,
@@ -52,6 +55,12 @@ pub struct Config {
     /// Optional in development, set in production: unauthenticated GitHub ref
     /// resolution is 60 calls an hour per IP.
     pub github_token: Option<String>,
+    /// The GitHub API and raw-content hosts import resolves refs and fetches
+    /// tarballs from. Configuration for the same reason `magpie_data_repo`
+    /// is; overridden only by the end-to-end suite, which serves a fixture
+    /// tarball from a static-file container so import runs offline.
+    pub github_api_url: String,
+    pub github_raw_url: String,
     /// How many reverse proxies sit in front of this process and append to
     /// `X-Forwarded-For`. 0 trusts nothing and keys per-IP limits on the TCP
     /// peer; 1 is right behind the ALB and behind the local Nginx. See
@@ -64,6 +73,11 @@ pub enum MailBackend {
     /// Log the message body to stdout. The local default: there is no local SES.
     Console,
     Ses,
+    /// One file per message in `MAIL_OUTBOX_DIR`, named for its recipient.
+    /// For the end-to-end suite: a journey reads the confirmation code sent to
+    /// its own address, which the single stream of `console` cannot tell apart
+    /// when journeys run in parallel. Never production.
+    File,
 }
 
 fn var(key: &str) -> Option<String> {
@@ -156,8 +170,15 @@ impl Config {
         let mail_backend = match var_or("MAIL_BACKEND", "console").as_str() {
             "ses" => MailBackend::Ses,
             "console" => MailBackend::Console,
-            other => anyhow::bail!("unknown MAIL_BACKEND {other:?} (expected 'console' or 'ses')"),
+            "file" => MailBackend::File,
+            other => anyhow::bail!(
+                "unknown MAIL_BACKEND {other:?} (expected 'console', 'ses' or 'file')"
+            ),
         };
+        let mail_outbox_dir = var("MAIL_OUTBOX_DIR").map(std::path::PathBuf::from);
+        if mail_backend == MailBackend::File && mail_outbox_dir.is_none() {
+            anyhow::bail!("MAIL_BACKEND=file needs MAIL_OUTBOX_DIR, the directory to write to");
+        }
 
         let secure_cookies = match var_or("SECURE_COOKIES", "false").as_str() {
             "true" => true,
@@ -180,6 +201,7 @@ impl Config {
             session_ttl: Duration::from_secs(parsed_u64("SESSION_TTL_SECONDS", 604_800)?),
             secure_cookies,
             mail_backend,
+            mail_outbox_dir,
             mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
             public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
             heartbeat_timeout: Duration::from_secs(parsed_u64("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
@@ -204,6 +226,12 @@ impl Config {
             magpie_threads: parsed(lookup, "MAGPIE_THREADS", 1usize)?,
             magpie_data_repo: var_or("MAGPIE_DATA_REPO", "jvc56/MAGPIE-DATA"),
             github_token: var("GITHUB_TOKEN"),
+            github_api_url: var_or("GITHUB_API_URL", "https://api.github.com")
+                .trim_end_matches('/')
+                .to_string(),
+            github_raw_url: var_or("GITHUB_RAW_URL", "https://raw.githubusercontent.com")
+                .trim_end_matches('/')
+                .to_string(),
             trusted_proxy_hops: parsed(lookup, "TRUSTED_PROXY_HOPS", 0usize)?,
         })
     }
@@ -266,6 +294,15 @@ mod tests {
                 c.github_token.clone().unwrap_or_else(|| "None".into())
             }),
             ("TRUSTED_PROXY_HOPS", "0", "2", |c| c.trusted_proxy_hops.to_string()),
+            ("GITHUB_API_URL", "https://api.github.com", "http://fixtures:80", |c| {
+                c.github_api_url.clone()
+            }),
+            ("GITHUB_RAW_URL", "https://raw.githubusercontent.com", "http://fixtures:80", |c| {
+                c.github_raw_url.clone()
+            }),
+            ("MAIL_OUTBOX_DIR", "None", "/outbox", |c| {
+                c.mail_outbox_dir.as_ref().map_or("None".into(), |p| p.display().to_string())
+            }),
         ];
         for (key, default, set, read) in rows {
             let unset = config(&[]).unwrap();
@@ -302,10 +339,14 @@ mod tests {
             ("TRUSTED_PROXY_HOPS", "one"),
             ("SECURE_COOKIES", "yes"),
             ("MAIL_BACKEND", "smtp"),
+            // The file backend with nowhere to write.
+            ("MAIL_BACKEND", "file"),
         ] {
             let err = config(&[(key, value)]).unwrap_err();
             assert!(err.to_string().contains(key), "{key}={value}: {err}");
         }
+        let file = config(&[("MAIL_BACKEND", "file"), ("MAIL_OUTBOX_DIR", "/outbox")]).unwrap();
+        assert_eq!(file.mail_backend, MailBackend::File);
     }
 
     /// U-CFG-3: `MIN_MAGPIE_VERSION` goes through `Version`, so a malformed

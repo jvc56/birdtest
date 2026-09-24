@@ -114,8 +114,8 @@ pub fn input_object_key(sha256: &str) -> String {
 /// the record names a commit rather than a branch.
 pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
     let url = format!(
-        "https://api.github.com/repos/{}/commits/{}",
-        state.cfg.magpie_data_repo, git_ref
+        "{}/repos/{}/commits/{}",
+        state.cfg.github_api_url, state.cfg.magpie_data_repo, git_ref
     );
     let mut request = state
         .http
@@ -194,8 +194,8 @@ async fn download(
     progress: &Progress,
 ) -> AppResult<(Vec<u8>, String)> {
     let base = format!(
-        "https://raw.githubusercontent.com/{}/{}/versioned-tarballs/data-{}.tgz",
-        state.cfg.magpie_data_repo, commit_sha, tarball_date
+        "{}/{}/{}/versioned-tarballs/data-{}.tgz",
+        state.cfg.github_raw_url, state.cfg.magpie_data_repo, commit_sha, tarball_date
     );
 
     let mut body = Vec::new();
