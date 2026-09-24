@@ -6,6 +6,9 @@
 #
 #   DATABASE_URL=postgres://... BACKUP_BUCKET=my-bucket ./scripts/backup.sh
 #
+# Against a local stack, add AWS_S3_ENDPOINT (its MinIO); CloudWatch metrics
+# are then skipped -- see BACKUP_METRICS below.
+#
 # What it produces, per PLAN.md, "Layout and manifest":
 #
 #   s3://$BACKUP_BUCKET/pg/<stamp>/dump/...   pg_dump -Fd output
@@ -47,6 +50,16 @@ if [[ -n "${AWS_S3_ENDPOINT:-}" ]]; then
   s3_args=(--endpoint-url "${AWS_S3_ENDPOINT}")
 fi
 
+# The CloudWatch metrics are production's alarm inputs and nothing else's. A
+# run against a local stack has no CloudWatch to send them to -- its
+# credentials are MinIO's, and sending them would reach real AWS -- so it
+# skips them: BACKUP_METRICS=false skips them anywhere, =true sends them
+# anywhere, and unset means "send them unless AWS_S3_ENDPOINT points at a
+# stand-in object store".
+if [[ -z "${BACKUP_METRICS:-}" ]]; then
+  if [[ -n "${AWS_S3_ENDPOINT:-}" ]]; then BACKUP_METRICS=false; else BACKUP_METRICS=true; fi
+fi
+
 # A checksum of the dump's *contents*, independent of the file metadata that a
 # download does not preserve: each file hashed under its relative path, then a
 # hash of that listing. Hashing a tar of the directory instead would compare
@@ -78,6 +91,7 @@ finish() {
       VALUES ('pg_dump', '${BACKUP_PREFIX}/${STAMP}', '${STARTED_AT}', now(), '{}'::jsonb, false)
     " || log "could not record the failure in the backups table"
   fi
+  if [[ -n "${snapshot_pid:-}" ]]; then kill "${snapshot_pid}" 2>/dev/null || true; fi
   rm -rf "${WORKDIR}"
   exit "${status}"
 }
@@ -97,6 +111,43 @@ fi
 
 mkdir -p "${WORKDIR}"
 
+# --- One snapshot for everything that describes the dump -------------------
+# The manifest's row counts are what the drill checks a restore against, for
+# equality, so they have to be counts of exactly what was dumped. Counted after
+# pg_dump finished, outside its snapshot, they included every row committed
+# during the dump -- a claim, an audit entry -- and the drill of any backup
+# taken while the service was in use failed. So one session opens a
+# repeatable-read transaction, exports its snapshot, and holds it: pg_dump
+# (and each of its -j workers) reads that snapshot, and so does every fact
+# below. The session is a coprocess because the snapshot lives only as long
+# as its transaction.
+coproc SNAPSHOT_SESSION {
+  psql "${DATABASE_URL}" --no-psqlrc --tuples-only --no-align --quiet \
+       --set ON_ERROR_STOP=1 2>&1
+}
+snapshot_pid="${SNAPSHOT_SESSION_PID}"
+snapshot_in="${SNAPSHOT_SESSION[1]}"
+snapshot_out="${SNAPSHOT_SESSION[0]}"
+
+# Runs one single-row, single-column query in the snapshot session and reads
+# its answer into the variable named $1. Not a command substitution: that
+# would run in a subshell, which does not share the coprocess's pipes.
+snapshot_val() {
+  printf '%s;\n' "$2" >&"${snapshot_in}"
+  if ! IFS= read -r "$1" <&"${snapshot_out}"; then
+    log "the snapshot session ended unexpectedly"
+    return 1
+  fi
+  # psql reports an error on the same pipe and then exits.
+  if [[ "${!1}" == *ERROR:* || "${!1}" == psql:* ]]; then
+    log "snapshot session: ${!1}"
+    return 1
+  fi
+}
+
+snapshot_val SNAPSHOT "BEGIN ISOLATION LEVEL REPEATABLE READ, READ ONLY; SELECT pg_export_snapshot()"
+log "holding snapshot ${SNAPSHOT}"
+
 # --- Dump ------------------------------------------------------------------
 # Directory format, because -j is what makes a dump of the results tables
 # finish and because it lets a restore pull one table out without streaming the
@@ -105,6 +156,7 @@ mkdir -p "${WORKDIR}"
 # local reproduction is never the production one.
 log "dumping to ${DUMP_DIR}"
 pg_dump "${DATABASE_URL}" \
+  --snapshot="${SNAPSHOT}" \
   --format=directory \
   --jobs="${PGDUMP_JOBS}" \
   --compress=6 \
@@ -112,19 +164,13 @@ pg_dump "${DATABASE_URL}" \
   --no-privileges \
   --file="${DUMP_DIR}"
 
-# A dump that cannot be listed cannot be restored. This is cheap and catches
-# truncation and corruption before the upload rather than during a recovery.
-log "verifying the dump is readable"
-pg_restore --list "${DUMP_DIR}" >/dev/null
-
-DUMP_BYTES="$(du -sb "${DUMP_DIR}" | cut -f1)"
-DUMP_SHA="$(dump_digest "${DUMP_DIR}")"
-
 # --- Facts about what was dumped -------------------------------------------
 # Exact counts, not reltuples: this is what a restore is verified against
 # (PLAN.md, "Verifying a restore"), and an estimate would make the check meaningless.
+# Read in the dump's snapshot, above, so they describe the dump and not the
+# database as it is by the time the dump has finished.
 log "counting rows"
-ROW_COUNTS="$(psql_val "
+snapshot_val ROW_COUNTS "
   SELECT COALESCE(jsonb_object_agg(relname, cnt), '{}'::jsonb)::text
   FROM (
     SELECT c.relname,
@@ -135,22 +181,36 @@ ROW_COUNTS="$(psql_val "
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE c.relkind = 'r' AND n.nspname = 'public'
   ) counts
-")"
+"
 
 # What code can read this dump. Under a single migration edited in place, this
 # is the only thing that makes an older dump restorable at all -- see
 # PLAN.md, "Restoring across a schema change".
-MIGRATIONS="$(psql_val "
+snapshot_val MIGRATIONS "
   SELECT COALESCE(jsonb_agg(jsonb_build_object(
            'version', version,
            'description', description,
            'checksum', encode(checksum, 'hex')) ORDER BY version), '[]'::jsonb)::text
   FROM _sqlx_migrations
-")"
+"
+snapshot_val ARTIFACT_KEYS 'SELECT count(*) FROM leave_generation_artifacts'
+
+# Done with the snapshot: end the transaction and the session.
+printf 'COMMIT;\n' >&"${snapshot_in}"
+exec {snapshot_in}>&-
+wait "${snapshot_pid}"
+snapshot_pid=""
+
+# A dump that cannot be listed cannot be restored. This is cheap and catches
+# truncation and corruption before the upload rather than during a recovery.
+log "verifying the dump is readable"
+pg_restore --list "${DUMP_DIR}" >/dev/null
+
+DUMP_BYTES="$(du -sb "${DUMP_DIR}" | cut -f1)"
+DUMP_SHA="$(dump_digest "${DUMP_DIR}")"
 
 PG_VERSION="$(psql_val 'SHOW server_version')"
 DB_BYTES="$(psql_val 'SELECT pg_database_size(current_database())')"
-ARTIFACT_KEYS="$(psql_val 'SELECT count(*) FROM leave_generation_artifacts')"
 FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 DURATION=$(( $(date -u +%s) - START_EPOCH ))
 
@@ -203,7 +263,7 @@ SQL
 
 # The staleness alarm reads this metric and treats its absence as breaching, so
 # emitting it is the last thing that happens and only on the success path.
-if command -v aws >/dev/null 2>&1; then
+if [[ "${BACKUP_METRICS}" == true ]] && command -v aws >/dev/null 2>&1; then
   aws cloudwatch put-metric-data --namespace "${METRIC_NAMESPACE}" \
     --metric-name Success --value 1 --unit Count || log "metric publish failed"
   aws cloudwatch put-metric-data --namespace "${METRIC_NAMESPACE}" \

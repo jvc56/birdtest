@@ -30,6 +30,16 @@ if [[ -n "${AWS_S3_ENDPOINT:-}" ]]; then
   s3_args=(--endpoint-url "${AWS_S3_ENDPOINT}")
 fi
 
+# The CloudWatch metrics are production's alarm inputs and nothing else's. A
+# run against a local stack has no CloudWatch to send them to -- its
+# credentials are MinIO's, and sending them would reach real AWS -- so it
+# skips them: BACKUP_METRICS=false skips them anywhere, =true sends them
+# anywhere, and unset means "send them unless AWS_S3_ENDPOINT points at a
+# stand-in object store".
+if [[ -z "${BACKUP_METRICS:-}" ]]; then
+  if [[ -n "${AWS_S3_ENDPOINT:-}" ]]; then BACKUP_METRICS=false; else BACKUP_METRICS=true; fi
+fi
+
 # A checksum of the dump's *contents*, independent of the file metadata that a
 # download does not preserve: each file hashed under its relative path, then a
 # hash of that listing. Hashing a tar of the directory instead would compare
@@ -181,7 +191,7 @@ print(f"verified {len(expected)} tables against the manifest")
 PY
 
 log "drill of ${STAMP} passed"
-if command -v aws >/dev/null 2>&1; then
+if [[ "${BACKUP_METRICS}" == true ]] && command -v aws >/dev/null 2>&1; then
   aws cloudwatch put-metric-data --namespace "${METRIC_NAMESPACE}" \
     --metric-name DrillSuccess --value 1 --unit Count || log "metric publish failed"
 fi
