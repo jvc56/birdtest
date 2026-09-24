@@ -496,13 +496,10 @@ mod tests {
         assignment["task_request"].clone()
     }
 
-    /// The games request as a `game_pairs` job states it. There is no pairs
-    /// assignment fixture; the two share `GameRequest`.
+    /// A `game_pairs` job's request, as a real exchange captured it
+    /// (`contract-fixtures/assignment-game-pairs.json`).
     fn game_pairs_request() -> Value {
-        let mut request = task_request(ASSIGNMENTS[0].1);
-        request["job_type"] = json!("game_pairs");
-        request["game_pairs"] = json!(true);
-        request
+        task_request(include_str!("../../../contract-fixtures/assignment-game-pairs.json"))
     }
 
     fn seed_of(request: &TaskRequest) -> u64 {
