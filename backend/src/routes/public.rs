@@ -97,7 +97,7 @@ async fn list_jobs(
          FROM jobs j
          LEFT JOIN job_game_config gc ON gc.job_id = j.id
          LEFT JOIN job_game_pair_config pc ON pc.job_id = j.id
-         ORDER BY j.created_at DESC
+         ORDER BY j.created_at DESC, j.id DESC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
@@ -740,7 +740,7 @@ async fn list_users(
         "SELECT u.id, u.username, u.is_admin, u.created_at, u.tasks_completed
          FROM users u
          WHERE u.deleted_at IS NULL
-         ORDER BY u.tasks_completed DESC, u.created_at ASC
+         ORDER BY u.tasks_completed DESC, u.created_at ASC, u.id ASC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)

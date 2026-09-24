@@ -657,3 +657,57 @@ async fn tied_contributors_are_each_listed_exactly_once() {
         assert_eq!(seen, expected, "per_page={per_page}");
     }
 }
+
+/// A-PUBLIC-1, A-PUBLIC-7: the job and user lists page every row exactly once
+/// even when their sort keys tie. Rows written in one transaction share
+/// `created_at` (it is `now()`, the transaction's start), and without the
+/// primary key as a last sort key Postgres may order a tie differently for
+/// each page's LIMIT -- the bug `/api/workers` had.
+#[tokio::test]
+async fn tied_jobs_and_users_are_each_listed_exactly_once() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let admin = db.user("root", true).await;
+    let mut jobs = Vec::new();
+    for _ in 0..9 {
+        jobs.push(db.bare_job("games", 1, admin).await.to_string());
+    }
+    for i in 0..9 {
+        db.user(&format!("tied{i}"), false).await;
+    }
+    // One instant for everything: the tie a batch insert produces.
+    sqlx::query("UPDATE jobs SET created_at = '2026-01-01T00:00:00Z'").execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE users SET created_at = '2026-01-01T00:00:00Z', tasks_completed = 0")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let user_names: Vec<String> = {
+        let mut names = vec!["root".to_string()];
+        names.extend((0..9).map(|i| format!("tied{i}")));
+        names.sort();
+        names
+    };
+    jobs.sort();
+
+    for per_page in [2, 3, 4] {
+        let (mut seen_jobs, mut seen_users) = (Vec::new(), Vec::new());
+        for page in 0..=(10 / per_page) {
+            let (status, body) =
+                send(&app, get_request(&format!("/api/jobs?page={page}&per_page={per_page}"), &[]))
+                    .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            seen_jobs.extend(body["items"].as_array().unwrap().iter().map(|j| j["id"].as_str().unwrap().to_string()));
+            let (status, body) =
+                send(&app, get_request(&format!("/api/users?page={page}&per_page={per_page}"), &[]))
+                    .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            seen_users.extend(
+                body["items"].as_array().unwrap().iter().map(|u| u["username"].as_str().unwrap().to_string()),
+            );
+        }
+        seen_jobs.sort();
+        seen_users.sort();
+        assert_eq!(seen_jobs, jobs, "jobs, per_page={per_page}");
+        assert_eq!(seen_users, user_names, "users, per_page={per_page}");
+    }
+}
