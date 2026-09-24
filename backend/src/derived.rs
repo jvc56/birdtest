@@ -388,6 +388,15 @@ struct Lease {
 /// `FOR UPDATE SKIP LOCKED` plus the lease is what keeps two builder tasks off
 /// the same row: the lock holds for the moment it takes to mark the row, and
 /// the lease holds for the minutes it takes to build it.
+///
+/// A row queued under a builder this binary is not is left alone rather than
+/// built wrongly: the hash would be recorded against a builder that did not
+/// produce it, which is the one thing this whole design exists to prevent. It
+/// waits for a deployment that has that builder, or for an admin to notice.
+/// Skipped in the query rather than taken and put back: taken as the oldest
+/// row, it answered "nothing to build", and every row requested after it --
+/// after a MAGPIE upgrade, every row the new builder was asked for -- waited
+/// behind a build this binary will never do.
 async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease>> {
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
@@ -396,11 +405,14 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
          WHERE (state = 'pending'
                 OR (state = 'building' AND leased_until < now()))
            AND attempts < $1
+           AND builder = CASE role WHEN 'wmp' THEN $2 WHEN 'rit' THEN $3 END
          ORDER BY requested_at
          FOR UPDATE SKIP LOCKED
          LIMIT 1",
     )
     .bind(MAX_ATTEMPTS)
+    .bind(builders.wmp())
+    .bind(builders.rit())
     .fetch_optional(&mut *tx)
     .await?;
     let Some(row) = row else {
@@ -415,22 +427,6 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
         letterdist_id: row.get("letterdist_id"),
         builder: row.get("builder"),
     };
-
-    // A row queued under a builder this binary is not is left alone rather
-    // than built wrongly: the hash would be recorded against a builder that
-    // did not produce it, which is the one thing this whole design exists to
-    // prevent. It waits for a deployment that has that builder, or for an
-    // admin to notice.
-    let ours = builders.for_role(&lease.role)?;
-    if ours != lease.builder {
-        tx.rollback().await?;
-        tracing::warn!(
-            role = %lease.role, name = %lease.name,
-            wanted = %lease.builder, have = %ours,
-            "a derived file is queued for a builder this MAGPIE does not have"
-        );
-        return Ok(None);
-    }
 
     sqlx::query(
         "UPDATE derived_data
