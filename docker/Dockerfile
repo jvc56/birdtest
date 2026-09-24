@@ -83,6 +83,11 @@ COPY backend/Cargo.toml backend/Cargo.lock ./
 COPY backend/src ./src
 COPY backend/migrations ./migrations
 
+# Unset, cargo uses every core. `--build-arg CARGO_BUILD_JOBS=2` caps it on a
+# machine that has other work to do: a release build of the AWS SDK at full
+# parallelism takes several GB.
+ARG CARGO_BUILD_JOBS
+
 # Cache mounts keep the registry and target directory across rebuilds. The
 # binary is copied out inside the same RUN because a cache mount is not part of
 # the resulting layer.
