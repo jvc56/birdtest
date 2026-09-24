@@ -337,11 +337,15 @@ pub struct GameAggregate {
 
 impl GameAggregate {
     pub(super) fn is_consistent(&self) -> bool {
+        // Summed in i64: in i32 three large counts wrap round to a small total
+        // (a panic in a debug build), and a tally of two billion wins would
+        // pass as ten games.
         self.games >= 0
             && self.wins >= 0
             && self.losses >= 0
             && self.ties >= 0
-            && self.wins + self.losses + self.ties == self.games
+            && i64::from(self.wins) + i64::from(self.losses) + i64::from(self.ties)
+                == i64::from(self.games)
     }
 }
 
@@ -469,4 +473,242 @@ pub struct GameResultsRecord {
 #[derive(Debug, Clone)]
 pub struct LeaveRecord {
     pub racks: Vec<RackOccurrence>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    /// The server's own claim responses, as `contract-fixtures/` pins them.
+    /// Read, never written, here: that directory has its own tests.
+    const ASSIGNMENTS: [(&str, &str); 3] = [
+        ("games", include_str!("../../../contract-fixtures/assignment-games.json")),
+        ("opening_rack", include_str!("../../../contract-fixtures/assignment-opening-rack.json")),
+        (
+            "leave_generation",
+            include_str!("../../../contract-fixtures/assignment-leave-generation.json"),
+        ),
+    ];
+
+    fn task_request(assignment: &str) -> Value {
+        let assignment: Value = serde_json::from_str(assignment).unwrap();
+        assignment["task_request"].clone()
+    }
+
+    /// The games request as a `game_pairs` job states it. There is no pairs
+    /// assignment fixture; the two share `GameRequest`.
+    fn game_pairs_request() -> Value {
+        let mut request = task_request(ASSIGNMENTS[0].1);
+        request["job_type"] = json!("game_pairs");
+        request["game_pairs"] = json!(true);
+        request
+    }
+
+    fn seed_of(request: &TaskRequest) -> u64 {
+        match request {
+            TaskRequest::OpeningRack(r) => r.seed,
+            TaskRequest::Games(r) | TaskRequest::GamePairs(r) => r.seed,
+            TaskRequest::LeaveGeneration(r) => r.seed,
+        }
+    }
+
+    fn set_seed(request: &mut TaskRequest, seed: u64) {
+        match request {
+            TaskRequest::OpeningRack(r) => r.seed = seed,
+            TaskRequest::Games(r) | TaskRequest::GamePairs(r) => r.seed = seed,
+            TaskRequest::LeaveGeneration(r) => r.seed = seed,
+        }
+    }
+
+    /// U-WIRE-1: on every request type the seed crosses as a decimal string,
+    /// and seeds past 2^53 -- where a double starts skipping integers -- come
+    /// back exact.
+    #[test]
+    fn seeds_cross_the_wire_as_decimal_strings_without_loss() {
+        let seeds = [0, 1, (1u64 << 53) + 1, (1u64 << 63) + 7, u64::MAX];
+        for (job_type, assignment) in ASSIGNMENTS {
+            let mut request: TaskRequest = serde_json::from_value(task_request(assignment)).unwrap();
+            for seed in seeds {
+                set_seed(&mut request, seed);
+                let wire = serde_json::to_value(&request).unwrap();
+                assert_eq!(wire["seed"], Value::String(seed.to_string()), "{job_type}");
+                let text = serde_json::to_string(&request).unwrap();
+                let back: TaskRequest = serde_json::from_str(&text).unwrap();
+                assert_eq!(seed_of(&back), seed, "{job_type}");
+            }
+        }
+        // 2^53 + 1 is the first integer a double cannot hold, which is what a
+        // JSON number would have silently rounded it to.
+        assert_ne!(((1u64 << 53) + 1) as f64 as u64, (1u64 << 53) + 1);
+
+        // The leave fixture's own seed is above 2^53 as written.
+        let leave: TaskRequest = serde_json::from_value(task_request(ASSIGNMENTS[2].1)).unwrap();
+        assert_eq!(seed_of(&leave), 18_446_744_073_709_551_557);
+    }
+
+    /// U-WIRE-1: a JSON number is refused rather than read, deliberately: no
+    /// client should be sending one, and accepting it would be accepting a
+    /// value that may already have been rounded.
+    #[test]
+    fn a_seed_sent_as_a_json_number_is_refused() {
+        let mut request = task_request(ASSIGNMENTS[0].1);
+        request["seed"] = json!(12345);
+        assert!(serde_json::from_value::<TaskRequest>(request.clone()).is_err());
+        request["seed"] = json!("-1");
+        assert!(serde_json::from_value::<TaskRequest>(request).is_err(), "a uint64");
+    }
+
+    /// U-WIRE-2: the tag is `job_type` in snake_case, one per variant, and
+    /// every variant -- the pinned assignments plus `game_pairs` -- survives a
+    /// round trip unchanged.
+    #[test]
+    fn task_requests_are_tagged_in_snake_case_and_round_trip() {
+        let mut requests: Vec<(&str, Value)> =
+            ASSIGNMENTS.iter().map(|(job_type, a)| (*job_type, task_request(a))).collect();
+        requests.push(("game_pairs", game_pairs_request()));
+
+        for (job_type, wire) in requests {
+            let request: TaskRequest = serde_json::from_value(wire.clone()).unwrap();
+            let variant_matches = match (&request, job_type) {
+                (TaskRequest::OpeningRack(_), "opening_rack") => true,
+                (TaskRequest::Games(r), "games") => !r.game_pairs,
+                (TaskRequest::GamePairs(r), "game_pairs") => r.game_pairs,
+                (TaskRequest::LeaveGeneration(_), "leave_generation") => true,
+                _ => false,
+            };
+            assert!(variant_matches, "{job_type} decoded as {request:?}");
+            let again = serde_json::to_value(&request).unwrap();
+            assert_eq!(again["job_type"], json!(job_type));
+            assert_eq!(again, wire, "{job_type} does not round-trip");
+        }
+
+        // The tag is the only thing that decides the variant: the same body
+        // under an unknown or camel-cased tag is refused.
+        for tag in ["gamePairs", "GamePairs", "game-pairs", "pairs"] {
+            let mut wire = game_pairs_request();
+            wire["job_type"] = json!(tag);
+            assert!(serde_json::from_value::<TaskRequest>(wire).is_err(), "{tag}");
+        }
+    }
+
+    fn aggregate_json() -> Value {
+        json!({
+            "games": 10, "wins": 5, "losses": 4, "ties": 1,
+            "p1_score_mean": 420.0, "p1_score_sd": 60.0,
+            "p2_score_mean": 415.0, "p2_score_sd": 58.0,
+        })
+    }
+
+    /// U-WIRE-3: every `#[serde(default)]` field can be left out, all at once,
+    /// on every response type that has one.
+    #[test]
+    fn every_defaulted_response_field_is_optional() {
+        let bare_move = json!({ "move": "8D QI", "score": 22, "equity": 30.5 });
+
+        let entry: MoveEntry = serde_json::from_value(bare_move.clone()).unwrap();
+        assert_eq!((entry.win_percentage, entry.blended_utility), (None, None));
+        assert!(entry.plies.is_empty());
+
+        let analysis: RackAnalysis =
+            serde_json::from_value(json!({ "rack": "AEINRST", "moves": [bare_move] })).unwrap();
+        assert_eq!(analysis.num_moves, None);
+
+        let position: CapturedPosition = serde_json::from_value(json!({
+            "game_index": 0, "turn_number": 0, "rack": "AEINRST",
+            "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
+            "num_moves": 40, "moves": [bare_move],
+        }))
+        .unwrap();
+        assert_eq!((position.previous_move, position.previous_move_score), (None, None));
+
+        let results: GameResultsResponse =
+            serde_json::from_value(json!({ "all_games": aggregate_json() })).unwrap();
+        assert!(results.pentanomial.is_none());
+        assert!(results.divergent_games.is_none());
+        assert!(results.positions.is_empty());
+
+        // The contrast: a field without a default is required.
+        let mut no_score = bare_move.clone();
+        no_score.as_object_mut().unwrap().remove("score");
+        assert!(serde_json::from_value::<MoveEntry>(no_score).is_err());
+        assert!(serde_json::from_value::<GameResultsResponse>(json!({})).is_err());
+    }
+
+    /// U-WIRE-4, the compatibility decision: an unknown field anywhere in a
+    /// response is **ignored**, not rejected. No response type sets
+    /// `deny_unknown_fields`, so a newer client (MAGPIE is released separately
+    /// from the server) can add a field and still be accepted by an older
+    /// server. The cost is that a misspelled optional field is silently
+    /// dropped rather than refused; the required ones still fail loudly.
+    #[test]
+    fn unknown_response_fields_are_ignored_so_newer_clients_stay_valid() {
+        let extra = |mut value: Value| {
+            value["field_from_the_future"] = json!({ "any": ["shape"] });
+            value
+        };
+        let ply = extra(json!({ "ply": 0, "bingo_percentage": 1.0, "average_score": 30.0 }));
+        let entry = extra(json!({ "move": "8D QI", "score": 22, "equity": 30.5, "plies": [ply] }));
+        let position = extra(json!({
+            "game_index": 0, "turn_number": 3, "rack": "AEINRST", "position": "cgp",
+            "num_moves": 40, "moves": [entry.clone()],
+        }));
+
+        let opening = extra(json!({
+            "racks": [extra(json!({ "rack": "AEINRST", "moves": [entry], "num_moves": 9 }))],
+        }));
+        let decoded: PositionAnalysisResponse = serde_json::from_value(opening).unwrap();
+        assert_eq!(decoded.racks[0].moves[0].plies.len(), 1);
+
+        let games = extra(json!({
+            "all_games": extra(aggregate_json()),
+            "pentanomial": [0, 1, 2, 1, 1],
+            "divergent_games": extra(aggregate_json()),
+            "positions": [position],
+        }));
+        let decoded: GameResultsResponse = serde_json::from_value(games).unwrap();
+        assert_eq!(decoded.positions[0].turn_number, 3);
+
+        let leaves = extra(json!({
+            "racks": [extra(json!({ "rack": "AEINRST", "count": 2, "mean": 1.5 }))],
+        }));
+        let decoded: LeaveResponse = serde_json::from_value(leaves).unwrap();
+        assert_eq!(decoded.racks[0].count, 2);
+    }
+
+    fn tally(games: i32, wins: i32, losses: i32, ties: i32) -> GameAggregate {
+        GameAggregate {
+            games,
+            wins,
+            losses,
+            ties,
+            p1_score_mean: 420.0,
+            p1_score_sd: 60.0,
+            p2_score_mean: 415.0,
+            p2_score_sd: 58.0,
+        }
+    }
+
+    /// U-WIRE-5: a tally is consistent when every count is non-negative and
+    /// the outcomes sum to the games -- and each way of breaking that fails.
+    #[test]
+    fn a_game_tally_must_be_non_negative_and_sum_to_its_games() {
+        assert!(tally(10, 5, 4, 1).is_consistent());
+        assert!(tally(0, 0, 0, 0).is_consistent());
+        assert!(tally(3, 0, 0, 3).is_consistent(), "all ties");
+
+        for (broken, why) in [
+            (tally(10, 5, 4, 2), "outcomes exceed the games"),
+            (tally(10, 5, 4, 0), "outcomes fall short of the games"),
+            (tally(-1, 0, 0, -1), "negative games, sum matching"),
+            (tally(10, -1, 10, 1), "negative wins, sum matching"),
+            (tally(10, 10, -1, 1), "negative losses, sum matching"),
+            (tally(10, 5, 6, -1), "negative ties, sum matching"),
+            // i32::MAX + i32::MAX + 12 wraps to exactly 10 in 32 bits.
+            (tally(10, i32::MAX, i32::MAX, 12), "outcomes that only sum by overflowing"),
+            (tally(i32::MAX, i32::MAX, 1, 0), "one past i32::MAX"),
+        ] {
+            assert!(!broken.is_consistent(), "{why}: {broken:?}");
+        }
+    }
 }

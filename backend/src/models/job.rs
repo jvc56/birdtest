@@ -243,3 +243,100 @@ impl NamedPlayerConfig {
         JOIN input_data klv ON klv.id = pc.klv_id
         LEFT JOIN input_data wp ON wp.id = pc.winpct_id";
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIGRATION: &str = include_str!("../../migrations/0001_initial.sql");
+
+    /// The labels of `CREATE TYPE <name> AS ENUM (...)`, in declaration order.
+    fn enum_labels(name: &str) -> Vec<String> {
+        let header = format!("CREATE TYPE {name} AS ENUM (");
+        let start = MIGRATION.find(&header).expect("enum not declared") + header.len();
+        let body = &MIGRATION[start..start + MIGRATION[start..].find(')').unwrap()];
+        body.split(',').map(|label| label.trim().trim_matches('\'').to_string()).collect()
+    }
+
+    /// The text sqlx binds for a value of a Postgres enum.
+    fn pg_text<T: for<'q> sqlx::Encode<'q, sqlx::Postgres>>(value: &T) -> String {
+        let mut buffer = sqlx::postgres::PgArgumentBuffer::default();
+        let _ = value.encode_by_ref(&mut buffer).unwrap();
+        String::from_utf8(buffer.to_vec()).unwrap()
+    }
+
+    const JOB_TYPES: [JobType; 4] =
+        [JobType::OpeningRack, JobType::Games, JobType::GamePairs, JobType::LeaveGeneration];
+
+    /// U-WIRE-6: the wire name of each job type, the text sqlx binds for it
+    /// and the migration's enum label are one string, and serde reads it back.
+    /// A variant renamed on one side only would pass the type checker and
+    /// fail every query or every worker.
+    #[test]
+    fn job_types_have_one_name_on_the_wire_and_in_postgres() {
+        let labels = enum_labels("job_type");
+        assert_eq!(labels, ["opening_rack", "games", "game_pairs", "leave_generation"]);
+        assert_eq!(labels.len(), JOB_TYPES.len(), "a variant with no label, or the reverse");
+
+        for (job_type, label) in JOB_TYPES.iter().zip(&labels) {
+            let wire = serde_json::to_value(job_type).unwrap();
+            assert_eq!(wire, serde_json::Value::String(label.clone()));
+            assert_eq!(pg_text(job_type), *label);
+            let back: JobType = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, *job_type);
+        }
+        assert!(serde_json::from_str::<JobType>("\"GamePairs\"").is_err());
+    }
+
+    /// U-WIRE-6's sibling on the same table: job statuses, which the admin
+    /// API and the scheduler both read.
+    #[test]
+    fn job_statuses_have_one_name_on_the_wire_and_in_postgres() {
+        let labels = enum_labels("job_status");
+        let statuses = [JobStatus::Active, JobStatus::Inactive, JobStatus::Completed];
+        assert_eq!(labels.len(), statuses.len());
+        for (status, label) in statuses.iter().zip(&labels) {
+            assert_eq!(serde_json::to_value(status).unwrap(), serde_json::Value::String(label.clone()));
+            assert_eq!(pg_text(status), *label);
+        }
+    }
+
+    /// U-WIRE-7: the SPRT settings come out of a games config and a pairs
+    /// config the same way, with only the unit renamed. Every value is
+    /// distinct, so a swapped field (alpha for beta, low for high) shows.
+    #[test]
+    fn sprt_params_read_the_same_settings_from_games_and_pairs() {
+        let (job_id, p1, p2) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let games = GameConfig {
+            job_id,
+            player1_config_id: p1,
+            player2_config_id: p2,
+            games_per_batch: 7,
+            min_games: 100,
+            max_games: 5000,
+            sprt_alpha: 0.05,
+            sprt_beta: 0.1,
+            elo_low: -3.0,
+            elo_high: 4.5,
+            capture_positions: false,
+        };
+        let pairs = GamePairConfig {
+            job_id,
+            player1_config_id: p1,
+            player2_config_id: p2,
+            pairs_per_batch: 7,
+            min_pairs: 100,
+            max_pairs: 5000,
+            sprt_alpha: 0.05,
+            sprt_beta: 0.1,
+            elo_low: -3.0,
+            elo_high: 4.5,
+            capture_positions: false,
+        };
+
+        let fields = |p: SprtParams| (p.min_units, p.max_units, p.alpha, p.beta, p.elo_low, p.elo_high);
+        let expected = (100, 5000, 0.05, 0.1, -3.0, 4.5);
+        assert_eq!(fields(SprtParams::from(&games)), expected);
+        assert_eq!(fields(SprtParams::from(&pairs)), expected);
+    }
+}
