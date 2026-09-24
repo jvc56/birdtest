@@ -2,7 +2,7 @@
 # Every contract bug the audit found in MAGPIE was invisible to both
 # repositories' unit tests and obvious the first time a real task ran
 # This runs one small job of every type and asserts
-# the results land.
+# the results land, then the M-5..M-11 cases (see scripts/e2e_magpie.py).
 name: Nightly MAGPIE end-to-end
 
 on:
@@ -51,6 +51,11 @@ jobs:
         env:
           # Input-data imports resolve MAGPIE-DATA refs through the GitHub API.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the stand-in e2e_magpie.py serves on the host: it hands
+          # out the small test tarball M-10 imports and passes everything else
+          # -- the real data-YYYYMMDD.tgz import included -- on to GitHub.
+          GITHUB_API_URL: http://host.docker.internal:8481/api
+          GITHUB_RAW_URL: http://host.docker.internal:8481/raw
         run: docker compose up -d --build --wait postgres minio minio-init backend
 
       - uses: actions/setup-python@v5
@@ -58,11 +63,13 @@ jobs:
           python-version: "3.12"
       - run: pip install requests
 
-      - name: One real task of every job type
+      - name: Every tier-6 case (M-1 to M-11)
         run: >-
           python3 scripts/e2e_magpie.py
           --magpie magpie/bin/magpie
           --magpie-root magpie
+          --github-fixture-port 8481
+          --github-fixture-host 0.0.0.0
 
       - name: Backend log
         if: always()

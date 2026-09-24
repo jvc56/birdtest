@@ -113,10 +113,13 @@ services:
       # resolution is 60 calls an hour per IP.
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       MAGPIE_DATA_REPO: ${MAGPIE_DATA_REPO:-jvc56/MAGPIE-DATA}
-      # Unset here, so import talks to GitHub. GITHUB_API_URL (default
-      # https://api.github.com) and GITHUB_RAW_URL (default
-      # https://raw.githubusercontent.com) move it elsewhere: the e2e stack
-      # points both at a static server of fixtures/, so import runs offline.
+      # Import talks to GitHub unless these move it elsewhere: the e2e stack
+      # points both at a static server of fixtures/, so import runs offline,
+      # and the nightly MAGPIE smoke tier at the stand-in scripts/e2e_magpie.py
+      # serves on the host (--github-fixture-port), which hands out a small
+      # test tarball and passes every other request on to GitHub.
+      GITHUB_API_URL: ${GITHUB_API_URL:-https://api.github.com}
+      GITHUB_RAW_URL: ${GITHUB_RAW_URL:-https://raw.githubusercontent.com}
       # The fleet-wide floor. `birdtest-contribute` reports 0.1.0, its
       # pre-release version, which meets it; scripts/dev.py reads the version
       # out of your checkout and sets this for you, so a checkout that reports
@@ -140,6 +143,10 @@ services:
       AWS_SECRET_ACCESS_KEY: birdtestbirdtest
       AWS_REGION: us-east-1
       RUST_LOG: ${RUST_LOG:-birdtest=debug,tower_http=info}
+    # So GITHUB_API_URL can name a server on the host, as the nightly smoke
+    # tier's does.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Read-only: the container runs the binary and reads nothing else from
       # the checkout. Every conversion gets a throwaway data directory written
