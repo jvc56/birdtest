@@ -402,6 +402,103 @@ async fn a_head_to_head_counts_pairs_and_scores_half_points_over_four() {
     assert_eq!(actual, 0.5625, "nine half-points over four, per pair");
 }
 
+/// A further accepted copy of `task`'s result, from another claim, with its
+/// own pentanomial, stamped `seconds_ago`.
+async fn redundant_copy(db: &TestDb, job: Uuid, task: Uuid, pent: [i32; 5], seconds_ago: i32) {
+    let [p0, p1, p2, p3, p4] = pent;
+    let (wins, ties, losses) = (p2 + p3 + 2 * p4, p1 + p3, 2 * p0 + p1 + p2);
+    let worker = Uuid::new_v4();
+    sqlx::query("INSERT INTO anonymous_workers (uuid) VALUES ($1)")
+        .bind(worker)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO task_claims (task_id, claim_token, state, claimed_by_anon_uuid, completed_at)
+         VALUES ($1, gen_random_uuid(), 'completed', $2, now()) RETURNING id",
+    )
+    .bind(task)
+    .bind(worker)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO game_results
+             (task_claim_id, task_id, job_id, games, wins, losses, ties,
+              p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
+              pent_0, pent_1, pent_2, pent_3, pent_4, submitted_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 420, 60, 410, 58,
+                 $8[1], $8[2], $8[3], $8[4], $8[5], now() - make_interval(secs => $9))",
+    )
+    .bind(claim)
+    .bind(task)
+    .bind(job)
+    .bind(wins + losses + ties)
+    .bind(wins)
+    .bind(losses)
+    .bind(ties)
+    .bind(pent.to_vec())
+    .bind(seconds_ago)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
+/// I-RATE-3 (redundancy): under redundancy 2 one task has two accepted
+/// results. They replay the same seeded pairs, so the fit counts the task
+/// once -- four pairs, not eight -- and reads the **first accepted** copy.
+/// The copies here disagree completely ([0,0,0,0,4] and [4,0,0,0,0]) so which
+/// one was read is visible in the head-to-head's score, and the test is run
+/// with the order both ways round so it cannot pass by accident of which
+/// claim id sorts first.
+#[tokio::test]
+async fn a_redundant_task_is_evidence_once_through_its_first_accepted_copy() {
+    for (first, second, anchor_score) in
+        [([0, 0, 0, 0, 4], [4, 0, 0, 0, 0], 1.0), ([4, 0, 0, 0, 0], [0, 0, 0, 0, 4], 0.0)]
+    {
+        let db = TestDb::new().await;
+        let admin = db.user("root", true).await;
+        let scope = scope(&db).await;
+        let anchor = db.static_player("a-anchor", admin).await;
+        let rival = db.static_player("b-rival", admin).await;
+        let job = pairs_job(&db, "classic", scope, anchor, rival).await;
+        sqlx::query("UPDATE jobs SET redundancy = 2 WHERE id = $1")
+            .bind(job)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let task: Uuid = sqlx::query_scalar(
+            "INSERT INTO tasks (job_id, seed, state, accepted_count, completed_at)
+             VALUES ($1, 1, 'completed', 2, now()) RETURNING id",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        redundant_copy(&db, job, task, first, 120).await;
+        redundant_copy(&db, job, task, second, 60).await;
+        let pool = pool(&db, "pool", "classic", scope, anchor, &[rival], 2000.0).await;
+
+        let run = ratings::recompute(&db.pool, pool, Trigger::Manual).await.unwrap();
+        assert_eq!(evidence(&db, run).await, (4, 1), "one task's four pairs, once");
+        let stored = stored_ratings(&db, run).await;
+        assert_eq!((stored[&anchor].pairs_played, stored[&rival].pairs_played), (4, 4));
+        let residuals = residuals(&db, run).await;
+        assert_eq!(residuals.len(), 1, "{residuals:?}");
+        let (row, col, pairs, actual, _) = residuals[0];
+        assert_eq!((row, col, pairs), (anchor, rival, 4.0));
+        assert_eq!(actual, anchor_score, "the first accepted copy, {first:?}, not {second:?}");
+        // And the fit moved the right way: the rival loses to the anchor when
+        // the first copy says so, and beats it when it says the reverse.
+        let rival_rating = stored[&rival].rating;
+        if anchor_score == 1.0 {
+            assert!(rival_rating < 2000.0, "{rival_rating}");
+        } else {
+            assert!(rival_rating > 2000.0, "{rival_rating}");
+        }
+    }
+}
+
 /// I-RATE-4: a fit stores one run and one rating per member, the anchor
 /// flagged on exactly one of them; a second fit adds a second run rather than
 /// changing the first.
