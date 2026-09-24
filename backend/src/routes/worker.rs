@@ -814,6 +814,23 @@ mod contract_fixtures {
         assert!(body.missing.iter().any(|m| m.actual.is_some()));
     }
 
+    // Captured from a real `magpie contribute` exchange by
+    // scripts/capture_contract.py (see contract-fixtures/README.md), where the
+    // three above were written by hand.
+    const GAME_PAIRS_ASSIGNMENT: &str =
+        include_str!("../../../contract-fixtures/assignment-game-pairs.json");
+    const ANON_UUID_ASSIGNMENT: &str =
+        include_str!("../../../contract-fixtures/anon-uuid-assignment.json");
+    const EXPECTED_DATA: &str = include_str!("../../../contract-fixtures/expected-data.json");
+    const HEARTBEAT: &str = include_str!("../../../contract-fixtures/heartbeat.json");
+    const RESULT_GAMES: &str = include_str!("../../../contract-fixtures/result-games.json");
+    const RESULT_GAME_PAIRS: &str =
+        include_str!("../../../contract-fixtures/result-game-pairs.json");
+    const RESULT_OPENING_RACK: &str =
+        include_str!("../../../contract-fixtures/result-opening-rack.json");
+    const RESULT_LEAVE_GENERATION: &str =
+        include_str!("../../../contract-fixtures/result-leave-generation.json");
+
     #[test]
     fn assignments_carry_a_task_request_this_build_understands() {
         for (name, fixture) in [
@@ -826,6 +843,8 @@ mod contract_fixtures {
                 "leave-generation",
                 include_str!("../../../contract-fixtures/assignment-leave-generation.json"),
             ),
+            ("game-pairs", GAME_PAIRS_ASSIGNMENT),
+            ("anon-uuid", ANON_UUID_ASSIGNMENT),
         ] {
             let value: Value = serde_json::from_str(fixture).unwrap();
             let request: TaskRequest =
@@ -840,45 +859,208 @@ mod contract_fixtures {
         }
     }
 
-    #[test]
-    fn the_assignment_envelope_matches_what_the_server_sends() {
-        let fixture: Value =
-            serde_json::from_str(include_str!("../../../contract-fixtures/assignment-games.json"))
-                .unwrap();
+    /// A digest list with one entry of each kind, as the server builds one.
+    fn expected_data() -> ExpectedData {
+        ExpectedData {
+            algorithm: "sha256",
+            files: std::sync::Arc::new(vec![crate::jobs::ExpectedFile {
+                role: "kwg".into(),
+                name: "NWL23".into(),
+                path: "lexica/NWL23.kwg".into(),
+                sha256: "3e74af98".into(),
+                bytes: 4_719_596,
+                tarball_date: "20251004".into(),
+            }]),
+            derived: std::sync::Arc::new(vec![crate::derived::ExpectedDerived {
+                role: "wmp".into(),
+                name: "NWL23".into(),
+                sha256: "214a46d7".into(),
+                bytes: 104_857_600,
+                builder: "wmp-1".into(),
+                build_target: "nehalem".into(),
+            }]),
+        }
+    }
+
+    /// The envelope the server would send around `fixture`'s own request.
+    fn envelope_for(fixture: &Value, worker_uuid: Option<Uuid>) -> Value {
         let request: TaskRequest =
             serde_json::from_value(fixture["task_request"].clone()).unwrap();
-
-        let produced = serde_json::to_value(TaskAssignment {
+        let mut expected_data = expected_data();
+        // A job that needs no derived file says so with an empty list; the
+        // fixture decides which of the two this envelope is.
+        if fixture["expected_data"]["derived"] == serde_json::json!([]) {
+            expected_data.derived = std::sync::Arc::new(Vec::new());
+        }
+        serde_json::to_value(TaskAssignment {
             claim_token: Uuid::nil(),
             job_id: Uuid::nil(),
             task_request: request,
             min_magpie_version: "1.4.0".into(),
-            expected_data: ExpectedData {
-                algorithm: "sha256",
-                files: std::sync::Arc::new(vec![crate::jobs::ExpectedFile {
-                    role: "kwg".into(),
-                    name: "NWL23".into(),
-                    path: "lexica/NWL23.kwg".into(),
-                    sha256: "3e74af98".into(),
-                    bytes: 4_719_596,
-                    tarball_date: "20251004".into(),
-                }]),
-                derived: std::sync::Arc::new(vec![crate::derived::ExpectedDerived {
-                    role: "wmp".into(),
-                    name: "NWL23".into(),
-                    sha256: "214a46d7".into(),
-                    bytes: 104_857_600,
-                    builder: "wmp-1".into(),
-                    build_target: "nehalem".into(),
-                }]),
-            },
-            // Absent from the fixture: it is sent only to a worker that
-            // arrived with no identity at all, which this one did not.
-            worker_uuid: None,
+            expected_data,
+            worker_uuid,
         })
-        .unwrap();
+        .unwrap()
+    }
 
-        assert_same_shape(&fixture, &produced, "assignment envelope");
+    #[test]
+    fn the_assignment_envelope_matches_what_the_server_sends() {
+        for (name, fixture) in [
+            ("games", include_str!("../../../contract-fixtures/assignment-games.json")),
+            ("game-pairs", GAME_PAIRS_ASSIGNMENT),
+        ] {
+            let fixture: Value = serde_json::from_str(fixture).unwrap();
+            // Absent from both: it is sent only to a worker that arrived with
+            // no identity at all, which these did not.
+            assert_same_shape(
+                &fixture,
+                &envelope_for(&fixture, None),
+                &format!("assignment-{name} envelope"),
+            );
+        }
+    }
+
+    /// C-2: the pairs assignment is a `game_pairs` request -- tagged so, with
+    /// `game_pairs: true` -- and nothing else distinguishes it from games.
+    #[test]
+    fn the_game_pairs_assignment_is_a_pairs_request() {
+        let fixture: Value = serde_json::from_str(GAME_PAIRS_ASSIGNMENT).unwrap();
+        let request: TaskRequest =
+            serde_json::from_value(fixture["task_request"].clone()).unwrap();
+        let TaskRequest::GamePairs(pairs) = request else {
+            panic!("assignment-game-pairs.json decoded as {request:?}");
+        };
+        assert!(pairs.game_pairs, "a pairs request must say game_pairs: true");
+        assert!(pairs.num_games > 0);
+        assert!(fixture.get("worker_uuid").is_none());
+    }
+
+    /// C-9: a first claim with no identity is answered with the identity the
+    /// server minted, in an otherwise ordinary assignment.
+    #[test]
+    fn a_first_claim_is_assigned_a_worker_uuid() {
+        let fixture: Value = serde_json::from_str(ANON_UUID_ASSIGNMENT).unwrap();
+        let minted: Uuid = serde_json::from_value(fixture["worker_uuid"].clone())
+            .expect("anon-uuid-assignment.json carries no worker_uuid");
+        // Its job pins no derived file, and says so rather than leaving the
+        // key out: a missing key reads to a client as a server that checks
+        // nothing.
+        assert_eq!(fixture["expected_data"]["derived"], serde_json::json!([]));
+        assert_same_shape(
+            &fixture,
+            &envelope_for(&fixture, Some(minted)),
+            "anon-uuid-assignment envelope",
+        );
+    }
+
+    /// C-8: the digest list on an assignment -- input files and derived ones
+    /// -- has the shape the server writes, and pins a derived file.
+    #[test]
+    fn the_expected_data_block_matches_what_the_server_sends() {
+        let fixture: Value = serde_json::from_str(EXPECTED_DATA).unwrap();
+        assert_same_shape(
+            &fixture,
+            &serde_json::to_value(expected_data()).unwrap(),
+            "expected-data",
+        );
+        assert_eq!(fixture["algorithm"], "sha256");
+        let derived: Vec<crate::derived::ExpectedDerived> =
+            serde_json::from_value(fixture["derived"].clone()).unwrap();
+        assert!(!derived.is_empty(), "expected-data.json pins no derived file");
+    }
+
+    /// C-7
+    #[test]
+    fn heartbeat_parses_as_a_heartbeat_body() {
+        let body: HeartbeatBody = serde_json::from_str(HEARTBEAT)
+            .expect("heartbeat.json no longer parses as HeartbeatBody");
+        assert!(!body.claim_token.is_nil());
+    }
+
+    /// A result fixture's body, decoded and validated as `store_result`
+    /// would a submission of it: the envelope, then the job type's response
+    /// type, then its handler's checks. Returns the claim token and record.
+    fn submitted<H: crate::jobs::handler::JobHandler>(fixture: &str, what: &str) -> (Uuid, H::Record) {
+        let body: ResultBody = serde_json::from_str(fixture)
+            .unwrap_or_else(|e| panic!("{what} no longer parses as ResultBody: {e}"));
+        let response: H::Response = serde_json::from_value(body.result)
+            .unwrap_or_else(|e| panic!("{what}'s result is malformed: {e}"));
+        let record = H::process_response(response)
+            .unwrap_or_else(|e| panic!("{what} would be refused: {}", e.message));
+        (body.claim_token, record)
+    }
+
+    fn assignment_games(fixture: &str) -> (Uuid, i32) {
+        let value: Value = serde_json::from_str(fixture).unwrap();
+        let token = serde_json::from_value(value["claim_token"].clone()).unwrap();
+        let request: TaskRequest = serde_json::from_value(value["task_request"].clone()).unwrap();
+        match request {
+            TaskRequest::Games(r) | TaskRequest::GamePairs(r) => (token, r.num_games),
+            other => panic!("not a games request: {other:?}"),
+        }
+    }
+
+    /// C-3: a games result with captured positions, answering the first
+    /// assignment of the same exchange -- so its batch is checked against the
+    /// batch that assignment asked for, as the server checks it.
+    #[test]
+    fn the_games_result_is_accepted_as_a_submission() {
+        let (token, record) =
+            submitted::<crate::jobs::game::GameHandler>(RESULT_GAMES, "result-games.json");
+        let (assigned, num_games) = assignment_games(ANON_UUID_ASSIGNMENT);
+        assert_eq!(token, assigned, "the result answers another claim than the assignment");
+        crate::jobs::plausibility::check_batch_size(
+            record.all_games.games,
+            crate::jobs::plausibility::games_dispatched(num_games, false),
+        )
+        .unwrap();
+        assert!(record.pentanomial.is_none());
+        assert!(!record.positions.is_empty(), "result-games.json captured no positions");
+        assert!(record.positions.iter().all(|p| p.position.is_some() && !p.moves.is_empty()));
+    }
+
+    /// C-4: a pairs result carries the pentanomial, and both of its
+    /// invariants hold against the game tally -- which `process_response`
+    /// enforces, so accepting it is the assertion.
+    #[test]
+    fn the_game_pairs_result_is_accepted_as_a_submission() {
+        let (token, record) = submitted::<crate::jobs::game_pair::GamePairHandler>(
+            RESULT_GAME_PAIRS,
+            "result-game-pairs.json",
+        );
+        let (assigned, num_pairs) = assignment_games(GAME_PAIRS_ASSIGNMENT);
+        assert_eq!(token, assigned, "the result answers another claim than the assignment");
+        crate::jobs::plausibility::check_batch_size(
+            record.all_games.games,
+            crate::jobs::plausibility::games_dispatched(num_pairs, true),
+        )
+        .unwrap();
+        let pentanomial = record.pentanomial.expect("a pairs result without a pentanomial");
+        assert_eq!(pentanomial.iter().sum::<i64>() * 2, i64::from(record.all_games.games));
+    }
+
+    /// C-5: an opening-rack result from a simulating player, statistics and
+    /// all.
+    #[test]
+    fn the_opening_rack_result_is_accepted_as_a_submission() {
+        let (_, record) = submitted::<crate::jobs::opening_rack::OpeningRackHandler>(
+            RESULT_OPENING_RACK,
+            "result-opening-rack.json",
+        );
+        assert!(!record.positions.is_empty());
+        let best = &record.positions[0].moves[0];
+        assert!(best.win_percentage.is_some() && best.blended_utility.is_some());
+        assert!(!best.plies.is_empty(), "the simulation's per-ply statistics are missing");
+    }
+
+    /// C-6
+    #[test]
+    fn the_leave_generation_result_is_accepted_as_a_submission() {
+        let (_, record) = submitted::<crate::jobs::leave_gen::LeaveGenHandler>(
+            RESULT_LEAVE_GENERATION,
+            "result-leave-generation.json",
+        );
+        assert!(record.racks.iter().all(|r| r.count > 0));
     }
 
     #[test]
