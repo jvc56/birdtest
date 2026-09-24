@@ -1981,7 +1981,9 @@ surfacing the mismatch as a red build rather than as a dead job in production.
 `M-10` and the `capture` case run on MAGPIE's small data, which the script
 serves as a tarball from a GitHub stand-in it runs itself
 (`--github-fixture-port`; the backend's `GITHUB_API_URL` and `GITHUB_RAW_URL`
-point at it, and every other request is forwarded to GitHub). Every case has a
+point at it -- set through compose's `BIRDTEST_GITHUB_API_URL` and
+`BIRDTEST_GITHUB_RAW_URL`, since GitHub Actions will not let a workflow override
+a `GITHUB_*` variable -- and every other request is forwarded to GitHub). Every case has a
 ten-minute ceiling (`CASE_TIMEOUT`), and each deletes the jobs and worker
 directories it made.
 

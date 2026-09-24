@@ -66,8 +66,10 @@ jobs:
           # Through the stand-in e2e_magpie.py serves on the host: it hands
           # out the small test tarball M-10 imports and passes everything else
           # -- the real data-YYYYMMDD.tgz import included -- on to GitHub.
-          GITHUB_API_URL: http://host.docker.internal:8481/api
-          GITHUB_RAW_URL: http://host.docker.internal:8481/raw
+          # Not GITHUB_API_URL: Actions refuses to override its own GITHUB_*
+          # variables, so docker-compose.yml reads these names instead.
+          BIRDTEST_GITHUB_API_URL: http://host.docker.internal:8481/api
+          BIRDTEST_GITHUB_RAW_URL: http://host.docker.internal:8481/raw
         run: docker compose up -d --build --wait postgres minio minio-init backend
 
       - uses: actions/setup-python@v5
