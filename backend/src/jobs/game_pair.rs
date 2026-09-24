@@ -43,8 +43,15 @@ impl JobHandler for GamePairHandler {
         let pentanomial = response
             .pentanomial
             .ok_or_else(|| AppError::bad_request("a game_pairs result must report a pentanomial"))?;
-        if pentanomial.iter().any(|&count| count < 0) {
-            return Err(AppError::bad_request("pentanomial counts must be non-negative"));
+        // No bucket can hold more pairs than there were games. Bounding every
+        // count is also what keeps the cross-checks below in range: summed as
+        // u64, counts near 2^63 wrapped round to agreeing with the game tally
+        // (and panicked in a debug build).
+        let games = i64::from(response.all_games.games);
+        if pentanomial.iter().any(|&count| count < 0 || count > games) {
+            return Err(AppError::bad_request(
+                "pentanomial counts must be non-negative, and none can exceed the games played",
+            ));
         }
 
         // The pentanomial and the game aggregate describe the same games from
@@ -141,4 +148,29 @@ pub async fn next_request(
             player2: player2.clone(),
         },
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pentanomial that agrees with its tally only by overflowing. Summed as
+    /// u64, `i64::MAX + 2` pairs doubled wrap round to exactly the 2 games
+    /// reported, and the half-points (2 x 2) match two wins -- so a release
+    /// build accepted it and stored a bucket of 2^63 pairs for SPRT to read,
+    /// while a debug build panicked. No bucket can exceed the games played.
+    #[test]
+    fn a_pentanomial_that_only_agrees_by_overflowing_is_rejected() {
+        let response: GameResultsResponse = serde_json::from_value(serde_json::json!({
+            "all_games": {
+                "games": 2, "wins": 2, "losses": 0, "ties": 0,
+                "p1_score_mean": 420.0, "p1_score_sd": 60.0,
+                "p2_score_mean": 400.0, "p2_score_sd": 55.0,
+            },
+            "pentanomial": [i64::MAX, 0, 2, 0, 0],
+        }))
+        .unwrap();
+        let error = GamePairHandler::process_response(response).unwrap_err();
+        assert!(error.message.contains("none can exceed the games played"), "{}", error.message);
+    }
 }
