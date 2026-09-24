@@ -658,3 +658,35 @@ async fn the_sixth_reset_for_one_address_is_rate_limited_from_any_ip() {
     let other = reset_request(&app, "bystander@example.invalid", "203.0.113.101").await;
     assert_eq!(other.status, StatusCode::OK, "{other:?}");
 }
+
+/// A-AUTH-5, on the reset path: a reset refuses a password built from the
+/// account's username or address, exactly as registration does -- and the
+/// refusal leaves the link usable for a better password.
+#[tokio::test]
+async fn a_reset_refuses_a_password_built_from_the_account_and_keeps_the_link() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+    confirmed_user(&db, "vexmorlandtriq", PASSWORD).await;
+    let email = "vexmorlandtriq@example.invalid";
+
+    assert_eq!(reset_request(&app, email, "").await.status, StatusCode::OK);
+    let mail = outbox.wait_for(email, 1).await;
+    let token = link_param(&mail[0], "token");
+
+    for derived in ["Vexmorlandtriq!", "vexmorlandtriq@example.invalid1"] {
+        let alone = zxcvbn::zxcvbn(derived, &[]).unwrap().score();
+        assert!(alone >= 3, "{derived:?} scores {alone} on its own; the context must refuse it");
+        let response = reset_confirm(&app, &token, derived).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "{derived}: {response:?}");
+        assert_eq!(
+            response.json()["fields"],
+            json!([{ "field": "password", "message": "too weak — choose a longer, less predictable password" }]),
+        );
+    }
+    assert_eq!(login(&app, "vexmorlandtriq", PASSWORD).await.status, StatusCode::OK);
+
+    let response = reset_confirm(&app, &token, NEW_PASSWORD).await;
+    assert_eq!(response.status, StatusCode::OK, "the refused attempts spent the link: {response:?}");
+    assert_eq!(login(&app, "vexmorlandtriq", NEW_PASSWORD).await.status, StatusCode::OK);
+}
