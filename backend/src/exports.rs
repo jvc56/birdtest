@@ -421,14 +421,29 @@ pub struct ReadyExport {
     pub positions_artifact_key: Option<String>,
 }
 
-/// The newest ready export for a job, if there is one.
+/// How long an export's objects are relied on after it is built: a day short
+/// of the bucket's lifecycle rule, which deletes everything under `exports/`
+/// thirty days after it is written (`infra/s3.tf`, `expire-job-exports`). The
+/// two move together.
+///
+/// Past it the row still says `ready`, but the objects are gone or about to
+/// be. Counted as ready, it was what a completed job's result stream
+/// redirected to -- a `404` from the store, every time, with the scan it would
+/// otherwise fall back to never reached -- and what the admin page offered as
+/// a download.
+pub const EXPORT_LIFETIME_DAYS: i32 = 29;
+
+/// The newest ready export for a job whose objects are still in the store, if
+/// there is one.
 pub async fn newest_ready(pool: &sqlx::PgPool, job_id: Uuid) -> AppResult<Option<ReadyExport>> {
     Ok(sqlx::query_as::<_, (Uuid, String, Option<String>)>(
         "SELECT id, artifact_key, positions_artifact_key FROM job_exports
          WHERE job_id = $1 AND state = 'ready' AND artifact_key IS NOT NULL
+           AND completed_at > now() - make_interval(days => $2)
          ORDER BY requested_at DESC LIMIT 1",
     )
     .bind(job_id)
+    .bind(EXPORT_LIFETIME_DAYS)
     .fetch_optional(pool)
     .await?
     .map(|(id, artifact_key, positions_artifact_key)| ReadyExport {

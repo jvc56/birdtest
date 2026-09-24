@@ -199,29 +199,56 @@ async fn the_eleventh_login_from_one_address_is_rate_limited_even_with_the_right
     assert_eq!(elsewhere.status, StatusCode::OK, "another address is unaffected: {elsewhere:?}");
 }
 
+/// `RateLimiters::login_account`: `Quota::per_minute(100)`, the cap on one
+/// username from every address together.
+const LOGINS_PER_ACCOUNT_PER_MINUTE: usize = 100;
+
 /// A-AUTH-11 (login, per username), the half that matters since addresses are
-/// cheap: the eleventh attempt on one username in a minute is 429 although
-/// every attempt came from a different address -- with the right password too,
-/// and whatever case or padding the name is typed with. Another username is
-/// unaffected.
+/// cheap: the hundred-and-first attempt on one username in a minute is 429
+/// although every attempt came from a different address -- with the right
+/// password too, and whatever case or padding the name is typed with. Another
+/// username is unaffected. (The attempts name an account that does not exist,
+/// which the limiter cannot tell from one that does, and which costs no
+/// Argon2 verify.)
 #[tokio::test]
-async fn the_eleventh_login_for_one_username_is_rate_limited_from_any_address() {
+async fn a_username_tried_from_everywhere_is_rate_limited() {
     let db = TestDb::new().await;
     let app = proxied_app(&db).await;
-    confirmed_user(&db, "target", PASSWORD).await;
     confirmed_user(&db, "bystander", PASSWORD).await;
 
-    for i in 0..LOGINS_PER_MINUTE {
-        let response = login_from(&app, &format!("203.0.113.{i}"), "target", WRONG).await;
+    for i in 0..LOGINS_PER_ACCOUNT_PER_MINUTE {
+        let ip = format!("10.{}.{}.1", i / 200, i % 200);
+        let response = login_from(&app, &ip, "target", WRONG).await;
         assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
     }
-    let right = login_from(&app, "203.0.113.200", "target", PASSWORD).await;
-    assert_rate_limited(&right, "the right password on a spent username");
+    let limited = login_from(&app, "203.0.113.200", "target", PASSWORD).await;
+    assert_rate_limited(&limited, "a spent username");
     let padded = login_from(&app, "203.0.113.201", " TARGET ", PASSWORD).await;
     assert_rate_limited(&padded, "case and padding do not make it another username");
 
     let other = login_from(&app, "203.0.113.202", "bystander", PASSWORD).await;
     assert_eq!(other.status, StatusCode::OK, "another username is unaffected: {other:?}");
+}
+
+/// A-BOUND-2: one address trying wrong passwords for an account cannot lock
+/// its owner out. Keyed on the username alone at the per-address rate, one
+/// wrong guess every six seconds from anywhere held any account -- an admin's,
+/// whose name is public -- out of signing in, right password or not.
+#[tokio::test]
+async fn a_stranger_cannot_lock_an_account_out_of_signing_in() {
+    let db = TestDb::new().await;
+    let app = proxied_app(&db).await;
+    confirmed_user(&db, "target", PASSWORD).await;
+
+    for i in 0..LOGINS_PER_MINUTE {
+        let response = login_from(&app, "203.0.113.66", "target", WRONG).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
+    }
+    let limited = login_from(&app, "203.0.113.66", "target", WRONG).await;
+    assert_rate_limited(&limited, "the guessing address");
+
+    let owner = login_from(&app, "198.51.100.7", "target", PASSWORD).await;
+    assert_eq!(owner.status, StatusCode::OK, "the owner signs in from their own address: {owner:?}");
 }
 
 // ---------------------------------------------------------------------------

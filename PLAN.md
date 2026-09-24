@@ -31,7 +31,9 @@ Jobs are created in the **inactive** state. Allocation is not set at creation ti
 
 Admins can deactivate, reactivate, purge, force-complete, or delete a job at any time. **Purge deletes tasks outright** rather than returning them to `available`: every job type generates its tasks on demand, so a purged job regenerates them from the start of its space at the next claim. Leaving the rows behind would advance the seed cursor past work that was never done. Purging also rebuilds the generation-0 zeroed KLV a leave-generation job needs before it can dispatch; the generation-1 rack universe it deleted is seeded again by the first claim, as every generation's is. It takes the job's **merge lock** before anything else — a merge of a leave job's staged results takes the staged rows and then the per-rack rows, a purge deletes them the other way round, and run together the two deadlocked, with the purge the likelier victim: a `500` and nothing deleted (`leave_gen::lock_merges`; it is first in the lock order everywhere, because nothing takes it while holding another lock). Then the job's dispatch lock, the same one every claim takes: a claim in flight has already read the seed cursor and is about to insert its task, which the purge's deletes cannot see, so without the lock the purge finishes and the claim then commits a task into the job it just emptied. It then waits out every open claim's in-flight submission before taking the job's row, which is the order every submission locks in (claim, then task, then job): taken the other way round, a submission arriving mid-purge deadlocked against it, and one that committed between the purge counting contributions and deleting claims was never handed back. Delete takes the same three locks for the same reasons.
 
-A completed job cannot be reactivated, and for the same reason cannot be deactivated: deactivate-then-activate would otherwise restart it. Force-completion is unconditional.
+A completed job cannot be reactivated, and for the same reason cannot be deactivated: deactivate-then-activate would otherwise restart it. Force-completion is unconditional. **A purge returns a completed job to inactive**, and leaves an active or inactive job's state alone: a purged job has nothing left to be complete about, and one left `completed` was an empty job nothing could ever run again — where the purge is meant to start it over.
+
+**While a purge or delete runs, claims skip the job** without asking the database (`jobs::DispatchHolds`, an in-process set; the service is a single instance), and the claims it holds are not waited on by anything else: a heartbeat skips a locked claim (`FOR UPDATE SKIP LOCKED`), reclamation skips one, and a submission or decline waits at most five seconds for its claim's row (`lock_timeout`) before answering `503` with `Retry-After`, which MAGPIE backs off and retries — its retry after the purge finds the claim gone and is answered `accepted: false`. A purge of a large job holds every open claim of the job for as long as its deletes run, minutes for a full opening-rack job; before the eleventh audit each of those waited with a pool connection held, the fleet's heartbeats filled the twenty-connection pool within one thirty-second cycle, and every claim and submission on the server failed until the purge committed.
 
 ---
 
@@ -76,7 +78,7 @@ Every job type generates its tasks **on demand**: the next task request is gener
 2. The system selects the active job **most behind its configured allocation share** — specifically, among active jobs with an allocation above 0%, the one with the lowest ratio of `(claims_issued - claims_baseline) / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 
    **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on activation, which is also how an allocation is changed, and on a purge — so that the job's ratio equals the **lowest ratio among the other jobs being served** (`scheduler::join_at_parity`): it joins level with the job furthest behind and takes its share from then on. *Being served* is narrower than *offering work*, and the difference matters: a job can be active and above 0% and still stand still — its derived files are building or failed, it is pinned to data the fleet does not have yet, its MAGPIE floor is above what the workers run, its generation is mid-transition — and its ratio does not move while the others' climb. Put level with *that* job, a newcomer was, for every worker that could not run the lagging one, first in the list until it had caught up with the jobs that were running: a veteran at 100,000 claims, a job nobody could run at zero, and a newcomer took twelve of the next twelve claims. So a job counts toward parity only if it issued a claim within the heartbeat timeout — `jobs.last_claimed_at`, which rides the `UPDATE jobs` every claim already makes — and when no job has (a quiet server, the first activation in a while) every job on offer counts, as before. One case this does not reach, and no single ratio can: a job only a *minority* of the fleet can run is served, recently, and still lags, so a newcomer level with it is ahead of the rest for the majority. A fleet split that way is two queues, and the scheduler has one. This is start-time fair queuing's rule, and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level); ratios never are. One thing it deliberately does not cover: a job that stays a candidate but hands out nothing for a long stretch — waiting on a derived-file build, or on workers that can run it — still returns behind its share and is favoured until it catches up. That is a job being owed work it was offered and could not take, which is what a deficit is for; re-activating it forgives the debt if an admin would rather.
-3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`.
+3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`. A claim somebody holds locked — a submission, a decline, a purge — is skipped rather than waited on (`FOR UPDATE SKIP LOCKED`): it is not lapsed in any sense that matters, and the next claim request reclaims it if it still needs to be.
 4. The system acquires the next task (one being re-dispatched, or else one generated on demand), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
 6. The worker performs the task and submits a **task response** along with the claim token.
@@ -93,7 +95,7 @@ Workers are the clients that perform tasks and submit results. Two types are sup
 
 #### Worker Integrity and Anomaly Detection
 
-- **Plausibility checks at submission time** — every submission is checked against what is *possible*, not against what is usual: a negative standard deviation, a play scoring negative points, a rack with eight tiles, a batch reporting a different number of games than the task dispatched. Implemented in [`backend/src/jobs/plausibility.rs`](backend/src/jobs/plausibility.rs). This is the only active integrity mechanism at submission time, and the rest of this section explains why it is the only one that can be.
+- **Plausibility checks at submission time** — every submission is checked against what is *possible*, not against what is usual: a negative standard deviation, a play scoring negative points, a rack with eight tiles (counted as tiles: a multi-character letter such as Catalan's `[L·L]` is written bracketed and is one), a negative count of moves generated, a per-ply bingo percentage outside [0, 100] or plies out of order, a pentanomial whose pairs need more draws than the games report, a batch reporting a different number of games than the task dispatched. Implemented in [`backend/src/jobs/plausibility.rs`](backend/src/jobs/plausibility.rs). This is the only active integrity mechanism at submission time, and the rest of this section explains why it is the only one that can be.
 - **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID. Applied by an admin; nothing bans automatically. **One row per identity**, enforced by a partial unique index: enforcement is an `EXISTS`, so a second row's reason is never read, while unban deletes by row id — so a duplicate would leave an identity banned after an admin had lifted the ban, with nothing to say why. Banning again with a different reason is unban-then-ban, which the audit log records as both halves.
 - **Redundant task execution** — each job specifies a redundancy value X; X independent workers must each complete the task. All X results are stored independently. No consensus or agreement check is performed at submission time — reconciliation is a downstream analysis question deferred past v1. Every aggregate that treats results as observations — SPRT, progress counts, the job list, rating evidence and a leave generation's occurrence totals — reads **one result per task**, the first accepted: games are seeded and deterministic (a leave-generation task carries its seed too), so the other copies replay the same games, and counting them would multiply the evidence by the redundancy. "First" is the task's `accepted_count` read as zero under the task's row lock, which every submission takes before storing anything. A later result for a leave task is credited to its worker (`leave_records`) and not folded into `leave_rack_progress` — a guard rather than a path, since a
 leave-generation job is created at redundancy 1 only.
@@ -289,7 +291,14 @@ For game and game-pair jobs, results are evaluated using the Sequential Probabil
 SPRT is evaluated inline on the submission path (no background sweep), and
 **debounced**: every eighth submission for a job, plus unconditionally whenever
 that job has nothing left in flight. The server flips the job to `completed`
-automatically when either condition is met.
+automatically when either condition is met, and **stores the verdict it completed
+on** — status, LLR and units (`jobs.sprt_decided_*`) — with the completion. The
+claims in flight at that moment are still played and accepted, and the live
+figures are recomputed from every accepted result, so the LLR can go on moving
+afterwards, even back inside the bounds; without the stored verdict a job that
+passed could show "running" on its own page with no record of the decision that
+stopped it. The page shows the stored verdict as the result and the live LLR
+beside it. A purge clears it.
 
 The debounce trades *when* a job notices it is finished for the cost of
 noticing, and nothing else — the check still reads `game_results`, so a
@@ -490,7 +499,11 @@ sign-flipped residuals and as ratings that collapse toward each other. An
 incremental filter cannot show this at all; it just oscillates quietly. The
 ratings page therefore carries the scalar rating as the headline and the residual
 table beside it, and says so when the residuals are large enough that the
-ranking should not be read as one.
+ranking should not be read as one: three or more head-to-heads at least five
+points off *and* at least three standard errors from zero on the pairs behind
+them (`charts/residuals.ts`). Without the second condition a young pool — a few
+pairs per head-to-head, and a prior that pulls lightly observed configs toward
+the anchor — showed the warning on sampling noise alone.
 
 #### What counts as evidence
 
@@ -549,14 +562,19 @@ On membership change and on demand, immediately; on new evidence, from a periodi
 sweep (two minutes) rather than a hook on result submission. A fit is global to a
 pool, an active job submits results far faster than any rating needs to move, and
 — unlike SPRT — nothing blocks on the answer. The sweep compares the pool's
-current pair count against the last run's `pairs_used`, so no dirty flag is
+current pair count against the last run's `pairs_used`, and its current members
+against the configs that run rated — so a membership change whose own refit
+never ran (the request dropped after the membership committed) is repaired too,
+even when the config added or removed had no pairs — and no dirty flag is
 needed anywhere; it reads the evidence once and fits from the same read, rather
 than reading it to decide and again to fit.
 
 **A fit holds the pool's lock while it runs** (`pg_advisory_xact_lock`, per
 pool, for the fitting transaction). It is a read-then-write over state an admin
 can change underneath it — it reads membership and evidence, then writes a run
-stamped `now()` — so two at once interleave, and the fit that *started* first
+stamped `clock_timestamp()` under the lock (the column's `now()` default is the
+transaction's start, before the lock, which misordered two fits exactly the way
+the lock exists to prevent) — so two at once interleave, and the fit that *started* first
 can commit last. The newest `rating_runs` row is what the ratings page shows,
 so the visible symptom is a config removed from a pool coming straight back in
 the fit: the sweep had already read the old membership when the removal landed.
@@ -629,8 +647,18 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
    and which registration should not undo. The caller gets byte-for-byte what a
    new registration gets, no account is created, and a notice goes to the
    address's owner telling them someone tried and pointing them at login and
-   password reset. A real person who has forgotten they signed up still finds
-   out; someone probing the address learns nothing.
+   password reset (or, when the account holding the address has not confirmed
+   it, at the confirmation link already sent). A real person who has forgotten
+   they signed up still finds out; someone probing the address learns nothing.
+   The notice is limited per address as well as per IP, and skipped rather than
+   refused when limited, so it cannot be used to bury a mailbox.
+
+   **An account that never confirmed gives up its username and address once its
+   confirmation has expired.** The next registration naming either deletes it
+   first. Held for ever, it was a dead end — it cannot sign in, reset its
+   password or be sent a new code — and a way to squat anyone's address:
+   register it first, and its owner could never sign up unless they clicked a
+   stranger's link within the day.
 
    The password is hashed **before** this branch, not after, so both paths pay
    the same Argon2 cost. Returning an identical body and then answering tens of
@@ -645,7 +673,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
 
 #### Login Flow
 
-1. User submits the login form (`/login`) with username and password. Attempts are rate limited per client IP and, separately, per username (10 a minute each), checked before any Argon2 verify runs.
+1. User submits the login form (`/login`) with username and password. Attempts are rate limited per client IP (10 a minute), per username *from that IP* (10 a minute), and per username from everywhere (100 a minute), all checked before any Argon2 verify runs. The username limit was per username alone at 10 a minute, which let one address trying a wrong password every six seconds hold any account — an admin's, whose name is public — out of signing in; now a lockout takes a fleet of addresses, and the account-wide cap still bounds a distributed guesser.
 2. The server looks up the user by username. If not found, or the password does not verify, it returns `401` with an identical message for both, so the response body cannot be used to enumerate accounts.
 
    A known account still costs an Argon2 verify where an unknown one returns
@@ -969,7 +997,11 @@ Exports are derived data and are treated differently from the leave-generation
 KLVs in every way that matters: a purge deletes a job's exports with the results
 they describe (a row left saying `ready` would hand an admin a stable-looking
 artifact of a job that no longer holds any of it), they expire from the bucket
-after 30 days, and they are **not** cross-region replicated — losing one costs a
+after 30 days — and the server stops relying on one a day before that
+(`exports::EXPORT_LIFETIME_DAYS`): past it, a completed job's result stream falls
+back to the scan instead of redirecting to an object the bucket has deleted, and
+the admin page says *expired* rather than offering a dead download — and they
+are **not** cross-region replicated — losing one costs a
 re-export, where losing a KLV costs a rebuild that needs the database. `row_count`
 is recorded so a later mismatch against the job is visible rather than silent,
 the same reason the KLVs carry a digest.
@@ -1205,7 +1237,7 @@ start. The process has no SSM code path of its own.
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
-| `MIN_MAGPIE_VERSION` | `0.1.0` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
+| `MIN_MAGPIE_VERSION` | `0.1.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
 | `MAGPIE_BIN` | `/usr/local/bin/magpie` | The pinned MAGPIE the server runs for every derived file and every leave-generation KLV. The backend image builds one in; locally, a checkout's `bin/magpie`. Startup fails without a working one. |
 | `MAGPIE_THREADS` | `1` | Threads given to a conversion. The web task keeps 1; the derived-file builder task sets its vCPU count. |
 | `MAGPIE_SCRATCH_DIR` | the system temp directory | Where a conversion's throwaway data directory goes. The builder task points it at its ephemeral volume, since a rack info table is 1.9 GB. |
@@ -1804,20 +1836,20 @@ WHERE (j.min_magpie_major, j.min_magpie_minor, j.min_magpie_patch)
 distribution and a layout — and a client too old to understand `expected_data`
 will contribute unverified rather than decline. "No floor" is not a state worth
 being able to express once every job depends on the client honouring a protocol,
-so the columns are `NOT NULL` and default to **`0.1.0`**, the same value as the
+so the columns are `NOT NULL` and default to **`0.1.1`**, the same value as the
 server's `MIN_MAGPIE_VERSION`, which `create_job` writes explicitly.
 
-`0.1.0` is `birdtest-contribute`'s **pre-release version**. Neither birdtest
-nor the branch is in production yet, so everything the protocol relies on —
-every result-changing setting stated on the request rather than taken from the
-worker's build, input data and derived files checked against the hashes the job
-pins, the word info table switched off before every load, a seed on every task
-— is in `0.1.0`. The version was incremented through `0.5.1` as birdtest and
-MAGPIE changed together during development; none of those numbers ever
-shipped, so they carry no meaning a floor could use, and it is `0.1.0` until
-the first release. From then on the version moves only when a release changes
-what a task computes, and the floor moves with it: a floor is a minimum, not a
-pin, so it exists precisely so that the first such release can raise it. The
+`0.1.1` is the `birdtest-contribute` version the backend image pins. The version
+was incremented through `0.5.1` as birdtest and MAGPIE changed together during
+development and reset to `0.1.0` when the protocol settled; none of those numbers
+shipped. **The version moves with every change that can alter what a task
+computes or submits, and the floor moves with it**: a floor is a minimum, not a
+pin, and it is the only way the server has to keep a build it knows computes
+something wrong off its jobs. The eleventh audit found that rule had been broken
+— builds from between 16 and 24 September 2026 all reported `0.1.0`, among them
+ones whose capturing static player played its worst move and every one that
+played a leave task after its first with the previous task's KLV — so the branch
+went to `0.1.1` and the floor with it. The
 one place the floor lives is the server's configuration: the column default,
 the Terraform variable, the compose file and the env examples all carry the
 same value so no path writes a lower one.
@@ -2090,6 +2122,15 @@ connection*, and the pool is twenty. One slow claim on one job would stall
 submissions and the dashboard for the whole server. The bound turns that into
 those workers being told to look elsewhere.
 
+**And for the two long holders, claims do not wait at all.** A bounded wait
+still holds a connection for its whole two seconds, and a job that hands out
+nothing falls behind its share and so heads every worker's candidate list: a
+fleet of idle workers polling every five seconds held the pool on it for as long
+as a seeding ran. So a seeding and a purge or delete mark the job in an
+in-process set for as long as they hold its lock (`jobs::DispatchHolds`), and a
+claim skips a marked job before taking a connection. The advisory lock is still
+what makes the hold safe; the set only spares the wait.
+
 **Two things legitimately restart an attempt**, and both are ordinary rather than
 exceptional:
 
@@ -2203,7 +2244,19 @@ non-negative and agree with the game aggregate on both the pair count and player
 pentanomial](#magpie-reports-the-pentanomial). `divergent_games` is optional; when
 present its own counts must be consistent, its `games` even, and no larger than
 the total. A plain `games` result carrying either has it ignored rather than
-stored, since a job that does not play pairs has no pairs to describe.
+stored, since a job that does not play pairs has no pairs to describe. The
+pentanomial must also agree on the **draws**: a pair scoring one or three
+half-points holds exactly one draw and a pair scoring two holds none or two, so
+the ties must be buckets 1 and 3 plus an even number no larger than twice bucket
+2 — `[0,1,0,1,0]` beside two wins, two losses and no ties has the right pair
+count and score, and is two pairs that each needed a draw.
+
+**The body is decoded once, straight into the job type's response**, from the
+raw text kept by the extractor (`serde_json::value::RawValue`). It went through
+a `serde_json::Value` first, which holds every object as a B-tree node and every
+key as its own allocation — ten to twenty times the JSON's size, so a result near
+the 64 MiB ceiling became most of a gigabyte on a 2 GB task, and a few at once
+were enough to have it killed.
 
 **Captured positions**, when present:
 
@@ -2268,7 +2321,14 @@ visible as a count.
 
 Per-ply rows are written only where the worker reported them, which in practice
 means only for simming players; a static player produces none and the table stays
-empty rather than filling with placeholders.
+empty rather than filling with placeholders. They are kept to the plies the config
+records, the way moves are kept to the plays it records — `ply` below the player's
+`num_plies_recorded`, the larger of the two players' for a captured position —
+and must be numbered from 0 in order, with a bingo percentage in [0, 100] and an
+average score no play could not reach. Nothing bounded them before: a 64 MiB body
+could carry tens of thousands of ply rows per move. A ply row is keyed by
+`(move_id, ply)`; it carried a `BIGSERIAL` id beside that key which nothing read,
+at some 30 bytes a row — 2 to 5 GB for one simming opening-rack job.
 
 In-game positions are inserted with `ON CONFLICT DO NOTHING` and, when the insert
 is a no-op, their moves are skipped too — another claim already recorded that
@@ -2416,8 +2476,10 @@ whose transition outlasted the timeout would never close at all. Hence two thing
 together: the seeding and the transition each running on its own task rather than
 inline in the request (see Aggregation below), and the ALB's `idle_timeout` set to 300
 seconds rather than its 60-second default, which is comfortably above MAGPIE's own
-120-second request timeout. SSE streams are unaffected either way, since they send
-keep-alives every 15 seconds.
+120-second stall timeout (a request that makes no progress for two minutes fails;
+one still uploading does not — see "A request fails on a stall" under
+[Per-job-type executors](#per-job-type-executors)). SSE streams are
+unaffected either way, since they send keep-alives every 15 seconds.
 
 At claim time:
 1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and `configured_generation_count` generations are already done, return "no work."
@@ -3011,7 +3073,7 @@ and the retry policy, applied uniformly:
 |---|---|
 | 2xx | Return it. |
 | 204 | Return it; the caller decides (for `/task` it means "no work"). |
-| 429 | Sleep `Retry-After` (default 1s) and retry, up to 5 times. |
+| 429 | Sleep `Retry-After` (default 1s, never more than 60s) and retry, up to 5 times; the heartbeat's single-shot request does not retry it. `Retry-After` was read from the wrong libcurl field until the eleventh audit — `CURLINFO_OFF_T + 52`, the connect time in microseconds — so a worker slept for hours on its first `429`. |
 | 5xx, or a transport error | Exponential backoff from 1s, doubling to a ceiling of 60s, for 20 retries — about fifteen minutes — then fail. A task claim, once the server has answered this run at all, keeps retrying at the ceiling instead of failing. |
 | 4xx other than 429 | Return it; the caller decides. Never retried. |
 
@@ -3282,7 +3344,7 @@ a new MAGPIE setting has a table it visibly is not in.
 
 | Setting (MAGPIE flag) | Changes results? | What fixes it for a task |
 |---|---|---|
-| Lexicon (`-l1`/`-l2`), leaves (`-k1`/`-k2`) | Yes | Stated per player, pinned by digest in `expected_data`. An opening-rack task gives both seats its one player's; a leave task gives both the fetched KLV |
+| Lexicon (`-l1`/`-l2`), leaves (`-k1`/`-k2`) | Yes | Stated per player, pinned by digest in `expected_data`. An opening-rack task gives both seats its one player's; a leave task gives both the fetched KLV — read afresh from the file it was written to, see below |
 | Letter distribution (`-ld`), board layout (`-bdn`), variant (`-var`) | Yes | Required on every request; the two files are pinned by digest |
 | Win% model (`-winpct`) | For simmers | From whichever player states one; pinned by digest |
 | Wordmap (`-w1`/`-w2`), rack info table (`-rit*`) | They must not — but a stale or mismatched file does | Flags stated per player and set *before* the lexical load; the file's bytes must match the hash the server built, or the task is declined. A table is loaded by its pair's name, never the lexicon's |
@@ -3302,6 +3364,39 @@ a new MAGPIE setting has a table it visibly is not in.
 | Threads (`threads` in `contribute.txt`) | For a simmer's sampling and for a multi-threaded leave run | Deliberately the contributor's — see [Known Limits and Open Questions](#known-limits-and-open-questions) |
 | Output (`-hr`, print interval, board printing, game string options, `-ritmmap`) | No | `print_interval` is reset anyway: left over, it printed simulation progress per rack |
 | Data paths (`-path`) | Chooses files | Every file a task loads is digest-verified through the same resolver the load uses, and the task is declined on a mismatch |
+| Lexical data already in memory (a KWG, KLV, wordmap or rack info table of the name asked for) | Whatever that file held when it was read | Evicted and read again when its file has changed since this path read it, or when this path did not read it (settings.txt, an earlier command) — `config_contribute_evict_changed_data`, by file identity (size, inode, and mtime and ctime to the nanosecond) |
+
+**What is verified is a file; what is played is what is in memory.** MAGPIE
+caches loaded lexical data by *name*: a load that finds a KLV of the requested
+name already loaded keeps it and never opens the file. Every check on this
+path, though, is of the file on disk — its digest against the job's pin, or, for
+a leave task's KLV, the artifact just fetched and written under a fixed name.
+Until the eleventh audit the two could disagree, and for leave generation they
+always did: from the second leave task in a process the new generation's KLV was
+written over the old one and the old one, still in memory under the same name,
+was played — the task's games, its per-rack counts and its mean equities all
+from the previous generation's leaves, with nothing on the server able to tell.
+The same held for a wordmap or rack info table rebuilt mid-run after its pin
+moved, and for a lexicon updated mid-run. Before each contribute load, data
+whose file's identity has changed since this path read it is dropped and read
+again; data whose file has not is kept, so an ordinary run reads each file
+once.
+
+**Every name a request carries is checked before it becomes a path** — each
+player's lexicon, leaves and win% model, a rack info table's name (which may
+join a lexicon and leaves with one `.`), and every `expected_data` file name
+(`data_filepaths_is_safe_name`). Only the job-wide names were, before; a
+server that sent `../` in a table's name could have had a worker write 1.9 GB
+wherever it pointed, or hash any file and report the digest back.
+
+**A request fails on a stall, not on its length.** The HTTP client's timeout was
+libcurl's `CURLOPT_TIMEOUT` at 120 seconds, which bounds the whole exchange —
+upload, the server's processing and the download together. The server accepts
+results up to 64 MiB, and a capture batch is tens of megabytes; on an uplink
+under about 4.5 Mb/s the largest could not be sent at all, and each of the
+twenty retries uploaded it all again before the finished task was dropped. It is
+now a 120-second connect timeout plus stall detection (no bytes moved for 120
+seconds), under a one-hour ceiling, and a redirected `POST` stays a `POST`.
 
 - **Opening rack analysis** — for each rack in the batch, load the CGP, apply the
   single player config to both seats (the opponent a simulation plays out needs its
@@ -3570,7 +3665,9 @@ takes minutes, and the heartbeat is what keeps the claim alive through it.
 `POST /api/worker/heartbeat` with `{"claim_token": "..."}` every 30 seconds for
 the lifetime of a claim — through the result's submission, see the loop's step 8
 — using `cpthread` and a stop flag. Each goes out once, with no retry: the next
-one is thirty seconds away whatever happened to this one. Failures are ignored:
+one is thirty seconds away whatever happened to this one — a `429` included,
+which is not waited out: a heartbeat asleep on a `Retry-After` would hold up the
+task's submission, which waits for the heartbeat thread to stop. Failures are ignored:
 the server treats a missed heartbeat as a lapsed claim and reassigns the
 task, which is the designed behaviour.
 
@@ -4664,6 +4761,8 @@ birdtest/
 │   ├── backup.sh                   # the nightly pg_dump, its manifest, and the `backups` row
 │   ├── restore-drill.sh            # the monthly automated restore drill
 │   ├── restore-roundtrip.sh        # dump -> drop -> restore -> verify, against the local stack
+│   ├── prod-sql.sh                 # run SQL against production from inside the VPC (infra/ops.tf)
+│   ├── prod-shell.sh               # an interactive psql-capable shell there, over ECS Exec
 │   ├── dev-dump.sh                 # snapshot the local Postgres + MinIO state
 │   ├── dev-restore.sh              # put it back
 │   ├── leave-gen-bench.sh          # time a generation transition's SQL against any database,
@@ -4747,7 +4846,8 @@ birdtest/
 │
 ├── frontend/                       # SvelteKit app
 │   ├── Dockerfile                  # static build served by Nginx — the same artifact ECS runs
-│   ├── docker/nginx.conf           # SPA fallback + /api proxy (SSE needs proxy_buffering off)
+│   ├── docker/default.conf.template # SPA fallback + /api proxy (SSE needs proxy_buffering off); the
+│   │                               # backend's address filled in at start (BACKEND_UPSTREAM)
 │   ├── package.json
 │   ├── svelte.config.js
 │   ├── vite.config.ts
@@ -5221,20 +5321,16 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.1.0 is
-    -- `birdtest-contribute`'s pre-release version: neither birdtest nor the
-    -- branch is in production yet, so everything the protocol relies on --
-    -- every result-changing setting stated on the request, input data and
-    -- derived files checked against the hashes the job pins, the word info
-    -- table switched off before every load, a seed on every task -- is in
-    -- 0.1.0, and the version moves only when a release changes what a task
-    -- computes. The default here is the same value as the server's
+    -- so "no floor" is not a state worth being able to express. 0.1.1 is
+    -- the `birdtest-contribute` version the backend image pins; the branch's
+    -- version moves whenever a change can alter what a task computes, and the
+    -- floor moves with it. The default here is the same value as the server's
     -- MIN_MAGPIE_VERSION, which create_job writes explicitly; the two are kept
     -- equal so a row written any other way (a restore, a hand insert) does not
     -- floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -5264,6 +5360,20 @@ CREATE TABLE jobs (
     -- climb, and a newcomer put level with *it* then took every claim from the
     -- jobs that were actually running until it had caught up with them.
     last_claimed_at TIMESTAMPTZ,
+    -- The SPRT verdict a games or game-pairs job was completed on, as the
+    -- finish check saw it: NULL for every other job, and for one completed any
+    -- other way (by an admin, or at its cap in the claim path). The live
+    -- figures are recomputed from every accepted result, and the claims in
+    -- flight when a job completes are still played and accepted -- so without
+    -- this the page of a job that passed could drift back to "running" with no
+    -- record anywhere of the decision that stopped it. A purge clears it.
+    sprt_decided_status TEXT CHECK (sprt_decided_status IN ('passed', 'failed', 'terminated_at_max')),
+    sprt_decided_llr    DOUBLE PRECISION,
+    sprt_decided_units  BIGINT,
+    CONSTRAINT jobs_sprt_decided_together CHECK (
+        (sprt_decided_status IS NULL) = (sprt_decided_llr IS NULL)
+        AND (sprt_decided_status IS NULL) = (sprt_decided_units IS NULL)
+    ),
     -- Progress totals the dashboard reads, maintained in the submit transaction
     -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
     -- incremented
@@ -5569,7 +5679,6 @@ CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed);
 -- redundancy above 1 leaves tasks available until their slots fill, so that is
 -- not a short list.
 CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'available';
-CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
 --
@@ -5822,7 +5931,13 @@ CREATE TABLE position_analysis_records (
     -- rack across turns and games.
     id              BIGSERIAL PRIMARY KEY,
     task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- The task, for the in-game dedup key below. Deliberately not a foreign
+    -- key: a record goes with its claim (above) or its job (below), both of
+    -- which cascade through their own indexes, so a cascade from the task
+    -- only added an index entry and a foreign-key probe per record -- the same
+    -- pattern `position_analysis_moves.task_id` and the staging table's were
+    -- removed for.
+    task_id         UUID NOT NULL,
     -- Denormalized from the task. Every read of a job's records -- the public
     -- results feed, the rack lookup, the admin stream, the export -- filtered
     -- on the job and could only reach it through `tasks`, which put the filter
@@ -5939,14 +6054,17 @@ CREATE INDEX position_analysis_moves_record_idx
 -- Per-ply simulation stats for each candidate move. Only populated for simming
 -- player configs; a static player has no per-ply statistics to record.
 CREATE TABLE position_analysis_plies (
-    id               BIGSERIAL PRIMARY KEY,
     move_id          BIGINT NOT NULL REFERENCES position_analysis_moves(id) ON DELETE CASCADE,
     ply              SMALLINT NOT NULL,
     bingo_percentage DOUBLE PRECISION NOT NULL,
     average_score    DOUBLE PRECISION NOT NULL,
-    -- The UNIQUE above is the index the cascade from moves uses: move_id is
+    -- The natural key, and the index the cascade from moves uses: move_id is
     -- its leading column, so there is deliberately no second index on it.
-    UNIQUE (move_id, ply)
+    -- There was a BIGSERIAL `id` beside it that nothing referenced or read --
+    -- every reader goes through move_id and the insert conflicts on this key
+    -- -- at some 30 bytes a row between the column and its index: 2 to 5 GB
+    -- for one simming opening-rack job's tens of millions of plies.
+    PRIMARY KEY (move_id, ply)
 );
 
 -- Shared by games and game pairs: one row per accepted claim, holding the
@@ -6305,7 +6423,6 @@ CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitte
 CREATE INDEX        game_results_feed_idx
     ON game_results (job_id, submitted_at DESC, task_claim_id DESC);
 CREATE INDEX        leave_records_task_idx    ON leave_records (task_id);
-CREATE INDEX        position_records_task_idx ON position_analysis_records (task_id);
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);
 CREATE INDEX        audit_log_job_idx         ON audit_log (job_id);
 
@@ -6333,6 +6450,7 @@ CREATE INDEX leave_rack_progress_pick_idx
 
 Ten audits of this repository each left a findings record (`AUDIT_FINDINGS*.md`,
 now deleted; they are in the git history up to the commit that removed them).
+The eleventh's is `AUDIT_FINDINGS_7.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -6380,7 +6498,39 @@ what would make it worth revisiting.
   the template holds it, because `jobstats::game_stats` is shared with the
   display path, which has no `AppState`. The identity's `tasks_completed` is
   bumped inside the submit transaction — a single-row update, kept there so the
-  leaderboards' counters cannot drift.
+  leaderboards' counters cannot drift. The job's own progress totals are one
+  `UPDATE jobs`, the transaction's last statement, since it takes the row lock
+  every claim for the job also takes.
+- **The finish check runs before the worker is answered.** It is not display: it
+  decides whether the job goes on dispatching. It costs one submission in eight
+  an aggregate over the job's results (tens of milliseconds at 400,000 units) and
+  the rest an `EXISTS`; moving it off the worker's wait was considered in the
+  eleventh audit and not done, because it gains milliseconds per claim and would
+  need its own per-job coalescing to avoid stacking aggregates.
+- **A claim whose response is lost is a second claim when it is retried.** The
+  claim commits before the response is written; if the connection drops, or the
+  load balancer answers `502`, MAGPIE (which retries a claim without limit)
+  asks again and is handed another task, and the first holds its slot unheard
+  from until the heartbeat timeout — at a leave job's lap end or a games job at
+  its cap, the same idle as a dead worker, with none. *Open (eleventh audit):*
+  a per-claim request id, sent by MAGPIE and reused across retries, stored on
+  `task_claims` under a unique partial index, with a retry answered the
+  existing claim's assignment, would close it; it is a wire change on both
+  sides for a rare trigger, and is left for a decision.
+- **A purge or delete of a large job is one request, in one transaction.** Claims
+  skip the job while it runs and nothing waits on the claims it holds (see [Job
+  Lifecycle Controls](#job-lifecycle-controls)), so it no longer stalls the rest
+  of the fleet. What remains is its own length: the cascades are tens of millions
+  of rows for a full simming opening-rack job — minutes on the production
+  instance class — and past the load balancer's 300-second idle timeout the
+  request is dropped and the whole transaction rolls back, so it can never
+  finish through the API; and a finished one leaves that many dead tuples to
+  vacuum. *Open (eleventh audit):* a purge that commits the job's state change
+  at once and deletes bottom-up in batches on a spawned task with a status row,
+  like an export; or the result tables partitioned by job, so a purge is a
+  `TRUNCATE` and a delete a `DROP`. Both are real redesigns; neither is needed
+  until a job that size exists, and a purge's cost should be measured on the
+  synthetic million-rack dataset first.
 - **A reclaim can land between two statements of one leave claim.** Each
   statement has its own snapshot, so a claim can see a task as "not available"
   and then "not in flight", and start a lap (or a tail selection) with one
@@ -6465,10 +6615,21 @@ what would make it worth revisiting.
 - **`worker_data_gaps` and `task.declined` audit rows grow with declines**: up
   to 32 gap rows and one audit row each. Bounded in practice by workers × jobs,
   since a client remembers a job it declined — but only until it restarts.
-- **`tasks_claimed_idx` is used by no query.** Reclamation reaches tasks through
-  the open-claims index and the primary key; the counts use `tasks_job_idx`. It
-  is tiny (claimed tasks only), so it was never worth a migration edit of its
-  own. Drop it the next time the index list is touched.
+- **A completed job's scheduling history is kept for good.** `tasks`,
+  `task_claims` (abandoned and declined ones included) and the per-type request
+  rows — a leave generation's `forced_racks` arrays are 20 to 40 MB — stay as
+  long as the job's results do; nothing deletes them short of a purge. *Open
+  (eleventh audit), a retention decision:* whether a completed job's scheduling
+  history, as distinct from its results, needs to stay live. Deleting it is
+  irreversible, and results reference claims.
+- **`input_data_import_rows` of confirmed and failed imports are never
+  deleted**; only staged ones expire. Small rows; part of the same retention
+  decision.
+- **The nightly backup reads the database twice**: `pg_dump`, then an exact
+  `count(*)` of every table in the same snapshot, which the manifest and the
+  drill compare against. Counting lines of the dump's own data files instead
+  would take the second read off the instance; it changes what the manifest
+  certifies, and was left for when the corpus makes the backup window matter.
 - **`audit_log`'s filters and `task_claims.claimed_at` have no index.** A
   filtered audit query scans the log by `created_at`; `GET /api/admin/fleet`
   scans a week of claims sequentially — hundreds of milliseconds to seconds at
@@ -6476,6 +6637,13 @@ what would make it worth revisiting.
   an entry per claim on the hottest write table for one view.
 
 ### Abuse and input
+
+- **A rating pool cannot be edited or deleted once created.** Its anchor and
+  scope are fixed (creation now validates them: a variant a job can have,
+  input-data rows of the right roles, an anchor rating whose scale does not
+  overflow), and a pool made by mistake stays, pinning its anchor config
+  against deletion. Admin-only and cosmetic; an update and delete route are the
+  fix if it ever matters.
 
 - **A worker's identity is resolved before its rate limit is checked.** The
   extractor looks the credential up in the database first, and an unknown UUID
@@ -6995,11 +7163,18 @@ add a client to the failure surface without adding a row shape.)
 - The **backup bucket is replicated cross-region too**, not just the artifact bucket.
   The 24-hour region-loss RPO is not met by replicating only derivable data, and the
   marginal cost of a second replication rule is a KMS key in the DR region.
-- The **restore drill restores into a second database on the production instance**
-  rather than provisioning one. It keeps the drill a shell script instead of an
-  orchestration; the cost is transient storage, which `max_allocated_storage` (5×
-  allocated) covers. `restore_drill_enabled = false` turns it off if that becomes
-  tight.
+- The **restore drill restores into a Postgres of its own, inside the drill task**
+  (`DRILL_TARGET=local`): `initdb` on the task's ephemeral storage, a Unix socket
+  only, durability off. It still needs no provisioning — the task runs the postgres
+  image — and it never touches the production instance. It first restored into a
+  second database *on* that instance, on the reasoning that `max_allocated_storage`
+  covered a second copy; the eleventh audit found it does not reliably (RDS grows
+  storage only after free space has sat under 10% for five minutes, one step at a
+  time, six hours apart, and never shrinks it), so a drill near the free space could
+  fill production mid-restore, and one that did not ratcheted its storage up for
+  good and spent its burst credits. `DRILL_TARGET=server` keeps the old behaviour
+  for a hand-run drill against a scratch instance. `restore_drill_enabled = false`
+  turns it off.
 - **`multi_az` is a variable defaulting to false**, not a change. It doubles the
   instance cost, and it is availability rather than backup — the call belongs to
   whoever pays for it.

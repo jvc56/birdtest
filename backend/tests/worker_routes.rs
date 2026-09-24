@@ -160,7 +160,7 @@ async fn a_malformed_magpie_version_is_refused_rather_than_assumed() {
         assert_eq!(status, StatusCode::OK, "{version:?}: {body}");
         let shutdown = &body["shutdown"];
         assert_eq!(shutdown["reason"], "magpie_too_old", "{version:?}: {body}");
-        assert_eq!(shutdown["required_magpie_version"], "0.1.0", "{version:?}: {body}");
+        assert_eq!(shutdown["required_magpie_version"], "0.1.1", "{version:?}: {body}");
         assert_eq!(shutdown["download_url"], json!(state.cfg.magpie_download_url), "{body}");
         assert!(message(shutdown).contains("you are running 0.0.0"), "{version:?}: {body}");
         assert!(body.get("claim_token").is_none(), "{version:?} was handed a task: {body}");
@@ -275,7 +275,7 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let shutdown = &body["shutdown"];
     assert_eq!(shutdown["reason"], "magpie_too_old", "{body}");
-    assert_eq!(shutdown["required_magpie_version"], "0.1.0", "{body}");
+    assert_eq!(shutdown["required_magpie_version"], "0.1.1", "{body}");
     assert_eq!(shutdown["download_url"], download, "{body}");
     assert_eq!(shutdown["required_tarball_dates"], json!([]), "{body}");
 
@@ -291,7 +291,10 @@ async fn idle_and_each_shutdown_reason_are_distinct_answers() {
 
     // And a second job this worker is too old for: both, led by the version.
     let newer = db.games_job(1, 2).await;
-    sqlx::query("UPDATE jobs SET min_magpie_major = 2, min_magpie_minor = 0 WHERE id = $1")
+    sqlx::query(
+        "UPDATE jobs SET min_magpie_major = 2, min_magpie_minor = 0, min_magpie_patch = 0
+         WHERE id = $1",
+    )
         .bind(newer)
         .execute(&db.pool)
         .await

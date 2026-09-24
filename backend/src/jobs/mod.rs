@@ -55,6 +55,52 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
     Ok(())
 }
 
+/// Jobs whose dispatch lock this process is holding for a long time: a leave
+/// generation's universe being seeded (tens of seconds), a purge or a delete
+/// (minutes, for a large job).
+///
+/// A claim for such a job skips it without asking the database. The bounded
+/// wait of [`try_lock_job_dispatch`] alone was not enough: each waiter holds a
+/// pool connection for the whole [`DISPATCH_LOCK_WAIT_MS`], and a job that
+/// hands out nothing falls behind its share and so heads every worker's
+/// candidate list -- a fleet of idle workers polling every five seconds held
+/// the twenty-connection pool on it, and submissions for every other job
+/// queued. In-process is enough because the service is a single instance
+/// (`desired_count` is validated to at most one); the advisory lock is still
+/// what makes the hold safe, and this only spares the wait.
+#[derive(Clone, Default)]
+pub struct DispatchHolds(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>>);
+
+impl DispatchHolds {
+    /// Marks the job held until the returned guard is dropped.
+    pub fn hold(&self, job_id: Uuid) -> DispatchHold {
+        *self.0.lock().expect("dispatch holds poisoned").entry(job_id).or_insert(0) += 1;
+        DispatchHold { holds: self.clone(), job_id }
+    }
+
+    pub fn is_held(&self, job_id: Uuid) -> bool {
+        self.0.lock().expect("dispatch holds poisoned").contains_key(&job_id)
+    }
+}
+
+/// See [`DispatchHolds::hold`].
+pub struct DispatchHold {
+    holds: DispatchHolds,
+    job_id: Uuid,
+}
+
+impl Drop for DispatchHold {
+    fn drop(&mut self) {
+        let mut holds = self.holds.0.lock().expect("dispatch holds poisoned");
+        if let Some(count) = holds.get_mut(&self.job_id) {
+            *count -= 1;
+            if *count == 0 {
+                holds.remove(&self.job_id);
+            }
+        }
+    }
+}
+
 /// How long a claim waits for a job's dispatch lock before giving up on that
 /// job and trying the next one.
 ///
@@ -140,17 +186,26 @@ pub(crate) async fn try_lock_job_dispatch_now(
 /// zeroes it, and the caller reads it before reading the results -- so a purge
 /// in between leaves it below what was observed, and the update does nothing.
 /// Returns whether the job was completed.
+///
+/// `decided` is the SPRT verdict the check completed a games job on, with the
+/// units it had, and is stored with the completion (`jobs.sprt_decided_*`).
 pub async fn complete_unless_purged(
     pool: &sqlx::PgPool,
     job_id: Uuid,
     observed_claims_issued: i64,
+    decided: Option<(crate::stats::sprt::SprtResult, u64)>,
 ) -> AppResult<bool> {
+    let status = decided.map(|(sprt, _)| sprt.status.as_str());
     Ok(sqlx::query(
-        "UPDATE jobs SET status = 'completed'
+        "UPDATE jobs SET status = 'completed',
+                         sprt_decided_status = $3, sprt_decided_llr = $4, sprt_decided_units = $5
          WHERE id = $1 AND status = 'active' AND claims_issued >= $2",
     )
     .bind(job_id)
     .bind(observed_claims_issued)
+    .bind(status)
+    .bind(decided.map(|(sprt, _)| sprt.llr))
+    .bind(decided.map(|(_, units)| units as i64))
     .execute(pool)
     .await?
     .rows_affected()
@@ -299,6 +354,7 @@ pub(crate) async fn insert_position_analyses(
     claim_id: Uuid,
     positions: &[PositionAnalysis],
     top_moves: i32,
+    top_plies: i32,
     on_conflict_ignore: bool,
 ) -> AppResult<()> {
     use std::collections::HashMap;
@@ -413,10 +469,21 @@ pub(crate) async fn insert_position_analyses(
     // Only a simming player produces per-ply statistics; for a static player
     // this is empty and nothing is written. A simmed opening-rack batch is
     // racks x moves x plies rows, which is why they go out in batches too.
+    //
+    // Kept to the plies the config records, the way moves are kept to the
+    // plays it records: `num_plies_recorded` is what told the worker how many
+    // to report, and nothing bounded what it sent -- a 64 MB body could hold
+    // tens of thousands of ply rows per move.
     let plies: Vec<(i64, &PlyStats)> = move_ids
         .iter()
         .zip(pending.iter())
-        .flat_map(|(move_id, (_, _, entry))| entry.plies.iter().map(move |ply| (*move_id, ply)))
+        .flat_map(|(move_id, (_, _, entry))| {
+            entry
+                .plies
+                .iter()
+                .filter(|ply| i32::from(ply.ply) < top_plies)
+                .map(move |ply| (*move_id, ply))
+        })
         .collect();
     for chunk in plies.chunks(PLY_ROWS_PER_STATEMENT) {
         let mut builder = sqlx::QueryBuilder::new(
@@ -503,15 +570,30 @@ pub(crate) async fn insert_game_results(
     // How many ranked moves to keep: player 1's num_plays_recorded, which is
     // also the one MAGPIE reads to decide how many to report. From the job's
     // template: it is a setting of an immutable player config.
-    let top_moves = match &template.kind {
-        dispatch::JobKind::Games { player1, .. } | dispatch::JobKind::GamePairs { player1, .. } => {
-            player1.num_plays_recorded
-        }
+    //
+    // Plies are kept to the larger of the two players' `num_plies_recorded`: a
+    // position is either player's, and a player that reports fewer (a static
+    // one reports none) is not truncated by the other's cap.
+    let (top_moves, top_plies) = match &template.kind {
+        dispatch::JobKind::Games { player1, player2, .. }
+        | dispatch::JobKind::GamePairs { player1, player2, .. } => (
+            player1.num_plays_recorded,
+            player1.num_plies_recorded.max(player2.num_plies_recorded),
+        ),
         _ => return Err(template.mismatch("games")),
     };
 
-    insert_position_analyses(conn, job_id, task_id, claim_id, &record.positions, top_moves, true)
-        .await
+    insert_position_analyses(
+        conn,
+        job_id,
+        task_id,
+        claim_id,
+        &record.positions,
+        top_moves,
+        top_plies,
+        true,
+    )
+    .await
 }
 
 /// One file a task needs, as the assignment states it.

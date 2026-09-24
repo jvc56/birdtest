@@ -834,7 +834,7 @@ async fn delete_player_config(
 /// Reads an `input_data` row's name, insisting it is the role the caller
 /// expects. The foreign keys cannot express this -- every one of them points at
 /// the same table -- so it is validated wherever a role column is written.
-async fn require_role(
+pub(crate) async fn require_role(
     pool: &sqlx::PgPool,
     id: Uuid,
     role: &str,
@@ -1830,6 +1830,9 @@ async fn purge_job(
 ) -> AppResult<Json<PurgeResult>> {
     csrf::verify(&method, &headers, &jar)?;
 
+    // Claims skip the job while this runs rather than each waiting on its
+    // dispatch lock with a pool connection held: see `jobs::DispatchHolds`.
+    let _hold = state.dispatch_holds.hold(id);
     let mut tx = state.pool.begin().await?;
     // The same lock every claim takes before deciding what to hand out, and
     // for the same reason. A claim in flight has already read the seed cursor
@@ -1881,9 +1884,18 @@ async fn purge_job(
     // Every counter on the job describes rows this purge is deleting. Left
     // alone, a purged job would restart owing the scheduler every claim it ever
     // had, and reporting progress it no longer has any results for.
+    //
+    // A completed job goes back to inactive: it has nothing left to be complete
+    // about, and a completed job cannot be activated, so one purged in place
+    // was an empty job nothing could ever run again -- where the purge is
+    // meant to start it over. Active and inactive jobs keep their state.
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
-                         tasks_total = 0, tasks_completed = 0
+                         tasks_total = 0, tasks_completed = 0,
+                         sprt_decided_status = NULL, sprt_decided_llr = NULL,
+                         sprt_decided_units = NULL,
+                         status = CASE WHEN status = 'completed' THEN 'inactive'::job_status
+                                       ELSE status END
          WHERE id = $1",
     )
     .bind(id)
@@ -1977,6 +1989,7 @@ async fn delete_job(
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
 
+    let _hold = state.dispatch_holds.hold(id);
     let mut tx = state.pool.begin().await?;
     // The same locks a purge takes, in the same order and for the same
     // reasons: no claim is issued meanwhile, and no submission is between its
@@ -2111,7 +2124,7 @@ async fn get_export(
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ExportDetail>> {
-    let export = sqlx::query_as::<_, ExportRow>(
+    let mut export = sqlx::query_as::<_, ExportRow>(
         "SELECT id, state, bytes, sha256, row_count, positions_bytes, positions_sha256,
                 positions_row_count, error, requested_at, completed_at
          FROM job_exports WHERE job_id = $1
@@ -2132,6 +2145,12 @@ async fn get_export(
                     None => None,
                 };
                 (Some(results), positions)
+            }
+            // Built, and past the store's lifecycle: say so, rather than
+            // `ready` with nothing to download.
+            _ if export.state == "ready" => {
+                export.state = "expired".to_string();
+                (None, None)
             }
             _ => (None, None),
         };

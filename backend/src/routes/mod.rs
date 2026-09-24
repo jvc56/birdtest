@@ -23,7 +23,10 @@ const MAX_PER_PAGE: i64 = 500;
 pub fn paginate(page: i64, per_page: Option<i64>) -> (i64, i64) {
     let per_page = per_page.unwrap_or(DEFAULT_PER_PAGE).clamp(1, MAX_PER_PAGE);
     let page = page.max(0);
-    (per_page, page * per_page)
+    // Saturating: `?page=` is the caller's, and `page * per_page` past
+    // i64::MAX wrapped to a negative OFFSET, which Postgres refuses -- a 500
+    // for a request that is merely past the end.
+    (per_page, page.saturating_mul(per_page))
 }
 
 /// A page addressed by a cursor rather than an offset.
@@ -65,4 +68,16 @@ pub fn decode_cursor(raw: &str) -> Option<Vec<String>> {
     let bytes = hex::decode(raw).ok()?;
     let text = String::from_utf8(bytes).ok()?;
     Some(text.split(CURSOR_SEPARATOR).map(str::to_string).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_page_past_the_end_of_i64_is_past_the_end() {
+        assert_eq!(paginate(2, Some(50)), (50, 100));
+        assert_eq!(paginate(-3, None), (DEFAULT_PER_PAGE, 0));
+        assert_eq!(paginate(400_000_000_000_000_000, Some(500)), (500, i64::MAX));
+    }
 }

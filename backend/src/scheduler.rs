@@ -316,9 +316,18 @@ async fn shutdown_or_idle(
 ///
 /// Safe against a submission for the same claim racing it: the submit path
 /// holds the claim row locked from its lookup to its commit, and this
-/// statement re-checks `state = 'claimed'` after waiting on that lock, so a
-/// claim is either abandoned here or completed there -- never both, which is
-/// what would decrement the task's counter twice.
+/// statement skips a locked claim rather than waiting on it, so a claim is
+/// either abandoned here or completed there -- never both, which is what would
+/// decrement the task's counter twice.
+///
+/// Skipped, not waited on: a claim somebody holds locked is being submitted,
+/// declined, purged or deleted, and is not lapsed in any sense that matters.
+/// Waiting was what let one purge stall the fleet -- it holds every open claim
+/// of its job for as long as its deletes run, and a reclaim run by *any* claim
+/// request, for any job, blocked on the first of them once it lapsed, holding
+/// a pool connection -- and two reclaims locking overlapping claims in
+/// different orders could deadlock. A claim skipped now is reclaimed by the
+/// next claim request after its lock is released, if it still needs to be.
 pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> AppResult<u64> {
     reclaim_expired_for(pool, &[job_id], timeout_secs).await
 }
@@ -338,14 +347,20 @@ pub async fn reclaim_expired_for(
     timeout_secs: f64,
 ) -> AppResult<u64> {
     let result = sqlx::query(
-        "WITH expired AS (
-             UPDATE task_claims c
-             SET state = 'abandoned'
-             FROM tasks t
-             WHERE c.task_id = t.id
-               AND t.job_id = ANY($1)
+        "WITH lapsed AS (
+             SELECT c.id
+             FROM task_claims c
+             JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = ANY($1)
                AND c.state = 'claimed'
                AND COALESCE(c.last_heartbeat_at, c.claimed_at) < now() - make_interval(secs => $2)
+             FOR UPDATE OF c SKIP LOCKED
+         ),
+         expired AS (
+             UPDATE task_claims c
+             SET state = 'abandoned'
+             FROM lapsed
+             WHERE c.id = lapsed.id
              RETURNING c.task_id
          ),
          counts AS (
@@ -484,6 +499,12 @@ async fn try_claim_from_job(
     job: &Job,
     caps: &WorkerCapabilities,
 ) -> Result<Option<TaskClaim>, JobClaimError> {
+    // Its dispatch lock is held for a long time -- seeding, a purge -- and the
+    // wait for it would be spent holding a pool connection to learn that there
+    // is nothing here right now. See `jobs::DispatchHolds`.
+    if state.dispatch_holds.is_held(job.id) {
+        return Ok(None);
+    }
     // Before the dispatch lock, because a job with a table still building has
     // nothing to hand out and taking the lock would only make every other
     // claim for it wait. The hashes travel with the claim, so a task issued
@@ -960,6 +981,8 @@ async fn seed_leave_universe(state: &AppState, job: &Job, generation: i32) -> Ap
     if !crate::jobs::try_lock_job_dispatch_now(&mut tx, job.id).await? {
         return Ok(());
     }
+    // Until the commit below releases the lock.
+    let _hold = state.dispatch_holds.hold(job.id);
     let job_data = crate::jobs::load_job_data(&mut tx, job.id).await?;
     leave_gen::ensure_universe(&mut tx, job.id, generation, &job_data.letterdist).await?;
     tx.commit().await?;

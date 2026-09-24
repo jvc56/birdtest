@@ -578,6 +578,14 @@ async fn a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before() {
     close(games.sprt.llr, 3.069_265_955_413_046_7);
     assert_eq!(games.sprt.status, SprtStatus::Passed);
     assert_eq!(job_status(&db, job).await, "completed");
+
+    // I-STATS-9b: the verdict it completed on is stored with the completion,
+    // beside the live figures that results still in flight can go on moving.
+    let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
+    let decided = &body["games"]["decided"];
+    assert_eq!(decided["status"], json!("passed"), "{body}");
+    assert_eq!(decided["units"], json!(200), "{body}");
+    close(decided["llr"].as_f64().unwrap(), 3.069_265_955_413_046_7);
 }
 
 /// I-STATS-9 (H0): a job whose player 1 is losing completes too, with its
@@ -598,4 +606,5 @@ async fn a_job_driven_to_h0_completes_with_its_sprt_failed() {
 
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
     assert_eq!(body["games"]["sprt"]["status"], json!("failed"), "{body}");
+    assert_eq!(body["games"]["decided"]["status"], json!("failed"), "{body}");
 }

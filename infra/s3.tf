@@ -64,6 +64,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
       prefix = "exports/"
     }
 
+    # The backend stops relying on an export a day before this
+    # (`exports::EXPORT_LIFETIME_DAYS`); change the two together.
     expiration {
       days = 30
     }

@@ -692,6 +692,41 @@ async fn the_sweep_refits_only_the_pools_whose_evidence_grew() {
     assert_eq!((run_count(&db, busy).await, run_count(&db, quiet).await), (2, 1));
 }
 
+/// I-RATE-9b: the sweep also repairs a membership change whose own refit never
+/// ran -- the route commits the membership and then fits in a separate step,
+/// and a dropped request or a failed fit left the pool's newest run describing
+/// the old membership. When the config added had no pairs in the pool, the
+/// evidence count did not move and nothing ever noticed.
+#[tokio::test]
+async fn the_sweep_refits_a_pool_whose_membership_changed_without_a_refit() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let anchor = db.static_player("a-anchor", admin).await;
+    let rival = db.static_player("b-rival", admin).await;
+    let newcomer = db.static_player("c-newcomer", admin).await;
+    let scope = scope(&db).await;
+    let job = pairs_job(&db, "classic", scope, anchor, rival).await;
+    pair_result(&db, job, [0, 1, 1, 0, 0]).await;
+    let pool = pool(&db, "pool", "classic", scope, anchor, &[rival], 2000.0).await;
+    ratings::recompute(&db.pool, pool, Trigger::Manual).await.unwrap();
+
+    // A member with no pairs, added behind the route's back: no refit ran.
+    add_member(&db, pool, newcomer).await;
+    assert_eq!(ratings::recompute_stale(&db.pool).await.unwrap(), 1);
+    let newest: Uuid = sqlx::query_scalar(
+        "SELECT id FROM rating_runs WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
+    )
+    .bind(pool)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(stored_ratings(&db, newest).await.contains_key(&newcomer), "the newcomer is rated");
+    assert_eq!(ratings::recompute_stale(&db.pool).await.unwrap(), 0, "and then it is current");
+
+    remove_member(&db, pool, newcomer).await;
+    assert_eq!(ratings::recompute_stale(&db.pool).await.unwrap(), 1, "a removal likewise");
+}
+
 /// I-RATE-10: two pools over the same configs and the same set of jobs, scoped
 /// to different variants, each fit only their own jobs -- and so disagree,
 /// the rival above the anchor in one and below it in the other -- while each
@@ -933,6 +968,49 @@ async fn creating_a_pool_makes_its_anchor_a_member() {
     assert_eq!(list[0]["members"], 1, "{list}");
 }
 
+/// A-RATE-3b: a pool is validated the way a job is. A variant no job can have,
+/// a distribution row that is really a layout, or an anchor rating whose
+/// logistic scale overflows each made a pool that rated no one, or rated
+/// everyone at infinity -- and a pool cannot be deleted. Each is refused, and
+/// nothing is created.
+#[tokio::test]
+async fn a_pool_that_could_rate_no_one_is_refused() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let scope = scope(&db).await;
+    let anchor = db.static_player("a-anchor", admin).await;
+    let body = |variant: &str, letterdist: Uuid, rating: f64| {
+        json!({
+            "name": "pool",
+            "variant": variant,
+            "letterdist_id": letterdist,
+            "layout_id": scope.layout,
+            "anchor_player_config_id": anchor,
+            "anchor_rating": rating,
+        })
+    };
+
+    for (what, bad) in [
+        ("a variant no job has", body("scrabble", scope.letterdist, 2000.0)),
+        ("a layout as the distribution", body("classic", scope.layout, 2000.0)),
+        ("an overflowing anchor rating", body("classic", scope.letterdist, 200_000.0)),
+    ] {
+        let (status, response) = send(
+            &app,
+            request("POST", "/api/admin/rating-pools", &admin_headers(&state.cfg, admin), Some(bad)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {response}");
+    }
+    let pools: i64 = sqlx::query_scalar("SELECT count(*) FROM rating_pools")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(pools, 0);
+}
+
 /// A-RATE-4: adding a member and removing one each refit the pool and return
 /// the new run, which includes the newcomer and then no longer does.
 #[tokio::test]
@@ -1001,7 +1079,7 @@ async fn removing_the_anchor_is_refused_with_the_fix_named() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let message = body["message"].as_str().unwrap();
     assert!(message.contains("cannot remove the pool's anchor"), "{message}");
-    assert!(message.contains("Point the pool at a different anchor first"), "{message}");
+    assert!(message.contains("create a pool anchored on it"), "{message}");
 
     let still: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM rating_pool_members

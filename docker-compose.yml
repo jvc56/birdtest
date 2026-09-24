@@ -131,11 +131,11 @@ services:
       # was silently replaced by the real API.
       GITHUB_API_URL: ${BIRDTEST_GITHUB_API_URL:-https://api.github.com}
       GITHUB_RAW_URL: ${BIRDTEST_GITHUB_RAW_URL:-https://raw.githubusercontent.com}
-      # The fleet-wide floor. `birdtest-contribute` reports 0.1.0, its
-      # pre-release version, which meets it; scripts/dev.py reads the version
+      # The fleet-wide floor. `birdtest-contribute` reports 0.1.1, which
+      # meets it; scripts/dev.py reads the version
       # out of your checkout and sets this for you, so a checkout that reports
       # something else still runs locally.
-      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.1.0}
+      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.1.1}
       # The pinned MAGPIE this process runs. The production image builds one in;
       # locally it comes from the mounted checkout, so a `make magpie` there is
       # picked up by a restart. The backend refuses to start without it.
@@ -233,7 +233,7 @@ services:
       # Required by the shared configuration, never used: this process mints
       # no session.
       SESSION_SIGNING_KEY: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
-      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.1.0}
+      MIN_MAGPIE_VERSION: ${MIN_MAGPIE_VERSION:-0.1.1}
       MAGPIE_BIN: /magpie/bin/magpie
       MAGPIE_THREADS: "${MAGPIE_THREADS:-2}"
       S3_BUCKET: birdtest-artifacts

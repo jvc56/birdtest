@@ -8,14 +8,27 @@
 # This is the only check that catches a dump which has been silently producing
 # unusable output: everything else verifies that a backup *ran*.
 #
-# The drill restores into a second database on the same instance rather than
-# provisioning one, which keeps it a shell script rather than an orchestration.
-# The cost is transient storage: the instance needs headroom for a second copy
-# of the corpus, which `max_allocated_storage` (5x allocated) provides.
+# By default the drill restores into a Postgres of its own, started inside
+# this container -- the task runs the postgres image, whose major version is
+# the dump's by construction, with 100 GiB of ephemeral storage -- and never
+# touches the production instance. (DRILL_TARGET=server restores into a second
+# database on the server DATABASE_URL names instead, as it once always did.)
+#
+# It used to be the production instance, justified by `max_allocated_storage`
+# covering a second copy. It does not reliably: RDS grows storage only after
+# free space has sat under 10% for five minutes, by one step, then not again
+# for six hours, and never shrinks it. A drill writes a whole corpus, its
+# index builds' spill and their WAL in about an hour, so one near the free
+# space could fill the instance mid-restore -- production down -- and one that
+# survived ratcheted storage up for good, spent the burstable instance's CPU
+# and I/O credits against live traffic, and put its WAL in the PITR archive.
 
 set -Eeuo pipefail
 
-: "${DATABASE_URL:?DATABASE_URL is required}"
+DRILL_TARGET="${DRILL_TARGET:-local}"
+if [[ "${DRILL_TARGET}" == server ]]; then
+  : "${DATABASE_URL:?DATABASE_URL is required with DRILL_TARGET=server}"
+fi
 : "${BACKUP_BUCKET:?BACKUP_BUCKET is required}"
 BACKUP_PREFIX="${BACKUP_PREFIX:-pg}"
 METRIC_NAMESPACE="${METRIC_NAMESPACE:-birdtest/backup}"
@@ -52,24 +65,47 @@ dump_digest() {
 
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 
-# The admin URL is the same server, different database. Postgres cannot drop a
-# database from a connection to it, so CREATE/DROP go through this one. The
-# query string is carried across: `?sslmode=require` belongs on every one of
-# these connections, not just the original.
-BASE_URL="${DATABASE_URL%%\?*}"
-QUERY=""
-if [[ "${DATABASE_URL}" == *\?* ]]; then
-  QUERY="?${DATABASE_URL#*\?}"
+# Everything the drill's own server writes, in one directory the postgres user
+# owns: the data directory, its socket and its log.
+LOCAL_DIR="${WORKDIR}/local"
+LOCAL_PGDATA="${LOCAL_DIR}/pgdata"
+LOCAL_SOCKET="${LOCAL_DIR}/socket"
+if [[ "${DRILL_TARGET}" == local ]]; then
+  # Unix socket only, trust auth: nothing outside this container can reach it.
+  ADMIN_URL="postgresql:///postgres?host=${LOCAL_SOCKET}&user=postgres"
+  DRILL_URL="postgresql:///${DRILL_DB}?host=${LOCAL_SOCKET}&user=postgres"
+else
+  # The admin URL is the same server, different database. Postgres cannot drop
+  # a database from a connection to it, so CREATE/DROP go through this one.
+  # The query string is carried across: `?sslmode=require` belongs on every
+  # one of these connections, not just the original.
+  BASE_URL="${DATABASE_URL%%\?*}"
+  QUERY=""
+  if [[ "${DATABASE_URL}" == *\?* ]]; then
+    QUERY="?${DATABASE_URL#*\?}"
+  fi
+  ADMIN_URL="${BASE_URL%/*}/postgres${QUERY}"
+  DRILL_URL="${BASE_URL%/*}/${DRILL_DB}${QUERY}"
 fi
-ADMIN_URL="${BASE_URL%/*}/postgres${QUERY}"
-DRILL_URL="${BASE_URL%/*}/${DRILL_DB}${QUERY}"
+
+# As the postgres user, which the server refuses to run as root without.
+as_postgres() {
+  if [[ "$(id -u)" == 0 ]]; then gosu postgres "$@"; else "$@"; fi
+}
 
 cleanup() {
   local status=$?
-  log "dropping ${DRILL_DB}"
-  psql "${ADMIN_URL}" --no-psqlrc --quiet \
-    --command "DROP DATABASE IF EXISTS \"${DRILL_DB}\" WITH (FORCE)" \
-    || log "could not drop ${DRILL_DB} -- drop it by hand"
+  if [[ "${DRILL_TARGET}" == local ]]; then
+    if [[ -f "${LOCAL_PGDATA}/postmaster.pid" ]]; then
+      as_postgres pg_ctl -D "${LOCAL_PGDATA}" -m immediate stop >/dev/null 2>&1 \
+        || log "could not stop the drill's own server"
+    fi
+  else
+    log "dropping ${DRILL_DB}"
+    psql "${ADMIN_URL}" --no-psqlrc --quiet \
+      --command "DROP DATABASE IF EXISTS \"${DRILL_DB}\" WITH (FORCE)" \
+      || log "could not drop ${DRILL_DB} -- drop it by hand"
+  fi
   rm -rf "${WORKDIR}"
   exit "${status}"
 }
@@ -110,6 +146,19 @@ fi
 log "checksum matches"
 
 # --- Restore ---------------------------------------------------------------
+if [[ "${DRILL_TARGET}" == local ]]; then
+  log "starting the drill's own server"
+  mkdir -p "${LOCAL_PGDATA}" "${LOCAL_SOCKET}"
+  if [[ "$(id -u)" == 0 ]]; then chown -R postgres:postgres "${LOCAL_DIR}"; fi
+  as_postgres initdb --pgdata="${LOCAL_PGDATA}" --username=postgres --auth=trust \
+    --encoding=UTF8 >/dev/null
+  # Durability is worth nothing to a database dropped in an hour, and the
+  # restore is the whole of the drill's run time.
+  as_postgres pg_ctl -D "${LOCAL_PGDATA}" -w -l "${LOCAL_DIR}/postgres.log" start -o \
+    "-c listen_addresses='' -c unix_socket_directories='${LOCAL_SOCKET}' \
+     -c fsync=off -c synchronous_commit=off -c full_page_writes=off \
+     -c maintenance_work_mem=256MB -c max_wal_size=4GB" >/dev/null
+fi
 psql "${ADMIN_URL}" --no-psqlrc --quiet --set ON_ERROR_STOP=1 \
   --command "CREATE DATABASE \"${DRILL_DB}\""
 

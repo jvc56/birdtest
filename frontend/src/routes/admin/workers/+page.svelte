@@ -10,7 +10,11 @@
   let notice = '';
 
   onMount(async () => {
-    workers = await api.adminWorkers(0);
+    try {
+      workers = await api.adminWorkers(0);
+    } catch (e) {
+      error = `Could not load the workers: ${e instanceof Error ? e.message : String(e)}`;
+    }
   });
 
   /** A user id and an anonymous UUID are both UUIDs, so which field to send is

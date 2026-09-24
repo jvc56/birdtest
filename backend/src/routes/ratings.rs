@@ -321,6 +321,12 @@ fn default_anchor_rating() -> f64 {
     2000.0
 }
 
+/// How far from zero an anchor may be pinned. Ratings are a logistic scale
+/// (`10^(r/400)`), which overflows a double a little past ±123,000 and turned
+/// every rating in the pool into ±inf -- stored, serialized as `null`, and the
+/// pool's page broke on it. Nothing plausible is anywhere near this.
+const MAX_ABS_ANCHOR_RATING: f64 = 10_000.0;
+
 async fn create_pool(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -330,6 +336,29 @@ async fn create_pool(
     ApiJson(body): ApiJson<CreatePoolBody>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     csrf::verify(&method, &headers, &jar)?;
+
+    // Validated the way a job is: a pool's scope is compared with its jobs'
+    // (variant, distribution, layout), so a pool scoped to a variant no job
+    // can have, or to a distribution row that is really a layout, matches
+    // nothing and rates no one, silently.
+    let mut err = AppError::bad_request("rating pool details are invalid");
+    if body.name.trim().is_empty() {
+        err = err.with_field("name", "must not be empty");
+    }
+    if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
+        err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
+    }
+    if !body.anchor_rating.is_finite() || body.anchor_rating.abs() > MAX_ABS_ANCHOR_RATING {
+        err = err.with_field(
+            "anchor_rating",
+            format!("must be a number between -{MAX_ABS_ANCHOR_RATING} and {MAX_ABS_ANCHOR_RATING}"),
+        );
+    }
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+    super::admin::require_role(&state.pool, body.letterdist_id, "letterdist").await?;
+    super::admin::require_role(&state.pool, body.layout_id, "layout").await?;
 
     let mut tx = state.pool.begin().await?;
     let pool_id: Uuid = sqlx::query_scalar(
@@ -448,7 +477,7 @@ async fn remove_member(
     if is_anchor {
         return Err(AppError::bad_request(
             "cannot remove the pool's anchor: every other rating is measured against it. \
-             Point the pool at a different anchor first.",
+             A pool's anchor is fixed; to rate against another, create a pool anchored on it.",
         ));
     }
 

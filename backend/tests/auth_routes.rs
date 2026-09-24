@@ -328,6 +328,51 @@ async fn registering_a_taken_address_answers_exactly_like_a_new_registration() {
     assert!(!notice.contains("code="), "the notice carries no confirmation code: {notice}");
 }
 
+/// A-AUTH-4b: an account that never confirmed its address holds the address
+/// and the username only while its confirmation link works. Registering over
+/// it while it does is answered like any taken address, and the notice says
+/// what is waiting; once the link has expired, the next registration takes
+/// both. Held for ever, it was a dead end -- no sign-in, no reset, no new code
+/// -- and a way to squat anyone's address.
+#[tokio::test]
+async fn an_expired_unconfirmed_account_gives_up_its_address_and_username() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+
+    let first = register(&app, "squatter", "owner@example.invalid", PASSWORD, "").await;
+    assert_eq!(first.status, StatusCode::CREATED, "{first:?}");
+    let early = register(&app, "realowner", "owner@example.invalid", PASSWORD, "").await;
+    assert_eq!(early.bytes, first.bytes, "{early:?}");
+    let usernames = || async {
+        sqlx::query_scalar::<_, String>("SELECT username FROM users ORDER BY username")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(usernames().await, vec!["squatter".to_string()]);
+    let mail = outbox.wait_for("owner@example.invalid", 2).await;
+    assert!(
+        mail.iter().any(|m| m.contains("already waiting for the address to be confirmed")),
+        "the notice says an account is waiting, not to sign in: {mail:?}"
+    );
+
+    sqlx::query("UPDATE email_confirmations SET expires_at = now() - interval '1 minute'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let late = register(&app, "realowner", "owner@example.invalid", PASSWORD, "").await;
+    assert_eq!(late.status, StatusCode::CREATED, "{late:?}");
+    assert_eq!(usernames().await, vec!["realowner".to_string()]);
+    let mail = outbox.wait_for("owner@example.invalid", 3).await;
+    let codes = mail.iter().filter(|m| m.contains("code=")).count();
+    assert_eq!(codes, 2, "the new account is sent its own code: {mail:?}");
+
+    // The username went with it.
+    let name = register(&app, "squatter", "someone@example.invalid", PASSWORD, "").await;
+    assert_eq!(name.status, StatusCode::CREATED, "{name:?}");
+}
+
 /// A-AUTH-5: a weak password is refused, and so is one derived from the
 /// username or the email address -- each of which would score as strong
 /// without them as context, so it is the context that refuses it.

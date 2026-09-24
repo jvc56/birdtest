@@ -7,10 +7,16 @@
 
   let result: Page<JobListItem> | null = null;
   let page = 0;
+  let loadError = '';
 
   async function load(next: number) {
     page = next;
-    result = await api.jobs(next);
+    loadError = '';
+    try {
+      result = await api.jobs(next);
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   }
 
   onMount(() => load(0));
@@ -26,7 +32,9 @@
 
 <h1 class="mb-6 text-2xl font-semibold">Jobs</h1>
 
-{#if !result}
+{#if loadError}
+  <p class="text-sm text-destructive">Could not load the jobs: {loadError}</p>
+{:else if !result}
   <p class="text-muted-foreground">Loading…</p>
 {:else}
   <div class="card overflow-x-auto p-0">

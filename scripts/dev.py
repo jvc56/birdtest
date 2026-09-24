@@ -64,8 +64,9 @@ def resolve_magpie(args) -> tuple:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         fail(
             f"no MAGPIE binary at {binary}.\n"
-            "      Build one (`make magpie` in your MAGPIE checkout) and pass --magpie, "
-            "or set MAGPIE_BIN.\n"
+            "      Build one (`make magpie BUILD=portable_release` in your MAGPIE checkout, on\n"
+            "      a host whose glibc is no newer than Debian bookworm's 2.36, since the backend\n"
+            "      container runs it) and pass --magpie, or set MAGPIE_BIN.\n"
             "      Contributors here are always real MAGPIE; there is no fake-worker mode."
         )
 

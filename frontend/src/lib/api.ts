@@ -143,7 +143,14 @@ export interface GameStats {
   win_pct: number;
   loss_pct: number;
   draw_pct: number;
+  /** The test over every accepted result, recomputed on each read. */
   sprt: SprtResult;
+  /**
+   * What a completed job stopped on, when the finish check completed it. Results
+   * in flight at that moment still land, so `sprt` can move afterwards; this is
+   * the decision that stands.
+   */
+  decided?: { status: SprtResult['status']; llr: number; units: number };
 }
 
 export interface JobStats {
@@ -340,7 +347,8 @@ export interface DerivedData {
 /** A completed job's results as one gzipped NDJSON object; see PLAN.md, "Exports". */
 export interface JobExport {
   id: string;
-  state: 'running' | 'ready' | 'failed';
+  /** `expired`: built, but older than the artifact store keeps exports. */
+  state: 'running' | 'ready' | 'expired' | 'failed';
   bytes: number | null;
   sha256: string | null;
   row_count: number | null;

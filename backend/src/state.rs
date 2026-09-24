@@ -149,6 +149,9 @@ pub struct AppState {
     /// When each leave job's last claim-requested merge started; see
     /// [`crate::jobs::leave_gen::TailMerges`].
     pub leave_merges: crate::jobs::leave_gen::TailMerges,
+    /// Jobs whose dispatch lock this process holds for a long time, which
+    /// claims skip; see [`crate::jobs::DispatchHolds`].
+    pub dispatch_holds: crate::jobs::DispatchHolds,
     /// Ends the responses that never end on their own when the process is told
     /// to stop; see [`Shutdown`].
     pub shutdown: Shutdown,
@@ -183,6 +186,7 @@ impl AppState {
             derived_ready: Default::default(),
             templates: Default::default(),
             leave_merges: Default::default(),
+            dispatch_holds: Default::default(),
             shutdown: Default::default(),
             // A claim's only evidence of life is a heartbeat this process
             // received, and it has received none yet: see

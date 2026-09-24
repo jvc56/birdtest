@@ -72,6 +72,21 @@ impl JobHandler for GamePairHandler {
                 "pentanomial disagrees with the game counts about player 1's score",
             ));
         }
+        // And about the draws. A pair scoring one half-point (bucket 1) is a
+        // loss and a draw, one scoring three (bucket 3) a win and a draw, and a
+        // pair scoring two is a win and a loss or two draws. So the ties are
+        // buckets 1 and 3 plus an even number from bucket 2, at most all of it.
+        // `[0,1,0,1,0]` beside two wins, two losses and no ties has the right
+        // pair count and score, and is two pairs that each needed a draw.
+        let draws_in_even_pairs = response.all_games.ties as i64 - pentanomial[1] - pentanomial[3];
+        if draws_in_even_pairs < 0
+            || draws_in_even_pairs % 2 != 0
+            || draws_in_even_pairs / 2 > pentanomial[2]
+        {
+            return Err(AppError::bad_request(
+                "pentanomial disagrees with the game counts about the draws",
+            ));
+        }
 
         // The divergent subset is a diagnostic rather than a sample, so it is
         // still validated, still stored, and no longer required: a client that

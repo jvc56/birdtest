@@ -17,6 +17,7 @@
   let history: RatingHistoryPoint[] = [];
   let configs: PlayerConfig[] = [];
   let error = '';
+  let loadError = '';
   let busy = false;
   let addConfigId = '';
 
@@ -29,16 +30,28 @@
   async function load() {
     pool = await api.ratingPool(poolId);
     history = await api.ratingHistory(poolId);
-    if (isAdmin) {
-      try {
-        configs = await api.playerConfigs();
-      } catch {
-        configs = [];
-      }
-    }
   }
 
-  onMount(load);
+  onMount(async () => {
+    try {
+      await load();
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
+  });
+
+  // Reactive on the session rather than read once in `load`: the layout asks
+  // who is signed in at the same time this page loads, and on a hard refresh
+  // its answer can arrive after the pool's -- when an admin was shown the
+  // membership controls with nothing to add.
+  let configsLoaded = false;
+  $: if (isAdmin && !configsLoaded) {
+    configsLoaded = true;
+    api
+      .playerConfigs()
+      .then((list) => (configs = list))
+      .catch(() => (configs = []));
+  }
 
   /** Membership changes refit the whole pool, so the page reloads everything
    *  rather than patching one row: every other rating has moved too. */
@@ -186,6 +199,8 @@
       <ResidualMatrix residuals={pool.residuals} ratings={pool.ratings} />
     </div>
   </section>
+{:else if loadError}
+  <p class="text-sm text-destructive">Could not load this rating pool: {loadError}</p>
 {:else}
   <p class="text-sm text-muted-foreground">Loading…</p>
 {/if}

@@ -3,9 +3,14 @@
   import { api, type FleetVersion } from '$lib/api';
 
   let versions: FleetVersion[] = [];
+  let loadError = '';
 
   onMount(async () => {
-    versions = await api.fleet();
+    try {
+      versions = await api.fleet();
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   });
 </script>
 
@@ -16,6 +21,10 @@
   is a human decision, and this is half of what it is made from — the other half is each job's data
   gaps.
 </p>
+
+{#if loadError}
+  <p class="mb-4 text-sm text-destructive">Could not load the fleet: {loadError}</p>
+{/if}
 
 <div class="card overflow-x-auto p-0">
   <table class="table">

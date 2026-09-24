@@ -4,10 +4,15 @@
 
   let pools: RatingPoolListItem[] = [];
   let loaded = false;
+  let loadError = '';
 
   onMount(async () => {
-    pools = await api.ratingPools();
-    loaded = true;
+    try {
+      pools = await api.ratingPools();
+      loaded = true;
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   });
 </script>
 
@@ -22,7 +27,9 @@
     </p>
   </div>
 
-  {#if !loaded}
+  {#if loadError}
+    <p class="text-sm text-destructive">Could not load the rating pools: {loadError}</p>
+  {:else if !loaded}
     <p class="text-sm text-muted-foreground">Loading…</p>
   {:else if !pools.length}
     <div class="card space-y-2">

@@ -135,7 +135,8 @@ actually have. If those diverge, every worker declines every task.
 ### Doing it by hand
 
 `docker compose up` still brings up just the stack — database, object storage,
-backend and frontend — with Docker as the only host dependency:
+backend and frontend. Docker is the only host dependency besides a MAGPIE
+build, which the backend mounts and refuses to start without (below):
 
 ```bash
 docker compose up --build
@@ -176,8 +177,8 @@ magpie BUILD=portable_release`) and set `MAGPIE_ROOT` if the checkout is not at
 server's builder and the fleet's identical.
 
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.1.0`, `birdtest-contribute`'s pre-release
-version, which is what the branch reports. A checkout that reports something
+`MIN_MAGPIE_VERSION` defaults to `0.1.1`, the version `birdtest-contribute`
+reports. A checkout that reports something
 lower has every task declined with "update MAGPIE" until you update it or lower
 the floor — on the server *and* on the job, which records its own floor at
 creation:
@@ -298,13 +299,47 @@ To rotate the password later, run the same `modify-db-instance` and
 
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
 redirects — because the backend sets `Secure` cookies, which a browser will not
-keep over plain HTTP. `min_magpie_version` defaults to `0.1.0`,
-`birdtest-contribute`'s pre-release version — nothing is in production yet, so
-everything the protocol relies on is in it; raise it whenever a MAGPIE release
-changes results. `derived_builder_image`
+keep over plain HTTP. `public_url`, `ses_domain` and `mail_from_address` have
+none: they are what every confirmation and reset mail links to and is sent
+from, and a placeholder left in is refused. `min_magpie_version` defaults to
+`0.1.1`, the `birdtest-contribute` version the backend image pins; raise it
+whenever a MAGPIE release changes results, since it is the only way to keep a
+build that computes something wrong off the fleet. `derived_builder_image`
 has no default — it is the backend image built with `--target derived-builder`,
 and it must carry the same MAGPIE as `backend_image`, since the builder version
 recorded beside every hash comes from the binary that produced it.
+
+The three images are built from this repository and pushed to a registry of
+your choice (Terraform creates none), at one tag per release:
+
+```bash
+docker build -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
+docker build -f docker/Dockerfile --target derived-builder -t $REGISTRY/birdtest-derived-builder:$TAG .
+docker build frontend -t $REGISTRY/birdtest-frontend:$TAG
+docker push ...   # all three, then apply with backend_image, derived_builder_image, frontend_image
+```
+
+The backend image fetches MAGPIE at `docker/Dockerfile`'s `MAGPIE_COMMIT`
+from GitHub, so that commit must be pushed to `birdtest-contribute` first.
+
+**SES starts in the sandbox.** A new account's SES sends only to verified
+addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
+is granted every registration and password reset to anyone else fails. Request
+it, and add the `ses_dkim_tokens` output as CNAME records, before opening
+registration.
+
+**The database is reachable only from inside the VPC** — no public address, no
+bastion, and its security group admits only the service's. SQL runs through
+`scripts/prod-sql.sh`, which starts the ops task (`infra/ops.tf`: the postgres
+image, `DATABASE_URL` from SSM, the service's network) with psql reading the
+SQL and prints what psql printed; `scripts/prod-shell.sh` opens an interactive
+shell in the same task through ECS Exec, for RUNBOOK.md's longer procedures. The first admin is made that way,
+after registering and confirming the account through the site — there is no
+endpoint for it, by design:
+
+```bash
+scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE username = 'alice'"
+```
 
 `alert_email` has no default: `terraform apply` refuses to run without
 somewhere to send backup failures, because an unmonitored backup is the failure

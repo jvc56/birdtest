@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 152 | `#[cfg(test)]` in `jobs::plausibility` (22), `inputdata` (17), `stats::sprt` (12), `stats::bradley_terry` (12), `jobs::racks` (13), `error` (7), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `magpie` (3), `models::job` (3), `jobs::opening_rack` (3), `version` (3), `email` (2), `sse` (2), `exports`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair` (1 each) |
-| 1F Frontend unit | 93 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (13), `auth.test.ts` (9), `sse.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (10), `pentanomial.test.ts` (6) |
-| 2 Integration | 135 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (22), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (6), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 147 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (25), `worker_routes.rs` (15), `auth_routes.rs` (14), `boundaries.rs` (11), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
+| 1 Unit | 154 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `stats::sprt` (12), `stats::bradley_terry` (12), `jobs::racks` (13), `error` (7), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `magpie` (3), `models::job` (3), `jobs::opening_rack` (3), `version` (3), `email` (2), `sse` (2), `exports`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes` (1 each) |
+| 1F Frontend unit | 94 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (13), `auth.test.ts` (9), `sse.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 137 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (24), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (6), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 149 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (25), `worker_routes.rs` (15), `auth_routes.rs` (15), `boundaries.rs` (12), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 13 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 13 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (6), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 461 backend tests.
+--run-ignored all` runs 467 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -376,6 +376,18 @@ The two that were missing:
 - `U-PLAUS-2` A batch reporting one game more, and one fewer, than dispatched is
   rejected; the exact count passes. *(Covered:
   `plausibility::tests::a_batch_one_game_off_in_either_direction_is_rejected`.)*
+- `U-PLAUS-3` A rack is counted in tiles, a bracketed multi-character letter
+  (`[L·L]`, `[NY]`, `[QU]`) being one: seven Catalan tiles pass and eight do
+  not, and an unclosed or empty bracket is malformed. Counted in characters,
+  every captured position of a Catalan games job was refused. *(Covered:
+  `plausibility::tests::racks_are_bounded_by_what_a_rack_holds`.)* (Eleventh
+  audit.)
+- `U-PLAUS-4` A negative `num_moves` is refused (cast to `usize` it was larger
+  than any list), and per-ply statistics must be numbered from 0 in order, with
+  a bingo percentage in [0, 100] and a finite, non-negative average score.
+  *(Covered:
+  `plausibility::tests::a_worker_cannot_report_more_moves_than_it_generated`,
+  `plausibility::tests::per_ply_statistics_are_statistics`.)* (Eleventh audit.)
 
 ### `U-STATS-*` — pinned numbers (`stats/sprt.rs`, `stats/bradley_terry.rs`)
 
@@ -549,7 +561,8 @@ Test the pure functions; do not snapshot the SVG.
   `charts/ratingHistory.test.ts`; it used to colour by rank.)*
 - `F-CHART-6` `ResidualMatrix` sorts by absolute residual descending, and flags
   the non-transitive case only when at least three head-to-heads exceed the
-  threshold. *(Covered: `charts/residuals.test.ts`; the component now sorts
+  threshold on enough pairs to be at least three standard errors out — the
+  same misses on ten pairs each do not raise it. *(Covered: `charts/residuals.test.ts`; the component now sorts
   itself instead of drawing in the order it is handed.)*
 - `F-CHART-7` The job page maps pentanomial buckets to the right labels — index
   0 is "P1 lost both", index 4 "won both". An off-by-one here inverts the
@@ -1096,6 +1109,11 @@ permanent.
 - `I-RATE-9` `recompute_stale` refits a pool whose evidence grew and skips one
   whose `pairs_used` is unchanged. *(Covered:
   `ratings::the_sweep_refits_only_the_pools_whose_evidence_grew`.)*
+- `I-RATE-9b` It also refits a pool whose membership changed without a refit —
+  a config added or removed with no pairs in the pool leaves `pairs_used` where
+  it was — and then leaves it alone. *(Covered:
+  `ratings::the_sweep_refits_a_pool_whose_membership_changed_without_a_refit`.)*
+  (Eleventh audit.)
 - `I-RATE-10` Two pools with different scopes over the same jobs produce
   different, internally consistent fits. *(Covered:
   `ratings::pools_of_different_scopes_fit_different_consistent_ratings`.)*
@@ -1154,6 +1172,12 @@ permanent.
   `stats::a_job_completes_at_its_hard_cap_without_a_verdict`,
   `stats::a_crossed_llr_below_min_games_does_not_complete_the_job`; the
   bounds themselves by `U-STATS-1`, `-3`.)*
+- `I-STATS-9b` The verdict a job completed on is stored with the completion —
+  status, LLR and units — and reported beside the live figures, which results
+  in flight at completion can still move. *(Covered:
+  `stats::a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before`,
+  `stats::a_job_driven_to_h0_completes_with_its_sprt_failed`.)* (Eleventh
+  audit.)
 - `I-STATS-9a` **Debounced under load.** With a claim held open the whole time,
   so the job is never idle, the check runs on the `SPRT_CHECK_EVERY`th
   submission and not before, and the open claim's result is still accepted
@@ -1403,6 +1427,12 @@ below.
 - `A-AUTH-4` **Registering a taken address returns the same body as a fresh
   registration.** Assert the bodies are byte-identical. *(Covered:
   `auth_routes::registering_a_taken_address_answers_exactly_like_a_new_registration`.)*
+- `A-AUTH-4b` An account that never confirmed holds its address and username
+  only while its confirmation link works: registering over it before then is
+  answered like any taken address, with a notice saying an account is waiting;
+  after, the next registration takes both. *(Covered:
+  `auth_routes::an_expired_unconfirmed_account_gives_up_its_address_and_username`.)*
+  (Eleventh audit.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
   scored the new password without the account's context. *(Covered:
@@ -1449,7 +1479,7 @@ below.
 - `A-WORKER-2` A claim with a malformed `magpie_version` is rejected rather than
   assumed. Unparseable text reads as `0.0.0`, below the floor, so the worker is
   handed nothing and told to update (a floor of `0.0.0` would admit it; the
-  shipped floor is `0.1.0`); a version that is not a string is a `400` naming
+  shipped floor is `0.1.1`); a version that is not a string is a `400` naming
   the field. *(Covered:
   `worker_routes::a_malformed_magpie_version_is_refused_rather_than_assumed`.)*
 - `A-WORKER-3` An `unsupported_jobs` list over 200 is **truncated, not
@@ -1571,9 +1601,15 @@ below.
   `ratings::a_pool_with_no_run_renders_empty`.)*
 - `A-RATE-3` Creating a pool adds the anchor as a member automatically.
   *(Covered: `ratings::creating_a_pool_makes_its_anchor_a_member`.)*
+- `A-RATE-3b` A pool is validated like a job: a variant no job has, a
+  distribution id that is a layout row, and an anchor rating whose scale would
+  overflow are each a 400, and nothing is created. *(Covered:
+  `ratings::a_pool_that_could_rate_no_one_is_refused`.)* (Eleventh audit.)
 - `A-RATE-4` Adding and removing a member each trigger a refit and return a new
   `run_id`. *(Covered: `ratings::adding_and_removing_a_member_each_refit_the_pool`.)*
-- `A-RATE-5` Removing the anchor is refused with a message naming the fix.
+- `A-RATE-5` Removing the anchor is refused with a message naming what to do —
+  an anchor is fixed, so a pool anchored elsewhere (it named an operation that
+  did not exist until the eleventh audit).
   *(Covered: `ratings::removing_the_anchor_is_refused_with_the_fix_named`.)*
 - `A-RATE-6` History returns points in time order and excludes unrated configs.
   *(Covered: `ratings::history_is_in_time_order_and_leaves_out_unrated_configs`,
@@ -1648,9 +1684,14 @@ silent.
 - `A-BOUND-1` The eleventh login from one address is 429, even with the right
   password. *(Covered:
   `boundaries::the_eleventh_login_from_one_address_is_rate_limited_even_with_the_right_password`.)*
-- `A-BOUND-2` The eleventh login for one username is 429 from any address — the
-  half that stops a distributed guess. *(Covered:
-  `boundaries::the_eleventh_login_for_one_username_is_rate_limited_from_any_address`.)*
+- `A-BOUND-2` One address guessing an account's password cannot lock its owner
+  out: its eleventh attempt is 429, and the right password from another address
+  signs in. And the hundred-and-first attempt on one username in a minute is
+  429 from any address — the half that stops a distributed guess. (Until the
+  eleventh audit the username limit was 10 a minute from everywhere, which let
+  one address hold any account, an admin's included, out indefinitely.)
+  *(Covered: `boundaries::a_stranger_cannot_lock_an_account_out_of_signing_in`,
+  `boundaries::a_username_tried_from_everywhere_is_rate_limited`.)*
 - `A-BOUND-3` A player config's `kwg_id`, `klv_id` and `winpct_id` must each
   name an `input_data` row of that role; the foreign keys only say the row
   exists. Each swap is a 400 naming both roles, and creates nothing. *(Covered:
@@ -1740,6 +1781,17 @@ MAGPIE's half, in `test/contribute_test.c`, is two tests:
 `test_results_carry_every_key_the_server_reads` (the serializers a task's
 result is built with still produce every key the result fixtures carry, so a
 key renamed in MAGPIE fails there rather than every submission).
+
+Beyond the wire, `contribute_test.c` holds MAGPIE's regression tests for what
+the contribute path plays and how it talks. Two came from the eleventh audit:
+`test_a_rewritten_klv_is_read_again` (a KLV rewritten on disk under a name
+already loaded is read again, and an unchanged one is not — from the second
+leave task in a process the previous generation's KLV was being played, which
+tier 6's `M-4`, one generation long, could not see) and the `Retry-After`
+clamp in `test_http_retries_outlast_a_server_deployment` (a `429` was waited
+out for the connect time in microseconds, read as seconds); and
+`test_a_request_must_state_its_distribution_and_layout` now also refuses a
+path-escaping name in any player object.
 
 **Capture** is `scripts/capture_contract.py`, a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and
@@ -1900,7 +1952,8 @@ It has two halves:
   object store, so also `TEST_S3_ENDPOINT`) and `magpie_routes.rs` (2; leave-job
   creation and `rebuild-artifacts` through the router). `MAGPIE_ROOT` (default
   `../MAGPIE`) is where `magpie_smoke.rs` finds MAGPIE's small test lexicon.
-  Nothing in CI runs these; they are part of a full local run.
+  The pull-request run skips these; the nightly runs them against the MAGPIE
+  it builds, and they are part of a full local run.
 
 The backend itself is not opt-in about MAGPIE: it runs a pinned MAGPIE for
 every derived file and every leave-generation KLV, reads the builder versions
@@ -1912,8 +1965,7 @@ works — the directory it lays out, the names it invokes, the bytes it gets
 back.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.1.0`, the shipped `MIN_MAGPIE_VERSION` default
-and the branch's pre-release version; a checkout reporting anything lower is refused. The
+`birdtest-contribute` reports `0.1.1`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -2018,7 +2070,9 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
   snapshot, so they included every row committed during the dump and the drill
   of any backup taken while the service was in use failed. `backup.sh` now
   holds one exported repeatable-read snapshot for the dump and every fact about
-  it. *(Covered: `backup-drill-check.sh`, step 2.)*
+  it. The drill restores into a Postgres it starts inside its own container,
+  as the production task does, and never into the stack's database (the check
+  asserts it left nothing there). *(Covered: `backup-drill-check.sh`, step 2.)*
 - `S-BACKUP-3` A backup that cannot upload exits non-zero and leaves an
   `ok = false` row. *(Covered: `backup-drill-check.sh`, step 3.)*
 - `S-BACKUP-4` A dump of the current schema restores into an empty database and
@@ -2282,8 +2336,10 @@ GitHub Actions.
 
 1. **backend** — a Postgres 16 service and a MinIO container, with
    `TEST_DATABASE_URL` and `TEST_S3_ENDPOINT` pointing at them; `cargo clippy
-   --locked --all-targets -- -D warnings`, then `cargo test --locked`: tiers 1,
-   2, 3 and 4. The `#[ignore]`d tier-6 tests are not run.
+   --locked --all-targets -- -D warnings`, then `cargo nextest run --locked
+   --no-fail-fast` (tiers 1, 2, 3 and 4; `backend/.config/nextest.toml` kills a
+   test at ten minutes) and `cargo test --locked --doc`. The `#[ignore]`d
+   tier-6 tests are not run here; the nightly runs them.
 2. **frontend** — `npm ci`, `npm run check`, `npm test` (tier 1F), `npm run
    build`.
 3. **images** — the backend image (which builds the pinned MAGPIE too), a probe
@@ -2309,8 +2365,9 @@ GitHub Actions.
 - **e2e** — tier 6: MAGPIE built `portable_release` with a real
   `download_data.sh` install, the compose stack (`postgres`, `minio`,
   `backend`) with its GitHub URLs on the script's stand-in, and
-  `scripts/e2e_magpie.py` running every `M-*` case. Dispatchable by hand
-  against another MAGPIE ref.
+  `scripts/e2e_magpie.py` running every `M-*` case, then the opt-in Rust
+  tests (`cargo nextest run --run-ignored ignored-only`) against the same
+  MAGPIE. Dispatchable by hand against another MAGPIE ref.
 - **restore-roundtrip** — the schema applied to an empty database (the
   migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`).
 - **backup-drill** — Postgres and MinIO up, the schema applied, then

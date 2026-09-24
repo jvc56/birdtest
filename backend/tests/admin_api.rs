@@ -1148,7 +1148,7 @@ async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5).await.unwrap());
+    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None).await.unwrap());
     assert_eq!(status(&db).await, "active");
 
     // With no purge in between the counter has only grown, and it completes.
@@ -1157,7 +1157,7 @@ async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(birdtest::jobs::complete_unless_purged(&db.pool, job, 5).await.unwrap());
+    assert!(birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None).await.unwrap());
     assert_eq!(status(&db).await, "completed");
 }
 

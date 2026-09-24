@@ -291,6 +291,7 @@ async fn decline_task(
     let mut tx = state.pool.begin().await?;
     // Locked, so a timeout reclaiming this claim concurrently cannot release
     // it a second time.
+    bound_claim_lock_wait(&mut tx).await?;
     let row = sqlx::query(
         "SELECT c.id, t.job_id
          FROM task_claims c
@@ -305,6 +306,7 @@ async fn decline_task(
     .bind(identity.anon_uuid())
     .fetch_optional(&mut *tx)
     .await?;
+    end_claim_lock_wait(&mut tx).await?;
     let Some(row) = row else {
         // Already released, already submitted, never existed, or claimed by
         // a different identity: nothing the client can do about it either way.
@@ -353,6 +355,33 @@ async fn decline_task(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// How long a submission or a decline waits for its claim's row lock.
+///
+/// Ordinarily the only other holder is a heartbeat (skipped, never waited on)
+/// or a reclaim (a few milliseconds). The one long holder is a purge or a
+/// delete of the claim's job, which locks every open claim of the job for as
+/// long as its deletes run -- minutes, for a large job -- and every submission
+/// waiting on one held a pool connection throughout, with the pool twenty
+/// connections wide. Past this bound the worker is answered `503` with
+/// `Retry-After`, which MAGPIE backs off and retries, and its retry after the
+/// purge finds the claim gone and is answered `accepted: false`.
+const CLAIM_LOCK_WAIT: &str = "5s";
+
+async fn bound_claim_lock_wait(tx: &mut sqlx::PgConnection) -> AppResult<()> {
+    sqlx::query(&format!("SET LOCAL lock_timeout = '{CLAIM_LOCK_WAIT}'"))
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+/// The bound covers the claim lookup only: the rest of the transaction takes
+/// the task and job rows in the usual order and waits for them as it always
+/// has.
+async fn end_claim_lock_wait(tx: &mut sqlx::PgConnection) -> AppResult<()> {
+    sqlx::query("SET LOCAL lock_timeout = DEFAULT").execute(&mut *tx).await?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct HeartbeatBody {
     claim_token: Uuid,
@@ -368,11 +397,23 @@ async fn heartbeat(
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
 
+    // A claim somebody holds locked is skipped rather than waited on. Its
+    // holder is a submission, a decline, a purge or a delete, and in every case
+    // the heartbeat is moot: the claim is about to stop being open, or already
+    // has. Waiting was a pool connection held for as long as the holder ran --
+    // for a purge of a large job, minutes -- and every worker on that job
+    // heartbeats every thirty seconds, so the pool was gone in one cycle. At
+    // worst a skipped heartbeat is one refresh missed against a five-minute
+    // timeout.
     sqlx::query(
         "UPDATE task_claims SET last_heartbeat_at = now()
-         WHERE claim_token = $1 AND state = 'claimed'
-           AND claimed_by_user_id IS NOT DISTINCT FROM $2
-           AND claimed_by_anon_uuid IS NOT DISTINCT FROM $3",
+         WHERE id = (
+             SELECT id FROM task_claims
+             WHERE claim_token = $1 AND state = 'claimed'
+               AND claimed_by_user_id IS NOT DISTINCT FROM $2
+               AND claimed_by_anon_uuid IS NOT DISTINCT FROM $3
+             FOR UPDATE SKIP LOCKED
+         )",
     )
     .bind(body.claim_token)
     .bind(identity.user_id())
@@ -388,7 +429,8 @@ async fn heartbeat(
 #[derive(Deserialize)]
 struct ResultBody {
     claim_token: Uuid,
-    result: serde_json::Value,
+    /// Kept as text until the job type is known: see `registry::store_result`.
+    result: Box<serde_json::value::RawValue>,
 }
 
 #[derive(Serialize)]
@@ -413,6 +455,7 @@ async fn submit_result(
     // another worker had just been handed would read as unclaimed. The same
     // lock is what makes a retried submission of an already-accepted result a
     // clean `accepted: false` instead of a duplicate-key error.
+    bound_claim_lock_wait(&mut tx).await?;
     let claim = sqlx::query(
         "SELECT c.id, c.task_id, t.job_id
          FROM task_claims c JOIN tasks t ON t.id = c.task_id
@@ -426,6 +469,7 @@ async fn submit_result(
     .bind(identity.anon_uuid())
     .fetch_optional(&mut *tx)
     .await?;
+    end_claim_lock_wait(&mut tx).await?;
 
     // A token is bound to the identity it was issued to (the checks above), so
     // a ban or an audit row means what it says: a token handed to another
@@ -477,10 +521,9 @@ async fn submit_result(
     // the locks held here.
     let template = state.templates.get_or_load(&mut tx, &job).await?;
 
-    crate::jobs::registry::store_result(
+    let progress = crate::jobs::registry::store_result(
         &mut tx,
         &template,
-        &job,
         task_id,
         claim_id,
         prior_accepted == 0,
@@ -523,13 +566,6 @@ async fn submit_result(
     .fetch_one(&mut *tx)
     .await?;
 
-    if task_completed {
-        sqlx::query("UPDATE jobs SET tasks_completed = tasks_completed + 1 WHERE id = $1")
-            .bind(job_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-
     // The contributor's own running total, which is what the leaderboards read
     // instead of counting this identity's claims. One statement, on the row the
     // identity already owns. Deliberately not rolled back by account deletion:
@@ -559,6 +595,26 @@ async fn submit_result(
             .await?;
         }
         (None, None) => {}
+    }
+
+    // The job's running progress totals, in one statement and last: it takes
+    // the job's row lock, which every claim for the job also takes (last, in
+    // `issue_claim`), so it is held from here to the commit and no longer.
+    // They were two separate updates, the first made while storing the result
+    // -- a claim for the job then waited on this whole transaction.
+    if progress != crate::jobs::registry::ProgressDelta::default() || task_completed {
+        sqlx::query(
+            "UPDATE jobs SET games_completed = games_completed + $2,
+                             racks_analyzed = racks_analyzed + $3,
+                             tasks_completed = tasks_completed + $4
+             WHERE id = $1",
+        )
+        .bind(job_id)
+        .bind(progress.games_completed)
+        .bind(progress.racks_analyzed)
+        .bind(i64::from(task_completed))
+        .execute(&mut *tx)
+        .await?;
     }
 
     // Ratings are deliberately not touched here. A fit is global to a rating
@@ -613,14 +669,20 @@ async fn after_submission(state: &AppState, job: &Job) -> AppResult<()> {
     // `job.status` is as of the submit transaction. A job deactivated or
     // completed since is guarded by `complete_unless_purged`'s own predicate,
     // so a stale `active` here costs a check and never a wrong write.
-    if job.status == JobStatus::Active
+    let finished = if job.status == JobStatus::Active
         && job.job_type != JobType::LeaveGeneration
         && should_check_finish(state, job_id).await?
-        && finish_condition_met(state, job).await?
     {
+        finish_condition_met(state, job).await?
+    } else {
+        None
+    };
+    if let Some(decided) = finished {
         // `job` was loaded before the results were read, which is what lets
         // its `claims_issued` tell a purge in between from no purge at all.
-        if crate::jobs::complete_unless_purged(&state.pool, job.id, job.claims_issued).await? {
+        if crate::jobs::complete_unless_purged(&state.pool, job.id, job.claims_issued, decided)
+            .await?
+        {
             tracing::info!(job_id = %job.id, "job auto-completed");
             // Completion is final, so this job will never need checking again.
             state.finish_checks.forget(job_id);
@@ -713,11 +775,19 @@ async fn should_check_finish(state: &AppState, job_id: Uuid) -> AppResult<bool> 
 /// Either finish condition: SPRT significance (only after `min_units`) or the
 /// hard cap for game jobs; an exhausted and fully completed rack space for
 /// opening racks.
-async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<bool> {
+///
+/// `None` while the job goes on. `Some` when it is done, carrying for a games
+/// job the verdict that finished it and the units it had, which the completion
+/// stores: later results move the live LLR, but not what was decided.
+async fn finish_condition_met(
+    state: &AppState,
+    job: &Job,
+) -> AppResult<Option<Option<(crate::stats::sprt::SprtResult, u64)>>> {
     Ok(match job.job_type {
         JobType::Games | JobType::GamePairs => jobstats::game_stats(&state.pool, job)
             .await?
-            .is_some_and(|games| games.sprt.status.is_finished()),
+            .filter(|games| games.sprt.status.is_finished())
+            .map(|games| Some((games.sprt, games.units_completed))),
         JobType::OpeningRack => {
             // Tasks are generated on demand, so "all tasks complete" is not
             // enough -- it is trivially true before anything is dispatched.
@@ -735,10 +805,11 @@ async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<bool> {
             .fetch_optional(&state.pool)
             .await?
             .unwrap_or(false)
+            .then_some(None)
         }
         // Leave generation completes in `run_transition` once the final
         // generation is aggregated.
-        JobType::LeaveGeneration => false,
+        JobType::LeaveGeneration => None,
     })
 }
 
@@ -983,7 +1054,7 @@ mod contract_fixtures {
     fn submitted<H: crate::jobs::handler::JobHandler>(fixture: &str, what: &str) -> (Uuid, H::Record) {
         let body: ResultBody = serde_json::from_str(fixture)
             .unwrap_or_else(|e| panic!("{what} no longer parses as ResultBody: {e}"));
-        let response: H::Response = serde_json::from_value(body.result)
+        let response: H::Response = serde_json::from_str(body.result.get())
             .unwrap_or_else(|e| panic!("{what}'s result is malformed: {e}"));
         let record = H::process_response(response)
             .unwrap_or_else(|e| panic!("{what} would be refused: {}", e.message));

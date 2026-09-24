@@ -94,7 +94,21 @@ pub struct GameStats {
     pub win_pct: f64,
     pub loss_pct: f64,
     pub draw_pct: f64,
+    /// The test over every accepted result, recomputed on each read.
     pub sprt: SprtResult,
+    /// What the job was completed on, when the finish check completed it
+    /// (`jobs.sprt_decided_*`). The claims in flight at that moment are still
+    /// played and accepted, so `sprt` can move after it -- even back inside
+    /// the bounds -- and this is the decision that stands.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decided: Option<SprtDecided>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SprtDecided {
+    pub status: String,
+    pub llr: f64,
+    pub units: i64,
 }
 
 /// Progress, and nothing else.
@@ -326,11 +340,17 @@ async fn lexicon_and_variant(
 /// which is why it is separate from [`compute`]: deciding whether a job is done
 /// needs these aggregates and nothing else.
 pub async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<Option<GameStats>> {
-    Ok(match job.job_type {
-        JobType::Games => Some(plain_game_stats(pool, job).await?),
-        JobType::GamePairs => Some(game_pair_stats(pool, job).await?),
-        JobType::OpeningRack | JobType::LeaveGeneration => None,
-    })
+    let mut stats = match job.job_type {
+        JobType::Games => plain_game_stats(pool, job).await?,
+        JobType::GamePairs => game_pair_stats(pool, job).await?,
+        JobType::OpeningRack | JobType::LeaveGeneration => return Ok(None),
+    };
+    if let (Some(status), Some(llr), Some(units)) =
+        (&job.sprt_decided_status, job.sprt_decided_llr, job.sprt_decided_units)
+    {
+        stats.decided = Some(SprtDecided { status: status.clone(), llr, units });
+    }
+    Ok(Some(stats))
 }
 
 /// Sum the per-task aggregates for a plain `games` job. The SPRT unit is a
@@ -470,6 +490,7 @@ fn build_game_stats(
         loss_pct: pct(tally.losses),
         draw_pct: pct(tally.draws),
         sprt,
+        decided: None,
     }
 }
 

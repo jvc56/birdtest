@@ -203,6 +203,16 @@ impl SprtStatus {
     pub fn is_finished(self) -> bool {
         !matches!(self, SprtStatus::Running)
     }
+
+    /// As serialized, and as `jobs.sprt_decided_status` stores it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SprtStatus::Running => "running",
+            SprtStatus::Passed => "passed",
+            SprtStatus::Failed => "failed",
+            SprtStatus::TerminatedAtMax => "terminated_at_max",
+        }
+    }
 }
 
 #[cfg(test)]

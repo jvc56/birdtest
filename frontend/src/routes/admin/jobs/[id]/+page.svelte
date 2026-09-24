@@ -118,7 +118,7 @@
   function purge() {
     if (
       !confirm(
-        'Purge this job? Every task, claim and result it holds is deleted and the job starts over. This cannot be undone.'
+        'Purge this job? Every task, claim and result it holds is deleted and the job starts over (a completed job returns to inactive, to be activated again). This cannot be undone.'
       )
     )
       return;
@@ -298,6 +298,8 @@
                   {/if}
                 {/if}
                 {#if jobExport.download_url}(links valid for an hour){/if}
+              {:else if jobExport.state === 'expired'}
+                Expired: the store keeps an export for thirty days. Export again to rebuild it.
               {:else}
                 <span class="text-destructive">Failed: {jobExport.error ?? 'unknown error'}</span>
               {/if}
@@ -316,7 +318,12 @@
           label="{stats.games.unit}s completed"
         />
         <p class="text-sm text-muted-foreground">
-          SPRT {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}
+          {#if stats.games.decided}
+            SPRT {sprtLabel(stats.games.decided.status)} at LLR
+            {stats.games.decided.llr.toFixed(3)} (now {stats.games.sprt.llr.toFixed(3)})
+          {:else}
+            SPRT {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}
+          {/if}
         </p>
       {:else}
         <ProgressBar value={stats.tasks_completed} max={stats.tasks_total} label="tasks completed" />

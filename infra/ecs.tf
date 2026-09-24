@@ -258,6 +258,20 @@ data "aws_iam_policy_document" "task" {
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.artifacts.arn]
   }
+  # A failed or abandoned streaming upload (an export, a KLV) is aborted rather
+  # than left for the bucket's seven-day rule to find.
+  statement {
+    actions   = ["s3:AbortMultipartUpload"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/*"]
+  }
+  # Purging a job deletes its exports' objects, which hold the results the
+  # purge has just removed. Exports only: every other object here -- input
+  # data, derived files, leave-generation KLVs -- the backend never deletes,
+  # and a compromised process should not be able to either.
+  statement {
+    actions   = ["s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/exports/*"]
+  }
   statement {
     actions   = ["ses:SendEmail"]
     resources = ["*"]
@@ -329,6 +343,12 @@ resource "aws_ecs_task_definition" "main" {
       image        = var.frontend_image
       essential    = true
       portMappings = [{ containerPort = 80, protocol = "tcp" }]
+      # The containers of one awsvpc task share a network namespace, so the
+      # backend is on localhost; `backend`, compose's name for it, resolves to
+      # nothing here and Nginx would refuse to start.
+      environment = [
+        { name = "BACKEND_UPSTREAM", value = "127.0.0.1:8080" },
+      ]
       logConfiguration = {
         logDriver = "awslogs"
         options = {

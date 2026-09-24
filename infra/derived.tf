@@ -31,6 +31,11 @@ variable "derived_builder_image" {
     comes from the binary that produced it -- the two move together.
   EOT
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.derived_builder_image)) > 0
+    error_message = "derived_builder_image is the backend image built with --target derived-builder, at the same tag as backend_image."
+  }
 }
 
 variable "derived_builder_cpu" {
@@ -124,6 +129,13 @@ resource "aws_ecs_task_definition" "derived_builder" {
       name      = "derived-builder"
       image     = var.derived_builder_image
       essential = true
+      # Stated rather than left to the image's CMD. Given the backend image by
+      # mistake -- the same repository, a different target -- the CMD is the
+      # web server, which never exits: a 4-vCPU task started every five
+      # minutes, each running the startup reapers that fail the live server's
+      # exports and imports. Stated, the wrong image has no `build-derived`
+      # and the task fails at once, which the scheduler's failures show.
+      command = ["build-derived"]
       environment = [
         { name = "S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
         { name = "AWS_REGION", value = var.region },

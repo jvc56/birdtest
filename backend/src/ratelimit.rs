@@ -34,10 +34,14 @@ pub struct RateLimiters {
     /// Limiting by IP alone stops neither, since IPs are cheap.
     pub reset: Arc<Keyed>,
     /// 10 login attempts per minute, checked against the caller's IP and,
-    /// separately, the username tried. Each attempt costs an Argon2 verify, so
+    /// separately, the username tried from that IP. Each attempt costs an Argon2 verify, so
     /// an unlimited login endpoint is both an online password-guessing oracle
     /// and a cheap way to pin the server's CPU.
     pub login: Arc<Keyed>,
+    /// 100 login attempts per minute against one username from anywhere: the
+    /// bound on a guesser spread over many addresses, now that `login`'s
+    /// username half is per address as well.
+    pub login_account: Arc<Keyed>,
 }
 
 impl RateLimiters {
@@ -49,12 +53,14 @@ impl RateLimiters {
             .allow_burst(NonZeroU32::new(30).unwrap());
         let resets_per_hour = Quota::per_hour(NonZeroU32::new(5).unwrap());
         let logins_per_minute = Quota::per_minute(NonZeroU32::new(10).unwrap());
+        let account_logins_per_minute = Quota::per_minute(NonZeroU32::new(100).unwrap());
         Self {
             register: Arc::new(RateLimiter::keyed(per_hour)),
             worker: Arc::new(RateLimiter::keyed(per_second)),
             unregistered_worker: Arc::new(RateLimiter::keyed(unregistered)),
             reset: Arc::new(RateLimiter::keyed(resets_per_hour)),
             login: Arc::new(RateLimiter::keyed(logins_per_minute)),
+            login_account: Arc::new(RateLimiter::keyed(account_logins_per_minute)),
         }
     }
 
@@ -76,6 +82,7 @@ impl RateLimiters {
             &self.unregistered_worker,
             &self.reset,
             &self.login,
+            &self.login_account,
         ] {
             limiter.retain_recent();
         }

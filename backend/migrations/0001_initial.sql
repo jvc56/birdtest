@@ -361,20 +361,16 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.1.0 is
-    -- `birdtest-contribute`'s pre-release version: neither birdtest nor the
-    -- branch is in production yet, so everything the protocol relies on --
-    -- every result-changing setting stated on the request, input data and
-    -- derived files checked against the hashes the job pins, the word info
-    -- table switched off before every load, a seed on every task -- is in
-    -- 0.1.0, and the version moves only when a release changes what a task
-    -- computes. The default here is the same value as the server's
+    -- so "no floor" is not a state worth being able to express. 0.1.1 is
+    -- the `birdtest-contribute` version the backend image pins; the branch's
+    -- version moves whenever a change can alter what a task computes, and the
+    -- floor moves with it. The default here is the same value as the server's
     -- MIN_MAGPIE_VERSION, which create_job writes explicitly; the two are kept
     -- equal so a row written any other way (a restore, a hand insert) does not
     -- floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -404,6 +400,20 @@ CREATE TABLE jobs (
     -- climb, and a newcomer put level with *it* then took every claim from the
     -- jobs that were actually running until it had caught up with them.
     last_claimed_at TIMESTAMPTZ,
+    -- The SPRT verdict a games or game-pairs job was completed on, as the
+    -- finish check saw it: NULL for every other job, and for one completed any
+    -- other way (by an admin, or at its cap in the claim path). The live
+    -- figures are recomputed from every accepted result, and the claims in
+    -- flight when a job completes are still played and accepted -- so without
+    -- this the page of a job that passed could drift back to "running" with no
+    -- record anywhere of the decision that stopped it. A purge clears it.
+    sprt_decided_status TEXT CHECK (sprt_decided_status IN ('passed', 'failed', 'terminated_at_max')),
+    sprt_decided_llr    DOUBLE PRECISION,
+    sprt_decided_units  BIGINT,
+    CONSTRAINT jobs_sprt_decided_together CHECK (
+        (sprt_decided_status IS NULL) = (sprt_decided_llr IS NULL)
+        AND (sprt_decided_status IS NULL) = (sprt_decided_units IS NULL)
+    ),
     -- Progress totals the dashboard reads, maintained in the submit transaction
     -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
     -- incremented
@@ -709,7 +719,6 @@ CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed);
 -- redundancy above 1 leaves tasks available until their slots fill, so that is
 -- not a short list.
 CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'available';
-CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
 --
@@ -962,7 +971,13 @@ CREATE TABLE position_analysis_records (
     -- rack across turns and games.
     id              BIGSERIAL PRIMARY KEY,
     task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- The task, for the in-game dedup key below. Deliberately not a foreign
+    -- key: a record goes with its claim (above) or its job (below), both of
+    -- which cascade through their own indexes, so a cascade from the task
+    -- only added an index entry and a foreign-key probe per record -- the same
+    -- pattern `position_analysis_moves.task_id` and the staging table's were
+    -- removed for.
+    task_id         UUID NOT NULL,
     -- Denormalized from the task. Every read of a job's records -- the public
     -- results feed, the rack lookup, the admin stream, the export -- filtered
     -- on the job and could only reach it through `tasks`, which put the filter
@@ -1079,14 +1094,17 @@ CREATE INDEX position_analysis_moves_record_idx
 -- Per-ply simulation stats for each candidate move. Only populated for simming
 -- player configs; a static player has no per-ply statistics to record.
 CREATE TABLE position_analysis_plies (
-    id               BIGSERIAL PRIMARY KEY,
     move_id          BIGINT NOT NULL REFERENCES position_analysis_moves(id) ON DELETE CASCADE,
     ply              SMALLINT NOT NULL,
     bingo_percentage DOUBLE PRECISION NOT NULL,
     average_score    DOUBLE PRECISION NOT NULL,
-    -- The UNIQUE above is the index the cascade from moves uses: move_id is
+    -- The natural key, and the index the cascade from moves uses: move_id is
     -- its leading column, so there is deliberately no second index on it.
-    UNIQUE (move_id, ply)
+    -- There was a BIGSERIAL `id` beside it that nothing referenced or read --
+    -- every reader goes through move_id and the insert conflicts on this key
+    -- -- at some 30 bytes a row between the column and its index: 2 to 5 GB
+    -- for one simming opening-rack job's tens of millions of plies.
+    PRIMARY KEY (move_id, ply)
 );
 
 -- Shared by games and game pairs: one row per accepted claim, holding the
@@ -1445,7 +1463,6 @@ CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitte
 CREATE INDEX        game_results_feed_idx
     ON game_results (job_id, submitted_at DESC, task_claim_id DESC);
 CREATE INDEX        leave_records_task_idx    ON leave_records (task_id);
-CREATE INDEX        position_records_task_idx ON position_analysis_records (task_id);
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);
 CREATE INDEX        audit_log_job_idx         ON audit_log (job_id);
 

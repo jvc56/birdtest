@@ -155,6 +155,18 @@ impl From<sqlx::Error> for AppError {
                             "that read took too long and was cancelled",
                         )
                     },
+                    // A statement that gave up waiting for a row lock (the
+                    // bounded waits on the worker paths): something long-held
+                    // the row -- a purge, a delete -- and a retry after it
+                    // finishes gets a clean answer. MAGPIE retries a 5xx.
+                    Some(LOCK_NOT_AVAILABLE) => AppError {
+                        retry_after: Some(5),
+                        ..AppError::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "unavailable",
+                            "that claim is busy; try again shortly",
+                        )
+                    },
                     _ => AppError::internal(format!("database error: {db}")),
                 };
                 if error.status.is_server_error() {

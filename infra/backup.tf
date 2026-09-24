@@ -558,8 +558,11 @@ resource "aws_cloudwatch_metric_alarm" "backup_stale" {
 
 # --- Restore drill ---------------------------------------------------------
 # A restore procedure that has never run is a hypothesis. This one restores the
-# newest dump into a throwaway database on the same instance every month and
-# runs the verification queries against it (PLAN.md, "Drills").
+# newest dump into a throwaway Postgres of its own, started inside the task,
+# every month and runs the verification queries against it (PLAN.md,
+# "Drills"). It never connects to the production instance, so it holds no
+# credentials for it: the drill's disk is the task's ephemeral storage, which
+# must hold the downloaded dump and the restored database side by side.
 #
 # Its role is the mirror image of the backup task's: read and decrypt, never
 # write. Between the two, no single compromised role can both read old backups
@@ -626,9 +629,7 @@ resource "aws_ecs_task_definition" "restore_drill" {
         { name = "AWS_REGION", value = var.region },
         { name = "AWS_DEFAULT_REGION", value = var.region },
         { name = "PGRESTORE_JOBS", value = tostring(var.backup_dump_jobs) },
-      ]
-      secrets = [
-        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn }
+        { name = "DRILL_TARGET", value = "local" },
       ]
       logConfiguration = {
         logDriver = "awslogs"

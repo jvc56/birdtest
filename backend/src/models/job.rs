@@ -57,6 +57,12 @@ pub struct Job {
     /// When the job last issued a claim. What `scheduler::join_at_parity` reads
     /// to tell a job being served from one that is only on offer.
     pub last_claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The SPRT verdict the job was completed on, if the finish check completed
+    /// it: `passed`, `failed` or `terminated_at_max`, the LLR it crossed at,
+    /// and the units it had then. All three or none.
+    pub sprt_decided_status: Option<String>,
+    pub sprt_decided_llr: Option<f64>,
+    pub sprt_decided_units: Option<i64>,
     /// Games recorded by the first accepted result of each task; the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.

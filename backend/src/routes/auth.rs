@@ -110,15 +110,38 @@ async fn register(
         return Err(err);
     }
 
-    let taken = sqlx::query_as::<_, (bool, bool)>(
+    // An account that never confirmed its address, and whose confirmation has
+    // expired, gives up its username and address to whoever registers them
+    // next. Held for ever, it was a dead end with no way out -- it cannot sign
+    // in, reset its password or be sent a new code -- and a way to squat
+    // anyone's address: register it first, and its owner could never sign up
+    // unless they happened to click the stranger's link within the day.
+    // Nothing else can hang off such an account (it has never signed in), and
+    // an admin is never released this way.
+    sqlx::query(
+        "DELETE FROM users u
+         WHERE (u.username = $1 OR u.email = $2)
+           AND u.email_confirmed_at IS NULL AND u.deleted_at IS NULL AND NOT u.is_admin
+           AND NOT EXISTS (
+               SELECT 1 FROM email_confirmations c
+               WHERE c.user_id = u.id AND c.used_at IS NULL AND c.expires_at > now()
+           )",
+    )
+    .bind(&username)
+    .bind(&email)
+    .execute(&state.pool)
+    .await?;
+
+    let taken = sqlx::query_as::<_, (bool, bool, bool)>(
         "SELECT EXISTS (SELECT 1 FROM users WHERE username = $1),
-                EXISTS (SELECT 1 FROM users WHERE email = $2)",
+                EXISTS (SELECT 1 FROM users WHERE email = $2),
+                EXISTS (SELECT 1 FROM users WHERE email = $2 AND email_confirmed_at IS NOT NULL)",
     )
     .bind(&username)
     .bind(&email)
     .fetch_one(&state.pool)
     .await?;
-    let (username_taken, email_taken) = taken;
+    let (username_taken, email_taken, email_confirmed) = taken;
 
     // Hashed before the collision branch, not after, so both paths pay the same
     // Argon2 cost. Returning an identical body for a taken address and then
@@ -141,23 +164,39 @@ async fn register(
     // exactly what a new registration sees; the address owner is told someone
     // tried, so a real person who has forgotten they signed up still finds out.
     if email_taken {
-        state
-            .mailer
-            .send(
-                &email,
-                "Someone tried to register with your email address",
-                &format!(
-                    "Someone tried to create a birdtest account with this \
-                     address, but it already has one.\n\n\
-                     If that was you, sign in at {url}/login, or reset your \
-                     password at {url}/reset-password if you have forgotten \
-                     it.\n\n\
-                     If it was not you, no account was created and nothing \
-                     has changed.\n",
-                    url = state.cfg.public_url
-                ),
+        // Limited per address, and skipped rather than refused when limited:
+        // the per-IP limit alone let anyone bury an address in these notices
+        // from enough IPs, and a refusal here -- and only here -- would answer
+        // the question this branch hides.
+        let notice = if email_confirmed {
+            format!(
+                "Someone tried to create a birdtest account with this \
+                 address, but it already has one.\n\n\
+                 If that was you, sign in at {url}/login, or reset your \
+                 password at {url}/reset-password if you have forgotten \
+                 it.\n\n\
+                 If it was not you, no account was created and nothing \
+                 has changed.\n",
+                url = state.cfg.public_url
             )
-            .await?;
+        } else {
+            format!(
+                "Someone tried to create a birdtest account with this \
+                 address, but an account with it is already waiting for the \
+                 address to be confirmed.\n\n\
+                 If that was you, use the confirmation link sent when it was \
+                 created. It works for {CONFIRMATION_TTL_HOURS} hours; once it \
+                 has expired, register again and the address is yours.\n\n\
+                 If it was not you, nothing has changed, and the waiting \
+                 account cannot be used without the link sent to you.\n"
+            )
+        };
+        if ratelimit::check(&state.limits.reset, &format!("reg-em:{email}")).is_ok() {
+            state
+                .mailer
+                .send(&email, "Someone tried to register with your email address", &notice)
+                .await?;
+        }
         return Ok((
             StatusCode::CREATED,
             Json(MessageBody { message: "check your email to confirm" }),
@@ -235,11 +274,18 @@ async fn login(
     // Both halves, like password reset: per IP bounds one guesser, per
     // username bounds many guessers aimed at one account. Checked before the
     // lookup, so a limited attempt costs no Argon2 verify.
+    //
+    // The username half is keyed on the username *and* the caller's address,
+    // with a looser cap on the username alone. Keyed on the username alone at
+    // the per-IP rate, one caller trying a wrong password every six seconds
+    // held any account -- an admin's, whose name `GET /api/users` publishes --
+    // out of signing in for as long as it kept going, correct password or not.
+    // Now a lockout takes a fleet of addresses, and the account-wide cap still
+    // bounds how fast a distributed guesser can try.
+    let account = body.username.trim().to_lowercase();
     ratelimit::check(&state.limits.login, &format!("ip:{ip}"))?;
-    ratelimit::check(
-        &state.limits.login,
-        &format!("user:{}", body.username.trim().to_lowercase()),
-    )?;
+    ratelimit::check(&state.limits.login, &format!("user:{account}|ip:{ip}"))?;
+    ratelimit::check(&state.limits.login_account, &format!("user:{account}"))?;
 
     let row = sqlx::query_as::<_, (Uuid, String, String, bool, Option<chrono::DateTime<Utc>>, i32)>(
         "SELECT id, username, password_hash, is_admin, email_confirmed_at, session_generation

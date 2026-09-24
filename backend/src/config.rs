@@ -6,9 +6,9 @@ use std::time::Duration;
 ///
 /// In development every value comes from the environment (`.env` is loaded on
 /// startup). In ECS the same variables are populated by the task definition,
-/// which pulls the secret-valued ones from SSM Parameter Store and Secrets
-/// Manager — so the process only ever reads environment variables and there is
-/// no separate secrets code path.
+/// which pulls the secret-valued ones from SSM Parameter Store -- so the
+/// process only ever reads environment variables and there is no separate
+/// secrets code path.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
@@ -115,12 +115,12 @@ fn parsed<T: std::str::FromStr>(lookup: Lookup, key: &str, default: T) -> Result
 /// `DATABASE_URL` if it is set; otherwise one assembled from `DB_HOST`,
 /// `DB_PORT`, `DB_NAME`, `DB_USER` and `DB_PASSWORD`.
 ///
-/// The parts exist for the deployment. RDS manages the master password in
-/// Secrets Manager and rotates it (every seven days by default), so a
-/// hand-written `DATABASE_URL` in SSM goes stale by itself. ECS can inject the
-/// password straight from the managed secret, and the host is a Terraform
-/// output, so neither needs to be copied anywhere by hand. The password is
-/// percent-encoded: a generated one can contain `@`, `/` or `:`.
+/// The parts are for a deployment that injects the password on its own --
+/// from a secret RDS manages and rotates, say. This one does not: the master
+/// password is set by hand and lives only inside the `DATABASE_URL` SSM
+/// parameter (`infra/rds.tf`, README.md "Deploying"), because a password RDS
+/// rotated would leave that URL stale. The password is percent-encoded: a
+/// generated one can contain `@`, `/` or `:`.
 fn resolve_database_url(get: impl Fn(&str) -> Option<String>) -> Result<String> {
     if let Some(url) = get("DATABASE_URL") {
         return Ok(url);
@@ -186,7 +186,7 @@ impl Config {
             other => anyhow::bail!("SECURE_COOKIES must be 'true' or 'false', got {other:?}"),
         };
 
-        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.0");
+        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.1");
         if crate::version::Version::parse_or_zero(&min_magpie_version)
             == crate::version::Version::ZERO
             && min_magpie_version.trim() != "0.0.0"
@@ -207,16 +207,14 @@ impl Config {
             heartbeat_timeout: Duration::from_secs(parsed_u64("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            // 0.1.0 is `birdtest-contribute`'s pre-release version. Neither
-            // birdtest nor the branch is in production yet, so everything the
-            // protocol relies on -- every result-changing setting stated on
-            // the request rather than taken from the worker's build, input
-            // data and derived files checked against the hashes the job pins,
-            // the word info table switched off before every load, a seed on
-            // every task -- is in 0.1.0. The version moves only when a
-            // release changes what a task computes, and this floor moves with
-            // it; until then there is nothing below it to refuse, and the
-            // floor exists so that the first such release can raise it.
+            // 0.1.1 is the `birdtest-contribute` version the backend image
+            // pins. The branch's version moves whenever a change can alter
+            // what a task computes, and this floor moves with it: it is the
+            // only way to keep a build known to compute something wrong off
+            // the fleet. 0.1.0 is below it because builds reporting it
+            // include ones where a capturing static player played its worst
+            // move, and every one of them played a leave task after its
+            // first with the previous task's KLV.
             min_magpie_version,
             magpie_download_url: var_or(
                 "MAGPIE_DOWNLOAD_URL",
@@ -281,7 +279,7 @@ mod tests {
             ("S3_ENDPOINT", "None", "http://minio:9000", |c| {
                 c.s3_endpoint.clone().unwrap_or_else(|| "None".into())
             }),
-            ("MIN_MAGPIE_VERSION", "0.1.0", "1.10.0", |c| c.min_magpie_version.clone()),
+            ("MIN_MAGPIE_VERSION", "0.1.1", "1.10.0", |c| c.min_magpie_version.clone()),
             ("MAGPIE_DOWNLOAD_URL", "https://github.com/jvc56/MAGPIE", "https://d", |c| {
                 c.magpie_download_url.clone()
             }),

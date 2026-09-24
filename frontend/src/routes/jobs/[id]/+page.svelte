@@ -110,14 +110,24 @@
       <div class="card space-y-4">
         <div class="flex items-center justify-between">
           <h2 class="text-lg font-medium">SPRT</h2>
-          <JobStatusBadge status={stats.games.sprt.status} />
+          <JobStatusBadge status={stats.games.decided?.status ?? stats.games.sprt.status} />
         </div>
-        <p class="text-sm text-muted-foreground">
-          {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)} within
-          [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
-          SPRT is not acted on until {stats.games.min_units.toLocaleString()}
-          {stats.games.unit}s are complete.
-        </p>
+        {#if stats.games.decided}
+          <p class="text-sm text-muted-foreground">
+            Completed: {sprtLabel(stats.games.decided.status)} at LLR
+            {stats.games.decided.llr.toFixed(3)} after {stats.games.decided.units.toLocaleString()}
+            {stats.games.unit}s. With the {stats.games.unit}s that were in flight then, LLR
+            {stats.games.sprt.llr.toFixed(3)} within [{stats.games.sprt.lower_bound.toFixed(2)},
+            {stats.games.sprt.upper_bound.toFixed(2)}].
+          </p>
+        {:else}
+          <p class="text-sm text-muted-foreground">
+            {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)} within
+            [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
+            SPRT is not acted on until {stats.games.min_units.toLocaleString()}
+            {stats.games.unit}s are complete.
+          </p>
+        {/if}
         <OutcomeChart
           wins={stats.games.wins}
           losses={stats.games.losses}

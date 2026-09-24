@@ -64,6 +64,14 @@
   }
 
   onMount(async () => {
+    try {
+      await loadChoices();
+    } catch (e) {
+      error = `Could not load player configs and input data: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  });
+
+  async function loadChoices() {
     [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
     if (configs.length) {
       playerConfigId = configs[0].id;
@@ -78,7 +86,7 @@
     leaveKwgId = firstOfRole('kwg');
     serverFloor = (await api.clientVersion()).min_magpie_version;
     minMagpieVersion = serverFloor;
-  });
+  }
 
   function body(): Record<string, unknown> {
     const common = {

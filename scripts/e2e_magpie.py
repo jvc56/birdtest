@@ -870,7 +870,7 @@ def case_rack_info_table(ctx: Context) -> None:
         # Not dispatched while the table is unbuilt: an anonymous claim finds
         # no work at all, since this is the only active job.
         claim = requests.post(f"{ctx.args.api}/api/worker/task",
-                              json={"magpie_version": "0.1.0", "unsupported_jobs": []},
+                              json={"magpie_version": "0.1.1", "unsupported_jobs": []},
                               timeout=30)
         expect(claim.status_code == 204,
                f"a job waiting on its table dispatched: {claim.status_code} {claim.text[:300]}")

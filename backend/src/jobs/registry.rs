@@ -346,14 +346,18 @@ async fn insert_on_demand_task(
 pub async fn store_result(
     conn: &mut PgConnection,
     template: &JobTemplate,
-    job: &Job,
     task_id: Uuid,
     claim_id: Uuid,
     first_result: bool,
-    payload: serde_json::Value,
-) -> AppResult<()> {
-    fn decode<T: serde::de::DeserializeOwned>(payload: serde_json::Value) -> AppResult<T> {
-        serde_json::from_value(payload)
+    payload: Box<serde_json::value::RawValue>,
+) -> AppResult<ProgressDelta> {
+    /// Straight from the submission's text into its typed response. It went
+    /// through a `serde_json::Value` first, which holds every object as a
+    /// B-tree node and every key as its own allocation -- ten to twenty times
+    /// the JSON's size, and a result may be 64 MiB. A few of those at once
+    /// were enough to have the one web task killed for memory.
+    fn decode<T: serde::de::DeserializeOwned>(payload: &serde_json::value::RawValue) -> AppResult<T> {
+        serde_json::from_str(payload.get())
             .map_err(|e| AppError::bad_request(format!("malformed task response: {e}")))
     }
 
@@ -366,13 +370,13 @@ pub async fn store_result(
     /// in it, and an async worker thread that does not yield can hold up every
     /// other request the server has (see `exports::upload_rows`). The hop costs
     /// microseconds, against a transaction of a dozen round trips.
-    async fn normalize<H>(payload: serde_json::Value) -> AppResult<H::Record>
+    async fn normalize<H>(payload: Box<serde_json::value::RawValue>) -> AppResult<H::Record>
     where
         H: JobHandler,
         H::Response: Send + 'static,
         H::Record: Send + 'static,
     {
-        tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(payload)?))
+        tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(&payload)?))
             .await
             .map_err(|e| AppError::internal(format!("validating a task response failed: {e}")))?
     }
@@ -390,14 +394,7 @@ pub async fn store_result(
             // submission's length is its distinct-rack count. Racks never
             // repeat across tasks either: each task analyses its own slice of
             // the enumerated space.
-            count_first_result(
-                conn,
-                job,
-                first_result,
-                "racks_analyzed",
-                record.positions.len() as i64,
-            )
-            .await
+            Ok(ProgressDelta::first_result(first_result, 0, record.positions.len() as i64))
         }
         JobKind::Games { config, .. } => {
             let record = normalize::<game::GameHandler>(payload).await?;
@@ -409,8 +406,7 @@ pub async fn store_result(
                 super::plausibility::games_dispatched(config.games_per_batch, false),
             )?;
             game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
-            count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
-                .await
+            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
         }
         JobKind::GamePairs { config, .. } => {
             let record = normalize::<game_pair::GamePairHandler>(payload).await?;
@@ -423,8 +419,7 @@ pub async fn store_result(
                 .await?;
             // Games, not pairs, for both job types: the pairs count is half of
             // it and is derived where it is displayed.
-            count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
-                .await
+            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
         }
         JobKind::LeaveGeneration { config, .. } => {
             let record = normalize::<leave_gen::LeaveGenHandler>(payload).await?;
@@ -435,52 +430,42 @@ pub async fn store_result(
             super::plausibility::check_rack_occurrence_total(&record.racks, config.num_iterations)?;
             if first_result {
                 leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
-                    .await
+                    .await?;
             } else {
-                leave_gen::credit_claim(conn, task_id, claim_id, &record).await
+                leave_gen::credit_claim(conn, task_id, claim_id, &record).await?;
             }
+            Ok(ProgressDelta::default())
         }
     }
 }
 
-/// Add this submission's work to one of the job's running progress totals, but
-/// only if it is the first accepted result for its task.
+/// What one accepted result adds to its job's running progress totals: games
+/// played, opening racks analysed. Returned rather than written, so the submit
+/// path can make every change to the job's row in one statement, last.
 ///
-/// The reads these totals replace both selected one result per task -- the
-/// aggregates they summed describe the same deterministic work on every
-/// redundant claim, so counting all of them would multiply the total by the
-/// job's redundancy (PLAN.md, "What these reads cost"). "First" comes from the
-/// task's `accepted_count`, read by `submit_result` under the task's row lock
-/// before anything is stored: every accepted result increments it in the
-/// transaction that stores the result, and that transaction holds the same
-/// lock, so two submissions arriving together cannot both read zero. It used to
-/// be decided by counting the rows just written, which for an opening-rack
-/// batch was a read of up to 10,000 of them to learn one bit. Update and store
-/// share the submission's transaction, so a submission that later fails
-/// contributes neither.
-///
-/// The update takes a row lock on `jobs`, so two submissions for the same job
-/// serialize here for as long as the lock is held. A task is minutes of work, so
-/// that is a lock every few seconds at most on a busy job, and the alternative
-/// -- the count these totals exist to avoid -- was seconds of CPU per page view.
-async fn count_first_result(
-    conn: &mut PgConnection,
-    job: &Job,
-    first_result: bool,
-    column: &str,
-    amount: i64,
-) -> AppResult<()> {
-    if !first_result {
-        return Ok(());
-    }
+/// Only the first accepted result for its task counts. The reads these totals
+/// replace both selected one result per task -- the aggregates they summed
+/// describe the same deterministic work on every redundant claim, so counting
+/// all of them would multiply the total by the job's redundancy (PLAN.md,
+/// "What these reads cost"). "First" comes from the task's `accepted_count`,
+/// read by `submit_result` under the task's row lock before anything is
+/// stored: every accepted result increments it in the transaction that stores
+/// the result, and that transaction holds the same lock, so two submissions
+/// arriving together cannot both read zero.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressDelta {
+    pub games_completed: i64,
+    pub racks_analyzed: i64,
+}
 
-    // `column` is one of two literals chosen in this file, never worker input.
-    sqlx::query(&format!("UPDATE jobs SET {column} = {column} + $2 WHERE id = $1"))
-        .bind(job.id)
-        .bind(amount)
-        .execute(&mut *conn)
-        .await?;
-    Ok(())
+impl ProgressDelta {
+    fn first_result(first_result: bool, games: i64, racks: i64) -> Self {
+        if first_result {
+            ProgressDelta { games_completed: games, racks_analyzed: racks }
+        } else {
+            ProgressDelta::default()
+        }
+    }
 }
 
 /// The part of job initialization that cannot run inside the creating

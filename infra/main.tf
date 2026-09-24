@@ -22,7 +22,11 @@ provider "aws" {
 data "aws_caller_identity" "current" {}
 
 locals {
-  name = var.project
+  # Every name that has to be unique beyond this region -- buckets are global,
+  # IAM roles account-wide -- is built from this, so a second copy of the stack
+  # in the same account (a region-loss rebuild, RUNBOOK.md §5) differs from the
+  # first by `name_suffix` alone.
+  name = "${var.project}${var.name_suffix}"
   tags = {
     Project   = var.project
     ManagedBy = "terraform"

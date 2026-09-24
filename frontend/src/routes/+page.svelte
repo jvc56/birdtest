@@ -6,9 +6,15 @@
 
   let active: JobListItem[] = [];
 
+  // The job list is a side panel here; a failed load leaves it empty rather
+  // than the whole page broken, and is not an unhandled rejection.
   onMount(async () => {
-    const jobs = await api.jobs();
-    active = jobs.items.filter((job) => job.status === 'active');
+    try {
+      const jobs = await api.jobs();
+      active = jobs.items.filter((job) => job.status === 'active');
+    } catch {
+      active = [];
+    }
   });
 </script>
 

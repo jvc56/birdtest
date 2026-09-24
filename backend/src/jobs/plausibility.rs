@@ -25,7 +25,7 @@
 //! count that cannot correspond to any game, a truncated batch reported as
 //! complete.
 
-use super::handler::{GameAggregate, MoveEntry, RackOccurrence};
+use super::handler::{GameAggregate, MoveEntry, PlyStats, RackOccurrence};
 use crate::error::{AppError, AppResult};
 
 /// Tiles on a rack. Matches MAGPIE's `RACK_SIZE`; a submission naming more is
@@ -91,12 +91,48 @@ pub fn check_game_aggregate(aggregate: &GameAggregate, field: &str) -> AppResult
     Ok(())
 }
 
+/// How many tiles a rack spelled the way MAGPIE spells one holds, or `None`
+/// if the spelling is malformed.
+///
+/// A tile is one character, except that a letter whose name is more than one
+/// character is written in brackets (`ld_ml_to_hl`): Catalan's `[L·L]`,
+/// `[NY]` and `[QU]` are one tile each. Counted as characters, a full Catalan
+/// rack holding one was ten or eleven "tiles", and every captured position of
+/// a Catalan games job was refused.
+pub fn rack_tiles(rack: &str) -> Option<usize> {
+    let mut tiles = 0;
+    let mut chars = rack.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => {
+                let mut letter_chars = 0;
+                loop {
+                    match chars.next()? {
+                        ']' => break,
+                        '[' => return None,
+                        _ => letter_chars += 1,
+                    }
+                }
+                if letter_chars == 0 {
+                    return None;
+                }
+            }
+            ']' => return None,
+            _ => {}
+        }
+        tiles += 1;
+    }
+    Some(tiles)
+}
+
 /// A rack as the worker spelled it. Blanks are conventionally `?`, so this
-/// counts characters rather than validating the alphabet — the letter
+/// counts tiles rather than validating the alphabet — the letter
 /// distribution is what decides which letters exist, and that check belongs
 /// with the distribution, not here.
 pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
-    let tiles = rack.chars().count();
+    let tiles = rack_tiles(rack).ok_or_else(|| {
+        AppError::bad_request(format!("{context}: rack {rack:?} has an unclosed bracket"))
+    })?;
     if tiles == 0 {
         return Err(AppError::bad_request(format!("{context}: empty rack")));
     }
@@ -116,7 +152,8 @@ pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
 /// more moves than it claims to have generated.
 pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -> AppResult<()> {
     if let Some(num_moves) = num_moves {
-        if (num_moves as usize) < moves.len() {
+        // Negative first: cast to usize it is enormous, and passed.
+        if num_moves < 0 || (num_moves as usize) < moves.len() {
             return Err(AppError::bad_request(format!(
                 "{context}: reported {} moves but claims only {num_moves} were generated",
                 moves.len()
@@ -156,6 +193,40 @@ pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -
                 )));
             }
         }
+        check_plies(&entry.plies, &format!("{context}: play {:?}", entry.play))?;
+    }
+    Ok(())
+}
+
+/// A simulated play's per-ply statistics. MAGPIE numbers the plies from 0 in
+/// order, so a ply out of order or repeated is a broken client; a percentage
+/// outside [0, 100] or a mean score no play can reach is not a statistic.
+/// How many are *kept* is the player config's `num_plies_recorded`, applied
+/// where they are stored.
+fn check_plies(plies: &[PlyStats], context: &str) -> AppResult<()> {
+    let mut previous: Option<i16> = None;
+    for ply in plies {
+        if ply.ply < 0 || previous.is_some_and(|p| ply.ply <= p) {
+            return Err(AppError::bad_request(format!(
+                "{context}: ply {} is out of order; plies are numbered from 0, ascending",
+                ply.ply
+            )));
+        }
+        previous = Some(ply.ply);
+        finite(ply.bingo_percentage, &format!("{context}: bingo_percentage"))?;
+        if !(0.0..=100.0).contains(&ply.bingo_percentage) {
+            return Err(AppError::bad_request(format!(
+                "{context}: bingo percentage {} at ply {} is not a percentage",
+                ply.bingo_percentage, ply.ply
+            )));
+        }
+        finite(ply.average_score, &format!("{context}: average_score"))?;
+        if !(0.0..=f64::from(MAX_MOVE_SCORE)).contains(&ply.average_score) {
+            return Err(AppError::bad_request(format!(
+                "{context}: average score {} at ply {} is one no play can score",
+                ply.average_score, ply.ply
+            )));
+        }
     }
     Ok(())
 }
@@ -174,7 +245,7 @@ pub fn check_rack_occurrences(racks: &[RackOccurrence]) -> AppResult<()> {
         check_rack(&occurrence.rack, "leave result")?;
         // Leave generation observes full racks only. Anything shorter would
         // name no row of the generation's rack universe.
-        let tiles = occurrence.rack.chars().count();
+        let tiles = rack_tiles(&occurrence.rack).unwrap_or(0);
         if tiles != MAX_RACK_TILES {
             return Err(AppError::bad_request(format!(
                 "leave result: rack {:?} has {tiles} tiles; leave generation reports full \
@@ -343,6 +414,13 @@ mod tests {
         assert!(check_rack("AE?", "x").is_ok(), "blanks are legal tiles");
         assert!(check_rack("", "x").is_err());
         assert!(check_rack("AEINRSTU", "x").is_err());
+        // A multi-character letter is one tile, bracketed as MAGPIE writes it.
+        assert!(check_rack("A[L·L]E[NY]I[QU]S", "x").is_ok(), "seven Catalan tiles");
+        assert!(check_rack("A[L·L]E[NY]I[QU]ST", "x").is_err(), "eight Catalan tiles");
+        assert_eq!(rack_tiles("[L·L][L·L]"), Some(2));
+        assert_eq!(rack_tiles("A[NY"), None);
+        assert_eq!(rack_tiles("A]"), None);
+        assert_eq!(rack_tiles("[]"), None);
     }
 
     fn move_entry(score: i32, equity: f64) -> MoveEntry {
@@ -371,6 +449,28 @@ mod tests {
         assert!(check_moves(&moves, Some(50), "x").is_ok(), "truncation is normal");
         assert!(check_moves(&moves, Some(2), "x").is_ok());
         assert!(check_moves(&moves, Some(1), "x").is_err());
+        // Cast to usize, -1 was larger than any list and passed.
+        assert!(check_moves(&moves, Some(-1), "x").is_err());
+    }
+
+    fn ply(ply: i16, bingo_percentage: f64, average_score: f64) -> PlyStats {
+        PlyStats { ply, bingo_percentage, average_score }
+    }
+
+    #[test]
+    fn per_ply_statistics_are_statistics() {
+        let with = |plies: Vec<PlyStats>| {
+            let mut entry = move_entry(30, 30.0);
+            entry.plies = plies;
+            check_moves(&[entry], None, "x")
+        };
+        assert!(with(vec![ply(0, 12.5, 31.0), ply(1, 20.0, 35.2)]).is_ok());
+        assert!(with(vec![ply(0, 140.0, 31.0)]).is_err(), "not a percentage");
+        assert!(with(vec![ply(0, 12.5, -3.0)]).is_err(), "no play scores negative");
+        assert!(with(vec![ply(0, f64::NAN, 3.0)]).is_err());
+        assert!(with(vec![ply(-1, 12.5, 31.0)]).is_err());
+        assert!(with(vec![ply(1, 12.5, 31.0), ply(0, 12.5, 31.0)]).is_err(), "out of order");
+        assert!(with(vec![ply(0, 12.5, 31.0), ply(0, 12.5, 31.0)]).is_err(), "repeated");
     }
 
     #[test]

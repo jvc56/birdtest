@@ -11,6 +11,11 @@ COPY . .
 RUN npm run build
 
 FROM nginx:1.27-alpine
-COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+# A template, filled in at startup by the image's own entrypoint: see the
+# comment on BACKEND_UPSTREAM in it. The filter keeps envsubst to that one
+# variable, so Nginx's own `$host`, `$uri` and the rest are left alone.
+ENV BACKEND_UPSTREAM=backend:8080 \
+    NGINX_ENVSUBST_FILTER=^BACKEND_UPSTREAM$
+COPY docker/default.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=builder /app/build /usr/share/nginx/html
 EXPOSE 80

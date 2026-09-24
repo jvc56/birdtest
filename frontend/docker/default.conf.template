@@ -7,8 +7,16 @@ server {
     # is no ALB in compose, so Nginx does the same routing itself — which also
     # keeps the app on a single origin, so the session cookie and the CSRF
     # double-submit behave exactly as they do when deployed.
+    #
+    # The backend's address is ${BACKEND_UPSTREAM}, filled in when the
+    # container starts (the image's envsubst templates): `backend:8080` in
+    # compose, where each service is a host name, and `127.0.0.1:8080` in the
+    # ECS task, whose containers share one network namespace and are *not*
+    # names anything resolves. Written in literally, Nginx resolved `backend`
+    # while loading its configuration, found nothing on Fargate, and exited --
+    # and the frontend container is essential, so the task never started.
     location /api/ {
-        proxy_pass http://backend:8080;
+        proxy_pass http://${BACKEND_UPSTREAM};
         # Nginx's default is 1 MB. A worker result with captured positions is
         # routinely larger; the backend enforces its own 64 MB ceiling, and
         # this must not be lower than that or local contributors fail where
@@ -29,11 +37,20 @@ server {
     }
 
     location /health {
-        proxy_pass http://backend:8080/health;
+        proxy_pass http://${BACKEND_UPSTREAM}/health;
     }
 
     # Everything else is the SPA; unknown paths resolve client-side.
     location / {
         try_files $uri $uri/ /index.html;
+        # Nothing here is meant to be framed or sniffed, and the site is only
+        # ever served over HTTPS once deployed (the ALB redirects port 80).
+        # `add_header` in a location replaces the server's, so they are here,
+        # on the pages; the API sets its own.
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "same-origin" always;
+        add_header Content-Security-Policy "frame-ancestors 'none'; object-src 'none'; base-uri 'self'" always;
     }
 }

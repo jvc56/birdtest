@@ -4,6 +4,23 @@ variable "project" {
   default     = "birdtest"
 }
 
+variable "name_suffix" {
+  description = <<-EOT
+    Appended to the resource-name prefix. Empty for the one production stack.
+    A region-loss rebuild (RUNBOOK.md §5) applies a second copy of this stack
+    into the same account, where every bucket name (global) and IAM role name
+    (account-wide) of the first is still taken -- the lost region's buckets
+    and the DR replicas alike -- so it sets one, such as "-dr".
+  EOT
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^(-[a-z0-9]+)?$", var.name_suffix))
+    error_message = "name_suffix is empty or a hyphen followed by lowercase letters and digits, such as \"-dr\"."
+  }
+}
+
 variable "region" {
   description = "AWS region to deploy into."
   type        = string
@@ -206,17 +223,17 @@ variable "acm_certificate_arn" {
 
 variable "min_magpie_version" {
   description = <<-EOT
-    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.1.0 is
-    `birdtest-contribute`'s pre-release version: nothing is in production yet,
-    so everything the protocol relies on is in 0.1.0, and a build reporting a
-    lower version is offered nothing. Raise it whenever a MAGPIE release
-    changes results. Must not exceed the version the backend image's own
+    The oldest MAGPIE that may contribute (MIN_MAGPIE_VERSION). 0.1.1 is the
+    `birdtest-contribute` version the backend image pins, and a build reporting
+    a lower version is offered nothing. Raise it whenever a MAGPIE release
+    changes results: it is the only way to keep a build known to compute
+    something wrong off the fleet. Must not exceed the version the backend image's own
     pinned MAGPIE reports (docker/Dockerfile's MAGPIE_COMMIT), or the backend
     refuses to start: it will not hand out hashes built by a MAGPIE its
     workers may not run.
   EOT
   type        = string
-  default     = "0.1.0"
+  default     = "0.1.1"
 }
 
 variable "github_token_parameter_arn" {
@@ -225,20 +242,42 @@ variable "github_token_parameter_arn" {
   default     = ""
 }
 
+# The next three had placeholder defaults under birdtest.example. Forgotten,
+# the apply succeeded, every confirmation and reset mail linked to a domain
+# nobody owns, and SES was asked to verify it. Required now, and a leftover
+# placeholder is refused.
+
 variable "mail_from_address" {
   description = "Envelope From for SES. Must be within ses_domain."
   type        = string
-  default     = "no-reply@birdtest.example"
+
+  validation {
+    condition     = can(regex("^[^@\\s]+@[^@\\s]+$", var.mail_from_address)) && !endswith(var.mail_from_address, ".example")
+    error_message = "mail_from_address must be a real address within ses_domain."
+  }
 }
 
 variable "ses_domain" {
-  description = "Domain to verify with SES for outbound account mail."
+  description = <<-EOT
+    Domain to verify with SES for outbound account mail. A new AWS account's
+    SES starts in the sandbox, where it sends only to verified addresses: until
+    production access is granted, every confirmation and reset mail to anyone
+    else fails. See README.md, "Deploying".
+  EOT
   type        = string
-  default     = "birdtest.example"
+
+  validation {
+    condition     = length(var.ses_domain) > 0 && !can(regex("[/:@\\s]", var.ses_domain)) && !endswith(var.ses_domain, ".example")
+    error_message = "ses_domain must be a bare domain you own, such as birdtest.org."
+  }
 }
 
 variable "public_url" {
-  description = "Base URL used to build confirmation and password-reset links."
+  description = "Base URL used to build confirmation and password-reset links: the site's https:// origin, no trailing slash."
   type        = string
-  default     = "https://birdtest.example"
+
+  validation {
+    condition     = can(regex("^https://[^/]+$", var.public_url)) && !can(regex("\\.example$", var.public_url))
+    error_message = "public_url must be the site's https:// origin (no path or trailing slash), and not the birdtest.example placeholder."
+  }
 }

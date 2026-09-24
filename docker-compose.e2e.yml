@@ -56,7 +56,7 @@ services:
       GITHUB_TOKEN: ""
       # Must match fixtures/build.sh's REPO. Not a real repository, on purpose.
       MAGPIE_DATA_REPO: birdtest/fixtures
-      MIN_MAGPIE_VERSION: 0.1.0
+      MIN_MAGPIE_VERSION: 0.1.1
       RUST_LOG: birdtest=info,tower_http=warn
     volumes:
       # Written by the backend's uid 10001, so e2e/run.sh makes it world-

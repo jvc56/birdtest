@@ -7,6 +7,16 @@ explains why; this one is what to type at 2am. Read the whole procedure before s
 Placeholders throughout: `$REGION` (default `us-east-1`), `$CLUSTER`
 (`birdtest`), `$BUCKET` (the `backups_bucket` Terraform output).
 
+**Where the SQL runs.** The database has no public address and admits only the
+service's security group, so no `psql` on an operator's machine can reach it.
+Every `psql "$DATABASE_URL" ...` below runs inside the VPC, in the ops task
+(`infra/ops.tf`: the postgres image, `DATABASE_URL` already set, read access to
+the backups bucket): `scripts/prod-sql.sh "<SQL>"` for one batch of statements,
+or `scripts/prod-shell.sh` for an interactive shell (it needs the AWS CLI's
+Session Manager plugin) — which is where §2's scratch restore and row copy run,
+with the scratch database a Postgres started inside that shell the way
+`scripts/restore-drill.sh` starts one.
+
 ---
 
 ## 0. Before anything: what is the damage?
@@ -50,12 +60,17 @@ aws rds describe-db-instances --db-instance-identifier birdtest --region "$REGIO
 # 3. Restore to a NEW instance. The original is left untouched until the
 #    restore is confirmed good.
 STAMP=$(date -u +%Y%m%d%H%M)
+# The source's parameter group (a generated name): a restore without one gets
+# the default group and loses the WAL settings leave-generation merges need.
+PARAMETER_GROUP=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
+  --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' --output text)
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
   --target-db-instance-identifier "birdtest-restore-$STAMP" \
   --restore-time '2026-09-07T02:55:00Z' \
   --db-subnet-group-name birdtest-db \
-  --vpc-security-group-ids "$(terraform -chdir=infra output -raw db_security_group_id 2>/dev/null || echo sg-XXXX)" \
+  --vpc-security-group-ids "$(terraform -chdir=infra output -raw db_security_group_id)" \
+  --db-parameter-group-name "$PARAMETER_GROUP" \
   --no-publicly-accessible \
   --db-instance-class db.t4g.micro
 
@@ -72,6 +87,22 @@ aws rds modify-db-instance --region "$REGION" \
   --backup-retention-period 30 --deletion-protection --apply-immediately
 ```
 
+Swap the names, so the restored instance is the one Terraform manages. Terraform
+tracks the instance by its identifier, `birdtest`; left under its restore name,
+the next `terraform apply` would find `birdtest` missing once the damaged one was
+retired and create a new, empty database in its place. The rename moves the
+endpoint with it, which is why it comes before repointing:
+
+```bash
+aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
+  --new-db-instance-identifier "birdtest-damaged-$STAMP" --apply-immediately
+aws rds wait db-instance-available --region "$REGION" \
+  --db-instance-identifier "birdtest-damaged-$STAMP"
+aws rds modify-db-instance --region "$REGION" --db-instance-identifier "birdtest-restore-$STAMP" \
+  --new-db-instance-identifier birdtest --apply-immediately
+aws rds wait db-instance-available --region "$REGION" --db-instance-identifier birdtest
+```
+
 Repoint the application. The master password is set by hand and lives only in
 the `DATABASE_URL` parameter, so keep it and swap the host. A PITR copy keeps
 the password the source had at the restore point; if it was rotated after that
@@ -79,7 +110,7 @@ point, set it on the new instance first (see "Rotating the database password"):
 
 ```bash
 ENDPOINT=$(aws rds describe-db-instances --region "$REGION" \
-  --db-instance-identifier "birdtest-restore-$STAMP" \
+  --db-instance-identifier birdtest \
   --query 'DBInstances[0].Endpoint.Address' --output text)
 
 OLD_URL=$(aws ssm get-parameter --region "$REGION" --name /birdtest/DATABASE_URL \
@@ -96,8 +127,9 @@ aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type Se
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
 ```
 
-Then run §4 (verification). Only once it passes, rename or retire the damaged
-instance — never before.
+Then run §4 (verification), and `terraform apply`: the restore set none of
+Multi-AZ, the backup window or tag copying, and the apply puts them back. Only
+once §4 passes, retire `birdtest-damaged-$STAMP` — never before.
 
 **What the fleet does meanwhile.** Workers go on playing the tasks they hold.
 A worker asking for a task keeps asking, once a minute, for as long as the
@@ -118,29 +150,67 @@ the restored database, so results for them are answered `accepted: false`.
 ## 2. Selective restore (a mistaken purge or delete)
 
 The database must **not** be rolled back: everything else has moved on. The
-shape is always the same — restore a copy somewhere else, copy the missing rows
-across, repair the counters, recompute the derived state.
+shape is always the same — stop the job, restore a copy somewhere else, clear
+out what the job has done since, copy the missing rows across, repair the
+counters, recompute the derived state.
+
+### 2.0 Stop the job, and clear what it has done since
+
+A purge leaves the job's status alone, so an active job goes straight on
+dispatching: its seed cursor is back at zero, a leave job re-seeds generation
+1, and every new task takes a `(job_id, seed)` — and every new progress row a
+`(job_id, generation, rack)` — that the restored rows need. Copied over them
+with `ON CONFLICT DO NOTHING`, the restored rows lose silently, their claims and
+results then fail their foreign keys, and the restore reports success with the
+contributors' work still gone. So first, from the admin page or the API,
+**deactivate the job** (a purged completed job is already inactive). Then
+delete what it has generated since the purge — nothing of it predates the
+mistake — in one transaction, in the ops shell:
+
+```sql
+BEGIN;
+DELETE FROM task_claims c USING tasks t WHERE c.task_id = t.id AND t.job_id = :'job';
+DELETE FROM tasks WHERE job_id = :'job';
+DELETE FROM leave_rack_progress         WHERE job_id = :'job';
+DELETE FROM leave_rack_staging          WHERE job_id = :'job';
+DELETE FROM leave_generation_progress   WHERE job_id = :'job';
+DELETE FROM leave_selection_cursors     WHERE job_id = :'job';
+DELETE FROM leave_generation_artifacts  WHERE job_id = :'job';
+DELETE FROM leave_generation_transitions WHERE job_id = :'job';
+COMMIT;
+```
+
+(A deleted job has nothing to clear: re-insert its `jobs` row and its config
+rows from the scratch copy first, then the rest as below.) After this, any
+conflict in §2.2 means this step was missed — not that the row is safe to
+skip.
 
 ### 2.1 Get a copy of the old data
 
 Either a PITR instance from just before the mistake (fresher, §1 steps 2–3 with
-a `-scratch-` identifier and no repointing), or the latest nightly dump:
+a `-scratch-` identifier and no repointing), or the latest nightly dump
+restored into a Postgres of the ops shell's own (`scripts/prod-shell.sh`), the
+way the monthly drill does it:
 
 ```bash
+# Inside scripts/prod-shell.sh.
+apt-get update -qq && apt-get install -y -qq awscli >/dev/null
 STAMP=2026-09-07T03-00-00Z
-aws s3 cp "s3://$BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
-createdb -h "$SCRATCH_HOST" -U birdtest birdtest_scratch
-pg_restore -h "$SCRATCH_HOST" -U birdtest -d birdtest_scratch -j4 \
-  --no-owner --no-privileges --exit-on-error /tmp/dump
+aws s3 cp "s3://$BACKUP_BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
+mkdir -p /tmp/scratch /tmp/sock && chown postgres /tmp/scratch /tmp/sock
+gosu postgres initdb -D /tmp/scratch -U postgres --auth=trust >/dev/null
+gosu postgres pg_ctl -D /tmp/scratch -w -l /tmp/scratch.log start \
+  -o "-c listen_addresses='' -c unix_socket_directories=/tmp/sock"
+SCRATCH_URL="postgresql:///birdtest_scratch?host=/tmp/sock&user=postgres"
+createdb -h /tmp/sock -U postgres birdtest_scratch
+pg_restore -d "$SCRATCH_URL" -j4 --no-owner --no-privileges --exit-on-error /tmp/dump
 ```
-
-For a dump small enough, the scratch database can be the local docker compose
-stack: `./scripts/dev-restore.sh /tmp/dump` (which scrubs on the way in).
 
 ### 2.2 Copy the rows back, in dependency order
 
-Dump only the job's rows from the scratch copy and load them into production.
-`ON CONFLICT DO NOTHING` throughout, so a partial re-run is safe:
+Dump only the job's rows from the scratch copy and load them into production
+(`$DATABASE_URL`, in the same shell). `ON CONFLICT DO NOTHING` throughout, so a
+partial re-run is safe — which is all it is for, after §2.0:
 
 ```bash
 JOB=00000000-0000-0000-0000-000000000000
@@ -194,12 +264,12 @@ it has worked on.
 
 `position_analysis_records.id` and `_moves.id` are `BIGSERIAL`. Restoring them
 with their original ids preserves the parent-child links; afterwards the
-sequences must be moved past what was inserted, or the next insert collides:
+sequences must be moved past what was inserted, or the next insert collides
+(`_plies` is keyed by `(move_id, ply)` and has no sequence):
 
 ```sql
 SELECT setval('position_analysis_records_id_seq', (SELECT max(id) FROM position_analysis_records));
 SELECT setval('position_analysis_moves_id_seq',   (SELECT max(id) FROM position_analysis_moves));
-SELECT setval('position_analysis_plies_id_seq',   (SELECT max(id) FROM position_analysis_plies));
 ```
 
 ### 2.3 Repair the counters
@@ -356,9 +426,11 @@ rows actually support.
 - **Derived data** (`derived_data`): the SHA-256 of each wordmap and rack info
   table the server built. Derived by definition, and **a job whose rows are
   missing does not dispatch** — which is the symptom a restore produces here:
-  active jobs handing out nothing. Activating each job again re-queues them
-  (`POST /api/admin/jobs/:id/activate`), and the builder task fills them in
-  within a few minutes; `/admin/derived-data` shows the queue. The files
+  active jobs handing out nothing. Activating each job again re-queues them —
+  the **Activate** button on its admin page, with the allocation it had
+  (`POST /api/admin/jobs/:id/activate` takes `{"allocation": N}` and the CSRF
+  header, and a different `N` changes the job's share) — and the builder task
+  fills them in within a few minutes; `/admin/derived-data` shows the queue. The files
   themselves are not restored because none is kept: the server hashes and
   discards them.
 
@@ -451,17 +523,44 @@ database never issued is rejected the same way any stale claim is.
 
 ## 5. Region loss
 
-1. `terraform apply` in the DR region: `terraform apply -var region=$DR_REGION -var dr_region=$REGION`.
+A second copy of the stack, applied into the same account in another region.
+Every bucket name is global and every IAM role name account-wide, and the lost
+region's still hold theirs — as do the DR replicas the rebuild restores from —
+so the copy is named apart with `name_suffix`, and kept in state of its own.
+
+1. `terraform apply` the copy, in its own workspace so the lost region's state
+   is left as it was:
+
+   ```bash
+   terraform -chdir=infra workspace new dr
+   terraform -chdir=infra apply \
+     -var region=$DR_REGION -var 'azs=["'$DR_REGION'a","'$DR_REGION'b"]' \
+     -var name_suffix=-dr -var dr_region=$THIRD_REGION \
+     -var acm_certificate_arn=<a certificate issued in $DR_REGION> \
+     -var alert_email=... -var public_url=... -var ses_domain=... \
+     -var mail_from_address=... \
+     -var backend_image=... -var derived_builder_image=... -var frontend_image=...
+   ```
+
+   ACM certificates are regional, so the lost region's cannot be used; request
+   one in `$DR_REGION` first. `dr_region` must be a region that is up — the
+   copy replicates into it as the original did — not the one that was lost.
+   `$CLUSTER` below is then `birdtest-dr`.
 2. Set the two SSM parameters by hand — Terraform manages their names, never
    their values. `SESSION_SIGNING_KEY` may be a fresh `openssl rand -hex 32`;
    every session cookie is invalidated, which costs a round of logins.
 3. Restore the database from the replicated dump in
-   `birdtest-backups-dr-<account>` (§2.1's `pg_restore`, into the new instance).
+   `birdtest-backups-dr-<account>`, from `scripts/prod-shell.sh` against the
+   new stack: the dump into the new instance, as in §2.1 but with
+   `pg_restore -d "$DATABASE_URL"`. The new ops task reads the new stack's
+   backups bucket, so fetch the dump with the credentials of an operator who
+   can read the replica, or copy it across first.
 4. Artifacts are already in `birdtest-artifacts-dr-<account>`; sync them into
-   the new region's artifact bucket, or point `S3_BUCKET` at the replica.
+   the new stack's artifact bucket (`birdtest-dr-artifacts-<account>`), or
+   point `S3_BUCKET` at the replica.
 5. Re-verify the SES domain identity and add the DKIM CNAMEs — account mail is
    dead until this is done, which means no confirmations and no password
-   resets.
+   resets. SES production access is per region: request it again.
 6. Point DNS at the new ALB.
 7. Run §4.
 
@@ -482,7 +581,8 @@ database never issued is rejected the same way any stale claim is.
   stand-in object store, and `BACKUP_METRICS=false` (or `=true`) overrides that
   either way.
 - `scripts/restore-drill.sh` runs monthly in production and restores the newest
-  dump into a throwaway database. A failure means the backups are not
+  dump into a throwaway Postgres started inside its own task — never into the
+  production instance, whose credentials it does not hold. A failure means the backups are not
   restorable and is the loudest alarm in the system.
 - Twice a year, do §5 by hand into a scratch account or region. The manual
   drill exists to find the steps that live only in someone's head.
@@ -512,6 +612,6 @@ print(p._replace(netloc="birdtest:" + sys.argv[2] + "@" + p.netloc.rsplit("@", 1
 aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
   --value "$NEW_URL"
 
-# Tasks read SSM at start; the backup and restore-drill tasks read it per run.
+# Tasks read SSM at start; the backup task reads it per run.
 aws ecs update-service --region "$REGION" --cluster "$CLUSTER" --service birdtest --force-new-deployment
 ```

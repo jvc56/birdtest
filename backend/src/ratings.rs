@@ -223,14 +223,24 @@ async fn fit_and_store(
     let (members, matrix, pairs_used, jobs_used) = build_matrix(&mut tx, pool_id).await?;
 
     if only_if_evidence_changed {
-        let last: Option<i64> = sqlx::query_scalar(
-            "SELECT pairs_used FROM rating_runs
-             WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
+        // The evidence is the pairs *and* who is in the pool. Compared on the
+        // pairs alone, a membership change whose own refit never ran -- the
+        // request dropped, or the fit failing after the membership committed
+        // -- was never repaired when the config added or removed had no pairs
+        // in the pool, since the count did not move.
+        let last: Option<(i64, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT r.pairs_used,
+                    ARRAY(SELECT p.player_config_id FROM player_config_ratings p
+                           WHERE p.run_id = r.id ORDER BY p.player_config_id)
+             FROM rating_runs r
+             WHERE r.pool_id = $1 ORDER BY r.computed_at DESC, r.id DESC LIMIT 1",
         )
         .bind(pool_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if last == Some(pairs_used as i64) {
+        let mut current = members.clone();
+        current.sort();
+        if last == Some((pairs_used as i64, current)) {
             tx.rollback().await?;
             return Ok(None);
         }
@@ -244,9 +254,15 @@ async fn fit_and_store(
     let fit = bradley_terry::fit(&matrix, anchor_index, pool.anchor_rating);
 
     let run_id: Uuid = sqlx::query_scalar(
+        // `computed_at` is the moment of the insert, under the pool's lock,
+        // rather than the column's `now()` default -- the transaction's start,
+        // taken before the lock. A fit that began first and got the lock
+        // second would otherwise be stamped older than the run it superseded,
+        // and the page, which reads the newest, would show the older one.
         "INSERT INTO rating_runs
-             (pool_id, trigger, method, iterations, converged, pairs_used, jobs_used)
-         VALUES ($1, $2, 'bradley_terry_mm', $3, $4, $5, $6)
+             (pool_id, trigger, method, iterations, converged, pairs_used, jobs_used,
+              computed_at)
+         VALUES ($1, $2, 'bradley_terry_mm', $3, $4, $5, $6, clock_timestamp())
          RETURNING id",
     )
     .bind(pool_id)
