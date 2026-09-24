@@ -813,6 +813,12 @@ async fn worker_page(
     // `last_seen_at` here is the last *task finished*, which is what this list
     // has always shown; it is deliberately not `anonymous_workers.last_seen_at`,
     // which any request touches and answers a different question.
+    //
+    // The identity breaks ties. Contributions tie all the time -- every worker
+    // with one task finished -- and ordered by the count alone, Postgres is free
+    // to order a tie differently for each LIMIT, so paging through the list
+    // showed some contributors twice and others never. A row has exactly one of
+    // the two ids, so together they are a total order.
     let rows = sqlx::query(
         "SELECT * FROM (
              SELECT u.id AS user_id, NULL::uuid AS anon_uuid, NULL::text AS anon_id,
@@ -824,7 +830,7 @@ async fn worker_page(
                     NULL::text, w.tasks_completed, w.last_completed_at
              FROM anonymous_workers w WHERE w.tasks_completed > 0
          ) contributors
-         ORDER BY tasks_completed DESC
+         ORDER BY tasks_completed DESC, user_id, anon_uuid
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
