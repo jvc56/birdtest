@@ -1,0 +1,5 @@
+# `cargo nextest run` -- the runner the full suite uses. No single test may run
+# longer than ten minutes: a test is reported slow after a minute and killed
+# after ten, so a hang fails the run instead of stalling it.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 10 }
