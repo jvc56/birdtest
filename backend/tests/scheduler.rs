@@ -157,7 +157,8 @@ async fn a_claim_writes_its_row_and_counts_itself_on_the_task() {
     let task = claim_task(&state, &worker, &caps("1.2.3", &[])).await;
     assert_eq!(task.job_id, job);
 
-    let rows: Vec<(Uuid, String, Option<Uuid>, Option<Uuid>, Option<String>)> = sqlx::query_as(
+    type ClaimRow = (Uuid, String, Option<Uuid>, Option<Uuid>, Option<String>);
+    let rows: Vec<ClaimRow> = sqlx::query_as(
         "SELECT claim_token, state::text, claimed_by_user_id, claimed_by_anon_uuid, magpie_version
          FROM task_claims",
     )
