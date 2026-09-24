@@ -292,6 +292,10 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
     let decoder = flate2::read::GzDecoder::new(compressed);
     let mut archive = tar::Archive::new(decoder);
     let mut files = Vec::new();
+    // Symlinks at pinned paths, resolved once every regular file is read:
+    // (link's mapped path, role, name, target as written, target's archive
+    // path).
+    let mut links: Vec<(String, String, String, String, String)> = Vec::new();
     let mut total_uncompressed: u64 = 0;
 
     let entries = archive
@@ -310,13 +314,14 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         }
 
         let entry_type = entry.header().entry_type();
-        if !entry_type.is_file() {
-            if entry_type.is_dir() {
-                continue;
-            }
-            // A symlink, device or hard link has no business in a data
-            // tarball, and skipping it quietly would make a hostile archive
-            // look ordinary.
+        if entry_type.is_dir() {
+            continue;
+        }
+        // A device or hard link has no business in a data tarball, and
+        // skipping it quietly would make a hostile archive look ordinary. A
+        // symlink is resolved below, within the archive, or refused the same
+        // way.
+        if !entry_type.is_file() && !entry_type.is_symlink() {
             return Err(AppError::bad_request(format!(
                 "archive contains a non-regular entry ({entry_type:?})"
             )));
@@ -331,6 +336,29 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
             return Err(AppError::bad_request(format!(
                 "archive contains an unsafe path: {path:?}"
             )));
+        }
+
+        // MAGPIE-DATA ships aliases as symlinks -- `CSW24_super21.klv2 ->
+        // CSW21_super21.klv2` -- and `download_data.sh` extracts them as such,
+        // so a worker hashing the alias reads the target's bytes. The alias
+        // is pinned with those bytes too. One outside a pinned directory is
+        // skipped like any other unpinned entry; one that points anywhere but
+        // at a pinned file of the same kind in this archive is refused.
+        if entry_type.is_symlink() {
+            let Some((mapped_path, role, name)) = classify(&path) else {
+                continue;
+            };
+            let target = entry
+                .link_name()
+                .ok()
+                .flatten()
+                .map(|target| target.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let Some(resolved) = resolve_link(&path, &target) else {
+                return Err(unresolvable_link(&path, &target));
+            };
+            links.push((mapped_path, role, name, target, resolved));
+            continue;
         }
 
         let size = entry.header().size().unwrap_or(0);
@@ -376,12 +404,78 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         }
     }
 
+    for (mapped_path, role, name, written, target) in &links {
+        // A chain of aliases is followed a few hops, never round a cycle.
+        let mut target = target.clone();
+        let mut resolved = None;
+        for _ in 0..8 {
+            let Some((target_mapped, target_role, _)) = classify(&target) else {
+                break;
+            };
+            if &target_role != role {
+                break;
+            }
+            if let Some(file) = files.iter().find(|f| f.path == target_mapped) {
+                resolved = Some(file);
+                break;
+            }
+            match links.iter().find(|(link, ..)| *link == target_mapped) {
+                Some((.., next)) => target = next.clone(),
+                None => break,
+            }
+        }
+        let Some(file) = resolved else {
+            return Err(unresolvable_link(&format!("data/{mapped_path}"), written));
+        };
+        let alias = ImportedFile {
+            path: mapped_path.clone(),
+            role: role.clone(),
+            name: name.clone(),
+            sha256: file.sha256.clone(),
+            bytes: file.bytes,
+            content: file.content.clone(),
+            object_key: file.object_key.clone(),
+            // The target's own row uploads the bytes; the key is the digest.
+            stored: None,
+        };
+        files.push(alias);
+    }
+
     if files.is_empty() {
         return Err(AppError::bad_request(
             "archive contained no recognisable data files",
         ));
     }
     Ok(files)
+}
+
+/// A symlink's target as an archive path, when it stays inside the archive's
+/// `data/` tree. Relative to the link's own directory, as the filesystem
+/// `download_data.sh` extracts into would read it.
+fn resolve_link(link_path: &str, target: &str) -> Option<String> {
+    if target.is_empty() || target.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = link_path.split('/').collect();
+    parts.pop();
+    for part in target.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    let resolved = parts.join("/");
+    resolved.starts_with("data/").then_some(resolved)
+}
+
+fn unresolvable_link(path: &str, target: &str) -> AppError {
+    AppError::bad_request(format!(
+        "archive contains a non-regular entry (Symlink) at {path} whose target {target:?} \
+         is not a data file of the same kind in the archive"
+    ))
 }
 
 fn check_expansion(uncompressed: u64, compressed: u64) -> AppResult<()> {
@@ -773,6 +867,85 @@ mod tests {
 
         let err = walk_archive(&archive, None).unwrap_err();
         assert!(err.message.contains("non-regular"), "{}", err.message);
+    }
+
+    /// A tar of regular files and then symlinks, as (path, target) pairs --
+    /// the order MAGPIE-DATA's own tarball happens to put the targets in last
+    /// is covered by listing a link before its target.
+    fn tarball_with_links(files: &[(&str, &[u8])], links: &[(&str, &str)]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, target) in links {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            builder.append_link(&mut header, path, target).unwrap();
+        }
+        for (path, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append_data(&mut header, path, *bytes).unwrap();
+        }
+        let tar = builder.into_inner().unwrap();
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// data-20251004.tgz, as re-cut upstream, carries aliases as symlinks
+    /// (`data/lexica/CSW24_super21.klv2 -> CSW21_super21.klv2`, and a chain
+    /// of them) and refusing them refused the whole release. An alias is
+    /// pinned with the bytes `download_data.sh` leaves a worker reading
+    /// through it: its target's.
+    #[test]
+    fn a_symlink_alias_is_pinned_with_its_targets_bytes() {
+        let archive = tarball_with_links(
+            &[("data/lexica/CSW21_super21.klv2", b"klv-bytes" as &[u8])],
+            &[
+                ("data/lexica/CSW24_super21.klv2", "CSW21_super21.klv2"),
+                ("data/lexica/CSW15_super21.klv2", "./CSW24_super21.klv2"),
+                ("data/lexica/CSW12_super21.klv2", "../lexica/CSW21_super21.klv2"),
+                // Outside anything birdtest pins: skipped, as a file there is.
+                ("data/strategy/NWL23_super21.pat", "CSW24_super21.pat"),
+            ],
+        );
+        let files = walk_archive(&archive, None).unwrap();
+        assert_eq!(files.len(), 4, "{files:?}");
+        let digest = hex::encode(Sha256::digest(b"klv-bytes"));
+        for name in ["CSW21_super21", "CSW24_super21", "CSW15_super21", "CSW12_super21"] {
+            let file = files.iter().find(|f| f.name == name).unwrap();
+            assert_eq!((file.role.as_str(), file.sha256.as_str()), ("klv", digest.as_str()));
+            assert_eq!(file.path, format!("lexica/{name}.klv2"));
+            assert_eq!(file.object_key.as_deref(), Some(input_object_key(&digest).as_str()));
+        }
+        // One upload for the one set of bytes.
+        assert_eq!(files.iter().filter(|f| f.stored.is_some()).count(), 1);
+    }
+
+    /// A symlink at a pinned path that leaves the archive, dangles, loops, or
+    /// names a file of another kind is refused rather than skipped: it is
+    /// exactly what a hostile archive would use to look ordinary.
+    #[test]
+    fn a_symlink_that_is_not_an_alias_inside_the_archive_is_refused() {
+        let files: &[(&str, &[u8])] =
+            &[("data/lexica/NWL23.kwg", b"kwg"), ("data/lexica/NWL23.klv2", b"klv")];
+        for (link, target) in [
+            ("data/lexica/evil.klv2", "../../../etc/passwd"),
+            ("data/lexica/evil.klv2", "/etc/passwd"),
+            ("data/lexica/evil.klv2", "missing.klv2"),
+            ("data/lexica/evil.klv2", "NWL23.kwg"),
+            ("data/lexica/evil.klv2", "evil.klv2"),
+            ("data/lexica/evil.klv2", "../strategy/winpct.csv"),
+        ] {
+            let archive = tarball_with_links(files, &[(link, target)]);
+            let err = walk_archive(&archive, None).unwrap_err();
+            assert!(err.message.contains("non-regular"), "{target}: {}", err.message);
+            assert!(err.message.contains(target), "{target}: {}", err.message);
+        }
     }
 
     #[test]
