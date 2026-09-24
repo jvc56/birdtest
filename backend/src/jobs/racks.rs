@@ -53,6 +53,10 @@ impl LetterDistribution {
         })?;
 
         let mut tiles = Vec::new();
+        // Every row, zero-count ones included: MAGPIE numbers each row it
+        // reads, so a row this parser dropped would shift every letter after
+        // it (see the field comment).
+        let mut machine_letters: Vec<char> = Vec::new();
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -71,8 +75,16 @@ impl LetterDistribution {
                 AppError::internal(format!("empty letter in {origin}"))
             })?;
             let count: u32 = cols[2].trim().parse().map_err(|_| {
-                AppError::internal(format!("non-numeric tile count in {line:?}"))
+                AppError::internal(format!("non-numeric tile count in {origin}: {line:?}"))
             })?;
+            // A letter listed twice would enumerate every rack holding it
+            // twice, and give it two machine-letter numbers.
+            if machine_letters.contains(&letter) {
+                return Err(AppError::internal(format!(
+                    "duplicate letter {letter:?} in {origin}"
+                )));
+            }
+            machine_letters.push(letter);
             if count > 0 {
                 tiles.push(Tile { letter, count });
             }
@@ -81,7 +93,6 @@ impl LetterDistribution {
         if tiles.is_empty() {
             return Err(AppError::internal(format!("{origin} contains no tiles")));
         }
-        let machine_letters: Vec<char> = tiles.iter().map(|t| t.letter).collect();
         // Canonical rack strings are sorted, so sorting the distribution once
         // means the enumeration emits already-canonical strings.
         tiles.sort_by_key(|t| t.letter);
@@ -291,13 +302,17 @@ mod tests {
         ])
     }
 
+    /// U-RACK-5: counts above 2 (`C` in `tiny`, `A`/`E` in `testdist.csv`)
+    /// exercise multiset repetition, and `testdist.csv` adds a blank.
     #[test]
     fn unranking_matches_full_enumeration() {
         // The scattered index must still cover exactly the set the naive walk
         // produces -- every rack once, none twice -- or a job would analyse
         // some racks twice and miss others entirely.
-        for size in 1..=4 {
-            let distribution = tiny();
+        for (distribution, size) in (1..=4)
+            .map(|size| (tiny(), size))
+            .chain((1..=7).map(|size| (testdist(), size)))
+        {
             let index = RackIndex::new(&distribution, size);
             let mut enumerated = distribution.enumerate_racks(size);
             enumerated.sort();
@@ -336,5 +351,260 @@ mod tests {
         // the final batch of a job comes up short.
         let tail = index.racks_in_range(index.total() - 2, 10);
         assert_eq!(tail.len(), 2);
+    }
+
+    /// MAGPIE's own `english.csv` from `data-20251004.tgz`, copied verbatim
+    /// from MAGPIE's `data/letterdistributions/`. Its digest is the one
+    /// `contract-fixtures/` pins, which the first test below checks.
+    const ENGLISH: &[u8] = include_bytes!("testdata/english.csv");
+    /// Five letters and a blank, with counts of 1, 2 and 3.
+    const TESTDIST: &[u8] = include_bytes!("testdata/testdist.csv");
+
+    fn english() -> LetterDistribution {
+        LetterDistribution::parse(ENGLISH, "english").unwrap()
+    }
+
+    fn testdist() -> LetterDistribution {
+        LetterDistribution::parse(TESTDIST, "testdist").unwrap()
+    }
+
+    fn count_of(distribution: &LetterDistribution, letter: char) -> Option<u32> {
+        distribution.tiles.iter().find(|t| t.letter == letter).map(|t| t.count)
+    }
+
+    /// U-RACK-1: the real English file parses to its 27 rows and 100 tiles,
+    /// numbered in file order the way MAGPIE numbers them.
+    #[test]
+    fn the_real_english_distribution_parses_with_magpies_numbering() {
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            hex::encode(Sha256::digest(ENGLISH)),
+            "e698ce0b93e025daccd3390107a914d74581c4603de38df65131768b1c6f9102",
+            "testdata/english.csv is not the pinned data-20251004 file"
+        );
+
+        let english = english();
+        assert_eq!(english.name, "english");
+        assert_eq!(english.bytes, ENGLISH, "the pinned bytes are kept, not re-rendered");
+        assert_eq!(english.tiles.len(), 27);
+        assert_eq!(english.tiles.iter().map(|t| t.count).sum::<u32>(), 100);
+        for (letter, count) in [('?', 2), ('A', 9), ('E', 12), ('Q', 1), ('Z', 1)] {
+            assert_eq!(count_of(&english, letter), Some(count), "{letter}");
+        }
+        // Sorted for enumeration, and the blank sorts first.
+        let letters: Vec<char> = english.tiles.iter().map(|t| t.letter).collect();
+        assert!(letters.windows(2).all(|w| w[0] < w[1]), "{letters:?}");
+        assert_eq!(letters[0], '?');
+
+        assert_eq!(english.machine_letter('?'), Some(0));
+        assert_eq!(english.machine_letter('A'), Some(1));
+        assert_eq!(english.machine_letter('Z'), Some(26));
+        assert_eq!(english.machine_letter('a'), None, "the lowercase column is not a letter");
+        assert_eq!(english.machine_letter('!'), None);
+    }
+
+    /// U-RACK-1: the smallest distribution there is. Written out of order, so
+    /// the machine-letter numbering (file order) and the enumeration order
+    /// (sorted) visibly differ; with a comment, a blank line and the short
+    /// five-column form, which the parser skips and accepts respectively.
+    #[test]
+    fn a_minimal_two_letter_distribution_parses() {
+        let text = b"# two letters\nB,b,1,3,0\n\nA,a,2,1,1\n";
+        let distribution = LetterDistribution::parse(text, "two").unwrap();
+        assert_eq!(distribution.tiles.len(), 2);
+        assert_eq!(count_of(&distribution, 'A'), Some(2));
+        assert_eq!(count_of(&distribution, 'B'), Some(1));
+        assert_eq!(distribution.tiles[0].letter, 'A', "tiles are sorted");
+        assert_eq!(distribution.machine_letter('B'), Some(0), "numbered in file order");
+        assert_eq!(distribution.machine_letter('A'), Some(1));
+        assert_eq!(distribution.enumerate_racks(2), ["AA", "AB"]);
+    }
+
+    /// U-RACK-1: MAGPIE numbers every row it reads, so a zero-count row still
+    /// takes a machine letter. Dropping it along with its tiles would shift
+    /// every letter after it by one in a KWG built from this numbering.
+    #[test]
+    fn a_zero_count_row_keeps_its_machine_letter_but_has_no_tiles() {
+        let distribution =
+            LetterDistribution::parse(b"A,a,1,1,1\nB,b,0,3,0\nC,c,1,3,0\n", "zero").unwrap();
+        assert_eq!(count_of(&distribution, 'B'), None, "no tiles to draw");
+        assert_eq!(distribution.machine_letter('C'), Some(2));
+        assert_eq!(distribution.enumerate_racks(2), ["AC"]);
+    }
+
+    fn parse_error(text: &str) -> String {
+        match LetterDistribution::parse(text.as_bytes(), "origin-name.csv") {
+            Ok(_) => panic!("{text:?} should be rejected"),
+            Err(e) => e.message,
+        }
+    }
+
+    /// U-RACK-2: each malformed shape is refused for its own reason, and every
+    /// message names the file it came from.
+    #[test]
+    fn each_malformed_distribution_is_rejected_for_its_own_reason() {
+        let cases = [
+            ("A,a,9,1,1\nB,b\n", "malformed letter distribution line"),
+            ("A,a,nine,1,1\n", "non-numeric tile count"),
+            ("A,a,9,1,1\nB,b,2,3,0\nA,a,1,1,1\n", "duplicate letter 'A'"),
+            ("", "contains no tiles"),
+            ("# only a comment\n\n", "contains no tiles"),
+        ];
+        for (text, reason) in cases {
+            let message = parse_error(text);
+            assert!(message.contains(reason), "{text:?}: {message}");
+            assert!(message.contains("origin-name.csv"), "{text:?}: {message}");
+        }
+        // Distinct: no one message would satisfy two of the reasons.
+        let short = parse_error(cases[0].0);
+        assert!(!short.contains("non-numeric") && !short.contains("duplicate"));
+        assert!(!parse_error(cases[1].0).contains("duplicate"));
+    }
+
+    /// U-RACK-3: every rack of every size is sorted, distinct, drawable from
+    /// the bag, and there are exactly `total()` of them.
+    #[test]
+    fn every_enumerated_rack_is_canonical_distinct_and_counted() {
+        for (distribution, max) in [(tiny(), 6), (testdist(), 7)] {
+            for size in 0..=max {
+                let racks = distribution.enumerate_racks(size);
+                assert_eq!(
+                    racks.len() as u64,
+                    RackIndex::new(&distribution, size).total(),
+                    "size {size}"
+                );
+                let distinct: std::collections::HashSet<&String> = racks.iter().collect();
+                assert_eq!(distinct.len(), racks.len(), "size {size}: duplicates");
+                for rack in &racks {
+                    let letters: Vec<char> = rack.chars().collect();
+                    assert_eq!(letters.len(), size, "{rack}");
+                    assert!(letters.windows(2).all(|w| w[0] <= w[1]), "{rack} is not sorted");
+                    for tile in &distribution.tiles {
+                        let used = letters.iter().filter(|&&c| c == tile.letter).count();
+                        assert!(used as u32 <= tile.count, "{rack} overdraws {}", tile.letter);
+                    }
+                }
+            }
+        }
+        // Past the bag: seven tiles cannot be drawn from a bag of six.
+        assert!(tiny().enumerate_racks(7).is_empty());
+        assert_eq!(RackIndex::new(&tiny(), 7).total(), 0);
+    }
+
+    /// U-RACK-4: the leave universe is every size from 1 to the maximum, in
+    /// size order, and nothing else.
+    #[test]
+    fn the_leave_universe_is_every_size_up_to_the_maximum() {
+        let distribution = testdist();
+        for max in 1..=6 {
+            let leaves = distribution.enumerate_leaves(max);
+            let by_size: Vec<String> =
+                (1..=max).flat_map(|size| distribution.enumerate_racks(size)).collect();
+            assert_eq!(leaves, by_size, "max {max}");
+            let counted: u64 =
+                (1..=max).map(|size| RackIndex::new(&distribution, size).total()).sum();
+            assert_eq!(leaves.len() as u64, counted, "max {max}");
+            assert!(leaves.iter().all(|l| (1..=max).contains(&l.chars().count())));
+        }
+        assert!(distribution.enumerate_leaves(0).is_empty());
+    }
+
+    /// U-RACK-6: a range is the racks at those indices, in index order, and
+    /// one that runs off the end stops there.
+    ///
+    /// TESTING.md words this as "equals the slice of `enumerate_racks`", which
+    /// is not the design: `racks_in_range` scatters (see `rack_at`), so its
+    /// slices tile the enumeration's *set*, not its order. What is a plain
+    /// slice is `racks_in_enumeration_range`, which leave generation walks,
+    /// and its order is exactly `enumerate_racks` reversed -- the walk takes
+    /// the most of each tile first, the index the fewest.
+    #[test]
+    fn a_range_is_the_racks_at_its_indices_and_stops_at_the_end() {
+        let distribution = testdist();
+        let size = 4;
+        let index = RackIndex::new(&distribution, size);
+        let total = index.total();
+        let mut enumerated = distribution.enumerate_racks(size);
+        enumerated.reverse();
+
+        for (start, count) in [(0, 5), (7, 11), (total - 3, 3), (total - 3, 10), (total, 4)] {
+            let expected: Vec<String> =
+                (start..(start + count).min(total)).map(|i| index.rack_at(i).unwrap()).collect();
+            assert_eq!(index.racks_in_range(start, count), expected, "{start}+{count}");
+
+            let end = ((start + count).min(total)) as usize;
+            assert_eq!(
+                index.racks_in_enumeration_range(start, count),
+                enumerated[start as usize..end],
+                "raw {start}+{count}"
+            );
+        }
+        assert_eq!(index.racks_in_range(total - 3, 10).len(), 3);
+        assert!(index.racks_in_range(u64::MAX - 1, 5).is_empty(), "no overflow at the top");
+
+        // Consecutive batches -- how a job hands out the space -- cover every
+        // rack exactly once.
+        let mut batched: Vec<String> =
+            (0..total).step_by(6).flat_map(|start| index.racks_in_range(start, 6)).collect();
+        assert_eq!(batched.len() as u64, total);
+        batched.sort();
+        enumerated.sort();
+        assert_eq!(batched, enumerated);
+    }
+
+    /// U-RACK-7: the two sizes PLAN.md quotes and job creation is costed on,
+    /// from the counting table alone. Also pins a handful of rack ids: results
+    /// are stored against them, so a change to the ordering or the scatter
+    /// would silently re-point every existing row. The expected racks were
+    /// computed by an independent model of the documented order, not read off
+    /// this implementation.
+    #[test]
+    fn real_english_has_3199724_racks_and_914624_leaves() {
+        let english = english();
+        let racks = RackIndex::new(&english, 7);
+        assert_eq!(racks.total(), 3_199_724);
+        let leaves: u64 = (1..=6).map(|size| RackIndex::new(&english, size).total()).sum();
+        assert_eq!(leaves, 914_624);
+
+        for (id, rack) in [
+            (0, "VWWXYYZ"),
+            (1, "MQVVXYY"),
+            (2, "LMORTUX"),
+            (1_000, "?BFHQTW"),
+            (1_599_862, "BFFNOPX"),
+            (3_199_723, "??BDNPW"),
+        ] {
+            assert_eq!(racks.rack_at(id).as_deref(), Some(rack), "rack id {id}");
+        }
+        assert_eq!(racks.racks_in_enumeration_range(0, 1), ["VWWXYYZ"]);
+        assert_eq!(racks.racks_in_enumeration_range(3_199_723, 1), ["??AAAAA"]);
+    }
+
+    /// U-RACK-8: the blank is the character the file uses (`?`), sorts before
+    /// every letter, so it leads any canonical rack holding one; in the raw
+    /// index order, which takes the fewest of each tile first, every rack
+    /// with a blank comes after every rack without. And a rack holding one
+    /// comes back out of `rack_at` exactly once, blank first.
+    #[test]
+    fn blanks_lead_their_racks_and_sit_at_the_end_of_the_index() {
+        let english = english();
+        let index = RackIndex::new(&english, 2);
+        let raw = index.racks_in_enumeration_range(0, index.total());
+        let first_blank = raw.iter().position(|r| r.contains('?')).unwrap();
+        assert!(raw[first_blank..].iter().all(|r| r.starts_with('?')), "{raw:?}");
+        assert!(raw[..first_blank].iter().all(|r| !r.contains('?')));
+        // 26 racks of a blank and a letter, and the double blank.
+        assert_eq!(raw.len() - first_blank, 27);
+        assert_eq!(raw.last().map(String::as_str), Some("??"));
+
+        let distribution = testdist();
+        let index = RackIndex::new(&distribution, 3);
+        let unranked: Vec<String> =
+            (0..index.total()).map(|i| index.rack_at(i).unwrap()).collect();
+        for rack in ["?AB", "?EE", "?AA"] {
+            assert_eq!(unranked.iter().filter(|r| *r == rack).count(), 1, "{rack}");
+        }
+        assert!(unranked.iter().filter(|r| r.contains('?')).all(|r| r.starts_with('?')));
+        assert!(!unranked.iter().any(|r| r.matches('?').count() > 1), "only one blank in the bag");
     }
 }
