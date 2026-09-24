@@ -986,3 +986,70 @@ async fn a_purged_job_hands_out_its_seed_space_again_from_the_start() {
     }
     assert_eq!(after, before, "the space is handed out again from its start");
 }
+
+/// A `letterdist` row with the real Catalan file's bytes: MAGPIE-DATA's
+/// distribution with multi-character letters (`L·L`, `NY`, `QU`).
+async fn catalan(db: &TestDb) -> Uuid {
+    let bytes: &[u8] = include_bytes!("../src/jobs/testdata/catalan.csv");
+    sqlx::query_scalar(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+         VALUES ('letterdistributions/catalan.csv', 'letterdist', 'catalan', $1, $2, '20251004', $3)
+         RETURNING id",
+    )
+    .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(bytes)))
+    .bind(bytes.len() as i64)
+    .bind(bytes)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap()
+}
+
+/// U-RACK-2, I-JOB-3: a Catalan games job -- a combination `compat.rs`
+/// supports -- is created and dispatched, because playing games never
+/// enumerates racks; an opening-rack or leave-generation job on the same
+/// distribution is refused at creation, naming the letter it cannot spell,
+/// instead of being created and then enumerating a rack space in which `L·L`
+/// is a second `L` and `QU` a `Q` MAGPIE does not have. A parser that refused
+/// the file outright once made every Catalan job fail to load.
+#[tokio::test]
+async fn a_catalan_games_job_runs_and_a_catalan_rack_job_is_refused_at_creation() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let ld = catalan(&db).await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "DISC2").await;
+    let klv = db.input_data("klv", "DISC2").await;
+    let p1 = admin.static_player("cat-1", kwg, klv, json!({})).await;
+    let p2 = admin.static_player("cat-2", kwg, klv, json!({ "sort_strategy": "score" })).await;
+
+    let (status, created) = admin.create_job(games_body(ld, layout, p1, p2)).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let games: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    db.derived_ready(games).await;
+    let (status, body) =
+        admin.post(&format!("/api/admin/jobs/{games}/activate"), json!({ "allocation": 50 })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, assignment) =
+        send(&admin.app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "a Catalan games job dispatches: {assignment}");
+    assert_eq!(assignment["task_request"]["letter_distribution"], "catalan", "{assignment}");
+
+    let jobs_before = job_count(&db).await;
+    for body in [
+        json!({
+            "job_type": "opening_rack", "variant": "classic", "letterdist_id": ld,
+            "layout_id": layout, "player_config_id": p1, "racks_per_batch": 10, "rack_size": 7,
+        }),
+        json!({
+            "job_type": "leave_generation", "variant": "classic", "letterdist_id": ld,
+            "layout_id": layout, "kwg_id": kwg, "num_iterations": 10,
+            "target_rack_count": 10, "racks_per_task": 10,
+        }),
+    ] {
+        let (status, refused) = admin.create_job(body.clone()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{} {refused}", body["job_type"]);
+        let message = refused["message"].as_str().unwrap();
+        assert!(message.contains("multi-character letter \"L·L\""), "{message}");
+    }
+    assert_eq!(job_count(&db).await, jobs_before, "a refused job leaves no row behind");
+}

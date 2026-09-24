@@ -1378,7 +1378,7 @@ async fn insert_job_config(
             // universe the workers never play in.
             let job_data = crate::jobs::load_job_data(&mut *conn, job.id).await?;
             let total_racks =
-                crate::jobs::opening_rack::total_racks(&job_data.letterdist, *rack_size);
+                crate::jobs::opening_rack::total_racks(&job_data.letterdist, *rack_size)?;
             sqlx::query(
                 "INSERT INTO job_opening_rack_config
                      (job_id, player_config_id,
@@ -1491,6 +1491,11 @@ async fn insert_job_config(
                     lexicon.1
                 )));
             }
+            // Every generation seeds and hands out full racks over the pinned
+            // distribution, so one whose racks cannot be spelt is refused now
+            // rather than at the first claim.
+            let job_data = crate::jobs::load_job_data(&mut *conn, job.id).await?;
+            crate::jobs::racks::RackIndex::new(&job_data.letterdist, crate::jobs::leave_gen::RACK_SIZE)?;
             sqlx::query(
                 "INSERT INTO job_leave_config
                      (job_id, kwg_id, num_iterations,

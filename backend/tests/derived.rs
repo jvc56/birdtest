@@ -516,7 +516,7 @@ async fn two_distributions_with_one_name_size_two_different_rack_spaces() {
                 .await
                 .unwrap();
         let own = birdtest::jobs::racks::LetterDistribution::parse(bytes, "english").unwrap();
-        assert_eq!(total, birdtest::jobs::opening_rack::total_racks(&own, 7), "sized by its own row");
+        assert_eq!(total, birdtest::jobs::opening_rack::total_racks(&own, 7).unwrap(), "sized by its own row");
         totals.push(total);
     }
     assert_ne!(totals[0], totals[1], "{totals:?}");

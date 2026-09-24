@@ -40,6 +40,16 @@ pub struct LetterDistribution {
     /// numbering baked into a KWG's node bytes; nothing else in this struct
     /// does, which is why it's kept separately rather than replacing `tiles`.
     machine_letters: Vec<char>,
+    /// Why this distribution's racks cannot be enumerated, if they cannot.
+    ///
+    /// A rack here is a string of one-character letters, so a distribution
+    /// with a multi-character letter -- Catalan's `L·L`, `NY` and `QU` --
+    /// has no faithful rack space in this representation: `L·L` would be read
+    /// as a second `L`, and `QU` as a `Q` MAGPIE has never heard of. Parsing
+    /// still succeeds, because a games job only hands the pinned bytes to
+    /// MAGPIE and never enumerates anything; [`RackIndex::new`] is where it is
+    /// refused, which is everything that does.
+    unenumerable: Option<String>,
 }
 
 impl LetterDistribution {
@@ -57,6 +67,7 @@ impl LetterDistribution {
         // reads, so a row this parser dropped would shift every letter after
         // it (see the field comment).
         let mut machine_letters: Vec<char> = Vec::new();
+        let mut unenumerable = None;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -71,7 +82,8 @@ impl LetterDistribution {
                     "malformed letter distribution line in {origin}: {line:?}"
                 )));
             }
-            let letter = cols[0].chars().next().ok_or_else(|| {
+            let token = cols[0].trim();
+            let letter = token.chars().next().ok_or_else(|| {
                 AppError::internal(format!("empty letter in {origin}"))
             })?;
             let count: u32 = cols[2].trim().parse().map_err(|_| {
@@ -79,10 +91,15 @@ impl LetterDistribution {
             })?;
             // A letter listed twice would enumerate every rack holding it
             // twice, and give it two machine-letter numbers.
-            if machine_letters.contains(&letter) {
-                return Err(AppError::internal(format!(
-                    "duplicate letter {letter:?} in {origin}"
-                )));
+            if unenumerable.is_none() {
+                if token.chars().count() > 1 {
+                    unenumerable = Some(format!(
+                        "{origin} has the multi-character letter {token:?}, and racks here are \
+                         strings of one-character letters"
+                    ));
+                } else if machine_letters.contains(&letter) {
+                    unenumerable = Some(format!("duplicate letter {letter:?} in {origin}"));
+                }
             }
             machine_letters.push(letter);
             if count > 0 {
@@ -101,6 +118,7 @@ impl LetterDistribution {
             bytes: bytes.to_vec(),
             tiles,
             machine_letters,
+            unenumerable,
         })
     }
 
@@ -132,7 +150,7 @@ impl LetterDistribution {
             .into_bytes();
         let mut tiles = tiles;
         tiles.sort_by_key(|t| t.letter);
-        Self { name: "test".into(), bytes, tiles, machine_letters }
+        Self { name: "test".into(), bytes, tiles, machine_letters, unenumerable: None }
     }
 
     /// Every distinct multiset of exactly `size` tiles drawable from the bag,
@@ -198,7 +216,17 @@ pub struct RackIndex {
 }
 
 impl RackIndex {
-    pub fn new(distribution: &LetterDistribution, size: usize) -> Self {
+    /// The rack space of `size` tiles over `distribution`, or a `400` naming
+    /// why it has none this representation can express (see
+    /// `LetterDistribution::unenumerable`). Every job that hands out or seeds
+    /// racks comes through here, so a distribution it cannot enumerate is
+    /// refused rather than enumerated wrongly.
+    pub fn new(distribution: &LetterDistribution, size: usize) -> AppResult<Self> {
+        if let Some(reason) = &distribution.unenumerable {
+            return Err(AppError::bad_request(format!(
+                "cannot enumerate the racks of this distribution: {reason}"
+            )));
+        }
         let tiles = distribution.tiles.clone();
         let n = tiles.len();
         // The extra row is the empty suffix, which can only make the empty rack.
@@ -214,7 +242,7 @@ impl RackIndex {
                 counts[i][k] = total;
             }
         }
-        Self { tiles, counts, size }
+        Ok(Self { tiles, counts, size })
     }
 
     /// How many distinct racks of this size exist -- the job's total.
@@ -313,7 +341,7 @@ mod tests {
             .map(|size| (tiny(), size))
             .chain((1..=7).map(|size| (testdist(), size)))
         {
-            let index = RackIndex::new(&distribution, size);
+            let index = RackIndex::new(&distribution, size).unwrap();
             let mut enumerated = distribution.enumerate_racks(size);
             enumerated.sort();
 
@@ -333,7 +361,7 @@ mod tests {
         // near-identical racks. In the raw enumeration the first few indices
         // share a prefix; scattered, they should not.
         let distribution = tiny();
-        let index = RackIndex::new(&distribution, 3);
+        let index = RackIndex::new(&distribution, 3).unwrap();
         let batch = index.racks_in_range(0, 4);
         let distinct_first_letters: std::collections::HashSet<char> =
             batch.iter().filter_map(|rack| rack.chars().next()).collect();
@@ -345,7 +373,7 @@ mod tests {
 
     #[test]
     fn unranking_is_past_the_end_safe() {
-        let index = RackIndex::new(&tiny(), 3);
+        let index = RackIndex::new(&tiny(), 3).unwrap();
         assert!(index.rack_at(index.total()).is_none());
         // A range that runs off the end yields only what exists, which is how
         // the final batch of a job comes up short.
@@ -446,7 +474,6 @@ mod tests {
         let cases = [
             ("A,a,9,1,1\nB,b\n", "malformed letter distribution line"),
             ("A,a,nine,1,1\n", "non-numeric tile count"),
-            ("A,a,9,1,1\nB,b,2,3,0\nA,a,1,1,1\n", "duplicate letter 'A'"),
             ("", "contains no tiles"),
             ("# only a comment\n\n", "contains no tiles"),
         ];
@@ -457,8 +484,40 @@ mod tests {
         }
         // Distinct: no one message would satisfy two of the reasons.
         let short = parse_error(cases[0].0);
-        assert!(!short.contains("non-numeric") && !short.contains("duplicate"));
-        assert!(!parse_error(cases[1].0).contains("duplicate"));
+        assert!(!short.contains("non-numeric") && !short.contains("no tiles"));
+        assert!(!parse_error(cases[1].0).contains("malformed"));
+    }
+
+    const CATALAN: &[u8] = include_bytes!("testdata/catalan.csv");
+
+    /// U-RACK-2: a distribution this representation cannot enumerate still
+    /// parses -- a games job only hands its bytes to MAGPIE -- and every rack
+    /// space over it is refused with the reason: a letter listed twice, and
+    /// the real Catalan file, whose `L·L`, `NY` and `QU` are one tile each to
+    /// MAGPIE and would be enumerated here as a second `L`, a second `N` and a
+    /// `Q` MAGPIE does not have. Refusing the duplicate in `parse`, as this
+    /// once did, made every Catalan job fail to load, games included.
+    #[test]
+    fn a_distribution_whose_racks_cannot_be_spelt_parses_but_has_no_rack_space() {
+        let duplicate =
+            LetterDistribution::parse(b"A,a,9,1,1\nB,b,2,3,0\nA,a,1,1,1\n", "dup.csv").unwrap();
+        let err = RackIndex::new(&duplicate, 2).err().expect("refused");
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("duplicate letter 'A' in dup.csv"), "{}", err.message);
+
+        let catalan = LetterDistribution::parse(CATALAN, "catalan").unwrap();
+        assert_eq!(catalan.bytes, CATALAN, "the pinned bytes go to MAGPIE untouched");
+        for size in [1, 7] {
+            let err = RackIndex::new(&catalan, size).err().expect("refused");
+            assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+            assert!(
+                err.message.contains("multi-character letter \"L·L\"")
+                    && err.message.contains("catalan"),
+                "{}",
+                err.message
+            );
+        }
+        assert!(crate::jobs::opening_rack::total_racks(&catalan, 7).is_err());
     }
 
     /// U-RACK-3: every rack of every size is sorted, distinct, drawable from
@@ -470,7 +529,7 @@ mod tests {
                 let racks = distribution.enumerate_racks(size);
                 assert_eq!(
                     racks.len() as u64,
-                    RackIndex::new(&distribution, size).total(),
+                    RackIndex::new(&distribution, size).unwrap().total(),
                     "size {size}"
                 );
                 let distinct: std::collections::HashSet<&String> = racks.iter().collect();
@@ -488,7 +547,7 @@ mod tests {
         }
         // Past the bag: seven tiles cannot be drawn from a bag of six.
         assert!(tiny().enumerate_racks(7).is_empty());
-        assert_eq!(RackIndex::new(&tiny(), 7).total(), 0);
+        assert_eq!(RackIndex::new(&tiny(), 7).unwrap().total(), 0);
     }
 
     /// U-RACK-4: the leave universe is every size from 1 to the maximum, in
@@ -502,7 +561,7 @@ mod tests {
                 (1..=max).flat_map(|size| distribution.enumerate_racks(size)).collect();
             assert_eq!(leaves, by_size, "max {max}");
             let counted: u64 =
-                (1..=max).map(|size| RackIndex::new(&distribution, size).total()).sum();
+                (1..=max).map(|size| RackIndex::new(&distribution, size).unwrap().total()).sum();
             assert_eq!(leaves.len() as u64, counted, "max {max}");
             assert!(leaves.iter().all(|l| (1..=max).contains(&l.chars().count())));
         }
@@ -522,7 +581,7 @@ mod tests {
     fn a_range_is_the_racks_at_its_indices_and_stops_at_the_end() {
         let distribution = testdist();
         let size = 4;
-        let index = RackIndex::new(&distribution, size);
+        let index = RackIndex::new(&distribution, size).unwrap();
         let total = index.total();
         let mut enumerated = distribution.enumerate_racks(size);
         enumerated.reverse();
@@ -561,9 +620,9 @@ mod tests {
     #[test]
     fn real_english_has_3199724_racks_and_914624_leaves() {
         let english = english();
-        let racks = RackIndex::new(&english, 7);
+        let racks = RackIndex::new(&english, 7).unwrap();
         assert_eq!(racks.total(), 3_199_724);
-        let leaves: u64 = (1..=6).map(|size| RackIndex::new(&english, size).total()).sum();
+        let leaves: u64 = (1..=6).map(|size| RackIndex::new(&english, size).unwrap().total()).sum();
         assert_eq!(leaves, 914_624);
 
         for (id, rack) in [
@@ -588,7 +647,7 @@ mod tests {
     #[test]
     fn blanks_lead_their_racks_and_sit_at_the_end_of_the_index() {
         let english = english();
-        let index = RackIndex::new(&english, 2);
+        let index = RackIndex::new(&english, 2).unwrap();
         let raw = index.racks_in_enumeration_range(0, index.total());
         let first_blank = raw.iter().position(|r| r.contains('?')).unwrap();
         assert!(raw[first_blank..].iter().all(|r| r.starts_with('?')), "{raw:?}");
@@ -598,7 +657,7 @@ mod tests {
         assert_eq!(raw.last().map(String::as_str), Some("??"));
 
         let distribution = testdist();
-        let index = RackIndex::new(&distribution, 3);
+        let index = RackIndex::new(&distribution, 3).unwrap();
         let unranked: Vec<String> =
             (0..index.total()).map(|i| index.rack_at(i).unwrap()).collect();
         for rack in ["?AB", "?EE", "?AA"] {

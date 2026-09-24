@@ -8,6 +8,9 @@ filesystem at run time.
 - `english.csv` — MAGPIE's `data/letterdistributions/english.csv`, copied
   verbatim. Its sha256 is the one `contract-fixtures/` pins for
   `data-20251004.tgz`, and `racks::tests` checks that it still is.
+- `catalan.csv` — MAGPIE's `data/letterdistributions/catalan.csv`, copied
+  verbatim: the shipped distribution with multi-character letters (`L·L`,
+  `NY`, `QU`), which parses but has no rack space here.
 - `testdist.csv` — a small hand-written distribution with a blank and tile
   counts of 1 to 3, small enough to enumerate exhaustively.
 

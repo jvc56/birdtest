@@ -96,7 +96,7 @@ async fn a_generations_klv_is_built_from_its_rack_equities() {
 
     let magpie = magpie();
     let (scratch, distribution) = scratch_with_distribution().await;
-    let index = RackIndex::new(&distribution, 7);
+    let index = RackIndex::new(&distribution, 7).unwrap();
 
     let mut rows = String::new();
     for i in 0..index.total() {

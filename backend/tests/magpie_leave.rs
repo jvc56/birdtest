@@ -270,7 +270,7 @@ async fn klv_from(
     distribution: &LetterDistribution,
     rows: &HashMap<String, (i64, f64)>,
 ) -> Vec<u8> {
-    let index = RackIndex::new(distribution, 7);
+    let index = RackIndex::new(distribution, 7).unwrap();
     let mut csv = String::new();
     for i in 0..index.total() {
         let rack = index.rack_at(i).unwrap();
@@ -849,7 +849,7 @@ async fn a_rack_named_differently_is_refused_rather_than_valued_at_zero() {
     let scratch_root = ScratchRoot::new();
     let magpie = Magpie::new(magpie_bin(), 1);
     let distribution = LetterDistribution::parse(TESTDIST, "testdist").unwrap();
-    let index = RackIndex::new(&distribution, 7);
+    let index = RackIndex::new(&distribution, 7).unwrap();
     let rows: Vec<(String, i64, f64)> = (0..index.total())
         .map(|i| {
             (

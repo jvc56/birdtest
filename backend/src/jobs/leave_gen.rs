@@ -1075,7 +1075,7 @@ pub async fn seed_generation(
     generation: i32,
     distribution: &LetterDistribution,
 ) -> AppResult<i64> {
-    let index = std::sync::Arc::new(RackIndex::new(distribution, RACK_SIZE));
+    let index = std::sync::Arc::new(RackIndex::new(distribution, RACK_SIZE)?);
     let total = index.total();
 
     // Idempotent: a universe already seeded (a seeding started twice) is left
@@ -1549,7 +1549,7 @@ async fn generation_klv(
     // so this is a second check rather than the only one -- but it fails with
     // the job and generation in the message, where MAGPIE's failure would only
     // name a path inside a directory that no longer exists.
-    let expected = RackIndex::new(distribution, RACK_SIZE).total();
+    let expected = RackIndex::new(distribution, RACK_SIZE)?.total();
     if written != expected {
         return Err(AppError::internal(format!(
             "leave job {job_id} generation {generation} has {written} progress rows, but the \
