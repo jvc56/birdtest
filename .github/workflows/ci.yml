@@ -52,8 +52,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: backend
+      - uses: taiki-e/install-action@nextest
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      # nextest rather than `cargo test`: backend/.config/nextest.toml kills
+      # any test after ten minutes, so a hang fails the run instead of eating
+      # the job's timeout. It runs no doctests, hence the second step.
+      - run: cargo nextest run --locked --no-fail-fast
+      - run: cargo test --locked --doc
 
   frontend:
     runs-on: ubuntu-latest

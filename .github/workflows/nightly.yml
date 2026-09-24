@@ -71,6 +71,24 @@ jobs:
           --github-fixture-port 8481
           --github-fixture-host 0.0.0.0
 
+      # The opt-in Rust tests (#[ignore]: magpie_smoke, magpie_leave,
+      # magpie_routes), which need this MAGPIE and its testdata as well as a
+      # Postgres and a MinIO -- the stack's, which is still up. Nothing else
+      # runs them.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+      - uses: taiki-e/install-action@nextest
+      - name: The opt-in Rust tests against this MAGPIE
+        working-directory: backend
+        env:
+          TEST_DATABASE_URL: postgres://birdtest:birdtest@localhost:5432/birdtest
+          TEST_S3_ENDPOINT: http://localhost:9000
+          MAGPIE_BIN: ${{ github.workspace }}/magpie/bin/magpie
+          MAGPIE_ROOT: ${{ github.workspace }}/magpie
+        run: cargo nextest run --locked --run-ignored ignored-only --no-fail-fast
+
       - name: Backend log
         if: always()
         run: docker compose logs --no-color backend | tail -n 300
