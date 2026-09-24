@@ -259,7 +259,10 @@ pub fn fit_with_prior(matrix: &Matrix, anchor: usize, anchor_rating: f64, prior:
 
     let ratings = (0..n)
         .map(|i| {
-            let rating = 400.0 * gamma[i].log10();
+            // The anchor's rating is the input, not a round trip through its
+            // strength: `400 * log10(10^(r / 400))` is not `r` in floating
+            // point, and the pool's fixed point must be stored as stated.
+            let rating = if i == anchor { anchor_rating } else { 400.0 * gamma[i].log10() };
             // Fisher information for player i in log-strength units: each game
             // contributes p(1-p), which is largest between evenly matched
             // players and vanishes in a mismatch — the reason games against a
