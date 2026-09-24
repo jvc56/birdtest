@@ -38,6 +38,17 @@ fn session_cookie(state: &AppState, value: String) -> Cookie<'static> {
     cookie
 }
 
+/// The removal of a cookie set by the two functions around this one. A
+/// browser replaces a cookie only with one of the same path, and gives a
+/// cookie that names none the directory of the request that set it -- here
+/// `/api/auth` -- so a removal without `Path=/` removed nothing and the
+/// session cookie outlived the logout.
+fn removal(name: &'static str) -> Cookie<'static> {
+    let mut cookie = Cookie::from(name);
+    cookie.set_path("/");
+    cookie
+}
+
 /// Readable by JavaScript on purpose — the frontend echoes it back in the
 /// `X-CSRF-Token` header, which is what makes the double-submit check work.
 fn csrf_cookie(state: &AppState, value: String) -> Cookie<'static> {
@@ -79,7 +90,11 @@ async fn register(
         err = err.with_field("email", "must be a valid email address");
     }
     // Scored server-side; the client shows the same feedback but is not trusted.
-    let entropy = zxcvbn::zxcvbn(&body.password, &[username.as_str(), email.as_str()])
+    // The address's local part is context of its own: zxcvbn matches each
+    // input whole, so the address alone let `jsmith` through for
+    // `jsmith@example.com`.
+    let local_part = email.split('@').next().unwrap_or_default();
+    let entropy = zxcvbn::zxcvbn(&body.password, &[username.as_str(), email.as_str(), local_part])
         .map_err(|e| AppError::bad_request(format!("could not score password: {e}")))?;
     if entropy.score() < MIN_PASSWORD_SCORE {
         err = err.with_field("password", "too weak — choose a longer, less predictable password");
@@ -258,8 +273,8 @@ async fn logout(
 ) -> AppResult<(CookieJar, StatusCode)> {
     csrf::verify(&method, &headers, &jar)?;
     let jar = jar
-        .remove(Cookie::from(session::SESSION_COOKIE))
-        .remove(Cookie::from(csrf::CSRF_COOKIE));
+        .remove(removal(session::SESSION_COOKIE))
+        .remove(removal(csrf::CSRF_COOKIE));
     let _ = state;
     Ok((jar, StatusCode::NO_CONTENT))
 }
@@ -291,8 +306,8 @@ async fn sign_out_everywhere(
     .await?;
     tx.commit().await?;
     let jar = jar
-        .remove(Cookie::from(session::SESSION_COOKIE))
-        .remove(Cookie::from(csrf::CSRF_COOKIE));
+        .remove(removal(session::SESSION_COOKIE))
+        .remove(removal(csrf::CSRF_COOKIE));
     Ok((jar, StatusCode::NO_CONTENT))
 }
 
@@ -454,6 +469,6 @@ async fn confirm_password_reset(
 
     // Every session was revoked above; dropping the cookie just tidies the
     // caller's browser.
-    let jar = jar.remove(Cookie::from(session::SESSION_COOKIE));
+    let jar = jar.remove(removal(session::SESSION_COOKIE));
     Ok((jar, Json(MessageBody { message: "password updated" })))
 }
