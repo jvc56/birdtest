@@ -23,7 +23,8 @@
 #
 # Arguments are passed through to scripts/e2e_magpie.py (see its --help).
 #
-# Needs: docker (the postgres:16, minio/minio and minio/mc images), cargo,
+# Needs: docker (postgres:16 and Chainguard's MinIO server and client images --
+# MinIO no longer publishes its own), cargo,
 # python3 with `requests`, and a MAGPIE checkout with a `portable_release`
 # bin/magpie (`make magpie BUILD=portable_release`) and a download_data.sh
 # install in its data/.
@@ -94,7 +95,7 @@ log "scratch directory $WORK"
     -p "127.0.0.1:$PG_PORT:5432" postgres:16 >/dev/null
 "$REAL_DOCKER" run -d --name "$MINIO" --memory 512m \
     -e MINIO_ROOT_USER=birdtest -e MINIO_ROOT_PASSWORD=birdtestbirdtest \
-    -p "127.0.0.1:$MINIO_PORT:9000" minio/minio server /data >/dev/null
+    -p "127.0.0.1:$MINIO_PORT:9000" cgr.dev/chainguard/minio:latest server /data >/dev/null
 
 if [ "${TIER6_SKIP_BUILD:-}" != 1 ]; then
     log "building the backend"
@@ -110,7 +111,8 @@ for _ in $(seq 60); do
     sleep 1
 done
 "$REAL_DOCKER" exec "$PG" pg_isready -U birdtest -d birdtest >/dev/null || die "postgres did not come up"
-"$REAL_DOCKER" run --rm --network host --entrypoint sh minio/mc -c "
+"$REAL_DOCKER" run --rm --network host --entrypoint sh \
+    cgr.dev/chainguard/minio-client:latest-dev -c "
     for i in \$(seq 60); do
         mc alias set local http://127.0.0.1:$MINIO_PORT birdtest birdtestbirdtest >/dev/null 2>&1 && break
         sleep 1

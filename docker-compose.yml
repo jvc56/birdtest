@@ -50,8 +50,15 @@ services:
       timeout: 3s
       retries: 20
 
+  # Chainguard's builds of MinIO: MinIO stopped publishing its own images
+  # (minio/minio and minio/mc are gone from Docker Hub and quay.io), and every
+  # pull of them now fails. The server image is distroless; the client is the
+  # -dev variant because the bucket loop below needs a shell.
   minio:
-    image: minio/minio:latest
+    image: cgr.dev/chainguard/minio:latest
+    # Root, as MinIO's own image ran: this one defaults to uid 65532, which
+    # cannot write a miniodata volume that image created, and refuses to start.
+    user: "0"
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: birdtest
@@ -66,7 +73,7 @@ services:
   # KLVs into. Retries rather than relying on a MinIO healthcheck, since the
   # server image does not ship a reliable one.
   minio-init:
-    image: minio/mc:latest
+    image: cgr.dev/chainguard/minio-client:latest-dev
     depends_on:
       - minio
     entrypoint:

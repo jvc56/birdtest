@@ -44,7 +44,7 @@ jobs:
         run: |
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=birdtest -e MINIO_ROOT_PASSWORD=birdtestbirdtest \
-            minio/minio:latest server /data
+            cgr.dev/chainguard/minio:latest server /data
           until curl -fsS http://localhost:9000/minio/health/live; do sleep 1; done
       - uses: dtolnay/rust-toolchain@stable
         with:
