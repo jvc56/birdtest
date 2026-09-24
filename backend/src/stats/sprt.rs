@@ -308,4 +308,71 @@ mod tests {
         let result = evaluate(&sample, 100, 1_000, 50, 0.05, 0.05, -10.0, 10.0);
         assert_eq!(result.status, SprtStatus::TerminatedAtMax);
     }
+
+    // The numbers below were computed outside this code, in 40-digit decimal
+    // arithmetic straight from PLAN.md's formulas ("How the LLR is
+    // computed"): `expected_score(±10)` = 0.485612815834001343… and
+    // 0.514387184165998656…, and `llr = n·(µ₁-µ₀)·(mean-(µ₀+µ₁)/2)/variance`
+    // with the per-game or per-pair mean and variance its table gives. They
+    // pin the arithmetic, so a rewrite that agrees with itself but not with the
+    // documented test fails here.
+
+    /// I-STATS-9 (maths): the bounds at the schema's default α = β = 0.05 are
+    /// ln(0.05/0.95) and ln(0.95/0.05), ±2.944438979166440460…
+    #[test]
+    fn the_default_bounds_are_the_documented_logarithms() {
+        let (lower, upper) = bounds(0.05, 0.05);
+        approx(lower, -2.944_438_979_166_440_5, 1e-12);
+        approx(upper, 2.944_438_979_166_440_5, 1e-12);
+        // Asymmetric error rates move each bound on its own.
+        let (lower, upper) = bounds(0.05, 0.10);
+        approx(lower, (0.10f64 / 0.95).ln(), 1e-15);
+        approx(upper, 18f64.ln(), 1e-15);
+    }
+
+    /// I-STATS-1 (maths): W21 L7 D2 at ±10 Elo. Per game: mean 11/15, second
+    /// moment 43/60, variance 161/900, LLR 1.125953543425981809…
+    #[test]
+    fn a_games_tally_scores_the_documented_llr() {
+        let sample = Sample::from_games(&Tally { wins: 21, losses: 7, draws: 2 });
+        assert_eq!(sample.n, 30);
+        approx(sample.mean, 11.0 / 15.0, 1e-15);
+        approx(sample.variance, 161.0 / 900.0, 1e-15);
+        approx(llr(&sample, -10.0, 10.0), 1.125_953_543_425_981_8, 1e-12);
+    }
+
+    /// I-STATS-2 (maths): the pentanomial [1, 3, 7, 3, 2] is 16 pairs scored
+    /// i/4: mean 17/32, variance 71/1024, LLR 0.207499670225107383…
+    #[test]
+    fn a_pentanomial_scores_the_documented_llr() {
+        let sample = Sample::from_pentanomial(&Pentanomial { counts: [1, 3, 7, 3, 2] });
+        assert_eq!(sample.n, 16);
+        approx(sample.mean, 17.0 / 32.0, 1e-15);
+        approx(sample.variance, 71.0 / 1024.0, 1e-15);
+        approx(llr(&sample, -10.0, 10.0), 0.207_499_670_225_107_38, 1e-12);
+    }
+
+    /// I-STATS-9 (maths): a losing tally reaches H0. 28-72 over 100 games is
+    /// LLR -3.140060036229865496…, below the lower bound, so the test fails
+    /// (H0 accepted) once the floor is met; 29-71 is -2.934734021233334488…,
+    /// just inside, and is still running. The mirror images pass and run.
+    #[test]
+    fn a_losing_tally_reaches_h0_and_one_game_short_does_not() {
+        let games = |wins: u64| Sample::from_games(&Tally { wins, losses: 100 - wins, draws: 0 });
+        let at = |wins: u64| evaluate(&games(wins), 100, 100, 1_000_000, 0.05, 0.05, -10.0, 10.0);
+
+        let failed = at(28);
+        approx(failed.llr, -3.140_060_036_229_865_5, 1e-12);
+        assert_eq!(failed.status, SprtStatus::Failed);
+        let inside = at(29);
+        approx(inside.llr, -2.934_734_021_233_334_5, 1e-12);
+        assert_eq!(inside.status, SprtStatus::Running);
+
+        let passed = at(72);
+        approx(passed.llr, 3.140_060_036_229_865_5, 1e-12);
+        assert_eq!(passed.status, SprtStatus::Passed);
+        let inside = at(71);
+        approx(inside.llr, 2.934_734_021_233_334_5, 1e-12);
+        assert_eq!(inside.status, SprtStatus::Running);
+    }
 }

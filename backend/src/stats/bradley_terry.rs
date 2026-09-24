@@ -398,7 +398,26 @@ mod tests {
         few.add(0, 1, 50.0, 25.0);
         let mut many = matrix(2);
         many.add(0, 1, 5_000.0, 2_500.0);
-        assert!(fit(&many, 0, ANCHOR).ratings[1].stderr < fit(&few, 0, ANCHOR).ratings[1].stderr);
+        let (few, many) = (fit(&few, 0, ANCHOR), fit(&many, 0, ANCHOR));
+        assert!(many.ratings[1].stderr < few.ratings[1].stderr);
+
+        // And by exactly as much as the analytic standard error says:
+        // (400 / ln 10) / sqrt(n·p·(1-p)), with p = 1/2 for an even
+        // head-to-head. Computed outside this code: 49.134811709710… at 50
+        // games and a tenth of that at 5,000.
+        let close = |got: f64, want: f64| {
+            assert!((got - want).abs() < want * 1e-6, "{got} != {want}");
+        };
+        close(few.ratings[1].stderr, 49.134_811_709_710_03);
+        close(many.ratings[1].stderr, 4.913_481_170_971_004);
+
+        // Away from even the p(1-p) term matters: 75% over 100,000 games is
+        // 1.268655383138… Elo. The prior's two virtual draws move p by about
+        // 1e-5, so this is held to 0.1%.
+        let mut lopsided = matrix(2);
+        lopsided.add(0, 1, 100_000.0, 25_000.0);
+        let got = fit(&lopsided, 0, ANCHOR).ratings[1].stderr;
+        assert!((got - 1.268_655_383_138_294).abs() < 1.268_655_383_138_294e-3, "{got}");
     }
 
     /// The case that rules out freezing a rating once it is "established": A
