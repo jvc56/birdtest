@@ -67,3 +67,25 @@ jobs:
       - name: Backend log
         if: always()
         run: docker compose logs --no-color backend | tail -n 300
+
+  # TESTING.md's other two nightly checks, together: the schema applied to an
+  # empty database, and scripts/restore-roundtrip.sh -- dump, drop, restore,
+  # verify -- against it. Nothing ran the round trip before this, and its seed
+  # had fallen three NOT NULL columns behind the schema without anyone
+  # noticing. Only Postgres is needed; the script runs inside its container.
+  restore-roundtrip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Postgres
+        run: docker compose up -d --wait postgres
+      - name: Apply the schema to the empty database
+        run: |
+          docker compose exec -T postgres \
+            psql -U birdtest -d birdtest -v ON_ERROR_STOP=1 -q \
+            < backend/migrations/0001_initial.sql
+      - name: Dump, drop, restore, verify
+        run: ./scripts/restore-roundtrip.sh
+      - if: always()
+        run: docker compose down -v
