@@ -488,9 +488,10 @@ CREATE TABLE jobs (
 --   For autoplay in birdtest, always use 'best'.
 --
 -- sort_strategy (-s1 / -s2): 'equity' = sort by equity (score + leave value) — standard static
---   player; 'score' = sort by raw score only. A simming player sorts its candidates too, before
---   simulating them, so every row states one. Both static and simming players are valid in
---   games/game_pairs jobs.
+--   player; 'score' = sort by raw score only, for a static player. A simming player's candidates
+--   are the top plays by equity (autoplay generates them so whatever the row says), so a simmer
+--   is always 'equity': config creation refuses 'score' for one. Both static and simming
+--   players are valid in games/game_pairs jobs.
 --
 -- Simulation columns are all NULL for a static (no-sim) player.
 

@@ -588,6 +588,18 @@ async fn create_player_config(
         return Err(AppError::bad_request("player config is invalid")
             .with_field("num_plies", "a simming player must simulate at least 1 ply"));
     }
+    // A simmer's candidates are the top plays by equity: autoplay's simulating
+    // player generates them that way whatever the config says, so a `score`
+    // simmer would mean equity in a games job and score in an opening-rack one
+    // (whose executor sorts by the player's strategy) -- one config, two
+    // players. Refused rather than given two meanings.
+    if simming && body.sort_strategy.as_deref() == Some("score") {
+        return Err(AppError::bad_request("player config is invalid").with_field(
+            "sort_strategy",
+            "a simming player's candidates are the best plays by equity, in games jobs \
+             whatever the config says; use 'equity' (or leave it out) for a simmer",
+        ));
+    }
     // A simulation stops at whichever comes first, its iteration budget or its
     // time limit, and a time limit makes how far it gets depend on the
     // contributor's hardware: two honest workers would rank the same position
@@ -1208,50 +1220,69 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     }
 }
 
-/// An opening-rack job asks for a *ranked list* per rack, and a recorder type
-/// of `best` cannot produce one.
+/// An opening-rack job asks for a *ranked list* per rack, and a static player
+/// with a `best` recorder cannot produce one.
 ///
 /// `-r best` is `MOVE_RECORD_BEST`: move generation keeps the single top play
 /// and discards the rest, so a static player's batch comes back with exactly
 /// one move per rack however many the config says to record. Verified against
 /// MAGPIE: `generate` on an opening rack reports "1 of 1 plays" under
-/// `-r1 best` and 100 under `-r1 all`. (A simulating player ranks every play up
-/// to `num_plays` whatever its recorder, as autoplay's does; MAGPIE's
-/// opening-rack executor once used the recorder there too, so a `best` simmer
-/// reported the static top play -- PLAN.md.)
+/// `-r1 best` and 100 under `-r1 all`.
 ///
 /// Nothing downstream notices. The racks are analysed, the results are
 /// accepted, `racks_analyzed` climbs, and the corpus quietly holds a
 /// hundredth of the analysis it was configured for. So the contradiction is
 /// refused where it is introduced rather than discovered in the data later.
 ///
-/// `best` with `num_plays_recorded = 1` is coherent and stays legal: "the best
-/// opening play for every rack" is a real job. This rule is scoped to opening
-/// racks; a `games` job's players are applied through autoplay, where the
-/// simmer's candidate list is sized by `num_plays` rather than by the move
-/// recorder, and `best` is the right setting there (PLAN.md, "Position Capture
-/// From Games").
+/// A simulating player is not refused: its candidates are every play up to
+/// `num_plays` whatever its recorder, in opening-rack jobs as in autoplay, so
+/// a `best` simmer ranks as many moves as it records. (MAGPIE's opening-rack
+/// executor once generated them with the recorder, so a `best` simmer reported
+/// the static top play -- PLAN.md.) `best` with `num_plays_recorded = 1` is
+/// coherent for any player: "the best opening play for every rack" is a real
+/// job.
+///
+/// The same quiet shortfall comes from a `num_plays` below `num_plays_recorded`,
+/// static or simulating: an opening-rack analysis sizes its move list from
+/// `num_plays`, so no rack can come back with more, and the job would store
+/// fewer moves than it asks for.
 async fn validate_opening_rack_player(
     conn: &mut sqlx::PgConnection,
     player_config_id: Uuid,
 ) -> AppResult<()> {
-    let row = sqlx::query_as::<_, (String, i32)>(
-        "SELECT recorder_type, num_plays_recorded FROM player_configs WHERE id = $1",
+    let (recorder, recorded, plies, plays) = sqlx::query_as::<_, (String, i32, i32, i32)>(
+        "SELECT recorder_type, num_plays_recorded, num_plies, num_plays
+         FROM player_configs WHERE id = $1",
     )
     .bind(player_config_id)
     .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| AppError::bad_request("player config not found"))?;
 
-    if row.0 == "best" && row.1 > 1 {
+    if recorder == "best" && recorded > 1 && plies == 0 {
         return Err(AppError::bad_request(
-            "an opening-rack job cannot rank moves with a 'best' recorder",
+            "an opening-rack job cannot rank moves with a static 'best' recorder",
         )
         .with_field(
             "player_config_id",
             format!(
-                "this config records the single best move, so every rack would come back                  with one move rather than the {} it asks for. Use a config with                  recorder_type 'all' or 'equity', or set num_plays_recorded to 1.",
-                row.1
+                "this static config records the single best move, so every rack would come \
+                 back with one move rather than the {recorded} it asks for. Use a config with \
+                 recorder_type 'all' or 'equity', a simulating one, or set \
+                 num_plays_recorded to 1."
+            ),
+        ));
+    }
+    if plays < recorded {
+        return Err(AppError::bad_request(
+            "an opening-rack job cannot record more moves than its player generates",
+        )
+        .with_field(
+            "player_config_id",
+            format!(
+                "this config generates {plays} plays per rack, so every rack would come back \
+                 with at most {plays} moves rather than the {recorded} it asks for. Use a \
+                 config with num_plays of at least {recorded}, or a lower num_plays_recorded."
             ),
         ));
     }

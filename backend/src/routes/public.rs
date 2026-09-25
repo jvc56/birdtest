@@ -291,21 +291,9 @@ async fn job_results(
                          ORDER BY r.submitted_at DESC, r.id DESC
                          LIMIT $6"
                     .to_string(),
-                Some(ranges) => merged_pages(
-                    ranges.iter().map(|claims| {
-                        format!(
-                            "SELECT r.id, r.task_id, r.rack, r.num_moves, r.submitted_at,
-                                    r.task_claim_id, cl.completed_at AS at
-                             FROM ({claims}) cl
-                             JOIN position_analysis_records r ON r.task_claim_id = cl.id
-                             WHERE $4::timestamptz IS NULL
-                                   OR (cl.completed_at, r.id) < ($4, $5)
-                             ORDER BY cl.completed_at DESC, r.id DESC
-                             LIMIT $6"
-                        )
-                    }),
-                    "at DESC, id DESC",
-                ),
+                Some(ranges) => {
+                    merged_pages(ranges.iter().map(|c| opening_rack_page(c)), "at DESC, id DESC")
+                }
             };
             let sql = format!(
                 "WITH page AS ({page})
@@ -377,17 +365,7 @@ async fn job_results(
                          LIMIT $6"
                     .to_string(),
                 Some(ranges) => merged_pages(
-                    ranges.iter().map(|claims| {
-                        format!(
-                            "SELECT r.task_claim_id, cl.completed_at AS at
-                             FROM ({claims}) cl
-                             JOIN game_results r ON r.task_claim_id = cl.id
-                             WHERE $4::timestamptz IS NULL
-                                   OR (cl.completed_at, cl.id) < ($4, $5)
-                             ORDER BY cl.completed_at DESC, cl.id DESC
-                             LIMIT $6"
-                        )
-                    }),
+                    ranges.iter().map(|c| game_page(c)),
                     "at DESC, task_claim_id DESC",
                 ),
             };
@@ -607,6 +585,15 @@ async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<Worker
 /// completed_at)`: only a completed claim has a `completed_at`, so the rest
 /// sit at the NULL end, outside it.
 ///
+/// Past the cursor's time is the range's own bound, `completed_at <= $4`; the
+/// pages built on it break the tie at exactly `$4` as `NOT (completed_at = $4
+/// AND id >= $5)`, which is `(completed_at, id) < ($4, $5)` inside the range.
+/// Not written as that row comparison: Postgres estimates one from its first
+/// column, so it applied the time bound's selectivity twice, expected fewer
+/// rows than the page, and dropped the ordered scan that stops at the page --
+/// reading the contributor's whole range, or every position record in the
+/// fleet (0.5-2 s), for an old cursor anyone can send.
+///
 /// There is deliberately no `state = 'completed'`. It says nothing more, and
 /// it lets the planner prove the fleet-wide `task_claims_completed_idx` usable,
 /// which it then chose for a heavy contributor on a large job -- judging their
@@ -629,6 +616,33 @@ fn filtered_claims(worker: &WorkerFilter) -> Vec<String> {
         ranges.push(range("claimed_by_anon_uuid", "$3"));
     }
     ranges
+}
+
+/// One identity's opening-rack page over its claim range (`filtered_claims`).
+fn opening_rack_page(claims: &str) -> String {
+    format!(
+        "SELECT r.id, r.task_id, r.rack, r.num_moves, r.submitted_at,
+                r.task_claim_id, cl.completed_at AS at
+         FROM ({claims}) cl
+         JOIN position_analysis_records r ON r.task_claim_id = cl.id
+         WHERE $4::timestamptz IS NULL
+               OR NOT (cl.completed_at = $4 AND r.id >= $5)
+         ORDER BY cl.completed_at DESC, r.id DESC
+         LIMIT $6"
+    )
+}
+
+/// One identity's games page over its claim range (`filtered_claims`).
+fn game_page(claims: &str) -> String {
+    format!(
+        "SELECT r.task_claim_id, cl.completed_at AS at
+         FROM ({claims}) cl
+         JOIN game_results r ON r.task_claim_id = cl.id
+         WHERE $4::timestamptz IS NULL
+               OR NOT (cl.completed_at = $4 AND cl.id >= $5)
+         ORDER BY cl.completed_at DESC, cl.id DESC
+         LIMIT $6"
+    )
 }
 
 /// One identity's page, or two merged. Each page is complete on its own --
@@ -1172,6 +1186,12 @@ mod tests {
         let one = WorkerFilter { user_id: Some(Uuid::nil()), anon_uuid: None };
         assert_eq!(filtered_claims(&one).len(), 1);
 
+        // The tie at the cursor's time is broken by a negation, not a row
+        // comparison the planner would estimate from its time column again.
+        for page in ranges.iter().flat_map(|c| [opening_rack_page(c), game_page(c)]) {
+            assert!(!page.contains(") < ($4"), "{page}");
+            assert!(page.contains("NOT (cl.completed_at = $4 AND"), "{page}");
+        }
         let merged = merged_pages(ranges.into_iter(), "at DESC, id DESC");
         assert_eq!(merged.matches("LIMIT $6").count(), 1, "the merge's own; each page brings one");
         assert!(merged.contains(") UNION ALL ("), "{merged}");

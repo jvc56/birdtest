@@ -71,7 +71,7 @@ at tier 5 names a symptom.
 | 1 Unit | 167 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
 | 1F Frontend unit | 112 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 145 | `backend/tests/`: `leave_gen.rs` (28), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 169 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (18), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
+| 3 API | 170 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 509 backend tests (the per-tier counts above are
+--run-ignored all` runs 510 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
 they had drifted by up to 17).
 
@@ -985,6 +985,16 @@ job creation touches needs one caller here.
   more than 10 recorded plies (what a captured position keeps) is `400`.
   *(Covered: `jobs::a_player_config_past_magpies_limits_is_refused`.)*
   (Fifteenth audit.)
+- `I-JOB-14b` A simming player config with `sort_strategy = 'score'` is `400`:
+  a simmer's candidates are the top plays by equity in a games job whatever
+  the row says, so `score` would give one config two meanings. A static one
+  may sort by score (twenty-ninth audit). *(Covered:
+  `admin_api::a_simming_player_config_is_bounded_by_iterations_not_time`.)*
+- `I-JOB-14c` An opening-rack job refuses a static player with a `best`
+  recorder and more than one recorded play, and any player whose `num_plays` is
+  below its `num_plays_recorded`: each would store fewer moves per rack than it
+  asks for. A `best` simmer is accepted (twenty-ninth audit). *(Covered:
+  `admin_api::an_opening_rack_job_cannot_rank_moves_with_a_best_recorder`.)*
 
 ### `I-SUBMIT-*` — result submission (`jobs/mod.rs`, `jobs/*.rs`)
 
@@ -1848,7 +1858,9 @@ below.
 - `A-PUBLIC-3c` A contributor's claim range names no `state`, so the planner
   cannot choose the fleet-wide completed-claims index for it, and a name that
   is two identities is two pages merged, not one sort over both identities'
-  claims (twenty-eighth audit). *(Covered:
+  claims (twenty-eighth audit). Each page breaks the tie at the cursor's time
+  with a negation, not a row comparison the planner estimates from the time
+  column a second time (twenty-ninth audit). *(Covered:
   `routes::public::tests::a_contributors_page_is_read_through_their_own_index`.)*
 - `A-PUBLIC-4` `rack_lookup` finds an analysed rack, however it is typed, with
   its whole ranked list. A rack with no analysis yet is a `200` with an empty
@@ -1933,6 +1945,10 @@ silent.
   `cloned_from_id` that names no config is a `400` on that field, not the
   generic foreign-key `409` (twenty-first audit). *(Covered:
   `boundaries::a_player_config_refuses_input_data_of_the_wrong_role`.)*
+- `A-MIGRATE-1` A rolled-back image starts against a schema a newer one
+  migrated (a migration the database has and the binary does not), and an
+  applied migration whose file changed is still refused (twenty-ninth audit).
+  *(Covered: `boundaries::a_rolled_back_image_starts_on_a_newer_schema`.)*
 - `A-BOUND-4` A valid result bigger than axum's 2 MB default — a capture batch
   — is accepted, which only the route's own `MAX_RESULT_BYTES` limit allows.
   *(Covered: `boundaries::a_capture_result_of_several_megabytes_is_accepted`.)*
@@ -2650,6 +2666,20 @@ GitHub Actions.
 
 Nightly failures are an alert rather than a blocked merge, because they are
 slower and more environment-sensitive than a pull request should wait on.
+
+**While the pin is unpushed.** GitHub serves a commit only once it is on a
+branch it can reach, so until `docker/Dockerfile`'s `MAGPIE_COMMIT` is pushed to
+`birdtest-contribute`:
+- `images`, `e2e` and `magpie-contract` fail: the image fetches the commit, and
+  the other two check it out.
+- The nightly's pin leg fails at its checkout. Its head leg builds whatever the
+  branch's remote head is, which may be older than the backend's
+  `MIN_MAGPIE_VERSION` allows.
+- `backend`, `frontend` and `terraform` are unaffected.
+
+Push the pin before relying on CI. Once pushed, it must stay reachable: a
+rebase or force-push of the branch past it breaks rebuilding that release,
+and so rolling back to it.
 
 ---
 

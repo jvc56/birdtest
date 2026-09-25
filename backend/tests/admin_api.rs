@@ -437,16 +437,16 @@ async fn only_a_completed_job_can_be_exported() {
     assert_eq!(recorded, 1);
 }
 
-/// An opening-rack job whose player records only the best move cannot produce
-/// a ranked list, and nothing downstream would say so.
+/// An opening-rack job whose static player records only the best move cannot
+/// produce a ranked list, and nothing downstream would say so.
 ///
 /// `-r best` is MOVE_RECORD_BEST: move generation keeps the top play and
 /// discards the rest, so every rack comes back with exactly one move whatever
-/// `num_plays_recorded` says -- and for a simming player there is nothing left
-/// for the simulation to choose between. Verified against MAGPIE, which
-/// reports "1 of 1 plays" under `-r1 best` and 100 under `-r1 all`. The
-/// results look perfectly well-formed, so the misconfiguration is refused
-/// where it is made.
+/// `num_plays_recorded` says. Verified against MAGPIE, which reports "1 of 1
+/// plays" under `-r1 best` and 100 under `-r1 all`. The results look perfectly
+/// well-formed, so the misconfiguration is refused where it is made. A
+/// simulating player ranks every play up to `num_plays` whatever its recorder,
+/// so a `best` simmer is accepted.
 #[tokio::test]
 async fn an_opening_rack_job_cannot_rank_moves_with_a_best_recorder() {
     let db = TestDb::new().await;
@@ -460,19 +460,28 @@ async fn an_opening_rack_job_cannot_rank_moves_with_a_best_recorder() {
     let kwg = db.input_data("kwg", "NWL23").await;
     let klv = db.input_data("klv", "NWL23").await;
 
-    let make_player = |name: &'static str, recorder: &'static str, recorded: i32| {
+    let winpct = db.input_data("winpct", "winpct").await;
+    let make_player = |name: &'static str, recorder: &'static str, recorded: i32, sim: bool| {
         let headers = headers.clone();
         let app = app.clone();
         async move {
+            let mut config = json!({
+                "name": name, "recorder_type": recorder, "sort_strategy": "equity",
+                "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": recorded,
+            });
+            if sim {
+                config["num_plies"] = json!(2);
+                config["num_plays"] = json!(12);
+                config["max_iterations"] = json!(100);
+                config["time_limit_secs"] = json!(0);
+                config["winpct_id"] = json!(winpct);
+            }
             let (status, body) = send(
                 &app,
                 post_json(
                     "/api/admin/player-configs",
                     &headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(),
-                    json!({
-                        "name": name, "recorder_type": recorder, "sort_strategy": "equity",
-                        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": recorded,
-                    }),
+                    config,
                 ),
             )
             .await;
@@ -502,21 +511,34 @@ async fn an_opening_rack_job_cannot_rank_moves_with_a_best_recorder() {
     };
 
     // Ten moves asked for, one move possible.
-    let contradictory = make_player("best-ten", "best", 10).await;
+    let contradictory = make_player("best-ten", "best", 10, false).await;
     let (status, body) = create_job(contradictory).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["fields"][0]["field"], "player_config_id", "{body}");
 
     // "The best opening play for every rack" is a real job, and `best` is
     // exactly the right recorder for it.
-    let single = make_player("best-one", "best", 1).await;
+    let single = make_player("best-one", "best", 1, false).await;
     let (status, body) = create_job(single).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 
     // And a recorder that keeps candidates may rank as many as it likes.
-    let ranking = make_player("all-ten", "all", 10).await;
+    let ranking = make_player("all-ten", "all", 10, false).await;
     let (status, body) = create_job(ranking).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A simulating player ranks every play up to num_plays, whatever its
+    // recorder: a `best` simmer asking for ten is a working config.
+    let simmer = make_player("best-ten-sim", "best", 10, true).await;
+    let (status, body) = create_job(simmer).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // No player, static or simulating, reports more moves than it generates:
+    // twenty recorded from twelve candidates would store twelve.
+    let short = make_player("all-twenty-sim", "all", 20, true).await;
+    let (status, body) = create_job(short).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["fields"][0]["message"].as_str().unwrap().contains("12 plays"), "{body}");
 }
 
 /// An identity's contribution counter spans every job it ever worked on, so a
@@ -921,6 +943,20 @@ async fn a_simming_player_config_is_bounded_by_iterations_not_time() {
         ("a-limit", json!({ "max_iterations": 100, "time_limit_secs": 30 }), StatusCode::BAD_REQUEST, Some("time_limit_secs")),
         ("no-budget", json!({ "time_limit_secs": 0 }), StatusCode::BAD_REQUEST, Some("max_iterations")),
         ("bounded", json!({ "max_iterations": 100, "time_limit_secs": 0 }), StatusCode::CREATED, None),
+        // A simmer's candidates are the top plays by equity in a games job
+        // whatever it says, so `score` would mean two players (A-ADMIN-PC-2b).
+        (
+            "score-simmer",
+            json!({ "max_iterations": 100, "time_limit_secs": 0, "sort_strategy": "score" }),
+            StatusCode::BAD_REQUEST,
+            Some("sort_strategy"),
+        ),
+        (
+            "equity-simmer",
+            json!({ "max_iterations": 100, "time_limit_secs": 0, "sort_strategy": "equity" }),
+            StatusCode::CREATED,
+            None,
+        ),
     ];
     for (name, extra, expected, field) in cases {
         let mut body = json!({

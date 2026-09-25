@@ -127,10 +127,10 @@
       </select>
       <p class="mt-1 text-xs text-muted-foreground">
         This decides what move generation <em>keeps</em>, not which move is played.
-        <strong>best</strong> throws away every candidate but the winner, so a config using it
-        can only ever report one move per position — and a simmer using it has nothing to choose
-        between, which makes plies and plays do nothing. Right for games jobs, where only the
-        move played matters. An opening-rack job wants a ranking, so it needs
+        <strong>best</strong> throws away every candidate but the winner, so a static config
+        using it can only ever report one move per position. A simmer is unaffected: it ranks
+        every play up to its number of plays, whatever the recorder. Right for games jobs, where
+        only the move played matters. A static opening-rack player wants a ranking, so it needs
         <strong>all</strong> or <strong>equity</strong> unless it records exactly one play.
       </p>
     </div>
@@ -196,7 +196,7 @@
       <label class="label" for="sort">Sort strategy (-s)</label>
       <select id="sort" class="input" bind:value={sortStrategy}>
         <option value="equity">equity — score plus leave value (standard static player)</option>
-        <option value="score">score — raw score only</option>
+        <option value="score">score — raw score only (static players; a simmer ranks by equity)</option>
       </select>
     </div>
   {/if}

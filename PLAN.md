@@ -272,7 +272,7 @@ of information loss. A client that omits the field reported everything it
 ranked, which is what builds before the field was added did, so the list's own
 length stands in for it.
 
-**An opening-rack job cannot use a `best` recorder to rank moves.** `-r best`
+**An opening-rack job cannot use a static `best` recorder to rank moves.** `-r best`
 is `MOVE_RECORD_BEST`: move generation keeps the single top play and discards
 the rest, so a static player's rack comes back with one move however many
 `num_plays_recorded` asks for. (A simulating player's candidates are every
@@ -282,10 +282,12 @@ simmer — legal at `num_plays_recorded` 1 — had one candidate, and reported
 the static top play as the simulation's; twenty-eighth audit.) Nothing downstream
 notices: the racks are analysed, the results accepted, `racks_analyzed` climbs,
 and the corpus quietly holds a fraction of the analysis the job was configured
-for. Job creation therefore refuses `recorder_type = 'best'` together with a
-`num_plays_recorded` above 1, and names the remedy. `best` with
-`num_plays_recorded` of 1 stays legal, because "the best opening play for every
-rack" is a real job. The rule is scoped to opening racks: a `games` job's
+for. Job creation therefore refuses a static player (`num_plies` 0) with
+`recorder_type = 'best'` and a `num_plays_recorded` above 1, and names the
+remedy. A simulating one is accepted: it ranks as many moves as it records.
+`best` with `num_plays_recorded` of 1 stays legal for any player, because "the
+best opening play for every rack" is a real job. The rule is scoped to opening
+racks: a `games` job's
 players go through autoplay, where a simmer's candidate list is sized by
 `num_plays` rather than by the move recorder, and `best` is right there.
 
@@ -1199,9 +1201,14 @@ What the numbers settled:
   the fleet-wide completion index instead, and did for a heavy contributor on
   a large job, walking every completion in the fleet (6.2 s). A name that is
   both an account and a pseudonym is two pages, one per identity, merged; as
-  one sort over both identities' claims it read all of them (1.3–2.5 s). The
-  opening-rack page is chosen before its best moves and accounts are joined,
-  so only its fifty rows are.
+  one sort over both identities' claims it read all of them (1.3–2.5 s). Past
+  the first page the tie at the cursor's time is broken with
+  `NOT (completed_at = $4 AND id >= $5)`, not the equivalent row comparison:
+  Postgres estimates a row comparison from its time column, counted the range's
+  own bound twice, and for an old cursor read the contributor's whole range or
+  every position record in the fleet (0.5–2 s). The opening-rack page is
+  chosen before its best moves and accounts are joined, so only its fifty rows
+  are.
 - **A leave claim neither sorts the generation nor reads what is staged.**
   Selection used to order on `(occurrence_count, rack)` through an index on the
   count alone. Counts tie in their millions — every rack starts at zero and the
@@ -3382,8 +3389,8 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 
 | JSON field | Setting | Notes |
 |---|---|---|
-| `recorder_type` | `-rN` | `best` \| `equity` \| `all`. `best` is right for games and game pairs, where autoplay keeps the one move it plays; an opening-rack job that keeps more than one move per rack needs `equity` or `all`, and job creation refuses `best` there |
-| `sort_strategy` | `-sN` | `equity` or `score`, for every player: a simmer sorts its candidates before simulating them |
+| `recorder_type` | `-rN` | `best` \| `equity` \| `all`. `best` is right for games and game pairs, where autoplay keeps the one move it plays; a static opening-rack player that keeps more than one move per rack needs `equity` or `all`, and job creation refuses `best` there. A simmer ranks every play up to `num_plays` whatever its recorder |
+| `sort_strategy` | `-sN` | `equity` or `score` for a static player. A simmer's candidates are the top plays by equity (autoplay generates them so whatever this says), so a simmer is always `equity` and config creation refuses `score` for one |
 | `lexicon` | `-lN` | **Required.** Every player names its own; there is no job lexicon to fall back to. |
 | `leaves` | `-kN` | **Required**, for the same reason. |
 | `win_pct_model` | `-winpct` | Null for a static player, which never loads one |
@@ -4706,9 +4713,10 @@ Beyond role matching, creation enforces six rules the schema cannot express:
   static player has none and static-versus-simmer is the mix a games job most
   often wants. Skipped when both slots name the same config, which
   is a legal and useful degenerate case.
-- **A recorder that can rank, for opening racks.** `recorder_type = 'best'` with
-  `num_plays_recorded` above 1 is refused: `best` records one move, so the job
-  would store one move per rack while claiming to store ten. See
+- **A recorder that can rank, for opening racks.** A static player with
+  `recorder_type = 'best'` and `num_plays_recorded` above 1 is refused: `best`
+  records one move, so the job would store one move per rack while claiming to
+  store ten. A simmer ranks every play up to `num_plays`, whatever its recorder. See
   [How much of an analysis is kept](#how-much-of-an-analysis-is-kept).
 - **A capture job's simmers consider at least what is captured.** With
   `capture_positions` on, MAGPIE raises each simming player's `num_plays` to
@@ -5598,9 +5606,10 @@ CREATE TABLE jobs (
 --   For autoplay in birdtest, always use 'best'.
 --
 -- sort_strategy (-s1 / -s2): 'equity' = sort by equity (score + leave value) — standard static
---   player; 'score' = sort by raw score only. A simming player sorts its candidates too, before
---   simulating them, so every row states one. Both static and simming players are valid in
---   games/game_pairs jobs.
+--   player; 'score' = sort by raw score only, for a static player. A simming player's candidates
+--   are the top plays by equity (autoplay generates them so whatever the row says), so a simmer
+--   is always 'equity': config creation refuses 'score' for one. Both static and simming
+--   players are valid in games/game_pairs jobs.
 --
 -- Simulation columns are all NULL for a static (no-sim) player.
 
@@ -6700,8 +6709,8 @@ the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
 `AUDIT_FINDINGS_18.md`, the twenty-third's `AUDIT_FINDINGS_19.md`, the
 twenty-fourth's `AUDIT_FINDINGS_20.md`, the twenty-fifth's
 `AUDIT_FINDINGS_21.md`, the twenty-sixth's `AUDIT_FINDINGS_22.md`, the
-twenty-seventh's `AUDIT_FINDINGS_23.md` and the twenty-eighth's
-`AUDIT_FINDINGS_24.md`.
+twenty-seventh's `AUDIT_FINDINGS_23.md`, the twenty-eighth's
+`AUDIT_FINDINGS_24.md` and the twenty-ninth's `AUDIT_FINDINGS_25.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -7440,6 +7449,14 @@ fifteen minutes. The `low storage` mail before each autoscaling step
 (RDS-EVENT-0089, over 90% of the current allocation) is routine; the ones that
 matter are allocation past 80% of the ceiling (RDS-EVENT-0225, `notification`)
 and the ceiling reached (RDS-EVENT-0224, `failure`).
+
+It also carries the site being down (`infra/ecs.tf`): no healthy backend or
+frontend target behind the load balancer for ten minutes. Nothing else would
+report a crash-looping task, a health check that never passes, or a rollback
+onto a schema its image refuses. Ten minutes, not one, because the service
+keeps no healthy task through a deploy, and migrations run inside the health
+check's grace. The alarms exist only while `desired_count` is above 0, so a
+first apply or RUNBOOK §5's first step does not page.
 
 Layer 3 had a design choice of its own. Having the backend list the backup bucket
 directly would require giving the task role `ListBucket` / `GetObject` on it,

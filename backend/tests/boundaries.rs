@@ -998,3 +998,29 @@ async fn malformed_paths_and_queries_answer_json() {
     assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED, "{response:?}");
     assert_eq!(response.body["code"], "method_not_allowed", "{response:?}");
 }
+
+/// A-MIGRATE-1: a rolled-back image starts against the schema a newer one
+/// migrated -- a migration the database has and the binary does not is
+/// allowed -- but an applied migration whose file changed is still refused.
+/// sqlx refuses the first by default, and with no healthy task kept through
+/// a deploy the rolled-back service crash-looped with nothing serving.
+#[tokio::test]
+async fn a_rolled_back_image_starts_on_a_newer_schema() {
+    let db = TestDb::new().await;
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations
+             (version, description, success, checksum, execution_time)
+         VALUES (99999999999999, 'a later release', TRUE, '\\x00', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    birdtest::db::migrate(&db.pool).await.expect("the newer migration is left alone");
+
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\x01' WHERE version = 1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let err = birdtest::db::migrate(&db.pool).await.expect_err("an edited migration");
+    assert!(format!("{err:#}").contains("modified"), "{err:#}");
+}

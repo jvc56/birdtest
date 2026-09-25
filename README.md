@@ -259,6 +259,14 @@ docker compose exec postgres \
 docker compose restart backend
 ```
 
+After release, a schema change is a new numbered migration, never an edit, and
+it is **additive**: new tables, new nullable or defaulted columns, new
+indexes. A drop or a rename waits for a later release, once no image that
+reads the old shape can run. The previous image then runs on the newer
+schema. The backend starts against a database with migrations it does not
+know (it refuses only an applied migration whose file changed), so rolling
+back is an image change (RUNBOOK, "Rolling back a deploy").
+
 ### Without Docker
 
 The backend and frontend still run directly on the host if you would rather:

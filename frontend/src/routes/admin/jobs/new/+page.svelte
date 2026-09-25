@@ -49,14 +49,17 @@
 
   // The combination job creation refuses, surfaced before the submit rather
   // than as the error that comes back from it: `-r best` is MOVE_RECORD_BEST,
-  // so movegen keeps one play and the rest of the ranking never exists.
+  // so a static player's movegen keeps one play and the rest of the ranking
+  // never exists. A simmer ranks every play up to num_plays whatever its
+  // recorder, so it is not refused.
   $: selectedConfig = configs.find((config) => config.id === playerConfigId);
   $: openingRackConflict =
     jobType === 'opening_rack' &&
     selectedConfig &&
     selectedConfig.recorder_type === 'best' &&
-    selectedConfig.num_plays_recorded > 1
-      ? `${selectedConfig.name} records only the best move, so this job would store one play per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
+    selectedConfig.num_plays_recorded > 1 &&
+    selectedConfig.num_plies === 0
+      ? `${selectedConfig.name} is static and records only the best move, so this job would store one play per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
       : null;
 
   function firstOfRole(role: string): string {
@@ -223,13 +226,14 @@
     {#if openingRackConflict}
       <p class="field-error">
         {openingRackConflict} Pick a config whose recorder is <strong>all</strong> or
-        <strong>equity</strong>, or one that records a single play.
+        <strong>equity</strong>, a simulating one, or one that records a single play.
       </p>
     {/if}
     <p class="text-xs text-muted-foreground">
-      The recorder is shown because it decides whether this job can rank anything at all:
-      <strong>best</strong> keeps only the top move, so every rack would come back with one
-      analysis however many plays the config says to record. Tasks address <em>ranges</em> of the
+      The recorder is shown because it decides whether a static player can rank anything at
+      all: <strong>best</strong> keeps only the top move, so every rack would come back with one
+      analysis however many plays the config says to record. A simulating player ranks every
+      play up to its number of plays, whatever its recorder. Tasks address <em>ranges</em> of the
       rack space and are generated as workers claim them, so creating the job writes no rows
       however large the space is.
     </p>

@@ -152,6 +152,40 @@ resource "aws_lb_target_group" "frontend" {
   tags = local.tags
 }
 
+# The site is down: no healthy target behind the load balancer for ten
+# minutes. Nothing else alarms on it -- a crash-looping task, a rollback onto a
+# schema it refuses, a health check that never passes -- and the service keeps
+# no healthy task through a deploy, so ten minutes, not one, clears a deploy
+# (migrations run inside the health check grace) without paging. Only while
+# the service is meant to run: at desired_count 0 (a first apply, RUNBOOK §5's
+# first step) there is nothing to be healthy. The task runs both containers,
+# but each has its own target group and health check.
+resource "aws_cloudwatch_metric_alarm" "no_healthy_targets" {
+  for_each = var.desired_count > 0 ? {
+    backend  = aws_lb_target_group.backend.arn_suffix
+    frontend = aws_lb_target_group.frontend.arn_suffix
+  } : {}
+
+  alarm_name        = "${local.name}-${each.key}-down"
+  alarm_description = "birdtest's ${each.key} has had no healthy target for ten minutes"
+  namespace         = "AWS/ApplicationELB"
+  metric_name       = "HealthyHostCount"
+  dimensions = {
+    TargetGroup  = each.value
+    LoadBalancer = aws_lb.main.arn_suffix
+  }
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 10
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  # No datapoints at all -- as with nothing registered -- counts as down.
+  treat_missing_data = "breaching"
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+  tags               = local.tags
+}
+
 # Plain HTTP only redirects. The backend runs with SECURE_COOKIES=true, and a
 # browser discards a Secure cookie set over http, so serving the app on port 80
 # would make signing in silently impossible -- and would send session cookies

@@ -60,9 +60,16 @@ pub async fn connect_read(database_url: &str) -> Result<PgPool> {
 
 /// Applied at startup, before the server binds, so a container never serves
 /// traffic against an out-of-date schema.
+///
+/// A migration the database has and this binary does not is allowed: that is
+/// a rollback, the previous image started against the schema the newer one
+/// migrated. sqlx refuses it by default, and with no healthy task kept
+/// through a deploy the rolled-back service crash-looped with nothing
+/// serving. Migrations after release are additive so the previous image can
+/// run on them (README, "After a schema change"; RUNBOOK, "Rolling back a
+/// deploy"). An applied migration whose file *changed* is still refused.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
-    sqlx::migrate!("./migrations")
-        .run(pool)
-        .await
-        .context("failed to run migrations")
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.set_ignore_missing(true);
+    migrator.run(pool).await.context("failed to run migrations")
 }
