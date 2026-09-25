@@ -1004,6 +1004,11 @@ async fn a_pool_that_could_rate_no_one_is_refused() {
         ("a variant no job has", body("scrabble", scope.letterdist, 2000.0)),
         ("a layout as the distribution", body("classic", scope.layout, 2000.0)),
         ("an overflowing anchor rating", body("classic", scope.letterdist, 200_000.0)),
+        ("an anchor that does not exist", {
+            let mut b = body("classic", scope.letterdist, 2000.0);
+            b["anchor_player_config_id"] = json!(Uuid::new_v4());
+            b
+        }),
     ] {
         let (status, response) = send(
             &app,
@@ -1063,6 +1068,46 @@ async fn adding_and_removing_a_member_each_refit_the_pool() {
     .unwrap();
     assert_eq!(triggers, ["membership", "membership"]);
     assert_eq!(run_count(&db, f.pool).await, 3);
+}
+
+/// A-RATE-4b: adding a config that does not exist is a 400 on its field, and
+/// to a pool that does not exist a 404 -- not the 409 "still referenced" a
+/// bare foreign-key failure maps to. Neither refits anything.
+#[tokio::test]
+async fn adding_an_unknown_member_or_to_an_unknown_pool_says_which() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let f = fixture(&db).await;
+    let headers = admin_headers(&state.cfg, f.admin);
+    let runs = run_count(&db, f.pool).await;
+
+    let ghost = Uuid::new_v4();
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/rating-pools/{}/members", f.pool),
+            &headers,
+            Some(json!({ "player_config_id": ghost })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "player_config_id", "{body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/rating-pools/{}/members", Uuid::new_v4()),
+            &headers,
+            Some(json!({ "player_config_id": f.rival })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(run_count(&db, f.pool).await, runs);
 }
 
 /// A-RATE-5: removing the anchor is refused, with a message that says what to

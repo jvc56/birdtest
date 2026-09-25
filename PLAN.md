@@ -553,8 +553,10 @@ scale.
   rating carries `connected_to_anchor`, and the page shows an unconnected config
   as **unrated** rather than as a plausible-looking 1500.
 
-Standard errors come from the diagonal of the Fisher information. They ignore
-off-diagonal terms, so they under-state the true uncertainty, but they are more
+Standard errors come from the diagonal of the Fisher information, counting each
+paired game as one trial. Ignoring the off-diagonal terms narrows them;
+counting a pair (two games, scored in quarters) as one trial widens them by at
+least √2. So they are neither bound on the true uncertainty, but they are more
 than good enough for the distinction the page needs to draw: 1700 ± 15 and
 1700 ± 200 must not look alike.
 
@@ -682,7 +684,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
 
 #### Login Flow
 
-1. User submits the login form (`/login`) with username and password. Attempts are rate limited per client IP (10 a minute) and per username from everywhere (100 a minute), both checked before any Argon2 verify runs. The username limit was per username alone at 10 a minute, which let one address trying a wrong password every six seconds hold any account — an admin's, whose name is public — out of signing in; now a lockout takes a fleet of addresses, and the account-wide cap still bounds a distributed guesser.
+1. User submits the login form (`/login`) with username and password. Attempts are rate limited per client IP (10 a minute) and per username from everywhere (100 a minute), both checked before any Argon2 verify runs. The username limit was per username alone at 10 a minute, which let one address trying a wrong password every six seconds hold any account — an admin's, whose name is public — out of signing in; now a lockout takes a fleet of addresses, and the account-wide cap still bounds a distributed guesser. The account's bucket is keyed by the account the lookup found, not by the name as typed: the lookup matches with Postgres's `lower`, which does not agree with Rust's (`İ`), so a name keyed on Rust's lowering gave one account a bucket per spelling. A name that matches no account has a bucket of its own, so a 429 does not say which names exist.
 2. The server looks up the user by username, whatever its case — the name is unique whatever its case, so this finds at most one account, and a contributor who registered "Josh" and types "josh" is not told their password is wrong. If not found, or the password does not verify, it returns `401` with an identical message for both, so the response body cannot be used to enumerate accounts.
 
    A known account still costs an Argon2 verify where an unknown one returns
@@ -881,7 +883,11 @@ server holds no per-job state. The submission path checks for a subscriber befor
 building a payload at all. `GET /api/jobs/:id/stream` sends the current stats
 immediately as its first event, then an event per accepted result, all named
 `stats`, with a 15-second keep-alive so an idle connection survives an
-intermediary's timeout.
+intermediary's timeout. The route is public, and each open stream holds a
+connection, a task and a receiver, so at most 2,000 are open at once across
+every job; past that a stream is a `503` with `Retry-After`, and the page tries
+again a few seconds later. A push is shared among its subscribers (`Arc<str>`),
+not copied to each.
 
 **An event per result, not one per result.** Building a payload is several
 aggregates over the job's history, so it happens off the submitting request and
@@ -1100,15 +1106,15 @@ What the numbers settled:
   afterwards, so every fit sorted the entire table. With the job filter first it
   is an index walk of those jobs' tasks. The sweep also builds it once per tick
   rather than twice (once to decide the pool was stale, once to fit).
-- **The two questions about recent completions read a time index.** The ETA
-  (on every detail view and live push) counts a job's claims completed in the
-  last hour, and the job list's `stalled` flag asks whether any completed in
-  the last day. `task_claims` has no job column, so both used to walk every
-  task of the job and every claim of each — the job's whole history, for a
-  question about its last hour — on a job whose age is exactly what makes the
-  walk long. A partial index on completed claims by time
-  (`task_claims_completed_idx`) bounds both by the fleet's recent completions
-  instead, whatever the job's age.
+- **Recent completions are read from a time index or a column.** The ETA (on
+  every detail view and live push) counts a job's claims completed in the last
+  hour. `task_claims` has no job column, so it used to walk every task of the
+  job and every claim of each — the job's whole history, for a question about
+  its last hour — on a job whose age is exactly what makes the walk long. A
+  partial index on completed claims by time (`task_claims_completed_idx`)
+  bounds it by the fleet's recent completions instead, whatever the job's age.
+  The job list's `stalled` flag ("any completed in the last day") reads
+  `jobs.last_completed_at`.
 - **Deleting a task no longer scans the moves table.** `position_analysis_moves`
   carried a `task_id` of its own, with a cascade and no index, so every task a
   purge or a job delete removed scanned the largest table in the schema to
@@ -4297,7 +4303,11 @@ answered with the generic message.
 A unique or foreign-key violation that reaches the handler maps to `conflict`
 (409), not `internal` (500): "this name is taken" and "something still references
 this" are answers the caller can act on, and a 500 invites a retry that will fail
-identically. Anything else from the database is a 500 with a generic message.
+identically. Where a foreign-key failure means the caller named a row that does
+not exist -- a rating pool's anchor or new member -- the handler answers
+`bad_request` on that field instead, and `not_found` for an unknown pool: "still
+referenced" would say the opposite. Anything else from the database is a 500
+with a generic message.
 
 #### Pagination
 
@@ -6607,8 +6617,8 @@ now deleted; they are in the git history up to the commit that removed them).
 The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
 the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md`,
 the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md`,
-the seventeenth's `AUDIT_FINDINGS_13.md`, the eighteenth's `AUDIT_FINDINGS_14.md` and
-the nineteenth's `AUDIT_FINDINGS_15.md`.
+the seventeenth's `AUDIT_FINDINGS_13.md`, the eighteenth's `AUDIT_FINDINGS_14.md`,
+the nineteenth's `AUDIT_FINDINGS_15.md` and the twentieth's `AUDIT_FINDINGS_16.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says

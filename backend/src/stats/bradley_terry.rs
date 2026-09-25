@@ -105,9 +105,14 @@ impl Matrix {
 pub struct Rated {
     pub rating: f64,
     /// Approximate standard error in Elo, from the diagonal of the Fisher
-    /// information. It ignores the off-diagonal terms, so it is a lower bound
-    /// on the true uncertainty — good enough to tell 1700 ± 15 from 1700 ± 200,
-    /// which is the distinction the page needs to draw.
+    /// information. Two approximations pull it opposite ways, so it is neither
+    /// bound on the true uncertainty: ignoring the off-diagonal terms makes it
+    /// narrower, and counting each unit of `games` as one Bernoulli trial
+    /// makes it wider when a unit is more than one game -- the ratings feed
+    /// one paired game (two games, scored in quarters) per unit, whose
+    /// information is at least twice that, so from pairs it reads at least
+    /// √2 wide. Good enough to tell 1700 ± 15 from 1700 ± 200, which is the
+    /// distinction the page needs to draw.
     pub stderr: f64,
     pub games: f64,
     /// Index of this player's connected component in the graph of who actually

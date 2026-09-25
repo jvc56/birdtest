@@ -1509,9 +1509,9 @@ CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
--- detail view and live push) and the job list's `stalled` flag both ask
--- "how many of this job's claims completed in the last hour / day", and
--- task_claims has no job column, so the alternative plan walks every task of
+-- detail view and live push) asks "how many of this job's claims completed
+-- in the last hour" (the job list's `stalled` flag reads
+-- `jobs.last_completed_at` instead), and task_claims has no job column, so the alternative plan walks every task of
 -- the job and every claim of each -- the job's whole history, for a question
 -- about its last hour. Through this index the scan is bounded by the fleet's
 -- recent completions instead, whatever the job's age.

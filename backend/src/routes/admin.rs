@@ -1972,7 +1972,10 @@ fn refuse_if_purged_since(state: &AppState, id: Uuid, taken: u64) -> AppResult<(
 /// cascade), while its `DispatchHold`, dropped at once, told claims and
 /// submissions the job was free and started the reclaim grace on a job whose
 /// claims were still locked. On its own task the operation finishes whatever
-/// happens to the request, and the hold lasts exactly as long as its locks.
+/// happens to the request, and the hold lasts at least as long as its locks --
+/// a little longer, to the end of the post-commit steps (a leave job's
+/// generation-0 rebuild), so a claim cannot start a second build of it
+/// alongside; claims skip the job and lifecycle actions answer 409 meanwhile.
 async fn run_to_completion<T: Send + 'static>(
     operation: impl std::future::Future<Output = AppResult<T>> + Send + 'static,
 ) -> AppResult<T> {

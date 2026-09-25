@@ -374,7 +374,8 @@ async fn create_pool(
     .bind(body.anchor_player_config_id)
     .bind(body.anchor_rating)
     .fetch_one(&mut *tx)
-    .await?;
+    .await
+    .map_err(|e| unknown_config(e.into(), "anchor_player_config_id", body.anchor_player_config_id))?;
 
     // The anchor is a member by construction: a pool whose fixed point is not
     // in the pool has nothing to fix.
@@ -403,6 +404,18 @@ async fn create_pool(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": pool_id }))))
 }
 
+/// A foreign-key failure on a config reference is the caller naming a config
+/// that does not exist: a 400 on that field, not the generic 409 ("still
+/// referenced by other records"), which says the opposite.
+fn unknown_config(err: AppError, field: &str, id: Uuid) -> AppError {
+    if err.db_code.as_deref() == Some(crate::error::FOREIGN_KEY_VIOLATION) {
+        AppError::bad_request("that player config does not exist")
+            .with_field(field, format!("no player config {id}"))
+    } else {
+        err
+    }
+}
+
 #[derive(Deserialize)]
 struct MemberBody {
     player_config_id: Uuid,
@@ -425,6 +438,13 @@ async fn add_member(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
+    // Pools are never deleted, so a pool seen here is still there for the
+    // insert, and a foreign-key failure on it can only be the config.
+    sqlx::query("SELECT 1 FROM rating_pools WHERE id = $1")
+        .bind(pool_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found("rating pool not found"))?;
     sqlx::query(
         "INSERT INTO rating_pool_members (pool_id, player_config_id, added_by)
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
@@ -433,7 +453,8 @@ async fn add_member(
     .bind(body.player_config_id)
     .bind(admin.0.id)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|e| unknown_config(e.into(), "player_config_id", body.player_config_id))?;
     audit::log(
         &mut tx,
         "rating_pool.member_added",

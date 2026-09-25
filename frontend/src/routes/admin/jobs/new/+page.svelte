@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { api, ApiError, type InputData, type JobType, type PlayerConfig } from '$lib/api';
+  import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
   import { jobTypeLabel } from '$lib/format';
 
   let configs: PlayerConfig[] = [];
@@ -139,12 +139,7 @@
       const created = await api.createJob(body());
       goto(`/admin/jobs/${created.job.id}`);
     } catch (e) {
-      // The server says which setting is wrong in `fields`; the message alone
-      // ("job settings are invalid") told the admin nothing to change.
-      const fields = e instanceof ApiError ? Object.entries(e.fields) : [];
-      error = fields.length
-        ? `${(e as Error).message}: ${fields.map(([field, why]) => `${field} ${why}`).join('; ')}`
-        : (e as Error).message;
+      error = errorText(e);
     } finally {
       busy = false;
     }

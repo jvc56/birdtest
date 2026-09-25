@@ -213,7 +213,8 @@ jobs:
       - name: Build and run MAGPIE's contribute tests
         working-directory: magpie
         run: make magpie_test && ./bin/magpie_test contribute
-      # The derived-file builders, pinned by hash. birdtest publishes the
+      # The derived-file builders, pinned by hash (and the KLV builders, whose
+      # version "Check artifacts" reports). birdtest publishes the
       # SHA-256 of the wordmap and rack info table its server built, and every
       # worker refuses one whose bytes differ -- so a builder change that
       # slipped through without a version bump would take the fleet down, job
@@ -225,14 +226,43 @@ jobs:
       # And the conversions birdtest's server actually invokes. A rename or a
       # changed positional argument here is a server that cannot build
       # anything, discovered on deploy rather than in CI.
-      - name: Check the conversions birdtest invokes still exist
+      - name: Check the conversions birdtest invokes still work
         working-directory: magpie
+        shell: bash
         run: |
+          set -euo pipefail
           make magpie
-          ./bin/magpie builders
-          for conversion in dawg2wordmap klvwmp2rit rackequity2klv; do
-            if ! ./bin/magpie help convert | grep -q "$conversion"; then
-              echo "magpie no longer offers '$conversion', which birdtest runs" >&2
-              exit 1
-            fi
+          magpie="$PWD/bin/magpie"
+          "$magpie" builders
+          # Each command as the server runs it (backend/src/magpie.rs): in a
+          # scratch root whose ./data holds the inputs, on MAGPIE's two-letter
+          # test lexicon. A help text that still names a conversion says nothing
+          # about its arguments, and `createdata klv` was not in it at all.
+          scratch=$(mktemp -d)
+          mkdir -p "$scratch/data/lexica" "$scratch/data/letterdistributions"
+          cp -r data/layouts "$scratch/data/"
+          cp testdata/lexica/CSW21_ab.kwg testdata/lexica/CSW21_ab.klv2 "$scratch/data/lexica/"
+          cp testdata/letterdistributions/english_ab.csv "$scratch/data/letterdistributions/"
+          # english_ab's eight full racks, A^k B^(7-k), for rackequity2klv.
+          python3 - "$scratch/data/lexica/racks.csv" <<'PY'
+          import sys
+          with open(sys.argv[1], "w") as f:
+              for a in range(8):
+                  f.write(f"{'A' * a}{'B' * (7 - a)},{a + 1},{a - 3}\n")
+          PY
+          cd "$scratch"
+          run() {
+            echo "+ magpie $*"
+            out=$("$magpie" "$@" 2>&1) || { echo "$out" >&2; exit 1; }
+            if grep -q '(error ' <<<"$out"; then echo "$out" >&2; exit 1; fi
+          }
+          run convert dawg2wordmap CSW21_ab english_ab -threads 1
+          run convert klvwmp2rit CSW21_ab english_ab CSW21_ab CSW21_ab -threads 1
+          run createdata klv zero english_ab
+          run convert rackequity2klv racks english_ab -threads 1
+          for f in CSW21_ab.wmp CSW21_ab.rit zero.klv2 racks.klv2; do
+            test -s "data/lexica/$f" || { echo "magpie wrote no data/lexica/$f" >&2; exit 1; }
           done
+          if ls data/lexica | grep -q '\.tmp\|wbx'; then
+            echo "magpie left temporaries: $(ls data/lexica)" >&2; exit 1
+          fi

@@ -8,7 +8,9 @@ use uuid::Uuid;
 /// is listening, so an idle server holds no per-job state.
 #[derive(Clone, Default)]
 pub struct SseBroadcaster {
-    channels: Arc<Mutex<HashMap<Uuid, broadcast::Sender<String>>>>,
+    /// Payloads are shared, not copied: a receiver clones what it receives,
+    /// and a `String` was a whole payload per subscriber per push.
+    channels: Arc<Mutex<HashMap<Uuid, broadcast::Sender<Arc<str>>>>>,
     /// Jobs with a stats push in flight, and whether a further one has been
     /// asked for while it ran. Building the payload is several aggregates over
     /// a job's history, so it runs on a spawned task rather than on the
@@ -23,7 +25,7 @@ impl SseBroadcaster {
         Self::default()
     }
 
-    pub fn subscribe(&self, job_id: Uuid) -> broadcast::Receiver<String> {
+    pub fn subscribe(&self, job_id: Uuid) -> broadcast::Receiver<Arc<str>> {
         let mut channels = self.channels.lock().expect("sse channel map poisoned");
         let sender = channels
             .entry(job_id)
@@ -94,7 +96,7 @@ impl SseBroadcaster {
 
     /// Push a serialized stats payload to everyone watching `job_id`. A send with
     /// no receivers is not an error — nobody has the dashboard open.
-    pub fn publish(&self, job_id: Uuid, payload: String) {
+    pub fn publish(&self, job_id: Uuid, payload: Arc<str>) {
         let mut channels = self.channels.lock().expect("sse channel map poisoned");
         if let Some(sender) = channels.get(&job_id) {
             if sender.send(payload).is_err() {

@@ -616,19 +616,38 @@ async fn rack_lookup(
     Ok(super::CursorPage { items, total, per_page: total.max(1), next_cursor: None })
 }
 
+/// How many live job streams are open at once, across every job.
+const MAX_LIVE_STREAMS: usize = 2000;
+static LIVE_STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_LIVE_STREAMS);
+
+/// A place among the live streams, or the 503 that says there is none.
+fn stream_permit(streams: &tokio::sync::Semaphore) -> AppResult<tokio::sync::SemaphorePermit<'_>> {
+    streams.try_acquire().map_err(|_| AppError {
+        retry_after: Some(30),
+        ..AppError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "too many live pages are open; this one will try again shortly",
+        )
+    })
+}
+
 /// One SSE event per accepted result, carrying the same payload `GET
 /// /api/jobs/:id` would return.
 async fn job_stream(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    // A stream is a connection, a task and a receiver for as long as the page
+    // is open, on a public route: unbounded, one host could hold enough of
+    // them to run the task out of memory. Past the cap a 503, which the page
+    // answers by trying again later (`frontend/src/lib/sse.ts`).
+    let permit = stream_permit(&LIVE_STREAMS)?;
     let job = load_job(&state, id).await?;
     // Subscribed before the first payload is read: a push published between
     // the two was lost, and on a quiet job nothing followed it.
     let receiver = state.sse.subscribe(id);
-    let initial = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache)
-        .await?
-        .to_string();
+    let initial = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache).await?;
 
     let updates = tokio_stream::wrappers::BroadcastStream::new(receiver)
         .filter_map(|msg| async move { msg.ok() });
@@ -640,7 +659,11 @@ async fn job_stream(
     let shutdown = state.shutdown.clone();
     let stream = futures::stream::once(async move { initial })
         .chain(updates)
-        .map(|payload| Ok(Event::default().event("stats").data(payload)))
+        .map(move |payload| {
+            // Held for the life of the stream.
+            let _ = &permit;
+            Ok(Event::default().event("stats").data(payload.as_ref()))
+        })
         .take_until(async move { shutdown.triggered().await });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
@@ -925,4 +948,22 @@ async fn worker_page(
         page: query.page.max(0),
         per_page: limit,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A-PUBLIC-6b: past the cap a stream is a 503 with `Retry-After`, and a
+    /// place comes back when a stream ends.
+    #[test]
+    fn a_stream_past_the_cap_is_told_to_come_back() {
+        let streams = tokio::sync::Semaphore::new(1);
+        let held = stream_permit(&streams).expect("the first stream has a place");
+        let refused = stream_permit(&streams).expect_err("the second has none");
+        assert_eq!(refused.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.retry_after, Some(30));
+        drop(held);
+        assert!(stream_permit(&streams).is_ok(), "an ended stream gives its place back");
+    }
 }

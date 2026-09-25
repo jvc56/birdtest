@@ -608,6 +608,13 @@ async fn submit_result(
         tracing::debug!(claim_token = %body.claim_token, "ignoring result for stale claim");
         return Ok(Json(ResultAck { accepted: false }));
     };
+    // The purge count the finish check's second witness compares against
+    // (`complete_unless_purged`), read before the hold check: a purge whose
+    // hold was taken before this read is refused just below, or has already
+    // committed and deleted this claim; any later one changes the count. Read
+    // after the commit, as it was, it already counted a purge that had been
+    // waiting on this very submission's claim.
+    let purges_before = state.dispatch_holds.claims_holds_taken(job.id);
     // The same question `refuse_if_claims_held` asks, answered from the row
     // just read rather than a second lookup of the token.
     if state.dispatch_holds.claims_held(job.id) {
@@ -780,7 +787,10 @@ async fn submit_result(
     //
     // `last_completed_at` rides along, at most once a minute when nothing else
     // changes: a statement whose WHERE matches nothing takes no row lock, so
-    // a leave job's submissions do not all queue on the job's row for it.
+    // submissions that change no counter -- the extra copies a redundancy
+    // above 1 asks for -- do not all queue on the job's row for it. (At
+    // redundancy 1, leave generation's included, every submission completes a
+    // task and takes the lock regardless.)
     {
         sqlx::query(
             "UPDATE jobs SET games_completed = games_completed + $2,
@@ -824,7 +834,7 @@ async fn submit_result(
     // result was stored and before the finish check reads any result --
     // which is the order `complete_unless_purged`'s witness needs -- and it
     // is reused rather than read again on the path the worker waits on.
-    if let Err(err) = after_submission(&state, &job).await {
+    if let Err(err) = after_submission(&state, &job, purges_before).await {
         tracing::error!(job_id = %job_id, error = %err.message, "post-submission bookkeeping failed");
     }
 
@@ -845,10 +855,8 @@ async fn submit_result(
 /// have open. It is coalesced per job (`sse::begin_push`), so a busy job
 /// builds one payload at a time rather than one per submission, and they stay
 /// ordered because one task issues them.
-async fn after_submission(state: &AppState, job: &Job) -> AppResult<()> {
+async fn after_submission(state: &AppState, job: &Job, purges_before: u64) -> AppResult<()> {
     let job_id = job.id;
-    // Before the finish check reads anything: see `complete_unless_purged`.
-    let purges_before = state.dispatch_holds.claims_holds_taken(job_id);
 
     // Leave generation finishes in its own transition and has no finish
     // condition here, so it skips the in-flight query `should_check_finish`
@@ -917,7 +925,7 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         for _ in 0..3 {
             match jobstats::refresh_payload(&state.read_pool, job_id, state.cfg.stats_cache).await {
                 Ok(Some(payload)) => {
-                    state.sse.publish(job_id, payload.to_string());
+                    state.sse.publish(job_id, payload);
                     break;
                 }
                 Ok(None) => continue,

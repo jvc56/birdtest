@@ -208,8 +208,7 @@ const LOGINS_PER_ACCOUNT_PER_MINUTE: usize = 100;
 /// although every attempt came from a different address -- with the right
 /// password too, and whatever case or padding the name is typed with. Another
 /// username is unaffected. (The attempts name an account that does not exist,
-/// which the limiter cannot tell from one that does, and which costs no
-/// Argon2 verify.)
+/// which has a bucket of its own so that a 429 does not say which names do.)
 #[tokio::test]
 async fn a_username_tried_from_everywhere_is_rate_limited() {
     let db = TestDb::new().await;
@@ -228,6 +227,36 @@ async fn a_username_tried_from_everywhere_is_rate_limited() {
 
     let other = login_from(&app, "203.0.113.202", "bystander", PASSWORD).await;
     assert_eq!(other.status, StatusCode::OK, "another username is unaffected: {other:?}");
+}
+
+/// A-AUTH-11b: an account's bucket is the account's, however its name is
+/// spelled. Postgres lowers `İ` to `i` and Rust to `i̇`, so while the bucket
+/// was keyed on Rust's lowering, `TİM` signed in to `tim` from a bucket of its
+/// own, and every such spelling was a fresh hundred guesses.
+#[tokio::test]
+async fn an_accounts_login_bucket_does_not_depend_on_how_its_name_is_spelled() {
+    let db = TestDb::new().await;
+    let app = proxied_app(&db).await;
+    confirmed_user(&db, "tim", PASSWORD).await;
+
+    let spelled = login_from(&app, "198.51.100.1", "TİM", PASSWORD).await;
+    assert_eq!(spelled.status, StatusCode::OK, "the database matches `TİM` to `tim`: {spelled:?}");
+
+    // Until the bucket is spent: each wrong guess at a real account costs an
+    // Argon2 verify, and the bucket refills a little while they run.
+    let mut spent = false;
+    for i in 1..2 * LOGINS_PER_ACCOUNT_PER_MINUTE {
+        let ip = format!("10.{}.{}.1", i / 200, i % 200);
+        let response = login_from(&app, &ip, "tim", WRONG).await;
+        if response.status == StatusCode::TOO_MANY_REQUESTS {
+            spent = true;
+            break;
+        }
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
+    }
+    assert!(spent, "the account's bucket never ran out");
+    let limited = login_from(&app, "203.0.113.210", "TİM", PASSWORD).await;
+    assert_rate_limited(&limited, "the same account spelled with a dotted capital I");
 }
 
 /// A-BOUND-2: one address trying wrong passwords for an account cannot lock

@@ -298,8 +298,14 @@ From a PITR scratch instance rather than a dump there is no restore to wait
 for; write what the script reads first:
 
 ```bash
-SCRATCH_URL="postgres://birdtest:<the master password>@<the scratch instance's endpoint>:5432/birdtest"
-echo "export SCRATCH_URL='$SCRATCH_URL'" > /tmp/restore.env
+# The production URL with the scratch instance's endpoint for its host: a PITR
+# restore keeps the source's master password, already encoded in the URL as
+# it must be. %q, so no character in it can break the file.
+SCRATCH_URL=$(python3 -c 'import os, sys, urllib.parse as u
+url = u.urlsplit(os.environ["DATABASE_URL"])
+print(url._replace(netloc=url.netloc.rsplit("@", 1)[0] + "@" + sys.argv[1] + ":5432").geturl())' \
+  "<the scratch instance's endpoint>")
+printf 'export SCRATCH_URL=%q\n' "$SCRATCH_URL" > /tmp/restore.env
 echo 'pg_restore exit 0' > /tmp/pg_restore.log   # nothing to wait for
 ```
 
@@ -477,10 +483,11 @@ UPDATE tasks t
 -- copy leaves them describing the results the job had before. Each is
 -- recomputed here exactly as the read it replaced computed it: one result per
 -- task, because redundant claims replay the same work.
+-- The claims are read once, for both of their columns: a second subquery for
+-- last_completed_at was a second pass over them.
 UPDATE jobs j
-   SET claims_issued = (SELECT count(*) FROM task_claims c
-                          JOIN tasks t ON t.id = c.task_id
-                         WHERE t.job_id = j.id),
+   SET claims_issued = cl.issued,
+       last_completed_at = cl.last,
        tasks_total = (SELECT count(*) FROM tasks t WHERE t.job_id = j.id),
        tasks_completed = (SELECT count(*) FROM tasks t
                            WHERE t.job_id = j.id AND t.state = 'completed'),
@@ -492,10 +499,11 @@ UPDATE jobs j
                           ) g),
        racks_analyzed = (SELECT count(DISTINCT p.rack)
                            FROM position_analysis_records p
-                          WHERE p.job_id = j.id AND p.game_index IS NULL),
-       last_completed_at = (SELECT max(c.completed_at) FROM task_claims c
-                              JOIN tasks t ON t.id = c.task_id
-                             WHERE t.job_id = j.id AND c.state = 'completed')
+                          WHERE p.job_id = j.id AND p.game_index IS NULL)
+  FROM (SELECT count(*) AS issued,
+               max(c.completed_at) FILTER (WHERE c.state = 'completed') AS last
+          FROM task_claims c JOIN tasks t ON t.id = c.task_id
+         WHERE t.job_id = :'job') cl
  WHERE j.id = :'job';
 
 -- Level with the jobs being *served* -- those that issued a claim within the
@@ -569,7 +577,9 @@ and every submission increments its worker's counter: submissions would wait,
 then be answered 503 after five seconds, for as long as the recount ran.
 
 ```sql
--- /tmp/recount.sql; run as  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/recount.sql
+-- /tmp/recount.sql -- written with  cat > /tmp/recount.sql <<'EOF' ... EOF
+-- (quoted: unquoted, the shell turns each $$ below into its process id) --
+-- and run as  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/recount.sql
 -- Room for the temporary tables below in memory; they are read once per batch.
 -- (Set before any temporary table is touched, which a fresh session is.)
 SET temp_buffers = '64MB';
@@ -841,10 +851,24 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    # wins): without prod.tfvars every other setting fell back to its default
    # -- a micro instance, 20 GiB, and the fleet's MAGPIE floor back at 0.1.1.
    # Storage sized for the restore in step 3 at creation: autoscaling cannot
-   # keep up with a bulk load, and Terraform does not grow it afterwards.
+   # keep up with a bulk load (a step at most every six hours), and raising
+   # the variable later is no quicker. Sized from the replicated dump's
+   # manifest: database_bytes is the database's own size when it was dumped
+   # (the dump compresses four times or more, so a multiple of the dump
+   # undershoots), plus 30% and room for WAL (db_max_wal_size_mb, 4 GiB by
+   # default). No less than production's own allocation, if that is larger.
+   REPLICA=s3://birdtest-backups-dr-<account>/pg
+   MANIFEST=$(aws s3 ls "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
+   DR_STORAGE_GB=$(aws s3 cp "$REPLICA/$MANIFEST" - | python3 -c '
+   import json, math, sys
+   print(math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4)')
+   echo "$MANIFEST: $DR_STORAGE_GB GiB"
+   # And every ARN prod.tfvars names in the lost region overridden: a task
+   # whose secrets live there cannot start. GITHUB_TOKEN is optional; leave it
+   # off, or create the parameter in $DR_REGION and pass its ARN.
    terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 \
-     -var db_allocated_storage=<at least the production allocation; the latest
-       "low storage" mail says it, or take three times the dump's size> \
+     -var github_token_parameter_arn= \
+     -var db_allocated_storage=$DR_STORAGE_GB \
      -var region=$DR_REGION -var 'azs=["'$DR_REGION'a","'$DR_REGION'b"]' \
      -var name_suffix=-dr -var dr_region=$THIRD_REGION \
      -var acm_certificate_arn=<a certificate issued in $DR_REGION> \
@@ -896,9 +920,10 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    resets. SES production access is per region: request it again.
 6. Point DNS at the new ALB.
 7. Confirm the new stack's alert subscription (SNS mails a confirmation) and
-   run README.md's alert-path checks with the `dr` names
-   (`birdtest-dr-backup-stale`, `birdtest-dr-db-storage`,
-   `birdtest-dr-backup`).
+   run README.md's alert-path checks with `SUFFIX=-dr` and
+   `REGION=$DR_REGION` (in the `dr` workspace, so the Terraform outputs are
+   the copy's): with `REGION` still the lost region, they test nothing that
+   exists.
 8. Run §4, and **Check artifacts** on every leave-generation job (§3): the
    synced objects are the replicas' latest versions, which need not be the ones
    the restored rows describe.

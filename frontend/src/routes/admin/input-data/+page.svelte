@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { api, type ImportDetail, type InputData } from '$lib/api';
+  import { api, errorText, type ImportDetail, type InputData } from '$lib/api';
 
   let files: InputData[] = [];
   let error = '';
@@ -49,11 +49,15 @@
     try {
       // Returns as soon as the ref resolves; the ~94 MB download runs in the
       // background and this page polls for it.
-      const started = await api.startImport({ tarball_date: tarballDate, git_ref: gitRef });
+      // An empty ref is the server's default ("main") rather than an error.
+      const started = await api.startImport({
+        tarball_date: tarballDate.trim(),
+        git_ref: gitRef.trim() || undefined
+      });
       current = await api.getImport(started.id);
       watch(started.id);
     } catch (e) {
-      error = (e as Error).message;
+      error = errorText(e);
     } finally {
       busy = false;
     }

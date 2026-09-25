@@ -78,7 +78,15 @@ variable "db_allocated_storage" {
 }
 
 variable "db_apply_immediately" {
-  description = "Apply database class and Multi-AZ changes at once, not in the next maintenance window. Either way RDS may restart the instance."
+  description = <<-EOT
+    Apply database modifications at the apply rather than in the next weekly
+    maintenance window: instance class, Multi-AZ, storage, backup window and
+    retention, CA certificate, parameter-group association. A class change is
+    a restart -- a few minutes with no database -- so with this on, an apply
+    that changes the class takes the site down at that moment. On an existing
+    stack created without it, check `PendingModifiedValues` first: queued
+    changes are applied by the first apply that turns it on.
+  EOT
   type        = bool
   default     = true
 }

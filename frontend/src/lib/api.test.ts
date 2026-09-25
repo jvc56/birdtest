@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, ApiError } from './api';
+import { api, ApiError, errorText } from './api';
 
 /**
  * lib/api.ts is under test here, not fetch: fetch and document.cookie are
@@ -198,5 +198,23 @@ describe('F-API-5 credentials', () => {
     await api.job('x');
     expect(lastInit().body).toBeUndefined();
     expect(lastHeaders()).not.toHaveProperty('content-type');
+  });
+});
+
+describe('F-API-6 errorText', () => {
+  it('lists the fields the server named after the message', () => {
+    const e = new ApiError(400, 'bad_request', 'import details are invalid', {
+      git_ref: "letters, digits, '-', '_', '.' and '/' only"
+    });
+    expect(errorText(e)).toBe(
+      "import details are invalid: git_ref letters, digits, '-', '_', '.' and '/' only"
+    );
+  });
+
+  it('is the message alone when there are none', () => {
+    expect(errorText(new ApiError(409, 'conflict', 'that already exists'))).toBe(
+      'that already exists'
+    );
+    expect(errorText(new Error('offline'))).toBe('offline');
   });
 });

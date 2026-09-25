@@ -68,18 +68,20 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 154 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `stats::sprt` (12), `stats::bradley_terry` (12), `jobs::racks` (13), `error` (7), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `magpie` (3), `models::job` (3), `jobs::opening_rack` (3), `version` (3), `email` (2), `sse` (2), `exports`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes` (1 each) |
-| 1F Frontend unit | 94 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (13), `auth.test.ts` (9), `sse.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 138 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (24), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 155 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (29), `worker_routes.rs` (16), `auth_routes.rs` (16), `boundaries.rs` (12), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
+| 1 Unit | 161 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (13), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `exports`, `jobs`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `ratelimit`, `routes`, `routes::auth`, `routes::public` (1 each) |
+| 1F Frontend unit | 98 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (9), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 143 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (14), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 165 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (15), `public_api.rs` (11), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 10 cases + 13 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 13 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (6), `magpie_routes.rs` (2) |
+| 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 494 backend tests.
+--run-ignored all` runs 497 backend tests (the per-tier counts above are
+from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
+they had drifted by up to 17).
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -530,6 +532,9 @@ Each entry's tests are the `describe` block named for its id.
   *(Covered: `api.test.ts`.)*
 - `F-API-5` Every request sets `credentials: 'include'`. *(Covered:
   `api.test.ts`.)*
+- `F-API-6` `errorText` lists the fields the server named after the message,
+  and is the message alone when there are none; the job, player-config and
+  input-data import forms show it. *(Covered: `api.test.ts`.)*
 
 ### `F-SSE-*` — `lib/sse.ts`
 
@@ -1524,6 +1529,12 @@ below.
   limited both ways too (`A-BOUND-1`, `-2`). *(Covered:
   `auth_routes::the_eleventh_registration_from_one_address_is_rate_limited`,
   `auth_routes::the_sixth_reset_for_one_address_is_rate_limited_from_any_ip`.)*
+- `A-AUTH-11b` An account's login bucket is the account's however its name is
+  spelled: `TİM` signs in to `tim` (Postgres lowers `İ` to `i`) and shares its
+  bucket. *(Covered:
+  `boundaries::an_accounts_login_bucket_does_not_depend_on_how_its_name_is_spelled`;
+  keyed on Rust's lowering, each spelling had a bucket of its own. Twentieth
+  audit.)*
 
 ### `A-WORKER-*` — `routes/worker.rs`
 
@@ -1696,6 +1707,12 @@ below.
   `ratings::a_pool_that_could_rate_no_one_is_refused`.)* (Eleventh audit.)
 - `A-RATE-4` Adding and removing a member each trigger a refit and return a new
   `run_id`. *(Covered: `ratings::adding_and_removing_a_member_each_refit_the_pool`.)*
+- `A-RATE-4b` Adding a config that does not exist is a `400` on
+  `player_config_id`, and adding to a pool that does not exist a `404`; an
+  anchor that does not exist is a `400` too. None was the `409` "still
+  referenced" a bare foreign-key failure maps to. *(Covered:
+  `ratings::adding_an_unknown_member_or_to_an_unknown_pool_says_which`,
+  `ratings::a_pool_that_could_rate_no_one_is_refused`.)*
 - `A-RATE-5` Removing the anchor is refused with a message naming what to do —
   an anchor is fixed, so a pool anchored elsewhere (it named an operation that
   did not exist until the eleventh audit).
@@ -1740,6 +1757,10 @@ below.
 - `A-PUBLIC-6` The SSE stream ends cleanly when the client disconnects.
   *(Covered: `public_api::the_stream_unsubscribes_when_the_client_disconnects`,
   `sse::tests::subscribers_are_counted_and_forgotten_when_they_leave`.)*
+- `A-PUBLIC-6b` Live streams are capped (2,000 across every job): past the cap
+  a stream is a `503` with `Retry-After`, and an ended stream gives its place
+  back. *(Covered: `routes::public::tests::a_stream_past_the_cap_is_told_to_come_back`.)*
+  (Twentieth audit: a public route with no bound on open connections.)
 - `A-PUBLIC-6a` The SSE stream ends when the process is told to stop: it has no
   end of its own, and graceful shutdown waits for every open response, so an
   open dashboard used to hold every deployment until the runtime's `SIGKILL`
@@ -2068,12 +2089,17 @@ It has two halves:
   `MAGPIE_BIN=../MAGPIE/bin/magpie cargo nextest run --run-ignored all`:
   `magpie_smoke.rs` (5; the server's own conversions in a scratch directory
   laid out by `magpie.rs`, and the builder versions read out of the binary; no
-  database), `magpie_leave.rs` (6; leave transitions on real KLVs and a real
+  database), `magpie_leave.rs` (7; leave transitions on real KLVs and a real
   object store, so also `TEST_S3_ENDPOINT`) and `magpie_routes.rs` (2; leave-job
   creation and `rebuild-artifacts` through the router). `MAGPIE_ROOT` (default
   `../MAGPIE`) is where `magpie_smoke.rs` finds MAGPIE's small test lexicon.
   The pull-request run skips these; the nightly runs them against the MAGPIE
-  it builds, and they are part of a full local run.
+  it builds, and they are part of a full local run. Run them against MAGPIE's
+  sanitizer build (`make magpie`, the default `BUILD=dev`) as well as the
+  release one when MAGPIE's side has changed: the twentieth audit's
+  out-of-bounds write on a lower-case rack (`magpie_leave.rs`'s misnamed-rack
+  case) passed on the release build and is a stack-buffer-overflow under
+  AddressSanitizer.
 
 The backend itself is not opt-in about MAGPIE: it runs a pinned MAGPIE for
 every derived file and every leave-generation KLV, reads the builder versions
@@ -2474,9 +2500,12 @@ GitHub Actions.
 6. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
    commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
    `test/birdtest_contract/`, and run `magpie_test contribute`; then
-   `magpie_test builderhash` (the derived-file builders against their pinned
-   hashes) and a check that the conversions the server invokes
-   (`dawg2wordmap`, `klvwmp2rit`, `rackequity2klv`) still exist. A fixture
+   `magpie_test builderhash` (the wordmap, rack info table and both KLV
+   builders -- `createdata klv` and `rackequity2klv` -- against their pinned
+   hashes), and then every command the server invokes (`convert dawg2wordmap`,
+   `convert klvwmp2rit`, `createdata klv`, `convert rackequity2klv`), run as
+   the server runs it on MAGPIE's two-letter test data, each required to exit 0
+   with no error and to write its file. A fixture
    changed here and not in MAGPIE fails here; a MAGPIE-side change is caught
    by the nightly run.
 

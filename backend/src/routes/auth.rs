@@ -334,8 +334,9 @@ async fn login(
     ApiJson(body): ApiJson<LoginBody>,
 ) -> AppResult<(CookieJar, Json<LoginResponse>)> {
     // Both halves, like password reset: per IP bounds one guesser, per
-    // username bounds many guessers aimed at one account. Checked before the
-    // lookup, so a limited attempt costs no Argon2 verify.
+    // username bounds many guessers aimed at one account. Both are checked
+    // before the Argon2 verify, so a limited attempt costs none; the address
+    // half before the lookup as well.
     //
     // The username half is ten times the address half. At the per-address
     // rate it let one caller trying a wrong password every six seconds hold
@@ -345,9 +346,7 @@ async fn login(
     // how fast a distributed guesser can try. (A per-username-per-address
     // bucket at the address's own rate was tried and could never trip: it
     // only ever saw requests the address's bucket had already let through.)
-    let account = body.username.trim().to_lowercase();
     ratelimit::check(&state.limits.login, &format!("ip:{ip}"))?;
-    ratelimit::check(&state.limits.login_account, &format!("user:{account}"))?;
 
     let row = sqlx::query_as::<_, (Uuid, String, String, bool, Option<chrono::DateTime<Utc>>, i32)>(
         "SELECT id, username, password_hash, is_admin, email_confirmed_at, session_generation
@@ -356,6 +355,18 @@ async fn login(
     .bind(body.username.trim())
     .fetch_optional(&state.pool)
     .await?;
+
+    // An account's bucket is keyed by the account, not by the name as sent:
+    // the lookup matches with the database's `lower`, which Rust's
+    // `to_lowercase` does not agree with (`İ` is `i` to one and `i̇` to the
+    // other), so one account answered to several buckets. A name that matches
+    // no account keeps a bucket of its own, so a 429 says nothing about which
+    // names exist.
+    let bucket = match &row {
+        Some((id, ..)) => format!("id:{id}"),
+        None => format!("name:{}", body.username.trim().to_lowercase()),
+    };
+    ratelimit::check(&state.limits.login_account, &bucket)?;
 
     // Identical response whether the username is unknown or the password is
     // wrong, so the endpoint cannot be used to enumerate accounts.

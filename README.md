@@ -270,6 +270,22 @@ minio minio-init` gives you one without the rest of the stack.
 
 ## Deploying
 
+A first deployment, in order (each step is described below):
+
+1. Tools: Terraform 1.9, the AWS CLI with the Session Manager plugin, `jq`,
+   `openssl`, and `python3` for RUNBOOK.md's procedures.
+2. Build and push the three images (below, "The three images"), and push
+   MAGPIE's `birdtest-contribute` first — the backend image fetches the commit
+   `docker/Dockerfile` pins.
+3. Write `infra/prod.tfvars`, then
+   `terraform -chdir=infra init` and
+   `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0`.
+4. Confirm the SNS subscription mail, set the database password and the two
+   SSM parameters (below), then
+   `terraform -chdir=infra apply -var-file=prod.tfvars` (one task).
+5. Add the SES DNS records, request SES production access, point DNS at the
+   load balancer, run the alert-path checks, and make the first admin.
+
 `infra/` is a complete Terraform description of the AWS side. Keep the stack's
 variables in `infra/prod.tfvars` (not committed: it names the account's
 certificate and addresses) and pass `-var-file=prod.tfvars` to every `apply`,
@@ -350,27 +366,28 @@ subscription is confirmed), and after any change to the alerts topic: nothing
 else will say an alert was dropped. With `REGION` set as above:
 
 ```bash
-TF="terraform -chdir=infra output -raw"
+# A function, not a variable holding the command: zsh does not split one.
+tf() { terraform -chdir=infra output -raw "$@"; }
+SUFFIX=""   # the stack's name_suffix: "-dr" for RUNBOOK §5's copy
 # To OK first: a fresh stack's staleness alarm is already in ALARM (no backup
 # has run), and setting the state it is in sends nothing.
-aws cloudwatch set-alarm-state --region "$REGION" --alarm-name birdtest-backup-stale \
+aws cloudwatch set-alarm-state --region "$REGION" --alarm-name "birdtest$SUFFIX-backup-stale" \
   --state-value OK --state-reason "testing the alert path"
-aws cloudwatch set-alarm-state --region "$REGION" --alarm-name birdtest-backup-stale \
+aws cloudwatch set-alarm-state --region "$REGION" --alarm-name "birdtest$SUFFIX-backup-stale" \
   --state-value ALARM --state-reason "testing the alert path"     # a mail arrives
-aws rds describe-event-subscriptions --region "$REGION" --subscription-name birdtest-db-storage \
+aws rds describe-event-subscriptions --region "$REGION" --subscription-name "birdtest$SUFFIX-db-storage" \
   --query 'EventSubscriptionsList[0].Status' --output text      # "active"
 
 # A backup run that fails: its failure mail arrives. The task's entry point is
 # `bash -c`, so the override is the whole script, one string.
-aws ecs run-task --region "$REGION" --cluster "$($TF cluster_name)" \
-  --task-definition birdtest-backup --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$(terraform -chdir=infra output -json service_subnet_ids | jq -r 'join(",")')],securityGroups=[$($TF service_security_group_id)],assignPublicIp=ENABLED}" \
+aws ecs run-task --region "$REGION" --cluster "$(tf cluster_name)" \
+  --task-definition "$(tf backup_task_definition)" --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$(terraform -chdir=infra output -json service_subnet_ids | jq -r 'join(",")')],securityGroups=[$(tf service_security_group_id)],assignPublicIp=ENABLED}" \
   --overrides '{"containerOverrides":[{"name":"backup","command":["exit 1"]}]}'
 ```
 
-Then `AWS/Events` `TriggeredRules` for `birdtest-backup-failed` is 1 and its
-`FailedInvocations` 0. (The DR copy's names carry its `name_suffix`:
-`birdtest-dr-backup-stale` and so on — RUNBOOK §5 runs the same checks.)
+Then `AWS/Events` `TriggeredRules` for `birdtest$SUFFIX-backup-failed` is 1 and
+its `FailedInvocations` 0. (RUNBOOK §5 runs the same checks with `SUFFIX=-dr`.)
 
 **SES starts in the sandbox.** A new account's SES sends only to verified
 addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)

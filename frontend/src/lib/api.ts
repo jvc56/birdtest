@@ -17,6 +17,19 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * What a form shows for a failed request: the message, and which fields the
+ * server said were wrong and why. The message alone ("job settings are
+ * invalid") tells the admin nothing to change.
+ */
+export function errorText(e: unknown): string {
+  const message = e instanceof Error ? e.message : String(e);
+  const fields = e instanceof ApiError ? Object.entries(e.fields) : [];
+  return fields.length
+    ? `${message}: ${fields.map(([field, why]) => `${field} ${why}`).join('; ')}`
+    : message;
+}
+
 function csrfToken(): string {
   const match = document.cookie.match(/(?:^|;\s*)birdtest_csrf=([^;]+)/);
   return match ? decodeURIComponent(match[1]) : '';

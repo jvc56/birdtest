@@ -575,9 +575,9 @@ data "aws_iam_policy_document" "alerts_topic" {
   statement {
     actions   = ["SNS:Publish"]
     resources = [aws_sns_topic.alerts.arn]
+    # RDS's event subscription (rds.tf) publishes as events.rds.
     principals {
       type        = "Service"
-      # RDS's event subscription (rds.tf) publishes as events.rds.
       identifiers = ["events.amazonaws.com", "cloudwatch.amazonaws.com", "events.rds.amazonaws.com"]
     }
     # Only on this account's behalf: a service principal alone would let any
