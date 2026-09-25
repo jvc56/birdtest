@@ -142,11 +142,12 @@ async fn concurrent_key_requests_cannot_exceed_the_key_limit() {
         }
         builder.body(Body::from("{}")).unwrap()
     };
-    let attempts = futures::future::join_all((0..12).map(|_| send(&app, request()))).await;
+    // Ten: the most an account may create in a burst (A-ACCOUNT-6).
+    let attempts = futures::future::join_all((0..10).map(|_| send(&app, request()))).await;
 
     let created = attempts.iter().filter(|(status, _)| *status == StatusCode::CREATED).count();
     let refused = attempts.iter().filter(|(status, _)| *status == StatusCode::CONFLICT).count();
-    assert_eq!((created, refused), (2, 10), "{attempts:?}");
+    assert_eq!((created, refused), (2, 8), "{attempts:?}");
     let held: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
         .bind(user)
         .fetch_one(&db.pool)

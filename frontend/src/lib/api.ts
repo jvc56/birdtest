@@ -343,7 +343,6 @@ export interface DerivedData {
   built_at: string | null;
 }
 
-/** Per generation, what rebuilding a leave job's KLV from the database found. */
 /** A ban in force; `id` is what lifting it takes. */
 export interface WorkerBan {
   id: string;
@@ -378,6 +377,7 @@ export interface JobExport {
   positions_download_url?: string;
 }
 
+/** Per generation, what rebuilding a leave job's KLV from the database found. */
 export interface ArtifactRebuild {
   generation: number;
   artifact_key: string;
@@ -394,6 +394,8 @@ export interface ArtifactRebuild {
   matches: boolean;
   object_present: boolean;
   rewritten: boolean;
+  /** The hash workers are sent and verify against: that of the object as it now is. */
+  served_sha256: string;
 }
 
 export interface ApiKey {

@@ -207,9 +207,49 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
 /// `running`.
 static EXPORT_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
+/// Longer than any build of a real corpus takes. A row still `running` past
+/// it is a build that hung (a stalled store call) rather than one in progress,
+/// and with one export per job at a time it would otherwise refuse every
+/// export of the job until a restart reaped it.
+const EXPORT_BUILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 async fn run(state: AppState, job: Job, export_id: Uuid) {
     let _turn = EXPORT_BUILDS.acquire().await;
-    match build(&state, &job, export_id).await {
+    // Its turn may have come after a purge or a delete removed the row; then
+    // there is nothing to build for, and building would leave objects nobody
+    // names.
+    let still_wanted = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM job_exports WHERE id = $1 AND state = 'running')",
+    )
+    .bind(export_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(true);
+    if !still_wanted {
+        return;
+    }
+    // On a task of its own and under a time limit, so that a panic or a hang
+    // still ends in the row being marked failed below rather than left
+    // `running` -- which, one export per job at a time, refused every later
+    // export of the job until a restart.
+    let build_task = {
+        let (state, job) = (state.clone(), job.clone());
+        tokio::spawn(async move { build(&state, &job, export_id).await })
+    };
+    // Dropping a JoinHandle detaches the task rather than stopping it: a hung
+    // build past its limit would go on holding its connection after its turn
+    // was handed on.
+    let abort = build_task.abort_handle();
+    let outcome = tokio::time::timeout(EXPORT_BUILD_LIMIT, build_task).await;
+    if outcome.is_err() {
+        abort.abort();
+    }
+    let result = match outcome {
+        Ok(Ok(result)) => result,
+        Ok(Err(panicked)) => Err(AppError::internal(format!("the export task failed: {panicked}"))),
+        Err(_) => Err(AppError::internal("the export did not finish within its time limit")),
+    };
+    match result {
         Ok(()) => tracing::info!(job_id = %job.id, %export_id, "job export ready"),
         Err(err) => {
             tracing::warn!(job_id = %job.id, %export_id, error = %err.message, "job export failed");

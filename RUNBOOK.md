@@ -145,7 +145,10 @@ aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type Se
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
 ```
 
-Then run §4 (verification), and `terraform apply`: the restore set none of
+Then run §4 (verification), **Check artifacts** on every leave-generation job
+(§3: the database now describes the objects as they were at the restore point,
+and the button makes what workers are sent match what the bucket holds), and
+`terraform apply -var-file=prod.tfvars`: the restore set none of
 Multi-AZ, the backup window or tag copying, and the apply puts them back. Only
 once §4 passes, retire `birdtest-damaged-$STAMP` — never before.
 
@@ -414,38 +417,63 @@ span every job an identity ever worked on — so a partial restore of one job
 cannot repair them in isolation the way §2.3 repairs the job's own. Recompute
 them globally, once, after every job has been restored:
 
+Count first, into a temporary table, then apply in small batches. A single
+`UPDATE` over every account would hold each one's row lock until it finished,
+and every submission increments its worker's counter: submissions would wait,
+then be answered 503 after five seconds, for as long as the recount ran.
+
 ```sql
-BEGIN;
+-- 1. Count. Reads only; nothing waits on this.
+CREATE TEMP TABLE recount AS
+SELECT 'u' AS kind, c.claimed_by_user_id::text AS id, count(*) AS n, max(c.completed_at) AS last
+  FROM task_claims c
+ WHERE c.state = 'completed' AND c.claimed_by_user_id IS NOT NULL
+ GROUP BY 2
+UNION ALL
+SELECT 'a', c.claimed_by_anon_uuid::text, count(*), max(c.completed_at)
+  FROM task_claims c
+ WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
+ GROUP BY 2;
+
+-- 2. Apply, a thousand rows a statement, only where the figure differs. Each
+--    statement is its own transaction (psql's autocommit), and gives up rather
+--    than queue behind a submission. Repeat until both report UPDATE 0; a
+--    lock_timeout error just means run it again.
+SET lock_timeout = '2s';
 
 UPDATE users u
-   SET tasks_completed = COALESCE(actual.n, 0),
-       last_completed_at = actual.last
-  FROM (SELECT c.claimed_by_user_id AS id, count(*) AS n, max(c.completed_at) AS last
-          FROM task_claims c
-         WHERE c.state = 'completed' AND c.claimed_by_user_id IS NOT NULL
-         GROUP BY 1) actual
- WHERE u.id = actual.id;
+   SET tasks_completed = r.n, last_completed_at = r.last
+  FROM (SELECT r.id::uuid AS id, r.n, r.last
+          FROM recount r JOIN users u ON u.id = r.id::uuid
+         WHERE r.kind = 'u'
+           AND (u.tasks_completed, u.last_completed_at) IS DISTINCT FROM (r.n, r.last)
+         LIMIT 1000) r
+ WHERE u.id = r.id;
 
 UPDATE anonymous_workers w
-   SET tasks_completed = COALESCE(actual.n, 0),
-       last_completed_at = actual.last
-  FROM (SELECT c.claimed_by_anon_uuid AS uuid, count(*) AS n, max(c.completed_at) AS last
-          FROM task_claims c
-         WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
-         GROUP BY 1) actual
- WHERE w.uuid = actual.uuid;
-
-COMMIT;
+   SET tasks_completed = r.n, last_completed_at = r.last
+  FROM (SELECT r.id::uuid AS uuid, r.n, r.last
+          FROM recount r JOIN anonymous_workers w ON w.uuid = r.id::uuid
+         WHERE r.kind = 'a'
+           AND (w.tasks_completed, w.last_completed_at) IS DISTINCT FROM (r.n, r.last)
+         LIMIT 1000) r
+ WHERE w.uuid = r.uuid;
 ```
+
+The counts are a snapshot: a submission accepted between step 1 and a row's
+update is overwritten by the older figure. Run this when the fleet is quiet, or
+`DROP TABLE recount;` and run both steps again afterwards; a second run changes
+only what moved.
 
 This is the one recount a restore is most likely to need, and the one most
 likely to be forgotten: nothing about a single job's restore makes a wrong
 leaderboard visible. An identity with no completed claims at all keeps whatever
-it had — the joins above only touch identities that appear in `task_claims` — so
-if claims were *dropped* rather than restored, zero those rows first
-(`UPDATE users SET tasks_completed = 0, last_completed_at = NULL;` and the
-same for `anonymous_workers`) and let the statements above put back what the
-rows actually support.
+it had — the statements above only touch identities that appear in
+`task_claims` — so if claims were *dropped* rather than restored, zero those
+rows first (`UPDATE users SET tasks_completed = 0, last_completed_at = NULL
+WHERE tasks_completed > 0 AND id NOT IN (SELECT id::uuid FROM recount WHERE kind = 'u');`
+and the same for `anonymous_workers`) and let the statements above put back
+what the rows actually support.
 
 ### 2.4 Recompute derived state
 
@@ -465,9 +493,12 @@ rows actually support.
   month whatever the backup's age.
 - **SPRT**: computed from `game_results` on read, so it corrects itself once
   the results are back.
-- **Leave-generation artifacts**: if any object is missing, use
-  `POST /api/admin/jobs/:id/rebuild-artifacts` (the "Check artifacts" button on
-  the admin job page) rather than restoring bytes — see §3.
+- **Leave-generation artifacts**: run `POST /api/admin/jobs/:id/rebuild-artifacts`
+  (the "Check artifacts" button on the admin job page) on every restored
+  leave-generation job, whether or not an object is missing: it rebuilds the
+  missing ones, and makes the hash workers are sent match the object each
+  generation's key now holds — restored rows describe the objects as they were,
+  and a worker refuses a KLV whose hash does not match. See §3.
 - **Derived data** (`derived_data`): the SHA-256 of each wordmap and rack info
   table the server built. Derived by definition, and **a job whose rows are
   missing does not dispatch** — which is the symptom a restore produces here:
@@ -514,6 +545,11 @@ aws s3api copy-object --bucket "$ARTIFACTS_BUCKET" \
   --copy-source "$ARTIFACTS_BUCKET/leaves/$JOB/generation-3.klv2?versionId=$VERSION" \
   --key "leaves/$JOB/generation-3.klv2"
 ```
+
+Then **Check artifacts** (without `force`). Workers verify the KLV they fetch
+against the hash they are sent, and that hash still describes the object the
+copy replaced: until the check records the restored object's hash, every task
+of the next generation is declined.
 
 Never restore the artifact bucket wholesale to an older point: the bucket is
 allowed to be newer than the database, never older (PLAN.md, "Artifacts: back up, or rebuild?").
@@ -619,7 +655,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    dead until this is done, which means no confirmations and no password
    resets. SES production access is per region: request it again.
 6. Point DNS at the new ALB.
-7. Run §4.
+7. Run §4, and **Check artifacts** on every leave-generation job (§3): the
+   synced objects are the replicas' latest versions, which need not be the ones
+   the restored rows describe.
 8. `terraform -chdir=infra workspace select default` when done. The workspace
    is remembered in `infra/.terraform`, and `scripts/prod-sql.sh`,
    `scripts/prod-shell.sh` and §1's outputs would otherwise go on reading the

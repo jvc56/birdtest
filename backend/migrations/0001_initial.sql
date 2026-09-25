@@ -37,6 +37,12 @@ CREATE TABLE users (
 CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at ASC)
     WHERE deleted_at IS NULL;
 
+-- Serves the account half of /api/workers, in that list's order (see
+-- anonymous_workers_contribution_idx). A deleted account keeps its place there:
+-- its work was done, and it is listed under its anonymized name.
+CREATE INDEX users_worker_rank_idx ON users (tasks_completed DESC, id)
+    WHERE tasks_completed > 0;
+
 CREATE TABLE email_confirmations (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -65,9 +71,10 @@ CREATE INDEX password_reset_tokens_hash_idx ON password_reset_tokens (token_hash
 CREATE INDEX password_reset_tokens_user_idx ON password_reset_tokens (user_id);
 
 -- One account per username whatever its case: "Josh" and "josh" side by side
--- on a public leaderboard is an impersonation. (Login looks names up exactly,
--- as they were registered.)
+-- on a public leaderboard is an impersonation. Login matches the same way, so
+-- whoever registered "Josh" can sign in as "josh"; this index serves it.
 CREATE UNIQUE INDEX users_username_lower_idx ON users (lower(username));
+
 
 CREATE TABLE api_keys (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -78,6 +85,9 @@ CREATE TABLE api_keys (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at TIMESTAMPTZ
 );
+-- A user's keys: the key list, the hundred-key check, and the cascade when a
+-- user is deleted or an expired unconfirmed account is released.
+CREATE INDEX api_keys_user_idx ON api_keys (user_id);
 -- Enforce the 100-key limit per user at the application layer, not via a DB constraint.
 
 -- Workers
@@ -101,7 +111,7 @@ CREATE TABLE anonymous_workers (
 -- identity in one ranking. Partial: an identity that has completed nothing is
 -- not a contributor and is not listed.
 CREATE INDEX anonymous_workers_contribution_idx
-    ON anonymous_workers (tasks_completed DESC) WHERE tasks_completed > 0;
+    ON anonymous_workers (tasks_completed DESC, uuid) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),

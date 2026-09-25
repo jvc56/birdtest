@@ -89,6 +89,9 @@ async fn create_key(
     ApiJson(body): ApiJson<CreateKeyBody>,
 ) -> AppResult<(StatusCode, Json<CreatedKey>)> {
     csrf::verify(&method, &headers, &jar)?;
+    // Each key is a worker rate-limit bucket of its own, so making keys is
+    // limited too: revoke-and-create would otherwise be unlimited rate.
+    crate::ratelimit::check(&state.limits.key_creation, &format!("u:{}", user.id))?;
 
     // Count and insert under the account's row lock. Counted and then inserted
     // as two statements on the pool, requests arriving together each read the

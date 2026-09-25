@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 474 backend tests.
+--run-ignored all` runs 476 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -1023,7 +1023,10 @@ job creation touches needs one caller here.
   `rebuild_artifacts` share `generation_means` precisely so a rebuild cannot
   drift; fold, rebuild, compare digests. And a forced rebuild that writes
   different bytes records them as `served_sha256` — what workers are told to
-  check the object against — while `sha256` keeps the first hash. *(Covered,
+  check the object against — while `sha256` keeps the first hash; and a check
+  that rewrites nothing still sets it from the object the key holds, so an
+  older object version copied back is served under its own hash again
+  (fourteenth audit). *(Covered,
   tier 6 opt-in: `magpie_leave::a_rebuild_reproduces_every_generations_bytes`.)*
 - `I-LEAVE-9` A job with `generation_count > 1` advances to the next generation
   and finishes after the last. *(Covered:
@@ -1449,8 +1452,10 @@ below.
   after, the next registration takes both. *(Covered:
   `auth_routes::an_expired_unconfirmed_account_gives_up_its_address_and_username`.)*
   (Eleventh audit.)
-- `A-AUTH-4c` A username is taken whatever its case. *(Covered:
-  `auth_routes::a_username_is_taken_whatever_its_case`.)* (Thirteenth audit.)
+- `A-AUTH-4c` A username is taken whatever its case, and signs in whatever its
+  case. *(Covered:
+  `auth_routes::a_username_is_taken_and_signs_in_whatever_its_case`.)*
+  (Thirteenth audit; the sign-in half, fourteenth.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
   scored the new password without the account's context. *(Covered:
@@ -1632,7 +1637,13 @@ below.
   registered `<id>@deleted.invalid` no longer blocks the delete), and the bans
   in force are listed with the id lifting one takes. *(Covered:
   `admin_api::a_deleted_accounts_tombstone_cannot_be_squatted_and_bans_are_listed`.)*
-  (Thirteenth audit.)
+  (Thirteenth audit.) Banning an identity that does not exist is `404`
+  (`admin_api::an_identity_can_be_banned_once_and_unbanning_lifts_it`;
+  fourteenth audit).
+- `A-ADMIN-19` A purge or delete of a job whose purge or delete is already
+  running is `409`, and allowed once it has finished. *(Covered:
+  `admin_api::a_second_purge_or_delete_is_refused_while_one_runs`.)* (Fourteenth
+  audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -1716,6 +1727,9 @@ below.
   `account::deactivation_suspends_a_key_reactivation_restores_it_and_revocation_is_final`.)*
 - `A-ACCOUNT-5` One user cannot see or modify another's keys. *(Covered:
   `account::one_user_cannot_see_or_change_anothers_keys`.)*
+- `A-ACCOUNT-6` An account creates at most ten keys an hour; another account is
+  unaffected. *(Covered: `account::key_creation_is_rate_limited_per_account`.)*
+  (Fourteenth audit.)
 
 ### `A-BOUND-*` — boundaries (`backend/tests/boundaries.rs`)
 
@@ -1835,7 +1849,10 @@ out for the connect time in microseconds, read as seconds); and
 `test_a_request_must_state_its_distribution_and_layout` now also refuses a
 path-escaping name in any player object; and `test_a_player_must_state_every_setting`
 refuses a player without its leaves (twelfth audit), which a load would
-otherwise take from whatever was loaded last.
+otherwise take from whatever was loaded last. `test_an_abandoned_temporary_is_removed`
+(fourteenth audit): a write's `<name>.<pid>.tmp` sibling untouched for an hour
+— a killed writer's, up to 1.9 GB for a rack info table — is removed by the
+next write of the name, and a fresh one or another name's is not.
 
 **Capture** is `scripts/capture_contract.py`, a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and

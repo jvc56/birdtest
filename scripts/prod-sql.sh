@@ -57,9 +57,14 @@ fi
 echo "running $task_arn" >&2
 # Polled without a cap. `aws ecs wait tasks-stopped` gives up after ten
 # minutes and exits, with no output, while the SQL goes on running and
-# commits -- and running it again would run it twice.
-while [[ "$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
-    --query 'tasks[0].lastStatus' --output text)" != STOPPED ]]; do
+# commits -- and running it again would run it twice. A task ECS no longer
+# describes (it forgets stopped ones after about an hour: a laptop that slept
+# through the run) reads `None`, and has stopped too; a failed call reads
+# empty, and is asked again.
+while :; do
+  status=$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
+    --query 'tasks[0].lastStatus' --output text 2>/dev/null) || status=""
+  [[ "$status" == STOPPED || "$status" == None ]] && break
   sleep 10
 done
 

@@ -214,7 +214,22 @@ async fn register(
     .bind(&email)
     .bind(&password_hash)
     .fetch_one(&mut *tx)
-    .await?;
+    .await
+    .map_err(|err| {
+        // Two registrations of one name (in any case) at once: the loser is
+        // told what the check above would have told it.
+        let username_taken = matches!(
+            &err,
+            sqlx::Error::Database(db)
+                if matches!(db.constraint(), Some("users_username_key" | "users_username_lower_idx"))
+        );
+        if username_taken {
+            AppError::conflict("registration details are invalid")
+                .with_field("username", "that username is taken")
+        } else {
+            err.into()
+        }
+    })?;
 
     sqlx::query(
         "INSERT INTO email_confirmations (user_id, code_hash, expires_at) VALUES ($1, $2, $3)",
@@ -304,7 +319,7 @@ async fn login(
 
     let row = sqlx::query_as::<_, (Uuid, String, String, bool, Option<chrono::DateTime<Utc>>, i32)>(
         "SELECT id, username, password_hash, is_admin, email_confirmed_at, session_generation
-         FROM users WHERE username = $1 AND deleted_at IS NULL",
+         FROM users WHERE lower(username) = lower($1) AND deleted_at IS NULL",
     )
     .bind(body.username.trim())
     .fetch_optional(&state.pool)

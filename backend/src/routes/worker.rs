@@ -482,7 +482,7 @@ async fn submit_result(
 
     refuse_if_claims_held(&state, body.claim_token).await?;
     // Held until the handler returns, after the commit.
-    let _turn = crate::jobs::registry::large_result_turn(body.result.get().len()).await?;
+    let turn = crate::jobs::registry::large_result_turn(body.result.get().len()).await?;
     let mut tx = state.pool.begin().await?;
 
     // The claim is looked up and locked inside the transaction that completes
@@ -665,6 +665,9 @@ async fn submit_result(
     // the path a worker waits on.
 
     tx.commit().await?;
+    // The stored result is out of memory's way; the finish check below does
+    // not need the turn.
+    drop(turn);
 
     // The result is committed; nothing below can un-accept it. Failing the
     // request now would tell the worker to retry a submission that already

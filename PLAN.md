@@ -678,7 +678,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
 #### Login Flow
 
 1. User submits the login form (`/login`) with username and password. Attempts are rate limited per client IP (10 a minute) and per username from everywhere (100 a minute), both checked before any Argon2 verify runs. The username limit was per username alone at 10 a minute, which let one address trying a wrong password every six seconds hold any account — an admin's, whose name is public — out of signing in; now a lockout takes a fleet of addresses, and the account-wide cap still bounds a distributed guesser.
-2. The server looks up the user by username. If not found, or the password does not verify, it returns `401` with an identical message for both, so the response body cannot be used to enumerate accounts.
+2. The server looks up the user by username, whatever its case — the name is unique whatever its case, so this finds at most one account, and a contributor who registered "Josh" and types "josh" is not told their password is wrong. If not found, or the password does not verify, it returns `401` with an identical message for both, so the response body cannot be used to enumerate accounts.
 
    A known account still costs an Argon2 verify where an unknown one returns
    immediately, so the *timing* does distinguish them. That is a known and
@@ -918,7 +918,9 @@ held for the life of the response body, released when a caller disconnects as
 well as when one reads to the end), and a completed job is served from an
 artifact instead. Building an export reads the corpus through the same pool, so
 a job has **one export running at a time** (a partial unique index) and at most
-**two build at once** across the server; beyond that an export waits its turn
+**two build at once** across the server (a build that outlives six hours is
+failed, freeing the job for another request, and one whose row an admin
+cleared while it waited does not start); beyond that an export waits its turn
 `running`.
 
 `POST /api/admin/jobs/:id/export` spawns a task that streams the job's rows out
@@ -3857,9 +3859,9 @@ rack per task would spend a claim/submit round trip on each.
 builds a zeroed KLV for it at `generation-0` when the job is created, so every
 generation fetches its leaves the same way and the client has no first-generation
 branch. `previous_artifact_sha256` is the hash of the bytes the object store
-holds for that KLV — `leave_generation_artifacts.served_sha256`, which a rebuild
-that rewrites the object sets, else `sha256`, the hash recorded when it was
-built; MAGPIE checks the fetched bytes
+holds for that KLV — `leave_generation_artifacts.served_sha256`, which every
+rebuild sets from the object as it finds or leaves it, else `sha256`, the hash
+recorded when it was built; MAGPIE checks the fetched bytes
 against it before playing a game, and writes them under a name made from it
 (`<lexicon>_birdtest_<16 hex>`), so a name always means the same bytes — the
 load's name-keyed cache cannot mix generations, and two `contribute` processes
@@ -3892,7 +3894,10 @@ pair.
 
 `204`. `reason` is `missing_data`, `magpie_version`, `unknown_job_type`,
 `derived_mismatch` — the worker built the wordmap or rack info table the job pins
-and got different bytes — or `task_failed` — the worker ran the task and could
+and got different bytes, or (role `klv`) the leave KLV it fetched does not hash to
+`previous_artifact_sha256`; for that one the worker does not set the job aside,
+since it is the server's to fix, but waits its idle interval and claims again —
+or `task_failed` — the worker ran the task and could
 not produce a result the server accepted;
 `missing` is present for `missing_data` and `derived_mismatch`, where `actual`
 is the digest of what the worker built. `actual: null` means the file was not
@@ -4327,7 +4332,8 @@ In-memory token buckets, per process, reset on restart.
 | `POST /api/auth/register` | 10 / hour | Client IP |
 | `POST /api/auth/login` | 10 / minute, and 100 / minute | Client IP; and, separately, the username tried from anywhere — ten times the address's, so that one address cannot lock an account out |
 | `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
-| `POST /api/worker/{task,result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5**; and 10 / second, burst 50, per account | Worker identity: the API key (`k:<key-id>`) or the anonymous UUID (`a:<uuid>`). Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. The account-wide bucket bounds an account's keys together, since revoking a key and making another is a fresh bucket |
+| `POST /api/worker/{task,result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Worker identity: the API key (`k:<key-id>`) or the anonymous UUID (`a:<uuid>`). Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
+| `POST /api/me/api-keys` | 10 / hour | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered creation was unmetered submission. A contributor setting up many machines at once makes ten keys, then one every six minutes |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
 
 "Client IP" is the `X-Forwarded-For` entry `TRUSTED_PROXY_HOPS` from the right —
@@ -4487,8 +4493,8 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. |
-| `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. |
-| `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. |
+| `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. `409` while a purge or delete of the job is already running: each runs to completion on a task of its own, so a second click stacked a second behind the first's locks. |
+| `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. `409` while a purge or delete of it is running, as above. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account: anonymize it in place, keeping its claims and records so no donated compute is lost (see Admin API semantics). |
 | `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. One ban per identity: a second is `409`, so that unban means what it says. |
 | `GET` | `/api/admin/workers/bans` | Every ban in force, newest first, with the id lifting it takes. (Nothing listed them before the thirteenth audit; a mistaken ban needed SQL.) |
@@ -5041,6 +5047,12 @@ CREATE TABLE users (
 CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at ASC)
     WHERE deleted_at IS NULL;
 
+-- Serves the account half of /api/workers, in that list's order (see
+-- anonymous_workers_contribution_idx). A deleted account keeps its place there:
+-- its work was done, and it is listed under its anonymized name.
+CREATE INDEX users_worker_rank_idx ON users (tasks_completed DESC, id)
+    WHERE tasks_completed > 0;
+
 CREATE TABLE email_confirmations (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -5069,9 +5081,10 @@ CREATE INDEX password_reset_tokens_hash_idx ON password_reset_tokens (token_hash
 CREATE INDEX password_reset_tokens_user_idx ON password_reset_tokens (user_id);
 
 -- One account per username whatever its case: "Josh" and "josh" side by side
--- on a public leaderboard is an impersonation. (Login looks names up exactly,
--- as they were registered.)
+-- on a public leaderboard is an impersonation. Login matches the same way, so
+-- whoever registered "Josh" can sign in as "josh"; this index serves it.
 CREATE UNIQUE INDEX users_username_lower_idx ON users (lower(username));
+
 
 CREATE TABLE api_keys (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -5082,6 +5095,9 @@ CREATE TABLE api_keys (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at TIMESTAMPTZ
 );
+-- A user's keys: the key list, the hundred-key check, and the cascade when a
+-- user is deleted or an expired unconfirmed account is released.
+CREATE INDEX api_keys_user_idx ON api_keys (user_id);
 -- Enforce the 100-key limit per user at the application layer, not via a DB constraint.
 
 -- Workers
@@ -5105,7 +5121,7 @@ CREATE TABLE anonymous_workers (
 -- identity in one ranking. Partial: an identity that has completed nothing is
 -- not a contributor and is not listed.
 CREATE INDEX anonymous_workers_contribution_idx
-    ON anonymous_workers (tasks_completed DESC) WHERE tasks_completed > 0;
+    ON anonymous_workers (tasks_completed DESC, uuid) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -6534,8 +6550,8 @@ CREATE INDEX leave_rack_progress_pick_idx
 
 Ten audits of this repository each left a findings record (`AUDIT_FINDINGS*.md`,
 now deleted; they are in the git history up to the commit that removed them).
-The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md` and
-the thirteenth's `AUDIT_FINDINGS_9.md`.
+The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
+the thirteenth's `AUDIT_FINDINGS_9.md` and the fourteenth's `AUDIT_FINDINGS_10.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -6636,8 +6652,8 @@ what would make it worth revisiting.
   cascades are tens of millions of rows for a full simming opening-rack job —
   minutes on the production instance class, the job's claims held throughout,
   and the admin told nothing past the load balancer's timeout (the audit log and
-  the job's page say when it is done) — and a finished one leaves that many dead
-  tuples to vacuum. *Open (eleventh audit):* a purge that commits the job's state change
+  the job's page say when it is done; clicking again is answered `409`) — and a
+  finished one leaves that many dead tuples to vacuum. *Open (eleventh audit):* a purge that commits the job's state change
   at once and deletes bottom-up in batches on a spawned task with a status row,
   like an export; or the result tables partitioned by job, so a purge is a
   `TRUNCATE` and a delete a `DROP`. Both are real redesigns; neither is needed
@@ -6865,6 +6881,15 @@ what would make it worth revisiting.
 ### Scaling
 
 - **Primary/secondary server split** — one instance owns task scheduling and mutations; read-only instances serve the dashboard. Eliminates concurrent scheduling conflicts under high worker load. Note that several things assume a single instance today and would have to move first: staged imports and their reaper, the in-process rate limiters, and the per-process SSE broadcaster (`desired_count` is validated to 1 for that reason).
+- **The job list's `stalled` flag scans the fleet's last day.** For an active
+  job with a recent decline, "no submission in 24 hours" is answered from the
+  index of completed claims by time — every claim completed in the last day,
+  fleet-wide, joined to its task — once per such job per list view. Nothing
+  indexes claims by job and completion time (`tasks_job_idx` was dropped, and
+  a per-job index would be the widest on the busiest table for one badge).
+  Cheap while declines are rare, which is the normal case; if the list slows,
+  keep a `last_completed_at` on `jobs`, bumped by the submission that already
+  updates the job row.
 - **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least a second apart. What remains is moving the payload's own aggregates to a background refresh, which `compute`'s slow-query log line exists to decide on.
 
 ---
@@ -7035,10 +7060,10 @@ incomplete multipart uploads at 7 days.
 
 ```
 s3://birdtest-backups-<account>/
-  pg/2026-09-07T03:00:00Z/
+  pg/2026-09-07T03-00-00Z/
     manifest.json
     dump/                     # pg_dump -Fd output, one file per table
-  pg/2026-09-07T03:00:00Z.manifest.json   # duplicated at top level for cheap listing
+  pg/2026-09-07T03-00-00Z.manifest.json   # duplicated at top level for cheap listing
 ```
 
 `manifest.json` is what makes a backup self-describing, and the in-place-migration
@@ -7123,11 +7148,17 @@ restore uses when a DB restored to time *T* references keys that no longer exist
 
 Two details a rebuild has to respect:
 
-- **A rebuild that rewrites an object records what it wrote**:
-  `served_sha256`, which workers are sent and check the object against, while
-  `sha256` keeps the hash first written as the evidence it is. Left on the first
-  hash, a rebuild under a changed builder (or `force`) had every task of the
-  next generation refused by every worker.
+- **A rebuild records what the object holds**: `served_sha256`, which workers
+  are sent and check the object against, while `sha256` keeps the hash first
+  written as the evidence it is. Left on the first hash, a rebuild under a
+  changed builder (or `force`) had every task of the next generation refused
+  by every worker. It is set on *every* rebuild, not only one that rewrites:
+  from the bytes written, or the bytes read back when the object is left
+  alone — so a rebuild whose write landed but whose update did not, or an
+  object version an operator copied back (RUNBOOK §3), or a restore's rows
+  describing other bytes, are all put right by running **Check artifacts**
+  again. A worker declines a KLV that fails the check and waits, leaving the
+  job claimable, since this is the server's to fix.
 - `seed_zero_generation` writes generation 0 as a zeroed KLV; a rebuild must
   reproduce generation 0 the same way rather than from `leave_rack_progress`, which
   for generation 0 does not exist.

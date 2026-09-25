@@ -821,9 +821,14 @@ async fn worker_page(
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
     // Both kinds of contributor in one ranking, each from its own running
-    // total. This was a group-by over every completed claim in the database --
-    // twice, once for the page and once for the count. Each arm is now an
-    // ordered scan of a partial index, merged under the LIMIT.
+    // total. Each arm is an ordered scan of its own partial index, cut off at
+    // the end of the requested page, and the two are merged. The arms must be
+    // limited themselves: with the LIMIT only outside the UNION, Postgres
+    // sorted every contributor of both kinds on each view (the constant NULL
+    // column in each arm defeats a merge of the index orders). Within a count,
+    // the outer order puts accounts (by id) before anonymous identities (by
+    // UUID) -- a NULL sorts last -- which is what each arm's own order gives,
+    // so the first `offset + limit` of each arm hold the page.
     //
     // `last_seen_at` here is the last *task finished*, which is what this list
     // has always shown; it is deliberately not `anonymous_workers.last_seen_at`,
@@ -846,12 +851,16 @@ async fn worker_page(
                 c.username, c.tasks_completed, c.last_seen_at
          FROM (
              SELECT * FROM (
-                 SELECT u.id AS user_id, NULL::uuid AS anon_uuid,
-                        u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
-                 FROM users u WHERE u.tasks_completed > 0
+                 (SELECT u.id AS user_id, NULL::uuid AS anon_uuid,
+                         u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
+                  FROM users u WHERE u.tasks_completed > 0
+                  ORDER BY u.tasks_completed DESC, u.id
+                  LIMIT $3)
                  UNION ALL
-                 SELECT NULL::uuid, w.uuid, NULL::text, w.tasks_completed, w.last_completed_at
-                 FROM anonymous_workers w WHERE w.tasks_completed > 0
+                 (SELECT NULL::uuid, w.uuid, NULL::text, w.tasks_completed, w.last_completed_at
+                  FROM anonymous_workers w WHERE w.tasks_completed > 0
+                  ORDER BY w.tasks_completed DESC, w.uuid
+                  LIMIT $3)
              ) contributors
              ORDER BY tasks_completed DESC, user_id, anon_uuid
              LIMIT $1 OFFSET $2
@@ -860,6 +869,7 @@ async fn worker_page(
     )
     .bind(limit)
     .bind(offset)
+    .bind(offset.saturating_add(limit))
     .fetch_all(&state.read_pool)
     .await?;
 

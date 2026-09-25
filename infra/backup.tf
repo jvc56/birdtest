@@ -161,7 +161,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups" {
 resource "aws_s3_bucket" "backups_dr" {
   provider = aws.dr
   bucket   = "${local.name}-backups-dr-${data.aws_caller_identity.current.account_id}"
-  tags     = local.tags
+  # S3 replicates nothing from a source with Object Lock into a destination
+  # without it: every replication would fail, and the dumps would never leave
+  # the region. No default retention here -- each replica carries its source
+  # object's retention. Like the source's, decided at creation: on a stack
+  # applied without it, the bucket is replaced (empty it first; its contents
+  # are copies).
+  object_lock_enabled = true
+  tags                = local.tags
 }
 
 resource "aws_s3_bucket_public_access_block" "backups_dr" {
@@ -212,6 +219,22 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups_dr" {
     expiration {
       days = var.backup_retention_days
     }
+
+    # Expiring a replica only adds a delete marker; the bytes stay until the
+    # noncurrent version goes, as in the source bucket.
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+  }
+
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
   }
 }
 
@@ -229,10 +252,14 @@ data "aws_iam_policy_document" "backup_replication" {
     resources = [aws_s3_bucket.backups.arn]
   }
   statement {
+    # The two retention reads: replicating from an Object Lock bucket copies
+    # each object's retention, and fails without them.
     actions = [
       "s3:GetObjectVersionForReplication",
       "s3:GetObjectVersionAcl",
       "s3:GetObjectVersionTagging",
+      "s3:GetObjectRetention",
+      "s3:GetObjectLegalHold",
     ]
     resources = ["${aws_s3_bucket.backups.arn}/*"]
   }

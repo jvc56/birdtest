@@ -329,6 +329,18 @@
             SPRT {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}
           {/if}
         </p>
+      {:else if stats.opening_racks}
+        <ProgressBar
+          value={stats.opening_racks.racks_analyzed}
+          max={stats.opening_racks.racks_total}
+          label="racks analysed"
+        />
+      {:else if stats.leave_generation}
+        <ProgressBar
+          value={Math.max(stats.leave_generation.current_generation - 1, 0)}
+          max={stats.leave_generation.generation_count}
+          label="generations closed"
+        />
       {:else}
         <ProgressBar value={stats.tasks_completed} max={stats.tasks_total} label="tasks completed" />
       {/if}

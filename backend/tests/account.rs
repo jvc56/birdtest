@@ -107,6 +107,28 @@ async fn me_returns_the_caller_and_never_a_password_hash() {
     }
 }
 
+/// A-ACCOUNT-6: an account creates at most ten keys an hour. Each key is a
+/// worker rate-limit bucket of its own, so unmetered creation was unmetered
+/// submission; the hundred-key cap alone did not bound it, as revoking frees
+/// a slot.
+#[tokio::test]
+async fn key_creation_is_rate_limited_per_account() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let user = db.user("churner", false).await;
+    let headers = signed_in(&db, user);
+    for n in 0..10 {
+        create_key(&app, &headers, &format!("key {n}")).await;
+    }
+    let (status, body) =
+        send(&app, request("POST", "/api/me/api-keys", &headers, Some(json!({ "label": "one more" })))).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+
+    // Another account is not held back by this one.
+    let other = db.user("bystander", false).await;
+    create_key(&app, &signed_in(&db, other), "first").await;
+}
+
 /// A-ACCOUNT-2: creating a key returns it in full once -- the key that
 /// actually authenticates -- and the list never returns it, or its hash,
 /// again.

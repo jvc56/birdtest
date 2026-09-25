@@ -1803,11 +1803,16 @@ impl Contributions {
     }
 
     /// The caller's last statement before it commits, so the rows are held
-    /// for milliseconds. In id order (the counts are read sorted), so two
-    /// purges sharing contributors lock them in the same order rather than
-    /// deadlocking at the end of both.
+    /// for milliseconds. In id order, so two purges sharing contributors lock
+    /// them in the same order rather than deadlocking at the end of both.
     async fn give_back(self, conn: &mut sqlx::PgConnection) -> AppResult<()> {
         let (ids, counts): (Vec<Uuid>, Vec<i64>) = self.users.into_iter().unzip();
+        // Locked in id order first: the update below locks rows in whatever
+        // order its plan visits them, which a sorted array does not decide.
+        sqlx::query("SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE")
+            .bind(&ids)
+            .execute(&mut *conn)
+            .await?;
         sqlx::query(
             "UPDATE users u
              SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
@@ -1819,6 +1824,12 @@ impl Contributions {
         .execute(&mut *conn)
         .await?;
         let (uuids, counts): (Vec<Uuid>, Vec<i64>) = self.anonymous.into_iter().unzip();
+        sqlx::query(
+            "SELECT 1 FROM anonymous_workers WHERE uuid = ANY($1) ORDER BY uuid FOR NO KEY UPDATE",
+        )
+        .bind(&uuids)
+        .execute(&mut *conn)
+        .await?;
         sqlx::query(
             "UPDATE anonymous_workers w
              SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
@@ -1870,7 +1881,22 @@ async fn purge_job(
     jar: CookieJar,
 ) -> AppResult<Json<PurgeResult>> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_if_already_running(&state, id)?;
     run_to_completion(purge_body(state, admin.0.id, id)).await
+}
+
+/// A purge or delete of this job already running -- one the load balancer
+/// stopped waiting for, which the admin page shows as an error and invites a
+/// second click on -- is not started again: the second would park a pool
+/// connection on the first's locks and then do all of it over.
+fn refuse_if_already_running(state: &AppState, id: Uuid) -> AppResult<()> {
+    if state.dispatch_holds.claims_held(id) {
+        return Err(AppError::conflict(
+            "a purge or delete of this job is already running; its result will show on the \
+             job's page and in the audit log when it finishes",
+        ));
+    }
+    Ok(())
 }
 
 /// Runs a purge or a delete on a task of its own, and waits for it.
@@ -1968,9 +1994,6 @@ async fn purge_body(state: AppState, admin_id: Uuid, id: Uuid) -> AppResult<Json
     .bind(id)
     .execute(&mut *tx)
     .await?;
-    // A job back at zero claims would otherwise be first in every candidate
-    // list until it had re-issued as many as the jobs beside it.
-    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -2032,6 +2055,13 @@ async fn purge_body(state: AppState, admin_id: Uuid, id: Uuid) -> AppResult<Json
         Some(id),
     )
     .await?;
+    // A job back at zero claims would otherwise be first in every candidate
+    // list until it had re-issued as many as the jobs beside it. Last, not
+    // beside the counters it follows: the other jobs go on issuing claims for
+    // the minutes the cascade above takes, and parity taken before it left the
+    // purged job that far behind, heading every candidate list until it had
+    // caught up.
+    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     contributions.give_back(&mut tx).await?;
     tx.commit().await?;
     hold.committed();
@@ -2057,6 +2087,7 @@ async fn delete_job(
     jar: CookieJar,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_if_already_running(&state, id)?;
     run_to_completion(delete_body(state, admin.0.id, id)).await
 }
 
@@ -2581,6 +2612,29 @@ async fn ban_worker(
 
     if body.user_id.is_some() == body.anon_uuid.is_some() {
         return Err(AppError::bad_request("supply exactly one of user_id or anon_uuid"));
+    }
+    // Said plainly rather than left to the foreign key, whose refusal read
+    // "that is still referenced by other records" -- the usual sign of an
+    // anonymous UUID sent as a user id, or the other way round.
+    let exists: bool = match (body.user_id, body.anon_uuid) {
+        (Some(id), _) => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?,
+        (_, Some(uuid)) => {
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM anonymous_workers WHERE uuid = $1)")
+                .bind(uuid)
+                .fetch_one(&state.pool)
+                .await?
+        }
+        (None, None) => false,
+    };
+    if !exists {
+        return Err(AppError::not_found(if body.user_id.is_some() {
+            "no account has that id; is it an anonymous worker's UUID?"
+        } else {
+            "no anonymous worker has that UUID; is it an account's id?"
+        }));
     }
 
     let mut tx = state.pool.begin().await?;

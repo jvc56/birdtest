@@ -117,10 +117,16 @@ jobs:
       # directories it fills itself. Built in the backend image's own base,
       # so the binary links against the glibc it will run on rather than the
       # runner's newer one.
+      # The MAGPIE this branch pins (docker/Dockerfile), not the branch's head:
+      # a MAGPIE change pushed ahead of the pin would otherwise fail, or pass,
+      # a pull request that does not include it. The nightly tests the head.
+      - name: Read the pinned MAGPIE commit
+        id: magpie-pin
+        run: echo "commit=$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE
-          ref: birdtest-contribute
+          ref: ${{ steps.magpie-pin.outputs.commit }}
           path: magpie
       - name: Build MAGPIE
         run: |
@@ -173,16 +179,22 @@ jobs:
   # MAGPIE's half of the contract. Each repository
   # tests against its own copy of the fixtures, so a fixture changed here and
   # not copied to MAGPIE would pass both suites while breaking the protocol.
-  # This runs MAGPIE's contribute tests against *this* branch's fixtures.
-  # It does not catch a MAGPIE-side change; the nightly end-to-end job does.
+  # This runs the pinned MAGPIE's contribute tests against *this* branch's
+  # fixtures. A MAGPIE-side change past the pin is the nightly's to catch.
   magpie-contract:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # The MAGPIE this branch pins (docker/Dockerfile), not the branch's head:
+      # a MAGPIE change pushed ahead of the pin would otherwise fail, or pass,
+      # a pull request that does not include it. The nightly tests the head.
+      - name: Read the pinned MAGPIE commit
+        id: magpie-pin
+        run: echo "commit=$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE
-          ref: birdtest-contribute
+          ref: ${{ steps.magpie-pin.outputs.commit }}
           path: magpie
       - name: Use this branch's contract fixtures
         run: cp contract-fixtures/*.json magpie/test/birdtest_contract/

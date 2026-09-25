@@ -374,9 +374,10 @@ async fn an_expired_unconfirmed_account_gives_up_its_address_and_username() {
 }
 
 /// A-AUTH-4c: a username is taken whatever its case -- "Josh" and "josh" side
-/// by side on a public list is an impersonation.
+/// by side on a public list is an impersonation. And, being one name, it signs
+/// in whatever its case.
 #[tokio::test]
-async fn a_username_is_taken_whatever_its_case() {
+async fn a_username_is_taken_and_signs_in_whatever_its_case() {
     let db = TestDb::new().await;
     let (state, _outbox) = mail_state(&db, 0).await;
     let app = birdtest::app(state);
@@ -384,6 +385,15 @@ async fn a_username_is_taken_whatever_its_case() {
     assert_eq!(first.status, StatusCode::CREATED, "{first:?}");
     let second = register(&app, "josh", "other@example.invalid", PASSWORD, "").await;
     assert_eq!(second.status, StatusCode::CONFLICT, "{second:?}");
+    assert_eq!(second.json()["fields"][0]["field"], "username", "{second:?}");
+
+    sqlx::query("UPDATE users SET email_confirmed_at = now()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let response = login(&app, "josh", PASSWORD).await;
+    assert_eq!(response.status, StatusCode::OK, "{response:?}");
+    assert_eq!(response.json()["username"], "Josh", "the account's own spelling");
 }
 
 /// A-AUTH-5: a weak password is refused, and so is one derived from the

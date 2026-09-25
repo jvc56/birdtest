@@ -10,6 +10,7 @@
 
   async function load(next: number) {
     page = next;
+    error = '';
     try {
       result = await api.users(next);
     } catch (e) {

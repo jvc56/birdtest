@@ -93,6 +93,20 @@
           max={stats.games.max_units}
           label="{stats.games.unit}s completed (hard cap)"
         />
+      {:else if stats.opening_racks}
+        <!-- Tasks are made on demand, so a task count is only what has been
+             handed out so far: a job 1% through its racks read 99%. -->
+        <ProgressBar
+          value={stats.opening_racks.racks_analyzed}
+          max={stats.opening_racks.racks_total}
+          label="racks analysed"
+        />
+      {:else if stats.leave_generation}
+        <ProgressBar
+          value={Math.max(stats.leave_generation.current_generation - 1, 0)}
+          max={stats.leave_generation.generation_count}
+          label="generations closed"
+        />
       {:else}
         <ProgressBar
           value={stats.tasks_completed}

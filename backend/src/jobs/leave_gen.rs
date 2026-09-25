@@ -1388,6 +1388,9 @@ pub struct ArtifactRebuild {
     pub generation: i32,
     pub artifact_key: String,
     pub stored_sha256: String,
+    /// What the object holds now, and what workers are sent: `stored_sha256`
+    /// unless a rebuild rewrote it with other bytes.
+    pub served_sha256: String,
     pub rebuilt_sha256: String,
     pub matches: bool,
     /// Whether the stored artifact was written by the builder this rebuild
@@ -1469,26 +1472,35 @@ pub async fn rebuild_artifacts(
         // built by a different builder needs it twice over, since the
         // difference is expected rather than evidence of anything.
         let rewritten = !object_present || force;
-        if rewritten {
+        let served_sha256 = if rewritten {
             artifacts.put(&artifact_key, klv).await?;
-            // What workers are sent to check the object against has to be
-            // what the object now holds; `sha256` keeps the first hash.
-            sqlx::query(
-                "UPDATE leave_generation_artifacts
-                 SET served_sha256 = NULLIF($3, sha256)
-                 WHERE job_id = $1 AND generation = $2",
-            )
-            .bind(job_id)
-            .bind(generation)
-            .bind(&rebuilt_sha256)
-            .execute(pool)
-            .await?;
-        }
+            rebuilt_sha256.clone()
+        } else {
+            hex::encode(Sha256::digest(artifacts.get(&artifact_key).await?))
+        };
+        // What workers are sent to check the object against has to be what
+        // the object holds; `sha256` keeps the first hash. Set from the bytes
+        // actually stored, every time, rather than only after a rewrite: a
+        // rebuild cut off between its upload and this update (the request
+        // dropped, the update failing) left the row on the old hash, and a
+        // re-run found the object present, rewrote nothing, and never fixed
+        // it -- every worker refusing the job until someone forced it.
+        sqlx::query(
+            "UPDATE leave_generation_artifacts
+             SET served_sha256 = NULLIF($3, sha256)
+             WHERE job_id = $1 AND generation = $2",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .bind(&served_sha256)
+        .execute(pool)
+        .await?;
 
         report.push(ArtifactRebuild {
             generation,
             artifact_key,
             stored_sha256,
+            served_sha256,
             rebuilt_sha256,
             matches,
             same_builder,

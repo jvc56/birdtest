@@ -1120,6 +1120,17 @@ async fn an_identity_can_be_banned_once_and_unbanning_lifts_it() {
     // different reason" is expressed.
     let (status, body) = ban("a new reason").await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // An identity that does not exist is not "banned": a typo, or a UUID
+    // pasted into the wrong kind, would otherwise read as done.
+    for body in [
+        json!({ "user_id": Uuid::new_v4(), "reason": "typo" }),
+        json!({ "anon_uuid": target, "reason": "an account id sent as an anonymous UUID" }),
+    ] {
+        let (status, response) =
+            send(&app, post_json("/api/admin/workers/ban", &header_refs, body.clone())).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}: {response}");
+    }
 }
 
 /// Bug: the finish check reads a job's results, then completes it. A purge in
@@ -1532,6 +1543,38 @@ async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["accepted"], true, "the claim survived the failed purge: {body}");
+}
+
+/// A-ADMIN-19: a purge or delete clicked again while one is running is refused
+/// with 409. Each ran to completion on a task of its own, so a re-click
+/// stacked a second behind the first's locks, and the first to finish ended
+/// the hold the other still relied on.
+#[tokio::test]
+async fn a_second_purge_or_delete_is_refused_while_one_runs() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let hold = state.dispatch_holds.hold(
+        job,
+        birdtest::jobs::HoldKind::Claims,
+        std::time::Duration::from_secs(300),
+    );
+    let (status, body) =
+        send(&app, post_json(&format!("/api/admin/jobs/{job}/purge"), &refs, json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let (status, body) =
+        send(&app, request("DELETE", &format!("/api/admin/jobs/{job}"), &headers)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    drop(hold);
+    let (status, body) =
+        send(&app, post_json(&format!("/api/admin/jobs/{job}/purge"), &refs, json!({}))).await;
+    assert!(status.is_success(), "once it has finished: {body}");
 }
 
 /// A-ADMIN-17: a worker request's `last_seen_at` touch does not wait on its

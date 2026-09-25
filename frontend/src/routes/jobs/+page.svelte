@@ -28,7 +28,15 @@
    */
   function progress(job: JobListItem): { value: number; max: number; unit: string } {
     if (job.units_completed !== null && job.max_units !== null) {
-      return { value: job.units_completed, max: job.max_units, unit: 'units' };
+      const unit =
+        job.job_type === 'opening_rack'
+          ? 'racks'
+          : job.job_type === 'leave_generation'
+            ? 'generations'
+            : job.job_type === 'game_pairs'
+              ? 'pairs'
+              : 'games';
+      return { value: job.units_completed, max: job.max_units, unit };
     }
     return { value: job.tasks_completed, max: job.tasks_total, unit: 'tasks' };
   }
