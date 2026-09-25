@@ -2588,7 +2588,7 @@ At claim time:
 1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and `configured_generation_count` generations are already done, return "no work."
 2. Check that the generation's rack universe exists — every generation's, the first included, is written by a task the first claim to find it missing starts. That check is one indexed `EXISTS`. A claim that finds the universe missing rolls back, starts the seeding on its own task, and treats the job as having no work yet: the seeding takes the job's lock without waiting and holds it while it writes, so no claim reads a half-written universe, and a seeding a client or a deploy interrupts rolls back whole and is started again by the next claim. (It used to run inside the claim itself, where MAGPIE's 120-second request timeout could cancel it — on a database slower than that at writing 3.2 million rows, every claim restarted it and none finished.) Then select up to `racks_per_task` racks below `target_rack_count`, in one of two ways (`leave_gen::next_step`), chosen from the generation's summary row — how many racks were below target as of the last merge, the same age as the counts both selections read.
 
-   **While many racks are below target — more than a hundred tasks' worth (`SWEEP_WHILE_TASKS_REMAIN`) — a sweep.** The generation's racks are handed out in primary-key order from a cursor remembered between claims (`leave_selection_cursors`, one row per generation, read and written only under the job's lock), one *lap* over the universe at a time, skipping racks already at target. A lap **starts only with no claim of the generation in flight and nothing staged**. From there every rack that is out — forced by an open claim, or by a result not yet merged — was handed out during this lap and so lies behind the cursor, and nothing ahead of it is out: a claim needs no list of what is out, and selection costs the same with one result staged as with ten thousand. (A task whose claim lapsed is reissued as it stands, before anything new is selected, so its racks stay behind the cursor with it.) Each selection reads one rack more than a task holds, so the task that takes a lap's last racks knows it and deletes the cursor in its own transaction; after that the job hands out nothing until the lap's last results are in and merged, and the next lap selects on exact counts. That pause is one task's duration and one merge per lap — some 6,400 tasks for English — and it is the wait that already precedes closing a generation, which is simply a lap that starts and finds nothing below target. (One task's duration when every worker holding one of the lap's last tasks is alive. When one is not, it is the heartbeat timeout for that claim to lapse plus a whole task for whoever is reissued it, with the job handing out nothing meanwhile; it is left that way on purpose for now — see [Known Limits and Open Questions](#known-limits-and-open-questions), "A lap's end".) A cursor lost to a purge or a partial restore is a lap not started: the same rule applies and nothing is handed out twice. A claim that hands out nothing commits rather than rolls back, so a lap found finished stays found.
+   **While many racks are below target — more than a hundred tasks' worth (`SWEEP_WHILE_TASKS_REMAIN`) — a sweep.** The generation's racks are handed out in primary-key order from a cursor remembered between claims (`leave_selection_cursors`, one row per generation, read and written only under the job's lock), one *lap* over the universe at a time, skipping racks already at target. A lap **starts only with no claim of the generation in flight and nothing staged**. From there every rack that is out — forced by an open claim, or by a result not yet merged — was handed out during this lap and so lies behind the cursor, and nothing ahead of it is out: a claim needs no list of what is out, and selection costs the same with one result staged as with ten thousand. (A task whose claim lapsed is reissued as it stands, before anything new is selected, so its racks stay behind the cursor with it.) Each selection reads one rack more than a task holds, so the task that takes a lap's last racks knows it and deletes the cursor in its own transaction; after that the job hands out nothing until the lap's last results are in and merged, and the next lap selects on exact counts. That pause is one task's duration and one merge per lap — some 6,400 tasks for English — and it is the wait that already precedes closing a generation, which is simply a lap that starts and finds nothing below target. (One task's duration when every worker holding one of the lap's last tasks is alive. When one is not, it is the heartbeat timeout for that claim to lapse plus a whole task for whoever is reissued it, with the job handing out nothing meanwhile; it is left that way on purpose for now — see [Known Limits and Open Questions](#known-limits-and-open-questions), KL-15.) A cursor lost to a purge or a partial restore is a lap not started: the same rule applies and nothing is handed out twice. A claim that hands out nothing commits rather than rolls back, so a lap found finished stays found.
 
    This replaced lowest-count-first selection for the bulk of a generation because of what that costs between merges: `leave_rack_progress` shows a finished task's racks at the counts they had before it played, so they are the *lowest* in the generation the moment their claim completes. They have to be held out — or they are handed straight back out, to every claim until the next merge — and holding them out meant every claim hashing and stepping over every staged rack, about a microsecond each, inside the dispatch lock: 160–290 ms with 400 results staged, a second at a hundred workers, where the lock's other claimants give up after two.
 
@@ -3480,7 +3480,7 @@ a new MAGPIE setting has a table it visibly is not in.
 | Challenge bonus (`-cb`) | No | Read only by game-history code (GCG import, challenge events) |
 | `maxnumdplays`, `shplies` | Not for what is stored: a simulation's display sort covers every play, and the writers take their caps as arguments from the request. With capture on, autoplay raises a simmer's `num_plays` to `maxnumdplays` | Set from player 1 on a games task; job creation refuses a capture job whose simmers would be raised. Not set on an opening-rack task, where they reach only printing |
 | Leave-generation run shape (`leavegen_max_games`, the rack target, force-draw start, written files) | Yes | Set per task: the request's `num_games`, an unreachable target, the literal `0`, files off |
-| Threads (`threads` in `contribute.txt`) | For a simmer's sampling and for a multi-threaded leave run | Deliberately the contributor's — see [Known Limits and Open Questions](#known-limits-and-open-questions) |
+| Threads (`threads` in `contribute.txt`) | For a simmer's sampling and for a multi-threaded leave run | Deliberately the contributor's — see [Known Limits and Open Questions](#known-limits-and-open-questions), KL-14 |
 | Output (`-hr`, print interval, board printing, game string options, `-ritmmap`) | No | `print_interval` is reset anyway: left over, it printed simulation progress per rack |
 | Data paths (`-path`) | Chooses files | Every file a task loads is digest-verified through the same resolver the load uses, and the task is declined on a mismatch |
 | Lexical data already in memory (a KWG, KLV, wordmap or rack info table of the name asked for) | Whatever that file held when it was read | Evicted and read again when its file has changed since this path read it, or when this path did not read it (settings.txt, an earlier command) — `config_contribute_evict_changed_data`, by file identity (size, inode, and mtime and ctime to the nanosecond) |
@@ -6723,371 +6723,684 @@ twenty-seventh's `AUDIT_FINDINGS_23.md`, the twenty-eighth's
 thirtieth's `AUDIT_FINDINGS_26.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
-considered and not built, and small things noted rather than fixed. Each says
-what would make it worth revisiting.
+considered and not built, and small things noted rather than fixed.
+
+Each finding is numbered (`KL-n`) and set out the same way:
+
+- **Context:** where it lives and what it depends on.
+- **Problem:** what goes wrong, or what it costs.
+- **Options considered:** the alternatives weighed. Where a finding's record
+  names none, it says so, rather than inventing one after the fact.
+- **Option implemented:** what the code does now. For a finding still open, that
+  is "none yet", with the audit that opened it.
+- **Justification:** why that option, and what would make it worth revisiting.
+
+Numbers are permanent. A new finding takes the next unused number, whichever
+subsection it goes in. A finding that is later resolved keeps its number and
+says so in its implemented option, rather than being removed.
 
 ### Scheduling and claims
 
-- **A lapsed claim of a job nobody claims from stays on its books, and its late
-  result is accepted.** Reclamation is lazy and runs only for candidate jobs
-  (see [Task States](#task-states)), so a claim whose worker vanished on an
-  inactive, completed or parked job stays `claimed` until the job is activated
-  again or exported — and if the worker comes back hours later its submission
-  *is* accepted, where the Workflow's step 7 says a timed-out claim's result is
-  refused. Left alone deliberately: a late result for a finished job is real
-  work, harmless to SPRT (already decided) and to ratings (which refit on it),
-  and the `tasks_claimed` it inflates is a display figure. Rejected: refusing
-  any submission past the timeout whether or not it was reclaimed (throws away
-  real results), and a periodic reclaim sweep (the background process the lazy
-  design exists to avoid).
-- **A poison task blocks an SPRT job at its cap.** No task is generated past
-  `max_games`/`max_pairs`, so a job at its cap completes only when every task
-  handed out has a result; a task every worker fails keeps it `active`. Opening
-  racks have always had this property. It is visible as repeated `task_failed`
-  declines on one task. Not built: letting a job past its cap complete when its
-  only unfinished tasks have failed more than N times. Revisit if a job is ever
-  seen stuck on one task.
-- **Re-dispatch at redundancy above 1 walks every task the claimant has already
-  filled.** `registry::next_available` takes the oldest `available` task the
-  identity holds no slot on. With workers of unequal speed the fast one's
-  completed-once tasks pile up waiting for the slow one, every claim by the fast
-  worker probes all of them first — linear in the backlog, inside the dispatch
-  lock — and the backlog is unbounded, because generation never waits for
-  redundancy to catch up. No job runs above redundancy 1 today. Whoever builds
-  the replicated-task cross-check ([Why impossibility](#why-impossibility-and-not-per-worker-anomaly-detection))
-  needs a bound on how far generation may run ahead of acceptance.
-- **The reclaim statement runs on every claim request.** It is bounded by the
-  claims in flight across the fleet, not by history, so it is a millisecond or
-  two at a thousand workers. Throttling it per process (once every few seconds)
-  is available when a fleet is large enough to care; reclamation is already
-  approximate by design.
-- **Milliseconds deliberately left on the claim and submit paths.** Taking the
-  dispatch lock is three statements (`SET LOCAL lock_timeout`, the lock, the
-  reset) where a batch could make it one round trip; only the reset runs under
-  the lock. The finish check reads the job's config row once per check although
-  the template holds it, because `jobstats::game_stats` is shared with the
-  display path, which has no `AppState`. The identity's `tasks_completed` is
-  bumped inside the submit transaction — a single-row update, kept there so the
-  leaderboards' counters cannot drift. The job's own progress totals are one
-  `UPDATE jobs`, the transaction's last statement, since it takes the row lock
-  every claim for the job also takes.
-- **Large results waiting their turn are still resident.** The three-slot bound
-  on storing results of 8 MiB or more is taken after the body has been read, so
-  each waiter keeps its body in memory for up to thirty seconds; some twenty-five
-  maximum-size submissions waiting at once would still fill the web task. Taking
-  the turn from `Content-Length` before the body is read (a layer on the result
-  route) is the fix if capture jobs that large are ever run; and above three at
-  a time a submitter can be answered `503` and re-upload.
-- **`task_claims` is stored at fillfactor 85**, for its heartbeats to be HOT
-  updates: some 15% of every claim page is kept free for good (about 6.5 MB a
-  day at 288,000 claims a day), and while the nightly dump holds its snapshot,
-  HOT pruning cannot reclaim dead versions, so heartbeats are non-HOT again for
-  the backup window.
-- **A leave task fetches its KLV every time**, 3.6 MB from the store and a
-  buffered copy on the server, even when the worker already has those bytes
-  under their content name. Writing it afresh each task is what guarantees the
-  process reads it again (a new file identity), which matters if an aborted
-  leave run left its in-memory copy altered; skipping the fetch when the file
-  matches would need that guarantee some other way.
-- **A leave generation's progress row is taken mid-submission.** `stage_fold`'s
-  upsert of `leave_generation_progress` (display counters) locks the
-  generation's row from there to the commit, serializing that generation's
-  submissions for the last few statements. Moving it to the transaction's end
-  was considered in the twelfth audit and not done: those submissions already
-  serialize on the job's row at the end, so it would save milliseconds.
-- **The finish check runs before the worker is answered.** It is not display: it
-  decides whether the job goes on dispatching. It costs one submission in eight
-  an aggregate over the job's results (tens of milliseconds at 400,000 units) and
-  the rest an `EXISTS`; moving it off the worker's wait was considered in the
-  eleventh audit and not done, because it gains milliseconds per claim and would
-  need its own per-job coalescing to avoid stacking aggregates.
-- **A claim whose response is lost is a second claim when it is retried.** The
-  claim commits before the response is written; if the connection drops, or the
-  load balancer answers `502`, MAGPIE (which retries a claim without limit)
-  asks again and is handed another task, and the first holds its slot unheard
-  from until the heartbeat timeout — at a leave job's lap end or a games job at
-  its cap, the same idle as a dead worker, with none. *Open (eleventh audit):*
-  a per-claim request id, sent by MAGPIE and reused across retries, stored on
-  `task_claims` under a unique partial index, with a retry answered the
-  existing claim's assignment, would close it; it is a wire change on both
-  sides for a rare trigger, and is left for a decision.
-- **A purge or delete of a large job is one request, in one transaction.** Claims
-  skip the job while it runs and nothing waits on the claims or contributor rows
-  it holds (see [Job Lifecycle Controls](#job-lifecycle-controls)), so it no
-  longer stalls the rest of the fleet, and it runs on a task of its own, so a
-  request the load balancer drops at its 300-second idle timeout no longer
-  takes the transaction with it: the purge finishes, and the hold on the job
-  lasts at least as long as its locks (to the end of the steps after the
-  commit, the generation-0 rebuild among them). What remains is its own length: the
-  cascades are tens of millions of rows for a full simming opening-rack job —
-  minutes on the production instance class, the job's claims held throughout,
-  and the admin told nothing past the load balancer's timeout (the audit log and
-  the job's page say when it is done; clicking again is answered `409`) — and a
-  finished one leaves that many dead tuples to vacuum. *Open (eleventh audit):* a purge that commits the job's state change
-  at once and deletes bottom-up in batches on a spawned task with a status row,
-  like an export; or the result tables partitioned by job, so a purge is a
-  `TRUNCATE` and a delete a `DROP`. Both are real redesigns; neither is needed
-  until a job that size exists, and a purge's cost should be measured on the
-  synthetic million-rack dataset first.
-- **A reclaim can land between two statements of one leave claim.** Each
-  statement has its own snapshot, so a claim can see a task as "not available"
-  and then "not in flight", and start a lap (or a tail selection) with one
-  lapsed task unissued; the next claim reissues it. The cost is that task's
-  racks forced twice, on different seeds — duplicate coverage, never a closed
-  generation missing a result, because closing reads in flight and staged
-  afresh.
-- **A worker's thread count is its own.** A simulation's sampling and a
-  multi-threaded leave-generation run both depend on it, which is why simming
-  jobs are excluded from any equality cross-check and leave generation runs at
-  redundancy 1. Pinning threads per task from the server was considered and
-  rejected: fair across workers, and a waste of contributors' cores.
+**KL-1. A lapsed claim of a job nobody claims from stays on its books, and its late result is accepted.**
+- **Context:** Reclamation is lazy, and runs only for candidate jobs (see
+  [Task States](#task-states)). The Workflow's step 7 says a timed-out claim's
+  result is refused.
+- **Problem:** A claim whose worker vanished on an inactive, completed or parked
+  job stays `claimed` until the job is activated again or exported. If the
+  worker comes back hours later, its submission *is* accepted, and the
+  `tasks_claimed` the claim holds is inflated meanwhile.
+- **Options considered:**
+  - refuse any submission past the timeout, whether or not it was reclaimed;
+  - a periodic reclaim sweep;
+  - leave it.
+- **Option implemented:** Left alone deliberately.
+- **Justification:** A late result for a finished job is real work. It is
+  harmless to SPRT, which has already decided, and to ratings, which refit on
+  it, and `tasks_claimed` is a display figure. Refusing late submissions throws
+  away real results. A periodic sweep is the background process the lazy
+  design exists to avoid.
+
+**KL-2. A poison task blocks an SPRT job at its cap.**
+- **Context:** No task is generated past `max_games`/`max_pairs`, so a job at its
+  cap completes only when every task handed out has a result. Opening racks
+  have always had this property.
+- **Problem:** A task that every worker fails keeps the job `active`. It shows as
+  repeated `task_failed` declines on one task.
+- **Options considered:** let a job past its cap complete when its only
+  unfinished tasks have failed more than N times.
+- **Option implemented:** None; not built.
+- **Justification:** No job has been seen stuck this way. Revisit if one ever is.
+
+**KL-3. Re-dispatch at redundancy above 1 walks every task the claimant has already filled.**
+- **Context:** `registry::next_available` takes the oldest `available` task the
+  identity holds no slot on. Generation never waits for redundancy to catch up.
+- **Problem:** With workers of unequal speed, the fast one's completed-once tasks
+  pile up waiting for the slow one. Every claim by the fast worker probes all
+  of them first: linear in the backlog, inside the dispatch lock, and the
+  backlog is unbounded.
+- **Options considered:** a bound on how far generation may run ahead of
+  acceptance.
+- **Option implemented:** None.
+- **Justification:** No job runs above redundancy 1 today. Whoever builds the
+  replicated-task cross-check
+  ([Why impossibility](#why-impossibility-and-not-per-worker-anomaly-detection))
+  needs the bound.
+
+**KL-4. The reclaim statement runs on every claim request.**
+- **Context:** It is bounded by the claims in flight across the fleet, not by
+  history.
+- **Problem:** A millisecond or two per claim at a thousand workers.
+- **Options considered:**
+  - throttle it per process, to once every few seconds;
+  - leave it on every claim.
+- **Option implemented:** On every claim.
+- **Justification:** The cost is small at the fleet sizes planned, and
+  reclamation is already approximate by design. The throttle is there to take
+  when a fleet is large enough to care.
+
+**KL-5. Milliseconds deliberately left on the claim and submit paths.**
+- **Context:** Four places each cost a round trip or a row lock:
+  - taking the dispatch lock is three statements (`SET LOCAL lock_timeout`, the
+    lock, the reset), of which only the reset runs under the lock;
+  - the finish check reads the job's config row once per check, although the
+    template holds it;
+  - the identity's `tasks_completed` is bumped inside the submit transaction;
+  - the job's own progress totals are one `UPDATE jobs`.
+- **Problem:** A few round trips and row locks per claim or submission.
+- **Options considered:**
+  - batch the lock statements into one round trip;
+  - read the config from the template;
+  - move the counters out of the transaction.
+- **Option implemented:** Kept as described.
+- **Justification:**
+  - The finish check uses `jobstats::game_stats`, which is shared with the
+    display path, and that has no `AppState`.
+  - The counter is a single-row update, kept in the transaction so the
+    leaderboards' counters cannot drift.
+  - The jobs update is the transaction's last statement, because it takes the
+    row lock that every claim for the job also takes.
+  - What is left is milliseconds.
+
+**KL-6. Large results waiting their turn are still resident.**
+- **Context:** The three-slot bound on storing results of 8 MiB or more is taken
+  after the body has been read.
+- **Problem:** Each waiter keeps its body in memory for up to thirty seconds.
+  Some twenty-five maximum-size submissions waiting at once would still fill
+  the web task.
+- **Options considered:**
+  - take the turn from `Content-Length` before the body is read, as a layer on
+    the result route;
+  - above three at a time, answer `503` and let the submitter re-upload.
+- **Option implemented:** None.
+- **Justification:** Only capture jobs that large reach it. Build the layer if
+  they are ever run.
+
+**KL-7. `task_claims` is stored at fillfactor 85.**
+- **Context:** A heartbeat changes only `last_heartbeat_at`, which no index
+  covers, so it can be a HOT update if the row's page has room.
+- **Problem:**
+  - Some 15% of every claim page is kept free for good: about 6.5 MB a day at
+    288,000 claims a day.
+  - While the nightly dump holds its snapshot, HOT pruning cannot reclaim dead
+    versions, so heartbeats are non-HOT again for the backup window.
+- **Options considered:** the default fillfactor of 100, or 85.
+- **Option implemented:** 85.
+- **Justification:** At 100 a claim's first heartbeat found its page full and
+  wrote a new entry into every one of the table's indexes: two a minute for
+  every claim in flight. The free space costs less than that.
+
+**KL-8. A leave task fetches its KLV every time.**
+- **Context:** The KLV is 3.6 MB from the store, plus a buffered copy on the
+  server.
+- **Problem:** The transfer repeats even when the worker already has those bytes
+  under their content name.
+- **Options considered:**
+  - skip the fetch when the file matches, which needs another way to guarantee
+    the process reads the file again;
+  - fetch afresh.
+- **Option implemented:** Fetched afresh every task.
+- **Justification:** Writing the file afresh gives it a new file identity, which
+  guarantees the process reads it again. That matters if an aborted leave run
+  left its in-memory copy altered.
+
+**KL-9. A leave generation's progress row is taken mid-submission.**
+- **Context:** `stage_fold`'s upsert of `leave_generation_progress` (display
+  counters) locks the generation's row from there to the commit.
+- **Problem:** It serializes that generation's submissions for the last few
+  statements.
+- **Options considered:** move the upsert to the transaction's end (twelfth
+  audit).
+- **Option implemented:** Not moved.
+- **Justification:** Those submissions already serialize on the job's row at the
+  end, so moving it would save milliseconds.
+
+**KL-10. The finish check runs before the worker is answered.**
+- **Context:** The check is not display. It decides whether the job goes on
+  dispatching.
+- **Problem:** One submission in eight pays an aggregate over the job's results,
+  tens of milliseconds at 400,000 units; the rest pay an `EXISTS`. The worker
+  waits for it.
+- **Options considered:** move it off the worker's wait (eleventh audit).
+- **Option implemented:** Kept inline.
+- **Justification:** It gates dispatch, a correctness input. Moving it gains
+  milliseconds per claim, and would need per-job coalescing of its own to avoid
+  stacking aggregates.
+
+**KL-11. A claim whose response is lost is a second claim when it is retried.**
+- **Context:** The claim commits before the response is written, and MAGPIE
+  retries a claim without limit.
+- **Problem:** If the connection drops, or the load balancer answers `502`, the
+  retry is handed another task. The first claim holds its slot, unheard from,
+  until the heartbeat timeout. At a leave job's lap end, or a games job at its
+  cap, that is the same idle as a dead worker, with none.
+- **Options considered:**
+  - a per-claim request id, sent by MAGPIE and reused across retries, stored on
+    `task_claims` under a unique partial index, with a retry answered with the
+    existing claim's assignment;
+  - leave it.
+- **Option implemented:** None yet. *Open (eleventh audit).*
+- **Justification:** It is a wire change on both sides for a rare trigger, and
+  is left for a decision.
+
+**KL-12. A purge or delete of a large job is one request, in one transaction.**
+- **Context:** Claims skip the job while the purge runs, and nothing waits on the
+  claims or contributor rows it holds (see
+  [Job Lifecycle Controls](#job-lifecycle-controls)). It runs on a task of its
+  own, so a request the load balancer drops at its 300-second idle timeout no
+  longer takes the transaction with it. The hold on the job lasts at least as
+  long as its locks: to the end of the steps after the commit, the
+  generation-0 rebuild among them.
+- **Problem:** Its own length. The cascades are tens of millions of rows for a
+  full simming opening-rack job:
+  - minutes on the production instance class, with the job's claims held
+    throughout;
+  - the admin told nothing past the load balancer's timeout (the audit log and
+    the job's page say when it is done, and clicking again is answered `409`);
+  - that many dead tuples left to vacuum.
+- **Options considered:**
+  - a purge that commits the job's state change at once and deletes bottom-up in
+    batches on a spawned task with a status row, like an export;
+  - the result tables partitioned by job, so a purge is a `TRUNCATE` and a
+    delete a `DROP`.
+- **Option implemented:** None yet. *Open (eleventh audit).*
+- **Justification:** Both are real redesigns, and neither is needed until a job
+  that size exists. A purge's cost should first be measured on the synthetic
+  million-rack dataset.
+
+**KL-13. A reclaim can land between two statements of one leave claim.**
+- **Context:** Each statement of a leave claim has its own snapshot.
+- **Problem:** A claim can see a task as "not available" and then "not in
+  flight", and start a lap (or a tail selection) with one lapsed task
+  unissued. The next claim reissues it, so that task's racks are forced twice,
+  on different seeds.
+- **Options considered:** None recorded.
+- **Option implemented:** Accepted as it is.
+- **Justification:** The cost is duplicate coverage, never a closed generation
+  missing a result: closing reads what is in flight and staged afresh.
+
+**KL-14. A worker's thread count is its own.**
+- **Context:** A simulation's sampling, and a multi-threaded leave-generation
+  run, both depend on the worker's thread count.
+- **Problem:** The same task can give different results on different workers.
+  That is why simming jobs are excluded from any equality cross-check, and why
+  leave generation runs at redundancy 1.
+- **Options considered:**
+  - pin threads per task from the server;
+  - leave them to the contributor's `contribute.txt`.
+- **Option implemented:** The contributor's.
+- **Justification:** Pinning would be fair across workers and a waste of
+  contributors' cores, so it was rejected.
 
 ### Leave generation
 
-- **A lap's end can idle the job for a dead worker's timeout plus a replay.** A
-  sweep's lap starts only with nothing in flight and nothing staged — that rule
-  is what lets a claim carry no exclusion list — so when a lap's racks run out
-  the job hands out nothing until the lap's last results are in and merged.
-  With every worker alive that is one task's duration. When the worker holding
-  one of the lap's last tasks has gone, it is the heartbeat timeout for the
-  claim to lapse (twice that just after a server restart, with the reclamation
-  grace) **plus a whole task** for whoever is reissued it, for every worker on
-  the job. A lap is about 6,400 tasks for English, so it is a per-lap tax, and a
-  fleet with other jobs to run loses only the leave job's share. **Decided:
-  leave it** — a throughput tax on one job type, not a correctness problem.
-  Two repairs were considered, and each gives back some of what the sweep
-  bought. *Start the next lap while stragglers are out*, carrying an exclusion
-  list of their racks only: bounded by the stragglers rather than by what is
-  staged, but it reintroduces the list, and the next lap selects on counts
-  missing the stragglers' own results. *Reissue a suspect task redundantly near
-  a lap's end*, once its claim has been silent for a couple of heartbeat
-  intervals: needs a notion of a suspect claim the design does not have, and
-  burns a duplicate task when the worker was only slow. The first is the one to
-  build if leave generation is ever the only job a large fleet is running,
-  where an idle lap end is the whole fleet idle.
-- **A sweep visits racks in key order, not rarest first.** Within a lap that is
-  immaterial — every rack below target is visited — and across laps the racks
-  still short are what the next lap finds. What it gives up is forcing the
-  rarest racks first within a lap, which lowest-count-first only ever did to
-  the resolution of the last merge.
-- **Claims on one leave job serialize on its dispatch lock.** Selection is a
-  fraction of a millisecond now, so the ceiling is high, but it is per job.
-  `num_iterations` is the tuning knob: larger tasks mean fewer claims and fewer,
-  larger submissions.
-- **`leave_rack_progress` keeps every generation's rows for the life of the
-  job** — about 430 MB a generation for English, never read again once that
-  generation's artifact is verified. Deliberate: they are what
-  `rebuild-artifacts` derives a KLV from, and the design treats the object store
-  as derivable from the database. Dropping or archiving a closed generation's
-  rows (keeping the hash) would trade that guarantee for the space.
-- **`rebuild-artifacts` runs every generation inline in the admin request**,
-  about 13 seconds each in a release build. Past roughly twenty generations the
-  request outlasts the load balancer's 300-second idle timeout and stops
-  part-way; each upload is idempotent, so running it again repairs it. Move it
-  to a spawned task with a status row, like exports, if a job ever has that
-  many generations.
-- **A submission's validation runs on the blocking pool while its claim and task
-  rows are locked.** It ran inside the same locks before, on an async worker.
-  Decoding *before* taking the locks would shorten them, but needs the job type,
-  which is read under them.
-- **`seed_generation`'s `COPY` is not aborted explicitly** if a chunk fails to
-  build. The transaction rolls back either way.
-- **The database orders racks by its collation, not by byte.** Under
-  `en_US.utf8` (the test database's, and RDS's default) `?` is ignored at the
-  first level, so `?AAABBC` sorts among the `AAABBC…` racks rather than before
-  them. Everything that orders on `rack` does so *inside* Postgres — the sweep,
-  the feed's seek, the KLV's stream — so it is self-consistent. Anyone comparing
-  a database-ordered rack list with an application-ordered one should know.
+**KL-15. A lap's end can idle the job for a dead worker's timeout plus a replay.**
+- **Context:** A sweep's lap starts only with nothing in flight and nothing
+  staged. That rule is what lets a claim carry no exclusion list.
+- **Problem:** When a lap's racks run out, the job hands out nothing until the
+  lap's last results are in and merged.
+  - With every worker alive, that is one task's duration.
+  - When the worker holding one of the lap's last tasks has gone, it is the
+    heartbeat timeout for the claim to lapse (twice that just after a server
+    restart, with the reclamation grace), **plus a whole task** for whoever is
+    reissued it, for every worker on the job.
+
+  A lap is about 6,400 tasks for English, so this is a per-lap tax, and a fleet
+  with other jobs to run loses only the leave job's share.
+- **Options considered:**
+  - *start the next lap while stragglers are out*, carrying an exclusion list of
+    their racks only;
+  - *reissue a suspect task redundantly near a lap's end*, once its claim has
+    been silent for a couple of heartbeat intervals;
+  - leave it.
+- **Option implemented:** Left, a decision.
+- **Justification:** It is a throughput tax on one job type, not a correctness
+  problem, and each repair gives back some of what the sweep bought.
+  - The first is bounded by the stragglers rather than by what is staged, but it
+    reintroduces the list, and the next lap selects on counts missing the
+    stragglers' own results.
+  - The second needs a notion of a suspect claim that the design does not have,
+    and burns a duplicate task when the worker was only slow.
+
+  The first is the one to build if leave generation is ever the only job a
+  large fleet is running, where an idle lap end is the whole fleet idle.
+
+**KL-16. A sweep visits racks in key order, not rarest first.**
+- **Context:** Selection sweeps the primary key from a cursor.
+- **Problem:** Within a lap, it gives up forcing the rarest racks first.
+- **Options considered:** lowest-count-first, the order it replaced.
+- **Option implemented:** Key order.
+- **Justification:** Within a lap the order is immaterial, since every rack
+  below target is visited, and across laps the racks still short are what the
+  next lap finds. Lowest-count-first only ever achieved rarest-first to the
+  resolution of the last merge.
+
+**KL-17. Claims on one leave job serialize on its dispatch lock.**
+- **Context:** Selection is a fraction of a millisecond.
+- **Problem:** The claim rate has a ceiling per job.
+- **Options considered:** larger tasks.
+- **Option implemented:** `num_iterations` is the tuning knob: larger tasks mean
+  fewer claims and fewer, larger submissions.
+- **Justification:** The ceiling is high.
+
+**KL-18. `leave_rack_progress` keeps every generation's rows for the life of the job.**
+- **Context:** About 430 MB a generation for English, never read again once that
+  generation's artifact is verified.
+- **Problem:** Storage that grows with every generation.
+- **Options considered:** drop or archive a closed generation's rows, keeping the
+  hash.
+- **Option implemented:** Kept.
+- **Justification:** The rows are what `rebuild-artifacts` derives a KLV from,
+  and the design treats the object store as derivable from the database.
+  Dropping them trades that guarantee for the space.
+
+**KL-19. `rebuild-artifacts` runs every generation inline in the admin request.**
+- **Context:** About 13 seconds a generation in a release build.
+- **Problem:** Past roughly twenty generations, the request outlasts the load
+  balancer's 300-second idle timeout and stops part-way.
+- **Options considered:** a spawned task with a status row, like exports.
+- **Option implemented:** None.
+- **Justification:** Each upload is idempotent, so running it again repairs a
+  partial run. Build the task if a job ever has that many generations.
+
+**KL-20. A submission's validation runs on the blocking pool while its claim and task rows are locked.**
+- **Context:** It ran inside the same locks before, on an async worker.
+- **Problem:** The locks are held while the result is decoded.
+- **Options considered:** decode *before* taking the locks.
+- **Option implemented:** None.
+- **Justification:** Decoding needs the job type, which is read under the locks.
+
+**KL-21. `seed_generation`'s `COPY` is not aborted explicitly if a chunk fails to build.**
+- **Context:** Seeding a generation streams its rows through `COPY`.
+- **Problem:** A failed chunk leaves the `COPY` without an explicit abort.
+- **Options considered:** an explicit abort.
+- **Option implemented:** None.
+- **Justification:** The transaction rolls back either way.
+
+**KL-22. The database orders racks by its collation, not by byte.**
+- **Context:** Under `en_US.utf8`, the test database's collation and RDS's
+  default, `?` is ignored at the first level.
+- **Problem:** `?AAABBC` sorts among the `AAABBC…` racks rather than before them,
+  so a database-ordered rack list differs from an application-ordered one.
+- **Options considered:** None recorded.
+- **Option implemented:** Ordering stays in Postgres.
+- **Justification:** Everything that orders on `rack` does so *inside* Postgres
+  (the sweep, the feed's seek, the KLV's stream), so it is self-consistent.
+  Anyone comparing the two kinds of list should know.
 
 ### Storage
 
-- **Captured positions store their CGP as `TEXT`**: 130–270 bytes each for
-  English, below the TOAST compression threshold — about 1.8 GB for the nine
-  million positions of a 400,000-game capture job. A packed machine-letter
-  encoding would be several times smaller and is a schema and wire change.
-  Decided: leave it until a capture job of that size exists.
-- **Every rating run keeps its residuals for the month runs are kept in full**,
-  though only the newest run's are ever read (the pool page): some 4.5 million
-  rows for a pool of twenty at steady state, 3–6 GB for a dense pool of forty,
-  all of it dumped nightly. *Open (twelfth audit), a retention decision:* keep
-  residuals for the newest run only (deleting the superseded run's in the fit
-  that supersedes it), or only for the runs the thinning keeps. The run-by-run
-  diff this section's month exists for is the ratings', not the residuals'.
-- **Per-ply statistics are a row each, and a move's id exists only for them.**
-  `position_analysis_plies` (≈88 bytes a ply with its key) is read only by the
-  export, which folds a move's plies straight back into an array; two
-  `float8[]` columns on the move would be ≈28 bytes a ply and remove the ply
-  inserts from the submit path — about 2.4 GB saved per simming opening-rack
-  job. And `position_analysis_moves.id` is referenced only by the plies; with
-  `(record_id, rank)` as the key (already indexed) a full opening-rack job saves
-  about 0.9 GB. *Open (twelfth audit):* both are schema and insert-path
-  rewrites, the moves one touching the restore order and every reader; worth
-  doing together, before release, if simming opening-rack jobs are planned.
-- **`position_analysis_records.task_id` is stored for opening racks**, whose
-  dedup key does not use it: 16 bytes a record, ~50 MB per full opening-rack
-  job. Nullable for opening racks is the fix; not worth a change of its own.
-- **`audit_log` has no retention.** Claims and submissions no longer write to
-  it, which removed most of its growth; what remains is admin and account
-  actions and one row per decline. Partitioning it by month and dropping old
-  partitions of worker events is the option if it ever matters.
-- **`worker_data_gaps` and `task.declined` audit rows grow with declines**: up
-  to 32 gap rows and one audit row each. Bounded in practice by workers × jobs,
-  since a client remembers a job it declined — but only until it restarts.
-- **A completed job's scheduling history is kept for good.** `tasks`,
-  `task_claims` (abandoned and declined ones included) and the per-type request
-  rows — a leave generation's `forced_racks` arrays are 20 to 40 MB — stay as
-  long as the job's results do; nothing deletes them short of a purge. *Open
-  (eleventh audit), a retention decision:* whether a completed job's scheduling
-  history, as distinct from its results, needs to stay live. Deleting it is
-  irreversible, and results reference claims.
-- **`input_data_import_rows` of confirmed and failed imports are never
-  deleted**; only staged ones expire. Small rows; part of the same retention
+**KL-23. Captured positions store their CGP as `TEXT`.**
+- **Context:** 130–270 bytes each for English, below the TOAST compression
+  threshold.
+- **Problem:** About 1.8 GB for the nine million positions of a 400,000-game
+  capture job.
+- **Options considered:** a packed machine-letter encoding, several times
+  smaller, which is a schema and wire change.
+- **Option implemented:** `TEXT`, a decision.
+- **Justification:** Leave it until a capture job of that size exists.
+
+**KL-24. Every rating run keeps its residuals for the month runs are kept in full.**
+- **Context:** Only the newest run's residuals are ever read, on the pool page.
+- **Problem:** Some 4.5 million rows for a pool of twenty at steady state, and
+  3–6 GB for a dense pool of forty, all of it dumped nightly.
+- **Options considered:**
+  - keep residuals for the newest run only, deleting the superseded run's in
+    the fit that supersedes it;
+  - keep them only for the runs the thinning keeps.
+- **Option implemented:** None yet. *Open (twelfth audit)*, a retention decision.
+- **Justification:** The run-by-run diff that this month of history exists for
+  is the ratings', not the residuals'. Deleting history is a human's call.
+
+**KL-25. Per-ply statistics are a row each, and a move's id exists only for them.**
+- **Context:**
+  - `position_analysis_plies` (≈88 bytes a ply with its key) is read only by the
+    export, which folds a move's plies straight back into an array.
+  - `position_analysis_moves.id` is referenced only by the plies.
+- **Problem:** Storage and inserts on the submit path.
+- **Options considered:**
+  - two `float8[]` columns on the move: ≈28 bytes a ply, with the ply inserts
+    gone from the submit path, saving about 2.4 GB per simming opening-rack
+    job;
+  - `(record_id, rank)` as the move's key (already indexed), saving about
+    0.9 GB per full opening-rack job.
+- **Option implemented:** None yet. *Open (twelfth audit).*
+- **Justification:** Both are schema and insert-path rewrites, and the moves one
+  touches the restore order and every reader. They are worth doing together,
+  before release, if simming opening-rack jobs are planned.
+
+**KL-26. `position_analysis_records.task_id` is stored for opening racks.**
+- **Context:** The opening-rack dedup key does not use it.
+- **Problem:** 16 bytes a record, about 50 MB per full opening-rack job.
+- **Options considered:** make it nullable for opening racks.
+- **Option implemented:** None.
+- **Justification:** Not worth a change of its own.
+
+**KL-27. `audit_log` has no retention.**
+- **Context:** Claims and submissions no longer write to it, which removed most
+  of its growth. What remains is admin and account actions, and one row per
+  decline.
+- **Problem:** It still grows without bound.
+- **Options considered:** partition it by month, and drop old partitions of
+  worker events.
+- **Option implemented:** None.
+- **Justification:** The remaining growth is small. Partition it if it ever
+  matters.
+
+**KL-28. `worker_data_gaps` and `task.declined` audit rows grow with declines.**
+- **Context:** Up to 32 gap rows and one audit row per decline.
+- **Problem:** Growth with declines.
+- **Options considered:** None recorded.
+- **Option implemented:** None.
+- **Justification:** It is bounded in practice by workers × jobs, since a
+  client remembers a job it declined, though only until it restarts.
+
+**KL-29. A completed job's scheduling history is kept for good.**
+- **Context:** `tasks`, `task_claims` (abandoned and declined ones included) and
+  the per-type request rows stay as long as the job's results do. Nothing
+  deletes them short of a purge.
+- **Problem:** Storage. A leave generation's `forced_racks` arrays alone are 20
+  to 40 MB.
+- **Options considered:** delete a completed job's scheduling history, as
+  distinct from its results; keep it.
+- **Option implemented:** None yet. *Open (eleventh audit)*, a retention
   decision.
-- **The nightly backup reads the database twice**: `pg_dump`, then an exact
-  `count(*)` of every table in the same snapshot, which the manifest and the
-  drill compare against. Counting lines of the dump's own data files instead
-  would take the second read off the instance; it changes what the manifest
-  certifies, and was left for when the corpus makes the backup window matter.
-- **`audit_log`'s filters and `task_claims.claimed_at` have no index.** A
-  filtered audit query scans the log by `created_at`; `GET /api/admin/fleet`
-  scans a week of claims sequentially — hundreds of milliseconds to seconds at
-  millions of claims. Both are admin pages. An index on `claimed_at` would cost
-  an entry per claim on the hottest write table for one view.
+- **Justification:** Deleting it is irreversible, and results reference claims.
+
+**KL-30. `input_data_import_rows` of confirmed and failed imports are never deleted.**
+- **Context:** Only staged imports expire.
+- **Problem:** Small rows that accumulate.
+- **Options considered:** include them in KL-29's retention decision.
+- **Option implemented:** None.
+- **Justification:** The rows are small, and part of the same decision.
+
+**KL-31. The nightly backup reads the database twice.**
+- **Context:** `pg_dump` runs, then an exact `count(*)` of every table in the
+  same snapshot, which the manifest and the drill compare against.
+- **Problem:** A second full read of the instance.
+- **Options considered:** count lines of the dump's own data files instead.
+- **Option implemented:** None.
+- **Justification:** It changes what the manifest certifies. It is left for when
+  the corpus makes the backup window matter.
+
+**KL-32. `audit_log`'s filters and `task_claims.claimed_at` have no index.**
+- **Context:** A filtered audit query scans the log by `created_at`.
+  `GET /api/admin/fleet` scans a week of claims sequentially.
+- **Problem:** Hundreds of milliseconds to seconds at millions of claims, on
+  both admin pages.
+- **Options considered:** an index on `claimed_at`.
+- **Option implemented:** None.
+- **Justification:** An index would cost an entry per claim on the hottest write
+  table, for one view.
 
 ### Abuse and input
 
+**KL-33. Recovering an account does not revoke its API keys.**
+- **Context:** A password reset and "sign out everywhere" end sessions. Keys are
+  listed on the account page, where the owner can revoke them.
+- **Problem:** Keys an attacker made while in control go on working until the
+  owner revokes them.
+- **Options considered:** revoke keys on reset.
+- **Option implemented:** None yet. *Open (sixteenth audit).*
+- **Justification:** Revoking would stop every one of the contributor's machines
+  along with the attacker's.
 
-- **Recovering an account does not revoke its API keys.** A password reset and
-  "sign out everywhere" end sessions; keys an attacker made while in control
-  go on working until the owner revokes them from the account page, which
-  lists them. *Open (sixteenth audit):* revoke keys on reset, at the cost of
-  every one of the contributor's machines stopping with it.
-- **Confirming an address happens when the link is opened**, so a mail scanner
-  that runs the page's script confirms it. A button to press would stop that
-  and cost every registrant a click. *(Sixteenth audit.)*
-- **Only ASCII addresses register** (`is_bare_address`). SES does not send to
-  SMTPUTF8 addresses; an internationalized domain could be sent as punycode by
-  the form. Existing accounts are unaffected. *(Sixteenth audit.)*
-- **Every pool connection is pinged when it is taken** (sqlx's
-  `test_before_acquire`): a round trip per acquire, three or four per claim or
-  submission. Turning it off saves them and makes a connection broken by a
-  failover fail one request instead of being replaced silently. *Open
-  (sixteenth audit).*
+**KL-34. Confirming an address happens when the link is opened.**
+- **Context:** The confirmation page confirms on load.
+- **Problem:** A mail scanner that runs the page's script confirms the address.
+- **Options considered:** a button to press.
+- **Option implemented:** Confirm on open. *(Sixteenth audit.)*
+- **Justification:** A button would cost every registrant a click.
 
-- **Registration answers the same, and what it leaves behind does not.** A
-  taken address and a fresh one get byte-identical registration responses, but
-  only the fresh one creates the account, so signing in with the username and
-  password just used (`403` "confirm your email" against `401`) tells a prober
-  whether the address was free — deterministically, where the login timing gap
-  above is only statistical — and the probe holds a free address for a day.
-  *Open (twelfth audit):* registrations pending confirmation in a table of their
-  own (username unique, address not), with the `users` row created only at
-  confirmation and a taken address recorded as a pending row too, so that both
-  branches leave the same state. A schema and flow change; until it is made,
-  "someone probing the address learns nothing" (Account Creation Flow) is true
-  of the response and not of the account.
-- **Unconfirmed accounts, spent tokens and anonymous identities are never
-  reaped.** An unconfirmed account goes only when its name or address is
-  registered again; expired and used confirmation and reset tokens stay; every
-  worker install that ever received a task keeps its `anonymous_workers` row.
-  Small rows, bounded by rate limits; a reaper in the hourly sweep is the fix if
-  they ever matter, and deciding what an anonymous identity with contributions
-  is worth keeping is the policy half.
-- **`?worker=<pseudonym>` hashes every contributing anonymous identity.** The
-  pseudonym is a SHA-256 that cannot be indexed as written (`convert_to` is not
-  immutable); at 100,000 anonymous contributors that is 100–200 ms on the
-  display pool, under its fifteen-second statement timeout. A stored pseudonym
-  column with an index is the fix when that many exist.
+**KL-35. Only ASCII addresses register (`is_bare_address`).**
+- **Context:** SES does not send to SMTPUTF8 addresses.
+- **Problem:** Internationalized addresses cannot register.
+- **Options considered:** have the form send an internationalized domain as
+  punycode.
+- **Option implemented:** None. *(Sixteenth audit.)*
+- **Justification:** Existing accounts are unaffected.
 
-- **Usernames are unique whatever their case, and otherwise free text.** Any
-  string of 3–32 characters is accepted, so look-alike, zero-width and bidi
-  variants of a name (`trim()` leaves them) can sit side by side on the public
-  lists; a character-set rule -- refusing format and control characters,
-  normalizing (NFKC), or one script -- is a product decision (international
-  names) left open.
-- **A rating pool cannot be edited or deleted once created.** Its anchor and
-  scope are fixed (creation now validates them: a variant a job can have,
-  input-data rows of the right roles, an anchor rating whose scale does not
-  overflow), and a pool made by mistake stays, pinning its anchor config
-  against deletion. Admin-only and cosmetic; an update and delete route are the
-  fix if it ever matters.
+**KL-36. Every pool connection is pinged when it is taken.**
+- **Context:** sqlx's `test_before_acquire`.
+- **Problem:** A round trip per acquire: three or four per claim or submission.
+- **Options considered:** turn it off, saving the round trips; a connection
+  broken by a failover would then fail one request instead of being replaced
+  silently.
+- **Option implemented:** None yet. *Open (sixteenth audit).*
+- **Justification:** A trade between those round trips and one failed request
+  after a failover, left for a decision.
 
-- **A worker's identity is resolved before its rate limit is checked** — closed
-  (twenty-first and twenty-second audits). Every presented key or UUID is
-  charged its own bucket before the lookup, and one that has not resolved in
-  the last ten minutes also pays its address's (5 a second, burst 100), match
-  or not (`ratelimit::CredentialGate`). A credential that resolved recently
-  skips the address's bucket, so a misbehaving machine behind a shared address
-  does not lock out the workers beside it. After a restart nothing is known,
-  and more than a hundred machines behind one address are admitted five a
-  second.
-- **`?rack=` canonicalises by Unicode code point.** That equals machine-letter
-  order for English and would not for a distribution whose letters are outside
-  ASCII or longer than one character; such a lookup would miss. No such
-  opening-rack job exists.
-- **Concurrent imports each hold a ~94 MB tarball in memory.** Two admins
-  importing at once on a 2 GB task is survivable; five is not. Admin-only.
+**KL-37. Registration answers the same, and what it leaves behind does not.**
+- **Context:** A taken address and a fresh one get byte-identical registration
+  responses, but only the fresh one creates the account.
+- **Problem:** Signing in with the username and password just used answers
+  `403` "confirm your email" against `401`, which tells a prober whether the
+  address was free. That is deterministic, where the login timing gap is only
+  statistical, and the probe holds a free address for a day. Until fixed, "someone
+  probing the address learns nothing" (Account Creation Flow) is true of the
+  response and not of the account.
+- **Options considered:** keep registrations pending confirmation in a table of
+  their own (username unique, address not), create the `users` row only at
+  confirmation, and record a taken address as a pending row too, so both
+  branches leave the same state.
+- **Option implemented:** None yet. *Open (twelfth audit).*
+- **Justification:** It is a schema and flow change, left for a decision.
+
+**KL-38. Unconfirmed accounts, spent tokens and anonymous identities are never reaped.**
+- **Context:**
+  - An unconfirmed account goes only when its name or address is registered
+    again.
+  - Expired and used confirmation and reset tokens stay.
+  - Every worker install that ever received a task keeps its
+    `anonymous_workers` row.
+- **Problem:** Rows that accumulate.
+- **Options considered:** a reaper in the hourly sweep, plus a policy on what an
+  anonymous identity with contributions is worth keeping.
+- **Option implemented:** None.
+- **Justification:** The rows are small and bounded by rate limits. Add the
+  reaper if they ever matter.
+
+**KL-39. `?worker=<pseudonym>` hashes every contributing anonymous identity.**
+- **Context:** The pseudonym is a SHA-256 that cannot be indexed as written,
+  because `convert_to` is not immutable.
+- **Problem:** At 100,000 anonymous contributors, 100–200 ms on the display pool.
+  That is under its fifteen-second statement timeout.
+- **Options considered:** a stored pseudonym column with an index.
+- **Option implemented:** None.
+- **Justification:** Build it when that many anonymous contributors exist.
+
+**KL-40. Usernames are unique whatever their case, and otherwise free text.**
+- **Context:** Any string of 3–32 characters is accepted, and `trim()` leaves
+  look-alike, zero-width and bidi characters alone.
+- **Problem:** Variants of a name can sit side by side on the public lists. One
+  such variant, a username of 16 hex characters, merges under `?worker=` with
+  the anonymous worker whose pseudonym it matches.
+- **Options considered:**
+  - refuse format and control characters;
+  - normalize (NFKC);
+  - allow one script only;
+  - refuse pseudonym-shaped names.
+- **Option implemented:** None; a product decision left open.
+- **Justification:** A character-set rule has to allow for international names,
+  which is a product decision.
+
+**KL-41. A rating pool cannot be edited or deleted once created.**
+- **Context:** A pool's anchor and scope are fixed. Creation validates them: a
+  variant a job can have, input-data rows of the right roles, and an anchor
+  rating whose scale does not overflow.
+- **Problem:** A pool made by mistake stays, and keeps its anchor config from
+  being deleted.
+- **Options considered:** an update route and a delete route.
+- **Option implemented:** Validation at creation only.
+- **Justification:** It is admin-only and cosmetic. Add the routes if it ever
+  matters.
+
+**KL-42. A worker's identity was resolved before its rate limit was checked. Closed in the twenty-first and twenty-second audits.**
+- **Context:** The worker extractor looked a presented key or UUID up in the
+  database before any limit applied.
+- **Problem:** Unmetered lookups for credentials that match nothing.
+- **Options considered:**
+  - charge an address's bucket only for misses. This locked valid workers
+    behind a shared address out along with a misbehaving neighbour.
+  - charge each credential its own bucket, and the address's only for a
+    credential not recently resolved.
+- **Option implemented:** The second, `ratelimit::CredentialGate`.
+  - Every presented key or UUID is charged its own bucket before the lookup.
+  - One that has not resolved in the last ten minutes also pays its address's
+    bucket (5 a second, burst 100), match or not.
+  - A credential that resolved recently skips the address's bucket.
+- **Justification:** A misbehaving machine behind a shared address does not
+  lock out the workers beside it. What remains: after a restart nothing is
+  known, so more than a hundred machines behind one address are admitted five
+  a second.
+
+**KL-43. `?rack=` canonicalises by Unicode code point.**
+- **Context:** The rack lookup sorts the typed rack before searching.
+- **Problem:** Code-point order equals machine-letter order for English, but not
+  for a distribution whose letters are outside ASCII or longer than one
+  character. There, a lookup would miss.
+- **Options considered:** None recorded.
+- **Option implemented:** Code-point order.
+- **Justification:** No such opening-rack job exists.
+
+**KL-44. Concurrent imports each hold a ~94 MB tarball in memory.**
+- **Context:** An input-data import buffers its tarball.
+- **Problem:** Two admins importing at once on a 2 GB task is survivable; five
+  is not.
+- **Options considered:** None recorded.
+- **Option implemented:** None.
+- **Justification:** Imports are admin-only.
 
 ### Deployment
 
-- **Terraform's state is local.** `infra/main.tf` declares no backend, so the
-  state is a file on the machine that applied, and RUNBOOK.md's recovery steps
-  and both ops scripts read it. Lost with that machine, SQL can no longer
-  reach the database by the scripts, and the next apply tries to create every
-  named resource again. README.md says to keep it off the machine and the
-  region. *Open (fifteenth audit):* an S3 backend in a second region, versioned
-  and locked — a bootstrap bucket outside this configuration, and a choice of
-  region and account that is the operator's to make.
+**KL-45. Terraform's state is local.**
+- **Context:** `infra/main.tf` declares no backend, so the state is a file on the
+  machine that applied. RUNBOOK.md's recovery steps and both ops scripts read
+  it.
+- **Problem:** If the file is lost with that machine, the scripts can no longer
+  reach the database by SQL, and the next apply tries to create every named
+  resource again.
+- **Options considered:** an S3 backend in a second region, versioned and
+  locked, with a bootstrap bucket outside this configuration.
+- **Option implemented:** None yet. *Open (fifteenth audit).* README.md says to
+  keep the state off the machine and out of the region.
+- **Justification:** The backend's region and account are the operator's
+  choice.
 
-- **The restore drill's disk stops at Fargate's 200 GiB**, which holds a
-  database a little over 150 GiB with its dump beside it. Past that the drill
-  refuses to start, naming the alternative: a hand-run drill with
-  `DRILL_TARGET=server` against a scratch instance restored from a snapshot.
-  The ops task's scratch restore (RUNBOOK.md §2.1) has the same ceiling; a PITR
-  scratch instance is the way past it.
-- **Fargate's provisioning time is the floor on a deployment's gap** — a minute
-  or so that Terraform cannot shorten. Getting under it means two tasks alive at
-  once, which is the [primary/secondary split](#scaling) and everything the
-  single-instance assumptions were written against.
+**KL-46. The restore drill's disk stops at Fargate's 200 GiB.**
+- **Context:** 200 GiB holds a database a little over 150 GiB with its dump
+  beside it. The ops task's scratch restore (RUNBOOK.md §2.1) has the same
+  ceiling.
+- **Problem:** A larger database cannot be drilled, or scratch-restored, on
+  Fargate.
+- **Options considered:**
+  - a hand-run drill with `DRILL_TARGET=server` against a scratch instance
+    restored from a snapshot;
+  - a PITR scratch instance for §2.1.
+- **Option implemented:** Past the limit, the drill refuses to start and names
+  the alternative.
+- **Justification:** 200 GiB is Fargate's maximum ephemeral storage.
+
+**KL-47. Fargate's provisioning time is the floor on a deployment's gap.**
+- **Context:** A minute or so that Terraform cannot shorten.
+- **Problem:** Every deploy has a gap at least that long.
+- **Options considered:** two tasks alive at once, the
+  [primary/secondary split](#scaling).
+- **Option implemented:** None.
+- **Justification:** Two live tasks break the single-instance assumptions the
+  system was written against.
 
 ### The MAGPIE side
 
-- **Only the assignment shapes are pinned in MAGPIE's tests.** The claim, the
-  decline and the three shutdowns are checked on birdtest's side
-  (`routes::worker::contract_fixtures`) and were traced by hand on MAGPIE's at
-  every audit: `claim_task_over_http` writes `magpie_version` and
-  `unsupported_jobs`; `decline_over_http` writes `claim_token`, `reason` and
-  `missing` with `role`/`name`/`expected`/`actual`; `print_shutdown` reads
-  `message`, `required_magpie_version`, `download_url` and
-  `required_tarball_dates`. Making that a test needs the message builders in
-  `contribute.c` exposed; nothing is wrong today.
-- **`birdtest-contribute`'s include graph differs from upstream's.** It has no
-  include cycles (`find_circ_deps.py` on a clean archive; a working tree's
-  untracked `cppcheck_dir/` shows some that are not the branch's), but
-  `compat/ctime.h` no longer includes `io_util.h` here while upstream main still
-  does. An upstream file that gets `io_util`'s declarations through `ctime.h`
-  fails to compile after a merge; MAGPIE's CI would say so.
-- **The backup, ops and drill tasks pull `backup_image` from public ECR**
-  (`public.ecr.aws/…/postgres:16`). Public ECR is anchored in us-east-1, and
-  whether it still serves pulls in another region while us-east-1 is down is
-  unverified. For a stack in us-east-1 that is exactly RUNBOOK §5's case.
-  *Open (twenty-first audit):* mirror it with the three app images (one more
-  image to keep current), or accept the risk.
-- **A full disk while writing a wordmap or rack info table ends the worker.**
-  The writers are MAGPIE's CLI writers (`fwrite_or_die`), which exit; on the
-  contribute path the claim then waits out the heartbeat timeout, and the
-  partial temporary is removed by the next write an hour on. A declined task
-  would be kinder; it means error returns through writers the CLI shares.
-- **Local write failures are counted, not remembered.** A worker that cannot
-  write a table or a fetched KLV (a read-only data directory) counts a failure
-  rather than setting the job aside, and a success on another job resets the
-  count, so it keeps claiming the job it cannot run between the ones it can.
-- **A wordmap or table this build cannot reproduce ends in a `data_out_of_date`
-  shutdown** when it is the worker's last active job: it is remembered as
-  unsupported, and the server's shutdown message advises downloading data,
-  where the cause is the build. The worker's own summary prints the "built as"
-  lines, which say otherwise. Distinguishing them needs a shutdown reason for
-  builder mismatches on the server.
+**KL-48. Only the assignment shapes are pinned in MAGPIE's tests.**
+- **Context:** The claim, the decline and the three shutdowns are checked on
+  birdtest's side (`routes::worker::contract_fixtures`), and have been traced
+  by hand on MAGPIE's at every audit:
+  - `claim_task_over_http` writes `magpie_version` and `unsupported_jobs`;
+  - `decline_over_http` writes `claim_token`, `reason` and `missing` with
+    `role`/`name`/`expected`/`actual`;
+  - `print_shutdown` reads `message`, `required_magpie_version`, `download_url`
+    and `required_tarball_dates`.
+- **Problem:** A change on MAGPIE's side to these messages is caught only by
+  hand.
+- **Options considered:** expose the message builders in `contribute.c`, so they
+  can be tested.
+- **Option implemented:** Hand traces.
+- **Justification:** Nothing is wrong today.
+
+**KL-49. `birdtest-contribute`'s include graph differs from upstream's.**
+- **Context:** The branch has no include cycles (`find_circ_deps.py` on a clean
+  archive; a working tree's untracked `cppcheck_dir/` shows some that are not
+  the branch's). But `compat/ctime.h` no longer includes `io_util.h` here, while
+  upstream main still does.
+- **Problem:** An upstream file that gets `io_util`'s declarations through
+  `ctime.h` fails to compile after a merge.
+- **Options considered:** None recorded.
+- **Option implemented:** None.
+- **Justification:** MAGPIE's CI would report the failure.
+
+**KL-50. The backup, ops and drill tasks pull `backup_image` from public ECR.**
+- **Context:** `public.ecr.aws/…/postgres:16`. Public ECR is anchored in
+  us-east-1.
+- **Problem:** Whether it still serves pulls in another region while us-east-1
+  is down is unverified. For a stack in us-east-1, that is exactly RUNBOOK §5's
+  case.
+- **Options considered:**
+  - mirror it with the three app images, which is one more image to keep
+    current;
+  - accept the risk.
+- **Option implemented:** None yet. *Open (twenty-first audit).*
+- **Justification:** A trade between upkeep and an unverified risk, left for a
+  decision.
+
+**KL-51. A full disk while writing a wordmap or rack info table ends the worker.**
+- **Context:** The writers are MAGPIE's CLI writers (`fwrite_or_die`), which
+  exit.
+- **Problem:** On the contribute path, the claim then waits out the heartbeat
+  timeout, and the partial temporary is removed by the next write, an hour on.
+- **Options considered:** decline the task.
+- **Option implemented:** None.
+- **Justification:** Declining means error returns through writers the CLI
+  shares.
+
+**KL-52. Local write failures are counted, not remembered.**
+- **Context:** A worker that cannot write a table or a fetched KLV, for example
+  because its data directory is read-only, counts a failure.
+- **Problem:** A success on another job resets the count, so the worker keeps
+  claiming the job it cannot run, between the ones it can.
+- **Options considered:** set the job aside, as for other failures.
+- **Option implemented:** Counted.
+- **Justification:** Noted rather than fixed. The record gives no further reason.
+
+**KL-53. A wordmap or table this build cannot reproduce ends in a `data_out_of_date` shutdown.**
+- **Context:** When the mismatched job is the worker's last active job, it is
+  remembered as unsupported, and the server's shutdown message advises
+  downloading data.
+- **Problem:** The cause is the build, not the data. The worker's own summary
+  prints the "built as" lines, which say otherwise.
+- **Options considered:** a shutdown reason for builder mismatches, on the
+  server.
+- **Option implemented:** None.
+- **Justification:** The worker's summary already shows the real cause.
 
 ---
 
