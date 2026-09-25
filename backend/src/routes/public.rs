@@ -1,3 +1,4 @@
+use crate::clientip::ClientIp;
 use crate::error::{AppError, AppResult};
 use crate::jobstats;
 use crate::models::job::{Job, JobType};
@@ -12,7 +13,9 @@ use axum::{Json, Router};
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -620,29 +623,89 @@ async fn rack_lookup(
 const MAX_LIVE_STREAMS: usize = 2000;
 static LIVE_STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_LIVE_STREAMS);
 
-/// A place among the live streams, or the 503 that says there is none.
-fn stream_permit(streams: &tokio::sync::Semaphore) -> AppResult<tokio::sync::SemaphorePermit<'_>> {
-    streams.try_acquire().map_err(|_| AppError {
+/// How many of them one client address may hold. The global cap alone let one
+/// host hold every place, idle, and every other page got a 503 for as long as
+/// it stayed connected. Generous for one household or office behind one
+/// address; nowhere near the global cap.
+const MAX_LIVE_STREAMS_PER_ADDRESS: usize = 32;
+
+/// Open streams per client address; an address leaves the map with its last.
+#[derive(Debug, Default)]
+struct StreamsByAddress(std::sync::Mutex<HashMap<IpAddr, usize>>);
+
+static STREAMS_BY_ADDRESS: std::sync::LazyLock<StreamsByAddress> =
+    std::sync::LazyLock::new(StreamsByAddress::default);
+
+/// One address's place among its streams, given back on drop.
+#[derive(Debug)]
+struct AddressStream<'a> {
+    table: &'a StreamsByAddress,
+    address: IpAddr,
+}
+
+impl StreamsByAddress {
+    fn take(&self, address: IpAddr, cap: usize) -> Option<AddressStream<'_>> {
+        let mut open = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let count = open.entry(address).or_insert(0);
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(AddressStream { table: self, address })
+    }
+}
+
+impl Drop for AddressStream<'_> {
+    fn drop(&mut self) {
+        let mut open = self.table.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = open.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.address);
+            }
+        }
+    }
+}
+
+/// A place among the live streams -- this address's share first, then the
+/// global cap -- or the 503 that says there is none. Both are held for the
+/// life of the stream.
+fn stream_permit<'a>(
+    streams: &'a tokio::sync::Semaphore,
+    by_address: &'a StreamsByAddress,
+    address: IpAddr,
+    per_address: usize,
+) -> AppResult<(AddressStream<'a>, tokio::sync::SemaphorePermit<'a>)> {
+    let unavailable = |message: &str| AppError {
         retry_after: Some(30),
-        ..AppError::new(
-            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "too many live pages are open; this one will try again shortly",
-        )
-    })
+        ..AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
+    };
+    let mine = by_address
+        .take(address, per_address)
+        .ok_or_else(|| unavailable("too many live pages are open from this address"))?;
+    let global = streams
+        .try_acquire()
+        .map_err(|_| unavailable("too many live pages are open; this one will try again shortly"))?;
+    Ok((mine, global))
 }
 
 /// One SSE event per accepted result, carrying the same payload `GET
 /// /api/jobs/:id` would return.
 async fn job_stream(
     State(state): State<AppState>,
+    ClientIp(address): ClientIp,
     Path(id): Path<Uuid>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     // A stream is a connection, a task and a receiver for as long as the page
     // is open, on a public route: unbounded, one host could hold enough of
     // them to run the task out of memory. Past the cap a 503, which the page
     // answers by trying again later (`frontend/src/lib/sse.ts`).
-    let permit = stream_permit(&LIVE_STREAMS)?;
+    let permit = stream_permit(
+        &LIVE_STREAMS,
+        &STREAMS_BY_ADDRESS,
+        address,
+        MAX_LIVE_STREAMS_PER_ADDRESS,
+    )?;
     let job = load_job(&state, id).await?;
     // Subscribed before the first payload is read: a push published between
     // the two was lost, and on a quiet job nothing followed it.
@@ -954,16 +1017,49 @@ async fn worker_page(
 mod tests {
     use super::*;
 
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
     /// A-PUBLIC-6b: past the cap a stream is a 503 with `Retry-After`, and a
     /// place comes back when a stream ends.
     #[test]
     fn a_stream_past_the_cap_is_told_to_come_back() {
         let streams = tokio::sync::Semaphore::new(1);
-        let held = stream_permit(&streams).expect("the first stream has a place");
-        let refused = stream_permit(&streams).expect_err("the second has none");
+        let by_address = StreamsByAddress::default();
+        let held = stream_permit(&streams, &by_address, ip("192.0.2.1"), 8)
+            .expect("the first stream has a place");
+        let refused = stream_permit(&streams, &by_address, ip("192.0.2.2"), 8)
+            .expect_err("the second has none");
         assert_eq!(refused.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(refused.retry_after, Some(30));
         drop(held);
-        assert!(stream_permit(&streams).is_ok(), "an ended stream gives its place back");
+        assert!(
+            stream_permit(&streams, &by_address, ip("192.0.2.2"), 8).is_ok(),
+            "an ended stream gives its place back"
+        );
+    }
+
+    /// A-PUBLIC-6c: one address cannot take every place. Past its share it is
+    /// refused while another address still gets one, a refusal holds nothing,
+    /// and an address with no streams left is forgotten.
+    #[test]
+    fn one_address_cannot_hold_every_stream() {
+        let streams = tokio::sync::Semaphore::new(10);
+        let by_address = StreamsByAddress::default();
+        let greedy = ip("198.51.100.7");
+        let held: Vec<_> = (0..3)
+            .map(|_| stream_permit(&streams, &by_address, greedy, 3).expect("within its share"))
+            .collect();
+        let refused = stream_permit(&streams, &by_address, greedy, 3).expect_err("past its share");
+        assert_eq!(refused.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(streams.available_permits(), 7, "the refusal took no global place");
+        assert!(stream_permit(&streams, &by_address, ip("203.0.113.9"), 3).is_ok());
+
+        // A global refusal gives the address's place back as well.
+        let tight = tokio::sync::Semaphore::new(0);
+        assert!(stream_permit(&tight, &by_address, ip("203.0.113.10"), 3).is_err());
+        drop(held);
+        assert!(by_address.0.lock().unwrap().is_empty(), "{:?}", by_address.0.lock().unwrap());
     }
 }

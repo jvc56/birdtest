@@ -208,6 +208,7 @@ resource "aws_scheduler_schedule" "derived_builder" {
   description                  = "Drain the wordmap and rack info table build queue"
   schedule_expression          = var.derived_builder_schedule
   schedule_expression_timezone = "UTC"
+  state                        = var.scheduled_tasks_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window {
     mode = "OFF"

@@ -33,9 +33,20 @@ variable "vpc_cidr" {
 }
 
 variable "azs" {
-  description = "Availability zones. Two are required for both the ALB and the RDS subnet group."
+  description = <<-EOT
+    Availability zones, at least two (the ALB and the RDS subnet group both need
+    two). Unset, the region's first two zones that need no opt-in: the old
+    default named us-east-1's, so a stack in any other region that set
+    `region` without `azs` failed at its first subnet -- as did RUNBOOK §5's
+    "<region>a" and "<region>b" in a region whose accounts get other letters.
+  EOT
   type        = list(string)
-  default     = ["us-east-1a", "us-east-1b"]
+  default     = null
+
+  validation {
+    condition     = var.azs == null || length(coalesce(var.azs, [])) >= 2
+    error_message = "azs needs at least two availability zones."
+  }
 }
 
 variable "backend_image" {
@@ -75,6 +86,26 @@ variable "db_allocated_storage" {
   EOT
   type        = number
   default     = 20
+
+  validation {
+    # RDS refuses a Postgres instance under 20 GiB -- after the rest of the
+    # stack has been built, so a small computed size (RUNBOOK §5, for a young
+    # database) failed the apply half-way. Refused at plan instead.
+    condition     = var.db_allocated_storage >= 20
+    error_message = "db_allocated_storage must be at least 20 (GiB): RDS refuses less."
+  }
+}
+
+variable "scheduled_tasks_enabled" {
+  description = <<-EOT
+    Whether the scheduled tasks run: the derived-data builder, the nightly
+    backup and the restore drill. RUNBOOK §5 turns them off while the DR copy's
+    database is being restored -- the builder would fail rows whose inputs are
+    not synced yet, and a backup would dump the half-restored database as the
+    newest -- and back on with the stack.
+  EOT
+  type        = bool
+  default     = true
 }
 
 variable "db_apply_immediately" {

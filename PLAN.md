@@ -554,11 +554,16 @@ scale.
   as **unrated** rather than as a plausible-looking 1500.
 
 Standard errors come from the diagonal of the Fisher information, counting each
-paired game as one trial. Ignoring the off-diagonal terms narrows them;
-counting a pair (two games, scored in quarters) as one trial widens them by at
-least √2. So they are neither bound on the true uncertainty, but they are more
-than good enough for the distinction the page needs to draw: 1700 ± 15 and
-1700 ± 200 must not look alike.
+paired game as one trial. Three approximations pull them different ways, so
+they bound the true uncertainty neither way. Ignoring the off-diagonal terms
+narrows them. Counting a pair (two games, scored in quarters) as one trial
+widens them by √(2/(1+ρ)), where ρ is the correlation between a pair's two
+games: √2 if they are independent, more when pairing works (ρ < 0), less when a
+config wins both halves on the same racks (ρ > 0), and never below 1. And the
+prior's virtual games are in the fit but not in the information, which widens
+them most for the barely-played. They are more than good enough for the
+distinction the page needs to draw: 1700 ± 15 and 1700 ± 200 must not look
+alike.
 
 #### When a fit runs
 
@@ -721,7 +726,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
 
 **CSRF**: CSRF protection applies to session-cookie-backed endpoints only (Auth API, Account API, Admin API). Worker endpoints (`/api/worker/*`) use bearer tokens or the `X-Worker-UUID` header — neither is sent automatically by browsers, so they are not susceptible to CSRF and are exempt.
 
-**Rate limiting**: Public unauthenticated endpoints are protected against abuse with per-IP (and per-UUID for worker endpoints) rate limiting enforced at the Axum middleware layer using the `governor` crate (token bucket algorithm). Rate-limited responses return `429 Too Many Requests` with a `Retry-After` header. The specific limits, and how a client's address is determined behind a proxy, are in [Rate limits](#rate-limits).
+**Rate limiting**: Endpoints that cost work and need no session — registration, login, password reset, redeeming confirmation and reset links, every worker endpoint, the live stream — are rate limited in their handlers (and the worker identity extractor), per client IP, per worker identity or per account as each needs, using the `governor` crate (token bucket algorithm). The public read pages are not metered; they run on a display pool of their own (`db::connect_read`) so they cannot starve claims and submissions. Rate-limited responses return `429 Too Many Requests` with a `Retry-After` header. The specific limits, and how a client's address is determined behind a proxy, are in [Rate limits](#rate-limits).
 
 For v1, rate limit state is held in-memory (resets on process restart). A persistent backend can be added later for cross-instance coordination.
 
@@ -885,8 +890,10 @@ immediately as its first event, then an event per accepted result, all named
 `stats`, with a 15-second keep-alive so an idle connection survives an
 intermediary's timeout. The route is public, and each open stream holds a
 connection, a task and a receiver, so at most 2,000 are open at once across
-every job; past that a stream is a `503` with `Retry-After`, and the page tries
-again a few seconds later. A push is shared among its subscribers (`Arc<str>`),
+every job, and at most 32 from one client address (otherwise one host could
+hold every place, idle, and every other page got a 503). Past either a stream
+is a `503`; the page tries again after 5 s, doubling to a minute while it is
+refused, jittered so refused pages do not return together. A push is shared among its subscribers (`Arc<str>`),
 not copied to each.
 
 **An event per result, not one per result.** Building a payload is several
@@ -4368,11 +4375,14 @@ In-memory token buckets, per process, reset on restart.
 | Endpoint | Limit | Keyed on |
 |---|---|---|
 | `POST /api/auth/register` | 10 / hour | Client IP |
-| `POST /api/auth/login` | 10 / minute, and 100 / minute | Client IP; and, separately, the username tried from anywhere — ten times the address's, so that one address cannot lock an account out |
+| `POST /api/auth/login` | 10 / minute, and 100 / minute | Client IP; and, separately, the account the name matched (or, for a name that matches none, the name) from anywhere — ten times the address's, so that one address cannot lock an account out |
 | `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
 | `POST /api/worker/{task,result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Worker identity: the API key (`k:<key-id>`) or the anonymous UUID (`a:<uuid>`). Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
 | `POST /api/me/api-keys` | 10 / hour, **burst 100** | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered churn was unmetered new capacity. The burst is the cap, so a contributor setting up a machine per key is not held back (at ten an hour from the start, fifty machines took five hours); what refills slowly is revoke-and-recreate |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
+| Any worker request whose API key or `X-Worker-UUID` matches nothing | 30 / minute, then refused **before the lookup** until the bucket refills | Client IP. The identity lookup is a main-pool query made before any worker bucket can be charged; a real worker never misses (`ratelimit::MissGate`) |
+| `POST /api/auth/confirm-email`, `POST /api/auth/reset-password/confirm` | 20 / minute | Client IP. The codes are too long to guess; this bounds cost (unauthenticated writes on the main pool, and a password scored) |
+| `GET /api/jobs/:id/stream` | 2,000 open at once, at most 32 from one address | Open streams, not requests: past either a `503`. The page backs off from 5 s to a minute between attempts |
 
 "Client IP" is the `X-Forwarded-For` entry `TRUSTED_PROXY_HOPS` from the right —
 the ALB's or Nginx's view of the caller — or the TCP peer when that is 0. Keying
@@ -6618,7 +6628,8 @@ The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
 the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md`,
 the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md`,
 the seventeenth's `AUDIT_FINDINGS_13.md`, the eighteenth's `AUDIT_FINDINGS_14.md`,
-the nineteenth's `AUDIT_FINDINGS_15.md` and the twentieth's `AUDIT_FINDINGS_16.md`.
+the nineteenth's `AUDIT_FINDINGS_15.md`, the twentieth's `AUDIT_FINDINGS_16.md`
+and the twenty-first's `AUDIT_FINDINGS_17.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -6715,7 +6726,8 @@ what would make it worth revisiting.
   longer stalls the rest of the fleet, and it runs on a task of its own, so a
   request the load balancer drops at its 300-second idle timeout no longer
   takes the transaction with it: the purge finishes, and the hold on the job
-  lasts exactly as long as its locks. What remains is its own length: the
+  lasts at least as long as its locks (to the end of the steps after the
+  commit, the generation-0 rebuild among them). What remains is its own length: the
   cascades are tens of millions of rows for a full simming opening-rack job —
   minutes on the production instance class, the job's claims held throughout,
   and the admin told nothing past the load balancer's timeout (the audit log and
@@ -6909,11 +6921,10 @@ what would make it worth revisiting.
   against deletion. Admin-only and cosmetic; an update and delete route are the
   fix if it ever matters.
 
-- **A worker's identity is resolved before its rate limit is checked.** The
-  extractor looks the credential up in the database first, and an unknown UUID
-  or key is answered `401` without being counted, so an unauthenticated caller
-  can make the server run one indexed probe per request at any rate. Cheap to
-  absorb; a per-IP bucket for failed worker authentication would close it.
+- **A worker's identity is resolved before its rate limit is checked** — closed
+  (twenty-first audit). The lookup still comes first, since the bucket is the
+  identity's, but an address whose credentials keep matching nothing is refused
+  before the lookup after 30 misses a minute (`ratelimit::MissGate`).
 - **`?rack=` canonicalises by Unicode code point.** That equals machine-letter
   order for English and would not for a distribution whose letters are outside
   ASCII or longer than one character; such a lookup would miss. No such
@@ -6954,10 +6965,18 @@ what would make it worth revisiting.
   `message`, `required_magpie_version`, `download_url` and
   `required_tarball_dates`. Making that a test needs the message builders in
   `contribute.c` exposed; nothing is wrong today.
-- **`birdtest-contribute` has seven include cycles** (`find_circ_deps.py`, all
-  through `config` and `json`), and MAGPIE's CI lists circular dependencies
-  among its required checks. They do not affect birdtest; whoever merges the
-  branch upstream will meet them.
+- **`birdtest-contribute`'s include graph differs from upstream's.** It has no
+  include cycles (`find_circ_deps.py` on a clean archive; a working tree's
+  untracked `cppcheck_dir/` shows some that are not the branch's), but
+  `compat/ctime.h` no longer includes `io_util.h` here while upstream main still
+  does. An upstream file that gets `io_util`'s declarations through `ctime.h`
+  fails to compile after a merge; MAGPIE's CI would say so.
+- **The backup, ops and drill tasks pull `backup_image` from public ECR**
+  (`public.ecr.aws/…/postgres:16`). Public ECR is anchored in us-east-1, and
+  whether it still serves pulls in another region while us-east-1 is down is
+  unverified. For a stack in us-east-1 that is exactly RUNBOOK §5's case.
+  *Open (twenty-first audit):* mirror it with the three app images (one more
+  image to keep current), or accept the risk.
 - **A full disk while writing a wordmap or rack info table ends the worker.**
   The writers are MAGPIE's CLI writers (`fwrite_or_die`), which exit; on the
   contribute path the claim then waits out the heartbeat timeout, and the
@@ -7115,6 +7134,11 @@ The scenarios worth designing against, in descending order of likelihood:
 3. **Instance or AZ failure.** RDS is single-AZ by default; an instance failure is
    an outage and a restore.
 4. **Region loss.** Unlikely, survivable only if backups already left the region.
+   The rebuild (RUNBOOK §5) is a second copy of the stack under `name_suffix`,
+   applied with its scheduled tasks off (`scheduled_tasks_enabled = false`)
+   until its database is restored and its artifacts synced, its storage sized
+   from the replicated manifest, and its zones taken from the region
+   (`azs` unset).
 5. **Credential compromise.** An attacker with the task role can `PutObject` over
    any artifact key; an attacker with broader AWS access can delete backups. This
    is what object versioning and Object Lock are for.

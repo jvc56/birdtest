@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { api, errorText, type ImportDetail, type InputData } from '$lib/api';
+  import { api, ApiError, errorText, type ImportDetail, type InputData } from '$lib/api';
 
   let files: InputData[] = [];
   let error = '';
@@ -23,7 +23,38 @@
       error = `Could not load the input data: ${e instanceof Error ? e.message : String(e)}`;
     }
   }
-  onMount(load);
+  // The import in progress, remembered in this browser: there is no list of
+  // imports, so a reload (or a poll that gave up) otherwise lost a staged
+  // import, and the only way on was to download it again.
+  const IMPORT_KEY = 'birdtest:input-data-import';
+  const remember = (id: string | null) => {
+    try {
+      if (id) localStorage.setItem(IMPORT_KEY, id);
+      else localStorage.removeItem(IMPORT_KEY);
+    } catch {
+      // Storage unavailable (a private window): nothing to resume, no harm.
+    }
+  };
+  async function resume() {
+    let id: string | null = null;
+    try {
+      id = localStorage.getItem(IMPORT_KEY);
+    } catch {
+      return;
+    }
+    if (!id) return;
+    try {
+      current = await api.getImport(id);
+      if (current.state === 'running') watch(id);
+      else if (current.state !== 'staged') remember(null);
+    } catch {
+      remember(null);
+    }
+  }
+  onMount(() => {
+    load();
+    resume();
+  });
   onDestroy(() => poll && clearInterval(poll));
 
   function watch(id: string) {
@@ -31,14 +62,23 @@
     poll = setInterval(async () => {
       try {
         current = await api.getImport(id);
+        error = '';
         if (current.state !== 'running') {
           poll && clearInterval(poll);
           poll = null;
+          if (current.state !== 'staged') remember(null);
         }
       } catch (e) {
-        error = (e as Error).message;
-        poll && clearInterval(poll);
-        poll = null;
+        error = errorText(e);
+        // Only a refusal that asking again will not change ends the watch.
+        // A deploy's 503 or a network blip used to end it for good, and with
+        // no list of imports the staged one could not be found again: the
+        // admin downloaded the ~94 MB again instead.
+        const status = e instanceof ApiError ? e.status : 0;
+        if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+          poll && clearInterval(poll);
+          poll = null;
+        }
       }
     }, 1000);
   }
@@ -54,6 +94,7 @@
         tarball_date: tarballDate.trim(),
         git_ref: gitRef.trim() || undefined
       });
+      remember(started.id);
       current = await api.getImport(started.id);
       watch(started.id);
     } catch (e) {
@@ -70,6 +111,7 @@
     try {
       await api.confirmImport(current.id);
       current = await api.getImport(current.id);
+      remember(null);
       await load();
     } catch (e) {
       error = (e as Error).message;
@@ -126,6 +168,7 @@
   </div>
 
   {#if current}
+    <p class="text-xs text-muted-foreground">Import <span class="font-mono">{current.id}</span></p>
     {#if current.state === 'running'}
       <p class="text-sm">
         Downloading… {mib(current.progress_bytes)}, {current.progress_entries} files hashed.

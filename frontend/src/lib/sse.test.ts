@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { subscribeToJob } from './sse';
+import { resubscribeDelay, subscribeToJob } from './sse';
 
 /** A stand-in EventSource the test drives by hand. */
 class FakeEventSource {
@@ -161,5 +161,36 @@ describe('F-SSE-3 unsubscribe', () => {
     FakeEventSource.instances[0].giveUp();
     vi.advanceTimersByTime(60_000);
     expect(FakeEventSource.instances).toHaveLength(1);
+  });
+});
+
+describe('F-SSE-4 backoff', () => {
+  it('doubles from five seconds to a minute, jittered down by at most half', () => {
+    expect([0, 1, 2, 3, 4, 10].map((n) => resubscribeDelay(n, () => 1))).toEqual([
+      5000, 10_000, 20_000, 40_000, 60_000, 60_000
+    ]);
+    expect(resubscribeDelay(0, () => 0)).toBe(2500);
+    expect(resubscribeDelay(4, () => 0)).toBe(30_000);
+  });
+
+  it('a stream refused again and again is asked less often, and an event resets it', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(1);
+    vi.stubGlobal('fetch', vi.fn(async () => ({ status: 200 })));
+    subscribeToJob('busy', vi.fn());
+    FakeEventSource.instances[0].giveUp();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(FakeEventSource.instances).toHaveLength(2);
+
+    FakeEventSource.instances[1].giveUp();
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(FakeEventSource.instances).toHaveLength(3);
+
+    // Working again: the next failure waits five seconds, not twenty.
+    FakeEventSource.instances[2].emit('stats', '{}');
+    FakeEventSource.instances[2].giveUp();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(FakeEventSource.instances).toHaveLength(4);
   });
 });

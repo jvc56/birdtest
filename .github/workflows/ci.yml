@@ -233,14 +233,18 @@ jobs:
           set -euo pipefail
           make magpie
           magpie="$PWD/bin/magpie"
-          "$magpie" builders
+          # MAGPIE exits 0 on an error, so the output is what says it worked.
+          "$magpie" builders | tee /dev/stderr | grep -q '"klv_builder_version"'
           # Each command as the server runs it (backend/src/magpie.rs): in a
           # scratch root whose ./data holds the inputs, on MAGPIE's two-letter
           # test lexicon. A help text that still names a conversion says nothing
           # about its arguments, and `createdata klv` was not in it at all.
           scratch=$(mktemp -d)
-          mkdir -p "$scratch/data/lexica" "$scratch/data/letterdistributions"
-          cp -r data/layouts "$scratch/data/"
+          mkdir -p "$scratch/data/lexica" "$scratch/data/letterdistributions" "$scratch/data/layouts"
+          # The layout the server writes (backend/src/magpie.rs), not MAGPIE's
+          # own copy: a renamed default would otherwise pass here and fail
+          # every conversion on the server.
+          cp ../backend/src/magpie_standard15.txt "$scratch/data/layouts/standard15.txt"
           cp testdata/lexica/CSW21_ab.kwg testdata/lexica/CSW21_ab.klv2 "$scratch/data/lexica/"
           cp testdata/letterdistributions/english_ab.csv "$scratch/data/letterdistributions/"
           # english_ab's eight full racks, A^k B^(7-k), for rackequity2klv.
@@ -263,6 +267,6 @@ jobs:
           for f in CSW21_ab.wmp CSW21_ab.rit zero.klv2 racks.klv2; do
             test -s "data/lexica/$f" || { echo "magpie wrote no data/lexica/$f" >&2; exit 1; }
           done
-          if ls data/lexica | grep -q '\.tmp\|wbx'; then
+          if ls data/lexica | grep -q '\.tmp$'; then
             echo "magpie left temporaries: $(ls data/lexica)" >&2; exit 1
           fi

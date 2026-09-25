@@ -375,7 +375,14 @@ async fn create_pool(
     .bind(body.anchor_rating)
     .fetch_one(&mut *tx)
     .await
-    .map_err(|e| unknown_config(e.into(), "anchor_player_config_id", body.anchor_player_config_id))?;
+    .map_err(|e| {
+        unknown_config(
+            e.into(),
+            "rating_pools_anchor_player_config_id_fkey",
+            "anchor_player_config_id",
+            body.anchor_player_config_id,
+        )
+    })?;
 
     // The anchor is a member by construction: a pool whose fixed point is not
     // in the pool has nothing to fix.
@@ -404,11 +411,15 @@ async fn create_pool(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": pool_id }))))
 }
 
-/// A foreign-key failure on a config reference is the caller naming a config
-/// that does not exist: a 400 on that field, not the generic 409 ("still
-/// referenced by other records"), which says the opposite.
-fn unknown_config(err: AppError, field: &str, id: Uuid) -> AppError {
-    if err.db_code.as_deref() == Some(crate::error::FOREIGN_KEY_VIOLATION) {
+/// A foreign-key failure on `constraint`, a config reference, is the caller
+/// naming a config that does not exist: a 400 on that field, not the generic
+/// 409 ("still referenced by other records"), which says the opposite. Any
+/// other failure -- another key of the same insert included -- is left as it
+/// was.
+pub(crate) fn unknown_config(err: AppError, constraint: &str, field: &str, id: Uuid) -> AppError {
+    if err.db_code.as_deref() == Some(crate::error::FOREIGN_KEY_VIOLATION)
+        && err.db_constraint.as_deref() == Some(constraint)
+    {
         AppError::bad_request("that player config does not exist")
             .with_field(field, format!("no player config {id}"))
     } else {
@@ -454,7 +465,14 @@ async fn add_member(
     .bind(admin.0.id)
     .execute(&mut *tx)
     .await
-    .map_err(|e| unknown_config(e.into(), "player_config_id", body.player_config_id))?;
+    .map_err(|e| {
+        unknown_config(
+            e.into(),
+            "rating_pool_members_player_config_id_fkey",
+            "player_config_id",
+            body.player_config_id,
+        )
+    })?;
     audit::log(
         &mut tx,
         "rating_pool.member_added",

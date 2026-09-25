@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 161 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (13), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `exports`, `jobs`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `ratelimit`, `routes`, `routes::auth`, `routes::public` (1 each) |
-| 1F Frontend unit | 98 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (9), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1 Unit | 163 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (13), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `ratelimit` (2), `routes::public` (2), `exports`, `jobs`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1F Frontend unit | 101 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 143 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (14), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 165 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (15), `public_api.rs` (11), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
+| 3 API | 168 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (18), `public_api.rs` (11), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 497 backend tests (the per-tier counts above are
+--run-ignored all` runs 502 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
 they had drifted by up to 17).
 
@@ -547,6 +547,11 @@ Each entry's tests are the `describe` block named for its id.
   unsubscribe cancels a pending reopen; a job that answers a 4xx other than
   408 or 429 (deleted, or a bad id) is not subscribed to again (sixteenth and
   seventeenth audits). *(Covered: `sse.test.ts`.)*
+- `F-SSE-4` A stream refused again and again is asked less often: the wait
+  doubles from 5 s to a minute, jittered down by up to half, and an event
+  resets it. At a fixed 5 s, every page the server's stream cap refused asked
+  again, with a stats read first, every five seconds (twenty-first audit).
+  *(Covered: `sse.test.ts`.)*
 
 ### `F-CHART-*` — chart maths
 
@@ -557,7 +562,9 @@ Test the pure functions; do not snapshot the SVG.
   `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-2` It clamps a runaway error bar rather than letting one
   barely-measured config flatten the scale, and still reports the true number in
-  the table. *(Covered: `charts/ratingDotPlot.test.ts`.)*
+  the table. The anchor has no bar at all, whatever error the fit stored for it
+  (with no games, `f64::MAX`, which was drawn at the cap). *(Covered:
+  `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-3` A config with `connected_to_anchor: false` is listed as unrated
   and **not** drawn at a position. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-4` `RatingHistoryChart` caps at six series, picks them by latest
@@ -1535,6 +1542,10 @@ below.
   `boundaries::an_accounts_login_bucket_does_not_depend_on_how_its_name_is_spelled`;
   keyed on Rust's lowering, each spelling had a bucket of its own. Twentieth
   audit.)*
+- `A-AUTH-11c` Redeeming confirmation and reset links is limited per address:
+  the twenty-first in a minute is a 429. Both are unauthenticated writes on the
+  main pool, and a reset scores a password first. *(Covered:
+  `boundaries::redeeming_links_is_limited_per_address`.)* (Twenty-first audit.)
 
 ### `A-WORKER-*` — `routes/worker.rs`
 
@@ -1608,6 +1619,13 @@ below.
   request in a burst is 429 and the account's other key is not. *(Covered:
   `worker_routes::an_accounts_workers_are_limited_per_key`.)* (Thirteenth
   audit.)
+- `A-WORKER-16` An address whose worker credentials (API key or
+  `X-Worker-UUID`) keep matching nothing gets 401s, then, past 30 in a minute,
+  429s with `Retry-After`, refused before the identity lookup; another address
+  is unaffected. The lookup is a main-pool query that no bucket covered.
+  *(Covered: `boundaries::made_up_worker_credentials_are_limited_per_address`,
+  `ratelimit::key_tests::an_address_that_keeps_missing_is_refused_before_the_lookup`.)*
+  (Twenty-first audit.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*
@@ -1761,6 +1779,12 @@ below.
   a stream is a `503` with `Retry-After`, and an ended stream gives its place
   back. *(Covered: `routes::public::tests::a_stream_past_the_cap_is_told_to_come_back`.)*
   (Twentieth audit: a public route with no bound on open connections.)
+- `A-PUBLIC-6c` One address holds at most 32 live streams, each for as long as
+  its response lives; a refusal holds nothing, and another address is
+  unaffected. *(Covered: `routes::public::tests::one_address_cannot_hold_every_stream`,
+  and on the router `boundaries::one_address_holds_at_most_its_share_of_live_streams`,
+  which fails if the handler stops holding its place for the stream's life.)*
+  (Twenty-first audit: the global cap alone let one host hold every place.)
 - `A-PUBLIC-6a` The SSE stream ends when the process is told to stop: it has no
   end of its own, and graceful shutdown waits for every open response, so an
   open dashboard used to hold every deployment until the runtime's `SIGKILL`
@@ -1818,7 +1842,9 @@ silent.
   `boundaries::a_username_tried_from_everywhere_is_rate_limited`.)*
 - `A-BOUND-3` A player config's `kwg_id`, `klv_id` and `winpct_id` must each
   name an `input_data` row of that role; the foreign keys only say the row
-  exists. Each swap is a 400 naming both roles, and creates nothing. *(Covered:
+  exists. Each swap is a 400 naming both roles, and creates nothing. A
+  `cloned_from_id` that names no config is a `400` on that field, not the
+  generic foreign-key `409` (twenty-first audit). *(Covered:
   `boundaries::a_player_config_refuses_input_data_of_the_wrong_role`.)*
 - `A-BOUND-4` A valid result bigger than axum's 2 MB default — a capture batch
   — is accepted, which only the route's own `MAX_RESULT_BYTES` limit allows.

@@ -248,6 +248,14 @@ so start it with `SHELL_HOURS=12 scripts/prod-shell.sh` for anything big:
 apt-get update -qq && apt-get install -y -qq awscli >/dev/null
 STAMP=2026-09-07T03-00-00Z
 aws s3 cp "s3://$BACKUP_BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
+# Checked against its manifest as the drill checks it (scripts/restore-drill.sh,
+# dump_digest): a partial download, or a replica whose files were still
+# arriving, restores part of a database and says nothing.
+aws s3 cp "s3://$BACKUP_BUCKET/pg/$STAMP.manifest.json" /tmp/manifest.json
+want=$(grep -o '"sha256"[^,}]*' /tmp/manifest.json | sed 's/.*: *"//;s/"//')
+got=$( (cd /tmp/dump && find . -type f | LC_ALL=C sort | xargs -r sha256sum) | sha256sum | cut -d' ' -f1)
+[ -n "$want" ] && [ "$want" = "$got" ] && echo "checksum matches" \
+  || echo "CHECKSUM MISMATCH ($want vs $got): stop, and fetch the dump again"
 mkdir -p /tmp/scratch /tmp/sock && chown postgres /tmp/scratch /tmp/sock
 gosu postgres initdb -D /tmp/scratch -U postgres --auth=trust >/dev/null
 # As the drill starts its own (scripts/restore-drill.sh): no parallel query,
@@ -288,6 +296,14 @@ DO NOTHING`, so a partial re-run is safe — which is all it is for, after §2.0
 (`COPY` itself has no `ON CONFLICT`: loaded straight in, a re-run stopped at the
 first row already there.)
 
+For a large job, look at the space first. Each table is staged in an unindexed
+temporary table on the production volume before it is inserted, so for a while
+the copy-back holds about twice the job's largest table, plus the WAL the
+inserts write. Autoscaling keeps only about a tenth of the volume free and grows
+it at most every six hours. Compare the job's largest table in the scratch copy
+(`pg_total_relation_size`) with `FreeStorageSpace`, and raise
+`db_allocated_storage` first if it is close.
+
 Save this as `/tmp/copyback.sh` — `cat > /tmp/copyback.sh <<'EOF'` … `EOF`,
 the quotes mattering: unquoted, the shell fills in `$JOB` and the rest as it
 writes the file — and run it (`bash /tmp/copyback.sh`, or detached as §2.1
@@ -300,13 +316,14 @@ for; write what the script reads first:
 ```bash
 # The production URL with the scratch instance's endpoint for its host: a PITR
 # restore keeps the source's master password, already encoded in the URL as
-# it must be. %q, so no character in it can break the file.
-SCRATCH_URL=$(python3 -c 'import os, sys, urllib.parse as u
-url = u.urlsplit(os.environ["DATABASE_URL"])
-print(url._replace(netloc=url.netloc.rsplit("@", 1)[0] + "@" + sys.argv[1] + ":5432").geturl())' \
-  "<the scratch instance's endpoint>")
-printf 'export SCRATCH_URL=%q\n' "$SCRATCH_URL" > /tmp/restore.env
-echo 'pg_restore exit 0' > /tmp/pg_restore.log   # nothing to wait for
+# it must be. sed, not python: the ops image (postgres:16) has no python3.
+# The last '@' ends the password (one in it is encoded); the host runs to the
+# path or query. %q, so no character in the URL can break the file.
+ENDPOINT="<the scratch instance's endpoint>"
+SCRATCH_URL=$(printf '%s' "$DATABASE_URL" | sed -E "s#^(.*@)[^/?]+#\1$ENDPOINT:5432#")
+case "$SCRATCH_URL" in *"@$ENDPOINT:5432"*) ;; *) echo "could not build SCRATCH_URL: stop"; SCRATCH_URL= ;; esac
+[ -n "$SCRATCH_URL" ] && printf 'export SCRATCH_URL=%q\n' "$SCRATCH_URL" > /tmp/restore.env \
+  && echo 'pg_restore exit 0' > /tmp/pg_restore.log   # nothing to wait for
 ```
 
 ```bash
@@ -855,21 +872,31 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    # the variable later is no quicker. Sized from the replicated dump's
    # manifest: database_bytes is the database's own size when it was dumped
    # (the dump compresses four times or more, so a multiple of the dump
-   # undershoots), plus 30% and room for WAL (db_max_wal_size_mb, 4 GiB by
-   # default). No less than production's own allocation, if that is larger.
+   # undershoots), plus 30% and room for WAL (db_max_wal_size_mb/1024; 4 by
+   # default); never under RDS's minimum of 20. Raise it by hand to
+   # production's own allocation if that is larger and known.
+   # The replica bucket is in the lost stack's dr_region, which need not be
+   # $DR_REGION; with no --region the CLI asks the lost region first.
+   REPLICA_REGION=<the lost stack's dr_region>
    REPLICA=s3://birdtest-backups-dr-<account>/pg
-   MANIFEST=$(aws s3 ls "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
-   DR_STORAGE_GB=$(aws s3 cp "$REPLICA/$MANIFEST" - | python3 -c '
-   import json, math, sys
-   print(math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4)')
-   echo "$MANIFEST: $DR_STORAGE_GB GiB"
+   MANIFEST=$(aws s3 ls --region $REPLICA_REGION "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
+   DR_STORAGE_GB=$(aws s3 cp --region $REPLICA_REGION "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4))')
+   echo "restoring ${MANIFEST%.manifest.json}: $DR_STORAGE_GB GiB"
+   # The zones: whichever the region offers this account, not "<region>a" and
+   # "<region>b" (ap-northeast-1 offers newer accounts a, c and d). Or leave
+   # azs out: unset, it is the region's first two.
+   aws ec2 describe-availability-zones --region $DR_REGION \
+     --query 'AvailabilityZones[?OptInStatus==`opt-in-not-required`].ZoneName'
+   # Scheduled tasks off until step 4: the derived builder would fail rows
+   # whose inputs are not synced yet, and a 03:00 backup would dump the
+   # half-restored database as the newest.
    # And every ARN prod.tfvars names in the lost region overridden: a task
    # whose secrets live there cannot start. GITHUB_TOKEN is optional; leave it
    # off, or create the parameter in $DR_REGION and pass its ARN.
    terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 \
      -var github_token_parameter_arn= \
-     -var db_allocated_storage=$DR_STORAGE_GB \
-     -var region=$DR_REGION -var 'azs=["'$DR_REGION'a","'$DR_REGION'b"]' \
+     -var db_allocated_storage=$DR_STORAGE_GB -var scheduled_tasks_enabled=false \
+     -var region=$DR_REGION -var 'azs=null' \
      -var name_suffix=-dr -var dr_region=$THIRD_REGION \
      -var acm_certificate_arn=<a certificate issued in $DR_REGION> \
      -var alert_email=... -var public_url=... -var ses_domain=... \
@@ -897,8 +924,12 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    `openssl rand -hex 32`; every session cookie is invalidated, which costs a
    round of logins.
 3. Restore the database from the replicated dump in
-   `birdtest-backups-dr-<account>`, from `scripts/prod-shell.sh` against the
-   new stack: the dump into the new instance, as in §2.1 but with
+   `birdtest-backups-dr-<account>` -- the one step 1 sized for
+   (`STAMP=${MANIFEST%.manifest.json}`), checked against its manifest as §2.1
+   checks it: replication does not keep order, so just after a 03:00 backup the
+   newest manifest can arrive before all of its dump's files -- from
+   `scripts/prod-shell.sh` against the new stack: the dump into the new
+   instance, as in §2.1 but with
    `pg_restore -d "$DATABASE_URL"` — run detached as §2.1 does, since it takes
    longer than an ECS Exec session lasts, and not finished until its log ends
    `pg_restore exit 0`: step 4's `desired_count=1` against a half-restored
@@ -912,7 +943,8 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    imported before the `input-data` replication rule existed was never
    replicated: re-import those tarballs from the admin page instead —
    importing is idempotent.) Then `terraform apply` again with
-   `desired_count=1`, the same variables otherwise.
+   `desired_count=1` and `scheduled_tasks_enabled=true`, the same variables
+   otherwise.
 5. Re-verify the SES domain identity and add the DKIM CNAMEs, and point the
    MAIL FROM MX record at the DR region (the `ses_mail_from_records` output of
    the `dr` workspace) — account mail is

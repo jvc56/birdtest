@@ -39,6 +39,10 @@ export function splitByAnchorConnection(ratings: RatingRow[]): {
 /** Clamp runaway intervals so one barely-measured config cannot flatten the
  *  scale for everyone else; the table still reports the real number. */
 export function visibleError(row: RatingRow): number {
+  // The anchor is fixed by definition: its stored error is the fit's for
+  // that config, not an uncertainty in its rating, and with no games it is
+  // f64::MAX -- drawn at the cap, it stretched the scale.
+  if (row.is_anchor) return 0;
   return Math.min(row.stderr, MAX_VISIBLE_ERROR);
 }
 
@@ -120,7 +124,8 @@ export function layoutDotPlot(
 
 /** The dot's tooltip. Reports the true standard error, not the clamped one. */
 export function dotTitle(row: RatingRow): string {
-  return `${row.name}: ${row.rating.toFixed(1)} ± ${row.stderr.toFixed(1)} over ${row.pairs_played.toLocaleString()} pairs`;
+  const spread = row.is_anchor ? ' (fixed)' : ` ± ${row.stderr.toFixed(1)}`;
+  return `${row.name}: ${row.rating.toFixed(1)}${spread} over ${row.pairs_played.toLocaleString()} pairs`;
 }
 
 /** The ratings table's rating column: a dash for a config with no scale. */

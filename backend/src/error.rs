@@ -18,7 +18,11 @@ pub struct AppError {
     /// scheduler losing a race on a unique index -- match on this rather than
     /// on the message text, which is localised by the server's `lc_messages`
     /// and is not an interface.
-    pub db_code: Option<String>,
+    pub db_code: Option<Box<str>>,
+    /// The constraint a database violation names, for a handler that maps
+    /// one foreign key to what the caller got wrong (and leaves the rest
+    /// alone).
+    pub db_constraint: Option<Box<str>>,
 }
 
 /// SQLSTATE for a unique-constraint violation.
@@ -54,6 +58,7 @@ impl AppError {
             fields: Vec::new(),
             retry_after: None,
             db_code: None,
+            db_constraint: None,
         }
     }
 
@@ -181,7 +186,8 @@ impl From<sqlx::Error> for AppError {
                 if error.status == StatusCode::SERVICE_UNAVAILABLE {
                     tracing::warn!(code = ?code, error = %db, "database busy");
                 }
-                error.db_code = code;
+                error.db_code = code.map(String::into_boxed_str);
+                error.db_constraint = db.constraint().map(Box::from);
                 error
             }
             // Every connection of the pool asked was busy for the whole

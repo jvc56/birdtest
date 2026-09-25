@@ -151,6 +151,15 @@ describe('F-CHART-2 runaway error bars', () => {
     expect(stderrCell(anchor)).toBe('fixed');
     expect(stderrCell(other)).toBe('±50.0');
   });
+
+  it("draws no bar for the anchor, whatever error the fit stored for it", () => {
+    // With no games the server stores f64::MAX; drawn at the cap, it was a
+    // ±400 bar on the one rating that is fixed, and stretched the scale.
+    const unplayed = row('a', 1500, Number.MAX_VALUE, { is_anchor: true, pairs_played: 0 });
+    expect(visibleError(unplayed)).toBe(0);
+    expect(dotPlotBounds([unplayed])).toEqual({ lo: 1490, hi: 1510 });
+    expect(dotTitle(unplayed)).toBe('A: 1500.0 (fixed) over 0 pairs');
+  });
 });
 
 describe('F-CHART-3 configs not connected to the anchor', () => {

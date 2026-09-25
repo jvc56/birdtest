@@ -444,8 +444,10 @@ struct ConfirmEmailBody {
 
 async fn confirm_email(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     ApiJson(body): ApiJson<ConfirmEmailBody>,
 ) -> AppResult<Json<MessageBody>> {
+    ratelimit::check(&state.limits.redeem, &format!("ip:{ip}"))?;
     let code_hash = api_key::hash_code(body.code.trim());
 
     let mut tx = state.pool.begin().await?;
@@ -549,9 +551,11 @@ struct ResetConfirmBody {
 
 async fn confirm_password_reset(
     State(state): State<AppState>,
+    ClientIp(ip): ClientIp,
     jar: CookieJar,
     ApiJson(body): ApiJson<ResetConfirmBody>,
 ) -> AppResult<(CookieJar, Json<MessageBody>)> {
+    ratelimit::check(&state.limits.redeem, &format!("ip:{ip}"))?;
     let weak = || {
         AppError::bad_request("password is invalid")
             .with_field("password", "too weak — choose a longer, less predictable password")

@@ -2,8 +2,11 @@ use crate::error::AppError;
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 type Keyed = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 
@@ -49,6 +52,76 @@ pub struct RateLimiters {
     /// was too tight for the hundred keys an account may hold: fifty idle
     /// machines filled it, and heartbeats, which are not retried, lapsed.)
     pub key_creation: Arc<Keyed>,
+    /// Worker credentials that matched nothing, per client address: see
+    /// [`MissGate`].
+    pub worker_misses: Arc<MissGate>,
+    /// Confirmation and reset links redeemed, per client address: 20 a
+    /// minute. The codes are too long to guess, so this is about cost, not
+    /// guessing -- both routes are unauthenticated and write on the main pool,
+    /// and a reset scores the new password first.
+    pub redeem: Arc<Keyed>,
+}
+
+/// Worker requests whose API key or `X-Worker-UUID` matched nothing, per
+/// client address, and the addresses refused for it.
+///
+/// Resolving a worker identity is a main-pool query, made before any worker
+/// bucket can be charged -- the bucket is the identity's. So a made-up key or
+/// UUID cost a query and a 401, unmetered, on the pool that claims and
+/// submissions need (`db.rs`). A real worker never misses; an address that
+/// misses 30 times in a minute is refused without a query until its bucket
+/// refills.
+pub struct MissGate {
+    misses: Keyed,
+    refused_until: Mutex<HashMap<IpAddr, Instant>>,
+}
+
+impl MissGate {
+    fn new() -> Self {
+        Self {
+            misses: RateLimiter::keyed(Quota::per_minute(NonZeroU32::new(30).unwrap())),
+            refused_until: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Before the lookup: a 429, costing nothing, while `address` is refused.
+    pub fn check(&self, address: IpAddr) -> Result<(), AppError> {
+        let refused = self.refused_until.lock().unwrap_or_else(|e| e.into_inner());
+        match refused.get(&address) {
+            Some(until) if *until > Instant::now() => Err(AppError::rate_limited(
+                until.saturating_duration_since(Instant::now()).as_secs().max(1),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// After a lookup that matched nothing: charged, and once the bucket is
+    /// empty the address is refused (and this miss answered 429) until it
+    /// refills.
+    pub fn record_miss(&self, address: IpAddr) -> Result<(), AppError> {
+        match self.misses.check_key(&address.to_string()) {
+            Ok(()) => Ok(()),
+            Err(negative) => {
+                let wait = negative
+                    .wait_time_from(governor::clock::Clock::now(&DefaultClock::default()))
+                    .max(Duration::from_secs(1));
+                self.refused_until
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(address, Instant::now() + wait);
+                Err(AppError::rate_limited(wait.as_secs().max(1)))
+            }
+        }
+    }
+
+    fn retain_recent(&self) {
+        self.misses.retain_recent();
+        let now = Instant::now();
+        self.refused_until
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, until| *until > now);
+    }
 }
 
 impl RateLimiters {
@@ -74,6 +147,8 @@ impl RateLimiters {
             login: Arc::new(RateLimiter::keyed(logins_per_minute)),
             login_account: Arc::new(RateLimiter::keyed(account_logins_per_minute)),
             key_creation: Arc::new(RateLimiter::keyed(keys_per_hour)),
+            worker_misses: Arc::new(MissGate::new()),
+            redeem: Arc::new(RateLimiter::keyed(Quota::per_minute(NonZeroU32::new(20).unwrap()))),
         }
     }
 
@@ -97,9 +172,11 @@ impl RateLimiters {
             &self.login,
             &self.login_account,
             &self.key_creation,
+            &self.redeem,
         ] {
             limiter.retain_recent();
         }
+        self.worker_misses.retain_recent();
     }
 }
 
@@ -138,6 +215,28 @@ pub fn check(limiter: &Keyed, key: &str) -> Result<(), AppError> {
 #[cfg(test)]
 mod key_tests {
     use super::*;
+
+    /// A-WORKER-16 (the gate): an address whose worker credentials keep matching
+    /// nothing is refused before the lookup once its bucket is spent, with a
+    /// `Retry-After`; another address is not.
+    #[test]
+    fn an_address_that_keeps_missing_is_refused_before_the_lookup() {
+        let gate = MissGate::new();
+        let noisy: IpAddr = "192.0.2.50".parse().unwrap();
+        let mut refused = None;
+        for _ in 0..31 {
+            assert!(gate.check(noisy).is_ok(), "not refused before its bucket is spent");
+            if let Err(e) = gate.record_miss(noisy) {
+                refused = Some(e);
+                break;
+            }
+        }
+        let refused = refused.expect("the thirty-first miss is refused");
+        assert_eq!(refused.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let early = gate.check(noisy).expect_err("refused without a lookup now");
+        assert!(early.retry_after.unwrap() >= 1);
+        assert!(gate.check("192.0.2.51".parse().unwrap()).is_ok(), "another address");
+    }
 
     /// A caller-supplied key is kept as a digest past `MAX_KEY_BYTES`: a
     /// megabyte "username" held a megabyte in the limiter until its sweep.

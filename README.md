@@ -277,14 +277,29 @@ A first deployment, in order (each step is described below):
 2. Build and push the three images (below, "The three images"), and push
    MAGPIE's `birdtest-contribute` first — the backend image fetches the commit
    `docker/Dockerfile` pins.
-3. Write `infra/prod.tfvars`, then
+3. Request an ACM certificate for the site's hostname in the stack's region,
+   add its validation CNAME, and wait for it
+   (`aws acm wait certificate-validated --region "$REGION" --certificate-arn …`):
+   the first apply creates the HTTPS listener, which refuses a certificate
+   still pending validation and leaves the apply half done.
+4. Write `infra/prod.tfvars` with the eight variables that have no default --
+   `backend_image`, `derived_builder_image`, `frontend_image`, `alert_email`,
+   `acm_certificate_arn`, `ses_domain`, `mail_from_address`, `public_url` --
+   and `region` if it is not us-east-1 (`azs` may be left out: it defaults to
+   the region's first two zones). Then
    `terraform -chdir=infra init` and
    `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0`.
-4. Confirm the SNS subscription mail, set the database password and the two
+5. Add the SES DNS records straight away (the `ses_dkim_tokens` and
+   `ses_mail_from_records` outputs; SES looks for them for about 72 hours) and
+   request SES production access, which can take a day.
+6. Confirm the SNS subscription mail, set the database password and the two
    SSM parameters (below), then
    `terraform -chdir=infra apply -var-file=prod.tfvars` (one task).
-5. Add the SES DNS records, request SES production access, point DNS at the
-   load balancer, run the alert-path checks, and make the first admin.
+7. Point DNS at the load balancer, run the alert-path checks, and make the
+   first admin. Until production access is granted SES sends only to verified
+   identities, so the first admin's confirmation mail arrives only if their
+   address is in `ses_domain` or verified on its own (below, "SES starts in the
+   sandbox").
 
 `infra/` is a complete Terraform description of the AWS side. Keep the stack's
 variables in `infra/prod.tfvars` (not committed: it names the account's
@@ -366,8 +381,11 @@ subscription is confirmed), and after any change to the alerts topic: nothing
 else will say an alert was dropped. With `REGION` set as above:
 
 ```bash
-# A function, not a variable holding the command: zsh does not split one.
-tf() { terraform -chdir=infra output -raw "$@"; }
+# A function, not a variable holding the command: zsh does not split one. Not
+# named `tf`: that is a common alias for terraform, and in bash an alias is
+# expanded in a function definition -- `tf() {...}` then redefined
+# `terraform` as a function calling itself.
+tfout() { terraform -chdir=infra output -raw "$@"; }
 SUFFIX=""   # the stack's name_suffix: "-dr" for RUNBOOK §5's copy
 # To OK first: a fresh stack's staleness alarm is already in ALARM (no backup
 # has run), and setting the state it is in sends nothing.
@@ -380,9 +398,9 @@ aws rds describe-event-subscriptions --region "$REGION" --subscription-name "bir
 
 # A backup run that fails: its failure mail arrives. The task's entry point is
 # `bash -c`, so the override is the whole script, one string.
-aws ecs run-task --region "$REGION" --cluster "$(tf cluster_name)" \
-  --task-definition "$(tf backup_task_definition)" --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$(terraform -chdir=infra output -json service_subnet_ids | jq -r 'join(",")')],securityGroups=[$(tf service_security_group_id)],assignPublicIp=ENABLED}" \
+aws ecs run-task --region "$REGION" --cluster "$(tfout cluster_name)" \
+  --task-definition "$(tfout backup_task_definition)" --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$(terraform -chdir=infra output -json service_subnet_ids | jq -r 'join(",")')],securityGroups=[$(tfout service_security_group_id)],assignPublicIp=ENABLED}" \
   --overrides '{"containerOverrides":[{"name":"backup","command":["exit 1"]}]}'
 ```
 

@@ -701,7 +701,16 @@ async fn create_player_config(
     .bind(movegen_margin)
     .bind(admin.0.id)
     .fetch_one(&state.pool)
-    .await?;
+    .await
+    .map_err(|e| match body.cloned_from_id {
+        Some(id) => super::ratings::unknown_config(
+            e.into(),
+            "player_configs_cloned_from_id_fkey",
+            "cloned_from_id",
+            id,
+        ),
+        None => e.into(),
+    })?;
 
     Ok((StatusCode::CREATED, Json(config)))
 }

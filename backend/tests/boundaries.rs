@@ -259,6 +259,103 @@ async fn an_accounts_login_bucket_does_not_depend_on_how_its_name_is_spelled() {
     assert_rate_limited(&limited, "the same account spelled with a dotted capital I");
 }
 
+/// `routes::public::MAX_LIVE_STREAMS_PER_ADDRESS`.
+const LIVE_STREAMS_PER_ADDRESS: usize = 32;
+
+/// A-PUBLIC-6c (on the router): one address holds at most its share of live
+/// streams, each for as long as its response lives -- the place is the
+/// handler's to hold, not just the helper's to count -- and another address is
+/// unaffected. A stream given up gives its place back.
+#[tokio::test]
+async fn one_address_holds_at_most_its_share_of_live_streams() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let app = proxied_app(&db).await;
+    let stream = |ip: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(get_request(
+                &format!("/api/jobs/{job}/stream"),
+                &[("x-forwarded-for".to_string(), ip.to_string())],
+            ))
+            .await
+            .unwrap()
+        }
+    };
+
+    let mut open = Vec::new();
+    for i in 0..LIVE_STREAMS_PER_ADDRESS {
+        let response = stream("198.51.100.77").await;
+        assert_eq!(response.status(), StatusCode::OK, "#{i}");
+        open.push(response);
+    }
+    let refused = stream("198.51.100.77").await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(refused.headers().contains_key(RETRY_AFTER));
+    assert_eq!(stream("198.51.100.78").await.status(), StatusCode::OK, "another address");
+
+    drop(open.pop());
+    assert_eq!(stream("198.51.100.77").await.status(), StatusCode::OK, "a place came back");
+}
+
+/// A-WORKER-16 (on the router): an address whose worker credentials keep
+/// matching nothing gets 401s, then 429s with `Retry-After` -- refused before
+/// the lookup from then on -- while a real worker elsewhere is unaffected.
+/// The lookup is a main-pool query, and nothing else limited it.
+#[tokio::test]
+async fn made_up_worker_credentials_are_limited_per_address() {
+    let db = TestDb::new().await;
+    let app = proxied_app(&db).await;
+    let bogus = |ip: &'static str, i: usize| {
+        let key = format!("Bearer not-a-key-{i}");
+        let app = app.clone();
+        async move {
+            send_raw(
+                &app,
+                post_json(
+                    "/api/worker/heartbeat",
+                    &[("x-forwarded-for", ip), ("authorization", key.as_str())],
+                    json!({}),
+                ),
+            )
+            .await
+        }
+    };
+    let mut limited = None;
+    for i in 0..40 {
+        let response = bogus("203.0.113.99", i).await;
+        if response.status == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(i);
+            break;
+        }
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
+    }
+    assert_eq!(limited, Some(30), "thirty misses a minute, then refused");
+    assert_rate_limited(&bogus("203.0.113.99", 99).await, "refused before the lookup");
+    assert_eq!(bogus("203.0.113.100", 0).await.status, StatusCode::UNAUTHORIZED, "another address");
+}
+
+/// A-AUTH-11c: redeeming confirmation and reset links is limited per
+/// address -- both are unauthenticated writes on the main pool, and a reset
+/// scores a password first. The twenty-first in a minute is a 429.
+#[tokio::test]
+async fn redeeming_links_is_limited_per_address() {
+    let db = TestDb::new().await;
+    let app = proxied_app(&db).await;
+    for i in 0..20 {
+        let path = if i % 2 == 0 { "/api/auth/confirm-email" } else { "/api/auth/reset-password/confirm" };
+        let body = json!({ "code": "nope", "token": "nope", "password": "correct horse battery staple 42" });
+        let response = send_raw(&app, post_json(path, &[("x-forwarded-for", "192.0.2.44")], body)).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "#{i} {path}: {response:?}");
+    }
+    let limited = send_raw(
+        &app,
+        post_json("/api/auth/confirm-email", &[("x-forwarded-for", "192.0.2.44")], json!({ "code": "nope" })),
+    )
+    .await;
+    assert_rate_limited(&limited, "the twenty-first link from one address");
+}
+
 /// A-BOUND-2: one address trying wrong passwords for an account cannot lock
 /// its owner out. Keyed on the username alone at the per-address rate, one
 /// wrong guess every six seconds from anywhere held any account -- an admin's,
@@ -350,6 +447,15 @@ async fn a_player_config_refuses_input_data_of_the_wrong_role() {
         .await
         .unwrap();
     assert_eq!(created, 0, "a refused config is not stored");
+
+    // A clone of a config that does not exist names the field; the foreign
+    // key's bare failure was a 409 "still referenced by other records".
+    let mut cloned = body(kwg, klv, winpct);
+    cloned["cloned_from_id"] = json!(nothing);
+    let (status, response) =
+        send(&app, post_json("/api/admin/player-configs", &headers, cloned)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown clone source: {response}");
+    assert_eq!(response["fields"][0]["field"], "cloned_from_id", "{response}");
 
     let (status, response) =
         send(&app, post_json("/api/admin/player-configs", &headers, body(kwg, klv, winpct))).await;

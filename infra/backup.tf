@@ -493,6 +493,7 @@ resource "aws_scheduler_schedule" "backup" {
   description                  = "Nightly pg_dump to s3://${aws_s3_bucket.backups.bucket}"
   schedule_expression          = var.backup_schedule
   schedule_expression_timezone = "UTC"
+  state                        = var.scheduled_tasks_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window {
     mode = "OFF"
@@ -737,7 +738,7 @@ resource "aws_scheduler_schedule" "restore_drill" {
   description                  = "Monthly restore of the newest dump into a throwaway database"
   schedule_expression          = var.backup_restore_drill_schedule
   schedule_expression_timezone = "UTC"
-  state                        = var.restore_drill_enabled ? "ENABLED" : "DISABLED"
+  state                        = var.scheduled_tasks_enabled && var.restore_drill_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window {
     mode = "OFF"

@@ -6,6 +6,24 @@
 const RESUBSCRIBE_MS = 5000;
 
 /**
+ * The longest wait between attempts. Each attempt that gets no event doubles
+ * the wait up to this: a server refusing streams (its cap is full, and the
+ * `Retry-After` it sends is a header EventSource never shows us) was asked
+ * again, with a stats read first, every five seconds by every open page.
+ */
+const MAX_RESUBSCRIBE_MS = 60_000;
+
+/**
+ * The wait before attempt `failures + 1`: doubling from `RESUBSCRIBE_MS`, and
+ * jittered down by up to half so pages refused together do not come back
+ * together.
+ */
+export function resubscribeDelay(failures: number, random: () => number = Math.random): number {
+  const ceiling = Math.min(MAX_RESUBSCRIBE_MS, RESUBSCRIBE_MS * 2 ** Math.max(0, failures));
+  return Math.round(ceiling * (0.5 + 0.5 * random()));
+}
+
+/**
  * Subscribe to a job's live stat stream. The server pushes the same payload
  * `GET /api/jobs/:id` returns after every accepted result, so the handler can
  * simply replace local state rather than merging deltas.
@@ -18,6 +36,8 @@ export function subscribeToJob<T>(jobId: string, onUpdate: (stats: T) => void): 
   let source: EventSource | null = null;
   let retry: ReturnType<typeof setTimeout> | null = null;
   let unsubscribed = false;
+  // Attempts since the last event; an event means the stream works again.
+  let failures = 0;
 
   const open = async () => {
     retry = null;
@@ -42,6 +62,7 @@ export function subscribeToJob<T>(jobId: string, onUpdate: (stats: T) => void): 
     source = opened;
 
     opened.addEventListener('stats', (event) => {
+      failures = 0;
       try {
         onUpdate(JSON.parse((event as MessageEvent).data) as T);
       } catch (error) {
@@ -60,7 +81,8 @@ export function subscribeToJob<T>(jobId: string, onUpdate: (stats: T) => void): 
     opened.addEventListener('error', () => {
       if (opened.readyState === EventSource.CLOSED && !unsubscribed && retry === null) {
         console.debug('job stream closed; subscribing again shortly');
-        retry = setTimeout(open, RESUBSCRIBE_MS);
+        retry = setTimeout(open, resubscribeDelay(failures));
+        failures += 1;
       } else {
         console.debug('job stream interrupted; retrying');
       }

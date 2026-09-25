@@ -177,6 +177,15 @@ impl FromRequestParts<AppState> for WorkerIdentity {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        // An address whose credentials keep matching nothing is refused here,
+        // before the lookup (`ratelimit::MissGate`): the per-identity bucket
+        // cannot be charged until there is an identity.
+        let ClientIp(client_ip) = ClientIp::from_request_parts(parts, state).await?;
+        state.limits.worker_misses.check(client_ip)?;
+        let miss = |message: &'static str| {
+            state.limits.worker_misses.record_miss(client_ip).err().unwrap_or_else(|| AppError::unauthorized(message))
+        };
+
         let bearer = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
@@ -220,7 +229,7 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             .bind(&hash)
             .fetch_optional(&state.pool)
             .await?
-            .ok_or_else(|| AppError::unauthorized("unknown or inactive API key"))?;
+            .ok_or_else(|| miss("unknown or inactive API key"))?;
 
             if row.2 {
                 return Err(AppError::forbidden("this worker identity is banned"));
@@ -275,7 +284,7 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     .await?;
 
                     let Some(banned) = banned else {
-                        return Err(AppError::unauthorized(
+                        return Err(miss(
                             "unrecognized worker UUID. Omit the X-Worker-UUID \
                              header to be issued one, or authenticate with an \
                              API key.",
@@ -287,7 +296,6 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     WorkerIdentity::Anonymous { uuid }
                 }
                 None => {
-                    let ClientIp(client_ip) = ClientIp::from_request_parts(parts, state).await?;
                     // Nothing to ban: this identity does not exist yet.
                     return Ok(WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip });
                 }
