@@ -258,7 +258,7 @@ async fn job_results(
     // `submitted_at` is the same transaction's `now()`; a games result's is
     // taken moments later, in the same transaction), so this is the feed's
     // own order; the cursor is the claim's time, so paging is exact either
-    // way.
+    // way. One range per identity the name is (`filtered_claims`).
     let claims = worker.as_ref().map(filtered_claims);
 
     // Every branch below reads its rows through the job id the record tables
@@ -291,15 +291,20 @@ async fn job_results(
                          ORDER BY r.submitted_at DESC, r.id DESC
                          LIMIT $6"
                     .to_string(),
-                Some(claims) => format!(
-                    "SELECT r.id, r.task_id, r.rack, r.num_moves, r.submitted_at,
-                            r.task_claim_id, cl.completed_at AS at
-                     FROM ({claims}) cl
-                     JOIN position_analysis_records r ON r.task_claim_id = cl.id
-                     WHERE $4::timestamptz IS NULL
-                           OR (cl.completed_at, r.id) < ($4, $5)
-                     ORDER BY cl.completed_at DESC, r.id DESC
-                     LIMIT $6"
+                Some(ranges) => merged_pages(
+                    ranges.iter().map(|claims| {
+                        format!(
+                            "SELECT r.id, r.task_id, r.rack, r.num_moves, r.submitted_at,
+                                    r.task_claim_id, cl.completed_at AS at
+                             FROM ({claims}) cl
+                             JOIN position_analysis_records r ON r.task_claim_id = cl.id
+                             WHERE $4::timestamptz IS NULL
+                                   OR (cl.completed_at, r.id) < ($4, $5)
+                             ORDER BY cl.completed_at DESC, r.id DESC
+                             LIMIT $6"
+                        )
+                    }),
+                    "at DESC, id DESC",
                 ),
             };
             let sql = format!(
@@ -371,14 +376,19 @@ async fn job_results(
                          ORDER BY r.submitted_at DESC, r.task_claim_id DESC
                          LIMIT $6"
                     .to_string(),
-                Some(claims) => format!(
-                    "SELECT r.task_claim_id, cl.completed_at AS at
-                     FROM ({claims}) cl
-                     JOIN game_results r ON r.task_claim_id = cl.id
-                     WHERE $4::timestamptz IS NULL
-                           OR (cl.completed_at, cl.id) < ($4, $5)
-                     ORDER BY cl.completed_at DESC, cl.id DESC
-                     LIMIT $6"
+                Some(ranges) => merged_pages(
+                    ranges.iter().map(|claims| {
+                        format!(
+                            "SELECT r.task_claim_id, cl.completed_at AS at
+                             FROM ({claims}) cl
+                             JOIN game_results r ON r.task_claim_id = cl.id
+                             WHERE $4::timestamptz IS NULL
+                                   OR (cl.completed_at, cl.id) < ($4, $5)
+                             ORDER BY cl.completed_at DESC, cl.id DESC
+                             LIMIT $6"
+                        )
+                    }),
+                    "at DESC, task_claim_id DESC",
                 ),
             };
             let sql = format!(
@@ -591,27 +601,50 @@ async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<Worker
 }
 
 /// A named contributor's completed claims in the job (`$1`), from the cursor's
-/// time (`$4`) back, as `(id, completed_at)`: each identity's is one backward
-/// range of its index, `(identity, job_id, completed_at)`, which holds only
-/// completed claims above NULL. A name that is both an account and an
-/// anonymous pseudonym reads both ranges and merges them, rather than an `OR`
-/// that no single index range serves and would sort every claim of both.
-fn filtered_claims(worker: &WorkerFilter) -> String {
+/// time (`$4`) back, as `(id, completed_at)`: one range per identity the name
+/// is -- an account, an anonymous pseudonym, or (rarely) both. Each is one
+/// backward range of that identity's index, `(identity, job_id,
+/// completed_at)`: only a completed claim has a `completed_at`, so the rest
+/// sit at the NULL end, outside it.
+///
+/// There is deliberately no `state = 'completed'`. It says nothing more, and
+/// it lets the planner prove the fleet-wide `task_claims_completed_idx` usable,
+/// which it then chose for a heavy contributor on a large job -- judging their
+/// share of the job from their share of all claims -- and walked every
+/// completion in the fleet: 6.2 s to return an empty page.
+fn filtered_claims(worker: &WorkerFilter) -> Vec<String> {
     let range = |column: &str, param: &str| {
         format!(
             "SELECT c.id, c.completed_at FROM task_claims c
              WHERE c.{column} = {param}::uuid AND c.job_id = $1
-               AND c.completed_at IS NOT NULL AND c.state = 'completed'
+               AND c.completed_at IS NOT NULL
                AND ($4::timestamptz IS NULL OR c.completed_at <= $4)"
         )
     };
-    match (worker.user_id, worker.anon_uuid) {
-        (Some(_), None) => range("claimed_by_user_id", "$2"),
-        (None, Some(_)) => range("claimed_by_anon_uuid", "$3"),
-        _ => format!(
-            "{} UNION ALL {}",
-            range("claimed_by_user_id", "$2"),
-            range("claimed_by_anon_uuid", "$3")
+    let mut ranges = Vec::new();
+    if worker.user_id.is_some() {
+        ranges.push(range("claimed_by_user_id", "$2"));
+    }
+    if worker.anon_uuid.is_some() {
+        ranges.push(range("claimed_by_anon_uuid", "$3"));
+    }
+    ranges
+}
+
+/// One identity's page, or two merged. Each page is complete on its own --
+/// its range, its records, its order and its LIMIT -- so the merge is of at
+/// most two pages. Merged any earlier, as one `UNION ALL` of the two claim
+/// ranges under a single sort, Postgres did not merge the ranges in order: it
+/// read and sorted every claim of both identities in the job (1.3-2.5 s),
+/// for a name anyone can arrange to be both by registering a heavy anonymous
+/// worker's public pseudonym.
+fn merged_pages(pages: impl Iterator<Item = String>, order: &str) -> String {
+    let pages: Vec<String> = pages.map(|page| format!("({page})")).collect();
+    match pages.as_slice() {
+        [one] => one.clone(),
+        many => format!(
+            "SELECT * FROM ({}) merged ORDER BY {order} LIMIT $6",
+            many.join(" UNION ALL ")
         ),
     }
 }
@@ -1120,6 +1153,29 @@ mod tests {
 
     fn ip(text: &str) -> IpAddr {
         text.parse().unwrap()
+    }
+
+    /// A-PUBLIC-3c: a contributor's claim range names nothing a partial index
+    /// on completed claims could be proven from -- given `state = 'completed'`,
+    /// the planner walked the fleet's completions for a heavy contributor
+    /// (6.2 s) -- and a name that is two identities is two pages, merged,
+    /// never one sort over both identities' claims.
+    #[test]
+    fn a_contributors_page_is_read_through_their_own_index() {
+        let both = WorkerFilter { user_id: Some(Uuid::nil()), anon_uuid: Some(Uuid::nil()) };
+        let ranges = filtered_claims(&both);
+        assert_eq!(ranges.len(), 2);
+        for range in &ranges {
+            assert!(!range.contains("state"), "{range}");
+            assert!(range.contains("c.job_id = $1") && range.contains("completed_at IS NOT NULL"));
+        }
+        let one = WorkerFilter { user_id: Some(Uuid::nil()), anon_uuid: None };
+        assert_eq!(filtered_claims(&one).len(), 1);
+
+        let merged = merged_pages(ranges.into_iter(), "at DESC, id DESC");
+        assert_eq!(merged.matches("LIMIT $6").count(), 1, "the merge's own; each page brings one");
+        assert!(merged.contains(") UNION ALL ("), "{merged}");
+        assert_eq!(merged_pages(std::iter::once("SELECT 1".to_string()), "x"), "(SELECT 1)");
     }
 
     /// A-PUBLIC-6b: past the cap a stream is a 503 with `Retry-After`, and a

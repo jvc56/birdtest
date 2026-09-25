@@ -274,9 +274,12 @@ length stands in for it.
 
 **An opening-rack job cannot use a `best` recorder to rank moves.** `-r best`
 is `MOVE_RECORD_BEST`: move generation keeps the single top play and discards
-the rest, so every rack comes back with one move however many
-`num_plays_recorded` asks for — and a simming player has nothing left to choose
-between, which makes `num_plies` and `num_plays` inert too. Nothing downstream
+the rest, so a static player's rack comes back with one move however many
+`num_plays_recorded` asks for. (A simulating player's candidates are every
+play up to `num_plays`, whatever its recorder, as in autoplay. MAGPIE's
+opening-rack executor once generated them with the recorder, so a `best`
+simmer — legal at `num_plays_recorded` 1 — had one candidate, and reported
+the static top play as the simulation's; twenty-eighth audit.) Nothing downstream
 notices: the racks are analysed, the results accepted, `racks_analyzed` climbs,
 and the corpus quietly holds a fraction of the analysis the job was configured
 for. Job creation therefore refuses `recorder_type = 'best'` together with a
@@ -1182,17 +1185,23 @@ What the numbers settled:
   joined to each claim's records until the page is full. A claim's records
   share its completion time (the same transaction), so this is the feed's own
   order, and the cursor is the claim's time, so paging is exact. It costs a
-  page whoever the contributor is: 0.06–1.4 ms warm, 30 ms cold, at two
-  million claims and three million opening-rack records. The two readings it
+  page whoever the contributor is: 0.05–1.5 ms warm, at most 52 ms cold, at
+  three million games claims and two million opening-rack records, with one
+  contributor holding 30% of a two-million-claim job. The two readings it
   replaced each failed someone. Walking the job's feed newest first and keeping
   the contributor's rows costs the distance to their fiftieth: all of the job
   for someone who never worked it (5.8 s cold at two million records), and
   everything since for someone whose work was early (7.4 s for 150,000 early
   results in a 1.5-million-result job). Reading through a list of their claims
   in the job needs the list to be short, and the threshold between the two, a
-  thousand claims, only moved the walk to the contributors just past it. A name that is both an account and a pseudonym
-  reads both ranges and merges them. The opening-rack page is chosen before
-  its best moves and accounts are joined, so only its fifty rows are.
+  thousand claims, only moved the walk to the contributors just past it. The
+  range names no `state`: given `state = 'completed'`, the planner could use
+  the fleet-wide completion index instead, and did for a heavy contributor on
+  a large job, walking every completion in the fleet (6.2 s). A name that is
+  both an account and a pseudonym is two pages, one per identity, merged; as
+  one sort over both identities' claims it read all of them (1.3–2.5 s). The
+  opening-rack page is chosen before its best moves and accounts are joined,
+  so only its fifty rows are.
 - **A leave claim neither sorts the generation nor reads what is staged.**
   Selection used to order on `(occurrence_count, rack)` through an index on the
   count alone. Counts tie in their millions — every rack starts at zero and the
@@ -6690,8 +6699,9 @@ the nineteenth's `AUDIT_FINDINGS_15.md`, the twentieth's `AUDIT_FINDINGS_16.md`,
 the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
 `AUDIT_FINDINGS_18.md`, the twenty-third's `AUDIT_FINDINGS_19.md`, the
 twenty-fourth's `AUDIT_FINDINGS_20.md`, the twenty-fifth's
-`AUDIT_FINDINGS_21.md`, the twenty-sixth's `AUDIT_FINDINGS_22.md` and the
-twenty-seventh's `AUDIT_FINDINGS_23.md`.
+`AUDIT_FINDINGS_21.md`, the twenty-sixth's `AUDIT_FINDINGS_22.md`, the
+twenty-seventh's `AUDIT_FINDINGS_23.md` and the twenty-eighth's
+`AUDIT_FINDINGS_24.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says

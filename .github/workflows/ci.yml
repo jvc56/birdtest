@@ -1,8 +1,8 @@
 # Per pull request, cheapest first (TESTING.md, "Per pull request"): the
 # backend's lint, unit, contract and integration tests against a Postgres
-# service, the frontend's type check and build, both images the deployment
-# runs, the end-to-end journeys, the Terraform, and MAGPIE's half of the
-# contract fixtures.
+# service, the frontend's type check and build, the three images the
+# deployment runs, the end-to-end journeys, the Terraform, and MAGPIE's half
+# of the contract fixtures.
 name: CI
 
 # Read-only: nothing here writes to the repository or its releases.

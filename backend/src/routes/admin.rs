@@ -1212,12 +1212,13 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
 /// of `best` cannot produce one.
 ///
 /// `-r best` is `MOVE_RECORD_BEST`: move generation keeps the single top play
-/// and discards the rest, so the batch comes back with exactly one move per
-/// rack however many the config says to record -- and, for a simming player,
-/// with nothing for the simulation to choose between, so `num_plies` and
-/// `num_plays` do nothing either. Verified against MAGPIE: `generate` on an
-/// opening rack reports "1 of 1 plays" under `-r1 best` and 100 under
-/// `-r1 all`.
+/// and discards the rest, so a static player's batch comes back with exactly
+/// one move per rack however many the config says to record. Verified against
+/// MAGPIE: `generate` on an opening rack reports "1 of 1 plays" under
+/// `-r1 best` and 100 under `-r1 all`. (A simulating player ranks every play up
+/// to `num_plays` whatever its recorder, as autoplay's does; MAGPIE's
+/// opening-rack executor once used the recorder there too, so a `best` simmer
+/// reported the static top play -- PLAN.md.)
 ///
 /// Nothing downstream notices. The racks are analysed, the results are
 /// accepted, `racks_analyzed` climbs, and the corpus quietly holds a

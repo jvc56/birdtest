@@ -3,7 +3,7 @@
 # The commit this image's hashes are produced by, declared once for every
 # stage (each takes it with a bare `ARG MAGPIE_COMMIT`). CI reads it from this
 # line. MIN_MAGPIE_VERSION must never exceed the version this commit reports.
-ARG MAGPIE_COMMIT=ed801d83ea6ec8a0eaec38dea2319b0f276044ab
+ARG MAGPIE_COMMIT=8cc0b31c54ed470d064fdc8ee351a26d5b9d2109
 #
 # Backend and fake-worker.
 #
@@ -96,7 +96,7 @@ ARG CARGO_BUILD_JOBS
 # the resulting layer.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release \
+    cargo build --release --locked \
  && cp target/release/birdtest /usr/local/bin/birdtest \
  && cp target/release/build-derived /usr/local/bin/build-derived
 

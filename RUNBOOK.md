@@ -1095,26 +1095,44 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   §5 reads production's replicas (`birdtest-backups-dr-<account>`,
   `birdtest-artifacts-dr-<account>`, with production's account id), which the
   scratch account cannot. Stage them first, through this machine, so neither
-  account is granted anything on the other's buckets:
+  account is granted anything on the other's buckets. Two blocks, one per
+  account's credentials; each runs only with the account it names:
 
   ```bash
-  # With PRODUCTION's credentials. PROD_REPLICA_REGION is production's
-  # dr_region; PROD_ACCOUNT its account id.
-  STAGE=$(mktemp -d)
+  # 1. With PRODUCTION's credentials. PROD_ACCOUNT is its id, PROD_REPLICA_REGION
+  # its dr_region.
   PROD_REPLICA=s3://birdtest-backups-dr-$PROD_ACCOUNT/pg
-  M=$(aws s3 ls --region $PROD_REPLICA_REGION "$PROD_REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
-  if [ -n "$M" ] && [ -n "$PROD_ACCOUNT" ]; then
-    aws s3 cp --recursive --region $PROD_REPLICA_REGION "$PROD_REPLICA/${M%.manifest.json}/" "$STAGE/pg/${M%.manifest.json}/"
-    aws s3 cp --region $PROD_REPLICA_REGION "$PROD_REPLICA/$M" "$STAGE/pg/$M"
-    for P in leaves inputs; do
-      aws s3 sync --region $PROD_REPLICA_REGION "s3://birdtest-artifacts-dr-$PROD_ACCOUNT/$P" "$STAGE/$P"
-    done
-  else echo "set PROD_ACCOUNT and PROD_REPLICA_REGION first"; fi
-  # Then with the SCRATCH account's credentials: one bucket stands for both
-  # replicas. SCRATCH_ACCOUNT is its id.
-  aws s3 mb --region $PROD_REPLICA_REGION s3://birdtest-drill-stage-$SCRATCH_ACCOUNT
-  aws s3 sync --region $PROD_REPLICA_REGION "$STAGE" s3://birdtest-drill-stage-$SCRATCH_ACCOUNT/
-  rm -rf "$STAGE"   # production's data: users' emails and password hashes
+  if [ -z "$PROD_ACCOUNT" ] || [ -z "$PROD_REPLICA_REGION" ]; then
+    echo "set PROD_ACCOUNT and PROD_REPLICA_REGION first"
+  elif [ "$(aws sts get-caller-identity --query Account --output text)" != "$PROD_ACCOUNT" ]; then
+    echo "these are not production's credentials"
+  else
+    STAGE=$(mktemp -d)
+    M=$(aws s3 ls --region $PROD_REPLICA_REGION "$PROD_REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
+    [ -n "$M" ] && aws s3 cp --recursive --region $PROD_REPLICA_REGION \
+        "$PROD_REPLICA/${M%.manifest.json}/" "$STAGE/pg/${M%.manifest.json}/" \
+      && aws s3 cp --region $PROD_REPLICA_REGION "$PROD_REPLICA/$M" "$STAGE/pg/$M" \
+      && for P in leaves inputs; do
+           aws s3 sync --region $PROD_REPLICA_REGION "s3://birdtest-artifacts-dr-$PROD_ACCOUNT/$P" "$STAGE/$P" || break
+         done && echo "staged $M in $STAGE"
+  fi
+  ```
+
+  ```bash
+  # 2. With the SCRATCH account's credentials, in the same shell. SCRATCH_ACCOUNT
+  # is its id. One bucket stands for both replicas; it is created here, so a
+  # block pasted with production's credentials cannot create it in
+  # production's account (bucket names are global: the scratch account could
+  # then never have it).
+  if [ -z "$SCRATCH_ACCOUNT" ] || [ -z "$PROD_REPLICA_REGION" ] || [ ! -d "$STAGE/pg" ]; then
+    echo "set SCRATCH_ACCOUNT, and run block 1 in this shell first"
+  elif [ "$(aws sts get-caller-identity --query Account --output text)" != "$SCRATCH_ACCOUNT" ]; then
+    echo "these are not the scratch account's credentials"
+  else
+    aws s3 mb --region $PROD_REPLICA_REGION s3://birdtest-drill-stage-$SCRATCH_ACCOUNT \
+      && aws s3 sync --region $PROD_REPLICA_REGION "$STAGE" s3://birdtest-drill-stage-$SCRATCH_ACCOUNT/ \
+      && rm -rf "$STAGE"   # production's data: users' emails and password hashes
+  fi
   ```
 
   Then run §5 in the scratch account with `REPLICA_REGION=$PROD_REPLICA_REGION`
@@ -1123,50 +1141,86 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   replica's key does not apply: the staging bucket uses S3's own encryption.
   Skip step 6: DNS stays on production. The copy holds production's data, so
   tear it down the day the drill ends. Use the scratch account's credentials,
-  the `dr` workspace, and the drill's `DR_REGION` and `THIRD_REGION`:
+  with `DR_REGION`, `THIRD_REGION` and `PROD_REPLICA_REGION` set again as the
+  drill had them. §5 step 9 left the `default` workspace selected, and this
+  block selects `dr`: an apply or destroy in `default` works on production's
+  state.
 
   ```bash
-  # Nothing writes while the buckets empty: the service is stopped, and the
-  # 03:00 backup and the derived builder are unscheduled.
-  terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars \
-    -var desired_count=0 -var scheduled_tasks_enabled=false
-  aws rds modify-db-instance --region $DR_REGION --db-instance-identifier birdtest-dr \
-    --no-deletion-protection --apply-immediately
-  # Destroy refuses a bucket that is not empty, and versioning keeps every
-  # version, delete markers included. A listing page holds at most 1,000 --
-  # all delete-objects takes -- so one page at a time (--no-paginate; the
-  # CLI otherwise merges every page into one request that is refused), until
-  # the listing is empty. The backups buckets' versions are GOVERNANCE-locked
-  # for 30 days, so only they take --bypass-governance-retention. A version
-  # that is not deleted stops the loop for that bucket.
   empty() {  # bucket region [--bypass-governance-retention]
-    while aws s3api list-object-versions --bucket "$1" --region "$2" --no-paginate \
+    # Destroy refuses a bucket that is not empty, and versioning keeps every
+    # version, delete markers included. A listing page holds at most 1,000 --
+    # all delete-objects takes -- so one page at a time (--no-paginate; the
+    # CLI otherwise merges every page into one request that is refused),
+    # until the listing is empty. A failed listing or a version not deleted
+    # is a failure, not an empty bucket.
+    while :; do
+      aws s3api list-object-versions --bucket "$1" --region "$2" --no-paginate \
         --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
-        --output json > /tmp/versions.json \
-      && grep -q '"Key"' /tmp/versions.json; do
+        --output json > /tmp/versions.json || { echo "$1: listing failed"; return 1; }
+      grep -q '"Key"' /tmp/versions.json || return 0
       aws s3api delete-objects --bucket "$1" --region "$2" $3 \
-        --delete file:///tmp/versions.json --query Errors --output json > /tmp/errors.json
+        --delete file:///tmp/versions.json --query Errors --output json > /tmp/errors.json \
+        || { echo "$1: delete failed"; return 1; }
       if grep -q '"Key"' /tmp/errors.json; then echo "$1: not deleted:"; cat /tmp/errors.json; return 1; fi
     done
   }
   A=$(aws sts get-caller-identity --query Account --output text)
-  empty birdtest-dr-backups-$A $DR_REGION --bypass-governance-retention
-  empty birdtest-dr-artifacts-$A $DR_REGION
-  empty birdtest-dr-backups-dr-$A $THIRD_REGION --bypass-governance-retention
-  empty birdtest-dr-artifacts-dr-$A $THIRD_REGION
-  terraform -chdir=infra destroy -var-file=prod.tfvars -var-file=dr.tfvars
-  # Destroy leaves the instance's final snapshot behind, by design (rds.tf).
-  aws rds delete-db-snapshot --region $DR_REGION --db-snapshot-identifier birdtest-dr-final
-  aws s3 rb --force --region $PROD_REPLICA_REGION s3://birdtest-drill-stage-$A
-  terraform -chdir=infra workspace select default
-  terraform -chdir=infra workspace delete dr
-  mv infra/dr.tfvars infra/dr.tfvars.drill-$(date +%Y%m%d)
+  terraform -chdir=infra workspace select dr
+  if [ -z "$DR_REGION" ] || [ -z "$THIRD_REGION" ] || [ -z "$PROD_REPLICA_REGION" ]; then
+    echo "set DR_REGION, THIRD_REGION and PROD_REPLICA_REGION first"
+  elif [ "$(terraform -chdir=infra workspace show)" != dr ]; then
+    echo "not in the dr workspace"
+  elif [ -z "$A" ] || [ "$A" != "$SCRATCH_ACCOUNT" ]; then
+    echo "set SCRATCH_ACCOUNT, and use the scratch account's credentials"
+  elif ! terraform -chdir=infra state list | grep -q '^aws_db_instance.main$'; then
+    # Past destroy, the apply below would build the whole copy again.
+    echo "the copy is already destroyed: go on to the next block"
+  else
+    # Nothing writes while the buckets empty: the service is stopped, and the
+    # 03:00 backup and the derived builder are unscheduled. The backups
+    # buckets' versions are GOVERNANCE-locked for 30 days, so only they take
+    # --bypass-governance-retention. Each step runs only if the last worked.
+    terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars \
+        -var desired_count=0 -var scheduled_tasks_enabled=false \
+      && aws rds modify-db-instance --region $DR_REGION --db-instance-identifier birdtest-dr \
+        --no-deletion-protection --apply-immediately > /dev/null \
+      && empty birdtest-dr-backups-$A $DR_REGION --bypass-governance-retention \
+      && empty birdtest-dr-artifacts-$A $DR_REGION \
+      && empty birdtest-dr-backups-dr-$A $THIRD_REGION --bypass-governance-retention \
+      && empty birdtest-dr-artifacts-dr-$A $THIRD_REGION \
+      && terraform -chdir=infra destroy -var-file=prod.tfvars -var-file=dr.tfvars \
+      && echo "destroyed: now the next block"
+  fi
+  ```
+
+  Then what `destroy` leaves: the instance's final snapshot (rds.tf keeps
+  one, and it exists only once the instance is gone), the staging bucket, the
+  workspace and `dr.tfvars`:
+
+  ```bash
+  A=$(aws sts get-caller-identity --query Account --output text)
+  if [ -z "$DR_REGION" ] || [ -z "$PROD_REPLICA_REGION" ] || [ -z "$A" ] \
+     || [ "$A" != "$SCRATCH_ACCOUNT" ]; then
+    echo "set DR_REGION, PROD_REPLICA_REGION and SCRATCH_ACCOUNT, with the scratch account's credentials"
+  else
+    aws rds delete-db-snapshot --region $DR_REGION --db-snapshot-identifier birdtest-dr-final
+    aws s3 rb --force --region $PROD_REPLICA_REGION s3://birdtest-drill-stage-$A
+    terraform -chdir=infra workspace select default \
+      && terraform -chdir=infra workspace delete dr \
+      && mv infra/dr.tfvars infra/dr.tfvars.drill-$(date +%Y%m%d)
+  fi
   ```
 
   (A source bucket is emptied before its replica, so replication has nothing
-  left to write into the replica. If `empty` stops on a bucket, fix what it
-  printed and run it again. A real §5 must not start from the drill's
-  `dr.tfvars`, so it is moved aside.)
+  left to write into the replica. In the first block a step that fails stops
+  the rest: fix what it printed and paste the block again. Until `destroy` has
+  run every step in it is safe to repeat, and after it the block refuses to
+  run. A `destroy` that stopped part way, with the instance already gone, is
+  finished by running `destroy` again by hand; `workspace delete` refuses a
+  workspace whose state still holds anything. An ops task still running from `scripts/prod-shell.sh` can
+  write to a bucket or hold the cluster: stop it first. A real §5 must not
+  start from the drill's `dr.tfvars`, so it is moved aside.)
 
 ---
 
