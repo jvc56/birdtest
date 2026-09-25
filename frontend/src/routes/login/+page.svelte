@@ -18,8 +18,12 @@
       // Come back to whatever the user was trying to reach before the guard
       // redirected them here -- a path on this site only: `goto` refuses
       // anything else, which left a signed-in user on this page, unmoved.
-      const next = $page.url.searchParams.get('next') ?? '';
-      await goto(next.startsWith('/') && !next.startsWith('//') ? next : '/account');
+      // Resolved rather than pattern-matched: `/\evil.com` and a path with a
+      // tab in it both start with a single '/' and resolve off-site.
+      const next = new URL($page.url.searchParams.get('next') ?? '/account', $page.url.origin);
+      await goto(
+        next.origin === $page.url.origin ? next.pathname + next.search + next.hash : '/account'
+      );
     } catch (e) {
       error = (e as Error).message;
     } finally {

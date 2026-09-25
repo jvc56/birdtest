@@ -64,6 +64,10 @@ STAMP=$(date -u +%Y%m%d%H%M)
 # the default group and loses the WAL settings leave-generation merges need.
 PARAMETER_GROUP=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
   --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' --output text)
+# And its class: the restore serves production from step 5, before the final
+# `terraform apply` puts anything else back.
+INSTANCE_CLASS=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
+  --query 'DBInstances[0].DBInstanceClass' --output text)
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
   --target-db-instance-identifier "birdtest-restore-$STAMP" \
@@ -72,7 +76,7 @@ aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --vpc-security-group-ids "$(terraform -chdir=infra output -raw db_security_group_id)" \
   --db-parameter-group-name "$PARAMETER_GROUP" \
   --no-publicly-accessible \
-  --db-instance-class db.t4g.micro
+  --db-instance-class "$INSTANCE_CLASS"
 
 aws rds wait db-instance-available --region "$REGION" \
   --db-instance-identifier "birdtest-restore-$STAMP"
@@ -186,7 +190,12 @@ results then fail their foreign keys, and the restore reports success with the
 contributors' work still gone. So first, from the admin page or the API,
 **deactivate the job** (a purged completed job is already inactive). Then
 delete what it has generated since the purge — nothing of it predates the
-mistake — in one transaction, in the ops shell:
+mistake — in one transaction, in the ops shell. The SQL here and in §2.3 reads
+the job's id as `:'job'`, so start psql with it set:
+
+```bash
+psql "$DATABASE_URL" -v job=00000000-0000-0000-0000-000000000000
+```
 
 ```sql
 BEGIN;
@@ -231,8 +240,16 @@ gosu postgres pg_ctl -D /tmp/scratch -w -l /tmp/scratch.log start \
       -c synchronous_commit=off"
 SCRATCH_URL="postgresql:///birdtest_scratch?host=/tmp/sock&user=postgres"
 createdb -h /tmp/sock -U postgres birdtest_scratch
-pg_restore -d "$SCRATCH_URL" -j4 --no-owner --no-privileges --exit-on-error /tmp/dump
+# Detached, so the ECS Exec session ending (twenty idle minutes, a laptop
+# asleep) does not end the restore; `scripts/prod-shell.sh --attach <task>`
+# comes back to it.
+setsid nohup pg_restore -d "$SCRATCH_URL" -j4 --no-owner --no-privileges \
+  --exit-on-error /tmp/dump > /tmp/pg_restore.log 2>&1 &
+tail -f /tmp/pg_restore.log   # Ctrl-C leaves the restore running
 ```
+
+The §2.2 loop is best run the same way (`setsid nohup bash /tmp/copyback.sh >
+/tmp/copyback.log 2>&1 &`, with the script written to a file first).
 
 ### 2.2 Copy the rows back, in dependency order
 
@@ -275,7 +292,8 @@ TABLES=(
 for entry in "${TABLES[@]}"; do
   table=${entry%%|*} filter=${entry#*|}
   psql "$SCRATCH_URL" -v ON_ERROR_STOP=1 -c \
-    "COPY (SELECT * FROM $table WHERE $filter) TO STDOUT" > "/tmp/restore/$table"
+    "COPY (SELECT * FROM $table WHERE $filter) TO STDOUT" > "/tmp/restore/$table" \
+    || { echo "stopped: could not dump $table" >&2; break; }
 done
 
 for entry in "${TABLES[@]}"; do
@@ -287,6 +305,9 @@ CREATE TEMP TABLE restoring (LIKE $table) ON COMMIT DROP;
 INSERT INTO $table SELECT * FROM restoring ON CONFLICT DO NOTHING;
 COMMIT;
 SQL
+  # Every later table hangs off this one: carrying on buried the first error
+  # under a foreign-key failure per table.
+  [[ $? -eq 0 ]] || { echo "stopped: could not load $table" >&2; break; }
 done
 ```
 
@@ -301,6 +322,12 @@ done
 
 `worker_data_gaps` is what the admin page's data gaps and the job list's
 `stalled` flag read: left out, a job's declines are forgotten.
+
+Restoring a *deleted* job also means its `jobs` row and its config row
+(`job_game_config`, `job_game_pair_config`, `job_opening_rack_config` or
+`job_leave_config`) first, from the scratch copy the same way — and any
+`player_configs` row they name that has been deleted since (nothing pinned it
+once the job was gone), with its `input_data` rows if those went too.
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
 are recomputed from `game_results` (see §2.4).
@@ -336,18 +363,19 @@ it has worked on.
 Those ids came from these sequences, which a selective restore does not rewind,
 so nothing needs moving; the check below only ever moves a sequence forward
 (a plain `setval(..., max(id))` could move it *back* below ids the running
-fleet had taken since, and the next insert collided):
+fleet had taken since, and the next insert collided; each statement below
+sets nothing unless the table is ahead of its sequence):
 
 ```sql
-SELECT setval('position_analysis_records_id_seq', GREATEST(
-  (SELECT last_value FROM position_analysis_records_id_seq),
-  (SELECT COALESCE(max(id), 1) FROM position_analysis_records)));
-SELECT setval('position_analysis_moves_id_seq', GREATEST(
-  (SELECT last_value FROM position_analysis_moves_id_seq),
-  (SELECT COALESCE(max(id), 1) FROM position_analysis_moves)));
-SELECT setval('leave_rack_staging_id_seq', GREATEST(
-  (SELECT last_value FROM leave_rack_staging_id_seq),
-  (SELECT COALESCE(max(id), 1) FROM leave_rack_staging)));
+SELECT setval('position_analysis_records_id_seq', m)
+  FROM (SELECT max(id) AS m FROM position_analysis_records) x
+ WHERE m > (SELECT last_value FROM position_analysis_records_id_seq);
+SELECT setval('position_analysis_moves_id_seq', m)
+  FROM (SELECT max(id) AS m FROM position_analysis_moves) x
+ WHERE m > (SELECT last_value FROM position_analysis_moves_id_seq);
+SELECT setval('leave_rack_staging_id_seq', m)
+  FROM (SELECT max(id) AS m FROM leave_rack_staging) x
+ WHERE m > (SELECT last_value FROM leave_rack_staging_id_seq);
 ```
 
 ### 2.3 Repair the counters
@@ -493,52 +521,79 @@ SELECT 'a', c.claimed_by_anon_uuid::text, count(*), max(c.completed_at)
  WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
  GROUP BY 2;
 
--- 2. Apply, a thousand rows a statement, only where the figure differs. Each
---    statement is its own transaction (psql's autocommit), and gives up rather
---    than queue behind a submission. Repeat until both report UPDATE 0; a
---    lock_timeout error just means run it again.
+-- 2. Zero the identities with no completed claims left. Required after
+--    §2.0, which deletes the claims made after the purge: the counters those
+--    claims raised would otherwise stay, with nothing behind them. (An
+--    identity with no completed claims appears nowhere in step 1.)
+-- 3. Apply the counts, a thousand a transaction, only where they differ.
+--    Each batch is taken *out of* `recount` as it is applied, so a batch
+--    never rereads the rows before it (rescanning made the last batches of a
+--    million identities seconds each), and a run stopped by a lock timeout --
+--    it gives up rather than queue behind a submission -- is simply run again
+--    and continues where it stopped.
 SET lock_timeout = '2s';
 
-UPDATE users u
-   SET tasks_completed = r.n, last_completed_at = r.last
-  FROM (SELECT r.id::uuid AS id, r.n, r.last
-          FROM recount r JOIN users u ON u.id = r.id::uuid
-         WHERE r.kind = 'u'
-           AND (u.tasks_completed, u.last_completed_at) IS DISTINCT FROM (r.n, r.last)
-         LIMIT 1000) r
- WHERE u.id = r.id;
+DO $$
+DECLARE zeroed int;
+BEGIN
+  LOOP
+    WITH z AS (
+      UPDATE users SET tasks_completed = 0, last_completed_at = NULL
+       WHERE id IN (SELECT u.id FROM users u
+                     WHERE u.tasks_completed > 0
+                       AND u.id NOT IN (SELECT id::uuid FROM recount WHERE kind = 'u')
+                     LIMIT 1000)
+      RETURNING 1),
+    za AS (
+      UPDATE anonymous_workers SET tasks_completed = 0, last_completed_at = NULL
+       WHERE uuid IN (SELECT w.uuid FROM anonymous_workers w
+                       WHERE w.tasks_completed > 0
+                         AND w.uuid NOT IN (SELECT id::uuid FROM recount WHERE kind = 'a')
+                       LIMIT 1000)
+      RETURNING 1)
+    SELECT (SELECT count(*) FROM z) + (SELECT count(*) FROM za) INTO zeroed;
+    EXIT WHEN zeroed = 0;
+    COMMIT;
+  END LOOP;
+END $$;
 
-UPDATE anonymous_workers w
-   SET tasks_completed = r.n, last_completed_at = r.last
-  FROM (SELECT r.id::uuid AS uuid, r.n, r.last
-          FROM recount r JOIN anonymous_workers w ON w.uuid = r.id::uuid
-         WHERE r.kind = 'a'
-           AND (w.tasks_completed, w.last_completed_at) IS DISTINCT FROM (r.n, r.last)
-         LIMIT 1000) r
- WHERE w.uuid = r.uuid;
+DO $$
+DECLARE taken int;
+BEGIN
+  LOOP
+    WITH batch AS (
+      DELETE FROM recount
+       WHERE ctid IN (SELECT ctid FROM recount LIMIT 1000)
+      RETURNING kind, id, n, last),
+    u AS (
+      UPDATE users u SET tasks_completed = b.n, last_completed_at = b.last
+        FROM batch b
+       WHERE b.kind = 'u' AND u.id = b.id::uuid
+         AND (u.tasks_completed, u.last_completed_at) IS DISTINCT FROM (b.n, b.last)
+      RETURNING 1),
+    a AS (
+      UPDATE anonymous_workers w SET tasks_completed = b.n, last_completed_at = b.last
+        FROM batch b
+       WHERE b.kind = 'a' AND w.uuid = b.id::uuid
+         AND (w.tasks_completed, w.last_completed_at) IS DISTINCT FROM (b.n, b.last)
+      RETURNING 1)
+    SELECT count(*) INTO taken FROM batch;
+    EXIT WHEN taken = 0;
+    COMMIT;
+  END LOOP;
+END $$;
+
+SELECT count(*) AS left_to_apply FROM recount;  -- 0 when done
 ```
 
 The counts are a snapshot: a submission accepted between step 1 and a row's
 update is overwritten by the older figure. Run this when the fleet is quiet, or
-`DROP TABLE recount;` and run both steps again afterwards; a second run changes
-only what moved.
+run all three steps again afterwards (`DROP TABLE recount;` first if a run was
+cut short); a second run changes only what moved.
 
 This is the one recount a restore is most likely to need, and the one most
 likely to be forgotten: nothing about a single job's restore makes a wrong
-leaderboard visible. An identity with no completed claims at all keeps whatever
-it had — the statements above only touch identities that appear in
-`task_claims` — so if claims were *dropped* rather than restored, zero those
-rows first, in batches like the rest (repeat until `UPDATE 0`; the same for
-`anonymous_workers` with `uuid` and kind `'a'`), and let the statements above
-put back what the rows actually support:
-
-```sql
-UPDATE users SET tasks_completed = 0, last_completed_at = NULL
- WHERE id IN (SELECT u.id FROM users u
-               WHERE u.tasks_completed > 0
-                 AND u.id NOT IN (SELECT id::uuid FROM recount WHERE kind = 'u')
-               LIMIT 1000);
-```
+leaderboard visible.
 
 ### 2.4 Recompute derived state
 
@@ -594,7 +649,7 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   should not be: the results have moved on since the generation closed, so a
   rebuild legitimately produces different bytes, and rewriting would replace
   the KLV that workers actually played with. Investigate before forcing
-  (`?force=true`).
+  (**Force rebuild** on the admin job page; `?force=true` on the API).
 - **Object nothing accounts for** (the **Served** column says so): the bytes
   are neither the recorded build, nor the rebuild, nor what workers were being
   sent — typically another run's KLV under the same key, after a purge, a
@@ -646,7 +701,9 @@ SELECT count(*) AS jobs_missing_data FROM jobs j
 SELECT count(*) AS inputs_missing_content FROM input_data
  WHERE role IN ('letterdist','layout') AND content IS NULL;
 
--- 3. Counter sanity. Must be zero.
+-- 3. Counter sanity. Must be zero. Serial: in parallel, each worker builds
+--    the whole grouped aggregate of the claims itself.
+SET max_parallel_workers_per_gather = 0;
 SELECT count(*) AS counter_disagreements
   FROM tasks t
   LEFT JOIN (
@@ -724,7 +781,8 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
 3. Restore the database from the replicated dump in
    `birdtest-backups-dr-<account>`, from `scripts/prod-shell.sh` against the
    new stack: the dump into the new instance, as in §2.1 but with
-   `pg_restore -d "$DATABASE_URL"`. The new ops task reads the new stack's
+   `pg_restore -d "$DATABASE_URL"` — run detached as §2.1 does, since it takes
+   longer than an ECS Exec session lasts. The new ops task reads the new stack's
    backups bucket, so fetch the dump with the credentials of an operator who
    can read the replica, or copy it across first.
 4. The leave-generation KLVs (`leaves/`) and the imported input data
@@ -735,7 +793,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    replicated: re-import those tarballs from the admin page instead —
    importing is idempotent.) Then `terraform apply` again with
    `desired_count=1`, the same variables otherwise.
-5. Re-verify the SES domain identity and add the DKIM CNAMEs — account mail is
+5. Re-verify the SES domain identity and add the DKIM CNAMEs, and point the
+   MAIL FROM MX record at the DR region (the `ses_mail_from_records` output of
+   the `dr` workspace) — account mail is
    dead until this is done, which means no confirmations and no password
    resets. SES production access is per region: request it again.
 6. Point DNS at the new ALB.

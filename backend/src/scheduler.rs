@@ -606,6 +606,7 @@ async fn try_claim_from_job(
                 .await
                 .map_err(|e| JobClaimError::Fatal(e.into()))?;
             tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+            crate::jobstats::forget(job.id);
             Ok(None)
         }
         Acquired::NeedsUniverse { generation } => {
@@ -642,14 +643,21 @@ async fn try_claim_from_job(
                 }
                 building.push(job.id);
             }
+            // Cleared however the build ends -- a panic included, which left
+            // the job marked as building until the process restarted.
+            struct Built(Uuid);
+            impl Drop for Built {
+                fn drop(&mut self) {
+                    if let Ok(mut building) = BUILDING.lock() {
+                        building.retain(|id| *id != self.0);
+                    }
+                }
+            }
             let (spawn_state, spawn_job) = (state.clone(), job.clone());
             tokio::spawn(async move {
+                let _built = Built(spawn_job.id);
                 let built =
                     crate::jobs::registry::initialize_job_artifacts(&spawn_state, &spawn_job).await;
-                BUILDING
-                    .lock()
-                    .expect("zero-generation builds poisoned")
-                    .retain(|id| *id != spawn_job.id);
                 if let Err(err) = built {
                     tracing::error!(
                         job_id = %spawn_job.id, error = %err.message,

@@ -46,7 +46,7 @@ server {
         # Nothing here is meant to be framed or sniffed, and the site is only
         # ever served over HTTPS once deployed (the ALB redirects port 80).
         # `add_header` in a location replaces the server's, so they are here,
-        # on the pages; the API sets its own.
+        # on the pages; the API sets its own `nosniff` (backend/src/lib.rs).
         add_header Strict-Transport-Security "max-age=31536000" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header X-Frame-Options "DENY" always;

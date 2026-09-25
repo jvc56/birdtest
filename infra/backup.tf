@@ -576,7 +576,8 @@ data "aws_iam_policy_document" "alerts_topic" {
     resources = [aws_sns_topic.alerts.arn]
     principals {
       type        = "Service"
-      identifiers = ["events.amazonaws.com", "cloudwatch.amazonaws.com"]
+      # RDS's event subscription (rds.tf) publishes as events.rds.
+      identifiers = ["events.amazonaws.com", "cloudwatch.amazonaws.com", "events.rds.amazonaws.com"]
     }
   }
 }

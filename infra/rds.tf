@@ -109,40 +109,38 @@ resource "aws_db_instance" "main" {
 
 # --- Database alarms -------------------------------------------------------
 # Storage autoscales only up to max_allocated_storage; past it every write
-# fails, the submissions and claims first. Nothing warned before that. Alarmed
-# at a fifth of the ceiling free, which at a claim's ~420 bytes with its
-# indexes is weeks of headroom, not hours.
-resource "aws_cloudwatch_metric_alarm" "db_storage_low" {
-  alarm_name          = "${local.name}-db-storage-low"
-  alarm_description   = "birdtest's database is within a fifth of its storage ceiling"
-  namespace           = "AWS/RDS"
-  metric_name         = "FreeStorageSpace"
-  dimensions          = { DBInstanceIdentifier = aws_db_instance.main.identifier }
-  statistic           = "Minimum"
-  period              = 300
-  evaluation_periods  = 3
-  threshold           = aws_db_instance.main.max_allocated_storage * 1073741824 / 5
-  comparison_operator = "LessThanThreshold"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-  ok_actions          = [aws_sns_topic.alerts.arn]
-  tags                = local.tags
+# fails, the submissions and claims first. CloudWatch has no allocated-storage
+# metric, and FreeStorageSpace is measured against the *current* allocation --
+# a threshold on it either fires from the first apply (autoscaling keeps free
+# space near a tenth) or never. RDS's own events say it instead: "low storage"
+# is the instance running short, and autoscaling that cannot go further.
+resource "aws_db_event_subscription" "db_storage" {
+  name        = "${local.name}-db-storage"
+  sns_topic   = aws_sns_topic.alerts.arn
+  source_type = "db-instance"
+  source_ids  = [aws_db_instance.main.identifier]
+  # "failure" too: an instance that has failed is the other thing nobody
+  # would otherwise hear about until the site was down.
+  event_categories = ["low storage", "failure"]
+  tags             = local.tags
 }
 
-# A burstable instance (the default db.t4g.micro) that spends its CPU credits
-# is throttled to its baseline -- a tenth of a vCPU -- and claims and
-# submissions slow with everything else. Only burstable classes report it.
-resource "aws_cloudwatch_metric_alarm" "db_cpu_credits_low" {
-  count               = startswith(var.db_instance_class, "db.t") ? 1 : 0
-  alarm_name          = "${local.name}-db-cpu-credits-low"
-  alarm_description   = "birdtest's database is running out of CPU credits"
+# Sustained load. The default class is burstable and runs in unlimited mode:
+# out of credits it is billed for the surplus rather than throttled, so the
+# credit balance says little (and reads empty from launch). Busy for fifteen
+# minutes is the signal either way -- a stats payload rebuilt too often, a
+# sweep grown too large.
+resource "aws_cloudwatch_metric_alarm" "db_cpu_high" {
+  alarm_name          = "${local.name}-db-cpu-high"
+  alarm_description   = "birdtest's database has been over 80% CPU for fifteen minutes"
   namespace           = "AWS/RDS"
-  metric_name         = "CPUCreditBalance"
+  metric_name         = "CPUUtilization"
   dimensions          = { DBInstanceIdentifier = aws_db_instance.main.identifier }
-  statistic           = "Minimum"
+  statistic           = "Average"
   period              = 300
   evaluation_periods  = 3
-  threshold           = 10
-  comparison_operator = "LessThanThreshold"
+  threshold           = 80
+  comparison_operator = "GreaterThanOrEqualToThreshold"
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
   tags                = local.tags

@@ -19,8 +19,22 @@ export function subscribeToJob<T>(jobId: string, onUpdate: (stats: T) => void): 
   let retry: ReturnType<typeof setTimeout> | null = null;
   let unsubscribed = false;
 
-  const open = () => {
+  const open = async () => {
     retry = null;
+    // A stream is closed for good by any answer but a 200 -- a deployment's
+    // 503, and also a job that is gone. Asked first, so a deleted job (or a
+    // bad id) is not requested every five seconds for as long as the tab
+    // stays open; anything else is tried again.
+    if (source !== null) {
+      const status = await fetch(`/api/jobs/${jobId}`, { method: 'GET' })
+        .then((response) => response.status)
+        .catch(() => 0);
+      if (unsubscribed) return;
+      if (status === 404) {
+        console.debug('job is gone; not subscribing again');
+        return;
+      }
+    }
     const opened = new EventSource(`/api/jobs/${jobId}/stream`);
     source = opened;
 

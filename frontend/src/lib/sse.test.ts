@@ -109,12 +109,13 @@ describe('F-SSE-3 unsubscribe', () => {
     expect(FakeEventSource.instances).toHaveLength(1);
   });
 
-  it('a stream the browser gave up on is reopened after a pause', () => {
+  it('a stream the browser gave up on is reopened after a pause', async () => {
     const onUpdate = vi.fn();
+    vi.stubGlobal('fetch', vi.fn(async () => ({ status: 200 })));
     const unsubscribe = subscribeToJob('j', onUpdate);
     FakeEventSource.instances[0].giveUp();
     expect(FakeEventSource.instances).toHaveLength(1);
-    vi.advanceTimersByTime(5000);
+    await vi.advanceTimersByTimeAsync(5000);
     expect(FakeEventSource.instances).toHaveLength(2);
 
     FakeEventSource.instances[1].emit('stats', '{"n":2}');
@@ -123,6 +124,18 @@ describe('F-SSE-3 unsubscribe', () => {
     // Unsubscribing closes the current stream, not the dead one.
     unsubscribe();
     expect(FakeEventSource.instances[1].closeCalls).toBe(1);
+  });
+
+  it('a job that is gone is not subscribed to again', async () => {
+    // A deleted job's stream closes like a deployment's; asked, the job
+    // answers 404, and the page stops asking every five seconds.
+    const fetch = vi.fn(async () => ({ status: 404 }));
+    vi.stubGlobal('fetch', fetch);
+    subscribeToJob('gone', vi.fn());
+    FakeEventSource.instances[0].giveUp();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).toHaveBeenCalledWith('/api/jobs/gone', { method: 'GET' });
+    expect(FakeEventSource.instances).toHaveLength(1);
   });
 
   it('a transient error (still reconnecting) does not open a second stream', () => {

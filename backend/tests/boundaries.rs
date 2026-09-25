@@ -786,3 +786,21 @@ async fn a_freshly_built_production_state_grants_the_restart_grace() {
     assert_eq!(claim_state(&db, token(&silent)).await, "abandoned", "reclaimed once the grace is over");
     assert_eq!(third["task_request"]["seed"], silent["task_request"]["seed"], "and its task handed out again");
 }
+
+/// A-BOUND-11: the API's answers carry `X-Content-Type-Options: nosniff`. The
+/// pages get it from Nginx; the API is served by the load balancer straight
+/// from the backend, so it has to set its own -- the Nginx comment said it did,
+/// and nothing did.
+#[tokio::test]
+async fn api_responses_are_not_sniffed() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    for path in ["/health", "/api/jobs", "/api/jobs/00000000-0000-0000-0000-000000000000"] {
+        let response = send_raw(&app, Request::get(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(
+            response.headers.get("x-content-type-options").map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "{path}"
+        );
+    }
+}

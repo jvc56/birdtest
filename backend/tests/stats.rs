@@ -466,6 +466,26 @@ async fn the_eta_is_none_without_recent_throughput() {
     assert_eq!(stats(&db, job).await.eta_seconds, None, "an inactive job has no ETA");
 }
 
+/// I-STATS-8b: a games job's ETA is the units left at the rate units have
+/// been finishing -- claims an hour times the batch, over the redundancy,
+/// since a task's redundant copies add no units. Counted per completed task,
+/// as it was, it read half the time left at redundancy 2.
+#[tokio::test]
+async fn the_games_eta_divides_by_redundancy() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2, 10).await;
+    let worker = Owner::Anon(anon(&db).await);
+    claim(&db, job, worker, "completed", 10).await;
+    claim(&db, job, worker, "completed", 10).await;
+    let stats = stats(&db, job).await;
+    let games = stats.games.as_ref().expect("a games job");
+    let left = games.max_units as f64 - games.units_completed as f64;
+    // Two claims in the last hour, ten games a batch, each task played twice.
+    let expected = left / (2.0 / 3600.0 * 10.0 / 2.0);
+    let eta = stats.eta_seconds.expect("recent throughput");
+    assert!((eta - expected).abs() < 1e-6 * expected, "{eta} vs {expected}");
+}
+
 // ---------------------------------------------------------------------------
 // The finish check
 // ---------------------------------------------------------------------------

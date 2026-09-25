@@ -296,6 +296,10 @@ placeholder; replace it, then write the URL:
 
 ```bash
 DB_INSTANCE=birdtest   # the RDS identifier Terraform created
+# The stack's region on every command: with the CLI's default elsewhere,
+# put-parameter quietly creates the parameters in the wrong region, the real
+# ones stay `set-me`, and the service crash-loops on the second apply.
+export AWS_REGION=$(terraform -chdir=infra output -raw region)
 DB_PASSWORD=$(openssl rand -hex 24)   # hex: nothing to percent-encode in a URL
 aws rds modify-db-instance --db-instance-identifier "$DB_INSTANCE" \
   --master-user-password "$DB_PASSWORD" --apply-immediately
@@ -350,7 +354,9 @@ bastion, and its security group admits only the service's. SQL runs through
 `scripts/prod-sql.sh`, which starts the ops task (`infra/ops.tf`: the postgres
 image, `DATABASE_URL` from SSM, the service's network) with psql reading the
 SQL and prints what psql printed; `scripts/prod-shell.sh` opens an interactive
-shell in the same task through ECS Exec, for RUNBOOK.md's longer procedures. The first admin is made that way,
+shell in the same task through ECS Exec, for RUNBOOK.md's longer procedures
+(the task outlives the session, which ECS ends after twenty idle minutes:
+`scripts/prod-shell.sh --attach <task>` returns to it). The first admin is made that way,
 after registering and confirming the account through the site — there is no
 endpoint for it, by design:
 

@@ -1258,7 +1258,7 @@ start. The process has no SSM code path of its own.
 | `MAIL_FROM` | `no-reply@birdtest.local` | |
 | `PUBLIC_URL` | `http://localhost:5173` | The base for links in emails. |
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. |
-| `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. `0` builds it on every request (the tests). |
+| `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. Built one at a time per job; dropped by every admin action on the job, by its completion and by a leave generation closing, so the admin page reloading after an action reads the change. `0` builds it on every request (the tests). |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
 | `MIN_MAGPIE_VERSION` | `0.1.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
@@ -3295,8 +3295,9 @@ reason a bad file passes.
 cuts a running task short — autoplay starts no more games, simulations end
 early — so what it would submit is not the task the server asked for. The loop
 declines the claim (`task_failed`, not counted as a failure) and ends; a stop
-while waiting between claims returns within a second. (It once submitted the
-truncated result, and kept claiming.) A hard interrupt simply abandons the
+while waiting between claims, or while a request waits to retry against a
+server that is down, returns within a second. (It once submitted the truncated
+result, and kept claiming.) A hard interrupt simply abandons the
 claim, which the server's heartbeat timeout reclaims.
 
 **Errors during execution** are reported and the claim is handed back with a `task_failed` decline, so
@@ -3909,10 +3910,11 @@ pair.
 `204`. `reason` is `missing_data`, `magpie_version`, `unknown_job_type`,
 `derived_mismatch` — the worker built the wordmap or rack info table the job pins
 and got different bytes, or (role `klv`) the leave KLV it fetched does not hash to
-`previous_artifact_sha256` or is not there (`404`); for that one the worker does
-not set the job aside, since it is the server's to fix, but waits and claims
-again — the idle interval, doubling to ten minutes while the same key and hash
-keep failing, and without downloading a KLV it already found wrong —
+`previous_artifact_sha256` or is not there (`404`); that one is the server's to
+fix, so the worker sets the job aside only for a while — sent as unsupported for
+the idle interval, doubling per job to ten minutes, then claimed and its KLV
+fetched afresh, so a repair is noticed — and goes on with other jobs meanwhile (a
+shutdown answered only because of such jobs is waited out, not obeyed) —
 or `task_failed` — the worker ran the task and could
 not produce a result the server accepted;
 `missing` is present for `missing_data` and `derived_mismatch`, where `actual`
@@ -4830,7 +4832,7 @@ birdtest/
 │   ├── restore-drill.sh            # the monthly automated restore drill
 │   ├── restore-roundtrip.sh        # dump -> drop -> restore -> verify, against the local stack
 │   ├── prod-sql.sh                 # run SQL against production from inside the VPC (infra/ops.tf)
-│   ├── prod-shell.sh               # an interactive psql-capable shell there, over ECS Exec
+│   ├── prod-shell.sh               # an interactive psql-capable shell there, over ECS Exec (--attach to return)
 │   ├── dev-dump.sh                 # snapshot the local Postgres + MinIO state
 │   ├── dev-restore.sh              # put it back
 │   ├── leave-gen-bench.sh          # time a generation transition's SQL against any database,
@@ -6586,8 +6588,8 @@ CREATE INDEX leave_rack_progress_pick_idx
 Ten audits of this repository each left a findings record (`AUDIT_FINDINGS*.md`,
 now deleted; they are in the git history up to the commit that removed them).
 The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
-the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md` and
-the fifteenth's `AUDIT_FINDINGS_11.md`.
+the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md`,
+the fifteenth's `AUDIT_FINDINGS_11.md` and the sixteenth's `AUDIT_FINDINGS_12.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -6821,6 +6823,23 @@ what would make it worth revisiting.
   an entry per claim on the hottest write table for one view.
 
 ### Abuse and input
+
+- **Recovering an account does not revoke its API keys.** A password reset and
+  "sign out everywhere" end sessions; keys an attacker made while in control
+  go on working until the owner revokes them from the account page, which
+  lists them. *Open (sixteenth audit):* revoke keys on reset, at the cost of
+  every one of the contributor's machines stopping with it.
+- **Confirming an address happens when the link is opened**, so a mail scanner
+  that runs the page's script confirms it. A button to press would stop that
+  and cost every registrant a click. *(Sixteenth audit.)*
+- **Only ASCII addresses register** (`is_bare_address`). SES does not send to
+  SMTPUTF8 addresses; an internationalized domain could be sent as punycode by
+  the form. Existing accounts are unaffected. *(Sixteenth audit.)*
+- **Every pool connection is pinged when it is taken** (sqlx's
+  `test_before_acquire`): a round trip per acquire, three or four per claim or
+  submission. Turning it off saves them and makes a connection broken by a
+  failover fail one request instead of being replaced silently. *Open
+  (sixteenth audit).*
 
 - **Registration answers the same, and what it leaves behind does not.** A
   taken address and a fresh one get byte-identical registration responses, but
@@ -7276,6 +7295,12 @@ A backup that fails silently is not a backup. Three layers, cheapest first:
    custom metric and the alarm fires on `missing data` for > 36 hours. Catches both
    crashes and a schedule that silently stopped.
 3. **In-app surface.** An admin page listing recent backups.
+
+The same topic carries the database's own warnings (`infra/rds.tf`): RDS's
+`low storage` and `failure` events, through an event subscription —
+autoscaled storage stops at five times its first allocation, and CloudWatch has
+no metric for how near the ceiling is (a `FreeStorageSpace` threshold fired from
+the first apply and never cleared) — and CPU over 80% for fifteen minutes.
 
 Layer 3 had a design choice of its own. Having the backend list the backup bucket
 directly would require giving the task role `ListBucket` / `GetObject` on it,

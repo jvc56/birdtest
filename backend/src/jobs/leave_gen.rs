@@ -1321,6 +1321,8 @@ pub async fn close_generation(
             .await?;
     }
     tx.commit().await?;
+    // The page's generation count and status moved without a submission.
+    crate::jobstats::forget(job_id);
 
     // The next generation's universe is NOT written here. It is seeded when
     // that generation opens -- see `ensure_universe`, called from the claim
@@ -1519,15 +1521,22 @@ pub async fn rebuild_artifacts(
         // the old hash, and a re-run found the object present, rewrote
         // nothing, and never fixed it -- every worker refusing the job until
         // someone forced it. `sha256` keeps the first hash.
+        // Only onto the row this check read: a check running across a purge
+        // and a re-run that closed this generation again would otherwise put
+        // the old run's hash on the new run's row, and every worker refuse
+        // its KLV.
         if let Some(served) = &served_sha256 {
             sqlx::query(
                 "UPDATE leave_generation_artifacts
                  SET served_sha256 = NULLIF($3, sha256)
-                 WHERE job_id = $1 AND generation = $2",
+                 WHERE job_id = $1 AND generation = $2
+                   AND sha256 = $4 AND COALESCE(served_sha256, sha256) = $5",
             )
             .bind(job_id)
             .bind(generation)
             .bind(served)
+            .bind(&stored_sha256)
+            .bind(&was_served)
             .execute(pool)
             .await?;
         }

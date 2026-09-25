@@ -102,8 +102,8 @@ async fn artifact(
 /// first fetch reads it and the rest share one copy. Keyed by the hash
 /// workers are being sent as well as the key, so a rebuild that changes what
 /// is served is never answered from here, and only bytes that hash to it are
-/// kept; misses are fetched one at a time, so a generation's opening is one
-/// S3 GET, not one per worker.
+/// kept; misses of one key are fetched one at a time, so a generation's
+/// opening is one S3 GET, not one per worker.
 mod recent_artifacts {
     use crate::error::AppResult;
     use crate::state::AppState;
@@ -113,7 +113,13 @@ mod recent_artifacts {
 
     type Entry = (String, String, Bytes);
     static ENTRIES: std::sync::Mutex<Vec<Entry>> = std::sync::Mutex::new(Vec::new());
-    static FETCHING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    type Fetching = std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>;
+    static FETCHING: std::sync::LazyLock<std::sync::Mutex<Fetching>> =
+        std::sync::LazyLock::new(Default::default);
+    /// A fetch that has not answered in this long is given up, as a 503 the
+    /// worker retries: the object store's client sets no timeout of its own,
+    /// and a hung read held every worker waiting on that key.
+    const FETCH_LIMIT: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn cached(key: &str, served: &str) -> Option<Bytes> {
         ENTRIES
@@ -128,11 +134,42 @@ mod recent_artifacts {
         if let Some(bytes) = cached(key, served) {
             return Ok(bytes);
         }
-        let _turn = FETCHING.lock().await;
-        if let Some(bytes) = cached(key, served) {
-            return Ok(bytes);
+        // One fetch per key at a time -- per key, so a slow read of one
+        // generation's KLV holds up nobody asking for another.
+        let lock = FETCHING
+            .lock()
+            .expect("artifact fetches poisoned")
+            .entry(key.to_string())
+            .or_default()
+            .clone();
+        let result = {
+            let _turn = lock.lock().await;
+            match cached(key, served) {
+                Some(bytes) => Ok(bytes),
+                None => fetch_and_keep(state, key, served).await,
+            }
+        };
+        let mut fetching = FETCHING.lock().expect("artifact fetches poisoned");
+        drop(lock);
+        if fetching.get(key).is_some_and(|l| std::sync::Arc::strong_count(l) == 1) {
+            fetching.remove(key);
         }
-        let bytes = state.artifacts.get_bytes(key).await?;
+        result
+    }
+
+    async fn fetch_and_keep(state: &AppState, key: &str, served: &str) -> AppResult<Bytes> {
+        let bytes = tokio::time::timeout(FETCH_LIMIT, state.artifacts.get_bytes(key))
+            .await
+            .unwrap_or_else(|_| {
+                Err(crate::error::AppError {
+                    retry_after: Some(30),
+                    ..crate::error::AppError::new(
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                        "unavailable",
+                        format!("reading {key} from the object store timed out"),
+                    )
+                })
+            })?;
         // Only bytes that are what workers are told to expect. An object that
         // is not (RUNBOOK §3) is refused by every worker; kept here, it would
         // go on being served after an admin had put the right one back.
@@ -453,16 +490,20 @@ async fn refuse_if_claims_held(state: &AppState, claim_token: Uuid) -> AppResult
     .fetch_optional(&state.pool)
     .await?;
     if job_id.is_some_and(|job_id| state.dispatch_holds.claims_held(job_id)) {
-        return Err(AppError {
-            retry_after: Some(30),
-            ..AppError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                "this claim's job is being purged or deleted; try again shortly",
-            )
-        });
+        return Err(claims_held_error());
     }
     Ok(())
+}
+
+fn claims_held_error() -> AppError {
+    AppError {
+        retry_after: Some(30),
+        ..AppError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "this claim's job is being purged or deleted; try again shortly",
+        )
+    }
 }
 
 async fn bound_claim_lock_wait(tx: &mut sqlx::PgConnection) -> AppResult<()> {
@@ -544,10 +585,6 @@ async fn submit_result(
     identity.check_rate_limit(&state)?;
     identity.require_registered()?;
 
-    refuse_if_claims_held(&state, body.claim_token).await?;
-    // Held until the handler returns, after the commit.
-    let turn = crate::jobs::registry::large_result_turn(body.result.get().len()).await?;
-
     // Decoded before the transaction, with nothing locked and no connection
     // held: see `registry::decode_result`. The claim's job is read without a
     // lock for it -- a task never changes job -- and the claim itself is
@@ -570,11 +607,22 @@ async fn submit_result(
         tracing::debug!(claim_token = %body.claim_token, "ignoring result for stale claim");
         return Ok(Json(ResultAck { accepted: false }));
     };
+    // The same question `refuse_if_claims_held` asks, answered from the row
+    // just read rather than a second lookup of the token.
+    if state.dispatch_holds.claims_held(job.id) {
+        return Err(claims_held_error());
+    }
+    // Held until the handler returns, after the commit.
+    let turn = crate::jobs::registry::large_result_turn(body.result.get().len()).await?;
     // The job's immutable half: its batch size, its players' reporting caps,
-    // its rack space. Read once per process.
-    let template = {
-        let mut conn = state.pool.acquire().await?;
-        state.templates.get_or_load(&mut conn, &job).await?
+    // its rack space. Read once per process -- and a hit takes no connection:
+    // acquiring one to ask the cache was a wait on the pool per submission.
+    let template = match state.templates.get(job.id) {
+        Some(template) => template,
+        None => {
+            let mut conn = state.pool.acquire().await?;
+            state.templates.get_or_load(&mut conn, &job).await?
+        }
     };
     let decoded = crate::jobs::registry::decode_result(&template, body.result).await?;
 
@@ -813,6 +861,7 @@ async fn after_submission(state: &AppState, job: &Job) -> AppResult<()> {
             .await?
         {
             tracing::info!(job_id = %job.id, "job auto-completed");
+            jobstats::forget(job.id);
             // Completion is final, so this job will never need checking again.
             state.finish_checks.forget(job_id);
         }

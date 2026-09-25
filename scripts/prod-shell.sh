@@ -2,8 +2,15 @@
 # An interactive shell inside the VPC, with psql, pg_restore and DATABASE_URL:
 # the ops task (infra/ops.tf) started with ECS Exec, for the RUNBOOK.md steps
 # that are more than one batch of SQL -- a selective restore above all. The
-# task stops by itself after SHELL_HOURS (default 4); leaving the shell does
-# not stop it, so this stops it on exit.
+# task stops by itself after SHELL_HOURS (default 4).
+#
+# Leaving the shell does not stop the task, and neither does this script
+# unless asked: an ECS Exec session ends after twenty idle minutes, or when a
+# laptop sleeps, and stopping the task then killed a restore running in it --
+# hours of pg_restore, and the scratch copy on its disk. Run long commands
+# under `setsid nohup ... > /tmp/<name>.log 2>&1 &` inside, and come back with
+#
+#   scripts/prod-shell.sh --attach <task-arn>
 #
 # Needs the AWS CLI with the Session Manager plugin, jq, and the Terraform
 # state in infra/ (or INFRA_DIR). Inside, `apt-get update && apt-get install -y
@@ -24,6 +31,25 @@ subnets=$(tf -json service_subnet_ids | jq -r 'join(",")')
 security_group=$(tf -raw service_security_group_id)
 seconds=$(( ${SHELL_HOURS:-4} * 3600 ))
 
+attach() {
+  aws ecs execute-command --cluster "$cluster" --task "$1" --container ops \
+    --interactive --command /bin/bash || true
+  echo >&2
+  echo "the task goes on running until it stops itself (SHELL_HOURS). Again:" >&2
+  echo "  scripts/prod-shell.sh --attach $1" >&2
+  read -r -p "stop it now? [y/N] " answer </dev/tty || answer=n
+  if [[ "$answer" == [yY]* ]]; then
+    aws ecs stop-task --cluster "$cluster" --task "$1" >/dev/null
+    echo "stopped" >&2
+  fi
+}
+
+if [[ "${1:-}" == --attach ]]; then
+  [[ -n "${2:-}" ]] || { echo "usage: $0 --attach <task-arn>" >&2; exit 2; }
+  attach "$2"
+  exit 0
+fi
+
 overrides=$(jq -n --arg command "sleep $seconds" \
   '{containerOverrides: [{name: "ops", command: [$command]}]}')
 started=$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" \
@@ -36,6 +62,8 @@ if [[ -z "$task_arn" ]]; then
   jq '.failures' <<<"$started" >&2
   exit 1
 fi
+# Stopped if this script fails before the shell opens; after that, only when
+# asked (see above).
 trap 'aws ecs stop-task --cluster "$cluster" --task "$task_arn" >/dev/null' EXIT
 echo "starting $task_arn" >&2
 aws ecs wait tasks-running --cluster "$cluster" --tasks "$task_arn"
@@ -47,5 +75,5 @@ for _ in $(seq 60); do
   [[ "$agent" == RUNNING ]] && break
   sleep 5
 done
-aws ecs execute-command --cluster "$cluster" --task "$task_arn" --container ops \
-  --interactive --command /bin/bash
+trap - EXIT
+attach "$task_arn"

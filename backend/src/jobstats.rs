@@ -200,16 +200,25 @@ pub async fn payload(
     job: &Job,
     max_age: std::time::Duration,
 ) -> AppResult<std::sync::Arc<str>> {
+    if max_age.is_zero() {
+        return build_payload(pool, job, max_age).await;
+    }
     if let Some(cached) = cached_payload(job.id, max_age) {
         return Ok(cached);
     }
-    // Misses are built one at a time: when a popular job's payload expires,
-    // every viewer asking at once would otherwise build it at once.
-    let _turn = BUILDING.lock().await;
-    if let Some(cached) = cached_payload(job.id, max_age) {
-        return Ok(cached);
-    }
-    refresh_payload(pool, job, max_age).await
+    // One build per job at a time: when a popular job's payload expires,
+    // every viewer asking at once would otherwise build it at once. Per job,
+    // not one lock for all: a slow build of one job (a second, for a large
+    // one) held up every other job's page behind it.
+    let lock = build_lock(job.id);
+    let turn = lock.lock().await;
+    let result = match cached_payload(job.id, max_age) {
+        Some(cached) => Ok(cached),
+        None => build_payload(pool, job, max_age).await,
+    };
+    drop(turn);
+    release_build_lock(job.id, lock);
+    result
 }
 
 /// Builds the job's stats as JSON and keeps them for [`payload`].
@@ -218,35 +227,78 @@ pub async fn refresh_payload(
     job: &Job,
     max_age: std::time::Duration,
 ) -> AppResult<std::sync::Arc<str>> {
+    build_payload(pool, job, max_age).await
+}
+
+/// Drops what is kept for the job, for a change a submission does not push:
+/// an admin's activate, deactivate, complete, purge or merge, a job
+/// completing. Otherwise the admin page, reloading right after the action,
+/// read the payload from before it -- and put the old allocation back in
+/// the form. A build that started before this is not kept either.
+pub fn forget(job_id: Uuid) {
+    PAYLOADS
+        .lock()
+        .expect("stats cache poisoned")
+        .insert(job_id, CachedPayload { started: std::time::Instant::now(), json: None });
+}
+
+async fn build_payload(
+    pool: &PgPool,
+    job: &Job,
+    max_age: std::time::Duration,
+) -> AppResult<std::sync::Arc<str>> {
+    // Freshness runs from when the build *started* -- what it read -- and a
+    // build replaces only an entry that started before it: two builds
+    // finishing out of order left the older one kept.
+    let started = std::time::Instant::now();
     let stats = compute(pool, job).await?;
     let json: std::sync::Arc<str> = serde_json::to_string(&stats)
         .map_err(|e| crate::error::AppError::internal(format!("serializing job stats failed: {e}")))?
         .into();
     if !max_age.is_zero() {
-        let now = std::time::Instant::now();
         let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
-        payloads.retain(|_, (built, _)| now.duration_since(*built) < max_age);
-        payloads.insert(job.id, (now, json.clone()));
+        payloads.retain(|_, entry| entry.started.elapsed() < max_age);
+        let newer = payloads.get(&job.id).is_some_and(|entry| entry.started > started);
+        if !newer {
+            payloads.insert(job.id, CachedPayload { started, json: Some(json.clone()) });
+        }
     }
     Ok(json)
 }
 
-type CachedPayloads =
-    std::collections::HashMap<Uuid, (std::time::Instant, std::sync::Arc<str>)>;
-static PAYLOADS: std::sync::LazyLock<std::sync::Mutex<CachedPayloads>> =
+struct CachedPayload {
+    started: std::time::Instant,
+    /// `None`: forgotten at `started`.
+    json: Option<std::sync::Arc<str>>,
+}
+
+static PAYLOADS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, CachedPayload>>> =
     std::sync::LazyLock::new(Default::default);
-static BUILDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+type BuildLocks = std::collections::HashMap<Uuid, std::sync::Arc<tokio::sync::Mutex<()>>>;
+static BUILD_LOCKS: std::sync::LazyLock<std::sync::Mutex<BuildLocks>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn build_lock(job_id: Uuid) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    BUILD_LOCKS.lock().expect("stats build locks poisoned").entry(job_id).or_default().clone()
+}
+
+/// Drops the job's lock once nobody else holds or waits on it.
+fn release_build_lock(job_id: Uuid, lock: std::sync::Arc<tokio::sync::Mutex<()>>) {
+    let mut locks = BUILD_LOCKS.lock().expect("stats build locks poisoned");
+    drop(lock);
+    if locks.get(&job_id).is_some_and(|l| std::sync::Arc::strong_count(l) == 1) {
+        locks.remove(&job_id);
+    }
+}
 
 fn cached_payload(job_id: Uuid, max_age: std::time::Duration) -> Option<std::sync::Arc<str>> {
-    if max_age.is_zero() {
-        return None;
-    }
     PAYLOADS
         .lock()
         .expect("stats cache poisoned")
         .get(&job_id)
-        .filter(|(built, _)| built.elapsed() < max_age)
-        .map(|(_, json)| json.clone())
+        .filter(|entry| entry.started.elapsed() < max_age)
+        .and_then(|entry| entry.json.clone())
 }
 
 pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {

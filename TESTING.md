@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 482 backend tests.
+--run-ignored all` runs 484 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -537,7 +537,8 @@ Each entry's tests are the `describe` block named for its id.
   *(Covered: `sse.test.ts`.)*
 - `F-SSE-3` The returned function closes the `EventSource`, and calling it twice
   is safe; a stream the browser gave up on is reopened after a pause, and an
-  unsubscribe cancels a pending reopen. *(Covered: `sse.test.ts`.)*
+  unsubscribe cancels a pending reopen; a job that answers 404 (deleted, or a
+  bad id) is not subscribed to again (sixteenth audit). *(Covered: `sse.test.ts`.)*
 
 ### `F-CHART-*` — chart maths
 
@@ -1187,6 +1188,9 @@ permanent.
   `worker_api::contributions_are_counted_as_they_arrive`.)*
 - `I-STATS-8` ETA is `None` without recent throughput rather than infinity.
   *(Covered: `stats::the_eta_is_none_without_recent_throughput`.)*
+- `I-STATS-8b` A games job's ETA divides by the redundancy: units left at claims
+  an hour × batch ÷ redundancy. *(Covered:
+  `stats::the_games_eta_divides_by_redundancy`.)* (Sixteenth audit.)
 - `I-STATS-9` **The finish check** completes a job at SPRT significance and at
   the hard cap, and does **not** complete below `min_units` even with a crossed
   LLR. There is no `finish_if_done`, as this entry first named it: the check is
@@ -1799,6 +1803,9 @@ silent.
   start plus the heartbeat timeout (`I-SCHED-20`), so the grace cannot be lost
   in the wiring while every test that sets it by hand still passes. *(Covered:
   `boundaries::a_freshly_built_production_state_grants_the_restart_grace`.)*
+- `A-BOUND-11` Every API answer, errors included, carries
+  `X-Content-Type-Options: nosniff`. *(Covered:
+  `boundaries::api_responses_are_not_sniffed`.)* (Sixteenth audit.)
 
 ---
 
@@ -2473,7 +2480,8 @@ slower and more environment-sensitive than a pull request should wait on.
 **The runner is `cargo nextest run`** (run from `backend/`). It runs each test in
 its own process, and `backend/.config/nextest.toml` reports a test as slow after
 a minute and kills it after ten, so a hang fails the run instead of stalling it.
-`cargo test` runs the same tests — CI uses it — without that ceiling.
+`cargo test` runs the same tests without that ceiling; CI uses nextest, and
+`cargo test --doc` for the doctests nextest does not run.
 `--run-ignored all` adds the tier-6 Rust tests to everything else; a full local
 run is `cargo nextest run --run-ignored all` with every variable below set.
 

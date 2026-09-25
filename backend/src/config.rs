@@ -193,11 +193,13 @@ impl Config {
         };
 
         let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.1");
-        if crate::version::Version::parse_or_zero(&min_magpie_version)
-            == crate::version::Version::ZERO
-            && min_magpie_version.trim() != "0.0.0"
-        {
-            anyhow::bail!("MIN_MAGPIE_VERSION {min_magpie_version:?} is not a version");
+        // Strictly, as a job's floor is: the new-job form offers this value,
+        // and one read loosely here ("0.2.0-rc1") was then refused there on
+        // every job an admin created without touching the field.
+        if crate::version::Version::parse_strict(&min_magpie_version).is_none() {
+            anyhow::bail!(
+                "MIN_MAGPIE_VERSION {min_magpie_version:?} is not a version (major.minor[.patch])"
+            );
         }
 
         Ok(Self {
@@ -360,7 +362,9 @@ mod tests {
     /// client; an explicit 0.0.0 is still a floor someone chose.
     #[test]
     fn a_malformed_version_floor_fails_startup() {
-        for bad in ["latest", "v1", "1.x", "one.two.three"] {
+        // And strictly, as a job's floor is: "0.2.0-rc1" and "1.6.x" were
+        // accepted here and refused on every job created from the form.
+        for bad in ["latest", "v1", "1.x", "one.two.three", "0.2.0-rc1", "1.6.x", "1.6.0.1"] {
             let err = config(&[("MIN_MAGPIE_VERSION", bad)]).unwrap_err();
             assert!(err.to_string().contains("MIN_MAGPIE_VERSION"), "{bad}: {err}");
         }

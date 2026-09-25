@@ -187,7 +187,7 @@ services:
   # platform.
   frontend-dev:
     profiles: [dev]
-    image: node:20-alpine
+    image: node:22-alpine
     working_dir: /app
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
     depends_on:

@@ -609,11 +609,13 @@ async fn job_stream(
     Path(id): Path<Uuid>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let job = load_job(&state, id).await?;
+    // Subscribed before the first payload is read: a push published between
+    // the two was lost, and on a quiet job nothing followed it.
+    let receiver = state.sse.subscribe(id);
     let initial = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache)
         .await?
         .to_string();
 
-    let receiver = state.sse.subscribe(id);
     let updates = tokio_stream::wrappers::BroadcastStream::new(receiver)
         .filter_map(|msg| async move { msg.ok() });
 

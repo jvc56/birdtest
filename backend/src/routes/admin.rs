@@ -1631,6 +1631,7 @@ async fn activate_job(
     )
     .await?;
     tx.commit().await?;
+    crate::jobstats::forget(id);
     Ok(Json(updated))
 }
 
@@ -1670,6 +1671,7 @@ async fn deactivate_job(
     )
     .await?;
     tx.commit().await?;
+    crate::jobstats::forget(id);
     Ok(Json(job))
 }
 
@@ -1702,6 +1704,7 @@ async fn complete_job(
     )
     .await?;
     tx.commit().await?;
+    crate::jobstats::forget(id);
     Ok(Json(job))
 }
 
@@ -2100,17 +2103,39 @@ async fn purge_body(
     // caught up.
     crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     contributions.give_back(&mut tx).await?;
+    // Every pool's newest fit is marked for a refit: the sweep's cheap check
+    // compares a sum of `games_completed`, which a purge and a re-run to the
+    // same count leave where it was. NULL is "refit" -- one matrix build per
+    // pool, which is what the sweep did every time before it had the check.
+    sqlx::query(
+        "UPDATE rating_runs SET evidence_games = NULL
+         WHERE evidence_games IS NOT NULL
+           AND id IN (SELECT DISTINCT ON (pool_id) id FROM rating_runs
+                      ORDER BY pool_id, computed_at DESC, id DESC)",
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     hold.committed();
+    crate::jobstats::forget(id);
 
+    // Both after the commit, so a failure here is not the purge failing: it
+    // committed, and answering 500 invited a second one. Logged instead.
+    //
     // Exports describe results this purge has just deleted. A row left saying
     // `ready` would hand an admin a stable-looking artifact of a job that no
     // longer holds any of it.
-    crate::exports::purge(&state, id).await?;
-
-    // The generation-0 KLV was deleted with the artifacts above; rebuild it, or
-    // generation 1 would have nothing to play with.
-    registry::initialize_job_artifacts(&state, &job).await?;
+    if let Err(err) = crate::exports::purge(&state, id).await {
+        tracing::error!(job_id = %id, error = %err.message, "a purge's export cleanup failed");
+    }
+    // The generation-0 KLV was deleted with the artifacts above; rebuilt here,
+    // and if that fails, by the next claim (`Acquired::NeedsZeroGeneration`).
+    if let Err(err) = registry::initialize_job_artifacts(&state, &job).await {
+        tracing::error!(
+            job_id = %id, error = %err.message,
+            "rebuilding a purged job's generation-0 KLV failed; the next claim retries it"
+        );
+    }
 
     Ok(Json(PurgeResult { tasks_reset }))
 }
@@ -2185,8 +2210,18 @@ async fn delete_body(
         return Err(AppError::not_found("no such job"));
     }
     contributions.give_back(&mut tx).await?;
+    // As a purge does: the pools this job fed must refit.
+    sqlx::query(
+        "UPDATE rating_runs SET evidence_games = NULL
+         WHERE evidence_games IS NOT NULL
+           AND id IN (SELECT DISTINCT ON (pool_id) id FROM rating_runs
+                      ORDER BY pool_id, computed_at DESC, id DESC)",
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     hold.committed();
+    crate::jobstats::forget(id);
     // Tidiness only: a remembered answer for a job that no longer exists is
     // never asked for, but there is no reason to keep it.
     state.derived_ready.forget(id);
@@ -2243,6 +2278,7 @@ async fn start_export(
     jar: CookieJar,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
 
     let job = crate::jobstats::load_job(&state.pool, id).await?;
     let export_id = crate::exports::start(&state, &job, admin.0.id).await?;
@@ -2453,11 +2489,15 @@ async fn merge_leave_progress(
     jar: CookieJar,
 ) -> AppResult<Json<crate::jobs::leave_gen::MergeOutcome>> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
     let job = crate::jobstats::load_job(&state.pool, id).await?;
     if job.job_type != JobType::LeaveGeneration {
         return Err(AppError::bad_request("only a leave-generation job stages results"));
     }
-    Ok(Json(crate::jobs::leave_gen::merge_staged_for_job(&state.pool, id, true).await?))
+    let outcome = crate::jobs::leave_gen::merge_staged_for_job(&state.pool, id, true).await?;
+    // The point of the button is current rack figures.
+    crate::jobstats::forget(id);
+    Ok(Json(outcome))
 }
 
 /// Recompute a leave-generation job's KLVs from `leave_rack_progress` and
@@ -2476,6 +2516,7 @@ async fn rebuild_artifacts(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<crate::jobs::leave_gen::ArtifactRebuild>>> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
 
     let mut conn = state.pool.acquire().await?;
     let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")

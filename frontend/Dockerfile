@@ -1,7 +1,7 @@
 # The same artifact the ECS task definition runs: a static SvelteKit build
 # served by Nginx.
 
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -10,7 +10,7 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM nginx:1.27-alpine
+FROM nginx:1.28-alpine
 # A template, filled in at startup by the image's own entrypoint: see the
 # comment on BACKEND_UPSTREAM in it. The filter keeps envsubst to that one
 # variable, so Nginx's own `$host`, `$uri` and the rest are left alone.

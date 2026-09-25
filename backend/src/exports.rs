@@ -180,12 +180,30 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
         ));
     }
 
+    // Inserted only while the job is still completed, read under a share lock
+    // on its row: a purge committing meanwhile holds that row, so this waits
+    // for it and then finds the job inactive. Checked once above without a
+    // lock, an export started beside a purge built the emptied job, and the
+    // re-run's completed job then redirected its downloads to that export.
+    let mut tx = state.pool.begin().await?;
+    let still_completed = sqlx::query_scalar::<_, bool>(
+        "SELECT status = 'completed' FROM jobs WHERE id = $1 FOR SHARE",
+    )
+    .bind(job.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if !still_completed {
+        return Err(AppError::conflict(
+            "the job is no longer completed (purged or reactivated meanwhile)",
+        ));
+    }
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO job_exports (job_id, requested_by) VALUES ($1, $2) RETURNING id",
     )
     .bind(job.id)
     .bind(requested_by)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|err| {
         let err: AppError = err.into();
@@ -195,6 +213,7 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
             err
         }
     })?;
+    tx.commit().await?;
 
     let (state, job) = (state.clone(), job.clone());
     tokio::spawn(async move { run(state, job, id).await });

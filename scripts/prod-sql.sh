@@ -81,7 +81,11 @@ done
 
 # All of psql's output, page by page: one call returns at most 10,000 events
 # or 1 MB. A task that never started its container has no stream at all, and
-# its stopped reason says why.
+# its stopped reason says why. Read a few seconds after the stop: CloudWatch
+# takes that long to ingest the last lines, which are psql's ERROR when there
+# is one -- read at once, the output ended before it and only the exit code
+# said anything had gone wrong.
+sleep 10
 task_id=${task_arn##*/}
 token=""
 while :; do

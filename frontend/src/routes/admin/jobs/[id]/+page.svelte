@@ -95,12 +95,24 @@
   // so a lost object is repairable without a restore. Rebuilding also answers
   // whether each object still holds the bytes recorded when the generation
   // closed. See PLAN.md, "Artifacts: back up, or rebuild?".
-  async function rebuildArtifacts() {
+  async function rebuildArtifacts(force = false) {
+    // Forcing replaces every generation's object with what the database
+    // rebuilds now -- including ones that differ because the results moved
+    // on after the generation closed, which is the KLV workers played.
+    if (
+      force &&
+      !confirm(
+        'Rewrite every generation\'s KLV from the database, replacing objects that differ? ' +
+          'The replaced versions stay in the bucket as noncurrent versions.'
+      )
+    ) {
+      return;
+    }
     error = '';
     notice = '';
     rebuild = null;
     try {
-      rebuild = await api.rebuildArtifacts(jobId);
+      rebuild = await api.rebuildArtifacts(jobId, force);
       const missing = rebuild.filter((r) => r.rewritten).length;
       // A generation written by a different builder is expected to differ:
       // MAGPIE builds these now, so an upgrade legitimately changes the bytes.
@@ -207,7 +219,8 @@
         <button class="btn-secondary" on:click={forceComplete}>Force complete</button>
         <button class="btn-secondary" on:click={purge}>Purge results</button>
         {#if stats.job.job_type === 'leave_generation'}
-          <button class="btn-secondary" on:click={rebuildArtifacts}>Check artifacts</button>
+          <button class="btn-secondary" on:click={() => rebuildArtifacts()}>Check artifacts</button>
+          <button class="btn-destructive" on:click={() => rebuildArtifacts(true)}>Force rebuild</button>
           <button
             class="btn-secondary"
             title="Fold staged results into the rack totals now, rather than at the next half-hourly merge"

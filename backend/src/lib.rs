@@ -45,6 +45,13 @@ pub fn app(state: state::AppState) -> Router {
         .nest("/api/admin", routes::ratings::admin_router())
         .nest("/api", routes::public::router())
         .nest("/api", routes::ratings::public_router())
+        // The pages get their headers from Nginx; the API, which the ALB
+        // serves straight from here, did not have this one. Nothing it
+        // answers should be sniffed into something else.
+        .layer(tower_http::set_header::SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
