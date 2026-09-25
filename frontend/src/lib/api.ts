@@ -116,6 +116,20 @@ export interface JobListItem {
   stalled: boolean;
 }
 
+/**
+ * A job's own row, as the admin actions (create, activate, deactivate,
+ * complete) return it -- not the list's summary, which adds counts.
+ */
+export interface JobRow {
+  id: string;
+  job_type: JobType;
+  status: JobStatus;
+  allocation: number | null;
+  redundancy: number;
+  variant: string;
+  created_at: string;
+}
+
 export interface SprtResult {
   llr: number;
   lower_bound: number;
@@ -453,7 +467,8 @@ export const api = {
   revokeApiKey: (id: string) => del<void>(`/api/me/api-keys/${id}`),
 
   // Public
-  jobs: (page = 0) => get<Page<JobListItem>>(`/api/jobs?page=${page}`),
+  jobs: (page = 0, status?: JobStatus) =>
+    get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
   /** Cursor-paginated; see {@link CursorPage}. `?rack=` returns one rack's whole list. */
   jobResults: (id: string, params: Record<string, string | number> = {}) =>
@@ -520,11 +535,11 @@ export const api = {
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>
-    post<{ job: JobListItem }>('/api/admin/jobs', body),
+    post<{ job: JobRow }>('/api/admin/jobs', body),
   activateJob: (id: string, allocation: number) =>
-    post<JobListItem>(`/api/admin/jobs/${id}/activate`, { allocation }),
-  deactivateJob: (id: string) => post<JobListItem>(`/api/admin/jobs/${id}/deactivate`),
-  completeJob: (id: string) => post<JobListItem>(`/api/admin/jobs/${id}/complete`),
+    post<JobRow>(`/api/admin/jobs/${id}/activate`, { allocation }),
+  deactivateJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/deactivate`),
+  completeJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/complete`),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),

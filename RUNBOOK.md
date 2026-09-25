@@ -68,10 +68,17 @@ PARAMETER_GROUP=$(aws rds describe-db-instances --region "$REGION" --db-instance
 # `terraform apply` puts anything else back.
 INSTANCE_CLASS=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
   --query 'DBInstances[0].DBInstanceClass' --output text)
-# And its storage ceiling, which a point-in-time restore is not promised to
-# carry over: without it the restored instance cannot grow at all.
-MAX_STORAGE=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
-  --query 'DBInstances[0].MaxAllocatedStorage' --output text)
+# And a storage ceiling, which a point-in-time restore is not promised to
+# carry over: without one the restored instance cannot grow at all. RDS
+# refuses a ceiling less than 10% above the allocation, which the source's own
+# is once autoscaling has taken it near the top (and it reads `None` if it was
+# ever switched off), so it is at least a quarter above.
+read -r ALLOCATED MAX_STORAGE < <(aws rds describe-db-instances --region "$REGION" \
+  --db-instance-identifier birdtest \
+  --query 'DBInstances[0].[AllocatedStorage,MaxAllocatedStorage]' --output text)
+[[ "$MAX_STORAGE" =~ ^[0-9]+$ ]] || MAX_STORAGE=0
+MIN_CEILING=$(( (ALLOCATED * 125 + 99) / 100 ))
+(( MAX_STORAGE >= MIN_CEILING )) || MAX_STORAGE=$MIN_CEILING
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
   --target-db-instance-identifier "birdtest-restore-$STAMP" \
@@ -153,6 +160,12 @@ aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type Se
 # Tasks read SSM at start, so this is the whole deploy.
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
 ```
+
+(If the ceiling had to be raised above the stack's `db_allocated_storage * 5`,
+raise `db_allocated_storage` in `prod.tfvars` before the closing apply below:
+it sets the ceiling back to five times that, and RDS refuses one less than a
+tenth above the current allocation. The allocation itself Terraform leaves
+alone — autoscaling owns it.)
 
 Then run §4 (verification), **Check artifacts** on every leave-generation job
 (§3: the database now describes the objects as they were at the restore point,
@@ -273,6 +286,10 @@ file is loaded into a temporary table and inserted from there with `ON CONFLICT
 DO NOTHING`, so a partial re-run is safe — which is all it is for, after §2.0.
 (`COPY` itself has no `ON CONFLICT`: loaded straight in, a re-run stopped at the
 first row already there.)
+
+Save this as `/tmp/copyback.sh` and run it (`bash /tmp/copyback.sh`, or
+detached as below) — not pasted: its `exit` on a failure would end the
+interactive shell.
 
 ```bash
 source /tmp/restore.env

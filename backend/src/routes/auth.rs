@@ -119,7 +119,10 @@ async fn register(
     let email = body.email.trim().to_lowercase();
 
     let mut err = AppError::bad_request("registration details are invalid");
-    if username.len() < 3 || username.len() > 32 {
+    // Characters, as the message says: counted in bytes, an 11-character
+    // name in a CJK script was "longer than 32".
+    let username_chars = username.chars().count();
+    if !(3..=32).contains(&username_chars) {
         err = err.with_field("username", "must be between 3 and 32 characters");
     }
     if !is_bare_address(&email) {

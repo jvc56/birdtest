@@ -401,6 +401,20 @@ struct Lease {
 /// after a MAGPIE upgrade, every row the new builder was asked for -- waited
 /// behind a build this binary will never do.
 async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease>> {
+    // A build that died on its last attempt -- the builder task killed, out
+    // of memory on a 2.4 GB table -- recorded nothing, and its row sat in
+    // `building` for good: past the attempt cap nothing retakes it, and the
+    // admin's retry reopens only `failed` rows. Failed here, with the reason
+    // it can only guess at, so the retry can reopen it.
+    sqlx::query(
+        "UPDATE derived_data
+         SET state = 'failed', leased_until = NULL,
+             error = 'the builder stopped without recording an outcome (killed, or out of memory?)'
+         WHERE state = 'building' AND leased_until < now() AND attempts >= $1",
+    )
+    .bind(MAX_ATTEMPTS)
+    .execute(pool)
+    .await?;
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "SELECT role, name, builder, kwg_id, klv_id, letterdist_id

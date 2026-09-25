@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 487 backend tests.
+--run-ignored all` runs 490 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -1706,6 +1706,9 @@ below.
   `public_api::the_job_list_paginates_and_clamps_its_page_size`,
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`; ties had no
   `id` tie-break.)*
+- `A-PUBLIC-1b` `?status=` filters the job list and its total. *(Covered:
+  `public_api::the_job_list_filters_by_status`.)* (Eighteenth audit.) Deleting
+  a job ends its open streams (`sse::tests::closing_a_job_ends_its_streams`).
 - `A-PUBLIC-2` Job detail returns the right stats block for each job type, and
   404s for an unknown id. *(Covered:
   `public_api::job_detail_carries_the_stats_block_of_its_type`.)*

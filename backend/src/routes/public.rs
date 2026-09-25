@@ -33,6 +33,17 @@ pub struct PageQuery {
     pub per_page: Option<i64>,
 }
 
+/// The job list's query: a page, and optionally only jobs of one status --
+/// the home page's "active jobs" filtered the newest page in the browser,
+/// and lost every active job older than it.
+#[derive(Deserialize)]
+struct JobListQuery {
+    #[serde(default)]
+    page: i64,
+    per_page: Option<i64>,
+    status: Option<crate::models::job::JobStatus>,
+}
+
 #[derive(Serialize)]
 struct JobListItem {
     id: Uuid,
@@ -59,7 +70,7 @@ struct JobListItem {
 
 async fn list_jobs(
     State(state): State<AppState>,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<JobListQuery>,
 ) -> AppResult<Json<super::Page<JobListItem>>> {
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
@@ -107,17 +118,22 @@ async fn list_jobs(
          LEFT JOIN job_game_pair_config pc ON pc.job_id = j.id
          LEFT JOIN job_opening_rack_config rc ON rc.job_id = j.id
          LEFT JOIN job_leave_config lc ON lc.job_id = j.id
+         WHERE $3::job_status IS NULL OR j.status = $3
          ORDER BY j.created_at DESC, j.id DESC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
     .bind(offset)
+    .bind(query.status)
     .fetch_all(&state.read_pool)
     .await?;
 
-    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs")
-        .fetch_one(&state.read_pool)
-        .await?;
+    let total = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM jobs WHERE $1::job_status IS NULL OR status = $1",
+    )
+    .bind(query.status)
+    .fetch_one(&state.read_pool)
+    .await?;
 
     let items = rows
         .into_iter()

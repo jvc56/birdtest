@@ -244,11 +244,23 @@ pub async fn refresh_payload(
 /// read the payload from before it -- and put the old allocation back in
 /// the form. A build that started before this is not kept either.
 pub fn forget(job_id: Uuid) {
-    PAYLOADS
-        .lock()
-        .expect("stats cache poisoned")
-        .insert(job_id, CachedPayload { started: std::time::Instant::now(), json: None });
+    let now = std::time::Instant::now();
+    PAYLOADS.lock().expect("stats cache poisoned").remove(&job_id);
+    // Kept apart from the payloads, and for longer than any build takes:
+    // pruned with them after `max_age`, a marker was gone by the time a build
+    // slower than that finished, and the build -- begun before the action --
+    // was kept and pushed.
+    let mut forgotten = FORGOTTEN.lock().expect("stats cache poisoned");
+    forgotten.retain(|_, at| now.duration_since(*at) < FORGOTTEN_KEPT);
+    forgotten.insert(job_id, now);
 }
+
+/// Longer than any stats build can run: its statements are bounded by the
+/// display pool's statement timeout.
+const FORGOTTEN_KEPT: std::time::Duration = std::time::Duration::from_secs(3600);
+
+static FORGOTTEN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// Builds from the job's row as it is when the build starts: one passed in,
 /// read before a wait for the build lock, could predate an admin action the
@@ -270,19 +282,24 @@ async fn build_payload(
     if max_age.is_zero() {
         return Ok((json, true));
     }
+    let forgotten_after_start = FORGOTTEN
+        .lock()
+        .expect("stats cache poisoned")
+        .get(&job_id)
+        .is_some_and(|at| *at > started);
     let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
+    let superseded = forgotten_after_start
+        || payloads.get(&job_id).is_some_and(|entry| entry.started > started);
     payloads.retain(|_, entry| entry.started.elapsed() < max_age);
-    let superseded = payloads.get(&job_id).is_some_and(|entry| entry.started > started);
     if !superseded {
-        payloads.insert(job_id, CachedPayload { started, json: Some(json.clone()) });
+        payloads.insert(job_id, CachedPayload { started, json: json.clone() });
     }
     Ok((json, !superseded))
 }
 
 struct CachedPayload {
     started: std::time::Instant,
-    /// `None`: forgotten at `started`.
-    json: Option<std::sync::Arc<str>>,
+    json: std::sync::Arc<str>,
 }
 
 static PAYLOADS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, CachedPayload>>> =
@@ -319,7 +336,7 @@ fn cached_payload(
         .filter(|entry| {
             entry.started.elapsed() < max_age || since.is_some_and(|since| entry.started >= since)
         })
-        .and_then(|entry| entry.json.clone())
+        .map(|entry| entry.json.clone())
 }
 
 pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {

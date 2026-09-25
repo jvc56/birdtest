@@ -110,7 +110,22 @@ where
         axum::extract::Path::<T>::from_request_parts(parts, state)
             .await
             .map(|axum::extract::Path(value)| ApiPath(value))
-            .map_err(|rejection| AppError::not_found(format!("no such resource: {rejection}")))
+            .map_err(|rejection| {
+                use axum::extract::rejection::PathRejection;
+                match rejection {
+                    // A route and its handler that disagree about the path:
+                    // the server's fault, not the request's.
+                    PathRejection::MissingPathParams(_) => {
+                        AppError::internal(format!("path extraction failed: {rejection}"))
+                    }
+                    // The parser's own words (UUID grammar and the like)
+                    // meant nothing on a page; they go to the debug log.
+                    _ => {
+                        tracing::debug!(%rejection, "a path that does not parse");
+                        AppError::not_found("no such resource")
+                    }
+                }
+            })
     }
 }
 

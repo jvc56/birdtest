@@ -192,6 +192,33 @@ async fn lock_pool_fit(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<()> 
     Ok(())
 }
 
+/// Marks every pool's newest fit for a refit (`evidence_games = NULL`), for a
+/// purge or delete of a job whose results may have been in it: the sweep's
+/// cheap check compares a sum of `games_completed`, which a purge and a re-run
+/// to the same count leave where it was. Under every pool's fit lock, in pool
+/// order: a fit that read the pools before the purge committed would
+/// otherwise write its pre-purge sum back over the mark, or become the newest
+/// run itself, and the purged results stay in the ratings.
+pub async fn mark_every_pool_for_refit(conn: &mut PgConnection) -> AppResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext(id::text)) FROM rating_pools ORDER BY id")
+        .bind(RATING_LOCK_NAMESPACE)
+        .execute(&mut *conn)
+        .await?;
+    // Each pool's newest run, found by a seek into the pool's index --
+    // walking every run to find them was most of a second, inside the purge's
+    // locks, at a month's runs for a few dozen pools.
+    sqlx::query(
+        "UPDATE rating_runs r SET evidence_games = NULL
+           FROM rating_pools p
+           CROSS JOIN LATERAL (SELECT x.id FROM rating_runs x WHERE x.pool_id = p.id
+                               ORDER BY x.computed_at DESC, x.id DESC LIMIT 1) newest
+          WHERE r.id = newest.id AND r.evidence_games IS NOT NULL",
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Refits a pool from scratch and stores the result as a new run.
 ///
 /// Always a full refit, never a patch: adding or removing a config changes what

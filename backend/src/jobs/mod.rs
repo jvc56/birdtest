@@ -86,6 +86,10 @@ struct HoldsInner {
     /// Jobs whose claims-holding hold ended without committing, and until
     /// when their claims are not reclaimed.
     reclaim_not_before: std::collections::HashMap<Uuid, std::time::Instant>,
+    /// Per job, how many claims holds (purges and deletes) have been taken:
+    /// what an action that waited on the job's row compares, since the hold
+    /// itself can be gone by the time it wakes.
+    claims_holds_taken: std::collections::HashMap<Uuid, u64>,
 }
 
 /// What a [`DispatchHold`] holds besides the job's dispatch lock.
@@ -117,7 +121,19 @@ impl DispatchHolds {
             return None;
         }
         counts[HoldKind::Claims as usize] += 1;
+        *inner.claims_holds_taken.entry(job_id).or_insert(0) += 1;
         Some(DispatchHold { holds: self.clone(), job_id, kind: HoldKind::Claims, grace, committed: false })
+    }
+
+    /// How many purges or deletes of the job have started in this process.
+    pub fn claims_holds_taken(&self, job_id: Uuid) -> u64 {
+        self.0
+            .lock()
+            .expect("dispatch holds poisoned")
+            .claims_holds_taken
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Whether claims should skip the job.
@@ -777,5 +793,8 @@ mod holds_tests {
         drop(first);
         assert!(holds.try_hold_claims(job, grace).is_some());
         drop(seeding);
+        // Counted, so an action that waited on the job's row can tell a purge
+        // came and went meanwhile.
+        assert_eq!(holds.claims_holds_taken(job), 2);
     }
 }

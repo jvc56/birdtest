@@ -10,8 +10,9 @@
   // than the whole page broken, and is not an unhandled rejection.
   onMount(async () => {
     try {
-      const jobs = await api.jobs();
-      active = jobs.items.filter((job) => job.status === 'active');
+      // Filtered by the server: filtered here, only the newest page's
+      // active jobs were ever shown.
+      active = (await api.jobs(0, 'active')).items;
     } catch {
       active = [];
     }

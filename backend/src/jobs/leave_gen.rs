@@ -1220,6 +1220,9 @@ pub async fn run_transition(
     let key = artifact_key(job_id, generation);
     artifacts.put(&key, klv).await?;
     close_generation(pool, job_id, generation, &key, &sha256, &builders.klv(), config).await?;
+    // The generation closed -- and the job perhaps completed -- tens of
+    // seconds after the last submission: nothing else would tell open pages.
+    crate::routes::worker::push_after_change(state, job_id);
     Ok(key)
 }
 

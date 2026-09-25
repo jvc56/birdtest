@@ -345,6 +345,21 @@ docker push ...   # all three, then apply with backend_image, derived_builder_im
 The backend image fetches MAGPIE at `docker/Dockerfile`'s `MAGPIE_COMMIT`
 from GitHub, so that commit must be pushed to `birdtest-contribute` first.
 
+**Check that the alarms reach you** after the first apply, and after any
+change to the alerts topic: nothing else will say an alert was dropped.
+
+```bash
+aws cloudwatch set-alarm-state --alarm-name birdtest-backup-stale \
+  --state-value ALARM --state-reason "testing the alert path"     # a mail arrives
+aws rds describe-event-subscriptions --subscription-name birdtest-db-storage \
+  --query 'EventSubscriptionsList[0].Status' --output text      # "active"
+```
+
+and run the backup task once with a failing command (`--overrides` with
+`"command": ["sh", "-c", "exit 1"]` on the backup task definition): the failure
+mail arrives, and `AWS/Events FailedInvocations` for `birdtest-backup-failed`
+stays 0.
+
 **SES starts in the sandbox.** A new account's SES sends only to verified
 addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
 is granted every registration and password reset to anyone else fails. Request

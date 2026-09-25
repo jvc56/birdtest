@@ -172,8 +172,14 @@ impl From<sqlx::Error> for AppError {
                     },
                     _ => AppError::internal(format!("database error: {db}")),
                 };
-                if error.status.is_server_error() {
-                    error.message = format!("database error: {db}");
+                // The database's own words go to the log, never to the
+                // client: a 500's are scrubbed when it is rendered, and a
+                // 503's say "try again" in words of our own. Written over the
+                // 503's message, as they were, they reached the page once only
+                // 500s were scrubbed ("database error: canceling statement due
+                // to statement timeout").
+                if error.status == StatusCode::SERVICE_UNAVAILABLE {
+                    tracing::warn!(code = ?code, error = %db, "database busy");
                 }
                 error.db_code = code;
                 error
@@ -359,6 +365,24 @@ mod tests {
         let (status, _, body) = rendered(fk).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(!body.to_string().contains("jobs_config_fk"), "{body}");
+    }
+
+    /// A busy database's 503 says to try again in words of our own; the
+    /// database's message (a statement timeout, a lock wait given up) was
+    /// written over it and, once only 500s were scrubbed, reached the page.
+    #[tokio::test]
+    async fn a_busy_databases_503_keeps_its_own_message() {
+        for (code, ours) in [
+            (QUERY_CANCELED, "that read took too long and was cancelled"),
+            (LOCK_NOT_AVAILABLE, "that claim is busy; try again shortly"),
+        ] {
+            let err: AppError =
+                db_error(code, "could not obtain lock on row in relation \"task_claims\"").into();
+            let (status, _, body) = rendered(err).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["message"], ours, "{body}");
+            assert!(!body.to_string().contains("task_claims"), "{body}");
+        }
     }
 
     #[test]

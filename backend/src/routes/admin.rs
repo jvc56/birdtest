@@ -1558,7 +1558,7 @@ async fn activate_job(
     ApiJson(body): ApiJson<ActivateBody>,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
-    refuse_while_purging(&state, id)?;
+    let purges = refuse_while_purging(&state, id)?;
 
     if !(0..=100).contains(&body.allocation) {
         return Err(AppError::bad_request("allocation must be between 0 and 100"));
@@ -1580,10 +1580,7 @@ async fn activate_job(
 
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
-    // Again under the row lock: a purge that took the job between the check
-    // above and this lock has now committed, and acting on the emptied job
-    // (completing it, above all) is what the check exists to prevent.
-    refuse_while_purging(&state, id)?;
+    refuse_if_purged_since(&state, id, purges)?;
     if job.status == JobStatus::Completed {
         return Err(AppError::conflict("a completed job cannot be reactivated"));
     }
@@ -1649,14 +1646,11 @@ async fn deactivate_job(
     jar: CookieJar,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
-    refuse_while_purging(&state, id)?;
+    let purges = refuse_while_purging(&state, id)?;
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
-    // Again under the row lock: a purge that took the job between the check
-    // above and this lock has now committed, and acting on the emptied job
-    // (completing it, above all) is what the check exists to prevent.
-    refuse_while_purging(&state, id)?;
+    refuse_if_purged_since(&state, id, purges)?;
     // Completion is final. Flipping a completed job to inactive would be a
     // way around that rule: activation only refuses jobs that are *currently*
     // completed, so deactivate-then-activate would restart it.
@@ -1693,14 +1687,11 @@ async fn complete_job(
     jar: CookieJar,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
-    refuse_while_purging(&state, id)?;
+    let purges = refuse_while_purging(&state, id)?;
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
-    // Again under the row lock: a purge that took the job between the check
-    // above and this lock has now committed, and acting on the emptied job
-    // (completing it, above all) is what the check exists to prevent.
-    refuse_while_purging(&state, id)?;
+    refuse_if_purged_since(&state, id, purges)?;
     let job =
         sqlx::query_as::<_, Job>("UPDATE jobs SET status = 'completed' WHERE id = $1 RETURNING *")
             .bind(id)
@@ -1948,9 +1939,26 @@ fn hold_for_purge_or_delete(state: &AppState, id: Uuid) -> AppResult<crate::jobs
 /// Activating, deactivating or completing a job being purged or deleted would
 /// wait out the whole operation on its row with a pool connection held --
 /// and completing it then finished a job the purge had just emptied.
-fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<()> {
+/// Returns the job's purge count, for [`refuse_if_purged_since`].
+fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<u64> {
+    let taken = state.dispatch_holds.claims_holds_taken(id);
     if state.dispatch_holds.claims_held(id) {
         return Err(AppError::conflict(ALREADY_RUNNING));
+    }
+    Ok(taken)
+}
+
+/// Again under the job's row lock: a purge that took the job between the
+/// first check and the lock has committed by the time the lock is had, and
+/// acting on the emptied job -- completing it, above all, for good -- is what
+/// the check exists to prevent. Compared by count, not by whether a hold is
+/// held: a purge of a job with nothing to do after its commit has released
+/// its hold by the time the waiter wakes.
+fn refuse_if_purged_since(state: &AppState, id: Uuid, taken: u64) -> AppResult<()> {
+    if state.dispatch_holds.claims_holds_taken(id) != taken || state.dispatch_holds.claims_held(id) {
+        return Err(AppError::conflict(
+            "the job was purged while this waited for it; look at it again before acting",
+        ));
     }
     Ok(())
 }
@@ -2116,22 +2124,9 @@ async fn purge_body(
     // caught up.
     crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     contributions.give_back(&mut tx).await?;
-    // Every pool's newest fit is marked for a refit: the sweep's cheap check
-    // compares a sum of `games_completed`, which a purge and a re-run to the
-    // same count leave where it was. NULL is "refit" -- one matrix build per
-    // pool, which is what the sweep did every time before it had the check.
-    sqlx::query(
-        // Each pool's newest run, found by a seek into the pool's index --
-        // walking every run to find them was most of a second, inside the
-        // purge's locks, at a month's runs for a few dozen pools.
-        "UPDATE rating_runs r SET evidence_games = NULL
-           FROM rating_pools p
-           CROSS JOIN LATERAL (SELECT x.id FROM rating_runs x WHERE x.pool_id = p.id
-                               ORDER BY x.computed_at DESC, x.id DESC LIMIT 1) newest
-          WHERE r.id = newest.id AND r.evidence_games IS NOT NULL",
-    )
-    .execute(&mut *tx)
-    .await?;
+    // One matrix build per pool on the next sweep, which is what the sweep
+    // did every time before it had its cheap check.
+    crate::ratings::mark_every_pool_for_refit(&mut tx).await?;
     // Exports describe results this purge deletes. A row left saying `ready`
     // would hand an admin -- and, once the job completed again, every
     // download of its results -- a stable-looking artifact of a job that no
@@ -2229,22 +2224,13 @@ async fn delete_body(
     }
     contributions.give_back(&mut tx).await?;
     // As a purge does: the pools this job fed must refit.
-    sqlx::query(
-        // Each pool's newest run, found by a seek into the pool's index --
-        // walking every run to find them was most of a second, inside the
-        // purge's locks, at a month's runs for a few dozen pools.
-        "UPDATE rating_runs r SET evidence_games = NULL
-           FROM rating_pools p
-           CROSS JOIN LATERAL (SELECT x.id FROM rating_runs x WHERE x.pool_id = p.id
-                               ORDER BY x.computed_at DESC, x.id DESC LIMIT 1) newest
-          WHERE r.id = newest.id AND r.evidence_games IS NOT NULL",
-    )
-    .execute(&mut *tx)
-    .await?;
+    crate::ratings::mark_every_pool_for_refit(&mut tx).await?;
     tx.commit().await?;
     hold.committed();
-    // Nothing to push: the job is gone, and its page's stream answers 404.
+    // Nothing to push: the job is gone. Its open streams are ended; the pages
+    // reconnect, are answered 404, and stop.
     crate::jobstats::forget(id);
+    state.sse.close(id);
     // Tidiness only: a remembered answer for a job that no longer exists is
     // never asked for, but there is no reason to keep it.
     state.derived_ready.forget(id);

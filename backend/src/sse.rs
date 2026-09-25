@@ -31,6 +31,14 @@ impl SseBroadcaster {
         sender.subscribe()
     }
 
+    /// Ends every open stream of `job_id`: its channel's sender is dropped,
+    /// so each subscriber's stream finishes. For a deleted job, whose open
+    /// pages otherwise stayed "live" on keep-alives for as long as they were
+    /// open; reconnecting, they are answered 404 and stop.
+    pub fn close(&self, job_id: Uuid) {
+        self.channels.lock().expect("sse channel map poisoned").remove(&job_id);
+    }
+
     /// Whether anyone is watching `job_id`. The submission path asks before
     /// computing a stats payload: building one costs several aggregates over
     /// the job's results, and paying that on every submission to a job nobody
@@ -99,6 +107,21 @@ impl SseBroadcaster {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Closing a job's channel ends its open streams: a deleted job's pages
+    /// otherwise stayed "live" on keep-alives.
+    #[tokio::test]
+    async fn closing_a_job_ends_its_streams() {
+        let sse = SseBroadcaster::new();
+        let job = Uuid::new_v4();
+        let mut receiver = sse.subscribe(job);
+        sse.close(job);
+        assert!(matches!(
+            receiver.recv().await,
+            Err(tokio::sync::broadcast::error::RecvError::Closed)
+        ));
+        assert!(!sse.has_subscribers(job));
+    }
 
     /// A burst of submissions must not spawn a payload build each: the first
     /// owns the loop, the rest only mark it to go round once more.

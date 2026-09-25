@@ -101,7 +101,11 @@ resource "aws_db_instance" "main" {
   deletion_protection       = true
 
   lifecycle {
-    ignore_changes = [password]
+    # allocated_storage too: storage autoscaling grows it, and an apply that
+    # set it back to the variable would be asking RDS to shrink the volume,
+    # which it refuses -- every apply after the first autoscaling step failed.
+    # The variable is the starting size; max_allocated_storage is the bound.
+    ignore_changes = [password, allocated_storage]
   }
 
   tags = local.tags

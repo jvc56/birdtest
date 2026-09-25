@@ -163,6 +163,29 @@ async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
 // Jobs
 // ---------------------------------------------------------------------------
 
+/// A-PUBLIC-1b: `?status=` filters the job list and its total by status --
+/// the home page's active jobs, which it once filtered from the newest page
+/// in the browser and so lost every active job older than it.
+#[tokio::test]
+async fn the_job_list_filters_by_status() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let admin = db.user("root", true).await;
+    let active = db.bare_job("games", 1, admin).await;
+    let inactive = db.bare_job("games", 1, admin).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+        .bind(inactive)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, body) = send(&app, get_request("/api/jobs?status=active", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["total"], 1, "{body}");
+    assert_eq!(body["items"][0]["id"], active.to_string(), "{body}");
+    let (status, body) = send(&app, get_request("/api/jobs?status=bogus", &[])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
 /// A-PUBLIC-1: the job list pages newest first with a total, and `per_page`
 /// is clamped to 1..=500 and a negative page read as the first -- so no
 /// request can ask for the whole table in one page.

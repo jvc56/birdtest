@@ -635,7 +635,7 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
 
 1. User fills out the registration form (`/register`) with username, email, and password.
 2. The server validates, and returns `400` with field-level errors listing **every** problem at once rather than the first:
-   - Username is 3–32 characters, trimmed, and unique whatever its case (a
+   - Username is 3–32 characters (counted as characters, not bytes), trimmed, and unique whatever its case (a
      unique index on `lower(username)`): "Josh" and "josh" side by side on the
      public lists is an impersonation.
    - Email is one bare address — `local@domain.tld`, printable ASCII, none of
@@ -4702,7 +4702,7 @@ do not exist.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated. |
+| `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated; `?status=active` (or `inactive`, `completed`) lists only those, with a matching total. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics. |
 | `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one a second. |
@@ -6597,8 +6597,8 @@ Ten audits of this repository each left a findings record (`AUDIT_FINDINGS*.md`,
 now deleted; they are in the git history up to the commit that removed them).
 The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
 the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md`,
-the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md` and
-the seventeenth's `AUDIT_FINDINGS_13.md`.
+the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md`,
+the seventeenth's `AUDIT_FINDINGS_13.md` and the eighteenth's `AUDIT_FINDINGS_14.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -6832,6 +6832,13 @@ what would make it worth revisiting.
   an entry per claim on the hottest write table for one view.
 
 ### Abuse and input
+
+- **A username may be any Unicode.** `trim()` leaves zero-width and bidi
+  characters, and lookalike letters from other scripts are distinct, so
+  "josh" with a zero-width space, or in Cyrillic, gets past the
+  case-insensitive uniqueness meant to stop impersonation. *Open (eighteenth
+  audit):* refuse format and control characters, normalize (NFKC), or restrict
+  names to a script — a product decision.
 
 - **Recovering an account does not revoke its API keys.** A password reset and
   "sign out everywhere" end sessions; keys an attacker made while in control

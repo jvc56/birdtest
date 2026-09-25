@@ -606,7 +606,8 @@ async fn try_claim_from_job(
                 .await
                 .map_err(|e| JobClaimError::Fatal(e.into()))?;
             tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
-            crate::jobstats::forget(job.id);
+            // No submission is coming to push this to open pages.
+            crate::routes::worker::push_after_change(state, job.id);
             Ok(None)
         }
         Acquired::NeedsUniverse { generation } => {

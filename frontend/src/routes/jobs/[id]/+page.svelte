@@ -29,7 +29,13 @@
       .catch((e) => (error = e.message));
     // The stream carries the same payload as the REST call, so an update is a
     // straight replacement rather than a merge.
-    return subscribeToJob<JobStats>(jobId, (value) => (stats = value));
+    // A live payload also clears an error the first load hit (a deploy's
+    // 503): the page otherwise stayed on the error with the stats arriving
+    // behind it.
+    return subscribeToJob<JobStats>(jobId, (value) => {
+      stats = value;
+      error = '';
+    });
   });
 
   async function lookupRack() {
