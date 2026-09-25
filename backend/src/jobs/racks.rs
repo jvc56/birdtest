@@ -122,6 +122,12 @@ impl LetterDistribution {
             if token.len() > MAGPIE_MAX_LETTER_BYTES || cols[1].len() > MAGPIE_MAX_LETTER_BYTES {
                 return Err(malformed(line, "a letter longer than 4 bytes"));
             }
+            // The fullwidth display forms, when given, have MAGPIE's parser's
+            // own ceiling (5 bytes; a fullwidth letter is 3): past it they
+            // were copied without their terminator.
+            if cols.len() == 7 && (cols[5].len() > 5 || cols[6].len() > 5) {
+                return Err(malformed(line, "a display form longer than 5 bytes"));
+            }
             // MAGPIE's string_to_int allows surrounding blanks around numbers.
             fn number(c: &str) -> &str {
                 c.trim_matches([' ', '\t'])
@@ -561,6 +567,7 @@ mod tests {
             ("C,\r,c,2,3,0\n", "a field that is only a carriage return"),
             ("A,a,256,1,1\n", "a count above 255"),
             ("ABCDE,abcde,1,1,1\n", "a five-byte letter"),
+            ("A,a,1,1,1,AAAAAA,a\n", "a six-byte display form"),
             ("A,a,1,1\n", "four columns"),
             ("A,a,1,1,1,A\n", "six columns"),
             ("A,a,1,one,1\n", "a non-integer score"),

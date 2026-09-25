@@ -36,12 +36,18 @@ jobs:
       - uses: actions/checkout@v4
       - name: Which MAGPIE
         id: magpie-ref
+        # Through the environment, not pasted into the script: a dispatched
+        # ref is free text.
+        env:
+          LEG: ${{ matrix.magpie }}
+          HEAD_REF: ${{ inputs.magpie_ref || 'birdtest-contribute' }}
         run: |
-          if [ "${{ matrix.magpie }}" = pin ]; then
-            echo "ref=$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)" >> "$GITHUB_OUTPUT"
+          if [ "$LEG" = pin ]; then
+            ref="$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)"
           else
-            echo "ref=${{ inputs.magpie_ref || 'birdtest-contribute' }}" >> "$GITHUB_OUTPUT"
+            ref="$(printf '%s' "$HEAD_REF" | tr -d '\n')"
           fi
+          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE

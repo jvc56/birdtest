@@ -30,6 +30,15 @@
   // imports, so a reload (or a poll that gave up) otherwise lost a staged
   // import, and the only way on was to download it again.
   const IMPORT_KEY = 'birdtest:input-data-import';
+  // Forgets the stored import only if it is still `id`: another started since
+  // is kept.
+  const forgetIfStored = (id: string) => {
+    try {
+      if (localStorage.getItem(IMPORT_KEY) === id) localStorage.removeItem(IMPORT_KEY);
+    } catch {
+      // Storage unavailable: nothing stored.
+    }
+  };
   const remember = (id: string | null) => {
     try {
       if (id) localStorage.setItem(IMPORT_KEY, id);
@@ -82,6 +91,10 @@
       });
       remember(started.id);
       inserted = null;
+      // The previous import off the page at once: left there, its Insert
+      // stayed live until the new one's first read, and confirming it forgot
+      // the new one.
+      current = null;
       watcher.watch(started.id);
     } catch (e) {
       error = errorText(e);
@@ -92,18 +105,24 @@
 
   async function confirm() {
     if (!current) return;
+    // This import, throughout: `current` may be another one by the time an
+    // await returns.
+    const id = current.id;
     busy = true;
     error = '';
     try {
-      const confirmed = await api.confirmImport(current.id);
-      remember(null);
+      const confirmed = await api.confirmImport(id);
+      forgetIfStored(id);
       // What the server inserted, not what was staged: rows another import
       // confirmed first are skipped.
       inserted = confirmed.inserted;
-      // Confirmed whatever the next read says: a failed read left the button
-      // live, and a second click was a 409.
-      current = { ...current, state: 'confirmed' };
-      current = await api.getImport(current.id);
+      if (current?.id === id) {
+        // Confirmed whatever the next read says: a failed read left the
+        // button live, and a second click was a 409.
+        current = { ...current, state: 'confirmed' };
+        const read = await api.getImport(id);
+        if (current?.id === id) current = read;
+      }
       await load();
     } catch (e) {
       error = (e as Error).message;

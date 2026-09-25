@@ -1500,6 +1500,36 @@ async fn the_leave_results_feed_pages_through_every_generation_in_order() {
     assert_eq!(seen, expected, "newest generation first, then by rack");
 }
 
+/// I-LEAVE-16b: a made-up cursor costs a page, not a walk. The feed read its
+/// generations `current - 1` at a time from the cursor's, so a cursor naming
+/// generation 2,147,483,647 stepped down one empty read at a time on the
+/// display pool, for as long as the client waited. It now goes from an empty
+/// generation to the next one with rows in one probe.
+#[tokio::test]
+async fn a_made_up_generation_in_a_cursor_costs_one_page() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    {
+        let mut conn = db.pool.acquire().await.unwrap();
+        let data = birdtest::jobs::load_job_data(&mut conn, job).await.unwrap();
+        birdtest::jobs::leave_gen::seed_generation(&mut conn, job, 2, &data.letterdist)
+            .await
+            .unwrap();
+    }
+    let app = birdtest::app(db.state().await);
+    let forged = birdtest::routes::encode_cursor(&[i32::MAX.to_string(), String::new()]);
+
+    let started = std::time::Instant::now();
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{job}/results?per_page=5&cursor={forged}"), &[]))
+            .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 5, "{body}");
+    assert!(items.iter().all(|i| i["generation"] == 2), "the newest real generation: {body}");
+}
+
 /// Claims one leave task and returns the assignment, without submitting.
 async fn claim_one(app: &axum::Router) -> serde_json::Value {
     let (status, body) =

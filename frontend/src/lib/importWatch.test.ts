@@ -133,6 +133,15 @@ describe('F-IMPORT-1 import polling', () => {
     expect(watcher.polling).toBe(true);
   });
 
+  it('a watch after stop starts nothing', async () => {
+    const { reads, watcher } = harness();
+    watcher.stop();
+    watcher.watch('late');
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(reads).toEqual([]);
+    expect(watcher.polling).toBe(false);
+  });
+
   it('stop ignores answers still in flight', async () => {
     const { states, reads, watcher } = harness();
     watcher.watch('a');

@@ -297,7 +297,7 @@ A first deployment, in order (each step is described below):
    `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 -var scheduled_tasks_enabled=false`
    -- the scheduled builder and backup would fail against the placeholder
    parameters until step 6. Then pin the zones the stack chose:
-   `grep -q '^azs' infra/prod.tfvars || printf '\nazs = %s\n' "$(terraform -chdir=infra output -json azs)" >> infra/prod.tfvars`. Left to
+   `AZS=$(terraform -chdir=infra output -json azs) && ! grep -q '^azs' infra/prod.tfvars && printf '\nazs = %s\n' "$AZS" >> infra/prod.tfvars`. Left to
    the default, the pair is recomputed on every plan, and a change to what the
    region reports would plan to replace the subnets the database sits in.
 5. Add the SES DNS records straight away (the `ses_dkim_tokens` and

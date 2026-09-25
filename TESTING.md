@@ -69,8 +69,8 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 166 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::public` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
-| 1F Frontend unit | 111 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 144 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 1F Frontend unit | 112 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 145 | `backend/tests/`: `leave_gen.rs` (28), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 168 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (18), `public_api.rs` (11), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 506 backend tests (the per-tier counts above are
+--run-ignored all` runs 507 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
 they had drifted by up to 17).
 
@@ -264,7 +264,8 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
   audit; since the twenty-fourth, also refused as MAGPIE refuses them or
   cannot hold them: a CRLF blank line (a lone `\r`), a field that is only
   `\r`, a count above 255 (MAGPIE keeps it in a byte), and a letter longer
-  than 4 bytes (MAGPIE's shipped maximum; some of its buffers hold no more).)
+  than 4 bytes (MAGPIE's shipped maximum; some of its buffers hold no more),
+  and, since the twenty-fifth, a fullwidth display form longer than 5 bytes.)
 - `U-ERR-1` Each `AppError` constructor maps to its documented HTTP status:
   `bad_request` → 400, `unauthorized` → 401, `forbidden` → 403, `not_found` →
   404, `conflict` → 409, `rate_limited` → 429, `internal` → 500. *(Covered:
@@ -597,7 +598,9 @@ Each entry's tests are the `describe` block named for its id.
   one's poll and forgot its id, and Insert then confirmed the wrong import); a
   503 or a network failure keeps it polling; a 404 forgets the import, a 401
   keeps it and reports the lapsed session; an older read's error after a newer
-  success is ignored; stopping ignores answers in flight. *(Covered:
+  success is ignored; stopping ignores answers in flight, and a watch after
+  stop starts nothing (a start the admin left the page during began a poll
+  nothing could clear). *(Covered:
   `importWatch.test.ts`.)* (Twenty-fourth audit: this logic was wrong three
   audits running.)
 
@@ -1145,6 +1148,13 @@ job creation touches needs one caller here.
   and in the database's `rack` order within one, across the boundary between
   two generations. *(Covered:
   `leave_gen::the_leave_results_feed_pages_through_every_generation_in_order`.)*
+- `I-LEAVE-16b` A made-up cursor on the leave results feed costs a page, not a
+  walk: the feed stepped down from the cursor's generation one empty read at a
+  time, so a cursor naming generation 2,147,483,647 held a display-pool
+  connection for as long as the client waited. It now goes to the next
+  generation with rows in one probe. *(Covered:
+  `leave_gen::a_made_up_generation_in_a_cursor_costs_one_page`.)* (Twenty-fifth
+  audit.)
 - `I-LEAVE-17` **A count no game could produce is refused, because staged it
   wedges the generation.** A result reporting `i64::MAX` occurrences is a `400`
   and stages nothing, and an honest result for the same claim is then accepted
@@ -2623,7 +2633,7 @@ GitHub Actions.
 - **restore-roundtrip** — the schema applied to an empty database (the
   migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`).
 - **backup-drill** — Postgres and MinIO up, the schema applied, then
-  `scripts/backup-drill-check.sh` (`S-BACKUP-1`..`3`).
+  `scripts/backup-drill-check.sh` (`S-BACKUP-1`..`3`, and `S-BACKUP-2b`).
 
 Nightly failures are an alert rather than a blocked merge, because they are
 slower and more environment-sensitive than a pull request should wait on.

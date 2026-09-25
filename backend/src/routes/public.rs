@@ -430,8 +430,24 @@ async fn job_results(
                 .bind(remaining)
                 .fetch_all(&state.read_pool)
                 .await?;
+                let short = (page.len() as i64) < remaining;
                 rows.extend(page);
-                generation = Some(current - 1);
+                if !short {
+                    break;
+                }
+                // The next generation down that has rows, by one probe of the
+                // primary key -- not `current - 1`: the cursor is the client's,
+                // and a made-up generation of two billion stepped down one
+                // empty read at a time, holding a display-pool connection for
+                // as long as the client cared to wait.
+                generation = sqlx::query_scalar::<_, Option<i32>>(
+                    "SELECT MAX(generation) FROM leave_rack_progress
+                     WHERE job_id = $1 AND generation < $2",
+                )
+                .bind(id)
+                .bind(current)
+                .fetch_one(&state.read_pool)
+                .await?;
             }
 
             if rows.len() as i64 == limit {

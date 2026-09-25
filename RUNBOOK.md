@@ -887,7 +887,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    instance would stop the restore in step 3 at its first object:
 
    ```bash
-   terraform -chdir=infra workspace new dr
+   terraform -chdir=infra workspace select -or-create dr
    # The stack's own settings first, the DR overrides after (a later -var
    # wins): without prod.tfvars every other setting fell back to its default
    # -- a micro instance, 20 GiB, and the fleet's MAGPIE floor back at 0.1.1.
@@ -909,27 +909,37 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    DR_STORAGE_GB=$(aws s3 cp --region $REPLICA_REGION "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4))')
    echo "restoring ${MANIFEST%.manifest.json}: $DR_STORAGE_GB GiB"
    # Everything below needs these; an unset one wrote region = "" (the CLI's
-   # default region, likely the lost one) into dr.tfvars.
-   : "${DR_REGION:?}" "${THIRD_REGION:?}" "${REPLICA_REGION:?}" "${MANIFEST:?}" "${DR_STORAGE_GB:?}"
-   # The DR overrides, in a file of their own beside prod.tfvars, so every
-   # later DR command -- step 4's apply, the ones after it -- carries the same
-   # ones (a later -var-file wins). Every ARN prod.tfvars names in the lost
-   # region is overridden: a task whose secrets live there cannot start.
-   # GITHUB_TOKEN is optional; leave it empty, or create the parameter in
-   # $DR_REGION and put its ARN here. Fill in the <...> before applying.
-   # printf, not a heredoc: copied from this indented list, a heredoc's
-   # closing EOF keeps its indent and never ends it.
-   printf '%s\n' \
-     "region                     = \"$DR_REGION\"" \
-     "dr_region                  = \"$THIRD_REGION\"" \
-     'name_suffix                = "-dr"' \
-     "db_allocated_storage       = $DR_STORAGE_GB" \
-     'github_token_parameter_arn = ""' \
-     "acm_certificate_arn        = \"<a certificate issued in $DR_REGION>\"" \
-     "backend_image              = \"<pullable from $DR_REGION>\"" \
-     "derived_builder_image      = \"<pullable from $DR_REGION>\"" \
-     "frontend_image             = \"<pullable from $DR_REGION>\"" \
-     > infra/dr.tfvars
+   # default region, likely the lost one) into dr.tfvars. One `if`, not a
+   # `: "${X:?}"` line: pasted into a terminal, a failed expansion abandons
+   # only its own line, and the lines after it ran anyway.
+   # An existing one for this region -- filled in, then this block pasted
+   # again -- is kept; one for another (a drill's, §6) is not reused.
+   if [ -e infra/dr.tfvars ] && grep -q "^region *= *\"$DR_REGION\"" infra/dr.tfvars; then
+     echo "infra/dr.tfvars exists for $DR_REGION; kept"
+   elif [ -e infra/dr.tfvars ]; then
+     echo "infra/dr.tfvars is for another region (a drill's?): move it aside first"
+   elif [ -n "$DR_REGION" ] && [ -n "$THIRD_REGION" ] && [ -n "$REPLICA_REGION" ] \
+      && [ -n "$MANIFEST" ] && [ -n "$DR_STORAGE_GB" ]; then
+     # The DR overrides, in a file of their own beside prod.tfvars, so every
+     # later DR command -- step 4's apply, the ones after it -- carries the same
+     # ones (a later -var-file wins). Every ARN prod.tfvars names in the lost
+     # region is overridden: a task whose secrets live there cannot start.
+     # GITHUB_TOKEN is optional; leave it empty, or create the parameter in
+     # $DR_REGION and put its ARN here. Fill in the <...> before applying.
+     # printf, not a heredoc: copied from this indented list, a heredoc's
+     # closing EOF keeps its indent and never ends it.
+     printf '%s\n' \
+       "region                     = \"$DR_REGION\"" \
+       "dr_region                  = \"$THIRD_REGION\"" \
+       'name_suffix                = "-dr"' \
+       "db_allocated_storage       = $DR_STORAGE_GB" \
+       'github_token_parameter_arn = ""' \
+       "acm_certificate_arn        = \"<a certificate issued in $DR_REGION>\"" \
+       "backend_image              = \"<pullable from $DR_REGION>\"" \
+       "derived_builder_image      = \"<pullable from $DR_REGION>\"" \
+       "frontend_image             = \"<pullable from $DR_REGION>\"" \
+       > infra/dr.tfvars
+   else echo "set DR_REGION, THIRD_REGION, REPLICA_REGION, MANIFEST and DR_STORAGE_GB first"; fi
    # Scheduled tasks off until step 4: the derived builder would fail rows
    # whose inputs are not synced yet, and a 03:00 backup would dump the
    # half-restored database as the newest.
@@ -973,15 +983,19 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    ```bash
    # In step 1's shell, or with its variables set again: an empty REPLICA made
    # the source the local root, and --recursive would copy this machine's
-   # files into the Object-Locked bucket, where they stay for 30 days.
-   : "${REPLICA:?}" "${MANIFEST:?}" "${REPLICA_REGION:?}" "${DR_REGION:?}"
-   STAMP=${MANIFEST%.manifest.json}
+   # files into the Object-Locked bucket, where they stay for 30 days. One
+   # `if`, so nothing runs unless every one is set (a `: "${X:?}"` line stops
+   # only itself when pasted into a terminal).
    NEW=s3://$(terraform -chdir=infra output -raw backups_bucket)/pg
-   aws s3 cp --recursive --source-region $REPLICA_REGION --region $DR_REGION \
-     "$REPLICA/$STAMP/" "$NEW/$STAMP/"
-   aws s3 cp --source-region $REPLICA_REGION --region $DR_REGION \
-     "$REPLICA/$MANIFEST" "$NEW/$MANIFEST"
-   echo "$STAMP"   # for the ops shell, which has none of these variables
+   if [ -n "$REPLICA" ] && [ -n "$MANIFEST" ] && [ -n "$REPLICA_REGION" ] \
+      && [ -n "$DR_REGION" ] && [ "$NEW" != "s3:///pg" ]; then
+     STAMP=${MANIFEST%.manifest.json}
+     aws s3 cp --recursive --source-region $REPLICA_REGION --region $DR_REGION \
+       "$REPLICA/$STAMP/" "$NEW/$STAMP/"
+     aws s3 cp --source-region $REPLICA_REGION --region $DR_REGION \
+       "$REPLICA/$MANIFEST" "$NEW/$MANIFEST"
+     echo "$STAMP"   # for the ops shell, which has none of these variables
+   else echo "set REPLICA, MANIFEST, REPLICA_REGION and DR_REGION (step 1) first"; fi
    ```
 
    This needs `kms:Decrypt` on the lost stack's `backups-dr` key (in
@@ -1015,8 +1029,10 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
 
    ```bash
    # Once, and on a line of its own: a second append redefines the attribute.
-   grep -q '^azs' infra/dr.tfvars \
-     || printf '\nazs = %s\n' "$(terraform -chdir=infra output -json azs)" >> infra/dr.tfvars
+   # Captured first: a failed output wrote a bare `azs = `, which the grep
+   # then took for done.
+   AZS=$(terraform -chdir=infra output -json azs) && ! grep -q '^azs' infra/dr.tfvars \
+     && printf '\nazs = %s\n' "$AZS" >> infra/dr.tfvars
    terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars
    ```
 
@@ -1061,7 +1077,10 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   production instance, whose credentials it does not hold. A failure means the backups are not
   restorable and is the loudest alarm in the system.
 - Twice a year, do §5 by hand into a scratch account or region. The manual
-  drill exists to find the steps that live only in someone's head.
+  drill exists to find the steps that live only in someone's head. Afterwards,
+  move `infra/dr.tfvars` aside (and `terraform workspace delete dr` once the
+  copy is destroyed): a real §5 must not start from the drill's region, size
+  and zones.
 
 ---
 

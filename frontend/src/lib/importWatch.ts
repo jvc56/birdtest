@@ -38,6 +38,9 @@ export function createImportWatcher(hooks: ImportWatchHooks, intervalMs = 1000) 
   // one's poll and forgot its id, and Insert then confirmed the wrong import.)
   let generation = 0;
   let poll: ReturnType<typeof setInterval> | null = null;
+  // Stopped for good: the page is gone. A `watch` after that -- a start the
+  // admin left the page during -- would begin a poll nothing could clear.
+  let stopped = false;
 
   const clear = () => {
     if (poll !== null) {
@@ -49,6 +52,7 @@ export function createImportWatcher(hooks: ImportWatchHooks, intervalMs = 1000) 
   return {
     /** Watches `id`, reading it at once and then every interval. */
     watch(id: string) {
+      if (stopped) return;
       clear();
       const me = ++generation;
       const live = () => me === generation;
@@ -81,8 +85,9 @@ export function createImportWatcher(hooks: ImportWatchHooks, intervalMs = 1000) 
       poll = setInterval(tick, intervalMs);
       tick();
     },
-    /** Stops watching; answers still in flight are ignored. */
+    /** Stops for good; answers still in flight are ignored. */
     stop() {
+      stopped = true;
       generation++;
       clear();
     },

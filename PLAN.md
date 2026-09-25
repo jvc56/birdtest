@@ -6651,7 +6651,8 @@ the seventeenth's `AUDIT_FINDINGS_13.md`, the eighteenth's `AUDIT_FINDINGS_14.md
 the nineteenth's `AUDIT_FINDINGS_15.md`, the twentieth's `AUDIT_FINDINGS_16.md`,
 the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
 `AUDIT_FINDINGS_18.md`, the twenty-third's `AUDIT_FINDINGS_19.md` and the
-twenty-fourth's `AUDIT_FINDINGS_20.md`.
+twenty-fourth's `AUDIT_FINDINGS_20.md` and the twenty-fifth's
+`AUDIT_FINDINGS_21.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
