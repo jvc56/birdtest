@@ -126,8 +126,13 @@ mkdir -p "${WORKDIR}"
 LATEST="$(aws "${s3_args[@]}" s3 ls "s3://${BACKUP_BUCKET}/${BACKUP_PREFIX}/" \
   | awk '$NF ~ /\.manifest\.json$/ {print $NF}' | sort | tail -1)"
 if [[ -z "${LATEST}" ]]; then
-  log "no backups found under s3://${BACKUP_BUCKET}/${BACKUP_PREFIX}/"
-  exit 1
+  # Nothing to drill yet, which is not a drill failure: a new stack (or
+  # RUNBOOK §5's copy) has its schedules turned on before its first 03:00
+  # backup, and on the 1st between 03:00 and 05:00 the drill found an empty
+  # bucket and mailed "backups may not be restorable". A stack that should
+  # have backups and has none is the backup-stale alarm's to report.
+  log "no backups under s3://${BACKUP_BUCKET}/${BACKUP_PREFIX}/ yet; nothing to drill"
+  exit 0
 fi
 STAMP="${LATEST%.manifest.json}"
 log "drilling ${STAMP}"

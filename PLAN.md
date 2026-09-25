@@ -869,7 +869,11 @@ background refresh is a real option and a real cost (staleness on a live
 dashboard, and a cache to keep coherent), so the log line is there to make that
 decision on evidence rather than on a guess about when it starts to matter.
 
-**ETA** is extrapolated from claims completed in the last hour. It is `null` for
+**ETA** is extrapolated from claims completed in the last hour, or since the job
+was last activated if that is more recent (at least a minute): over a whole hour
+a job ten minutes old read six times its real time left. The hour stays a
+constant bound on the scan, so the completed-claims index serves it; the
+activation is a second condition. It is `null` for
 an inactive job and `null` when nothing completed in that window — there is
 nothing to extrapolate from, and a fabricated number is worse than a blank. For
 SPRT jobs the remaining work is measured in units against `max_units`, at the
@@ -6575,12 +6579,14 @@ CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
--- detail view and live push) and the job list's `stalled` flag both ask
--- "how many of this job's claims completed in the last hour / day", and
--- task_claims has no job column, so the alternative plan walks every task of
--- the job and every claim of each -- the job's whole history, for a question
--- about its last hour. Through this index the scan is bounded by the fleet's
--- recent completions instead, whatever the job's age.
+-- detail view and live push) asks "how many of this job's claims completed
+-- in the last hour" (the job list's `stalled` flag reads
+-- `jobs.last_completed_at` instead), and task_claims has no job column, so
+-- the alternative plan walks every task of the job and every claim of each
+-- -- the job's whole history, for a question about its last hour. Through
+-- this index the scan is bounded by the fleet's recent completions instead,
+-- whatever the job's age -- as long as the query's bound is one the planner
+-- can read: a constant `now() - interval '1 hour'`, not a parameter.
 CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
 -- Partial for the reason the unique indexes above are.
@@ -6634,8 +6640,9 @@ The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
 the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md`,
 the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md`,
 the seventeenth's `AUDIT_FINDINGS_13.md`, the eighteenth's `AUDIT_FINDINGS_14.md`,
-the nineteenth's `AUDIT_FINDINGS_15.md`, the twentieth's `AUDIT_FINDINGS_16.md`
-and the twenty-first's `AUDIT_FINDINGS_17.md`.
+the nineteenth's `AUDIT_FINDINGS_15.md`, the twentieth's `AUDIT_FINDINGS_16.md`,
+the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
+`AUDIT_FINDINGS_18.md` and the twenty-third's `AUDIT_FINDINGS_19.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says

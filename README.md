@@ -285,7 +285,7 @@ A first deployment, in order (each step is described below):
    REGION=us-east-1   # the stack's region, as in prod.tfvars
    aws acm request-certificate --region "$REGION" --domain-name <hostname> --validation-method DNS
    aws acm describe-certificate --region "$REGION" --certificate-arn <arn> \
-     --query 'Certificate.DomainValidationOptions[0].ResourceRecord'   # the CNAME to add
+     --query 'Certificate.DomainValidationOptions[0].ResourceRecord'   # the CNAME to add (null for a few seconds: ask again)
    aws acm wait certificate-validated --region "$REGION" --certificate-arn <arn>
    ```
 4. Write `infra/prod.tfvars` with the eight variables that have no default --
@@ -297,7 +297,7 @@ A first deployment, in order (each step is described below):
    `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 -var scheduled_tasks_enabled=false`
    -- the scheduled builder and backup would fail against the placeholder
    parameters until step 6. Then pin the zones the stack chose:
-   `azs = <terraform -chdir=infra output -json azs>` in `prod.tfvars`. Left to
+   `echo "azs = $(terraform -chdir=infra output -json azs)" >> infra/prod.tfvars`. Left to
    the default, the pair is recomputed on every plan, and a change to what the
    region reports would plan to replace the subnets the database sits in.
 5. Add the SES DNS records straight away (the `ses_dkim_tokens` and

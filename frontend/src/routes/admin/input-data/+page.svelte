@@ -35,12 +35,15 @@
       // Storage unavailable (a private window): nothing to resume, no harm.
     }
   };
-  // A refusal that asking again will not change: the import is gone, or the id
-  // is not one. Anything else -- a deploy's 503, a network blip -- is worth
-  // asking again about, and must not forget a staged import.
-  const isFinal = (e: unknown) => {
-    const status = e instanceof ApiError ? e.status : 0;
-    return status >= 400 && status < 500 && status !== 408 && status !== 429;
+  // The import is gone, or the id is not one: forget it. A 401 or 403 is
+  // about the session (it lapsed, or "sign out everywhere" ran elsewhere), not
+  // the import -- stop asking, but keep it for after signing in again.
+  // Anything else -- a deploy's 503, a network blip -- is worth asking again.
+  const status = (e: unknown) => (e instanceof ApiError ? e.status : 0);
+  const isGone = (e: unknown) => status(e) === 404 || status(e) === 400;
+  const stopsPolling = (e: unknown) => {
+    const s = status(e);
+    return s >= 400 && s < 500 && s !== 408 && s !== 429;
   };
   async function resume() {
     let id: string | null = null;
@@ -55,11 +58,11 @@
       if (current.state === 'running') watch(id);
       else if (current.state !== 'staged') remember(null);
     } catch (e) {
-      if (isFinal(e)) remember(null);
-      else {
+      if (isGone(e)) remember(null);
+      else if (!stopsPolling(e)) {
         error = errorText(e);
         watch(id);
-      }
+      } else error = errorText(e);
     }
   }
   onMount(() => {
@@ -68,11 +71,19 @@
   });
   onDestroy(() => poll && clearInterval(poll));
 
-  function watch(id: string) {
+  function watch(id: string, now = false) {
     poll && clearInterval(poll);
-    poll = setInterval(async () => {
+    // Reads can overlap (a slow one, then the next tick); only the newest
+    // answer is applied, so a late `running` cannot undo a newer `staged`.
+    let asked = 0;
+    let applied = 0;
+    const tick = async () => {
+      const mine = ++asked;
       try {
-        current = await api.getImport(id);
+        const read = await api.getImport(id);
+        if (mine < applied) return;
+        applied = mine;
+        current = read;
         error = '';
         if (current.state !== 'running') {
           poll && clearInterval(poll);
@@ -85,13 +96,15 @@
         // A deploy's 503 or a network blip used to end it for good, and with
         // no list of imports the staged one could not be found again: the
         // admin downloaded the ~94 MB again instead.
-        if (isFinal(e)) {
+        if (stopsPolling(e)) {
           poll && clearInterval(poll);
           poll = null;
-          remember(null);
+          if (isGone(e)) remember(null);
         }
       }
-    }, 1000);
+    };
+    poll = setInterval(tick, 1000);
+    if (now) tick();
   }
 
   async function start() {
@@ -106,10 +119,10 @@
         git_ref: gitRef.trim() || undefined
       });
       remember(started.id);
-      // Watched before the first read: if that read fails, the poll still
-      // finds the import.
-      watch(started.id);
-      current = await api.getImport(started.id);
+      // The poll's first tick is the first read: a separate one, answering
+      // after a quicker tick had seen the import stage or fail, put the older
+      // `running` back with nothing left polling.
+      watch(started.id, true);
     } catch (e) {
       error = errorText(e);
     } finally {

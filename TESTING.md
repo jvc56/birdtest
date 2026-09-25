@@ -68,7 +68,7 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 164 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (14), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `ratelimit` (2), `routes::public` (2), `exports`, `jobs`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1 Unit | 165 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `ratelimit` (2), `routes::public` (2), `exports`, `jobs`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
 | 1F Frontend unit | 103 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 144 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 168 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (18), `public_api.rs` (11), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 504 backend tests (the per-tier counts above are
+--run-ignored all` runs 505 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
 they had drifted by up to 17).
 
@@ -252,6 +252,16 @@ against it, so a change in ordering silently re-points existing rows.
 
 Every handler returns `AppResult`, so this type decides what a caller sees.
 
+- `U-RACK-10` The parser reads a distribution as MAGPIE does: a comment line,
+  a whitespace-only line, four or six columns, a non-integer score, a vowel
+  flag other than 0 or 1 and a letter with a space round it are each refused,
+  a CRLF ending and a blank line are accepted, and a `#` row is a letter that
+  takes its machine letter. It used to trim, skip `#` lines and want three
+  columns, so job creation passed files every worker then refused, and a `#`
+  letter shifted the numbering. *(Covered:
+  `racks::tests::it_reads_a_distribution_as_magpie_does`,
+  `racks::tests::a_minimal_two_letter_distribution_parses`.)* (Twenty-third
+  audit.)
 - `U-ERR-1` Each `AppError` constructor maps to its documented HTTP status:
   `bad_request` → 400, `unauthorized` → 401, `forbidden` → 403, `not_found` →
   404, `conflict` → 409, `rate_limited` → 429, `internal` → 500. *(Covered:
@@ -1647,7 +1657,10 @@ below.
   `boundaries::made_up_worker_credentials_are_limited_per_address_and_real_ones_are_not`,
   `ratelimit::key_tests::unknown_credentials_pay_their_address_and_known_ones_do_not`.)*
   (Twenty-first audit; the twenty-second's redesign: the first gate refused
-  every worker request from the address, real ones included.)
+  every worker request from the address, real ones included. The
+  twenty-third's order: an unknown credential pays its address first, so a
+  refused flood leaves no per-credential bucket behind -- asserted on the
+  limiter's size.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*
@@ -2186,7 +2199,10 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   *(Covered: `case_opening_racks`, for a static and a simming player, asserting
   the simulated statistics — win%, per-ply stats — are stored too. The static
   player asks for a wordmap, so the job also waits on the derived-file builder
-  and MAGPIE finds its own copy agrees.)*
+  and MAGPIE finds its own copy agrees. A third job uses 3-tile racks: jobs
+  choose a rack size from 1 to 7 and the request does not restate it, and a
+  worker that required full racks refused every such task (MAGPIE `0a69b625`;
+  reproduced, fixed in `34bf6f0c`; twenty-third audit).)*
 - `M-4` One `leave_generation` task lands, is staged, moves the generation's
   live counters, and a merge folds it into `leave_rack_progress`. *(Covered:
   `case_leave`, which also checks that nothing is written into MAGPIE's data

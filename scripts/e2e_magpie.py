@@ -626,6 +626,17 @@ def case_opening_racks(ctx: Context) -> None:
     run_job(ctx, ctx.data, {"job_type": "opening_rack", "player_config_id": simming_player(ctx),
                             "racks_per_batch": 3, "rack_size": 7}, simulated_statistics)
 
+    # A job may choose racks smaller than a full rack (1 to 7 tiles). The
+    # request does not restate the size, so a worker that required full racks
+    # refused every task of such a job (MAGPIE 0a69b625, fixed after it).
+    def three_tile_racks(job_id: str) -> None:
+        page = ctx.get(f"/api/jobs/{job_id}/results", "results")
+        expect(page["items"] and all(len(r["rack"]) == 3 for r in page["items"]),
+               f"expected analysed 3-tile racks: {page['items'][:3]}")
+
+    run_job(ctx, ctx.data, {"job_type": "opening_rack", "player_config_id": static_best_player(ctx),
+                            "racks_per_batch": 20, "rack_size": 3}, three_tile_racks)
+
 
 def case_leave(ctx: Context) -> None:
     """M-4"""

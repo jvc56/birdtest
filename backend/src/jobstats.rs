@@ -802,21 +802,30 @@ async fn estimate_eta(
     // The last hour, or since the job was activated if that is more recent:
     // over a whole hour, a job ten minutes old read six times its real time
     // left, and thirty times at two minutes. At least a minute, so a job's
-    // first few seconds do not read as a burst. The bound is one value for
-    // the whole scan, so the completed-claims index still serves it.
-    let (recent, window_seconds) = sqlx::query_as::<_, (i64, f64)>(
-        "WITH since AS (
-             SELECT least(greatest(now() - interval '1 hour', coalesce($2, now() - interval '1 hour')),
-                          now() - interval '1 minute') AS at
-         )
-         SELECT (SELECT COUNT(*) FROM task_claims c
-                   JOIN tasks t ON t.id = c.task_id
-                  WHERE t.job_id = $1 AND c.state = 'completed'
-                    AND c.completed_at > (SELECT at FROM since)),
-                EXTRACT(EPOCH FROM now() - (SELECT at FROM since))::float8",
+    // first seconds do not read as a burst.
+    //
+    // The hour stays a bound of its own, a constant the planner can read, so
+    // the completed-claims index serves the scan; the activation is a second
+    // condition on the rows it finds. Written as one bound through a CTE, it
+    // reached the planner as a parameter it could not estimate, and every
+    // live push seq-scanned both tables (~200 ms at two million claims, where
+    // this is ~10).
+    let hour = chrono::Duration::hours(1);
+    let now = chrono::Utc::now();
+    let since = job
+        .activated_at
+        .map_or(now - hour, |at| at.max(now - hour))
+        .min(now - chrono::Duration::minutes(1));
+    let window_seconds = (now - since).num_milliseconds() as f64 / 1000.0;
+    let recent = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM task_claims c
+         JOIN tasks t ON t.id = c.task_id
+         WHERE t.job_id = $1 AND c.state = 'completed'
+           AND c.completed_at > now() - interval '1 hour'
+           AND c.completed_at > $2",
     )
     .bind(job.id)
-    .bind(job.activated_at)
+    .bind(since)
     .fetch_one(pool)
     .await?;
 

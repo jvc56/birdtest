@@ -71,27 +71,50 @@ impl LetterDistribution {
         // it (see the field comment).
         let mut machine_letters: Vec<char> = Vec::new();
         let mut unenumerable = None;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+        // Read as MAGPIE reads it (`ld_create_internal`), so that a file this
+        // accepts -- job creation's check -- is one every worker and builder
+        // accepts, numbered the same way: lines split on '\n' with a trailing
+        // '\r' dropped, empty lines skipped and nothing else (no comments, no
+        // trimming: a `#` row is a letter to MAGPIE, and a whitespace-only line
+        // an error), empty fields dropped, then five or seven columns -- upper,
+        // lower, count, score, is_vowel, and the two fullwidth display forms --
+        // with integer count and score and a vowel flag of 0 or 1. This used to
+        // trim, skip `#` lines and want three columns, so a file MAGPIE refused
+        // passed, and a `#` letter shifted every machine letter after it.
+        let malformed = |line: &str, why: &str| {
+            AppError::internal(format!(
+                "malformed letter distribution line in {origin}: {line:?} ({why})"
+            ))
+        };
+        for raw in text.split('\n') {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            if line.is_empty() {
                 continue;
             }
-            // MAGPIE's files carry seven columns — upper, lower, count, score,
-            // is_vowel, and the two fullwidth display forms. Only the letter and
-            // the count matter here; the rest are read by MAGPIE itself.
-            let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() < 3 {
-                return Err(AppError::internal(format!(
-                    "malformed letter distribution line in {origin}: {line:?}"
-                )));
+            let cols: Vec<&str> = line
+                .split(',')
+                .map(|c| c.strip_suffix('\r').unwrap_or(c))
+                .filter(|c| !c.is_empty())
+                .collect();
+            if cols.len() != 5 && cols.len() != 7 {
+                return Err(malformed(line, "expected 5 or 7 columns"));
             }
-            let token = cols[0].trim();
-            let letter = token.chars().next().ok_or_else(|| {
-                AppError::internal(format!("empty letter in {origin}"))
-            })?;
-            let count: u32 = cols[2].trim().parse().map_err(|_| {
+            let token = cols[0];
+            if token.trim() != token || cols[1].trim() != cols[1] {
+                return Err(malformed(line, "space around a letter"));
+            }
+            let letter = token.chars().next().ok_or_else(|| malformed(line, "empty letter"))?;
+            // MAGPIE's string_to_int allows surrounding blanks around numbers.
+            fn number(c: &str) -> &str {
+                c.trim_matches([' ', '\t'])
+            }
+            let count: u32 = number(cols[2]).parse().map_err(|_| {
                 AppError::internal(format!("non-numeric tile count in {origin}: {line:?}"))
             })?;
+            number(cols[3]).parse::<i32>().map_err(|_| malformed(line, "non-numeric score"))?;
+            if !matches!(number(cols[4]), "0" | "1") {
+                return Err(malformed(line, "is_vowel must be 0 or 1"));
+            }
             // A letter listed twice would enumerate every rack holding it
             // twice, and give it two machine-letter numbers.
             if unenumerable.is_none() {
@@ -445,11 +468,11 @@ mod tests {
 
     /// U-RACK-1: the smallest distribution there is. Written out of order, so
     /// the machine-letter numbering (file order) and the enumeration order
-    /// (sorted) visibly differ; with a comment, a blank line and the short
-    /// five-column form, which the parser skips and accepts respectively.
+    /// (sorted) visibly differ; with a blank line, a CRLF ending and the short
+    /// five-column form, which the parser skips and accepts, as MAGPIE does.
     #[test]
     fn a_minimal_two_letter_distribution_parses() {
-        let text = b"# two letters\nB,b,1,3,0\n\nA,a,2,1,1\n";
+        let text = b"B,b,1,3,0\r\n\nA,a,2,1,1\n";
         let distribution = LetterDistribution::parse(text, "two").unwrap();
         assert_eq!(distribution.tiles.len(), 2);
         assert_eq!(count_of(&distribution, 'A'), Some(2));
@@ -499,6 +522,32 @@ mod tests {
         assert!(message.contains("origin-name.csv"), "{message}");
     }
 
+    /// U-RACK-10: what MAGPIE refuses, this refuses, and what MAGPIE numbers,
+    /// this numbers the same. A comment line, a whitespace-only line, the wrong
+    /// column count, a non-integer score, a vowel flag other than 0 or 1 and a
+    /// letter with a space round it are each refused (MAGPIE refuses the first
+    /// five, and would read the last as a two-character letter); a `#` row is a
+    /// letter, and takes its machine letter.
+    #[test]
+    fn it_reads_a_distribution_as_magpie_does() {
+        for (text, why) in [
+            ("# upper,lower,count,score,vowel\nA,a,1,1,1\n", "a comment"),
+            ("A,a,1,1,1\n  \n", "a whitespace-only line"),
+            ("A,a,1,1\n", "four columns"),
+            ("A,a,1,1,1,A\n", "six columns"),
+            ("A,a,1,one,1\n", "a non-integer score"),
+            ("A,a,1,1,2\n", "a vowel flag of 2"),
+            (" A,a,1,1,1\n", "a space before the letter"),
+        ] {
+            // Refused (parse_error panics otherwise), naming the file.
+            let message = parse_error(text);
+            assert!(message.contains("origin-name.csv"), "{why}: {message}");
+        }
+        let hash = LetterDistribution::parse(b"#,#,1,1,0\nA,a,1,1,1\n", "hash").unwrap();
+        assert_eq!(hash.machine_letter('#'), Some(0));
+        assert_eq!(hash.machine_letter('A'), Some(1), "numbered after the `#` row");
+    }
+
     /// U-RACK-2: each malformed shape is refused for its own reason, and every
     /// message names the file it came from.
     #[test]
@@ -507,7 +556,7 @@ mod tests {
             ("A,a,9,1,1\nB,b\n", "malformed letter distribution line"),
             ("A,a,nine,1,1\n", "non-numeric tile count"),
             ("", "contains no tiles"),
-            ("# only a comment\n\n", "contains no tiles"),
+            ("\n\n", "contains no tiles"),
         ];
         for (text, reason) in cases {
             let message = parse_error(text);

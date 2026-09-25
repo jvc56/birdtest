@@ -312,9 +312,11 @@ every table, with their indexes, and stages each table's in an unindexed
 temporary table on the production volume first, plus the WAL the inserts
 write; autoscaling keeps only about a tenth of the volume free and grows it at
 most every six hours. Run the script once with `COPYBACK_DUMP_ONLY=1`: it dumps
-the job's rows and prints their sizes (text; allow about twice the total), and
-stops before loading anything. Compare with `FreeStorageSpace`, raise
-`db_allocated_storage` first if it is close, then run it again without.
+the job's rows and prints their sizes, and stops before loading anything. Allow
+about twice the total (measured: the loaded rows and their indexes came to 1.5
+times the text), plus `db_max_wal_size_mb` (4 GiB by default) for the WAL the
+inserts write (3.2 times the text, measured). Compare with `FreeStorageSpace`,
+raise `db_allocated_storage` first if it is close, then run it again without.
 
 Save this as `/tmp/copyback.sh` — `cat > /tmp/copyback.sh <<'EOF'` … `EOF`,
 the quotes mattering: unquoted, the shell fills in `$JOB` and the rest as it
@@ -345,6 +347,9 @@ case "$SCRATCH_URL" in *"@$ENDPOINT:5432"*) ;; *) echo "could not build SCRATCH_
 source /tmp/restore.env
 grep -qx 'pg_restore exit 0' /tmp/pg_restore.log \
   || { echo "the scratch restore has not finished, or failed" >&2; exit 1; }
+# The dump is in the scratch database now; its files would share the task's
+# disk with the job's rows dumped below.
+rm -rf /tmp/dump
 JOB=00000000-0000-0000-0000-000000000000
 TASKS="SELECT id FROM tasks WHERE job_id = '$JOB'"
 RECORDS="SELECT id FROM position_analysis_records WHERE job_id = '$JOB'"
@@ -901,28 +906,30 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    MANIFEST=$(aws s3 ls --region $REPLICA_REGION "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
    DR_STORAGE_GB=$(aws s3 cp --region $REPLICA_REGION "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4))')
    echo "restoring ${MANIFEST%.manifest.json}: $DR_STORAGE_GB GiB"
-   # The zones: whichever the region offers this account, not "<region>a" and
-   # "<region>b" (ap-northeast-1 offers newer accounts a, c and d). Or leave
-   # azs out: unset, it is the region's first two -- and then pass the
-   # `azs` output (terraform -chdir=infra output -json azs) as -var azs=... in
-   # step 4's apply and every later one, as README pins it in prod.tfvars.
-   aws ec2 describe-availability-zones --region $DR_REGION \
-     --query 'AvailabilityZones[?OptInStatus==`opt-in-not-required`].ZoneName'
+   # The DR overrides, in a file of their own beside prod.tfvars, so every
+   # later DR command -- step 4's apply, the ones after it -- carries the same
+   # ones (a later -var-file wins). Every ARN prod.tfvars names in the lost
+   # region is overridden: a task whose secrets live there cannot start.
+   # GITHUB_TOKEN is optional; leave it empty, or create the parameter in
+   # $DR_REGION and put its ARN here. Fill in the <...> before applying.
+   cat > infra/dr.tfvars <<EOF
+   region                     = "$DR_REGION"
+   dr_region                  = "$THIRD_REGION"
+   name_suffix                = "-dr"
+   db_allocated_storage       = $DR_STORAGE_GB
+   github_token_parameter_arn = ""
+   acm_certificate_arn        = "<a certificate issued in $DR_REGION>"
+   backend_image              = "<pullable from $DR_REGION>"
+   derived_builder_image      = "<pullable from $DR_REGION>"
+   frontend_image             = "<pullable from $DR_REGION>"
+   EOF
    # Scheduled tasks off until step 4: the derived builder would fail rows
    # whose inputs are not synced yet, and a 03:00 backup would dump the
    # half-restored database as the newest.
-   # And every ARN prod.tfvars names in the lost region overridden: a task
-   # whose secrets live there cannot start. GITHUB_TOKEN is optional; leave it
-   # off, or create the parameter in $DR_REGION and pass its ARN.
-   terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 \
-     -var github_token_parameter_arn= \
-     -var db_allocated_storage=$DR_STORAGE_GB -var scheduled_tasks_enabled=false \
-     -var region=$DR_REGION -var 'azs=null' \
-     -var name_suffix=-dr -var dr_region=$THIRD_REGION \
-     -var acm_certificate_arn=<a certificate issued in $DR_REGION> \
-     -var alert_email=... -var public_url=... -var ses_domain=... \
-     -var mail_from_address=... \
-     -var backend_image=... -var derived_builder_image=... -var frontend_image=...
+   # azs=null undoes prod.tfvars' pinned zones, which are the lost region's:
+   # the copy takes $DR_REGION's first two, and step 4 pins those in dr.tfvars.
+   terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars \
+     -var desired_count=0 -var scheduled_tasks_enabled=false -var 'azs=null'
    ```
 
    ACM certificates are regional, so the lost region's cannot be used; request
@@ -944,33 +951,50 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    never their values. `SESSION_SIGNING_KEY` may be a fresh
    `openssl rand -hex 32`; every session cookie is invalidated, which costs a
    round of logins.
-3. Restore the database from the replicated dump in
-   `birdtest-backups-dr-<account>`, from `scripts/prod-shell.sh` against the
-   new stack. Fetch and check it with §2.1's first block, with
-   `STAMP=<the stamp step 1 printed>` (the ops shell has none of step 1's
-   variables), `BUCKET=birdtest-backups-dr-<account>` and
-   `S3_REGION=<the lost stack's dr_region>`. Replication does not keep order,
-   so just after a 03:00 backup the newest manifest can arrive before all of
-   its dump's files, and with the source region gone the rest never will: if
-   the block still says `CHECKSUM MISMATCH` after one re-fetch, take the
-   previous stamp (`aws s3 ls … | grep manifest | tail -2 | head -1`), a day
-   older, which step 1's size still covers. Then the dump into the new
-   instance, as in §2.1's second block but with
-   `pg_restore -d "$DATABASE_URL"` — run detached as §2.1 does, since it takes
-   longer than an ECS Exec session lasts, and not finished until its log ends
-   `pg_restore exit 0`: step 4's `desired_count=1` against a half-restored
-   database serves it. The new ops task reads the new stack's
-   backups bucket, so fetch the dump with the credentials of an operator who
-   can read the replica, or copy it across first.
+3. Restore the database from the replicated dump. The new stack's ops task
+   can read only the new stack's own backups bucket, so first copy the dump
+   step 1 sized for, and its manifest, across into it -- from the operator's
+   machine, whose credentials can read the replica:
+
+   ```bash
+   STAMP=${MANIFEST%.manifest.json}
+   NEW=s3://$(terraform -chdir=infra output -raw backups_bucket)/pg
+   aws s3 cp --recursive --source-region $REPLICA_REGION --region $DR_REGION \
+     "$REPLICA/$STAMP/" "$NEW/$STAMP/"
+   aws s3 cp --source-region $REPLICA_REGION --region $DR_REGION \
+     "$REPLICA/$MANIFEST" "$NEW/$MANIFEST"
+   echo "$STAMP"   # for the ops shell, which has none of these variables
+   ```
+
+   Then, in `scripts/prod-shell.sh` against the new stack, fetch and check it
+   with §2.1's first block with `STAMP=<the stamp printed above>` (and
+   `BUCKET`, `S3_REGION` unset: it is the stack's own bucket now).
+   Replication does not keep order, so just after a 03:00 backup the newest
+   manifest can arrive before all of its dump's files, and with the source
+   region gone the rest never will: if the block still says
+   `CHECKSUM MISMATCH` after one fresh copy, take the previous stamp --
+   `MANIFEST=$(aws s3 ls --region $REPLICA_REGION "$REPLICA/" | grep manifest | tail -2 | head -1 | awk '{print $4}')`,
+   a day older, which step 1's size still covers -- and copy that across
+   instead. Then the dump into the new instance, as in §2.1's second block but
+   with `pg_restore -d "$DATABASE_URL"` — run detached as §2.1 does, since it
+   takes longer than an ECS Exec session lasts, and not finished until its log
+   ends `pg_restore exit 0`: step 4's `desired_count=1` against a
+   half-restored database serves it.
 4. The leave-generation KLVs (`leaves/`) and the imported input data
    (`inputs/`) are in `birdtest-artifacts-dr-<account>`; sync both prefixes
    into the new stack's artifact bucket (`birdtest-dr-artifacts-<account>`)
    with `aws s3 sync`. The service reads only its own bucket. (Input data
    imported before the `input-data` replication rule existed was never
    replicated: re-import those tarballs from the admin page instead —
-   importing is idempotent.) Then `terraform apply` again with
-   `desired_count=1` and `scheduled_tasks_enabled=true`, the same variables
-   otherwise.
+   importing is idempotent.) Then pin the copy's zones and apply with the
+   service up and the schedules on (their defaults):
+
+   ```bash
+   echo "azs = $(terraform -chdir=infra output -json azs)" >> infra/dr.tfvars
+   terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars
+   ```
+
+   Every later command against the copy takes both files, in that order.
 5. Re-verify the SES domain identity and add the DKIM CNAMEs, and point the
    MAIL FROM MX record at the DR region (the `ses_mail_from_records` output of
    the `dr` workspace) — account mail is

@@ -44,6 +44,14 @@ locals {
 # without replacing it (and the ALB, tasks and database sit in them). Pin the
 # `azs` output into prod.tfvars after the first apply (README "Deploying").
 data "aws_availability_zones" "available" {
+  # Availability Zones proper: a Local or Wavelength Zone sorts first
+  # (us-west-2-lax-1a before us-west-2a). They are opt-in, so the filter
+  # below already leaves them out; this says so on its own.
+  filter {
+    name   = "zone-type"
+    values = ["availability-zone"]
+  }
+
   filter {
     name   = "opt-in-status"
     values = ["opt-in-not-required"]

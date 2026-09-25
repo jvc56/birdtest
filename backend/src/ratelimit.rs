@@ -104,14 +104,17 @@ impl CredentialGate {
         known.get(presented).is_some_and(|at| at.elapsed() < KNOWN_FOR)
     }
 
-    /// Before the lookup: the credential's own bucket, and, unless it resolved
-    /// recently, a cell of its address's.
+    /// Before the lookup: unless the credential resolved recently, a cell of
+    /// its address's bucket; then its own. The address first: each made-up
+    /// credential is a new key in the `worker` limiter, kept until the sweep,
+    /// so charged first, a refused flood from one address still grew memory
+    /// by an entry a request (150 MB a million) with no database work to slow
+    /// it down.
     pub fn admit(&self, worker: &Keyed, presented: &str, address: IpAddr) -> Result<(), AppError> {
-        check(worker, presented)?;
-        if self.is_known(presented) {
-            return Ok(());
+        if !self.is_known(presented) {
+            check(&self.unknown_per_address, &format!("ip:{address}"))?;
         }
-        check(&self.unknown_per_address, &format!("ip:{address}"))
+        check(worker, presented)
     }
 
     /// After a lookup that resolved.
@@ -252,6 +255,14 @@ mod key_tests {
             gate.admit(&worker, "k:fresh", "192.0.2.51".parse().unwrap()).is_ok(),
             "another address"
         );
+
+        // A refused flood leaves nothing behind per credential: the address
+        // refused it before its own bucket was made.
+        let before = worker.len();
+        for i in 0..1000 {
+            assert!(gate.admit(&worker, &format!("k:flood-{i}"), shared).is_err());
+        }
+        assert_eq!(worker.len(), before, "refused credentials were given buckets");
 
         // The credential's own bucket holds whether or not it is known.
         let mut own = 0;
