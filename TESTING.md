@@ -68,7 +68,7 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 179 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (25), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1 Unit | 183 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
 | 1F Frontend unit | 115 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 149 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 179 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (32), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 535 backend tests (the per-tier counts above are
+--run-ignored all` runs 539 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-first audit;
 they had drifted by up to 17).
 
@@ -541,14 +541,32 @@ path, nothing recognisable, and a bomb by compression ratio.)
   audit: both were staged and confirmed as rows, of which a worker extracting
   the tarball holds only the last.)
 - `U-ARCHIVE-10` An extension header — a PAX record or a GNU long name, which
-  the tar reader reads whole before the walk sees an entry — larger than 64 KiB
-  is refused before it is read, and every decompressed byte, headers and
+  the walk reads itself (an interpreting reader read it whole, before the walk
+  saw an entry) — larger than 64 KiB is refused before it is read, and every decompressed byte, headers and
   skipped data included, counts against the 1 GiB cap (and the ratio, past a
   64 MiB floor for archives of many tiny entries). *(Covered:
   `inputdata::tests::a_large_extension_header_is_refused_before_it_is_read`,
   `inputdata::tests::skipped_data_counts_against_the_caps`.)* (Thirty-first
   audit, second pass: a 400 KB gzip with a 400 MB PAX header held 465 MB and
   was accepted.)
+- `U-ARCHIVE-13` PAX records are split by their stated lengths: a value with a
+  newline (an extended attribute, as GNU tar and macOS write) walks, and a
+  keyword after an extra blank is refused rather than read as another.
+  *(Covered: `inputdata::tests::pax_records_are_split_by_their_lengths`.)*
+  (Thirty-first audit, pass 4: the tar crate's parser split on newlines and
+  refused such a release, and read `"  size"` as a keyword other than `size`.)
+- `U-ARCHIVE-14` Headers GNU tar reads otherwise than the tar crate are
+  refused: a base-64 size, a base-256 size other than a positive eight-byte
+  one, a directory or link with data, a file whose name ends in `/` (GNU tar
+  makes it a directory and reads on into its data), a ustar header of another
+  version, a NUL in a PAX path, a second PAX header before one entry.
+  *(Covered: `inputdata::tests::headers_extractors_read_differently_are_refused`,
+  and `an_entry_given_two_names_is_refused` for the second header.)*
+- `U-ARCHIVE-15` A tarball gzipped in several members walks every member, as
+  `tar -xzf` does; and a path spelled `./data/...` or `data//...` is the same
+  file as `data/...` for the one-name rule. *(Covered:
+  `inputdata::tests::every_gzip_member_is_walked`,
+  `inputdata::tests::a_path_named_twice_in_two_spellings_is_refused`.)*
 - `U-ARCHIVE-11` A GNU sparse entry is refused as it is met, its extension
   blocks never expanded. *(Covered:
   `inputdata::tests::a_sparse_entry_is_refused_unexpanded`, which also bounds
@@ -1518,10 +1536,11 @@ runs against a real MinIO.
 - `I-EXPORT-8` One export of a job runs at a time: a second request while one
   is `running` is a 409. *(Covered:
   `exports::a_job_has_one_export_running_at_a_time`.)* (Thirteenth audit.)
-- `I-EXPORT-9` A reader that stops early — a results-stream caller who hangs
-  up, an export whose upload fails — ends its corpus query: the connection is
-  closed, not drained back into the pool. *(Covered:
-  `exports::a_reader_that_hangs_up_ends_its_corpus_query`.)* (Thirty-first audit:
+- `I-EXPORT-9` A reader that stops early ends its corpus query: the connection
+  is closed, not drained back into the pool. *(Covered for the results stream:
+  `exports::a_reader_that_hangs_up_ends_its_corpus_query`. An export whose
+  upload fails, and KLV generation, take the same `close_on_drop` and are not
+  tested separately.)* (Thirty-first audit:
   each hang-up left Postgres building the whole corpus on a connection no cap
   counted; ten held a ten-connection pool, and every claim timed out.)
 
@@ -2514,7 +2533,8 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
   restored whole, its `jobs` row inactive, with its config, player config and
   input data, and resumed after a run stopped once the `jobs` row was in;
   batches smaller than a line;
-  the job's merge lock held while it loads;
+  the job's merge lock held while it loads; every rating pool left to refit
+  on the restored rows;
   position analyses back through their parents' ids; a row production holds under a restored
   row's key with other contents stops the run with that batch not loaded and
   another job untouched; the same run, after §2.0, finishes what the stopped one

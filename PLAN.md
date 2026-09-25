@@ -499,9 +499,13 @@ Three properties follow, and they are the reasons for the choice:
 
 MM is used rather than a gradient method because each step is a closed-form
 ratio with no step size to tune, it cannot overshoot, and it converges
-monotonically. For a pool of any plausible size it lands in microseconds, which
+monotonically. For a small, well-connected pool it lands in microseconds, which
 is what makes "refit everything on every change" affordable rather than
-aspirational.
+aspirational. It converges very slowly on a group of configs that moves
+together, though: a large pool, or one tied to its anchor by a thin link, can
+stop at the 10,000-iteration cap short of the answer (the thirty-first audit
+measured −34 Elo on a 12-member cluster, and more on a 20-config chain), and
+the page then marks the fit unconverged. KL-74.
 
 #### Non-transitivity is displayed, not solved
 
@@ -579,9 +583,12 @@ widens them by √(2/(1+ρ)), where ρ is the correlation between a pair's two
 games: √2 if they are independent, more when pairing works (ρ < 0), less when a
 config wins both halves on the same racks (ρ > 0), and never below 1. And the
 prior's virtual games are in the fit but not in the information, which widens
-them most for the barely-played. They are more than good enough for the
-distinction the page needs to draw: 1700 ± 15 and 1700 ± 200 must not look
-alike.
+them most for the barely-played. They are good enough for the distinction the page
+needs to draw, 1700 ± 15 against 1700 ± 200, **for a config tied closely to the
+anchor**. For a group linked to it thinly, the diagonal leaves out the
+uncertainty of that link, and the prior's pull adds up across the group: the
+thirty-first audit measured errors shown as ±2 to ±6 where the full covariance
+gives ±28, and a 30-member cluster fitted 200 Elo off (KL-74).
 
 #### When a fit runs
 
@@ -1670,13 +1677,17 @@ transaction, with `tarball_date` set to this import's date.
 
 Every one aborts the import rather than skipping the entry. The ratio is checked
 continuously rather than at the end, since that is the zip-bomb case a total cap
-alone lets through. An entry's size is the one its data has — a PAX `size`
-record overrides the header's field — and the per-entry cap and the ratio judge
-it before a byte is read; an archive naming one pinned path twice is refused.
-(Until the thirty-first audit the size was the header's field, so a header
-saying 0 and a PAX record saying 900 MiB passed every cap and was read whole,
-and the 30-minute limit was not enforced at all: the client's timeouts are per
-read.) The archive URL is built from `MAGPIE_DATA_REPO` and never
+alone lets through. The walk reads the archive raw, in one pass: every entry's
+size is its own header's, which is what the reader follows, and the per-entry
+cap and the ratio judge it before a byte is read. The walk reads extension
+headers itself, each capped at 64 KiB, and takes from them only a path or link
+target for the entry after; a PAX `size` or sparse record, a global PAX path,
+two names for one entry, a sparse entry, and a pinned path named twice are each
+refused. (In the thirty-first audit the tar reader, left to interpret
+extensions, held what no cap reached three different ways — a PAX `size` that
+passed every cap, a PAX header read whole, GNU sparse blocks expanded — before
+this replaced three patches; and the 30-minute limit was not enforced at all:
+the client's timeouts are per read.) The archive URL is built from `MAGPIE_DATA_REPO` and never
 from user input, so the residual exposure is a compromised upstream; that is the
 threat model these checks are written against.
 
@@ -7526,6 +7537,79 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** None.
 - **Justification:** The pages render no component tests today (tier 1F is
   plain TypeScript); the journeys (tier 5) read the account page.
+
+**KL-74. The rating fit biases large or thinly linked groups, and understates their errors.**
+- **Context:** `stats/bradley_terry.rs`: MM iteration capped at 10,000, a prior
+  of two virtual draws for every member against the anchor's strength, and
+  standard errors from the diagonal of the information (thirty-first audit,
+  pass 4).
+- **Problem:** The prior's pull adds up across any group of configs joined to
+  the anchor only through a few links, and MM converges very slowly on a group
+  that moves together. Measured with noiseless evidence against the real fit: a
+  12-member cluster linked by one 300-pair job is stored 42 Elo low with a shown
+  error of ±1.9 (the full-covariance error is about ±28), unconverged; a
+  20-config chain's top is 36.5 Elo low; a 30-member cluster about 200 low. A
+  well-played island with no path to the anchor holds the fit at the cap and
+  marks the whole pool unconverged. The page warns on an unconverged fit, not
+  on the prior's bias.
+- **Options considered:**
+  - a Newton / IRLS solve on log-strengths with the full Hessian, a few steps
+    for up to a hundred members;
+  - a much weaker prior, or one applied only to configs with a perfect or zero
+    score, so it no longer ties every member to the anchor;
+  - standard errors from the inverse of the full information matrix.
+- **Option implemented:** None yet. *Open (thirty-first audit)*, medium; the
+  docs now say what the fit does.
+- **Justification:** Each option changes what every published rating is, and
+  the prior's strength is a statistical decision (how far to trust a
+  barely-played config) rather than a bug fix. The audit's last pass could not
+  make it and verify it; it is the first thing to take up next.
+
+**KL-75. Small things in rating pools.**
+- **Context:** `ratings.rs`, `routes/ratings.rs` (thirty-first audit, pass 4).
+- **Problem:**
+  - History is thinned to 500 points by count, not by time: a year-old active
+    pool gives the eleven months before the last one some eight points, where
+    the thinning's own comment says a day is the resolution the chart draws.
+  - A pool's scope is its variant, distribution and layout, not the job-level
+    `bingo_bonus` and `sim_cutoff`: a change to `magpie_defaults` would mix
+    rule sets in one pool.
+  - Adding a member already in the pool, or removing one that is not, writes an
+    audit row and refits.
+- **Options considered:** thin by time buckets; add the two settings to the
+  pool's scope; answer a no-op membership change without a write.
+- **Option implemented:** None.
+- **Justification:** None changes a rating today; the defaults have not moved.
+
+**KL-76. The phone layout's remaining edges.**
+- **Context:** The site at phone width (E-10), after the thirty-first audit
+  wrapped the header and put wide tables in scrolling boxes.
+- **Problem:** Header links are 20 px tall, 24 px apart when they wrap at
+  280 px, which is borderline for WCAG 2.5.8; and E-10's seeded contributors are
+  all anonymous, so a long registered name — which widened the job page until
+  this audit — is not in the journey's data.
+- **Options considered:** larger tap targets; a registered contributor with a
+  32-character name in E-10's seed.
+- **Option implemented:** None.
+- **Justification:** Checked by hand in the audit's sweep (744 page loads, none
+  wider than the screen); the seed change needs a tier-5 run to prove.
+
+**KL-77. Where the archive walk and GNU tar still part, failing safe.**
+- **Context:** `inputdata::walk_archive`, compared with `tar -xzf` over many
+  crafted archives in the thirty-first audit's last passes; every real format
+  tried (GNU tar's gnu, oldgnu, ustar, posix and v7, with extended attributes;
+  Python's gnu and pax) walks and names files as `tar -t` does.
+- **Problem:**
+  - A tarball with no end-of-archive blocks, followed by zero padding after its
+    gzip member, is refused ("invalid gzip header") since the walk reads every
+    member; GNU tar extracts it.
+  - A symlink alias is resolved lexically: a target `CSW24.kwg/` or
+    `CSW24.kwg/../CSW24.kwg` pins the alias, where on disk it fails.
+- **Options considered:** stop at a member of zeros; resolve links against the
+  archive's directory tree.
+- **Option implemented:** None.
+- **Justification:** No real writer produces either, and both fail safe: a
+  worker hashes what it extracts and declines a mismatch.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the

@@ -14,7 +14,8 @@
 #
 # The cases:
 #   - it refuses to start before the scratch restore has finished, against a
-#     scratch copy that is production itself, for a job production has active,
+#     scratch copy that is production itself, for a job production has active
+#     or completed since, beside an export of the job made since,
 #     for a job the scratch copy holds nothing of, and against a copy taken
 #     after the purge from a job that went on running;
 #   - a deleted job comes back whole: its jobs row (inactive), its config, and
@@ -153,6 +154,19 @@ SELECT '00000000-0000-0000-0000-00000000000d', 'games', 'active', 100, 1, 'class
 INSERT INTO job_game_config (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
 VALUES ('00000000-0000-0000-0000-00000000000d', '00000000-0000-0000-0000-0000000000f1',
         '00000000-0000-0000-0000-0000000000f1', 10, 100, 1000);
+-- A rating pool whose newest run has seen its evidence: a restore must leave it
+-- to refit.
+INSERT INTO player_configs (id, name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
+                            num_plies_recorded, num_plays_recorded, use_wordmap, use_rit, movegen_margin, created_by)
+VALUES ('00000000-0000-0000-0000-0000000000f2', 'check-anchor', 'best', 'equity',
+        '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-0000000000e1', 0, 100, 2, 10,
+        false, false, 5, (SELECT id FROM users));
+INSERT INTO rating_pools (id, name, variant, letterdist_id, layout_id, anchor_player_config_id)
+SELECT '00000000-0000-0000-0000-0000000000a1', 'check-pool', 'classic',
+       (SELECT id FROM input_data WHERE role = 'letterdist'), (SELECT id FROM input_data WHERE role = 'layout'),
+       '00000000-0000-0000-0000-0000000000f2';
+INSERT INTO rating_runs (pool_id, trigger, iterations, converged, pairs_used, jobs_used, evidence_games)
+VALUES ('00000000-0000-0000-0000-0000000000a1', 'sweep', 10, true, 1, 1, 0);
 INSERT INTO tasks (job_id, seed, state, accepted_count)
 SELECT '00000000-0000-0000-0000-00000000000d', s, 'completed', 1 FROM generate_series(1, 50) s;
 INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
@@ -214,7 +228,7 @@ if out=$(restore "$GAMES"); then fail "restored into an active job: $out"; fi
 [[ "$out" == *"the job is active in production"* ]] || fail "not told why: $out"
 val "$PROD" "UPDATE jobs SET status = 'completed' WHERE id = '$GAMES'" >/dev/null
 if out=$(restore "$GAMES"); then fail "restored into a job completed since the purge: $out"; fi
-[[ "$out" == *"has completed since the mistake"* ]] || fail "not told why: $out"
+[[ "$out" == *"is completed in production"* ]] || fail "not told why: $out"
 val "$PROD" "UPDATE jobs SET status = 'inactive' WHERE id = '$GAMES'" >/dev/null
 val "$PROD" "INSERT INTO job_exports (job_id, state) VALUES ('$GAMES', 'running')" >/dev/null
 if out=$(restore "$GAMES"); then fail "restored beside an export made since the purge: $out"; fi
@@ -283,6 +297,10 @@ out=$(restore "$DELETED") || fail "the deleted job's restore failed: $(tail -5 <
 [[ "$(val "$PROD" "SELECT count(*) FROM job_game_config c JOIN player_configs p ON p.id = c.player1_config_id
                     JOIN input_data k ON k.id = p.klv_id WHERE c.job_id = '$DELETED'")" == 1 ]] \
   || fail "its config, player config or input data did not come back"
+
+echo "-- every rating pool is left to refit on the restored rows"
+[[ "$(val "$PROD" "SELECT count(*) FROM rating_runs WHERE evidence_games IS NOT NULL")" == 0 ]] \
+  || fail "a pool's newest run still counts its evidence as seen"
 
 echo "-- the sequences are past the restored ids"
 for table in leave_rack_staging position_analysis_records position_analysis_moves; do

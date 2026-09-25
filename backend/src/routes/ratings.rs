@@ -276,11 +276,21 @@ async fn pool_history(
                 OR (n - 1) % ((total + $2 - 1) / $2) = 0
                 OR n = total
          )
+         -- Each kept run's ratings by its key, not a join the planner may
+         -- answer by scanning every pool's ratings: it guessed thousands of
+         -- kept runs where there are at most 501, and on a month of 2-minute
+         -- runs in 11 pools (4.75 million rows) read them all, about half a
+         -- second an anonymous request and growing with every pool (thirty-first
+         -- audit). `OFFSET 0` keeps the subquery from being flattened back.
          SELECT kept.computed_at, r.player_config_id, c.name, r.rating, r.stderr
          FROM kept
-         JOIN player_config_ratings r ON r.run_id = kept.id
-         JOIN player_configs c        ON c.id = r.player_config_id
-         WHERE r.connected_to_anchor
+         CROSS JOIN LATERAL (
+             SELECT x.player_config_id, x.rating, x.stderr
+             FROM player_config_ratings x
+             WHERE x.run_id = kept.id AND x.connected_to_anchor
+             OFFSET 0
+         ) r
+         JOIN player_configs c ON c.id = r.player_config_id
          ORDER BY kept.computed_at ASC, c.name ASC",
     )
     .bind(id)

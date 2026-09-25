@@ -177,6 +177,7 @@
               ties — they stay in the sample, where they are what makes a paired run
               lower-variance than an unpaired one.
             </p>
+            <div class="overflow-x-auto">
             <table class="table text-xs">
               <thead>
                 <tr>
@@ -195,6 +196,7 @@
                 {/each}
               </tbody>
             </table>
+            </div>
             {#if stats.games.divergent_pairs !== undefined}
               <p class="text-xs text-muted-foreground">
                 {stats.games.divergent_pairs.toLocaleString()} of {stats.games.units_completed.toLocaleString()}
@@ -240,6 +242,7 @@
           </div>
           {#if rackError}<p class="field-error">{rackError}</p>{/if}
           {#if rackMoves?.length}
+            <div class="overflow-x-auto">
             <table class="table">
               <thead>
                 <tr><th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th></tr>
@@ -255,6 +258,7 @@
                 {/each}
               </tbody>
             </table>
+            </div>
           {/if}
         </div>
       </div>

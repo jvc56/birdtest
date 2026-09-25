@@ -32,6 +32,17 @@ pass with no high or medium finding (then one confirmation full pass).
   own fixes from its adversarial check; all fixed and verified. Lows: most
   fixed, the rest KL-70 to KL-73. The loop continues to pass 4, the last the
   budget allows.
+- **Pass 4 (follow-up: pass 3's diff, and rating pools):** 1 high and 4 medium
+  from the reviewers; the high and three mediums fixed and verified, **one
+  medium left open** (the rating fit's bias and understated errors, KL-74,
+  which needs a statistical decision). The adversarial check found no high or
+  medium. The budget of four passes is spent, so **the loop stops here** with
+  KL-74 open.
+- **Run total:** 5 high and 20 medium found by reviewers across four passes,
+  plus 1 high and 8 medium in the run's own fixes found by its adversarial
+  checks; all fixed and verified but one (KL-74). Known Limits KL-54 to KL-77
+  added, KL-6 closed, KL-37, KL-44, KL-62 and others updated. Final green run
+  below; tier 5 not run (image builds).
 
 ---
 
@@ -624,3 +635,131 @@ an early exit (closed on drop too); POSIX-format extension headers counted
 toward the 5,000-entry cap (now only entries do; their bytes are counted).
 **Left:** E-10 was checked against a build with the API mocked, not run end to
 end (tier 5 builds images).
+
+---
+
+## Pass 4 — follow-up pass (the last the budget allows)
+
+**Plan.** The diff since pass 2's commit (`b9b4ec5..d03837d`; MAGPIE and infra
+unchanged), reviewed against every objective, one reviewer per part it
+touches: backend (the raw archive walk above all); frontend and the phone-width
+journey; docs and procedures. Plus one area not examined in recent passes: **the
+rating sweep and rating pools** — pool creation and membership, the fit and its
+prior, refits and their triggers, history thinning and residuals, the ratings
+routes and pages.
+
+**Findings: 1 high, 4 medium** from the four reviewers (backend 1 medium and
+10 low; frontend 1 medium outside the diff and 4 low; docs and procedures 7
+low; rating pools 1 high, 2 medium and 5 low). Three mediums and the high are
+fixed and verified; **one medium is left open** (4.3, KL-74). The pass's
+adversarial check found no high or medium (4.6).
+
+### 4.1 High — the public rating-history route scanned every pool's ratings (rating-pools reviewer)
+
+**Code updated.** `pool_history` joined its kept runs to `player_config_ratings`;
+the planner guessed thousands of kept runs (there are at most 501) and hash-
+joined a sequential scan of every pool's rows: on a month of 2-minute runs in 11
+pools (4.75 M rows) 510–590 ms an anonymous request here, 0.76–1.1 s for the
+reviewer, and growing with every pool, against a display pool of eight
+connections. **Fix:** each kept run's ratings are read by the primary key
+(`CROSS JOIN LATERAL … OFFSET 0`): 125–240 ms on the same data, independent of
+the other pools, and the plan shows the key's index. The adversarial check
+confirmed identical rows and order over 11 pools and three limits; the history
+tests pass.
+
+### 4.2 Medium — a restored deleted job never re-entered the ratings (rating-pools reviewer)
+
+**Code updated.** The copy-back puts the `jobs` row back first, carrying its
+counters; a sweep during the load recorded the new total as seen, fitted part
+of the rows, and nothing moved the total again: reproduced, no refit during or
+after the restore, a rival stored at 2000 against 2462.5 on the full evidence.
+**Fix:** `restore-job.sh` ends by marking every pool for a refit
+(`mark_every_pool_for_refit`'s statement and locks), and RUNBOOK §2.4 says so.
+The check asserts no pool's newest run counts its evidence as seen afterwards.
+
+### 4.3 Medium, left open — the rating fit biases large or thinly linked groups and understates their errors (rating-pools reviewer)
+
+**Plan updated, code left pending a decision.** The prior (two virtual draws per
+member against the anchor) pulls a thinly linked group together, MM converges
+very slowly on such a group and stops at its 10,000-iteration cap, and the
+diagonal standard errors leave out the link's uncertainty. Measured with
+noiseless evidence against the real fit: a 12-member cluster 42 Elo low, shown
+±1.9 against about ±28; a 20-config chain's top 36.5 low; a 30-member cluster
+about 200 low. PLAN's claims ("lands in microseconds for any plausible size",
+errors "more than good enough") are corrected; the fix — a Newton solve with
+the full information, a weaker or targeted prior, full-covariance errors —
+changes every published rating and the prior's strength is a statistical
+choice, so it is **KL-74, open**, and the first thing to take up next.
+
+### 4.4 Medium — the raw walk refused a correct archive whose PAX values hold a newline (backend reviewer; pass 3's redesign)
+
+**Code updated.** The tar crate's `PaxExtensions` splits on newlines rather than
+record lengths, so an extended-attribute value with a 0x0a — which POSIX allows
+and GNU tar (`--xattrs`) and macOS write — refused the archive; and it read a
+keyword after two blanks as another keyword, letting a `size` record past its
+refusal. **Fix:** the walk's own parser splits records by their stated lengths.
+With it, the reviewer's lows where the walk and GNU tar disagreed were closed
+too: a second PAX header before one entry, a base-64 size field, a directory or
+link with data, a ustar version other than `00`, a NUL in a PAX path, `./` and
+`//` spellings of one file (normalised as GNU tar does), and a tarball gzipped
+in several members (all read, as `tar -xzf` does). `U-ARCHIVE-13`, `-14`, `-15`
+and the spelling test fail against the pass-3 walk and pass; the realistic GNU
+and Python PAX tarballs still walk to the same 37 files, and the reviewer walked
+the real 190 MB release to its 75.
+
+### 4.5 Medium — the job page scrolled sideways on a phone with a long registered name (frontend reviewer, outside the diff)
+
+**Code updated.** The contributors table had no scrolling box, so a name of 21
+to 31 characters (by width) widened the page past the screen, which E-10's
+anonymous-only data could not show. **Fix:** it scrolls in its own box, as do
+the account page's key table, the pool list, a pool's config table and the job
+page's two other tables; the account page breaks long values; the admin tabs
+wrap. The reviewer's sweep (12 widths × 5 sessions × 16 routes) had no page
+wider than the screen afterwards, and the extra spec over the pool and job
+pages is clean at every phone width.
+
+### 4.6 Adversarial check of the pass's fixes
+
+**Held:** every correct archive tried (GNU tar 1.30 in five formats with
+`--xattrs` and `./` prefixes; Python gnu and pax with newline values; a 128 MB
+posix tarball plain, split, in two members, with trailing zeros or garbage)
+walks and names files as `tar -t` does; the PAX parser's edge cases; the ustar
+check spares GNU and v7 headers; the history query's rows and order; the refit
+mark (no pools, no deadlock); the frontend wrappers. **Lows fixed:** a file
+named with a trailing `/` (which GNU tar makes a directory, reading on into its
+data) — refused; a base-256 size is accepted only as a positive eight-byte one;
+the pool page's and job page's remaining tables; the refit mark's output and
+its failure message. **Recorded:** KL-77 (a tarball with no end blocks and
+zero padding after its member; lexical link resolution) — both fail safe.
+
+### 4.7 Low findings
+
+**Fixed** (docs and procedures reviewer): PLAN's archive paragraph and
+TESTING's `U-ARCHIVE-10` described the reader interpreting extensions;
+`I-EXPORT-9` claimed test coverage of the export half; a re-run after §2.3's
+status step got advice that would undo the restore (the message now says the
+restore is done); the new refusals are listed in RUNBOOK §2.2 and both scripts'
+headers; §2.4's exports bullet; two stale size comments. **Recorded:** KL-75
+(history thinned by count; `bingo_bonus`/`sim_cutoff` outside a pool's scope;
+no-op membership changes), KL-76 (header tap targets; E-10's anonymous-only
+contributors), KL-77.
+
+---
+
+## Final green run (after pass 4)
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included
+  (`MAGPIE_BIN` a `portable_release` build of `7400184f`): **539 of 539
+  passed**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 115 of 115.
+- `terraform fmt -check -recursive` and `terraform validate` (the
+  `hashicorp/terraform:1.9` image, on a copy of `infra/`): clean.
+- `scripts/restore-roundtrip.sh` and `scripts/backup-drill-check.sh` on an
+  isolated compose stack with the current schema: both passed.
+  `scripts/restore-job-check.sh`: passed.
+- MAGPIE did not change during the run, so its test table and tier 6's native
+  run were not required; tier 6's Rust half ran in the suite above.
+- **Not run:** tier 5 (`e2e/run.sh`), which builds Docker images. E-2's and
+  E-10's changes were checked with e2e's Playwright against builds of the pages
+  with the API mocked.

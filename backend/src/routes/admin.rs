@@ -182,7 +182,7 @@ struct StartedImport {
     state: &'static str,
 }
 
-/// Phase 1, in the background. The archive is ~94 MB, so the request returns an
+/// Phase 1, in the background. The archive is ~190 MB, so the request returns an
 /// id immediately and the admin UI polls `GET .../imports/<id>`; nothing waits
 /// on the download and no transaction is held open across it.
 async fn start_import(

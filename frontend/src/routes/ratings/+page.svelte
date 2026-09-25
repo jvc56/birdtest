@@ -41,6 +41,7 @@
       </p>
     </div>
   {:else}
+    <div class="overflow-x-auto">
     <table class="table">
       <thead>
         <tr>
@@ -67,5 +68,6 @@
         {/each}
       </tbody>
     </table>
+    </div>
   {/if}
 </section>

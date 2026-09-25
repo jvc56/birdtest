@@ -320,7 +320,9 @@ through a temporary table and `INSERT … ON CONFLICT DO NOTHING` — holding th
 job's merge lock while it loads, so the half-hourly merge cannot fold restored
 staged rows in mid-run. It refuses to start until `/tmp/pg_restore.log` ends in
 `pg_restore exit 0`, and refuses when `SCRATCH_URL` is production itself, when
-production has the job active (§2.0), when the scratch copy holds no such job
+production has the job active or completed since the mistake (§2.0), when
+production holds an export of the job made since (§2.0 deletes it), when the
+scratch copy holds no such job
 (a mistyped id), and when the scratch copy already holds the audit row of the
 job's last purge or delete — a copy taken after the mistake, which may hold a
 job that went on running, or only the generation-0 artifact a leave job's purge
@@ -699,17 +701,18 @@ leaderboard visible.
 
 ### 2.4 Recompute derived state
 
-- **Job exports** (`job_exports`): derived data, and the one thing here that a
-  partial restore can make actively misleading — a row still saying `ready`
-  describes results the restore may not have brought back, and hands an admin a
-  stable-looking artifact of something else. Delete the job's rows
-  (`DELETE FROM job_exports WHERE job_id = :'job'`) and re-export if anyone
-  wants one; the objects behind them expire from the bucket on their own.
+- **Job exports** (`job_exports`): none comes back. A purge or delete removed
+  the job's own, §2.0 removed any made since, and §2.2 refuses to run beside
+  one. Export the job again once §2.3 has completed it, if anyone wants one;
+  the objects of the removed rows expire from the bucket on their own.
 
 - **Ratings** (`rating_runs` / `player_config_ratings`): a batch fit over
-  each pool's `game_results`, never applied per submission. Once the results
-  are back the two-minute sweep notices the pool's evidence changed and refits
-  it; `POST /api/admin/rating-pools/:id/recompute` does it immediately. Nothing
+  each pool's `game_results`, never applied per submission. §2.2's script ends
+  by marking every pool for a refit, and the two-minute sweep refits them on
+  the restored rows; `POST /api/admin/rating-pools/:id/recompute` does one
+  immediately. (Left to notice the change itself, a sweep that ran while the
+  rows were loading could record a deleted job's counter as seen and never
+  refit.) Nothing
   to copy. Runs older than a month are thinned to one a day in any case
   (PLAN.md, "Ratings"), so a restored history is at that resolution past the
   month whatever the backup's age.

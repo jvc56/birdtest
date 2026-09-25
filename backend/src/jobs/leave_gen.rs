@@ -1683,6 +1683,8 @@ async fn generation_klv(
         written += 1;
     }
     drop(rows);
+    // Not held through the conversion below.
+    drop(conn);
     csv.flush()
         .await
         .map_err(|e| AppError::internal(format!("could not write the rack equity csv: {e}")))?;

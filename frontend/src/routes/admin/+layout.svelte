@@ -24,7 +24,7 @@
 </script>
 
 {#if $session?.is_admin}
-  <div class="mb-6 flex gap-4 border-b border-border pb-3 text-sm">
+  <div class="mb-6 flex flex-wrap gap-x-4 gap-y-2 border-b border-border pb-3 text-sm">
     {#each tabs as tab}
       <a href={tab.href} class="text-muted-foreground no-underline hover:text-foreground">
         {tab.label}

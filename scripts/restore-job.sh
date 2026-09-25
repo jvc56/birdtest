@@ -22,7 +22,10 @@
 #                 now and would share the disk (default /tmp/dump; empty: none)
 #
 # It refuses to start when the scratch copy and production are one database,
-# when production has the job active (RUNBOOK §2.0 stops it), when the scratch
+# when production has the job active (RUNBOOK §2.0 stops it) or completed (it
+# completed again since the mistake, or §2.3 has already put it back), when
+# production holds an export of the job (made since; §2.0 deletes it), when the
+# scratch
 # copy holds nothing of the job (a mistyped id, or SCRATCH_URL pointing at
 # production), and when it already holds the audit row of the job's last purge
 # or delete -- a copy taken after the mistake, which may hold rows of a job that
@@ -91,7 +94,7 @@ status=$(sql "$DATABASE_URL" "SELECT status FROM jobs WHERE id = '$job'") \
 [[ "$status" != active ]] || { echo "stopped: the job is active in production; deactivate it and clear it first (RUNBOOK §2.0)" >&2; exit 1; }
 # A purge leaves a completed job inactive, so one completed now has completed
 # again since, on the results §2.0 deletes: its status and verdict are theirs.
-[[ "$status" != completed ]] || { echo "stopped: the job has completed since the mistake; RUNBOOK §2.0 returns it to inactive with its verdict cleared" >&2; exit 1; }
+[[ "$status" != completed ]] || { echo "stopped: the job is completed in production. If §2.3 has put it back -- it was completed before the mistake -- the restore is done: do not run §2.0 again. Otherwise it completed again since the mistake, on the results §2.0 deletes: RUNBOOK §2.0 returns it to inactive with its verdict cleared" >&2; exit 1; }
 exports=$(sql "$DATABASE_URL" "SELECT count(*) FROM job_exports WHERE job_id = '$job'") \
   || { echo "stopped: cannot read the job's exports in production" >&2; exit 1; }
 (( exports == 0 )) || { echo "stopped: production holds an export of the job made since the mistake, which would be served as the restored job's corpus; RUNBOOK §2.0 deletes it" >&2; exit 1; }
@@ -287,5 +290,20 @@ SELECT setval('position_analysis_moves_id_seq', m)
 SELECT setval('leave_rack_staging_id_seq', m)
   FROM (SELECT max(id) AS m FROM leave_rack_staging) x
  WHERE m > (SELECT last_value FROM leave_rack_staging_id_seq);
+SQL
+# Every rating pool refits at the next sweep, on the rows now back. A sweep
+# that ran while they were loading may have fitted part of them and recorded
+# the job's counter as seen -- a deleted job's row comes back with it -- and
+# after that nothing would move it again (thirty-first audit). The statement
+# and its locks are `ratings::mark_every_pool_for_refit`'s.
+psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 > /dev/null <<'SQL' || { echo "the rows are restored, but the rating pools could not be marked for a refit: run POST /api/admin/rating-pools/:id/recompute for each pool, then repair the counters (RUNBOOK §2.3, §2.3b)" >&2; exit 1; }
+BEGIN;
+SELECT pg_advisory_xact_lock(2, hashtext(id::text)) FROM rating_pools ORDER BY id;
+UPDATE rating_runs r SET evidence_games = NULL
+  FROM rating_pools p
+  CROSS JOIN LATERAL (SELECT x.id FROM rating_runs x WHERE x.pool_id = p.id
+                      ORDER BY x.computed_at DESC, x.id DESC LIMIT 1) newest
+ WHERE r.id = newest.id AND r.evidence_games IS NOT NULL;
+COMMIT;
 SQL
 echo "restored; now repair the counters (RUNBOOK §2.3, §2.3b)"

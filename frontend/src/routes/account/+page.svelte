@@ -74,8 +74,8 @@
 <div class="space-y-6">
   <div class="card">
     <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
-      <div><dt class="text-muted-foreground">Username</dt><dd>{$session?.username}</dd></div>
-      <div><dt class="text-muted-foreground">Email</dt><dd>{$session?.email}</dd></div>
+      <div class="min-w-0"><dt class="text-muted-foreground">Username</dt><dd class="break-all">{$session?.username}</dd></div>
+      <div class="min-w-0"><dt class="text-muted-foreground">Email</dt><dd class="break-all">{$session?.email}</dd></div>
       <div><dt class="text-muted-foreground">Role</dt><dd>{$session?.is_admin ? 'admin' : 'contributor'}</dd></div>
       <div>
         <dt class="text-muted-foreground">Tasks completed</dt>
@@ -124,6 +124,7 @@
     </form>
     {#if error}<p class="field-error">{error}</p>{/if}
 
+    <div class="overflow-x-auto">
     <table class="table">
       <thead>
         <tr><th>Label</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr>
@@ -147,5 +148,6 @@
         {/each}
       </tbody>
     </table>
+    </div>
   </div>
 </div>

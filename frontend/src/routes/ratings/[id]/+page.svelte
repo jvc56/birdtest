@@ -112,6 +112,7 @@
 
     <div class="card space-y-3">
       <h2 class="text-lg font-medium">All configs</h2>
+      <div class="overflow-x-auto">
       <table class="table">
         <thead>
           <tr>
@@ -152,6 +153,7 @@
           {/each}
         </tbody>
       </table>
+      </div>
 
       {#if isAdmin}
         <div class="flex flex-wrap items-end gap-2 border-t border-border pt-3">

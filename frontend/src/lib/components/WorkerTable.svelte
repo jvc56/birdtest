@@ -4,6 +4,9 @@
   export let workers: { username: string | null; anon_id: string | null; tasks_completed: number }[];
 </script>
 
+<!-- Scrolls in its own box on a phone: a long username cannot wrap, and
+     unwrapped it widened the whole job page. -->
+<div class="overflow-x-auto">
 <table class="table">
   <thead>
     <tr><th>Contributor</th><th class="text-right">Tasks completed</th></tr>
@@ -19,3 +22,4 @@
     {/each}
   </tbody>
 </table>
+</div>
