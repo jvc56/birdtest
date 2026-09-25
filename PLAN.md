@@ -1077,7 +1077,7 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | `opening_rack_stats`: the average alone, after the split | job detail and every SSE push | 343 ms |
 | `opening_rack_stats`: best-move types | job detail and every SSE push | 541 ms (322 ms on the later run) |
 | `opening_rack_stats` **as it is now** — two counters, after both aggregates were dropped | job detail and every SSE push | two single-row reads |
-| Rating sweep `build_matrix`, 600,000 paired results | every two minutes, and on every public read of a pool | 452 ms |
+| Rating sweep `build_matrix`, 600,000 paired results | a fit: the sweep, when a pool's evidence has grown (public reads serve the stored run) | 452 ms |
 | `worker_contributions`, 44,000 claims | job detail and every SSE push | 136 ms |
 | Public worker list, all claims | page view | 93 ms |
 | Leave `next_step` rack selection — **as it was**, ordering on `(occurrence_count, rack)` through an index without `rack` | every leave claim, inside the dispatch lock | 225–390 ms at **400,000** racks (an eighth of English; a scan and sort of the generation, so linear from there — 2–3 s at full size). The 47 ms first recorded here was measured on counts that rarely tied |
@@ -1180,7 +1180,13 @@ What the numbers settled:
   filtered query is sent unprepared, so it is planned for the identity asked
   about — a heavy contributor is found at the head of the job's feed index and
   a rare one through their own claims, and a cached generic plan picks one of
-  those for everybody.
+  those for everybody. That plan still judged a contributor's share of *this*
+  job from their share of all claims, so someone who worked hard in another
+  job and never in this one walked all of it to return nothing (5.8 s cold at
+  two million records). Their claims in this job are now found first: none is
+  an empty page, and up to a thousand are read through directly
+  (`task_claim_id = ANY(...)`); past that they are dense enough in the job for
+  the walk.
 - **A leave claim neither sorts the generation nor reads what is staged.**
   Selection used to order on `(occurrence_count, rack)` through an index on the
   count alone. Counts tie in their millions — every rack starts at zero and the
@@ -3338,6 +3344,17 @@ and a claim does only if the server has never answered this run.
 
 Because it is a normal command it inherits `-mode async`, so a GUI can start it,
 poll status, and stop it with the existing machinery.
+
+**Its tasks run in a config of their own.** Every task sets its lexicon,
+per-player settings and derived-file flags on the config it runs in. Run in the
+caller's, the REPL's save after the command wrote the last task's lexicon into
+`settings.txt`; undone afterwards by replaying a snapshot, a replay that failed
+part way left a session that could not load (a wordmap or word info table this
+machine lacks for the task's lexicon) and, one save later, that lexicon in the
+file. `contribute` creates a config for its tasks instead
+(`config_create_for_contribute`): the same data paths, the caller's thread
+control (so `stop` and the output reach it), settings never saved. The caller's
+session and settings file are left exactly as they were.
 
 ### Per-job-type executors
 
@@ -6652,7 +6669,7 @@ the nineteenth's `AUDIT_FINDINGS_15.md`, the twentieth's `AUDIT_FINDINGS_16.md`,
 the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
 `AUDIT_FINDINGS_18.md`, the twenty-third's `AUDIT_FINDINGS_19.md` and the
 twenty-fourth's `AUDIT_FINDINGS_20.md` and the twenty-fifth's
-`AUDIT_FINDINGS_21.md`.
+`AUDIT_FINDINGS_21.md` and the twenty-sixth's `AUDIT_FINDINGS_22.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says

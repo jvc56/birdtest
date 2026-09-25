@@ -813,7 +813,9 @@ allowed to be newer than the database, never older (PLAN.md, "Artifacts: back up
 Do not declare it finished because the page loads.
 
 ```bash
-# 1. Row counts, against the manifest of the dump that was restored.
+# 1. Row counts, against the manifest of the dump that was restored (after a
+#    dump restore, §2.1 or §5: STAMP is the dump's stamp. After §1's PITR there
+#    is no dump; skip this one).
 aws s3 cp "s3://$BUCKET/pg/$STAMP.manifest.json" - | python3 -m json.tool | head -40
 ```
 
@@ -914,10 +916,11 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    # only its own line, and the lines after it ran anyway.
    # An existing one for this region -- filled in, then this block pasted
    # again -- is kept; one for another (a drill's, §6) is not reused.
-   if [ -e infra/dr.tfvars ] && grep -q "^region *= *\"$DR_REGION\"" infra/dr.tfvars; then
+   if [ -e infra/dr.tfvars ] && grep -q "^region *= *\"$DR_REGION\"" infra/dr.tfvars \
+      && grep -q "^db_allocated_storage *= *$DR_STORAGE_GB\$" infra/dr.tfvars; then
      echo "infra/dr.tfvars exists for $DR_REGION; kept"
    elif [ -e infra/dr.tfvars ]; then
-     echo "infra/dr.tfvars is for another region (a drill's?): move it aside first"
+     echo "infra/dr.tfvars is for another region or size (a drill's?): move it aside first"
    elif [ -n "$DR_REGION" ] && [ -n "$THIRD_REGION" ] && [ -n "$REPLICA_REGION" ] \
       && [ -n "$MANIFEST" ] && [ -n "$DR_STORAGE_GB" ]; then
      # The DR overrides, in a file of their own beside prod.tfvars, so every
@@ -950,7 +953,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    `$DR_REGION`'s first two, and step 4 pins those in `dr.tfvars`.)
 
    ```bash
-   if grep -n '<' infra/dr.tfvars; then echo "fill these in first"; else
+   if ! grep -q "^region *= *\"$DR_REGION\"" infra/dr.tfvars; then
+     echo "infra/dr.tfvars is not for $DR_REGION"
+   elif grep -n '<' infra/dr.tfvars; then echo "fill these in first"; else
      terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars \
        -var desired_count=0 -var scheduled_tasks_enabled=false -var 'azs=null'
    fi
@@ -962,7 +967,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    releases to one that is not (ECR with cross-region replication, or a
    registry outside AWS) — or rebuild them from this repository and the pinned
    MAGPIE commit (README.md, "Deploying") first. And this needs Terraform's
-   state for the copy only — it is a new workspace — but §8's return to the
+   state for the copy only — it is a new workspace — but step 9's return to the
    default workspace needs the original's, which README.md says to keep off
    the lost machine and region. `dr_region` must be a region that is up — the
    copy replicates into it as the original did — not the one that was lost.
@@ -1033,7 +1038,11 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    # then took for done.
    AZS=$(terraform -chdir=infra output -json azs) && ! grep -q '^azs' infra/dr.tfvars \
      && printf '\nazs = %s\n' "$AZS" >> infra/dr.tfvars
-   terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars
+   # Only with the zones pinned: without them prod.tfvars' -- the lost
+   # region's -- apply, and the plan replaces the subnets.
+   if grep -q '^azs' infra/dr.tfvars; then
+     terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars
+   else echo "no azs in infra/dr.tfvars: is this the dr workspace, with step 1's state?"; fi
    ```
 
    Every later command against the copy takes both files, in that order.
@@ -1076,11 +1085,33 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   dump into a throwaway Postgres started inside its own task — never into the
   production instance, whose credentials it does not hold. A failure means the backups are not
   restorable and is the loudest alarm in the system.
-- Twice a year, do §5 by hand into a scratch account or region. The manual
-  drill exists to find the steps that live only in someone's head. Afterwards,
-  move `infra/dr.tfvars` aside (and `terraform workspace delete dr` once the
-  copy is destroyed): a real §5 must not start from the drill's region, size
-  and zones.
+- Twice a year, do §5 by hand into a **scratch account** (not only another
+  region of this one). The manual drill exists to find the steps that live only
+  in someone's head. In this account the drill's copy would hold §5's names --
+  the `-dr` buckets are global, its IAM roles account-wide -- and a real region
+  loss would fail at step 1 on the first of them. Afterwards, tear the copy
+  down, in the `dr` workspace and with the scratch account's credentials:
+
+  ```bash
+  aws rds modify-db-instance --region $DR_REGION --db-instance-identifier birdtest-dr \
+    --no-deletion-protection --apply-immediately
+  # The backups buckets hold 30-day GOVERNANCE-locked versions; the copy's
+  # replica too (in THIRD_REGION). Every version, markers included, removed:
+  for B in "$(terraform -chdir=infra output -raw backups_bucket)" birdtest-dr-backups-dr-<account>; do
+    aws s3api list-object-versions --bucket "$B" \
+      --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
+      --output json > /tmp/versions.json
+    aws s3api delete-objects --bucket "$B" --bypass-governance-retention --delete file:///tmp/versions.json
+  done
+  terraform -chdir=infra destroy -var-file=prod.tfvars -var-file=dr.tfvars
+  terraform -chdir=infra workspace select default
+  terraform -chdir=infra workspace delete dr
+  mv infra/dr.tfvars infra/dr.tfvars.drill-$(date +%Y%m%d)
+  ```
+
+  (`delete-objects` takes at most 1,000 keys a call: run the pair again until
+  the listing is empty. A real §5 must not start from the drill's `dr.tfvars`,
+  so it is moved aside.)
 
 ---
 

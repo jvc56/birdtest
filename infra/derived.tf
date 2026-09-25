@@ -147,7 +147,8 @@ resource "aws_ecs_task_definition" "derived_builder" {
         # Threads for a conversion. Matched to the vCPUs above: the whole
         # reason this task exists is that it can give MAGPIE the cores the web
         # task cannot.
-        { name = "MAGPIE_THREADS", value = tostring(var.derived_builder_cpu / 1024) },
+        # Whole vCPUs, at least one: 512 CPU units made "0.5".
+        { name = "MAGPIE_THREADS", value = tostring(max(1, floor(var.derived_builder_cpu / 1024))) },
         { name = "MIN_MAGPIE_VERSION", value = var.min_magpie_version }
       ]
       secrets = [

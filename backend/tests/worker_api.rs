@@ -2048,6 +2048,17 @@ async fn the_results_feed_filters_by_who_a_name_is() {
     // Unfiltered, all three.
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}/results"), &[])).await;
     assert_eq!(body["items"].as_array().unwrap().len(), 3, "{body}");
+
+    // A contributor with claims in another job and none in this one: an empty
+    // page, decided from their claims in this job before reading its records.
+    // (Read the other way, the planner judged their share of this job from
+    // their share of all claims, and walked all of it to return nothing.)
+    let other = db.games_job(1, 2).await;
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{other}/results?worker=keyed"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().unwrap().len(), 0, "{body}");
+    assert!(body["next_cursor"].is_null(), "{body}");
 }
 
 /// The display pool is what keeps page views off the path workers wait on, and

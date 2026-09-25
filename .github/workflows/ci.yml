@@ -5,6 +5,10 @@
 # contract fixtures.
 name: CI
 
+# Read-only: nothing here writes to the repository or its releases.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -122,7 +126,12 @@ jobs:
       # a pull request that does not include it. The nightly tests the head.
       - name: Read the pinned MAGPIE commit
         id: magpie-pin
-        run: echo "commit=$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)" >> "$GITHUB_OUTPUT"
+        # An empty pin (the ARG renamed) would check out MAGPIE's default
+        # branch and test that instead, silently.
+        run: |
+          commit="$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)"
+          [ -n "$commit" ] || { echo "no ARG MAGPIE_COMMIT= in docker/Dockerfile" >&2; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE
@@ -190,7 +199,12 @@ jobs:
       # a pull request that does not include it. The nightly tests the head.
       - name: Read the pinned MAGPIE commit
         id: magpie-pin
-        run: echo "commit=$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)" >> "$GITHUB_OUTPUT"
+        # An empty pin (the ARG renamed) would check out MAGPIE's default
+        # branch and test that instead, silently.
+        run: |
+          commit="$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)"
+          [ -n "$commit" ] || { echo "no ARG MAGPIE_COMMIT= in docker/Dockerfile" >&2; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE

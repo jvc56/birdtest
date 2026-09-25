@@ -244,6 +244,43 @@ async fn job_results(
     };
     let worker_predicate = worker_predicate(worker.as_ref());
 
+    // A named contributor's claims in this job, found first. Read the other
+    // way -- the job's records newest first, keeping that contributor's --
+    // the planner judges their share of this job from their share of all
+    // claims, so someone who worked hard in another job and never in this
+    // one walked all of it (5.8 s cold over two million records) to return
+    // nothing, on a public route. None here is an empty page; a few, and the
+    // page is read through them (`position_analysis_records_claim_idx`, and
+    // `game_results`' key); past that, their rows are dense enough in the job
+    // for the walk to find a page soon.
+    let claims_here: Option<Vec<Uuid>> = match (&worker, job.job_type) {
+        (Some(_), JobType::OpeningRack | JobType::Games | JobType::GamePairs) => {
+            let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
+                "SELECT c.id FROM task_claims c JOIN tasks t ON t.id = c.task_id
+                 WHERE t.job_id = $1 {worker_predicate}
+                 LIMIT {}",
+                MAX_CLAIMS_READ_DIRECTLY + 1
+            ))
+            .persistent(false)
+            .bind(id)
+            .bind(worker_user)
+            .bind(worker_anon)
+            .fetch_all(&state.read_pool)
+            .await?;
+            if ids.is_empty() {
+                return Ok(Json(super::CursorPage {
+                    items: Vec::new(),
+                    total: -1,
+                    per_page: limit,
+                    next_cursor: None,
+                }));
+            }
+            (ids.len() <= MAX_CLAIMS_READ_DIRECTLY).then_some(ids)
+        }
+        _ => None,
+    };
+    let claims_clause = if claims_here.is_some() { "AND r.task_claim_id = ANY($7)" } else { "" };
+
     // Every branch below reads its rows through the job id the record tables
     // now carry, rather than by joining `tasks` to find out which rows belong
     // to the job — which put the filter on the far side of a join from the
@@ -258,7 +295,7 @@ async fn job_results(
             // to now(), which is transaction time, so every record of one batch
             // shares it exactly and it is not a key on its own.
             let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
-            let rows = sqlx::query(&format!(
+            let sql = format!(
                 "SELECT r.id, r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
                         m.equity AS best_equity, r.num_moves, r.submitted_at,
                         u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
@@ -269,11 +306,13 @@ async fn job_results(
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE r.job_id = $1
                    {worker_predicate}
+                   {claims_clause}
                    AND ($4::timestamptz IS NULL
                         OR (r.submitted_at, r.id) < ($4, $5))
                  ORDER BY r.submitted_at DESC, r.id DESC
                  LIMIT $6",
-            ))
+            );
+            let rows = sqlx::query(&sql)
             // Planned for the values it is run with, not cached: see
             // `worker_predicate`.
             .persistent(worker.is_none())
@@ -282,7 +321,11 @@ async fn job_results(
             .bind(worker_anon)
             .bind(after_time)
             .bind(after_id)
-            .bind(limit)
+            .bind(limit);
+            let rows = match &claims_here {
+                Some(ids) => rows.bind(ids),
+                None => rows,
+            }
             .fetch_all(&state.read_pool)
             .await?;
 
@@ -320,7 +363,7 @@ async fn job_results(
             // rather than as the thing that decides which rows belong to the
             // job.
             let (after_time, after_claim) = game_result_cursor(cursor.as_deref());
-            let rows = sqlx::query(&format!(
+            let sql = format!(
                 "SELECT r.task_claim_id, r.task_id, r.games, r.wins, r.losses, r.ties,
                         r.p1_score_mean, r.p1_score_sd, r.p2_score_mean, r.p2_score_sd,
                         r.divergent_games, r.divergent_wins, r.divergent_losses,
@@ -332,18 +375,24 @@ async fn job_results(
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
                  WHERE r.job_id = $1
                    {worker_predicate}
+                   {claims_clause}
                    AND ($4::timestamptz IS NULL
                         OR (r.submitted_at, r.task_claim_id) < ($4, $5))
                  ORDER BY r.submitted_at DESC, r.task_claim_id DESC
                  LIMIT $6",
-            ))
+            );
+            let rows = sqlx::query(&sql)
             .persistent(worker.is_none())
             .bind(id)
             .bind(worker_user)
             .bind(worker_anon)
             .bind(after_time)
             .bind(after_claim)
-            .bind(limit)
+            .bind(limit);
+            let rows = match &claims_here {
+                Some(ids) => rows.bind(ids),
+                None => rows,
+            }
             .fetch_all(&state.read_pool)
             .await?;
 
@@ -539,6 +588,10 @@ async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<Worker
 /// orders of magnitude with who that is -- a heavy contributor is found at the
 /// head of the job's feed index, a rare one through their own claims -- and a
 /// cached generic plan picks one for everybody.
+/// Up to this many claims of a named contributor in a job, a filtered feed is
+/// read through the claims themselves rather than by walking the job.
+const MAX_CLAIMS_READ_DIRECTLY: usize = 1000;
+
 fn worker_predicate(worker: Option<&WorkerFilter>) -> &'static str {
     match worker {
         None => "AND $2::uuid IS NULL AND $3::uuid IS NULL",

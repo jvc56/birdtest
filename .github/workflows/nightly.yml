@@ -5,6 +5,11 @@
 # the results land, then the M-5..M-11 cases (see scripts/e2e_magpie.py).
 name: Nightly MAGPIE end-to-end
 
+# Read-only: the token reaches the backend container (for MAGPIE-DATA
+# lookups), so it should be able to do nothing else.
+permissions:
+  contents: read
+
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -47,6 +52,7 @@ jobs:
           else
             ref="$(printf '%s' "$HEAD_REF" | tr -d '\n')"
           fi
+          [ -n "$ref" ] || { echo "no MAGPIE ref (is ARG MAGPIE_COMMIT= in docker/Dockerfile?)" >&2; exit 1; }
           printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:

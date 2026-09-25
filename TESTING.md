@@ -1833,7 +1833,9 @@ below.
   404s for an unknown id. *(Covered:
   `public_api::job_detail_carries_the_stats_block_of_its_type`.)*
 - `A-PUBLIC-3` `job_results` paginates and filters, and returns `total = -1`
-  where an exact count is deliberately not computed. *(Covered:
+  where an exact count is deliberately not computed. A `?worker=` with no
+  claims in this job is an empty page decided from their claims here, not by
+  walking the job (twenty-sixth audit). *(Covered:
   `public_api::the_results_feed_paginates_and_filters_without_counting`,
   `worker_api::the_results_feed_walks_every_row_exactly_once`,
   `worker_api::the_results_feed_filters_by_who_a_name_is`.)*

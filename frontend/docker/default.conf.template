@@ -40,9 +40,24 @@ server {
         proxy_pass http://${BACKEND_UPSTREAM}/health;
     }
 
+    # The build's hashed assets: a name is never reused, so cached for good --
+    # and a name that is not there is a 404. Under `location /` a missing
+    # chunk fell through to index.html, a 200 of HTML that `nosniff` refuses
+    # to run as a module, and the page stayed blank.
+    location /_app/immutable/ {
+        try_files $uri =404;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header X-Content-Type-Options "nosniff" always;
+    }
+
     # Everything else is the SPA; unknown paths resolve client-side.
     location / {
         try_files $uri $uri/ /index.html;
+        # Revalidated on every visit. With no Cache-Control a browser cached
+        # index.html by heuristic -- a tenth of the build's age, a day for a
+        # two-week-old build -- and after a deploy asked for chunks the new
+        # image no longer has: a blank page until the entry expired.
+        add_header Cache-Control "no-cache" always;
         # Nothing here is meant to be framed or sniffed, and the site is only
         # ever served over HTTPS once deployed (the ALB redirects port 80).
         # `add_header` in a location replaces the server's, so they are here,
