@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { datetime, duration, jobTypeLabel, sprtLabel, workerLabel } from './format';
+import {
+  blankFields,
+  datetime,
+  duration,
+  jobTypeLabel,
+  optionalNumber,
+  sprtLabel,
+  workerLabel
+} from './format';
 
 describe('F-FMT-1 workerLabel', () => {
   const uuid = '3f2b8c1e-9d4a-4e7b-a1c2-5d6e7f809a1b';
@@ -115,5 +123,23 @@ describe('F-FMT-5 sprtLabel', () => {
   it('falls back to the raw status for an unknown one', () => {
     expect(sprtLabel('paused')).toBe('paused');
     expect(sprtLabel('constructor')).toBe('constructor');
+  });
+});
+
+describe('F-FMT-6 form numbers', () => {
+  it('reads a blank optional number as null, never 0', () => {
+    // Svelte binds a cleared number box as null; Number(null) is 0.
+    expect(optionalNumber(null)).toBeNull();
+    expect(optionalNumber('')).toBeNull();
+    expect(optionalNumber(undefined)).toBeNull();
+    expect(optionalNumber(Number.NaN)).toBeNull();
+    expect(optionalNumber(0)).toBe(0);
+    expect(optionalNumber(2.5)).toBe(2.5);
+    expect(optionalNumber('7')).toBe(7);
+  });
+
+  it('names the fields a request would send blank', () => {
+    expect(blankFields({ a: 1, b: null, c: Number.NaN, d: 'x', e: 0 })).toEqual(['b', 'c']);
+    expect(blankFields({ a: 1 })).toEqual([]);
   });
 });

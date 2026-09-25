@@ -267,6 +267,24 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
     let german = db.input_data("letterdist", "german").await;
     let winpct = db.input_data("winpct", "winpct").await;
     let other_winpct = db.input_data("winpct", "winpct2").await;
+    // More letters than MAGPIE holds: parsed at job creation now, rather than
+    // failing every claim of the job (and overrunning MAGPIE's arrays).
+    let too_many: String = (0..51)
+        .map(|i| {
+            let letter = char::from_u32(0x100 + i).unwrap();
+            format!("{letter},{letter},1,1,0\n")
+        })
+        .collect();
+    let oversized: Uuid = sqlx::query_scalar(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+         VALUES ('letterdistributions/huge.csv', 'letterdist', 'huge', $1, 1, '20251004', $2)
+         RETURNING id",
+    )
+    .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"huge")))
+    .bind(too_many.as_bytes())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
 
     let plain = created_config(&admin, static_config("static", &files)).await;
     let simmer = created_config(&admin, simming_config("simmer", &files, Some(winpct))).await;
@@ -291,6 +309,7 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
         ("a letter distribution that does not exist", with(&|body| body["letterdist_id"] = json!(Uuid::new_v4())), "no input data row"),
         ("a layout that does not exist", with(&|body| body["layout_id"] = json!(Uuid::new_v4())), "no input data row"),
         ("a lexicon given as the letter distribution", with(&|body| body["letterdist_id"] = json!(files.kwg)), "expected a letterdist row"),
+        ("a letter distribution MAGPIE cannot hold", with(&|body| body["letterdist_id"] = json!(oversized)), "cannot be used"),
         ("a player config that does not exist", with(&|body| body["player2_config_id"] = json!(Uuid::new_v4())), "player config not found"),
     ];
     for (name, body, says) in cases {

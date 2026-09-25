@@ -458,8 +458,27 @@ async fn confirm_email(
     )
     .bind(&code_hash)
     .fetch_optional(&mut *tx)
-    .await?
-    .ok_or_else(|| AppError::bad_request("that confirmation link is invalid or has expired"))?;
+    .await?;
+    let Some(user_id) = user_id else {
+        // The same link opened again -- a double click, a second tab, a mail
+        // scanner that followed it first -- is answered as the success it
+        // already was. It said "invalid or has expired" and offered to
+        // register again, which then said the name was taken. The code is a
+        // secret, so answering for it tells nobody else anything.
+        let already: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM email_confirmations c
+                              JOIN users u ON u.id = c.user_id
+                             WHERE c.code_hash = $1 AND c.used_at IS NOT NULL
+                               AND u.email_confirmed_at IS NOT NULL AND u.deleted_at IS NULL)",
+        )
+        .bind(&code_hash)
+        .fetch_one(&mut *tx)
+        .await?;
+        if already {
+            return Ok(Json(MessageBody { message: "email already confirmed" }));
+        }
+        return Err(AppError::bad_request("that confirmation link is invalid or has expired"));
+    };
 
     sqlx::query("UPDATE users SET email_confirmed_at = now() WHERE id = $1")
         .bind(user_id)

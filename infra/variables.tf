@@ -142,10 +142,18 @@ variable "db_multi_az" {
 variable "dr_region" {
   description = <<-EOT
     Second region that artifacts and backups are replicated into. Only has to
-    differ from `region`; nothing is served from it.
+    differ from `region`; nothing is served from it. A stack in us-west-2 must
+    set it: the same region twice made the backup KMS alias twice and failed
+    the first apply half-way (and, had it not, replication into the same
+    region protects against nothing).
   EOT
   type        = string
   default     = "us-west-2"
+
+  validation {
+    condition     = var.dr_region != var.region
+    error_message = "dr_region must differ from region: backups replicated into their own region do not survive its loss."
+  }
 }
 
 variable "backup_schedule" {

@@ -1,5 +1,6 @@
 terraform {
-  required_version = ">= 1.6"
+  # 1.9: a variable's validation may refer to another variable (dr_region's).
+  required_version = ">= 1.9"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -37,10 +38,12 @@ locals {
 
 # The zones, unless `azs` names them: the region's first two that need no
 # opt-in (Local and Wavelength Zones do), in name order. In us-east-1 that is
-# us-east-1a and us-east-1b, what the variable used to default to.
+# us-east-1a and us-east-1b, what the variable used to default to. Not filtered
+# on state: a zone reported impaired during an AZ event -- exactly when RUNBOOK
+# §1 applies -- would change the pair, and a subnet's zone cannot change
+# without replacing it (and the ALB, tasks and database sit in them). Pin the
+# `azs` output into prod.tfvars after the first apply (README "Deploying").
 data "aws_availability_zones" "available" {
-  state = "available"
-
   filter {
     name   = "opt-in-status"
     values = ["opt-in-not-required"]

@@ -68,9 +68,9 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 163 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (13), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `ratelimit` (2), `routes::public` (2), `exports`, `jobs`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
-| 1F Frontend unit | 101 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 143 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (14), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 1 Unit | 164 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (14), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `ratelimit` (2), `routes::public` (2), `exports`, `jobs`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1F Frontend unit | 103 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 144 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 168 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (18), `public_api.rs` (11), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 502 backend tests (the per-tier counts above are
+--run-ignored all` runs 504 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
 they had drifted by up to 17).
 
@@ -242,6 +242,11 @@ against it, so a change in ordering silently re-points existing rows.
   every rack with a blank comes after every rack without in the index — and a
   rack containing one round-trips through `rack_at`. *(Covered:
   `racks::tests::blanks_lead_their_racks_and_sit_at_the_end_of_the_index`.)*
+- `U-RACK-9` A distribution with more letters than MAGPIE's `MAX_ALPHABET_SIZE`
+  (50) is refused, naming the file; one at the limit parses. MAGPIE loaded a
+  longer one and wrote past every per-letter array. *(Covered:
+  `racks::tests::a_distribution_past_magpies_alphabet_is_refused`; job creation
+  refuses one in `A-ADMIN-3`.)* (Twenty-second audit.)
 
 ### `U-ERR-*` — error mapping (`error.rs`)
 
@@ -516,6 +521,11 @@ Each entry's tests are the `describe` block named for its id.
   `toString` that an object literal answers. *(Covered: `format.test.ts`.)*
 - `F-FMT-5` `sprtLabel` covers all four statuses. *(Covered:
   `format.test.ts`.)*
+- `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
+  number box as `null`, and `Number(null)` is 0, which the player-config form
+  wrote into configs that cannot be edited), and a request's blank required
+  fields are named before it is sent (the job form). *(Covered:
+  `format.test.ts`.)* (Twenty-second audit.)
 
 ### `F-API-*` — `lib/api.ts`
 
@@ -1206,6 +1216,11 @@ permanent.
 - `I-STATS-8b` A games job's ETA divides by the redundancy: units left at claims
   an hour × batch ÷ redundancy. *(Covered:
   `stats::the_games_eta_divides_by_redundancy`.)* (Sixteenth audit.)
+- `I-STATS-8c` A job activated less than an hour ago is measured since its
+  activation (at least a minute), not over the hour: ten minutes in, the hour's
+  average read six times the real time left. *(Covered:
+  `stats::a_new_jobs_eta_is_measured_since_it_was_activated`.)* (Twenty-second
+  audit.)
 - `I-STATS-9` **The finish check** completes a job at SPRT significance and at
   the hard cap, and does **not** complete below `min_units` even with a crossed
   LLR. There is no `finish_if_done`, as this entry first named it: the check is
@@ -1508,7 +1523,11 @@ below.
   `auth_routes::registration_refuses_weak_passwords_and_ones_built_from_the_username_or_email`,
   `auth_routes::a_reset_refuses_a_password_built_from_the_account_and_keeps_the_link`;
   the email's local part alone was accepted.)*
-- `A-AUTH-6` A confirmation code is single-use; replaying it fails. *(Covered:
+- `A-AUTH-6` A confirmation code is single-use: replaying it changes nothing.
+  Opened again for an account it confirmed (a double click, a mail scanner that
+  followed it first), it is answered "email already confirmed" rather than
+  "invalid" with an offer to register again (twenty-second audit); for any
+  other account it fails. *(Covered:
   `auth_routes::a_confirmation_code_works_once`.)*
 - `A-AUTH-7` An expired confirmation code fails. *(Covered:
   `auth_routes::an_expired_confirmation_code_is_refused`.)*
@@ -1619,13 +1638,16 @@ below.
   request in a burst is 429 and the account's other key is not. *(Covered:
   `worker_routes::an_accounts_workers_are_limited_per_key`.)* (Thirteenth
   audit.)
-- `A-WORKER-16` An address whose worker credentials (API key or
-  `X-Worker-UUID`) keep matching nothing gets 401s, then, past 30 in a minute,
-  429s with `Retry-After`, refused before the identity lookup; another address
-  is unaffected. The lookup is a main-pool query that no bucket covered.
-  *(Covered: `boundaries::made_up_worker_credentials_are_limited_per_address`,
-  `ratelimit::key_tests::an_address_that_keeps_missing_is_refused_before_the_lookup`.)*
-  (Twenty-first audit.)
+- `A-WORKER-16` Worker credentials are charged before their lookup (a
+  main-pool query): each its own bucket, and one that has not resolved lately
+  its address's too (burst 100). Made-up keys get 401s, then 429s with
+  `Retry-After`, while a real worker at the same address -- whose credential
+  resolved -- goes on being served, and another address is unaffected.
+  *(Covered:
+  `boundaries::made_up_worker_credentials_are_limited_per_address_and_real_ones_are_not`,
+  `ratelimit::key_tests::unknown_credentials_pay_their_address_and_known_ones_do_not`.)*
+  (Twenty-first audit; the twenty-second's redesign: the first gate refused
+  every worker request from the address, real ones included.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*
@@ -1646,7 +1668,8 @@ below.
   are enforced where the player is made, at player-config creation, not at job
   creation as this entry first listed them, so no job can name such a config.
   A config's `kwg_id`, `klv_id` and `winpct_id` must each name a file of that
-  role (`A-BOUND-3`). *(Covered:
+  role (`A-BOUND-3`). A letter distribution MAGPIE cannot hold (`U-RACK-9`) is
+  refused at creation, not by every claim as a 500. *(Covered:
   `admin_routes::job_creation_refuses_each_impossible_combination_and_says_which`,
   which asserts the player-config half too.)*
 - `A-ADMIN-4` Activate / deactivate / complete / purge / delete each return the

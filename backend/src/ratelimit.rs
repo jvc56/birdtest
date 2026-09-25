@@ -52,9 +52,8 @@ pub struct RateLimiters {
     /// was too tight for the hundred keys an account may hold: fifty idle
     /// machines filled it, and heartbeats, which are not retried, lapsed.)
     pub key_creation: Arc<Keyed>,
-    /// Worker credentials that matched nothing, per client address: see
-    /// [`MissGate`].
-    pub worker_misses: Arc<MissGate>,
+    /// Worker credentials, before their lookup: see [`CredentialGate`].
+    pub worker_credentials: Arc<CredentialGate>,
     /// Confirmation and reset links redeemed, per client address: 20 a
     /// minute. The codes are too long to guess, so this is about cost, not
     /// guessing -- both routes are unauthenticated and write on the main pool,
@@ -62,65 +61,73 @@ pub struct RateLimiters {
     pub redeem: Arc<Keyed>,
 }
 
-/// Worker requests whose API key or `X-Worker-UUID` matched nothing, per
-/// client address, and the addresses refused for it.
+/// Worker credentials looked up in the database, and how many of them one
+/// address may try.
 ///
-/// Resolving a worker identity is a main-pool query, made before any worker
-/// bucket can be charged -- the bucket is the identity's. So a made-up key or
-/// UUID cost a query and a 401, unmetered, on the pool that claims and
-/// submissions need (`db.rs`). A real worker never misses; an address that
-/// misses 30 times in a minute is refused without a query until its bucket
-/// refills.
-pub struct MissGate {
-    misses: Keyed,
-    refused_until: Mutex<HashMap<IpAddr, Instant>>,
+/// Resolving a worker identity is a main-pool query, on the pool claims and
+/// submissions need (`db.rs`). Every presented credential is charged its own
+/// bucket (`worker`, 1 a second, burst 5) before that query -- the key's hash
+/// or the UUID already names the bucket -- so a real identity costs at most
+/// that many lookups. A credential that has not resolved in the last ten
+/// minutes also pays a cell of its address's bucket (5 a second, burst 100)
+/// before its lookup, match or not: made-up keys and UUIDs, each a fresh
+/// bucket of its own, are bounded per address, and so are the lookups a
+/// burst of them sends at once. Credentials that resolved recently skip the
+/// address's bucket, so a misbehaving machine -- or a fleet still running a
+/// revoked key -- behind a shared address does not lock out the workers that
+/// are fine. The burst admits a hundred machines behind one address at once
+/// after a restart, when nothing is known yet.
+pub struct CredentialGate {
+    unknown_per_address: Keyed,
+    known: Mutex<HashMap<String, Instant>>,
 }
 
-impl MissGate {
+/// How long a credential that resolved counts as known.
+const KNOWN_FOR: Duration = Duration::from_secs(600);
+/// At most this many known credentials are remembered (about 7 MB); past it a
+/// credential is simply treated as unknown, which costs its address a cell.
+const MAX_KNOWN: usize = 50_000;
+
+impl CredentialGate {
     fn new() -> Self {
         Self {
-            misses: RateLimiter::keyed(Quota::per_minute(NonZeroU32::new(30).unwrap())),
-            refused_until: Mutex::new(HashMap::new()),
+            unknown_per_address: RateLimiter::keyed(
+                Quota::per_second(NonZeroU32::new(5).unwrap())
+                    .allow_burst(NonZeroU32::new(100).unwrap()),
+            ),
+            known: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Before the lookup: a 429, costing nothing, while `address` is refused.
-    pub fn check(&self, address: IpAddr) -> Result<(), AppError> {
-        let refused = self.refused_until.lock().unwrap_or_else(|e| e.into_inner());
-        match refused.get(&address) {
-            Some(until) if *until > Instant::now() => Err(AppError::rate_limited(
-                until.saturating_duration_since(Instant::now()).as_secs().max(1),
-            )),
-            _ => Ok(()),
-        }
+    fn is_known(&self, presented: &str) -> bool {
+        let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        known.get(presented).is_some_and(|at| at.elapsed() < KNOWN_FOR)
     }
 
-    /// After a lookup that matched nothing: charged, and once the bucket is
-    /// empty the address is refused (and this miss answered 429) until it
-    /// refills.
-    pub fn record_miss(&self, address: IpAddr) -> Result<(), AppError> {
-        match self.misses.check_key(&address.to_string()) {
-            Ok(()) => Ok(()),
-            Err(negative) => {
-                let wait = negative
-                    .wait_time_from(governor::clock::Clock::now(&DefaultClock::default()))
-                    .max(Duration::from_secs(1));
-                self.refused_until
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(address, Instant::now() + wait);
-                Err(AppError::rate_limited(wait.as_secs().max(1)))
-            }
+    /// Before the lookup: the credential's own bucket, and, unless it resolved
+    /// recently, a cell of its address's.
+    pub fn admit(&self, worker: &Keyed, presented: &str, address: IpAddr) -> Result<(), AppError> {
+        check(worker, presented)?;
+        if self.is_known(presented) {
+            return Ok(());
+        }
+        check(&self.unknown_per_address, &format!("ip:{address}"))
+    }
+
+    /// After a lookup that resolved.
+    pub fn remember(&self, presented: &str) {
+        let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        if known.len() < MAX_KNOWN || known.contains_key(presented) {
+            known.insert(presented.to_owned(), Instant::now());
         }
     }
 
     fn retain_recent(&self) {
-        self.misses.retain_recent();
-        let now = Instant::now();
-        self.refused_until
+        self.unknown_per_address.retain_recent();
+        self.known
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|_, until| *until > now);
+            .retain(|_, at| at.elapsed() < KNOWN_FOR);
     }
 }
 
@@ -147,7 +154,7 @@ impl RateLimiters {
             login: Arc::new(RateLimiter::keyed(logins_per_minute)),
             login_account: Arc::new(RateLimiter::keyed(account_logins_per_minute)),
             key_creation: Arc::new(RateLimiter::keyed(keys_per_hour)),
-            worker_misses: Arc::new(MissGate::new()),
+            worker_credentials: Arc::new(CredentialGate::new()),
             redeem: Arc::new(RateLimiter::keyed(Quota::per_minute(NonZeroU32::new(20).unwrap()))),
         }
     }
@@ -176,7 +183,7 @@ impl RateLimiters {
         ] {
             limiter.retain_recent();
         }
-        self.worker_misses.retain_recent();
+        self.worker_credentials.retain_recent();
     }
 }
 
@@ -216,26 +223,42 @@ pub fn check(limiter: &Keyed, key: &str) -> Result<(), AppError> {
 mod key_tests {
     use super::*;
 
-    /// A-WORKER-16 (the gate): an address whose worker credentials keep matching
-    /// nothing is refused before the lookup once its bucket is spent, with a
-    /// `Retry-After`; another address is not.
+    /// A-WORKER-16 (the gate): a credential's own bucket is charged before
+    /// its lookup; unknown credentials also pay their address's, and once
+    /// that is spent they are refused, while a credential that resolved is
+    /// not -- whatever its address's neighbours did.
     #[test]
-    fn an_address_that_keeps_missing_is_refused_before_the_lookup() {
-        let gate = MissGate::new();
-        let noisy: IpAddr = "192.0.2.50".parse().unwrap();
+    fn unknown_credentials_pay_their_address_and_known_ones_do_not() {
+        let gate = CredentialGate::new();
+        let worker: Keyed = RateLimiter::keyed(
+            Quota::per_second(NonZeroU32::new(1).unwrap()).allow_burst(NonZeroU32::new(5).unwrap()),
+        );
+        let shared: IpAddr = "192.0.2.50".parse().unwrap();
+
+        assert!(gate.admit(&worker, "a:real", shared).is_ok());
+        gate.remember("a:real");
+
         let mut refused = None;
-        for _ in 0..31 {
-            assert!(gate.check(noisy).is_ok(), "not refused before its bucket is spent");
-            if let Err(e) = gate.record_miss(noisy) {
-                refused = Some(e);
+        for i in 0..200 {
+            if let Err(e) = gate.admit(&worker, &format!("k:made-up-{i}"), shared) {
+                refused = Some(i);
+                assert_eq!(e.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
                 break;
             }
         }
-        let refused = refused.expect("the thirty-first miss is refused");
-        assert_eq!(refused.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
-        let early = gate.check(noisy).expect_err("refused without a lookup now");
-        assert!(early.retry_after.unwrap() >= 1);
-        assert!(gate.check("192.0.2.51".parse().unwrap()).is_ok(), "another address");
+        assert!(refused.is_some_and(|i| (99..=101).contains(&i)), "{refused:?}");
+        assert!(gate.admit(&worker, "a:real", shared).is_ok(), "the known worker is not refused");
+        assert!(
+            gate.admit(&worker, "k:fresh", "192.0.2.51".parse().unwrap()).is_ok(),
+            "another address"
+        );
+
+        // The credential's own bucket holds whether or not it is known.
+        let mut own = 0;
+        while gate.admit(&worker, "a:real", shared).is_ok() {
+            own += 1;
+            assert!(own < 10);
+        }
     }
 
     /// A caller-supplied key is kept as a digest past `MAX_KEY_BYTES`: a

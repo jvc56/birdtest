@@ -298,14 +298,45 @@ async fn one_address_holds_at_most_its_share_of_live_streams() {
     assert_eq!(stream("198.51.100.77").await.status(), StatusCode::OK, "a place came back");
 }
 
-/// A-WORKER-16 (on the router): an address whose worker credentials keep
-/// matching nothing gets 401s, then 429s with `Retry-After` -- refused before
-/// the lookup from then on -- while a real worker elsewhere is unaffected.
-/// The lookup is a main-pool query, and nothing else limited it.
+/// A-WORKER-16 (on the router): made-up worker credentials pay their
+/// address's bucket before their lookup, and past its burst are refused with
+/// a `Retry-After` -- while a real worker at the same address, whose
+/// credential resolved, goes on being served. (The previous gate refused
+/// every worker request from the address, real ones included.)
 #[tokio::test]
-async fn made_up_worker_credentials_are_limited_per_address() {
+async fn made_up_worker_credentials_are_limited_per_address_and_real_ones_are_not() {
     let db = TestDb::new().await;
+    db.games_job(1, 2).await;
     let app = proxied_app(&db).await;
+    let shared = "203.0.113.99";
+
+    // A real worker behind the shared address: its first claim mints a UUID.
+    let first = send_raw(
+        &app,
+        post_json("/api/worker/task", &[("x-forwarded-for", shared)], claim_body("1.0.0", &[])),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{first:?}");
+    let uuid = first.body["worker_uuid"].as_str().expect("a minted uuid").to_string();
+    let token = first.body["claim_token"].clone();
+    let heartbeat = |uuid: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            send_raw(
+                &app,
+                post_json(
+                    "/api/worker/heartbeat",
+                    &[("x-forwarded-for", shared), ("x-worker-uuid", uuid.as_str())],
+                    json!({ "claim_token": token }),
+                ),
+            )
+            .await
+        }
+    };
+    let real = heartbeat(uuid.clone()).await;
+    assert_ne!(real.status, StatusCode::TOO_MANY_REQUESTS, "{real:?}");
+
     let bogus = |ip: &'static str, i: usize| {
         let key = format!("Bearer not-a-key-{i}");
         let app = app.clone();
@@ -322,16 +353,19 @@ async fn made_up_worker_credentials_are_limited_per_address() {
         }
     };
     let mut limited = None;
-    for i in 0..40 {
-        let response = bogus("203.0.113.99", i).await;
+    for i in 0..150 {
+        let response = bogus(shared, i).await;
         if response.status == StatusCode::TOO_MANY_REQUESTS {
             limited = Some(i);
+            assert_rate_limited(&response, "past the address's burst");
             break;
         }
         assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
     }
-    assert_eq!(limited, Some(30), "thirty misses a minute, then refused");
-    assert_rate_limited(&bogus("203.0.113.99", 99).await, "refused before the lookup");
+    assert!(limited.is_some_and(|i| (99..=101).contains(&i)), "{limited:?}");
+
+    let still = heartbeat(uuid).await;
+    assert_ne!(still.status, StatusCode::TOO_MANY_REQUESTS, "the real worker is served: {still:?}");
     assert_eq!(bogus("203.0.113.100", 0).await.status, StatusCode::UNAUTHORIZED, "another address");
 }
 

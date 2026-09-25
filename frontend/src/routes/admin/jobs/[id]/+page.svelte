@@ -208,7 +208,10 @@
         </div>
         <button
           class="btn-primary"
-          on:click={() => run(() => api.activateJob(jobId, allocation), 'Job activated.')}
+          on:click={() =>
+            allocation === null || Number.isNaN(Number(allocation))
+              ? (error = 'Enter an allocation from 0 to 100.')
+              : run(() => api.activateJob(jobId, allocation), 'Job activated.')}
         >
           Activate
         </button>

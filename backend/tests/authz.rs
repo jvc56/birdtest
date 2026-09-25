@@ -592,10 +592,14 @@ async fn a_deactivated_or_revoked_api_key_is_refused_by_every_worker_endpoint() 
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "an active key is served (nothing to do): {body}");
 
+    // A fresh app, and so fresh rate limiters, for each round: every
+    // presented key is charged its own bucket (burst 5) before its lookup,
+    // live or dead, and a round is five requests on top of the claim above.
     let refused_everywhere = |label: &'static str| {
-        let app = app.clone();
+        let db = &db;
         let bearer = bearer.clone();
         async move {
+            let app = birdtest::app(db.state().await);
             let mut checked = 0;
             for (method, path, _, body) in routes_with(&[Worker]) {
                 let (status, response) = send(&app, request(method, path, &bearer, body)).await;

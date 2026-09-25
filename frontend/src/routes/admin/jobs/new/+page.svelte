@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
-  import { jobTypeLabel } from '$lib/format';
+  import { blankFields, jobTypeLabel } from '$lib/format';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -133,10 +133,19 @@
   }
 
   async function submit() {
-    busy = true;
     error = '';
+    // A cleared number box binds as null, and the server's answer to a null
+    // setting names the whole request ("data did not match any variant"),
+    // not the field.
+    const request = body();
+    const blank = blankFields(request);
+    if (blank.length) {
+      error = `Fill in every setting: ${blank.join(', ')} is empty.`;
+      return;
+    }
+    busy = true;
     try {
-      const created = await api.createJob(body());
+      const created = await api.createJob(request);
       goto(`/admin/jobs/${created.job.id}`);
     } catch (e) {
       error = errorText(e);

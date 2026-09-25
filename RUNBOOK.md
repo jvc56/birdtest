@@ -243,19 +243,30 @@ way the monthly drill does it. The shell's task stops itself after
 `SHELL_HOURS` (default 4); a large dump on the task's one vCPU can take longer,
 so start it with `SHELL_HOURS=12 scripts/prod-shell.sh` for anything big:
 
+First fetch the dump and check it against its manifest, as the drill does
+(`scripts/restore-drill.sh`, `dump_digest`): a partial download, or a replica
+whose files were still arriving, restores part of a database and says nothing.
+This block can be run again as it is; do not go on to the next until it says
+`checksum matches`.
+
 ```bash
 # Inside scripts/prod-shell.sh.
 apt-get update -qq && apt-get install -y -qq awscli >/dev/null
 STAMP=2026-09-07T03-00-00Z
-aws s3 cp "s3://$BACKUP_BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
-# Checked against its manifest as the drill checks it (scripts/restore-drill.sh,
-# dump_digest): a partial download, or a replica whose files were still
-# arriving, restores part of a database and says nothing.
-aws s3 cp "s3://$BACKUP_BUCKET/pg/$STAMP.manifest.json" /tmp/manifest.json
+BUCKET=${BUCKET:-$BACKUP_BUCKET}   # §5 sets the replica's, and S3_REGION
+rm -rf /tmp/dump   # a re-fetch must not keep files from an earlier one
+aws s3 cp ${S3_REGION:+--region $S3_REGION} "s3://$BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
+aws s3 cp ${S3_REGION:+--region $S3_REGION} "s3://$BUCKET/pg/$STAMP.manifest.json" /tmp/manifest.json
 want=$(grep -o '"sha256"[^,}]*' /tmp/manifest.json | sed 's/.*: *"//;s/"//')
 got=$( (cd /tmp/dump && find . -type f | LC_ALL=C sort | xargs -r sha256sum) | sha256sum | cut -d' ' -f1)
 [ -n "$want" ] && [ "$want" = "$got" ] && echo "checksum matches" \
-  || echo "CHECKSUM MISMATCH ($want vs $got): stop, and fetch the dump again"
+  || echo "CHECKSUM MISMATCH ($want vs $got): run this block again; do not restore"
+```
+
+Then restore it. If an earlier attempt got part of the way, start clean first:
+`gosu postgres pg_ctl -D /tmp/scratch stop; rm -rf /tmp/scratch`.
+
+```bash
 mkdir -p /tmp/scratch /tmp/sock && chown postgres /tmp/scratch /tmp/sock
 gosu postgres initdb -D /tmp/scratch -U postgres --auth=trust >/dev/null
 # As the drill starts its own (scripts/restore-drill.sh): no parallel query,
@@ -296,13 +307,14 @@ DO NOTHING`, so a partial re-run is safe — which is all it is for, after §2.0
 (`COPY` itself has no `ON CONFLICT`: loaded straight in, a re-run stopped at the
 first row already there.)
 
-For a large job, look at the space first. Each table is staged in an unindexed
-temporary table on the production volume before it is inserted, so for a while
-the copy-back holds about twice the job's largest table, plus the WAL the
-inserts write. Autoscaling keeps only about a tenth of the volume free and grows
-it at most every six hours. Compare the job's largest table in the scratch copy
-(`pg_total_relation_size`) with `FreeStorageSpace`, and raise
-`db_allocated_storage` first if it is close.
+For a large job, look at the space first. The copy-back adds the job's rows to
+every table, with their indexes, and stages each table's in an unindexed
+temporary table on the production volume first, plus the WAL the inserts
+write; autoscaling keeps only about a tenth of the volume free and grows it at
+most every six hours. Run the script once with `COPYBACK_DUMP_ONLY=1`: it dumps
+the job's rows and prints their sizes (text; allow about twice the total), and
+stops before loading anything. Compare with `FreeStorageSpace`, raise
+`db_allocated_storage` first if it is close, then run it again without.
 
 Save this as `/tmp/copyback.sh` — `cat > /tmp/copyback.sh <<'EOF'` … `EOF`,
 the quotes mattering: unquoted, the shell fills in `$JOB` and the rest as it
@@ -320,7 +332,10 @@ for; write what the script reads first:
 # The last '@' ends the password (one in it is encoded); the host runs to the
 # path or query. %q, so no character in the URL can break the file.
 ENDPOINT="<the scratch instance's endpoint>"
-SCRATCH_URL=$(printf '%s' "$DATABASE_URL" | sed -E "s#^(.*@)[^/?]+#\1$ENDPOINT:5432#")
+ENDPOINT=${ENDPOINT%%:*}   # a pasted ":5432" would be doubled
+# The userinfo is everything up to the '@' before the first '/', '?' or '#'
+# after the scheme: an '@' in a query string is not it.
+SCRATCH_URL=$(printf '%s' "$DATABASE_URL" | sed -E "s#^([a-z]+://[^/?\#]*@)[^/?\#]+#\1$ENDPOINT:5432#")
 case "$SCRATCH_URL" in *"@$ENDPOINT:5432"*) ;; *) echo "could not build SCRATCH_URL: stop"; SCRATCH_URL= ;; esac
 [ -n "$SCRATCH_URL" ] && printf 'export SCRATCH_URL=%q\n' "$SCRATCH_URL" > /tmp/restore.env \
   && echo 'pg_restore exit 0' > /tmp/pg_restore.log   # nothing to wait for
@@ -364,6 +379,10 @@ for entry in "${TABLES[@]}"; do
     "COPY (SELECT * FROM $table WHERE $filter) TO STDOUT" > "/tmp/restore/$table" \
     || { echo "stopped: could not dump $table" >&2; exit 1; }
 done
+du -ch /tmp/restore/* | sort -h | tail -6   # the job's own rows, largest last
+if [ -n "${COPYBACK_DUMP_ONLY:-}" ]; then
+  echo "dumped only; compare the sizes above with FreeStorageSpace"; exit 0
+fi
 
 for entry in "${TABLES[@]}"; do
   table=${entry%%|*}
@@ -884,7 +903,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    echo "restoring ${MANIFEST%.manifest.json}: $DR_STORAGE_GB GiB"
    # The zones: whichever the region offers this account, not "<region>a" and
    # "<region>b" (ap-northeast-1 offers newer accounts a, c and d). Or leave
-   # azs out: unset, it is the region's first two.
+   # azs out: unset, it is the region's first two -- and then pass the
+   # `azs` output (terraform -chdir=infra output -json azs) as -var azs=... in
+   # step 4's apply and every later one, as README pins it in prod.tfvars.
    aws ec2 describe-availability-zones --region $DR_REGION \
      --query 'AvailabilityZones[?OptInStatus==`opt-in-not-required`].ZoneName'
    # Scheduled tasks off until step 4: the derived builder would fail rows
@@ -924,12 +945,17 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    `openssl rand -hex 32`; every session cookie is invalidated, which costs a
    round of logins.
 3. Restore the database from the replicated dump in
-   `birdtest-backups-dr-<account>` -- the one step 1 sized for
-   (`STAMP=${MANIFEST%.manifest.json}`), checked against its manifest as §2.1
-   checks it: replication does not keep order, so just after a 03:00 backup the
-   newest manifest can arrive before all of its dump's files -- from
-   `scripts/prod-shell.sh` against the new stack: the dump into the new
-   instance, as in §2.1 but with
+   `birdtest-backups-dr-<account>`, from `scripts/prod-shell.sh` against the
+   new stack. Fetch and check it with §2.1's first block, with
+   `STAMP=<the stamp step 1 printed>` (the ops shell has none of step 1's
+   variables), `BUCKET=birdtest-backups-dr-<account>` and
+   `S3_REGION=<the lost stack's dr_region>`. Replication does not keep order,
+   so just after a 03:00 backup the newest manifest can arrive before all of
+   its dump's files, and with the source region gone the rest never will: if
+   the block still says `CHECKSUM MISMATCH` after one re-fetch, take the
+   previous stamp (`aws s3 ls … | grep manifest | tail -2 | head -1`), a day
+   older, which step 1's size still covers. Then the dump into the new
+   instance, as in §2.1's second block but with
    `pg_restore -d "$DATABASE_URL"` — run detached as §2.1 does, since it takes
    longer than an ECS Exec session lasts, and not finished until its log ends
    `pg_restore exit 0`: step 4's `desired_count=1` against a half-restored

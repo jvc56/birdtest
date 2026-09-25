@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
+  import { optionalNumber } from '$lib/format';
   import { api, errorText, type InputData } from '$lib/api';
 
   let name = '';
@@ -26,6 +27,8 @@
   // workers.
   let useWordmap = true;
   let useRit = false;
+  // Blank means "MAGPIE's default" (see optionalNumber).
+  const optional = optionalNumber;
   let minPlayIterations: number | '' = '';
   let threshold = '';
   let samplingRule = '';
@@ -87,16 +90,14 @@
         // Left blank, the server writes MAGPIE's default into the config. These
         // are simulation settings, which a static player states none of: the
         // server refuses one that does.
-        min_play_iterations:
-          !simming || minPlayIterations === '' ? null : Number(minPlayIterations),
+        min_play_iterations: simming ? optional(minPlayIterations) : null,
         threshold: (simming && threshold) || null,
         sampling_rule: (simming && samplingRule) || null,
-        inference_margin: !simming || inferenceMargin === '' ? null : Number(inferenceMargin),
-        utility_w_winpct: !simming || utilityWWinpct === '' ? null : Number(utilityWWinpct),
-        utility_w_spread: !simming || utilityWSpread === '' ? null : Number(utilityWSpread),
-        utility_spread_scale:
-          !simming || utilitySpreadScale === '' ? null : Number(utilitySpreadScale),
-        movegen_margin: movegenMargin === '' ? null : Number(movegenMargin)
+        inference_margin: simming ? optional(inferenceMargin) : null,
+        utility_w_winpct: simming ? optional(utilityWWinpct) : null,
+        utility_w_spread: simming ? optional(utilityWSpread) : null,
+        utility_spread_scale: simming ? optional(utilitySpreadScale) : null,
+        movegen_margin: optional(movegenMargin)
       });
       goto('/admin/player-configs');
       return created;

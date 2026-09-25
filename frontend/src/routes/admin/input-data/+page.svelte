@@ -35,6 +35,13 @@
       // Storage unavailable (a private window): nothing to resume, no harm.
     }
   };
+  // A refusal that asking again will not change: the import is gone, or the id
+  // is not one. Anything else -- a deploy's 503, a network blip -- is worth
+  // asking again about, and must not forget a staged import.
+  const isFinal = (e: unknown) => {
+    const status = e instanceof ApiError ? e.status : 0;
+    return status >= 400 && status < 500 && status !== 408 && status !== 429;
+  };
   async function resume() {
     let id: string | null = null;
     try {
@@ -47,8 +54,12 @@
       current = await api.getImport(id);
       if (current.state === 'running') watch(id);
       else if (current.state !== 'staged') remember(null);
-    } catch {
-      remember(null);
+    } catch (e) {
+      if (isFinal(e)) remember(null);
+      else {
+        error = errorText(e);
+        watch(id);
+      }
     }
   }
   onMount(() => {
@@ -74,10 +85,10 @@
         // A deploy's 503 or a network blip used to end it for good, and with
         // no list of imports the staged one could not be found again: the
         // admin downloaded the ~94 MB again instead.
-        const status = e instanceof ApiError ? e.status : 0;
-        if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+        if (isFinal(e)) {
           poll && clearInterval(poll);
           poll = null;
+          remember(null);
         }
       }
     }, 1000);
@@ -95,8 +106,10 @@
         git_ref: gitRef.trim() || undefined
       });
       remember(started.id);
-      current = await api.getImport(started.id);
+      // Watched before the first read: if that read fails, the poll still
+      // finds the import.
       watch(started.id);
+      current = await api.getImport(started.id);
     } catch (e) {
       error = errorText(e);
     } finally {
@@ -110,8 +123,11 @@
     error = '';
     try {
       await api.confirmImport(current.id);
-      current = await api.getImport(current.id);
       remember(null);
+      // Confirmed whatever the next read says: a failed read left the button
+      // live, and a second click was a 409.
+      current = { ...current, state: 'confirmed' };
+      current = await api.getImport(current.id);
       await load();
     } catch (e) {
       error = (e as Error).message;
@@ -172,6 +188,10 @@
     {#if current.state === 'running'}
       <p class="text-sm">
         Downloading… {mib(current.progress_bytes)}, {current.progress_entries} files hashed.
+      </p>
+    {:else if current.state === 'cancelled'}
+      <p class="text-sm text-muted-foreground">
+        This import was cancelled before it was confirmed{current.error ? `: ${current.error}` : '.'}
       </p>
     {:else if current.state === 'failed'}
       <p class="text-destructive">Import failed: {current.error}</p>

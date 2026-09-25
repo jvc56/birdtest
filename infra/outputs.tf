@@ -90,3 +90,10 @@ output "region" {
   description = "The stack's region, which scripts/prod-sql.sh and prod-shell.sh run every AWS call in."
   value       = var.region
 }
+
+# The availability zones the stack is in. Pin them into prod.tfvars as `azs`
+# after the first apply (README.md, "Deploying"), so that nothing about the
+# region's zones later can move a subnet.
+output "azs" {
+  value = local.azs
+}

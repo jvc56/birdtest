@@ -460,7 +460,11 @@ async fn confirmed(db: &TestDb, username: &str) -> bool {
         .unwrap()
 }
 
-/// A-AUTH-6: a confirmation code confirms once; replaying it is refused.
+/// A-AUTH-6: a confirmation code confirms once. Opened again (a double
+/// click, a mail scanner that followed it first) it changes nothing and is
+/// answered as the success it already was, not "invalid" with an offer to
+/// register again; a spent code of an account that is not confirmed is still
+/// refused.
 #[tokio::test]
 async fn a_confirmation_code_works_once() {
     let db = TestDb::new().await;
@@ -472,9 +476,30 @@ async fn a_confirmation_code_works_once() {
     assert_eq!(first.status, StatusCode::OK, "{first:?}");
     assert!(confirmed(&db, "onceonly").await);
 
+    let used_at = || async {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT max(used_at) FROM email_confirmations",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    let spent = used_at().await;
     let replay = post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await;
-    assert_eq!(replay.status, StatusCode::BAD_REQUEST, "{replay:?}");
-    assert_eq!(replay.json()["message"], "that confirmation link is invalid or has expired");
+    assert_eq!(replay.status, StatusCode::OK, "{replay:?}");
+    assert_eq!(replay.json()["message"], "email already confirmed");
+    assert_eq!(used_at().await, spent, "the replay changed nothing");
+
+    // The same spent code, for an account that is somehow not confirmed, is
+    // not taken as proof of anything.
+    sqlx::query("UPDATE users SET email_confirmed_at = NULL WHERE username = 'onceonly'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let refused = post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{refused:?}");
+    assert_eq!(refused.json()["message"], "that confirmation link is invalid or has expired");
+    assert!(!confirmed(&db, "onceonly").await);
 }
 
 /// A-AUTH-7: an expired confirmation code is refused and leaves the account

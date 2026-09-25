@@ -278,23 +278,35 @@ A first deployment, in order (each step is described below):
    MAGPIE's `birdtest-contribute` first — the backend image fetches the commit
    `docker/Dockerfile` pins.
 3. Request an ACM certificate for the site's hostname in the stack's region,
-   add its validation CNAME, and wait for it
-   (`aws acm wait certificate-validated --region "$REGION" --certificate-arn …`):
-   the first apply creates the HTTPS listener, which refuses a certificate
-   still pending validation and leaves the apply half done.
+   add its validation CNAME, and wait for it: the first apply creates the HTTPS
+   listener, which refuses a certificate still pending validation and leaves
+   the apply half done.
+   ```bash
+   REGION=us-east-1   # the stack's region, as in prod.tfvars
+   aws acm request-certificate --region "$REGION" --domain-name <hostname> --validation-method DNS
+   aws acm describe-certificate --region "$REGION" --certificate-arn <arn> \
+     --query 'Certificate.DomainValidationOptions[0].ResourceRecord'   # the CNAME to add
+   aws acm wait certificate-validated --region "$REGION" --certificate-arn <arn>
+   ```
 4. Write `infra/prod.tfvars` with the eight variables that have no default --
    `backend_image`, `derived_builder_image`, `frontend_image`, `alert_email`,
    `acm_certificate_arn`, `ses_domain`, `mail_from_address`, `public_url` --
-   and `region` if it is not us-east-1 (`azs` may be left out: it defaults to
-   the region's first two zones). Then
+   and `region` if it is not us-east-1, with `dr_region` (default us-west-2)
+   if the stack is in us-west-2: the two must differ. Then
    `terraform -chdir=infra init` and
-   `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0`.
+   `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 -var scheduled_tasks_enabled=false`
+   -- the scheduled builder and backup would fail against the placeholder
+   parameters until step 6. Then pin the zones the stack chose:
+   `azs = <terraform -chdir=infra output -json azs>` in `prod.tfvars`. Left to
+   the default, the pair is recomputed on every plan, and a change to what the
+   region reports would plan to replace the subnets the database sits in.
 5. Add the SES DNS records straight away (the `ses_dkim_tokens` and
    `ses_mail_from_records` outputs; SES looks for them for about 72 hours) and
    request SES production access, which can take a day.
 6. Confirm the SNS subscription mail, set the database password and the two
    SSM parameters (below), then
-   `terraform -chdir=infra apply -var-file=prod.tfvars` (one task).
+   `terraform -chdir=infra apply -var-file=prod.tfvars` (one task, and the
+   scheduled tasks on).
 7. Point DNS at the load balancer, run the alert-path checks, and make the
    first admin. Until production access is granted SES sends only to verified
    identities, so the first admin's confirmation mail arrives only if their
@@ -309,10 +321,10 @@ without it evaluates the configuration in the default region, prompting for
 eight variables. Two values must be set out of band right after the first
 `terraform apply` — Terraform manages
 the parameter *names* but never their values — so make the first apply with
-`-var desired_count=0`, set them as below, and apply again with the service at
-one task: started against the placeholders, the service crash-loops. (The
-scheduled derived-data builder, every five minutes, fails the same way until
-they are set; so would a 03:00 backup, alarming. Set them straight away.)
+`-var desired_count=0 -var scheduled_tasks_enabled=false`, set them as below,
+and apply again with the service at one task and the schedules on: started
+against the placeholders, the service crash-loops, the derived-data builder
+fails every five minutes, and a 03:00 backup fails and alarms.
 
 **Terraform's state is local** — `infra/terraform.tfstate`, ignored by git, on
 the machine that applied. RUNBOOK.md's recovery steps and both ops scripts read

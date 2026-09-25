@@ -1019,6 +1019,17 @@ async fn create_job(
 
     let letterdist_name = require_role(&state.pool, body.letterdist_id, "letterdist").await?;
     require_role(&state.pool, body.layout_id, "layout").await?;
+    // Parsed now as every claim will parse it: a file the server or MAGPIE
+    // cannot use -- more letters than MAGPIE holds, a malformed row -- was
+    // found by the first claim, as a 500, on a job already created.
+    let content: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(body.letterdist_id)
+        .fetch_one(&state.pool)
+        .await?;
+    crate::jobs::racks::LetterDistribution::parse(&content, &letterdist_name).map_err(|e| {
+        AppError::bad_request("the letter distribution cannot be used")
+            .with_field("letterdist_id", e.message)
+    })?;
 
     // Defaulted from config rather than typed, so the form shows the effective
     // value; a typed one was checked above.

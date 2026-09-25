@@ -52,6 +52,9 @@ pub struct LetterDistribution {
     unenumerable: Option<String>,
 }
 
+/// MAGPIE's `MAX_ALPHABET_SIZE` (`src/def/letter_distribution_defs.h`).
+pub const MAGPIE_MAX_ALPHABET_SIZE: usize = 50;
+
 impl LetterDistribution {
     /// Parses a distribution from the bytes of the `input_data` row a job
     /// pins. There is no path-taking constructor and no `DATA_PATH`: the
@@ -109,6 +112,15 @@ impl LetterDistribution {
 
         if tiles.is_empty() {
             return Err(AppError::internal(format!("{origin} contains no tiles")));
+        }
+        // MAGPIE's per-letter arrays hold MAX_ALPHABET_SIZE letters; a longer
+        // file was written past all of them by every build and worker that
+        // loaded it (and MAGPIE now refuses it, a builder failing mid-job).
+        if machine_letters.len() > MAGPIE_MAX_ALPHABET_SIZE {
+            return Err(AppError::internal(format!(
+                "{origin} has {} letters, and MAGPIE holds at most {MAGPIE_MAX_ALPHABET_SIZE}",
+                machine_letters.len()
+            )));
         }
         // Canonical rack strings are sorted, so sorting the distribution once
         // means the enumeration emits already-canonical strings.
@@ -465,6 +477,26 @@ mod tests {
             Ok(_) => panic!("{text:?} should be rejected"),
             Err(e) => e.message,
         }
+    }
+
+    /// U-RACK-9: a distribution MAGPIE cannot hold -- more letters than its
+    /// `MAX_ALPHABET_SIZE` -- is refused, naming the file; one at the limit
+    /// parses. (MAGPIE loaded a longer one and wrote past every per-letter
+    /// array; job creation now refuses it up front.)
+    #[test]
+    fn a_distribution_past_magpies_alphabet_is_refused() {
+        let rows = |n: usize| -> String {
+            (0..n)
+                .map(|i| {
+                    let letter = char::from_u32(0x100 + i as u32).unwrap();
+                    format!("{letter},{letter},1,1,0\n")
+                })
+                .collect()
+        };
+        assert!(LetterDistribution::parse(rows(MAGPIE_MAX_ALPHABET_SIZE).as_bytes(), "fifty").is_ok());
+        let message = parse_error(&rows(MAGPIE_MAX_ALPHABET_SIZE + 1));
+        assert!(message.contains("at most 50"), "{message}");
+        assert!(message.contains("origin-name.csv"), "{message}");
     }
 
     /// U-RACK-2: each malformed shape is refused for its own reason, and every

@@ -56,3 +56,26 @@ const SPRT_LABELS: Record<string, string> = {
 export function sprtLabel(status: string): string {
   return lookup(SPRT_LABELS, status);
 }
+
+/**
+ * An optional number field's value as the API wants it: blank is `null`
+ * ("MAGPIE's default"). Svelte binds a cleared number box as `null`, not `''`,
+ * and `Number(null)` is 0 -- which was written into a config that cannot be
+ * edited.
+ */
+export function optionalNumber(value: number | string | null | undefined): number | null {
+  if (value === '' || value === null || value === undefined) return null;
+  const number = Number(value);
+  return Number.isNaN(number) ? null : number;
+}
+
+/**
+ * The fields of a request body left blank: `null`, or a number box's `NaN`.
+ * Sent, the server's answer to one names the whole body ("data did not match
+ * any variant"), not the field.
+ */
+export function blankFields(body: Record<string, unknown>): string[] {
+  return Object.entries(body)
+    .filter(([, value]) => value === null || (typeof value === 'number' && Number.isNaN(value)))
+    .map(([field]) => field);
+}

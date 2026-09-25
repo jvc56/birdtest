@@ -486,6 +486,30 @@ async fn the_games_eta_divides_by_redundancy() {
     assert!((eta - expected).abs() < 1e-6 * expected, "{eta} vs {expected}");
 }
 
+/// I-STATS-8c: a job activated less than an hour ago is measured since its
+/// activation, not over a whole hour: ten minutes in, the hour's average read
+/// six times the real time left.
+#[tokio::test]
+async fn a_new_jobs_eta_is_measured_since_it_was_activated() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 10).await;
+    sqlx::query("UPDATE jobs SET activated_at = now() - interval '10 minutes' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let worker = Owner::Anon(anon(&db).await);
+    claim(&db, job, worker, "completed", 5).await;
+    claim(&db, job, worker, "completed", 5).await;
+    let stats = stats(&db, job).await;
+    let games = stats.games.as_ref().expect("a games job");
+    let left = games.max_units as f64 - games.units_completed as f64;
+    // Two claims in ten minutes, ten games a batch.
+    let expected = left / (2.0 / 600.0 * 10.0);
+    let eta = stats.eta_seconds.expect("recent throughput");
+    assert!((eta - expected).abs() < 0.01 * expected, "{eta} vs {expected}");
+}
+
 /// I-STATS-11: the stats payload cache. A payload is served from the cache
 /// until it expires; `forget` (every admin action) makes the next read build
 /// again; and a build reads the job's row itself, so a caller's copy read

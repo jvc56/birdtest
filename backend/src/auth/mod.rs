@@ -161,14 +161,18 @@ impl WorkerIdentity {
         }
     }
 
-    /// Applies the right per-worker rate limit for this identity: per API key
-    /// or per UUID. (Key churn is bounded where keys are made.)
+    /// Applies the per-worker rate limit an identity has not already paid.
+    /// A key or a UUID is charged in the extractor, before its lookup, on the
+    /// credential as presented (`ratelimit::CredentialGate`), so only an
+    /// unregistered worker is charged here, per address. (Key churn is
+    /// bounded where keys are made.)
     pub fn check_rate_limit(&self, state: &AppState) -> AppResult<()> {
-        let limiter = match self {
-            WorkerIdentity::Unregistered { .. } => &state.limits.unregistered_worker,
-            _ => &state.limits.worker,
-        };
-        crate::ratelimit::check(limiter, &self.rate_key())
+        match self {
+            WorkerIdentity::User { .. } | WorkerIdentity::Anonymous { .. } => Ok(()),
+            WorkerIdentity::Unregistered { .. } => {
+                crate::ratelimit::check(&state.limits.unregistered_worker, &self.rate_key())
+            }
+        }
     }
 }
 
@@ -177,14 +181,10 @@ impl FromRequestParts<AppState> for WorkerIdentity {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
-        // An address whose credentials keep matching nothing is refused here,
-        // before the lookup (`ratelimit::MissGate`): the per-identity bucket
-        // cannot be charged until there is an identity.
+        // Every credential is charged before its lookup, which is a
+        // main-pool query (`ratelimit::CredentialGate`).
         let ClientIp(client_ip) = ClientIp::from_request_parts(parts, state).await?;
-        state.limits.worker_misses.check(client_ip)?;
-        let miss = |message: &'static str| {
-            state.limits.worker_misses.record_miss(client_ip).err().unwrap_or_else(|| AppError::unauthorized(message))
-        };
+        let gate = &state.limits.worker_credentials;
 
         let bearer = parts
             .headers
@@ -195,6 +195,8 @@ impl FromRequestParts<AppState> for WorkerIdentity {
 
         let identity = if let Some(raw_key) = bearer {
             let hash = api_key::hash_key(&raw_key);
+            let presented = format!("k:{hash}");
+            gate.admit(&state.limits.worker, &presented, client_ip)?;
             // Lookup, `last_used_at` touch and ban check in one statement.
             // This runs on every worker request -- every claim, heartbeat and
             // submission -- so three round trips here were three on the
@@ -229,7 +231,8 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             .bind(&hash)
             .fetch_optional(&state.pool)
             .await?
-            .ok_or_else(|| miss("unknown or inactive API key"))?;
+            .ok_or_else(|| AppError::unauthorized("unknown or inactive API key"))?;
+            gate.remember(&presented);
 
             if row.2 {
                 return Err(AppError::forbidden("this worker identity is banned"));
@@ -246,6 +249,8 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     let uuid = Uuid::parse_str(raw.trim()).map_err(|_| {
                         AppError::bad_request("X-Worker-UUID is not a valid UUID")
                     })?;
+                    let presented = format!("a:{uuid}");
+                    gate.admit(&state.limits.worker, &presented, client_ip)?;
 
                     // Only identities the server itself issued are accepted. A
                     // client-invented UUID would otherwise let anyone
@@ -284,12 +289,13 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     .await?;
 
                     let Some(banned) = banned else {
-                        return Err(miss(
+                        return Err(AppError::unauthorized(
                             "unrecognized worker UUID. Omit the X-Worker-UUID \
                              header to be issued one, or authenticate with an \
                              API key.",
                         ));
                     };
+                    gate.remember(&presented);
                     if banned {
                         return Err(AppError::forbidden("this worker identity is banned"));
                     }

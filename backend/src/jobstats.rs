@@ -799,20 +799,31 @@ async fn estimate_eta(
         return Ok(None);
     }
 
-    let recent = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM task_claims c
-         JOIN tasks t ON t.id = c.task_id
-         WHERE t.job_id = $1 AND c.state = 'completed'
-           AND c.completed_at > now() - interval '1 hour'",
+    // The last hour, or since the job was activated if that is more recent:
+    // over a whole hour, a job ten minutes old read six times its real time
+    // left, and thirty times at two minutes. At least a minute, so a job's
+    // first few seconds do not read as a burst. The bound is one value for
+    // the whole scan, so the completed-claims index still serves it.
+    let (recent, window_seconds) = sqlx::query_as::<_, (i64, f64)>(
+        "WITH since AS (
+             SELECT least(greatest(now() - interval '1 hour', coalesce($2, now() - interval '1 hour')),
+                          now() - interval '1 minute') AS at
+         )
+         SELECT (SELECT COUNT(*) FROM task_claims c
+                   JOIN tasks t ON t.id = c.task_id
+                  WHERE t.job_id = $1 AND c.state = 'completed'
+                    AND c.completed_at > (SELECT at FROM since)),
+                EXTRACT(EPOCH FROM now() - (SELECT at FROM since))::float8",
     )
     .bind(job.id)
+    .bind(job.activated_at)
     .fetch_one(pool)
     .await?;
 
     if recent == 0 {
         return Ok(None);
     }
-    let per_second = recent as f64 / 3600.0;
+    let per_second = recent as f64 / window_seconds.max(60.0);
 
     // Tasks are made on demand, so `tasks_total - tasks_completed` is only what
     // is in flight: a 3.2-million-rack job 1% done read "three minutes left".

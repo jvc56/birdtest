@@ -183,6 +183,11 @@ name is carried on the request the worker receives. MAGPIE derives a
 distribution from the lexicon's prefix; birdtest used to mirror that inference,
 which meant guessing at something the job can simply say.
 
+Job creation parses the pinned distribution as every claim will, and refuses
+one the server or MAGPIE cannot use: in particular one with more letters than
+MAGPIE's `MAX_ALPHABET_SIZE` (50), which MAGPIE now refuses too and used to load
+past the end of every per-letter array.
+
 #### Two generate/report pairs on the player config
 
 `player_configs` carries two pairs, each "how much to compute" against "how much
@@ -4375,12 +4380,13 @@ In-memory token buckets, per process, reset on restart.
 | Endpoint | Limit | Keyed on |
 |---|---|---|
 | `POST /api/auth/register` | 10 / hour | Client IP |
+| The "that address already has an account" notice registration mails | 5 / hour | The address (`reg-em:`, on the reset limiter): past it the registration answers as usual and sends nothing, so it cannot bury an account holder in notices |
 | `POST /api/auth/login` | 10 / minute, and 100 / minute | Client IP; and, separately, the account the name matched (or, for a name that matches none, the name) from anywhere — ten times the address's, so that one address cannot lock an account out |
 | `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
 | `POST /api/worker/{task,result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Worker identity: the API key (`k:<key-id>`) or the anonymous UUID (`a:<uuid>`). Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
 | `POST /api/me/api-keys` | 10 / hour, **burst 100** | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered churn was unmetered new capacity. The burst is the cap, so a contributor setting up a machine per key is not held back (at ten an hour from the start, fifty machines took five hours); what refills slowly is revoke-and-recreate |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
-| Any worker request whose API key or `X-Worker-UUID` matches nothing | 30 / minute, then refused **before the lookup** until the bucket refills | Client IP. The identity lookup is a main-pool query made before any worker bucket can be charged; a real worker never misses (`ratelimit::MissGate`) |
+| Any worker request with an API key or `X-Worker-UUID` that has not resolved in the last ten minutes | 5 / second, **burst 100**, charged **before the lookup**, match or not | Client IP. The identity lookup is a main-pool query; a credential that resolved recently skips this, so a bad neighbour behind a shared address does not lock out working machines (`ratelimit::CredentialGate`). The worker's own bucket (above) is charged before the lookup too, on the credential as presented |
 | `POST /api/auth/confirm-email`, `POST /api/auth/reset-password/confirm` | 20 / minute | Client IP. The codes are too long to guess; this bounds cost (unauthenticated writes on the main pool, and a password scored) |
 | `GET /api/jobs/:id/stream` | 2,000 open at once, at most 32 from one address | Open streams, not requests: past either a `503`. The page backs off from 5 s to a minute between attempts |
 
@@ -6922,9 +6928,14 @@ what would make it worth revisiting.
   fix if it ever matters.
 
 - **A worker's identity is resolved before its rate limit is checked** — closed
-  (twenty-first audit). The lookup still comes first, since the bucket is the
-  identity's, but an address whose credentials keep matching nothing is refused
-  before the lookup after 30 misses a minute (`ratelimit::MissGate`).
+  (twenty-first and twenty-second audits). Every presented key or UUID is
+  charged its own bucket before the lookup, and one that has not resolved in
+  the last ten minutes also pays its address's (5 a second, burst 100), match
+  or not (`ratelimit::CredentialGate`). A credential that resolved recently
+  skips the address's bucket, so a misbehaving machine behind a shared address
+  does not lock out the workers beside it. After a restart nothing is known,
+  and more than a hundred machines behind one address are admitted five a
+  second.
 - **`?rack=` canonicalises by Unicode code point.** That equals machine-letter
   order for English and would not for a distribution whose letters are outside
   ASCII or longer than one character; such a lookup would miss. No such
@@ -7137,8 +7148,8 @@ The scenarios worth designing against, in descending order of likelihood:
    The rebuild (RUNBOOK §5) is a second copy of the stack under `name_suffix`,
    applied with its scheduled tasks off (`scheduled_tasks_enabled = false`)
    until its database is restored and its artifacts synced, its storage sized
-   from the replicated manifest, and its zones taken from the region
-   (`azs` unset).
+   from the replicated manifest, and its zones taken from the region (`azs`
+   unset, then pinned to the `azs` output for later applies).
 5. **Credential compromise.** An attacker with the task role can `PutObject` over
    any artifact key; an attacker with broader AWS access can delete backups. This
    is what object versioning and Object Lock are for.
