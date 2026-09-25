@@ -302,12 +302,27 @@ impl TestDb {
         let mut conn = self.pool.acquire().await.unwrap();
         let needs = birdtest::derived::needs_for_job(&mut conn, job).await.unwrap();
         for (i, need) in needs.iter().enumerate() {
+            // What a build leaves: a row a claim queued (`pending`) is now
+            // `built`, and one nothing queued exists, built.
+            sqlx::query(
+                "DELETE FROM derived_data
+                 WHERE role = $1 AND name = $2 AND builder = $3 AND kwg_id = $4
+                   AND klv_id IS NOT DISTINCT FROM $5 AND letterdist_id = $6",
+            )
+            .bind(&need.role)
+            .bind(&need.name)
+            .bind(builders.for_role(&need.role).unwrap())
+            .bind(need.kwg_id)
+            .bind(need.klv_id)
+            .bind(need.letterdist_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
             sqlx::query(
                 "INSERT INTO derived_data
                      (role, name, builder, kwg_id, klv_id, letterdist_id,
                       state, sha256, bytes, build_target, built_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,'built',$7,1,$8,now())
-                 ON CONFLICT DO NOTHING",
+                 VALUES ($1,$2,$3,$4,$5,$6,'built',$7,1,$8,now())",
             )
             .bind(&need.role)
             .bind(&need.name)

@@ -61,6 +61,24 @@ pub struct RateLimiters {
     pub redeem: Arc<Keyed>,
 }
 
+/// Which of a credential's two buckets a worker request is charged to.
+///
+/// Machines sharing a key, or a copied `uuid` line, share its buckets. An idle
+/// machine claims every few seconds and retries a `429` without limit, and a
+/// heartbeat is sent once and never retried: on one bucket, a few idle
+/// machines took every token and a busy one's heartbeats were refused until
+/// its claim lapsed and its finished task was thrown away (thirty-first
+/// audit). Asking for work and reporting on work in hand are charged apart,
+/// so the first can only hold back the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerBucket {
+    /// `POST /api/worker/task`.
+    Claims,
+    /// Heartbeats, declines, results and artifact fetches: work a machine
+    /// already holds.
+    WorkInHand,
+}
+
 /// Worker credentials looked up in the database, and how many of them one
 /// address may try.
 ///
@@ -110,11 +128,20 @@ impl CredentialGate {
     /// so charged first, a refused flood from one address still grew memory
     /// by an entry a request (150 MB a million) with no database work to slow
     /// it down.
-    pub fn admit(&self, worker: &Keyed, presented: &str, address: IpAddr) -> Result<(), AppError> {
+    pub fn admit(
+        &self,
+        worker: &Keyed,
+        presented: &str,
+        bucket: WorkerBucket,
+        address: IpAddr,
+    ) -> Result<(), AppError> {
         if !self.is_known(presented) {
             check(&self.unknown_per_address, &format!("ip:{address}"))?;
         }
-        check(worker, presented)
+        match bucket {
+            WorkerBucket::Claims => check(worker, presented),
+            WorkerBucket::WorkInHand => check(worker, &format!("{presented}#work")),
+        }
     }
 
     /// After a lookup that resolved.
@@ -238,21 +265,21 @@ mod key_tests {
         );
         let shared: IpAddr = "192.0.2.50".parse().unwrap();
 
-        assert!(gate.admit(&worker, "a:real", shared).is_ok());
+        assert!(gate.admit(&worker, "a:real", WorkerBucket::Claims, shared).is_ok());
         gate.remember("a:real");
 
         let mut refused = None;
         for i in 0..200 {
-            if let Err(e) = gate.admit(&worker, &format!("k:made-up-{i}"), shared) {
+            if let Err(e) = gate.admit(&worker, &format!("k:made-up-{i}"), WorkerBucket::Claims, shared) {
                 refused = Some(i);
                 assert_eq!(e.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
                 break;
             }
         }
         assert!(refused.is_some_and(|i| (99..=101).contains(&i)), "{refused:?}");
-        assert!(gate.admit(&worker, "a:real", shared).is_ok(), "the known worker is not refused");
+        assert!(gate.admit(&worker, "a:real", WorkerBucket::Claims, shared).is_ok(), "the known worker is not refused");
         assert!(
-            gate.admit(&worker, "k:fresh", "192.0.2.51".parse().unwrap()).is_ok(),
+            gate.admit(&worker, "k:fresh", WorkerBucket::Claims, "192.0.2.51".parse().unwrap()).is_ok(),
             "another address"
         );
 
@@ -260,13 +287,13 @@ mod key_tests {
         // refused it before its own bucket was made.
         let before = worker.len();
         for i in 0..1000 {
-            assert!(gate.admit(&worker, &format!("k:flood-{i}"), shared).is_err());
+            assert!(gate.admit(&worker, &format!("k:flood-{i}"), WorkerBucket::Claims, shared).is_err());
         }
         assert_eq!(worker.len(), before, "refused credentials were given buckets");
 
         // The credential's own bucket holds whether or not it is known.
         let mut own = 0;
-        while gate.admit(&worker, "a:real", shared).is_ok() {
+        while gate.admit(&worker, "a:real", WorkerBucket::Claims, shared).is_ok() {
             own += 1;
             assert!(own < 10);
         }

@@ -1703,3 +1703,119 @@ async fn a_sweep_that_finds_nothing_below_target_closes_the_generation() {
     let step = next_step(&db, job).await;
     assert!(matches!(step, Step::InProgress), "{step:?}");
 }
+
+/// A generation turns to its tail -- lowest count first, with everything out
+/// excluded -- only where a lap would start: nothing in flight, nothing staged.
+/// It turned whenever a merge put the summary under the threshold, mid-lap,
+/// and then every claim hashed the racks of every sweep claim still out: some
+/// 0.45 s a claim inside the dispatch lock at a thousand workers, until those
+/// claims drained and a merge ran (thirty-first audit). Here the summary drops
+/// under the threshold mid-lap; the sweep carries on, the lap's end waits for
+/// its claims, and only then does the tail begin, remembered as a cursor row
+/// with no rack, and carry on with its own claims out.
+#[tokio::test]
+async fn a_generation_turns_to_its_tail_only_where_a_lap_would_start() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 1).await;
+    let app = birdtest::app(db.state().await);
+    let order = racks_in_sweep_order(&db, job).await;
+
+    let first = claim_one(&app).await;
+    let second = claim_one(&app).await;
+    assert_eq!([forced_racks(&first), forced_racks(&second)].concat(), order[..2]);
+
+    // What a merge might leave: a few racks short, one of them far short, and
+    // the summary under the threshold.
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = CASE
+             WHEN rack = $2 THEN 0 WHEN rack = ANY($3) THEN 500 ELSE 1000 END
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .bind(&order[140])
+    .bind(&order[..52])
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE leave_generation_progress SET racks_at_target = racks_total - 53
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let third = claim_one(&app).await;
+    assert_eq!(forced_racks(&third), order[2..3], "mid-lap, the sweep carries on");
+
+    // The lap ends with its claims still out: the tail waits for them.
+    sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1").bind(job).execute(&db.pool).await.unwrap();
+    let (status, body) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "not the tail with the lap's claims out: {body}");
+
+    for assignment in [&first, &second, &third] {
+        let rack = forced_racks(assignment)[0].clone();
+        submit(&app, assignment, &[(&rack, 1000)]).await;
+    }
+    birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap();
+
+    let tail = claim_one(&app).await;
+    assert_eq!(forced_racks(&tail), order[140..141], "the tail: lowest count first");
+    let marker: Option<String> =
+        sqlx::query_scalar("SELECT cursor_rack FROM leave_selection_cursors WHERE job_id = $1 AND generation = 1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(marker, None, "the tail is remembered");
+    let next = claim_one(&app).await;
+    assert_ne!(forced_racks(&next), order[140..141], "with its own claim out, the tail carries on");
+}
+
+/// A transition that fails before it starts -- reading the job's config or its
+/// letter distribution -- hands ownership back at once too, as PLAN.md says of
+/// any failure the server survives. Those two reads ran outside the guard, and
+/// a transient error in either left the owner row standing: the generation
+/// handed out nothing until the half-hour takeover timeout (thirty-first
+/// audit). Forced here by removing the config row once the claim path has it
+/// in its template.
+#[tokio::test]
+async fn a_transition_that_fails_before_it_starts_hands_ownership_back() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    // One claim loads the job's template; its task is then taken away again,
+    // so nothing is in flight.
+    claim_one(&app).await;
+    sqlx::query("DELETE FROM tasks WHERE job_id = $1").bind(job).execute(&db.pool).await.unwrap();
+    sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1").bind(job).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE leave_rack_progress SET occurrence_count = 1000 WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM job_leave_config WHERE job_id = $1").bind(job).execute(&db.pool).await.unwrap();
+
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leave_generation_transitions WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(owned, 1, "the claim took ownership of the transition");
+    let released = wait_for(|| async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT started_at <= to_timestamp(0) FROM leave_generation_transitions
+             WHERE job_id = $1 AND generation = 1",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    })
+    .await;
+    assert!(released, "a transition that failed before it started hands ownership back");
+}

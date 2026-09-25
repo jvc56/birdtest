@@ -683,10 +683,9 @@ pub const SWEEP_WHILE_TASKS_REMAIN: i64 = 100;
 /// walking past racks already at target; here the set below target is small by
 /// construction, so the exclusion is too.
 ///
-/// Which one is decided from the generation's summary row, which a merge
-/// refreshes -- the same age as the counts both selections read. Going from the
-/// first to the second is safe at any moment, because the second excludes
-/// everything out; nothing goes the other way, since counts only grow.
+/// Which one is decided at a lap's boundary ([`at_boundary`]) and then kept:
+/// a lap in progress runs to its end, and the tail, once begun, runs to the
+/// generation's close.
 ///
 /// `lexicon` is the name of the row the job pins, from its template.
 pub async fn next_step(
@@ -700,22 +699,22 @@ pub async fn next_step(
         return Ok(LeaveGenStep::Finished);
     };
 
-    // Absent until the universe is seeded, which the caller has checked; read
-    // as "few" if it is missing anyway, since that selection assumes nothing.
-    let below_target: i64 = sqlx::query_scalar(
-        "SELECT racks_total - racks_at_target FROM leave_generation_progress
-         WHERE job_id = $1 AND generation = $2",
+    // Where the generation is: mid-lap (a cursor), in its tail (a row with no
+    // cursor), or at a lap's boundary (no row).
+    let place: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT cursor_rack FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2",
     )
     .bind(job_id)
     .bind(generation)
     .fetch_optional(&mut *conn)
-    .await?
-    .unwrap_or(0);
-
-    let selected = if below_target > SWEEP_WHILE_TASKS_REMAIN * i64::from(config.racks_per_task) {
-        sweep(conn, job_id, generation, config).await?
-    } else {
-        furthest_below_target(conn, job_id, generation, config).await?
+    .await?;
+    let selected = match place {
+        Some(Some(cursor)) => match continue_lap(conn, job_id, generation, config, &cursor).await? {
+            Some(selected) => selected,
+            None => at_boundary(conn, job_id, generation, config).await?,
+        },
+        Some(None) => furthest_below_target(conn, job_id, generation, config).await?,
+        None => at_boundary(conn, job_id, generation, config).await?,
     };
     let racks = match selected {
         Selected::Racks(racks) => racks,
@@ -909,7 +908,8 @@ async fn racks_after(
 ///
 /// A **lap** is one pass over the universe, handing out every rack that is
 /// below target as the pass reaches it. `leave_selection_cursors` holds the
-/// last rack handed out; its row exists exactly while a lap has racks left.
+/// last rack handed out; its row holds one exactly while a lap has racks left
+/// (a row with no rack means the generation is in its tail: [`at_boundary`]).
 ///
 /// What makes a sweep need no exclusion list is the rule for *starting* a lap:
 /// only with no claim of the generation in flight and nothing staged. From
@@ -926,51 +926,95 @@ async fn racks_after(
 ///
 /// A cursor row lost to a partial restore, or deleted by a purge, is a lap not
 /// started: the same rule applies, and nothing is handed out twice.
+async fn continue_lap(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    config: &LeaveConfig,
+    cursor: &str,
+) -> AppResult<Option<Selected>> {
+    let (racks, more) = racks_after(conn, job_id, generation, config, cursor).await?;
+    if more {
+        sqlx::query(
+            "UPDATE leave_selection_cursors SET cursor_rack = $3
+             WHERE job_id = $1 AND generation = $2",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .bind(racks.last())
+        .execute(&mut *conn)
+        .await?;
+        return Ok(Some(Selected::Racks(racks)));
+    }
+    // The lap ends here: with this task if it found any racks, already if
+    // it did not (a merge since the last claim can put the racks that were
+    // left at target).
+    sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2")
+        .bind(job_id)
+        .bind(generation)
+        .execute(&mut *conn)
+        .await?;
+    Ok((!racks.is_empty()).then_some(Selected::Racks(racks)))
+}
+
+/// A lap's boundary: where a lap starts, the tail begins, and a generation is
+/// found complete -- and only with nothing of the generation in flight or
+/// staged (see [`continue_lap`]'s rule), so the lap's stragglers are never part of
+/// what a selection must exclude.
+///
+/// Which way it goes is read from the generation's summary row, which a merge
+/// refreshes -- the same age as the counts both selections read. Once the tail
+/// has begun it is remembered, as a cursor row with no rack, and every later
+/// claim of the generation goes straight to it: its own claims are what is out
+/// then, at most the racks below target. Nothing goes back to a sweep, since
+/// counts only grow. The tail used to begin wherever a merge put the summary
+/// under the threshold, mid-lap included, and every claim then hashed the
+/// racks of every sweep claim still out: at a thousand workers 0.45 s a claim
+/// inside the dispatch lock, until those claims drained and a merge ran
+/// (thirty-first audit).
+async fn at_boundary(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    config: &LeaveConfig,
+) -> AppResult<Selected> {
+    if let Some(step) = nothing_to_hand_out(conn, job_id, generation).await? {
+        return Ok(Selected::Step(step));
+    }
+    // Absent until the universe is seeded, which the caller has checked; read
+    // as "few" if it is missing anyway, since the tail assumes nothing.
+    let below_target: i64 = sqlx::query_scalar(
+        "SELECT racks_total - racks_at_target FROM leave_generation_progress
+         WHERE job_id = $1 AND generation = $2",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_optional(&mut *conn)
+    .await?
+    .unwrap_or(0);
+    if below_target <= SWEEP_WHILE_TASKS_REMAIN * i64::from(config.racks_per_task) {
+        sqlx::query(
+            "INSERT INTO leave_selection_cursors (job_id, generation, cursor_rack)
+             VALUES ($1, $2, NULL)
+             ON CONFLICT (job_id, generation) DO UPDATE SET cursor_rack = NULL",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .execute(&mut *conn)
+        .await?;
+        return furthest_below_target(conn, job_id, generation, config).await;
+    }
+    sweep(conn, job_id, generation, config).await
+}
+
+/// Starts a lap, which is also how a generation is found complete: a pass from
+/// the top that finds no rack below target.
 async fn sweep(
     conn: &mut PgConnection,
     job_id: Uuid,
     generation: i32,
     config: &LeaveConfig,
 ) -> AppResult<Selected> {
-    let cursor: Option<String> = sqlx::query_scalar(
-        "SELECT cursor_rack FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .fetch_optional(&mut *conn)
-    .await?;
-
-    if let Some(cursor) = cursor {
-        let (racks, more) = racks_after(conn, job_id, generation, config, &cursor).await?;
-        if more {
-            sqlx::query(
-                "UPDATE leave_selection_cursors SET cursor_rack = $3
-                 WHERE job_id = $1 AND generation = $2",
-            )
-            .bind(job_id)
-            .bind(generation)
-            .bind(racks.last())
-            .execute(&mut *conn)
-            .await?;
-            return Ok(Selected::Racks(racks));
-        }
-        // The lap ends here: with this task if it found any racks, already if
-        // it did not (a merge since the last claim can put the racks that were
-        // left at target).
-        sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2")
-            .bind(job_id)
-            .bind(generation)
-            .execute(&mut *conn)
-            .await?;
-        if !racks.is_empty() {
-            return Ok(Selected::Racks(racks));
-        }
-    }
-
-    // Starting a lap, which is also how a generation is found complete.
-    if let Some(step) = nothing_to_hand_out(conn, job_id, generation).await? {
-        return Ok(Selected::Step(step));
-    }
     let (racks, more) = racks_after(conn, job_id, generation, config, "").await?;
     if racks.is_empty() {
         return Ok(Selected::Step(claim_transition(conn, job_id, generation).await?));

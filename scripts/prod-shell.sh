@@ -55,7 +55,9 @@ fi
 command -v session-manager-plugin >/dev/null \
   || { echo "install the AWS CLI's Session Manager plugin first" >&2; exit 1; }
 
-overrides=$(jq -n --arg command "sleep $seconds" \
+# The task definition carries RUNBOOK.md §2.2's copy-back as RESTORE_JOB_SH;
+# written out here, it is /tmp/restore-job.sh in the shell.
+overrides=$(jq -n --arg command "printf '%s' \"\${RESTORE_JOB_SH:?}\" > /tmp/restore-job.sh && sleep $seconds" \
   '{containerOverrides: [{name: "ops", command: [$command]}]}')
 started=$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" \
   --launch-type FARGATE --enable-execute-command \

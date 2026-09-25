@@ -189,9 +189,10 @@ MIN_MAGPIE_VERSION=0.0.0 docker compose up -d
 
 `dev.py` reads the version out of your checkout and sets both for you.
 
-Leave-generation jobs write one progress row per full 7-tile rack at creation
-time — 3,199,724 rows for a real English bag, copied again for every later
-generation — and build a zeroed KLV. Worth knowing before you create one by hand.
+Leave-generation jobs build a zeroed KLV at creation, and each generation writes
+one progress row per full 7-tile rack — 3,199,724 rows for a real English bag —
+when its first claim finds the universe missing (seeded off the claim path, so
+that claim is answered at once). Worth knowing before you create one by hand.
 Opening-rack jobs only *count* their rack space (3,199,724 racks for English)
 and address it by range, so they are cheap to create.
 
@@ -506,7 +507,8 @@ Recovering from anything is [RUNBOOK.md](RUNBOOK.md).
 
 `dev-restore.sh` also takes a production dump directory, and scrubs it on the
 way in (`scripts/scrub.sql`: emails become `@example.invalid`, every password
-becomes `birdtest-local`, credentials and tokens are truncated). Restoring
+becomes `birdtest-local`, credentials and tokens are truncated, and every
+anonymous worker's UUID -- its whole credential -- is replaced). Restoring
 production data locally without that is a disclosure risk, not a shortcut.
 
 After any schema change, prove a dump still round-trips:

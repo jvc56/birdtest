@@ -524,8 +524,12 @@ pub async fn large_result_turn(
     Ok(Some(permit))
 }
 
-/// A result at least this large takes a [`large_result_turn`].
-const LARGE_RESULT_BYTES: usize = 8 * 1024 * 1024;
+/// A result at least this large takes a [`large_result_turn`]: the size at
+/// which its body was reserved from `extract::LARGE_BODIES`, so every result
+/// the body budget counts is decoded three at a time. (At 8 MiB, results
+/// between the two decoded as many at once as the budget admitted, and their
+/// typed forms were counted nowhere.)
+const LARGE_RESULT_BYTES: usize = crate::extract::LARGE_BODY_BYTES;
 /// How many large results are decoded at once.
 static LARGE_RESULT_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
 /// How long a large result waits for a turn before its worker is told to come

@@ -1,6 +1,6 @@
 use crate::audit;
-use crate::auth::WorkerIdentity;
-use crate::extract::ApiJson;
+use crate::auth::{RegisteredWorker, WorkerIdentity};
+use crate::extract::{ApiJson, ChargedJson};
 use crate::error::{AppError, AppResult};
 use crate::jobs::handler::TaskRequest;
 use crate::jobstats;
@@ -27,6 +27,19 @@ use uuid::Uuid;
 /// it; see PLAN.md, "What bounds a submission?".
 pub const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 
+/// The largest body the other worker routes accept. A decline is a token and a
+/// handful of short entries, a heartbeat a token. A claim is a version and the
+/// jobs the worker cannot run: MAGPIE keeps that list for the life of its run
+/// and does not cap it, at some 40 bytes a job, and a claim refused for its
+/// size ends the run -- so this leaves room for some 26,000 (the server reads
+/// the first `MAX_UNSUPPORTED_JOBS`). What bounds the memory all bodies take
+/// together is `extract::BODY_BUDGET`; this is the bound on one.
+pub const WORKER_BODY_BYTES: usize = 1024 * 1024;
+
+/// The largest claim a caller with no worker identity may send: see
+/// `claim_task`.
+const UNREGISTERED_CLAIM_BYTES: usize = 16 * 1024;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/client-version", get(client_version))
@@ -38,6 +51,8 @@ pub fn router() -> Router<AppState> {
             post(submit_result).layer(DefaultBodyLimit::max(MAX_RESULT_BYTES)),
         )
         .route("/artifact", get(artifact))
+        // The result route's own limit, set on the route, is the one it gets.
+        .layer(DefaultBodyLimit::max(WORKER_BODY_BYTES))
 }
 
 #[derive(Serialize)]
@@ -69,11 +84,9 @@ struct ArtifactQuery {
 /// straight from S3, so a contributor never needs AWS credentials.
 async fn artifact(
     State(state): State<AppState>,
-    identity: WorkerIdentity,
+    RegisteredWorker(_identity): RegisteredWorker,
     Query(query): Query<ArtifactQuery>,
 ) -> AppResult<Response> {
-    identity.check_rate_limit(&state)?;
-    identity.require_registered()?;
 
     // Only keys the server itself minted are reachable; an arbitrary key would
     // turn this into a read primitive for the whole bucket.
@@ -251,15 +264,41 @@ struct ShutdownResponse {
 async fn claim_task(
     State(state): State<AppState>,
     identity: WorkerIdentity,
-    body: Result<ApiJson<ClaimBody>, AppError>,
+    request: axum::extract::Request,
 ) -> AppResult<Response> {
+    // Both before the body is read, which is why the body is taken here rather
+    // than by an extractor: a caller with no identity is metered first, and
+    // sends only what a first claim holds -- a version and, having never been
+    // offered a job, no list -- rather than the megabyte a long run's list of
+    // jobs it cannot run may need.
     identity.check_rate_limit(&state)?;
+    if matches!(identity, WorkerIdentity::Unregistered { .. }) {
+        let declared = request
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<usize>().ok());
+        if declared.is_some_and(|bytes| bytes > UNREGISTERED_CLAIM_BYTES) {
+            return Err(AppError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "a first claim, with no worker identity, is a few bytes: send the X-Worker-UUID \
+                 the server issued with your first task",
+            ));
+        }
+    }
+    let body = <ApiJson<ClaimBody> as axum::extract::FromRequest<AppState>>::from_request(request, &state).await;
 
     // The one malformed request worth more than the generic answer. A claim
     // with no body, or without `magpie_version`, is what a MAGPIE older than
     // the contribute protocol sends, and this message is what its contributor
     // is shown -- so it names the fix rather than the parser's complaint alone.
+    // Only a body that does not parse: any other refusal (a body too slow, or
+    // too large) is passed on as it is, `Retry-After` and all.
     let ApiJson(body) = body.map_err(|err| {
+        if err.code != "bad_request" {
+            return err;
+        }
         AppError::new(
             err.status,
             err.code,
@@ -353,11 +392,9 @@ fn bounded(text: &str) -> String {
 /// self-correcting when a contributor updates their data.
 async fn decline_task(
     State(state): State<AppState>,
-    identity: WorkerIdentity,
+    RegisteredWorker(identity): RegisteredWorker,
     ApiJson(body): ApiJson<DeclineBody>,
 ) -> AppResult<StatusCode> {
-    identity.check_rate_limit(&state)?;
-    identity.require_registered()?;
 
     // `task_failed` is a worker that ran the task and could not produce a
     // result the server accepted. Declining hands the slot straight back, where
@@ -531,11 +568,9 @@ struct HeartbeatBody {
 /// results, so a heartbeat carries no payload.
 async fn heartbeat(
     State(state): State<AppState>,
-    identity: WorkerIdentity,
+    RegisteredWorker(identity): RegisteredWorker,
     ApiJson(body): ApiJson<HeartbeatBody>,
 ) -> AppResult<StatusCode> {
-    identity.check_rate_limit(&state)?;
-    identity.require_registered()?;
 
     // A claim somebody holds locked is skipped rather than waited on. Its
     // holder is a submission, a decline, a purge or a delete, and in every case
@@ -580,11 +615,11 @@ struct ResultAck {
 
 async fn submit_result(
     State(state): State<AppState>,
-    identity: WorkerIdentity,
-    ApiJson(body): ApiJson<ResultBody>,
+    RegisteredWorker(identity): RegisteredWorker,
+    // Charged to the body budget until this returns: the result is held as
+    // text until its job type is known, then while it waits for its turn.
+    ChargedJson(body, _charged): ChargedJson<ResultBody>,
 ) -> AppResult<Json<ResultAck>> {
-    identity.check_rate_limit(&state)?;
-    identity.require_registered()?;
 
     // Decoded before the transaction, with nothing locked and no connection
     // held: see `registry::decode_result`. The claim's job is read without a

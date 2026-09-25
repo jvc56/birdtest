@@ -76,6 +76,11 @@ resource "aws_ecs_task_definition" "ops" {
         { name = "BACKUP_BUCKET", value = aws_s3_bucket.backups.bucket },
         { name = "AWS_REGION", value = var.region },
         { name = "AWS_DEFAULT_REGION", value = var.region },
+        # RUNBOOK.md §2.2's copy-back, which scripts/prod-shell.sh writes to
+        # /tmp/restore-job.sh when the shell's task starts: the image has
+        # none of the repository, and a script pasted into an ECS Exec session
+        # is the untested procedure it replaced.
+        { name = "RESTORE_JOB_SH", value = file("${path.module}/../scripts/restore-job.sh") },
       ]
       secrets = [
         { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn }

@@ -220,6 +220,10 @@ pub struct DerivedStatus {
     /// Gave up. A job with any of these is not dispatched either, and an admin
     /// has something to look at.
     pub failed: Vec<String>,
+    /// How many of `pending` nothing has requested under this binary's
+    /// builder: no row at all, as after a deployment whose MAGPIE bumped a
+    /// builder version.
+    pub unrequested: usize,
 }
 
 impl DerivedStatus {
@@ -245,7 +249,8 @@ pub async fn status_for_job(
             .bind(job_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let mut status = DerivedStatus { ready: Vec::new(), pending: Vec::new(), failed: Vec::new() };
+    let mut status =
+        DerivedStatus { ready: Vec::new(), pending: Vec::new(), failed: Vec::new(), unrequested: 0 };
     let Some(letterdist_id) = letterdist_id else {
         return Ok(status);
     };
@@ -275,8 +280,12 @@ pub async fn status_for_job(
         let label = format!("{role} {name}");
         // NULL state is a LEFT JOIN miss: nothing has requested this file
         // under this builder yet, which from a worker's point of view is the
-        // same wait as a queued one. The caller requests it; this reports.
-        match row.get::<Option<String>, _>("state").as_deref() {
+        // same wait as a queued one. `ready_for_job` requests it; this reports.
+        let state = row.get::<Option<String>, _>("state");
+        if state.is_none() {
+            status.unrequested += 1;
+        }
+        match state.as_deref() {
             Some("built") => status.ready.push(ExpectedDerived {
                 builder: builders.for_role(&role)?,
                 role,
@@ -360,6 +369,18 @@ pub async fn ready_for_job(
         return Ok(Some(ready));
     }
     let status = status_for_job(conn, job_id, builders).await?;
+    if status.unrequested > 0 {
+        // Creating and activating a job request its files, but a deployment
+        // whose MAGPIE bumped a builder version finds every running job's
+        // files built under the old one only. Requested here, by the first
+        // claim that considers the job, or nothing ever would be: the builder
+        // task builds only what is queued (thirty-first audit). Once queued, a
+        // file is no longer a miss, so this runs once per file.
+        let requested = request_for_job(conn, job_id, builders).await?;
+        if requested > 0 {
+            tracing::info!(%job_id, requested, "queued derived files under this binary's builder");
+        }
+    }
     if !status.dispatchable() {
         // Logged at debug: a table takes minutes to build, and every worker
         // asking during those minutes would otherwise produce a line each.
@@ -710,17 +731,19 @@ mod tests {
             builder: "wmp-1".into(),
             build_target: "nehalem".into(),
         };
-        assert!(DerivedStatus { ready: vec![], pending: vec![], failed: vec![] }.dispatchable());
+        assert!(DerivedStatus { ready: vec![], pending: vec![], failed: vec![], unrequested: 0 }.dispatchable());
         assert!(DerivedStatus {
             ready: vec![ready.clone()],
             pending: vec![],
-            failed: vec![]
+            failed: vec![],
+            unrequested: 0,
         }
         .dispatchable());
         assert!(!DerivedStatus {
             ready: vec![ready.clone()],
             pending: vec!["rit NWL23.CSW21".into()],
-            failed: vec![]
+            failed: vec![],
+            unrequested: 0,
         }
         .dispatchable());
         // A failed build is not "dispatch without it": the worker would fall
@@ -728,7 +751,8 @@ mod tests {
         assert!(!DerivedStatus {
             ready: vec![ready],
             pending: vec![],
-            failed: vec!["rit NWL23.CSW21".into()]
+            failed: vec!["rit NWL23.CSW21".into()],
+            unrequested: 0,
         }
         .dispatchable());
     }

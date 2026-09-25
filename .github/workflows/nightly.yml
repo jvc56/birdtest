@@ -154,6 +154,10 @@ jobs:
             < backend/migrations/0001_initial.sql
       - name: Dump, drop, restore, verify
         run: ./scripts/restore-roundtrip.sh
+      # RUNBOOK.md §2.2's copy-back, through its failure and re-run cases, in
+      # two databases of its own.
+      - name: Selective restore of a purged job
+        run: timeout 600 ./scripts/restore-job-check.sh
       - if: always()
         run: docker compose down -v
 

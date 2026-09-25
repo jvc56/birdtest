@@ -1532,6 +1532,40 @@ async fn a_job_is_not_dispatched_until_its_derived_files_are_built() {
     assert!(derived[0]["sha256"].is_string(), "{body}");
 }
 
+/// I-DERIVED-10: a job whose files were built under another builder -- a
+/// deployment whose MAGPIE bumped `wmp-N` -- has them queued under this
+/// binary's builder by the next claim that considers it. Only creating or
+/// activating a job queued anything, so after such a deployment every job
+/// needing a wordmap or a table answered `204` for good, with nothing queued
+/// to show why (thirty-first audit).
+#[tokio::test]
+async fn a_file_built_under_another_builder_is_queued_under_this_one_by_a_claim() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = deriving_player(&db, "bump-p1", kwg, klv, false).await;
+    let p2 = deriving_player(&db, "bump-p2", kwg, klv, false).await;
+    let job = job_between(&db, p1, p2).await;
+    assert_eq!(db.derived_ready(job).await, 1);
+    // What the previous deployment built: the same file under its builder.
+    sqlx::query("UPDATE derived_data SET builder = 'wmp-0'").execute(&db.pool).await.unwrap();
+    let worker = registered_worker(&db).await;
+
+    let (status, body) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "nothing is built under wmp-1: {body}");
+    let queued: Vec<(String, String)> =
+        sqlx::query_as("SELECT builder, state FROM derived_data ORDER BY builder")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        queued,
+        vec![("wmp-0".into(), "built".into()), ("wmp-1".into(), "pending".into())],
+        "the claim queued the file under this binary's builder"
+    );
+}
+
 /// Once a job has been found dispatchable, its hashes are answered from memory
 /// for the rest of the process: the query behind them ran for every candidate
 /// job on every claim, and its answer for a dispatchable job cannot change

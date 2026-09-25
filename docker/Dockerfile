@@ -5,7 +5,8 @@
 # line. MIN_MAGPIE_VERSION must never exceed the version this commit reports.
 ARG MAGPIE_COMMIT=7400184f0a45a3b2282a7be1c4bdfdbc39856a01
 #
-# Backend and fake-worker.
+# The backend, the derived-data builder, and the end-to-end suite's fake
+# worker.
 #
 # The backend image carries a pinned MAGPIE. The server builds the reference
 # copy of every wordmap, rack info table and leave-generation KLV with it, and
@@ -18,9 +19,10 @@ ARG MAGPIE_COMMIT=7400184f0a45a3b2282a7be1c4bdfdbc39856a01
 # contributor's laptop runs, and the whole point is that two builds of one
 # commit agree byte for byte. See MAGPIE's Makefile.
 #
-# The fake worker still needs no MAGPIE: it submits synthetic results. The real
-# contributor client is MAGPIE itself, via `magpie contribute` — see PLAN.md's
-# "Worker Client".
+# The fake worker needs no MAGPIE: it submits synthetic results, and exists only
+# for the end-to-end suite (e2e/), which needs contributions on cue. It is not a
+# contributor client, in production or local development: that is MAGPIE
+# itself, via `magpie contribute` — see PLAN.md's "Worker Client".
 #
 # Build with `--target backend`, `--target derived-builder` or
 # `--target fake-worker`.
@@ -141,7 +143,9 @@ CMD ["birdtest"]
 
 FROM backend AS derived-builder
 COPY --from=backend-build /usr/local/bin/build-derived /usr/local/bin/build-derived
-# Ephemeral storage for the scratch directories; the task definition mounts it.
+# Where the scratch directories go. On Fargate this is the task's ephemeral
+# storage, which backs the whole writable layer, /tmp included: nothing is
+# mounted here.
 ENV MAGPIE_SCRATCH_DIR=/scratch
 USER root
 RUN mkdir -p /scratch && chown birdtest:birdtest /scratch
@@ -151,8 +155,9 @@ CMD ["build-derived"]
 # ---------------------------------------------------------------------------
 # Fake worker
 # ---------------------------------------------------------------------------
-# Speaks the worker API and submits synthetic results. No MAGPIE, so this image
-# is a few hundred KB on top of python-slim and starts instantly.
+# Test-only: the end-to-end suite's stand-in for a contributor. Speaks the
+# worker API and submits synthetic results. No MAGPIE, so this image is a few
+# hundred KB on top of python-slim and starts instantly.
 
 FROM python:3.11-slim AS fake-worker
 

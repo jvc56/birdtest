@@ -1077,6 +1077,7 @@ async fn create_job(
     .await?;
 
     insert_job_config(&mut tx, &job, &body.config, &letterdist_name).await?;
+    refuse_one_name_for_two_files(&mut tx, &job).await?;
 
     audit::log(
         &mut tx,
@@ -1378,6 +1379,32 @@ async fn validate_capture_play_cap(
                      1's num_plays_recorded."
                 ),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// MAGPIE finds a file by its role and name, so a job cannot pin two
+/// different files under one: its two players on `NWL23.klv2` of two data
+/// releases -- the natural comparison after a MAGPIE-DATA update -- would have
+/// every worker hash its one `NWL23.klv2` against both digests, decline every
+/// task as missing data, and, with the job the only one active, be told to
+/// download data that cannot help (thirty-first audit). Read from the files
+/// the job's tasks will state, after its config is written, so every role is
+/// covered however the job came to pin it.
+async fn refuse_one_name_for_two_files(conn: &mut sqlx::PgConnection, job: &Job) -> AppResult<()> {
+    let files = crate::jobs::expected_data(conn, job).await?;
+    for (i, file) in files.iter().enumerate() {
+        if let Some(other) = files[i + 1..]
+            .iter()
+            .find(|other| other.role == file.role && other.name == file.name && other.sha256 != file.sha256)
+        {
+            return Err(AppError::bad_request(format!(
+                "this job would pin two different {} files named {:?} (from {} and {}): a worker \
+                 finds a file by its name and can hold only one of them. Give one player a \
+                 differently named file.",
+                file.role, file.name, file.tarball_date, other.tarball_date
+            )));
         }
     }
     Ok(())

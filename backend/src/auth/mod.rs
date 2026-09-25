@@ -4,6 +4,7 @@ pub mod session;
 
 use crate::clientip::ClientIp;
 use crate::error::{AppError, AppResult};
+use crate::ratelimit::WorkerBucket;
 use crate::state::AppState;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -176,11 +177,42 @@ impl WorkerIdentity {
     }
 }
 
+/// A [`WorkerIdentity`] the server already knows, rate limited: for the worker
+/// routes that refuse an unregistered caller. Checked here, as an extractor
+/// that reads only the headers, so the refusal comes *before* the body is read
+/// -- in the handler it came after, and the result route reads up to 64 MiB
+/// of anyone's body first (thirty-first audit).
+pub struct RegisteredWorker(pub WorkerIdentity);
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for RegisteredWorker {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let identity = WorkerIdentity::resolve(parts, state, WorkerBucket::WorkInHand).await?;
+        identity.check_rate_limit(state)?;
+        identity.require_registered()?;
+        // Who a large body is from, for its one-at-a-time rule
+        // (`extract::read_body`).
+        parts.extensions.insert(crate::extract::BodyOwner(identity.rate_key()));
+        Ok(Self(identity))
+    }
+}
+
+/// The claim route's identity: charged to its credential's claim bucket
+/// (`ratelimit::WorkerBucket`). Every other worker route takes a
+/// [`RegisteredWorker`].
 #[axum::async_trait]
 impl FromRequestParts<AppState> for WorkerIdentity {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        Self::resolve(parts, state, WorkerBucket::Claims).await
+    }
+}
+
+impl WorkerIdentity {
+    async fn resolve(parts: &mut Parts, state: &AppState, bucket: WorkerBucket) -> Result<Self, AppError> {
         // Every credential is charged before its lookup, which is a
         // main-pool query (`ratelimit::CredentialGate`).
         let ClientIp(client_ip) = ClientIp::from_request_parts(parts, state).await?;
@@ -196,7 +228,7 @@ impl FromRequestParts<AppState> for WorkerIdentity {
         let identity = if let Some(raw_key) = bearer {
             let hash = api_key::hash_key(&raw_key);
             let presented = format!("k:{hash}");
-            gate.admit(&state.limits.worker, &presented, client_ip)?;
+            gate.admit(&state.limits.worker, &presented, bucket, client_ip)?;
             // Lookup, `last_used_at` touch and ban check in one statement.
             // This runs on every worker request -- every claim, heartbeat and
             // submission -- so three round trips here were three on the
@@ -250,7 +282,7 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                         AppError::bad_request("X-Worker-UUID is not a valid UUID")
                     })?;
                     let presented = format!("a:{uuid}");
-                    gate.admit(&state.limits.worker, &presented, client_ip)?;
+                    gate.admit(&state.limits.worker, &presented, bucket, client_ip)?;
 
                     // Only identities the server itself issued are accepted. A
                     // client-invented UUID would otherwise let anyone

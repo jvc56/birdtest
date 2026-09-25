@@ -267,3 +267,92 @@ async fn one_user_cannot_see_or_change_anothers_keys() {
     assert_eq!(mine[0]["is_active"], true);
     assert_eq!(claim_with(&app, key["key"].as_str().unwrap()).await.0, StatusCode::NO_CONTENT);
 }
+
+/// `scripts/scrub.sql` as `dev-restore.sh` applies it, psql's own commands
+/// left out.
+async fn scrub(db: &TestDb) {
+    let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/scrub.sql")).unwrap();
+    let sql: String = script.lines().filter(|line| !line.starts_with('\\')).collect::<Vec<_>>().join("\n");
+    sqlx::raw_sql(&sql).execute(&db.pool).await.unwrap();
+}
+
+/// S-SCRUB-1: a scrubbed dump holds no credential. An anonymous worker's UUID
+/// is one -- `X-Worker-UUID` alone authenticates it -- and scrubbing left every
+/// one in place, so a laptop dump or a published sample could submit as any
+/// anonymous contributor (thirty-first audit). Each is replaced, and its
+/// claims, ban and audit rows follow it; an open claim's token is replaced
+/// too. Run twice, as the script promises it may be.
+#[tokio::test]
+async fn a_scrubbed_dump_keeps_no_worker_credential() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let job = db.games_job(1, 10).await;
+    let worker = Uuid::new_v4();
+    sqlx::query("INSERT INTO anonymous_workers (uuid, tasks_completed) VALUES ($1, 7)")
+        .bind(worker)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let task: Uuid = sqlx::query_scalar("INSERT INTO tasks (job_id, seed) VALUES ($1, 1) RETURNING id")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let token = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO task_claims (task_id, job_id, claim_token, claimed_by_anon_uuid, state)
+         VALUES ($1, $2, $3, $4, 'claimed')",
+    )
+    .bind(task)
+    .bind(job)
+    .bind(token)
+    .bind(worker)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO worker_bans (anon_uuid, banned_by, reason) VALUES ($1, $2, 'x')")
+        .bind(worker)
+        .bind(admin)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO audit_log (action, actor_user_id, actor_anon_uuid, target_type, target_id)
+         VALUES ('worker.banned', $1, $2, 'worker', $3)",
+    )
+    .bind(admin)
+    .bind(worker)
+    .bind(worker.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    for _ in 0..2 {
+        scrub(&db).await;
+    }
+
+    let (uuid, tasks_completed): (Uuid, i64) =
+        sqlx::query_as("SELECT uuid, tasks_completed FROM anonymous_workers").fetch_one(&db.pool).await.unwrap();
+    assert_ne!(uuid, worker, "the credential is gone");
+    assert_eq!(tasks_completed, 7, "what it did is kept");
+    let (claimed_by, claim_token): (Uuid, Uuid) =
+        sqlx::query_as("SELECT claimed_by_anon_uuid, claim_token FROM task_claims").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(claimed_by, uuid, "its claim follows it");
+    assert_ne!(claim_token, token, "an open claim's token is replaced");
+    let banned: Uuid = sqlx::query_scalar("SELECT anon_uuid FROM worker_bans").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(banned, uuid, "so does its ban");
+    let (actor, target): (Uuid, String) =
+        sqlx::query_as("SELECT actor_anon_uuid, target_id FROM audit_log").fetch_one(&db.pool).await.unwrap();
+    assert_eq!((actor, target), (uuid, uuid.to_string()), "and its audit rows");
+
+    // The script copies each identity's row column by column: a column added
+    // to the table must be added there too, or scrubbing resets it.
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns
+         WHERE table_name = 'anonymous_workers' ORDER BY ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, ["uuid", "first_seen_at", "last_seen_at", "tasks_completed", "last_completed_at"]);
+}

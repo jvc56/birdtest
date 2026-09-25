@@ -988,8 +988,8 @@ CREATE TABLE leave_generation_progress (
 );
 
 -- Where a leave generation's selection sweep has got to: the last rack handed
--- out in the lap under way. A row exists exactly while a lap has racks left to
--- hand out: the task that takes the last of them deletes it.
+-- out in the lap under way. A row with a rack exists exactly while a lap has
+-- racks left to hand out: the task that takes the last of them deletes it.
 --
 -- While many racks are below target, racks are handed out in primary-key order
 -- from this cursor rather than lowest count first. Everything behind the cursor
@@ -1000,13 +1000,17 @@ CREATE TABLE leave_generation_progress (
 -- every staged result are exactly the lowest, and each claim hashed and
 -- skipped all of them inside the job's dispatch lock.
 --
+-- Once few racks are below target the generation turns, at a lap's boundary,
+-- to lowest count first, and stays there: a row with a NULL cursor_rack
+-- (`leave_gen::at_boundary`).
+--
 -- Read and written only under that lock. A row that goes missing (a purge, a
 -- partial restore) is a lap not started, which waits for what is in flight and
 -- staged before it selects anything; nothing is handed out twice.
 CREATE TABLE leave_selection_cursors (
     job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     generation  INT NOT NULL,
-    cursor_rack TEXT NOT NULL,
+    cursor_rack TEXT,
     PRIMARY KEY (job_id, generation)
 );
 

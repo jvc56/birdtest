@@ -296,34 +296,48 @@ Do not start §2.2 until the log's last line is `pg_restore exit 0`: with `-j4`
 each table commits on its own, so a copy-back taken mid-restore finds some of
 the job's tables loaded and others empty, and reports success.
 
-The §2.2 loop is best run the same way (`setsid nohup bash /tmp/copyback.sh >
-/tmp/copyback.log 2>&1 &`, with the script written to a file first).
+The §2.2 script is best run the same way, detached.
 
 ### 2.2 Copy the rows back, in dependency order
 
-Dump only the job's rows from the scratch copy, a file per table, and load them
-into production (`$DATABASE_URL`, in the same shell) in dependency order. Each
-file is loaded into a temporary table and inserted from there with `ON CONFLICT
-DO NOTHING`, so a partial re-run is safe — which is all it is for, after §2.0.
-(`COPY` itself has no `ON CONFLICT`: loaded straight in, a re-run stopped at the
-first row already there.)
+`/tmp/restore-job.sh` does this; `scripts/prod-shell.sh` writes it there when
+the shell's task starts (it is `scripts/restore-job.sh`, carried by the ops task
+definition). It dumps only the job's rows from the scratch copy, a file per
+table, and loads them into production (`$DATABASE_URL`, in the same shell) in
+dependency order — 16 MiB of rows at a time, each batch its own transaction,
+through a temporary table and `INSERT … ON CONFLICT DO NOTHING` — holding the
+job's merge lock while it loads, so the half-hourly merge cannot fold restored
+staged rows in mid-run. It refuses to start until `/tmp/pg_restore.log` ends in
+`pg_restore exit 0`, and refuses when `SCRATCH_URL` is production itself, when
+production has the job active (§2.0), or when the scratch copy holds no row of
+the job: a mistyped id, or a copy taken after the mistake. (Use a dump or a
+PITR point from *before* the mistake: the latest nightly dump may be after it.)
+
+It stops, with nothing of that batch loaded, if production already holds a row
+under a restored row's key with other contents: that is a row the job wrote
+since the purge, and it means §2.0 was missed. A row already there exactly as
+dumped is an earlier run's, so running the script again after a stop — a
+failure, the session ending, §2.0 done late — carries on where it left off. (A
+leave job is the exception: if a merge folded its restored staged rows in
+between two runs, the next run reads them as other contents; do §2.0 and run
+it from the start.) It
+prints each table's rows, how many it loaded and how many were there already,
+and moves the three `BIGSERIAL` sequences forward if the restored ids are ahead
+of them. (One statement per table, as this section first had it, queued a
+foreign-key check per row in one backend: some 12 bytes a row, 780 MB for a
+20-generation leave job, more than a `db.t4g.micro` has. And its
+`ON CONFLICT DO NOTHING` dropped a conflicting row without a word.)
 
 For a large job, look at the space first. The copy-back adds the job's rows to
-every table, with their indexes, and stages each table's in an unindexed
+every table, with their indexes, and stages each batch in an unindexed
 temporary table on the production volume first, plus the WAL the inserts
 write; autoscaling keeps only about a tenth of the volume free and grows it at
-most every six hours. Run the script once with `COPYBACK_DUMP_ONLY=1`: it dumps
-the job's rows and prints their sizes, and stops before loading anything. Allow
+most every six hours. Run it once with `COPYBACK_DUMP_ONLY=1`: it dumps the
+job's rows and prints their sizes, and stops before loading anything. Allow
 about twice the total (measured: the loaded rows and their indexes came to 1.5
 times the text), plus `db_max_wal_size_mb` (4 GiB by default) for the WAL the
 inserts write (3.2 times the text, measured). Compare with `FreeStorageSpace`,
 raise `db_allocated_storage` first if it is close, then run it again without.
-
-Save this as `/tmp/copyback.sh` — `cat > /tmp/copyback.sh <<'EOF'` … `EOF`,
-the quotes mattering: unquoted, the shell fills in `$JOB` and the rest as it
-writes the file — and run it (`bash /tmp/copyback.sh`, or detached as §2.1
-runs `pg_restore`), not pasted: its `exit` on a failure would end the
-interactive shell.
 
 From a PITR scratch instance rather than a dump there is no restore to wait
 for; write what the script reads first:
@@ -344,66 +358,20 @@ case "$SCRATCH_URL" in *"@$ENDPOINT:5432"*) ;; *) echo "could not build SCRATCH_
   && echo 'pg_restore exit 0' > /tmp/pg_restore.log   # nothing to wait for
 ```
 
+Then, with the job's id:
+
 ```bash
-source /tmp/restore.env
-grep -qx 'pg_restore exit 0' /tmp/pg_restore.log \
-  || { echo "the scratch restore has not finished, or failed" >&2; exit 1; }
-# The dump is in the scratch database now; its files would share the task's
-# disk with the job's rows dumped below.
-rm -rf /tmp/dump
-JOB=00000000-0000-0000-0000-000000000000
-TASKS="SELECT id FROM tasks WHERE job_id = '$JOB'"
-RECORDS="SELECT id FROM position_analysis_records WHERE job_id = '$JOB'"
-MOVES="SELECT id FROM position_analysis_moves WHERE record_id IN ($RECORDS)"
-mkdir -p /tmp/restore
-
-# Order matters: tasks, then what hangs off a task, then claims, then what
-# hangs off a claim.
-TABLES=(
-  "tasks|job_id = '$JOB'"
-  "opening_rack_requests|task_id IN ($TASKS)"
-  "game_requests|task_id IN ($TASKS)"
-  "leave_requests|task_id IN ($TASKS)"
-  "task_claims|task_id IN ($TASKS)"
-  "worker_data_gaps|job_id = '$JOB'"
-  "game_results|job_id = '$JOB'"
-  "leave_records|task_id IN ($TASKS)"
-  "position_analysis_records|job_id = '$JOB'"
-  "position_analysis_moves|record_id IN ($RECORDS)"
-  "position_analysis_plies|move_id IN ($MOVES)"
-  "leave_rack_progress|job_id = '$JOB'"
-  "leave_rack_staging|job_id = '$JOB'"
-  "leave_generation_progress|job_id = '$JOB'"
-  "leave_selection_cursors|job_id = '$JOB'"
-  "leave_generation_artifacts|job_id = '$JOB'"
-  "leave_generation_transitions|job_id = '$JOB'"
-)
-
-for entry in "${TABLES[@]}"; do
-  table=${entry%%|*} filter=${entry#*|}
-  psql "$SCRATCH_URL" -v ON_ERROR_STOP=1 -c \
-    "COPY (SELECT * FROM $table WHERE $filter) TO STDOUT" > "/tmp/restore/$table" \
-    || { echo "stopped: could not dump $table" >&2; exit 1; }
-done
-du -ch /tmp/restore/* | sort -h | tail -6   # the job's own rows, largest last
-if [ -n "${COPYBACK_DUMP_ONLY:-}" ]; then
-  echo "dumped only; compare the sizes above with FreeStorageSpace"; exit 0
-fi
-
-for entry in "${TABLES[@]}"; do
-  table=${entry%%|*}
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
-BEGIN;
-CREATE TEMP TABLE restoring (LIKE $table) ON COMMIT DROP;
-\copy restoring FROM '/tmp/restore/$table'
-INSERT INTO $table SELECT * FROM restoring ON CONFLICT DO NOTHING;
-COMMIT;
-SQL
-  # Every later table hangs off this one: carrying on buried the first error
-  # under a foreign-key failure per table.
-  [[ $? -eq 0 ]] || { echo "stopped: could not load $table" >&2; exit 1; }
-done
+COPYBACK_DUMP_ONLY=1 bash /tmp/restore-job.sh 00000000-0000-0000-0000-000000000000
+# compare the sizes with FreeStorageSpace, then:
+setsid nohup bash /tmp/restore-job.sh 00000000-0000-0000-0000-000000000000 \
+  > /tmp/restore-job.log 2>&1 &
+tail -f /tmp/restore-job.log   # ends "restored; now repair the counters", or "stopped: …"
 ```
+
+It removes `/tmp/dump` first (the dump is in the scratch database by then, and
+its files would share the task's disk with the job's rows); `FREE_DUMP_DIR=`
+keeps it. `scripts/restore-job-check.sh` runs the script against a real
+Postgres through each of these cases, nightly.
 
 | Order | Table | Filter |
 |---|---|---|
@@ -421,7 +389,8 @@ Restoring a *deleted* job also means its `jobs` row and its config row
 (`job_game_config`, `job_game_pair_config`, `job_opening_rack_config` or
 `job_leave_config`) first, from the scratch copy the same way — and any
 `player_configs` row they name that has been deleted since (nothing pinned it
-once the job was gone), with its `input_data` rows if those went too.
+once the job was gone), with its `input_data` rows if those went too. Its
+`job_exports` rows are not restored: export the job again.
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
 are recomputed from `game_results` (see §2.4).
@@ -455,22 +424,10 @@ it has worked on.
 `position_analysis_records.id`, `_moves.id` and `leave_rack_staging.id` are
 `BIGSERIAL`, restored with their original ids so the parent-child links hold.
 Those ids came from these sequences, which a selective restore does not rewind,
-so nothing needs moving; the check below only ever moves a sequence forward
-(a plain `setval(..., max(id))` could move it *back* below ids the running
-fleet had taken since, and the next insert collided; each statement below
-sets nothing unless the table is ahead of its sequence):
-
-```sql
-SELECT setval('position_analysis_records_id_seq', m)
-  FROM (SELECT max(id) AS m FROM position_analysis_records) x
- WHERE m > (SELECT last_value FROM position_analysis_records_id_seq);
-SELECT setval('position_analysis_moves_id_seq', m)
-  FROM (SELECT max(id) AS m FROM position_analysis_moves) x
- WHERE m > (SELECT last_value FROM position_analysis_moves_id_seq);
-SELECT setval('leave_rack_staging_id_seq', m)
-  FROM (SELECT max(id) AS m FROM leave_rack_staging) x
- WHERE m > (SELECT last_value FROM leave_rack_staging_id_seq);
-```
+so nothing normally needs moving; the script moves a sequence only forward, and
+only when its table is ahead of it (a plain `setval(..., max(id))` could move it
+*back* below ids the running fleet had taken since, and the next insert
+collided).
 
 ### 2.3 Repair the counters
 
@@ -744,18 +701,24 @@ leaderboard visible.
 - **Derived data** (`derived_data`): the SHA-256 of each wordmap and rack info
   table the server built. Derived by definition, and **a job whose rows are
   missing does not dispatch** — which is the symptom a restore produces here:
-  active jobs handing out nothing. Activating each job again re-queues them —
-  the **Activate** button on its admin page, with the allocation it had
-  (`POST /api/admin/jobs/:id/activate` takes `{"allocation": N}` and the CSRF
-  header, and a different `N` changes the job's share) — and the builder task
-  fills them in within a few minutes; `/admin/derived-data` shows the queue. The files
-  themselves are not restored because none is kept: the server hashes and
-  discards them.
+  active jobs handing out nothing, for a few minutes. The first claim that
+  considers an active job queues whatever of its files has no row (so does
+  activating it), and the builder task fills them in; `/admin/derived-data`
+  shows the queue. The files themselves are not restored because none is kept:
+  the server hashes and discards them.
 
   A row whose `kwg_id` or `klv_id` points at an `input_data` row restored
   without its object-store bytes will fail with that as its reason. Re-import
   that tarball; the import is idempotent and adds no rows for files whose bytes
   have not changed.
+
+### 2.5 Start the job again
+
+§2.0 deactivated it, and nothing since has put it back. A job that was active
+before the mistake is activated again with the allocation it had: the
+**Activate** button on its admin page, or `POST /api/admin/jobs/:id/activate`
+with `{"allocation": N}` and the CSRF header (a different `N` changes the job's
+share). A job that was completed stays as §2.3 left it.
 
 ---
 
@@ -793,7 +756,13 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   bucket back:
 
 ```bash
+# On your own machine, with the Terraform state in infra/: the ops task can
+# read only the backups bucket.
+ARTIFACTS_BUCKET=$(terraform -chdir=infra output -raw artifacts_bucket)
+export AWS_REGION=$(terraform -chdir=infra output -raw region)
+JOB=00000000-0000-0000-0000-000000000000
 aws s3api list-object-versions --bucket "$ARTIFACTS_BUCKET" --prefix "leaves/$JOB/"
+VERSION="<the VersionId of the known-good version, from the listing above>"
 aws s3api copy-object --bucket "$ARTIFACTS_BUCKET" \
   --copy-source "$ARTIFACTS_BUCKET/leaves/$JOB/generation-3.klv2?versionId=$VERSION" \
   --key "leaves/$JOB/generation-3.klv2"

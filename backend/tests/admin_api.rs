@@ -1813,3 +1813,58 @@ async fn a_deleted_accounts_tombstone_cannot_be_squatted_and_bans_are_listed() {
     assert_eq!(bans[0]["id"], ban["id"], "{bans}");
     assert_eq!(bans[0]["username"], "root", "{bans}");
 }
+
+/// A-ADMIN-20: a job cannot pin two different files under one role and name.
+/// MAGPIE finds a file by its name, so two players on `NWL23.klv2` from two
+/// data releases made a job every worker declined as missing data, whichever
+/// release it held (thirty-first audit). The same file on both sides, and two
+/// differently named files, are still a job.
+#[tokio::test]
+async fn a_job_cannot_pin_two_files_under_one_name() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let old_klv = db.input_data("klv", "NWL23").await;
+    let new_klv = db.input_data("klv", "NWL23").await;
+    sqlx::query("UPDATE input_data SET tarball_date = '20260101' WHERE id = $1")
+        .bind(new_klv)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let other_klv = db.input_data("klv", "CSW21").await;
+
+    let mut players = Vec::new();
+    for (name, klv) in [("old", old_klv), ("new", new_klv), ("other", other_klv), ("old-again", old_klv)] {
+        let (status, created) = player_config(&app, &headers, json!({
+            "name": name, "recorder_type": "best", "sort_strategy": "equity",
+            "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1,
+        })).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        players.push(created["id"].clone());
+    }
+    let create = |p1: &serde_json::Value, p2: &serde_json::Value| {
+        post_json("/api/admin/jobs", &headers, json!({
+            "job_type": "games", "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout,
+            "player1_config_id": p1, "player2_config_id": p2,
+            "min_games": 1, "max_games": 10,
+        }))
+    };
+
+    let (status, body) = send(&app, create(&players[0], &players[1])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("NWL23"), "{body}");
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(jobs, 0, "nothing of the refused job is left");
+
+    let (status, body) = send(&app, create(&players[0], &players[3])).await;
+    assert_eq!(status, StatusCode::CREATED, "one file on both sides: {body}");
+    let (status, body) = send(&app, create(&players[0], &players[2])).await;
+    assert_eq!(status, StatusCode::CREATED, "two names, two files: {body}");
+}

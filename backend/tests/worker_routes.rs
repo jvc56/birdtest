@@ -881,11 +881,43 @@ async fn worker_requests_are_limited_per_identity() {
     let body: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(body["code"], "rate_limited", "{body}");
 
-    // The same bucket covers the claim, not just the heartbeat.
+    // Claims have a bucket of their own (A-WORKER-14c), which the heartbeats
+    // did not spend; and the next claim spends from it as usual.
+    for i in 1..=5 {
+        let (status, _) = claim_as(&app, &limited).await;
+        assert_ne!(status, StatusCode::TOO_MANY_REQUESTS, "claim {i}");
+    }
     let (status, _) = claim_as(&app, &limited).await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "the claims' own burst is spent");
 
     assert_eq!(heartbeat_as(&app, &other, &token).await, StatusCode::NO_CONTENT, "another identity is unaffected");
+}
+
+/// A-WORKER-14c: a credential's claims and its work in hand -- heartbeats,
+/// declines, results, artifacts -- are limited separately. Machines sharing a
+/// key or a copied `uuid` line claim every few seconds while idle and retry a
+/// `429` without limit; on one bucket they took every token, and a busy
+/// machine's heartbeats, sent once and never retried, were all refused until
+/// its claim lapsed and its finished task was thrown away (thirty-first audit).
+#[tokio::test]
+async fn idle_claims_cannot_starve_a_busy_machines_heartbeats() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let shared = registered_worker(&db).await;
+    let token = json!(Uuid::new_v4());
+
+    let mut refused = false;
+    for _ in 0..10 {
+        let (status, _) = claim_as(&app, &shared).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            refused = true;
+            break;
+        }
+    }
+    assert!(refused, "the idle machines' claims spent the claim bucket");
+    for i in 1..=5 {
+        assert_eq!(heartbeat_as(&app, &shared, &token).await, StatusCode::NO_CONTENT, "heartbeat {i}");
+    }
 }
 
 /// A-WORKER-14b: an account's worker is limited per API key, so two machines
@@ -940,4 +972,164 @@ async fn client_version_reports_the_configured_floor_and_download_url() {
             "download_url": "https://example.invalid/magpie/releases",
         })
     );
+}
+
+/// A body whose bytes never arrive: the sender is returned so the caller
+/// decides how long the upload stays open.
+fn stalled_upload(
+    path: &str,
+    headers: &[(&str, &str)],
+    declared_bytes: usize,
+) -> (Request<Body>, tokio::sync::mpsc::Sender<Result<Vec<u8>, std::io::Error>>) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    let mut builder = Request::post(path)
+        .header("content-type", "application/json")
+        .header("content-length", declared_bytes.to_string());
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let body = Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver));
+    (builder.body(body).unwrap(), sender)
+}
+
+/// A-WORKER-17: a worker route refuses a caller it would refuse anyway -- no
+/// identity, or one it does not know -- before reading the body. The result
+/// route reads up to 64 MiB, and a caller with no credentials at all held a
+/// few dozen uploads open and ran the one web task out of memory.
+#[tokio::test]
+async fn a_caller_the_route_refuses_is_answered_before_its_body() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let unknown = Uuid::new_v4().to_string();
+
+    for path in ["/api/worker/result", "/api/worker/heartbeat", "/api/worker/decline"] {
+        for headers in [vec![], vec![("x-worker-uuid", unknown.as_str())]] {
+            let (request, _still_open) = stalled_upload(path, &headers, 60 * 1024 * 1024);
+            let response = tokio::time::timeout(std::time::Duration::from_secs(5), app.clone().oneshot(request))
+                .await
+                .unwrap_or_else(|_| panic!("{path} {headers:?}: waited for a body it would refuse"))
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path} {headers:?}");
+        }
+    }
+}
+
+/// A-WORKER-17: the worker routes other than the result accept no more than
+/// 1 MiB -- room for a claim listing some 26,000 jobs the worker cannot run,
+/// which MAGPIE does not cap -- rather than axum's 2 MB.
+#[tokio::test]
+async fn a_claim_body_is_small() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let body = json!({ "magpie_version": "1.0.0", "padding": "x".repeat(1536 * 1024) });
+    let (status, body) = claim(&app, &[], body).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+}
+
+/// A-WORKER-18: nothing a caller does with request bodies makes another
+/// worker's heartbeat wait. The large results the budget holds -- three
+/// workers' 60 MiB uploads, stalled -- and a crowd of identity-less claims
+/// stalled mid-body leave a heartbeat answered at once. On one budget shared
+/// by every body, as the thirty-first audit first wrote it, 192 identity-less
+/// claims declaring 64 MiB filled it, and every heartbeat, login and ban got
+/// `503` after ten seconds -- in five minutes, every claim in the fleet
+/// lapsed. And a second large result from a worker already sending one, or a
+/// first claim declaring more than a first claim holds, is refused at once.
+#[tokio::test]
+async fn a_heartbeat_never_waits_behind_other_bodies() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+
+    // A first claim is a few bytes, and is metered before its body.
+    let (request, _sender) = stalled_upload("/api/worker/task", &[], 64 * 1024);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), app.clone().oneshot(request))
+        .await
+        .expect("refused before its body")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let mut open = Vec::new();
+    let mut senders = Vec::new();
+    for _ in 0..3 {
+        let worker = registered_worker(&db).await;
+        let (request, sender) = stalled_upload("/api/worker/result", &[("x-worker-uuid", &worker)], 60 * 1024 * 1024);
+        open.push(tokio::spawn(app.clone().oneshot(request)));
+        senders.push(sender);
+    }
+    while birdtest::extract::LARGE_BODIES.available_kib() >= 60 * 1024 {
+        tokio::task::yield_now().await;
+    }
+    // Past the identity-less burst these are refused at once, unread.
+    for _ in 0..50 {
+        let (request, sender) = stalled_upload("/api/worker/task", &[], 16 * 1024);
+        open.push(tokio::spawn(app.clone().oneshot(request)));
+        senders.push(sender);
+    }
+    // Two hundred claims that have sent all but a byte of a megabyte each:
+    // on the shared budget, more than it held.
+    for _ in 0..40 {
+        let worker = registered_worker(&db).await;
+        for _ in 0..5 {
+            let (request, sender) = stalled_upload("/api/worker/task", &[("x-worker-uuid", &worker)], 1024 * 1024);
+            sender.send(Ok(vec![b' '; 1024 * 1024 - 1])).await.unwrap();
+            open.push(tokio::spawn(app.clone().oneshot(request)));
+            senders.push(sender);
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let busy = registered_worker(&db).await;
+    let started = std::time::Instant::now();
+    let status = heartbeat_as(&app, &busy, &json!(Uuid::new_v4())).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+
+    // The budget is spent: a fourth worker's large result is refused at once,
+    // not queued with a part of it held.
+    let fourth = registered_worker(&db).await;
+    let (request, _sender) = stalled_upload("/api/worker/result", &[("x-worker-uuid", &fourth)], 60 * 1024 * 1024);
+    let started = std::time::Instant::now();
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(response.headers().contains_key("retry-after"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+    for task in open {
+        task.abort();
+    }
+}
+
+/// A-WORKER-18: one worker may have up to one maximum-size result's worth of
+/// large results in flight -- several smaller ones at once, as machines sharing
+/// a key send them -- and past that is refused at once; its reservations are
+/// given back as its uploads end. (One at a time, as first written, made a
+/// fleet on one key send its large results in single file.)
+#[tokio::test]
+async fn a_worker_may_send_a_share_of_large_results_at_once() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let worker = registered_worker(&db).await;
+    let full = 3 * 64 * 1024;
+
+    let mut open = Vec::new();
+    let mut senders = Vec::new();
+    for i in 1..=2 {
+        let (request, sender) = stalled_upload("/api/worker/result", &[("x-worker-uuid", &worker)], 8 * 1024 * 1024);
+        open.push(tokio::spawn(app.clone().oneshot(request)));
+        senders.push(sender);
+        while birdtest::extract::LARGE_BODIES.available_kib() > full - i * 8 * 1024 {
+            tokio::task::yield_now().await;
+        }
+    }
+    let (request, _sender) = stalled_upload("/api/worker/result", &[("x-worker-uuid", &worker)], 60 * 1024 * 1024);
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "past its share");
+
+    // They end (their senders gone, each body short of what it declared) and
+    // take their reservations with them.
+    drop(senders);
+    for upload in open {
+        let _ = upload.await.unwrap();
+    }
+    assert_eq!(birdtest::extract::LARGE_BODIES.available_kib(), full);
 }

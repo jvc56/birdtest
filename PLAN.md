@@ -652,7 +652,7 @@ Users can create an account to track their contributions. Account creation requi
 
 A confirmation code is sent to the email address on registration. Users can generate one or more API keys from their account, which are used to authenticate task submissions.
 
-API keys are stored as hashes (never raw values) in the database. The raw key is shown to the user exactly once at generation time. Users may hold up to **100 API keys**, and a request to create the 101st is refused rather than silently evicting one. The count and the insert run under the account's row lock: the limit lives in the application rather than the schema, and counted and inserted as two bare statements, requests arriving together each read the same count. Each key can be independently marked **active** or **inactive** — only active keys are accepted for worker authentication. This lets contributors rotate or temporarily disable a key without deleting it. Every worker request authenticated with a key stamps its `last_used_at`, so a contributor can tell which of their keys is actually in use before revoking one.
+API keys are stored as hashes (never raw values) in the database. The raw key is shown to the user exactly once at generation time. Users may hold up to **100 API keys**, and a request to create the 101st is refused rather than silently evicting one. The count and the insert run under the account's row lock: the limit lives in the application rather than the schema, and counted and inserted as two bare statements, requests arriving together each read the same count. Each key can be independently marked **active** or **inactive** — only active keys are accepted for worker authentication. This lets contributors rotate or temporarily disable a key without deleting it. A worker request authenticated with a key stamps its `last_used_at`, at most once a minute per key, so a contributor can tell which of their keys is actually in use before revoking one.
 
 **v1 account scope**: The sole v1 purpose of a user account is to generate an API token, which attributes task submissions to that account instead of an anonymous UUID. No other feature is gated behind registration. Anonymous workers can complete tasks fully, with no account or API token required.
 
@@ -736,7 +736,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
 5. On submit, `POST /api/auth/reset-password/confirm` re-scores the new password, validates the token (hash match, not expired, not already used), sets `used_at`, hashes and stores the new password, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
 
    The reset also **revokes every existing session**. Each session token carries the account's `session_generation`, and `CurrentUser` compares it with the `users` row it already reads on every request; the reset increments it, so every token minted before it — an attacker's included — stops working. `POST /api/auth/sign-out-everywhere` (the "Sign out everywhere" button on the account page) and account deletion increment it the same way.
-6. The user is redirected to `/login` with a success message.
+6. The user is redirected to `/login` (with no message; signing in with the new password is the confirmation).
 
 ---
 
@@ -1094,7 +1094,7 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | `worker_contributions`, 44,000 claims | job detail and every SSE push | 136 ms |
 | Public worker list, all claims | page view | 93 ms |
 | Leave `next_step` rack selection — **as it was**, ordering on `(occurrence_count, rack)` through an index without `rack` | every leave claim, inside the dispatch lock | 225–390 ms at **400,000** racks (an eighth of English; a scan and sort of the generation, so linear from there — 2–3 s at full size). The 47 ms first recorded here was measured on counts that rarely tied |
-| Leave `next_step` rack selection **as it is now** — a sweep of the primary key from a cursor while many racks are below target, lowest count first on the narrow index once few are | every leave claim | sweep: 3.9 ms at 400,000 racks with 97% of them at target (16,000 rows stepped over for 501 racks; nearer 0.1 ms early in a generation), and the same with nothing staged or ten thousand results staged; tail: 0.5 ms |
+| Leave `next_step` rack selection **as it is now** — a sweep of the primary key from a cursor while many racks are below target, lowest count first on the narrow index once few are | every leave claim | sweep: 3.9 ms at 400,000 racks with 97% of them at target (16,000 rows stepped over for 501 racks; nearer 0.1 ms early in a generation), and the same with nothing staged or ten thousand results staged; tail: 0.5 ms with little out, 67 ms with all 50,000 racks below target out (it begins only at a lap's boundary, so a sweep's claims are never among what it excludes) |
 | `leave_gen_stats` — **as it was**, counting the generation's racks at target | job detail and every SSE push | 210 ms |
 | `leave_gen_stats` **as it is now** — the generation's summary row | job detail and every SSE push | one single-row read |
 | Transition: stream generation 1 by rack | once per generation | 674 ms |
@@ -1717,7 +1717,8 @@ row. That is the correct outcome rather than an inconvenience:
 data, and nothing in the schema said so before. The cost is that a data update
 means cloning configs. `name` is `UNIQUE`, so the clone convention is fixed:
 `simmer-NWL23-4ply@20260101` — base name, `@`, the `tarball_date` of the data it
-pins — generated rather than typed. `cloned_from_id` records the lineage, because
+pins. The API leaves the name, and `cloned_from_id`, to the caller (the
+admin API's player-config section); no page sets `cloned_from_id` yet. It records the lineage, because
 a clone starts with no rating history and that would otherwise read as a bug: the
 config page shows "cloned from simmer-NWL23-4ply@20250101 — ratings restart on
 new data".
@@ -2592,7 +2593,7 @@ At claim time:
 
    This replaced lowest-count-first selection for the bulk of a generation because of what that costs between merges: `leave_rack_progress` shows a finished task's racks at the counts they had before it played, so they are the *lowest* in the generation the moment their claim completes. They have to be held out — or they are handed straight back out, to every claim until the next merge — and holding them out meant every claim hashing and stepping over every staged rack, about a microsecond each, inside the dispatch lock: 160–290 ms with 400 results staged, a second at a hundred workers, where the lock's other claimants give up after two.
 
-   **Once few remain, lowest count first**: `ORDER BY occurrence_count ASC` — on the count *alone*, ties falling in whatever order the index holds them (see [What a merge costs](#what-a-merge-costs) for why not by rack) — excluding the racks named in the `forced_racks` of an open claim for this generation, so concurrent claims are not handed overlapping subsets, **and the racks forced by a task whose result is staged but not yet merged**, for the reason above. A sweep would spend the end of a generation stepping over racks already at target; here the set below target is small by construction, so the excluded set is too. Going from the first selection to the second is safe at any moment, because the second excludes everything that is out; nothing goes the other way, since counts only grow.
+   **Once few remain, lowest count first**: `ORDER BY occurrence_count ASC` — on the count *alone*, ties falling in whatever order the index holds them (see [What a merge costs](#what-a-merge-costs) for why not by rack) — excluding the racks named in the `forced_racks` of an open claim for this generation, so concurrent claims are not handed overlapping subsets, **and the racks forced by a task whose result is staged but not yet merged**, for the reason above. A sweep would spend the end of a generation stepping over racks already at target; here the set below target is small by construction, so the excluded set is too. The turn from the first selection to the second is made only at a lap's boundary — nothing in flight, nothing staged — and then remembered, as the generation's cursor row with no rack, so every later claim of the generation goes straight to it and nothing goes back, since counts only grow. What the second excludes is then only what it has handed out itself, at most the racks below target: 67 ms a claim with all 50,000 of them out, at 400,000 racks and 500 a task. It used to turn wherever a merge put the summary under the threshold, mid-lap included, and every claim then hashed the racks of every sweep claim still out — 0.45 s a claim at a thousand workers, inside the dispatch lock, until those claims drained and a merge ran (thirty-first audit).
 
    Either way, if no rack is left to hand out *and* no `task_claims` row for this generation is still `claimed`: with results still staged, whether the generation is complete is **not yet known** — the claim starts a merge, off the request, and is told there is nothing here right now (`NeedsLeaveMerge`), and the next claim decides on exact figures; with nothing staged, the generation is complete — run generation transition (below) instead of dispatching a task. Claims in flight are read *before* what is staged, and the order matters: submissions are not serialized with claims, and read that way round a result is always one or the other. A claim that *is* handed racks, but fewer than `racks_per_task`, has found the generation (or the lap) nearly done, and asks for a merge too, at most once a minute per job: that is when stale counts cost most, since tasks go out forcing racks that may already be at target and the generation cannot close until a merge shows that they are.
 
@@ -2920,6 +2921,38 @@ games, and a generous per-game turn ceiling.
 2. **What bounds a submission?** Settled: `POST /api/worker/result` refuses a body
    over 64 MiB before parsing it (`MAX_RESULT_BYTES`, `413`), and the compose Nginx
    allows the same. `games_per_batch` stays the admin's lever for staying under it.
+   The other worker routes take 1 MiB (`WORKER_BODY_BYTES`): a claim lists the
+   jobs its worker cannot run, which MAGPIE does not cap. How many bodies are
+   held at once is bounded too (thirty-first audit), in two tiers
+   (`extract::read_body`):
+   - **small bodies** — every body declaring at most 1 MiB, or nothing — share
+     no budget, so nothing another caller does can make one wait; each has 30
+     seconds to arrive, and one declaring nothing is cut off at 1 MiB. What
+     they hold together is what callers can send in 30 seconds;
+   - **large bodies** — only results, from an identity the route has already
+     checked — reserve their declared length whole from a 192 MiB budget
+     (`extract::LARGE_BODIES`) before a byte is read, or are answered `503`
+     with `Retry-After` at once (MAGPIE retries 5xx for a quarter of an hour);
+     one identity may have 64 MiB reserved at once (machines sharing a key
+     share it); results over 1 MiB are decoded three at a time
+     (`registry::large_result_turn`); each has 30 seconds plus its size at
+     64 KiB/s, and may not stall for 30. A result keeps its reservation until
+     its handler returns;
+   - the heartbeat, decline, result and artifact routes refuse a caller with
+     no identity, or one the server does not know, from the headers
+     (`auth::RegisteredWorker`), and a claim with no identity is rate-limited
+     and held to 16 KiB before its body is read.
+
+   Before this, a caller with no credentials held a dozen 60 MiB uploads open
+   and took the web task's memory from 38 MB to 778 MB: the ALB streams `/api`
+   to the backend unbuffered. The same flood is now answered `401` at once;
+   twelve workers' 60 MiB results are three admitted (217 MiB resident) and
+   nine refused at once, with a heartbeat answered in 4 ms throughout. The
+   audit's first design put every body on one budget, charged as bytes
+   arrived and waited for when spent: 192 identity-less claims declaring
+   64 MiB filled it, and every heartbeat, login and ban waited ten seconds for
+   a `503` — heartbeats are not retried, so in five minutes every claim in the
+   fleet lapsed. Its own adversarial check found that, within the audit.
 
 There is deliberately no consumer yet: this is a corpus being built for later use,
 and it leaves the database as the second object of the job's [export](#exports).
@@ -3780,6 +3813,14 @@ creation, a `derived_data` row only ever moves toward `built`, and the builder
 the query matches on is a constant of the running binary, so nothing can make a
 remembered answer wrong. A job still waiting is asked about on every claim,
 which is what lets it be dispatched the moment its last file is built.
+
+Files are queued when a job is created and when it is activated, and by the
+first claim that finds one of a job's files with no row under the running
+binary's builder (`derived::ready_for_job`). That last is what a deployment
+whose MAGPIE bumped a builder version needs: every running job's files are
+built under the old one only, and until the thirty-first audit nothing queued
+them under the new one, so every such job handed out nothing, with nothing on
+`/admin/derived-data` to say why, until an admin re-activated it.
 
 On the worker, during task execution, after the heartbeat has started: a table
 takes minutes, and the heartbeat is what keeps the claim alive through it.
@@ -4847,7 +4888,7 @@ Protected by a layout guard (`/account/+layout.svelte`) that redirects unauthent
 
 | Route | Page |
 |---|---|
-| `/account` | Account overview — username, email, confirmation status, API key list (labels only), generate/revoke API keys. |
+| `/account` | Account overview — username, email, API key list (labels only), generate/revoke API keys. (No confirmation status: an unconfirmed account cannot sign in, so every account that sees this page is confirmed.) |
 
 ### Admin Routes
 
@@ -4855,14 +4896,14 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 
 | Route | Page |
 |---|---|
-| `/admin` | Admin overview — redirects to `/admin/jobs`. |
+| `/admin` | Admin overview — redirects to `/jobs`, the job list, where admin controls sit inline (there is no `/admin/jobs` list; `/admin/jobs/new` and `/admin/jobs/:id` exist). |
 | `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields. |
 | `/admin/jobs/[id]` | Admin job view — same stats as the public detail page plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form. |
 | `/admin/users` | User account list — delete accounts. (Contribution stats are shown publicly at `/users`.) |
 | `/admin/workers` | Worker ban management — ban / unban workers by user ID or anonymous UUID. |
-| `/admin/audit-log` | Audit log viewer — filterable by action type, actor, and target; paginated. |
+| `/admin/audit-log` | Audit log viewer — filterable by action and target type; paginated. (Not by actor: the page has no actor filter.) |
 | `/admin/input-data` | Input data browser and import wizard — pick a tarball date, watch the import, review the staged diff, confirm. |
 | `/admin/fleet` | What MAGPIE versions have claimed work recently, from `task_claims.magpie_version`. |
 | `/admin/derived-data` | The wordmap and rack info table build queue: what is built, pending or failed, and a retry for the failures. |
@@ -6115,8 +6156,8 @@ CREATE TABLE leave_generation_progress (
 );
 
 -- Where a leave generation's selection sweep has got to: the last rack handed
--- out in the lap under way. A row exists exactly while a lap has racks left to
--- hand out: the task that takes the last of them deletes it.
+-- out in the lap under way. A row with a rack exists exactly while a lap has
+-- racks left to hand out: the task that takes the last of them deletes it.
 --
 -- While many racks are below target, racks are handed out in primary-key order
 -- from this cursor rather than lowest count first. Everything behind the cursor
@@ -6127,13 +6168,17 @@ CREATE TABLE leave_generation_progress (
 -- every staged result are exactly the lowest, and each claim hashed and
 -- skipped all of them inside the job's dispatch lock.
 --
+-- Once few racks are below target the generation turns, at a lap's boundary,
+-- to lowest count first, and stays there: a row with a NULL cursor_rack
+-- (`leave_gen::at_boundary`).
+--
 -- Read and written only under that lock. A row that goes missing (a purge, a
 -- partial restore) is a lap not started, which waits for what is in flight and
 -- staged before it selects anything; nothing is handed out twice.
 CREATE TABLE leave_selection_cursors (
     job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     generation  INT NOT NULL,
-    cursor_rack TEXT NOT NULL,
+    cursor_rack TEXT,
     PRIMARY KEY (job_id, generation)
 );
 
@@ -6719,8 +6764,9 @@ the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
 twenty-fourth's `AUDIT_FINDINGS_20.md`, the twenty-fifth's
 `AUDIT_FINDINGS_21.md`, the twenty-sixth's `AUDIT_FINDINGS_22.md`, the
 twenty-seventh's `AUDIT_FINDINGS_23.md`, the twenty-eighth's
-`AUDIT_FINDINGS_24.md`, the twenty-ninth's `AUDIT_FINDINGS_25.md` and the
-thirtieth's `AUDIT_FINDINGS_26.md`.
+`AUDIT_FINDINGS_24.md`, the twenty-ninth's `AUDIT_FINDINGS_25.md`, the
+thirtieth's `AUDIT_FINDINGS_26.md` and the thirty-first's
+`AUDIT_FINDINGS_27.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed.
@@ -6821,19 +6867,34 @@ says so in its implemented option, rather than being removed.
     row lock that every claim for the job also takes.
   - What is left is milliseconds.
 
-**KL-6. Large results waiting their turn are still resident.**
+**KL-6. Large results waiting their turn were still resident. Closed in the thirty-first audit.**
 - **Context:** The three-slot bound on storing results of 8 MiB or more is taken
   after the body has been read.
-- **Problem:** Each waiter keeps its body in memory for up to thirty seconds.
-  Some twenty-five maximum-size submissions waiting at once would still fill
-  the web task.
+- **Problem:** Each waiter kept its body in memory for up to thirty seconds, and
+  nothing bounded how many bodies were being read: some twenty-five
+  maximum-size submissions at once would fill the web task. The thirty-first
+  audit found that a caller needed no credentials to do it (§ "What bounds a
+  submission?").
 - **Options considered:**
   - take the turn from `Content-Length` before the body is read, as a layer on
     the result route;
-  - above three at a time, answer `503` and let the submitter re-upload.
-- **Option implemented:** None.
-- **Justification:** Only capture jobs that large reach it. Build the layer if
-  they are ever run.
+  - above three at a time, answer `503` and let the submitter re-upload;
+  - charge every body to one byte budget as it arrives, and keep a result
+    charged until its handler returns.
+- **Option implemented:** The first, generalised: a result's declared length
+  is reserved whole from a 192 MiB budget (`extract::LARGE_BODIES`) before
+  its body is read, or refused at once with `503`; the result, heartbeat and
+  decline routes refuse an unknown caller before its body; small bodies share
+  no budget but have 30 seconds to arrive. A waiter now holds its reservation,
+  so the bodies waiting for a turn count against the same 192 MiB. The third
+  option was built first and broken by the audit's own adversarial check: on
+  one budget, small bodies could be made to wait behind large ones, and
+  heartbeats with them.
+- **Justification:** Reserving the declared length lets a caller with an
+  identity hold a reservation cheaply, which is KL-54; charging as bytes
+  arrive would make holding cost bytes, but lets honest uploads hold part of
+  the budget while waiting for more of it. Reservations are the simpler of the
+  two to reason about, and only large results are exposed.
 
 **KL-7. `task_claims` is stored at fillfactor 85.**
 - **Context:** A heartbeat changes only `last_heartbeat_at`, which no index
@@ -6950,6 +7011,69 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** The contributor's.
 - **Justification:** Pinning would be fair across workers and a waste of
   contributors' cores, so it was rejected.
+
+**KL-54. The large-result budget can be held by callers with identities.**
+- **Context:** A result declaring more than 1 MiB reserves its length from a
+  192 MiB budget before its body is read; one identity may hold 64 MiB of it; each
+  has a deadline and may not stall for 30 seconds (thirty-first audit; §
+  "What bounds a submission?"). The split of a credential's bucket in two
+  (claims, and work in hand) also doubles the credential lookups one
+  credential may cause, to two a second.
+- **Problem:** Three identities, each declaring 64 MiB and sending a byte every
+  half minute, hold the whole budget until their deadlines (some seventeen
+  minutes), and then again. Every other large result is refused with `503`
+  meanwhile; MAGPIE retries for a quarter of an hour and then gives up the
+  result. Small bodies — every heartbeat, claim, decline and ordinary result —
+  are untouched, and memory stays bounded.
+- **Options considered:**
+  - charge a large body as its bytes arrive, so holding it costs the bytes (at
+    the price of honest uploads holding part of the budget while they wait);
+  - a minimum average rate enforced as the body arrives, not only by its
+    deadline;
+  - rate rules at the load balancer (AWS WAF).
+- **Option implemented:** Reservation, per-identity, deadline and stall limit.
+- **Justification:** Only capture jobs send results over 1 MiB, the holders
+  need identities an admin can ban, and nothing else waits on it. Revisit if
+  capture jobs run at scale.
+
+**KL-55. Redundancy above 1 has two untested edges.**
+- **Context:** No job runs above redundancy 1 today (see KL-3).
+- **Problem:**
+  - Two concurrent reclaims holding lapsed claims on the same two tasks update
+    the `tasks` rows in opposite orders, and Postgres aborts one as a deadlock
+    (logged, not fatal).
+  - An `Unregistered` identity carries a fresh UUID, so a client that loses or
+    never keeps its UUID can take a second slot on the same task.
+- **Options considered:** order the reclaim's task updates and lock them with
+  `SELECT … FOR UPDATE` first; key the slot check on the minted identity only
+  once it persists.
+- **Option implemented:** None yet. *Open (thirty-first audit).*
+- **Justification:** Both matter only above redundancy 1. Whoever builds the
+  replicated-task cross-check fixes them with KL-3.
+
+**KL-56. An identity-less claim mints an identity and holds a task.**
+- **Context:** A client with no identity may claim five times a second per
+  address, burst thirty; each claim that hands out a task mints an identity.
+- **Problem:** One address can hold some 1,500 tasks open for the heartbeat
+  timeout, which can pin a leave job's lap end or tail, and those claims count
+  toward the job's share.
+- **Options considered:** a lower identity-less rate; a cap on open claims per
+  address.
+- **Option implemented:** None.
+- **Justification:** It is outside the stated threat model (a broken client,
+  not a hostile one), and a ban stops it. Revisit if it is seen.
+
+**KL-57. A job waiting on a derived build asks about it on every claim.**
+- **Context:** `derived::status_for_job` runs for a waiting job on every claim
+  that considers it, until the build lands (up to about 45 minutes for a rack
+  info table).
+- **Problem:** A few milliseconds on every such claim, and a waiting job heads
+  the candidate list because its claim count does not move.
+- **Options considered:** throttle it like `JobTemplates::recently_failed`, once
+  a few seconds per job.
+- **Option implemented:** None.
+- **Justification:** Small, and bounded by the build. Add the throttle if many
+  jobs ever wait at once.
 
 ### Leave generation
 
@@ -7152,6 +7276,18 @@ says so in its implemented option, rather than being removed.
 - **Justification:** An index would cost an entry per claim on the hottest write
   table, for one view.
 
+**KL-58. `jobstats::worker_contributions` scales with the job.**
+- **Context:** The per-contributor table on a job's page, rebuilt at most every
+  ten seconds per watched job (`JOB_STATS_CACHE_SECONDS`).
+- **Problem:** 0.8 s for a job with 600,000 completed claims, about 8% of a
+  database core per busy dashboard. It still joins `tasks`, though
+  `task_claims.job_id` exists.
+- **Options considered:** read `task_claims` by `job_id` alone; keep running
+  totals per contributor.
+- **Option implemented:** None.
+- **Justification:** Within the "decide on evidence" stance
+  (`SLOW_STATS_THRESHOLD` logs it). Revisit when it is logged.
+
 ### Abuse and input
 
 **KL-33. Recovering an account does not revoke its API keys.**
@@ -7202,8 +7338,13 @@ says so in its implemented option, rather than being removed.
   their own (username unique, address not), create the `users` row only at
   confirmation, and record a taken address as a pending row too, so both
   branches leave the same state.
-- **Option implemented:** None yet. *Open (twelfth audit).*
-- **Justification:** It is a schema and flow change, left for a decision.
+- **Option implemented:** None yet. *Open (twelfth audit).* The thirty-first
+  audit found two more channels for the same fact, left with it: two
+  registrations of one fresh address racing past the taken check give the
+  loser a `409` (the unique index) rather than the identical `201`, and
+  `/api/users` lists unconfirmed accounts.
+- **Justification:** It is a schema and flow change, left for a decision. The
+  pending-registrations table would close all three.
 
 **KL-38. Unconfirmed accounts, spent tokens and anonymous identities are never reaped.**
 - **Context:**
@@ -7290,6 +7431,40 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** None.
 - **Justification:** Imports are admin-only.
 
+**KL-59. A failed sign-out leaves the session live.**
+- **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
+  layout's sign-out has no error path (`F-AUTH-2` pins the store's side).
+- **Problem:** On a `503` or a network failure the server never cleared the
+  session cookie, yet the page shows the user signed out; the next page load
+  signs them back in. On a shared machine that matters.
+- **Options considered:** keep the session and say "sign-out failed"; retry.
+- **Option implemented:** None yet. *Open (thirty-first audit).*
+- **Justification:** It needs a UI decision about what to show, and the
+  trigger is an outage during sign-out.
+
+**KL-60. Admin UI gaps the API covers.**
+- **Context:** The job form (`/admin/jobs/new`) and the password form.
+- **Problem:**
+  - The job form sends no `capture_positions`, `racks_per_batch` or
+    `rack_size`, so capture jobs and opening-rack jobs of another rack size can
+    be made only through the API.
+  - A blank password gets a generic `400` rather than a field error (the form's
+    `required` normally stops it first).
+- **Options considered:** add the fields; map zxcvbn's blank-password error.
+- **Option implemented:** None.
+- **Justification:** Admin-only, and the API is documented.
+
+**KL-61. Marking every pool for a refit can still skip one.**
+- **Context:** After `mark_every_pool_for_refit`, the sweep skips a refit when
+  `pairs_used` and the members are unchanged.
+- **Problem:** A deleted job's pairs replaced by the same number of new ones
+  within one 120-second sweep leaves a pool fitted on evidence it no longer
+  has, until the next new pair.
+- **Options considered:** skip the "same pairs" shortcut when the last run's
+  `evidence_games` is NULL.
+- **Option implemented:** None.
+- **Justification:** It needs a coincidence and heals itself.
+
 ### Deployment
 
 **KL-45. Terraform's state is local.**
@@ -7328,6 +7503,95 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** None.
 - **Justification:** Two live tasks break the single-instance assumptions the
   system was written against.
+
+**KL-62. Terraform does not check that its variables agree.**
+- **Context:** `infra/*.tf` variables.
+- **Problem:**
+  - `backend_image` and `derived_builder_image` are two free strings. A
+    release that moves a builder version in one and not the other leaves rows
+    keyed to the web task's builder that nothing builds, and jobs needing them
+    wait, visible only on `/admin/derived-data`.
+  - `acm_certificate_arn` is not checked to be an ACM ARN in the stack's
+    region; a wrong one fails the apply half-way.
+  - `mail_from_address` is not checked to be within `ses_domain`; outside it,
+    every mail fails.
+- **Options considered:** cross-variable `validation` blocks (Terraform 1.9).
+- **Option implemented:** None yet. *Open (thirty-first audit).*
+- **Justification:** Each is a one-line validation, but `terraform validate`
+  does not exercise a validation's condition: only a plan against real values
+  shows it refuses the wrong ones and not the right, and one that refuses a
+  correct apply is worse than none.
+
+**KL-63. Secrets that reach logs or subprocesses.**
+- **Context:** Nginx's access log, MAGPIE subprocesses, the database URL.
+- **Problem:**
+  - Nginx logs `/confirm-email?code=…` and `/reset-password/confirm?token=…`
+    to CloudWatch for 30 days; a reset token opened but unused stays valid for
+    30 minutes.
+  - MAGPIE subprocesses inherit the backend's whole environment,
+    `DATABASE_URL`, `SESSION_SIGNING_KEY` and `GITHUB_TOKEN` included, while
+    parsing lexica fetched from the network.
+  - The backend does not verify the database's certificate: without
+    `sslmode=verify-full` the connection is encrypted but not authenticated.
+- **Options considered:** a `log_format` without `$args` for those paths;
+  `env_clear()` plus the few variables MAGPIE reads; `verify-full` with the RDS
+  CA bundle in the image.
+- **Option implemented:** None yet. *Open (thirty-first audit).*
+- **Justification:** Hardening with no demonstrated failure; each is a small
+  change with its own deployment risk.
+
+**KL-64. Infrastructure hardening not done.**
+- **Context:** `infra/`, `.github/workflows/`, `docker-compose.yml`.
+- **Problem:**
+  - Neither bucket's policy denies requests without `aws:SecureTransport`.
+  - The ALB does not set `drop_invalid_header_fields`.
+  - The alerts SNS topic is unencrypted.
+  - `ses:SendEmail` is allowed on `*` rather than the domain identity.
+  - The pages' CSP has no `script-src` or `default-src`.
+  - Third-party CI actions are pinned by tag, not commit.
+  - The dev compose file publishes Postgres, MinIO and the backend on every
+    interface, with committed credentials.
+- **Options considered:** each fix as named.
+- **Option implemented:** None.
+- **Justification:** No failure shown. Worth a pass of its own before release.
+
+**KL-65. Some failures raise no alarm.**
+- **Context:** The backup and drill failure rules match on a task's exit code.
+- **Problem:** A task that never starts its container (an image pull or secret
+  failure) is caught only by the 36-hour staleness alarm, and the derived
+  builder has no failure alarm at all.
+- **Options considered:** match `stopCode`/`stoppedReason` too; an alarm on the
+  builder's failures.
+- **Option implemented:** None.
+- **Justification:** Staleness catches the first within a day and a half, and
+  a failed build shows on `/admin/derived-data`.
+
+**KL-66. Most multi-step procedures are still pasted Markdown.**
+- **Context:** The audit's rule: a procedure longer than a few commands, or
+  with conditions, guards or loops, belongs in a tested script.
+- **Problem:** Untested and still pasted:
+  - RUNBOOK §1's ceiling arithmetic, poll loop, swap, `state rm` and `import`;
+  - §2.0's deletes, §2.1's fetch and scratch restore, §2.3 and §2.3b;
+  - §5's guards and `tfvars` generation, §6's staging and teardown;
+  - the deploy rollback's wait, the password rotation's URL rewrite;
+  - README "Deploying"'s SSM setup and alert-path checks.
+
+  Earlier audits found defects in these very blocks, pass after pass.
+- **Options considered:** move each into `scripts/`, with `aws` and `terraform`
+  stubbed in CI.
+- **Option implemented:** §2.2 moved (`scripts/restore-job.sh`, thirty-first
+  audit). The rest: none yet. *Open (thirty-first audit).*
+- **Justification:** Each move is a rewrite with tests of its own. §2.2 went
+  first because it was the one found to fail. Take §2.3/§2.3b and §1 next.
+
+**KL-67. RUNBOOK §4's first check compares nothing.**
+- **Context:** §4, "Verifying a restore".
+- **Problem:** Check 1 prints the manifest's row counts for the operator to
+  compare by eye; nothing compares them with the restored database.
+- **Options considered:** reuse `restore-drill.sh`'s comparison before the
+  service starts.
+- **Option implemented:** None.
+- **Justification:** The monthly drill does compare them. Fold it in with KL-66.
 
 ### The MAGPIE side
 
@@ -7401,6 +7665,44 @@ says so in its implemented option, rather than being removed.
   server.
 - **Option implemented:** None.
 - **Justification:** The worker's summary already shows the real cause.
+
+**KL-68. Small things on MAGPIE's contribute path.**
+- **Context:** `birdtest-contribute`'s `contribute.c`, `client_state.c`.
+- **Problem:**
+  - The raw autoplay summary line is printed on every games and leave task.
+  - A negative `maxtasks` in `contribute.txt` is accepted and stops the run
+    after one task.
+  - A heartbeat's single attempt can block for about 120 seconds against an
+    unreachable server, and the submission waits for it.
+  - An `expected_data` entry with a role MAGPIE does not know is skipped
+    silently, so a newer server's new role goes unchecked
+    (`min_magpie_version` is the only guard).
+  - `contribute_find_derived` takes the first matching entry; the server now
+    refuses a job that would pin two files under one name, so only a server bug
+    reaches it.
+- **Options considered:** each fix as named, on `birdtest-contribute`.
+- **Option implemented:** None.
+- **Justification:** None changes a result. They go with the next MAGPIE change
+  that has a reason of its own.
+
+**KL-69. What `scripts/restore-job.sh` does not handle.**
+- **Context:** RUNBOOK §2.2's copy-back, a script since the thirty-first audit.
+- **Problem:**
+  - It copies by column position (`SELECT *`, `LIKE`, `INSERT … SELECT *`): a
+    column added in production after the snapshot fails every table, with no
+    documented way out.
+  - It holds the job's merge lock only while it runs. A leave job stopped
+    part-way whose staged rows a merge then folds in reads, on the next run, as
+    rows with other contents: it needs §2.0 and a run from the start (the
+    script's hint says so), not a resume.
+  - `scripts/scrub.sql` replaces anonymous UUIDs where they are keys, not
+    where someone typed one into a ban's or an audit row's free-text reason.
+- **Options considered:** copy the column list the two schemas share; keep the
+  merge lock across runs (a marker the sweep reads); rewrite UUID-shaped text.
+- **Option implemented:** None.
+- **Justification:** A schema change between a snapshot and its restore, a
+  stop and a merge between two runs, and a UUID typed into a reason are each
+  rare, and each fails loudly or harmlessly.
 
 ---
 
@@ -7919,9 +8221,13 @@ development rather than recovery:
   and the one with a disclosure risk: the dump carries real email addresses and
   password hashes. `scripts/scrub.sql`, applied immediately after a local restore,
   rewrites `users.email` to `user-<id>@example.invalid`, replaces every
-  `password_hash` with a known throwaway argon2 hash, and truncates `api_keys`,
-  `email_confirmations` and `password_reset_tokens`. Restoring production data
-  locally without it is documented as something not to do.
+  `password_hash` with a known throwaway argon2 hash, truncates `api_keys`,
+  `email_confirmations` and `password_reset_tokens`, and replaces every
+  anonymous worker's UUID, which `X-Worker-UUID` alone authenticates, with its
+  claims, ban and audit rows following it, and every open claim's token
+  (thirty-first audit; until then a scrubbed dump could submit as any anonymous
+  contributor). Restoring production data locally without it is documented as
+  something not to do.
 
 The `scrub.sql` step is also what makes a public "sample database" possible later, if
 birdtest ever wants to publish its analysis corpus.

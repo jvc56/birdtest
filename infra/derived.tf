@@ -140,9 +140,10 @@ resource "aws_ecs_task_definition" "derived_builder" {
         { name = "S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
         { name = "AWS_REGION", value = var.region },
         { name = "RUST_LOG", value = "birdtest=info" },
-        # Where the throwaway data directories go. The container's default temp
-        # directory is not the ephemeral volume mounted above, and a 1.9 GB
-        # table written to the wrong one fills the layer instead.
+        # Where the throwaway data directories go: a directory the image makes
+        # for them. On Fargate the ephemeral storage above backs the whole
+        # writable layer, /tmp included, so this names the place rather than a
+        # different disk.
         { name = "MAGPIE_SCRATCH_DIR", value = "/scratch" },
         # Threads for a conversion. Matched to the vCPUs above: the whole
         # reason this task exists is that it can give MAGPIE the cores the web

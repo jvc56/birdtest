@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 167 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
-| 1F Frontend unit | 112 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 145 | `backend/tests/`: `leave_gen.rs` (28), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 170 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
+| 1 Unit | 171 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1F Frontend unit | 114 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 148 | `backend/tests/`: `leave_gen.rs` (31), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 178 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (32), `auth_routes.rs` (17), `worker_routes.rs` (21), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -79,8 +79,8 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 510 backend tests (the per-tier counts above are
-from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
+--run-ignored all` runs 524 backend tests (the per-tier counts above are
+from `cargo nextest list --run-ignored all` and `vitest`, thirty-first audit;
 they had drifted by up to 17).
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
@@ -284,6 +284,22 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
   payload_too_large` in the same shape; and a body above the blocking-pool
   threshold parses to the same value as one below it. *(Covered:
   `extract::tests::*`.)*
+- `U-ERR-6` **Request bodies are read in two tiers** (`extract::read_body`): a
+  large body (declaring over 1 MiB) is reserved whole before a byte is read
+  and given back, owner and all, when dropped; past the budget, or past one
+  owner's 64 MiB share, it is refused at once with `503` and `Retry-After`, never
+  queued holding part of it; a small body never touches the budget, one
+  declaring nothing is cut off at 1 MiB, and a large body declared to a route
+  without the budget is `413` unread; a stalled large body is let go with its
+  reservation. *(Covered: `extract::tests::a_large_body_is_reserved_whole_and_given_back`,
+  `…::a_large_body_that_cannot_be_reserved_is_refused_at_once`,
+  `…::a_small_body_never_waits_and_an_undeclared_one_is_bounded`,
+  `…::a_stalled_large_body_is_let_go_with_its_reservation`.)* (Thirty-first
+  audit: a caller with no credentials held a dozen 60 MiB uploads open and took
+  the web task from 38 MB to 778 MB. The audit's first fix, one budget for every
+  body charged as bytes arrived, let 192 identity-less claims make every
+  heartbeat wait ten seconds for a `503`; its adversarial check found that, and
+  these tests are the redesign's.)
 - `U-ERR-4` A `sqlx::Error` converted into `AppError` becomes a 500 whose public
   message does **not** contain the SQL string or the database URL. A leaked
   query in an error body is the failure this test exists for. *(Covered:
@@ -653,6 +669,15 @@ Test the pure functions; do not snapshot the SVG.
   network failure, in flight, and a later 401 replacing a user.)*
 - `F-AUTH-2` `signOut` clears the store even if the request fails, so the UI
   cannot be left showing a session that is gone. *(Covered: `auth.test.ts`.)*
+
+### `F-DOCS-*` — contributor instructions in `routes/`
+
+- `F-DOCS-1` No page tells a contributor to pass an API key on the command line
+  (`--api-key` is the test-only Python worker's flag; `magpie contribute` reads
+  a key only from an `apikey` line in `contribute.txt`), and the account page
+  shows that line for a freshly created key. The pages' text, read as source.
+  *(Covered: `contributeDocs.test.ts`.)* (Thirty-first audit: the account page
+  said `--api-key`, which MAGPIE rejects.)
 
 ---
 
@@ -1138,8 +1163,11 @@ job creation touches needs one caller here.
   runs -- the claim transaction that decides a generation is complete commits
   rather than rolls back, or the row that stops a second transition would be
   discarded -- and a transition that *fails* hands ownership back immediately
-  instead of waiting out the takeover timeout. *(Covered:
-  `leave_gen::the_transition_owner_is_committed_before_the_transition_runs`.)*
+  instead of waiting out the takeover timeout -- including one that fails
+  reading the job's config or distribution before it starts, which kept
+  ownership for the half hour until the thirty-first audit. *(Covered:
+  `leave_gen::the_transition_owner_is_committed_before_the_transition_runs`,
+  `leave_gen::a_transition_that_fails_before_it_starts_hands_ownership_back`.)*
 - `I-LEAVE-14` **A result for a closed generation is credited but not folded**:
   the claim completes and the `leave_records` row is written, and the closed
   generation's `occurrence_count` does not move — so a rebuild of that
@@ -1177,6 +1205,14 @@ job creation touches needs one caller here.
   *(Covered, tier 6 opt-in:
   `magpie_leave::a_missing_generation_zero_klv_is_built_by_the_next_claim`.)*
   (Fifteenth audit.)
+- `I-LEAVE-19` **A generation turns to its tail only where a lap would start**
+  -- nothing in flight, nothing staged -- and stays there: a summary under the
+  threshold mid-lap leaves the sweep running, a lap's end with claims out waits
+  for them, and the tail, once begun (a cursor row with no rack), carries on
+  with its own claims out. *(Covered:
+  `leave_gen::a_generation_turns_to_its_tail_only_where_a_lap_would_start`.)*
+  (Thirty-first audit: it turned mid-lap, and each claim then hashed every sweep
+  claim's racks inside the dispatch lock, 0.45 s a claim at a thousand workers.)
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -1505,6 +1541,12 @@ runs against a real MinIO.
   a wordmap keyed on the wrong player would silently break. *(Covered:
   `worker_api::players_on_different_lexicons_need_a_wordmap_each`; the shared
   case by `I-DERIVED-1`.)*
+- `I-DERIVED-10` A job whose files were built under another builder -- after a
+  deployment whose MAGPIE bumped a builder version -- has them queued under
+  this binary's builder by the next claim that considers it. *(Covered:
+  `worker_api::a_file_built_under_another_builder_is_queued_under_this_one_by_a_claim`.)*
+  (Thirty-first audit: only creating or activating a job queued anything, so
+  every such job answered `204` for good.)
 
 ---
 
@@ -1709,6 +1751,30 @@ below.
   twenty-third's order: an unknown credential pays its address first, so a
   refused flood leaves no per-credential bucket behind -- asserted on the
   limiter's size.)
+- `A-WORKER-14c` A credential's claims and its work in hand (heartbeats,
+  declines, results, artifacts) are limited separately, so idle machines
+  sharing a key cannot spend a busy one's heartbeats. *(Covered:
+  `worker_routes::idle_claims_cannot_starve_a_busy_machines_heartbeats`,
+  and `worker_requests_are_limited_per_identity` for each bucket's own burst.)*
+  (Thirty-first audit: on one bucket, eight machines on one identity had eleven
+  of eleven heartbeats refused in five minutes.)
+- `A-WORKER-17` A worker route refuses a caller it would refuse anyway -- no
+  identity, or an unknown one -- before reading the body, and the routes other
+  than the result accept at most 1 MiB. *(Covered:
+  `worker_routes::a_caller_the_route_refuses_is_answered_before_its_body`,
+  `worker_routes::a_claim_body_is_small`.)* (Thirty-first audit; see `U-ERR-6`.)
+- `A-WORKER-18` **Nothing a caller does with bodies makes a heartbeat wait**:
+  with the large-result budget spent by three stalled 60 MiB uploads, and two
+  hundred claims stalled a byte short of a megabyte each, a heartbeat is
+  answered at once; a fourth large result is refused at once with
+  `Retry-After`; a first claim declaring more than 16 KiB is refused before its
+  body; and one worker may have 64 MiB of large results in flight -- two 8 MiB
+  ones at once, but not a 60 MiB one beside them -- its reservations given back
+  as they end. *(Covered:
+  `worker_routes::a_heartbeat_never_waits_behind_other_bodies`,
+  `worker_routes::a_worker_may_send_a_share_of_large_results_at_once`.)*
+  (Thirty-first audit; one at a time, as first written, serialized a fleet on
+  one key.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*
@@ -1793,6 +1859,11 @@ below.
   finished. *(Covered:
   `admin_api::a_second_purge_or_delete_is_refused_while_one_runs`.)* (Fourteenth
   audit.)
+- `A-ADMIN-20` A job cannot pin two different files under one role and name
+  (MAGPIE finds a file by name, so every worker would decline every task); the
+  same file on both sides, and two differently named files, are still a job.
+  *(Covered: `admin_api::a_job_cannot_pin_two_files_under_one_name`.)*
+  (Thirty-first audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -2363,12 +2434,37 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
 - `S-BACKUP-4` A dump of the current schema restores into an empty database and
   comes back identical: row counts, referential integrity, the denormalized
   task counters, and `BYTEA` and `DOUBLE PRECISION` columns intact, over a seed
-  with a row in every table a result touches. *(Covered:
+  of a row in each of `users`, `input_data`, `jobs`, `tasks`, `task_claims`,
+  `game_results` and `backups` (it said "every table a result touches", which
+  it never was: no leave or position-analysis row goes through it). *(Covered:
   `scripts/restore-roundtrip.sh`, which had fallen three `NOT NULL` columns
   behind the schema and could not run.)*
+- `S-BACKUP-5` **A purged job's rows are copied back as RUNBOOK §2.2 says**
+  (`scripts/restore-job.sh`): not before the scratch restore has finished, not
+  from production as its scratch copy, not into a job production has active,
+  not for a job the scratch copy holds nothing of; nothing with
+  `COPYBACK_DUMP_ONLY`; the job's merge lock held while it loads;
+  position analyses back through their parents' ids; a row production holds under a restored
+  row's key with other contents stops the run with that batch not loaded and
+  another job untouched; the same run, after §2.0, finishes what the stopped one
+  began; a job loaded in several batches comes back row for row, and again
+  changes nothing; the sequences end past the restored ids. *(Covered:
+  `scripts/restore-job-check.sh`.)* (Thirty-first audit: §2.2 was a pasted loop
+  that loaded each table in one statement, whose foreign-key queue -- 12 bytes
+  a row, measured -- would exhaust a `db.t4g.micro` on a large job, and whose
+  `ON CONFLICT DO NOTHING` dropped a conflicting row silently. Measured on 1.5
+  million progress rows: the queue peaked at 18.9 MB in one statement and at
+  3.2 MB, whatever the job's size, in batches.)
 
-Both run nightly (`restore-roundtrip` and `backup-drill` in
-`.github/workflows/nightly.yml`), each against the schema applied to an empty
+- `S-SCRUB-1` A scrubbed dump holds no credential: every anonymous worker's
+  UUID is replaced, with its claims, ban and audit rows following it and what
+  it did kept, and an open claim's token is replaced; twice over, as the script
+  allows. *(Covered: `account::a_scrubbed_dump_keeps_no_worker_credential`,
+  which also pins `anonymous_workers`' columns to the ones the script copies.)*
+  (Thirty-first audit: the UUIDs, each a whole credential, survived scrubbing.)
+
+All three run nightly (`restore-roundtrip`, which runs `S-BACKUP-5` too, and
+`backup-drill` in `.github/workflows/nightly.yml`), each against the schema applied to an empty
 database — which is also the migration replay the nightly list asks for. The
 monthly production drill (`restore-drill.sh` on the newest real dump) remains
 the real check of the backups themselves.

@@ -197,9 +197,11 @@ together with the builder that produced it.
   is birdtest's fleet that a silent change would take down.
 - **The server rebuilds on a bump.** Deploying a server with a newer MAGPIE
   records new hashes under the new builder version; old ones stay for workers
-  still on the old builder until the floor moves past them. Activating a job
-  again is what re-queues its files, which is why activation requests them as
-  well as creation.
+  still on the old builder until the floor moves past them. The first claim
+  that considers a job after the deployment queues its files under the new
+  builder (as creating or activating it does); until the thirty-first audit
+  only activation did, and every running job needing a wordmap or a table
+  handed out nothing after such a deployment until an admin re-activated it.
 
 **One departure.** The proposal had a worker decline immediately when its
 builder version differed, to avoid a wasted three-minute build. That is not what

@@ -963,15 +963,6 @@ async fn run_leave_generation_transition(
     if job.job_type != JobType::LeaveGeneration {
         return Ok(());
     }
-    let config = sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
-        .bind(job.id)
-        .fetch_one(&state.pool)
-        .await?;
-
-    let mut conn = state.pool.acquire().await?;
-    let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
-    drop(conn);
-
     // This request owns the transition: `next_step` wrote the
     // `leave_generation_transitions` row that stops any other claim starting the
     // same one. If it fails, ownership has to go back, or the generation would
@@ -979,14 +970,20 @@ async fn run_leave_generation_transition(
     // store error would cost half an hour of idle workers. Backdating
     // `started_at` hands it to the next claim through the same takeover path,
     // which keeps the attempt count and says in the log that a transition was
-    // started and did not finish.
-    let result = leave_gen::run_transition(
-        state,
-        job.id,
-        generation,
-        &config,
-        &job_data.letterdist,
-    )
+    // started and did not finish. The reads before the transition are inside
+    // the guard too: outside it, as they were, a failure in either kept
+    // ownership for the half hour (thirty-first audit).
+    let result = async {
+        let config =
+            sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
+                .bind(job.id)
+                .fetch_one(&state.pool)
+                .await?;
+        let mut conn = state.pool.acquire().await?;
+        let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
+        drop(conn);
+        leave_gen::run_transition(state, job.id, generation, &config, &job_data.letterdist).await
+    }
     .await;
 
     let key = match result {
