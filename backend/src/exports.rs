@@ -375,7 +375,14 @@ async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> Ap
         };
         let mut batch: Vec<u8> = Vec::with_capacity(COMPRESS_BATCH_BYTES + 64 * 1024);
 
-        let mut rows = sqlx::query(sql).bind(job_id).fetch(&state.pool);
+        // Closed rather than returned when this ends: a pool connection
+        // dropped mid-result is drained before it is reused, so an upload that
+        // failed part way left Postgres building the rest of the corpus on a
+        // connection nothing counted (thirty-first audit). Closing it ends the
+        // query at the server's next write.
+        let mut conn = state.pool.acquire().await?;
+        conn.close_on_drop();
+        let mut rows = sqlx::query(sql).bind(job_id).fetch(&mut *conn);
         while let Some(row) = rows.try_next().await? {
             let line: String = row.get("row");
             batch.extend_from_slice(line.as_bytes());
@@ -395,6 +402,8 @@ async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> Ap
             }
         }
         drop(rows);
+        // Done with the database: the tail below compresses and uploads.
+        drop(conn);
 
         let (tail, bytes, sha256) = off_the_executor(move || {
             let (compressor, part) = compressor.push(batch)?;

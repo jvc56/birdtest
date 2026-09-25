@@ -959,7 +959,11 @@ caller per scan is one connection per scan against a pool of twenty. So bulk
 reads are admin-only, at most **two streams run at once** (a semaphore permit
 held for the life of the response body, released when a caller disconnects as
 well as when one reads to the end), and a completed job is served from an
-artifact instead. Building an export reads the corpus through the same pool, so
+artifact instead. A caller that disconnects takes its query with it: the
+stream's connection, like an export's, is closed rather than returned, because
+a pool connection dropped mid-result is drained first — Postgres built the whole
+corpus for every hung-up spot check, outside the permit, until the thirty-first
+audit. Building an export reads the corpus through the same pool, so
 a job has **one export running at a time** (a partial unique index) and at most
 **two build at once** across the server (a build that outlives six hours is
 failed, freeing the job for another request, and one whose row an admin
@@ -1496,7 +1500,7 @@ locally generated file. Don't.
 `download_data.sh` pins a version as a constant in the script
 (`DATA_VERSION="20251004"`), probes for `data-<version>.tgz.aa`, walks the chunk
 suffixes `aa`, `ab`, `ac`, … while they exist, concatenates them, and pipes the
-result through `tar -xzf`. Today that is three 40 MB chunks, ~94 MB total. Two
+result through `tar -xzf`. Today (`data-20251004`) that is five chunks, ~190 MB total, 250 MB uncompressed. Two
 consequences:
 
 1. **The data version is a MAGPIE release-time constant.** Everyone running a
@@ -1601,7 +1605,7 @@ became compiled-in fixture bytes in the test tree.
 Admin-triggered, two-phase, and never on the dispatch path. Dispatch reads local
 tables only; GitHub can be down for a week without a worker noticing.
 
-**Phase 1 — fetch and diff, in the background.** The archive is ~94 MB, so this
+**Phase 1 — fetch and diff, in the background.** The archive is ~190 MB, so this
 is not a request that waits. `POST /api/admin/input-data/imports` resolves the
 ref, inserts a `running` row, spawns a tokio task, and returns the import id
 immediately; the admin UI polls. birdtest runs as a single instance, so the
@@ -1632,7 +1636,7 @@ is the first thing that breaks.
    task carries and fails the task (after claiming it) otherwise, so a job
    pinned to `CSW24.v2` would have stopped every worker it reached.
 4. Upload every `kwg` and `klv` entry's bytes to the object store, keyed by
-   digest, while the archive is still in memory — re-downloading 94 MB at
+   digest, while the archive is still in memory — re-downloading 190 MB at
    confirmation time for files already hashed would be pure waste. The server
    builds reference wordmaps and rack info tables from these; a `winpct` file is
    neither read nor built from server-side, so it stays digest-only. An object
@@ -7436,13 +7440,13 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** Code-point order.
 - **Justification:** No such opening-rack job exists.
 
-**KL-44. Concurrent imports each hold a ~94 MB tarball in memory, and more.**
+**KL-44. Concurrent imports each hold a ~190 MB tarball in memory, and more.**
 - **Context:** An input-data import buffers its tarball, and the walk keeps every
-  lexicon and leaves file's bytes until they are uploaded: some 300 MB of them
-  uncompressed for the current release (the thirty-first audit's count; this
-  entry said the tarball alone).
-- **Problem:** Two admins importing at once on a 2 GB task is survivable; three
-  is close, five is not.
+  lexicon and leaves file's bytes until they are uploaded: most of the current
+  release's 250 MB uncompressed (the thirty-first audit's count; this entry said
+  a 94 MB tarball alone).
+- **Problem:** Some 450 MB an import at the current release's size: two admins
+  importing at once on a 2 GB task is close, three is not.
 - **Options considered:** None recorded.
 - **Option implemented:** None.
 - **Justification:** Imports are admin-only.
@@ -7461,6 +7465,9 @@ says so in its implemented option, rather than being removed.
   - Two imports staged at the same time each label a path `new` that becomes a
     collision once the other confirms, so the second admin misses the second
     look; a staged import's expiry counts from the request, not from staging.
+  - An import whose time limit fires while its staging transaction commits can
+    commit anyway with the row already `failed`; its staged rows are then never
+    expired (expiry takes `staged` rows only). The window is milliseconds.
   - An import past its time limit is failed, but the archive walk, on the
     blocking pool, runs to its end with the tarball and its files in memory: an
     admin starting it again at once holds two.
@@ -7476,12 +7483,49 @@ says so in its implemented option, rather than being removed.
   claim must carry a JSON body … update MAGPIE", the message an old MAGPIE's
   contributor sees.
 - **Problem:** A body the server could not read (the client disconnected) or a
-  missing content type gets the same advice, which is wrong for them.
+  missing content type gets the same advice, which is wrong for them. And a
+  first claim sent without a length and cut off at 16 KiB gets the generic
+  "larger than this endpoint accepts" rather than the claim's own "send the
+  X-Worker-UUID" (MAGPIE always sends a length).
 - **Options considered:** rewrite only a body that parses and lacks the fields.
 - **Option implemented:** None; `413` and `503` are passed on as they are since
   the thirty-first audit.
 - **Justification:** Cosmetic: the client that gets it has already gone, or
   sends no content type, which only an old MAGPIE does.
+
+**KL-72. What exports leave behind, and what they do not say.**
+- **Context:** `exports.rs`, the admin job page, the artifacts bucket (thirty-
+  first audit, third pass).
+- **Problem:**
+  - Deleting a job leaves its export objects in the bucket until the 30-day
+    rule (a purge removes them); the bucket is versioned and no rule removes
+    expired delete markers; `failed` and expired `job_exports` rows are never
+    pruned; a build ended by its time limit or a restart leaves its multipart
+    upload to the seven-day rule.
+  - At redundancy above 1, a games export has one row per accepted claim and an
+    opening-rack export one record per claim per rack, while the job's
+    statistics use the first result per task; nothing in the export marks it.
+  - After a point-in-time restore (§1), a `ready` row whose objects a later
+    purge deleted redirects to a 404.
+  - The admin page shows only the newest export row, so a failed or running
+    export hides an older ready one that still downloads.
+  - Presigned links are signed with the task role's temporary credentials and
+    may expire before the page's "valid for an hour".
+- **Options considered:** collect a deleted job's keys as a purge does; a
+  lifecycle rule for delete markers and a prune of old rows; mark the first
+  result in the export; list every unexpired export on the page.
+- **Option implemented:** None.
+- **Justification:** Storage and wording, with no wrong data served; no job
+  runs above redundancy 1.
+
+**KL-73. The contributor-instruction test catches one phrasing.**
+- **Context:** `F-DOCS-1` (`contributeDocs.test.ts`) reads the pages' source.
+- **Problem:** Its guard against putting `contribute.txt` beside the binary
+  matches one form of words; another phrasing would pass.
+- **Options considered:** render the pages and test the text.
+- **Option implemented:** None.
+- **Justification:** The pages render no component tests today (tier 1F is
+  plain TypeScript); the journeys (tier 5) read the account page.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
@@ -8194,8 +8238,10 @@ repointing SSM.
 
 **Selective restore** is the common case, and the database must not be rolled back
 because everything else has moved on. Restore into a scratch database, extract the
-affected rows in dependency order, re-insert into production inside one transaction
-with `ON CONFLICT DO NOTHING` throughout so a partial re-run is safe, then repair
+affected rows in dependency order, re-insert them into production in batches, each
+its own transaction, with `ON CONFLICT DO NOTHING` and a check that every row is
+there as dumped, so a partial run resumes and a conflicting row stops it
+(`scripts/restore-job.sh`, RUNBOOK §2.2), then repair
 the denormalized counters — which is the part a naive row copy gets wrong.
 `tasks.accepted_count` and `active_claim_count` must be recomputed from the restored
 `task_claims`, and `tasks.state` / `completed_at` recomputed against the job's

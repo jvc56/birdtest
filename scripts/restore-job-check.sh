@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Prove scripts/restore-job.sh (RUNBOOK.md §2.2) against a real Postgres: two
-# jobs' rows are purged from one database and copied back from a copy of it
-# taken before, through its failure and re-run cases. Run it against the local
+# jobs purged and one deleted in one database are copied back from a copy of
+# it taken before, through its failure and re-run cases. Run it against the local
 # docker compose stack:
 #
 #   docker compose up -d postgres
@@ -10,7 +10,7 @@
 #
 # or any Postgres 16 container, with PG_EXEC="docker exec -i <container>". It
 # runs entirely inside the container, as the ops shell runs the script, and
-# works in two databases of its own, which it drops afterwards.
+# works in three databases of its own, which it drops afterwards.
 #
 # The cases:
 #   - it refuses to start before the scratch restore has finished, against a
@@ -206,13 +206,20 @@ if out=$(restore "$GAMES"); then fail "ran with no restore log: $out"; fi
 [[ "$out" == *"has not finished"* ]] || fail "no reason given: $out"
 ${EXEC} sh -c 'printf "restoring\npg_restore exit 0\n" > /tmp/restore-job-check.log'
 
-echo "-- refuses production as its scratch copy, an active job, and a job it holds nothing of"
+echo "-- refuses production as its scratch copy, an active or since-completed job, and a job it holds nothing of"
 if out=$(restore "$GAMES" SCRATCH_URL="postgresql:///$PROD?user=$PGUSER_"); then fail "restored from production: $out"; fi
 [[ "$out" == *"SCRATCH_URL is production itself"* ]] || fail "not told why: $out"
 val "$PROD" "UPDATE jobs SET status = 'active' WHERE id = '$GAMES'" >/dev/null
 if out=$(restore "$GAMES"); then fail "restored into an active job: $out"; fi
 [[ "$out" == *"the job is active in production"* ]] || fail "not told why: $out"
+val "$PROD" "UPDATE jobs SET status = 'completed' WHERE id = '$GAMES'" >/dev/null
+if out=$(restore "$GAMES"); then fail "restored into a job completed since the purge: $out"; fi
+[[ "$out" == *"has completed since the mistake"* ]] || fail "not told why: $out"
 val "$PROD" "UPDATE jobs SET status = 'inactive' WHERE id = '$GAMES'" >/dev/null
+val "$PROD" "INSERT INTO job_exports (job_id, state) VALUES ('$GAMES', 'running')" >/dev/null
+if out=$(restore "$GAMES"); then fail "restored beside an export made since the purge: $out"; fi
+[[ "$out" == *"holds an export of the job"* ]] || fail "not told why: $out"
+val "$PROD" "DELETE FROM job_exports WHERE job_id = '$GAMES'" >/dev/null
 if out=$(restore 00000000-0000-0000-0000-0000000000ff); then fail "restored nothing and said so: $out"; fi
 [[ "$out" == *"holds no job"* ]] || fail "not told why: $out"
 for purged in "$GAMES" "$LEAVE"; do

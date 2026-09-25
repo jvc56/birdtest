@@ -208,8 +208,10 @@ threads  7
 maxtasks 0
 ```
 
-then run `./bin/magpie contribute` there. A second process needs a directory of
-its own: MAGPIE appends the identity it is issued to that file. Settings never
+then run `./bin/magpie contribute` there. A second process needs a
+`contribute.txt` of its own (`./bin/magpie contribute <file>`; a directory of its
+own is simplest, since MAGPIE also writes `settings.txt` there): MAGPIE appends
+the identity it is issued to that file. Settings never
 go on the command line, so an API
 key stays out of shell history and `ps` output. Wordmaps (`.wmp`) make game
 play dramatically faster, so MAGPIE always wants one for a lexicon it's

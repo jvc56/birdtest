@@ -68,9 +68,9 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 175 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (21), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1 Unit | 179 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (25), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
 | 1F Frontend unit | 115 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 148 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 2 Integration | 149 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 179 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (32), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 530 backend tests (the per-tier counts above are
+--run-ignored all` runs 535 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-first audit;
 they had drifted by up to 17).
 
@@ -526,12 +526,15 @@ path, nothing recognisable, and a bomb by compression ratio.)
   space, an empty name — is not importable, so no job can be pinned to it and
   stop every worker it reaches. *(Covered:
   `inputdata::tests::ignores_what_birdtest_does_not_pin`.)* (Twelfth audit.)
-- `U-ARCHIVE-8` An entry's size is the one its data has — a PAX `size` record
-  overrides the header's own field — and the per-entry cap and the expansion
-  ratio judge it before a byte is read, pinned or not. *(Covered:
-  `inputdata::tests::a_pax_size_is_judged_by_the_caps_before_the_entry_is_read`.)*
-  (Thirty-first audit: a header saying 0 and a PAX record saying 900 MiB passed
-  every cap and was read whole, 927 MiB resident from a 4 MiB gzip.)
+- `U-ARCHIVE-8` A PAX `size` record is refused, pinned entry or not, and so
+  cannot make the walk and the reader disagree on where the next header
+  starts. *(Covered: `inputdata::tests::a_pax_size_record_is_refused`,
+  `inputdata::tests::a_pax_size_record_cannot_move_the_next_header`.)*
+  (Thirty-first audit: first a header saying 0 and a record saying 900 MiB
+  passed every cap and was read whole, 927 MiB resident from a 4 MiB gzip; then,
+  with the size honoured, a record ahead of an ordinary entry slipped an 8 MiB
+  PAX header past a first pass that read raw. The walk is raw since, and reads
+  extension headers itself.)
 - `U-ARCHIVE-9` An archive naming one pinned path twice — two files, or a file
   and an alias — is refused. *(Covered:
   `inputdata::tests::an_archive_naming_a_path_twice_is_refused`.)* (Thirty-first
@@ -546,6 +549,22 @@ path, nothing recognisable, and a bomb by compression ratio.)
   `inputdata::tests::skipped_data_counts_against_the_caps`.)* (Thirty-first
   audit, second pass: a 400 KB gzip with a 400 MB PAX header held 465 MB and
   was accepted.)
+- `U-ARCHIVE-11` A GNU sparse entry is refused as it is met, its extension
+  blocks never expanded. *(Covered:
+  `inputdata::tests::a_sparse_entry_is_refused_unexpanded`, which also bounds
+  what the walk holds.)* (Thirty-first audit, third pass: an interpreting reader
+  built 64 bytes for every 24 of them, 1.1 GB from a 44 MB gzip.)
+- `U-ARCHIVE-12` What another tool writes still walks: a PAX `path` (with an
+  `mtime`, as Python's `tarfile` writes) and a GNU long name each name the entry
+  after them — once: a second name for the same entry (another PAX header, a
+  long name beside a PAX path) and a global PAX `path` are refused, as GNU tar
+  would extract under a name the walk did not choose, while a comment-only
+  global header walks. *(Covered:
+  `inputdata::tests::pax_paths_and_long_names_name_the_entry_after_them`,
+  `inputdata::tests::an_entry_given_two_names_is_refused`.)* Also
+  checked by hand in the thirty-first audit: 51 release files (133 MB) packed by
+  GNU tar and, with PAX headers on every member, by Python's `tarfile`, both
+  walked to the same 37 pinned files.
 
 ---
 
@@ -1499,6 +1518,12 @@ runs against a real MinIO.
 - `I-EXPORT-8` One export of a job runs at a time: a second request while one
   is `running` is a 409. *(Covered:
   `exports::a_job_has_one_export_running_at_a_time`.)* (Thirteenth audit.)
+- `I-EXPORT-9` A reader that stops early — a results-stream caller who hangs
+  up, an export whose upload fails — ends its corpus query: the connection is
+  closed, not drained back into the pool. *(Covered:
+  `exports::a_reader_that_hangs_up_ends_its_corpus_query`.)* (Thirty-first audit:
+  each hang-up left Postgres building the whole corpus on a connection no cap
+  counted; ten held a ten-connection pool, and every claim timed out.)
 
 ### `I-DATA-*` — the pinned-row invariant
 
@@ -2242,7 +2267,12 @@ admin in once and the admin journeys reuse its storage state.
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
 - `E-10` A page renders correctly at phone width — one journey, not all of them.
   *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list and a
-  job page, nothing wider than the screen.)*
+  job page, nothing wider than the screen.)* The screen is the device's width:
+  compared with `innerWidth`, as it was, the check could not fail, because a
+  phone's browser widens its layout viewport to fit what overflows — and the
+  header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
+  "Register" off it (thirty-first audit; the header now wraps). Checked against
+  a build of the pages with the API mocked: 533 before, 393 after.
 
 ### Reading confirmation codes
 
@@ -2475,7 +2505,9 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
 - `S-BACKUP-5` **A purged job's rows are copied back as RUNBOOK §2.2 says**
   (`scripts/restore-job.sh`): not before the scratch restore has finished, not
   from production as its scratch copy, not into a job production has active,
-  not for a job the scratch copy holds nothing of; nothing with
+  not into a job production has completed since the purge, not beside an export
+  of the job made since, not for a job the
+  scratch copy holds nothing of; nothing with
   `COPYBACK_DUMP_ONLY`; not from a copy taken after the purge — one already
   holding the purge's audit row, whether of a games job that went on running or
   of a leave job with only its generation-0 artifact written back; a deleted job

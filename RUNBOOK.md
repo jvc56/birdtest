@@ -219,6 +219,16 @@ psql "$DATABASE_URL" -v job=00000000-0000-0000-0000-000000000000
 
 ```sql
 BEGIN;
+-- A purged job that completed again since -- a small job, or a force-complete --
+-- cannot be deactivated from the admin page, and its verdict is from the
+-- results about to be deleted: back to inactive, with no verdict.
+UPDATE jobs SET status = 'inactive', sprt_decided_status = NULL,
+                sprt_decided_llr = NULL, sprt_decided_units = NULL
+ WHERE id = :'job' AND status = 'completed';
+-- And an export of those results: once §2.3 completes the job again it would be
+-- served as the restored job's corpus. (A purge deletes exports for this
+-- reason; the objects go with the bucket's lifecycle rule.)
+DELETE FROM job_exports WHERE job_id = :'job';
 DELETE FROM task_claims c USING tasks t WHERE c.task_id = t.id AND t.job_id = :'job';
 DELETE FROM tasks WHERE job_id = :'job';
 DELETE FROM leave_rack_progress         WHERE job_id = :'job';
@@ -314,8 +324,11 @@ production has the job active (§2.0), when the scratch copy holds no such job
 (a mistyped id), and when the scratch copy already holds the audit row of the
 job's last purge or delete — a copy taken after the mistake, which may hold a
 job that went on running, or only the generation-0 artifact a leave job's purge
-writes back. (Use a dump or a PITR point from *before* the mistake: the latest
-nightly dump may be after it.)
+writes back. Only the *last* purge or delete is checked: for a job purged by
+mistake and then purged or deleted again, a copy taken between the two is
+accepted, and holds the job as it ran on after the first. (Use a dump or a PITR
+point from *before* the mistake you mean: the latest nightly dump may be after
+it.)
 
 It stops, with nothing of that batch loaded, if production already holds a row
 under a restored row's key with other contents: that is a row the job wrote
@@ -1055,7 +1068,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
 - `./scripts/restore-roundtrip.sh` — proves a dump of the current schema
   restores byte-identically into an empty database. Run it after any schema
   change; nightly CI runs it too.
-- `./scripts/restore-job-check.sh` — runs §2.2's `restore-job.sh` against two
+- `./scripts/restore-job-check.sh` — runs §2.2's `restore-job.sh` against three
   databases of its own through its refusals, a stopped run and its resume, a
   deleted job, and a re-run; `PG_EXEC="docker exec -i <container>"` points it
   at any Postgres 16 container. Nightly CI runs it.

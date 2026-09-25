@@ -4,13 +4,21 @@ import { seededJob } from '../lib/api';
 // A phone, in Chromium: Pixel 5 is 393 CSS pixels wide.
 test.use({ ...devices['Pixel 5'] });
 
-/** Nothing on the page is wider than the screen, so nothing scrolls sideways. */
+/**
+ * Nothing on the page is wider than the screen, so nothing scrolls sideways.
+ * Measured against the device's width, not `innerWidth`: a phone's browser
+ * widens its layout viewport to fit content that overflows, so `innerWidth`
+ * grew with the page and the comparison always passed -- while the header's
+ * links ran 140 pixels off a Pixel 5 (thirty-first audit).
+ */
 async function expectNoSidewaysScroll(page: Page) {
+  const screen = page.viewportSize()!.width;
   const { scrollWidth, innerWidth } = await page.evaluate(() => ({
     scrollWidth: document.documentElement.scrollWidth,
     innerWidth: window.innerWidth
   }));
-  expect(scrollWidth, 'page is wider than the viewport').toBeLessThanOrEqual(innerWidth);
+  expect(innerWidth, 'the layout viewport was widened to fit the page').toBeLessThanOrEqual(screen);
+  expect(scrollWidth, 'page is wider than the screen').toBeLessThanOrEqual(screen);
 }
 
 /**

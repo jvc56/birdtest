@@ -969,7 +969,19 @@ pub(super) async fn job_results_stream(
             }
         }
 
-        let mut rows = sqlx::query(query).bind(id).fetch(&pool);
+        // Closed rather than returned when the stream ends: a pool connection
+        // dropped mid-result is drained first, so a caller that hung up after
+        // a line left the whole corpus building on a connection the permit no
+        // longer counted (thirty-first audit). Closing it ends the query.
+        let mut conn = match pool.acquire().await {
+            Ok(conn) => conn,
+            Err(err) => {
+                tracing::error!(error = %err, "result stream could not get a connection");
+                return;
+            }
+        };
+        conn.close_on_drop();
+        let mut rows = sqlx::query(query).bind(id).fetch(&mut *conn);
         while let Some(row) = rows.next().await {
             match row {
                 Ok(row) => {

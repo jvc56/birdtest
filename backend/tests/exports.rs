@@ -534,3 +534,90 @@ async fn an_export_reaped_while_it_ran_is_not_brought_back_ready() {
     .await;
     assert_eq!(status, StatusCode::OK, "streamed from the database, not redirected");
 }
+
+/// Corpus queries still running in this test's database, other than the
+/// caller's own.
+async fn corpus_scans_running(db: &TestDb) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect(&db.url).await.unwrap();
+    let running = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE state = 'active' AND pid <> pg_backend_pid() AND datname = current_database()
+           AND query LIKE '%jsonb_build_object(''moves''%'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    conn.close().await.ok();
+    running
+}
+
+/// I-EXPORT: a reader that stops early takes its query down with it. A pool
+/// connection dropped mid-result is drained before it goes back to the pool,
+/// so each `curl | head` spot check of the results stream -- and each export
+/// whose upload failed -- left Postgres building the whole corpus on a
+/// connection no cap counted: ten of them held a ten-connection pool, and
+/// every claim waited out its acquire timeout (thirty-first audit). The
+/// connection is now closed rather than drained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_that_hangs_up_ends_its_corpus_query() {
+    use http_body_util::BodyExt;
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    let task: Uuid = sqlx::query_scalar("INSERT INTO tasks (job_id, seed, state) VALUES ($1, 0, 'completed') RETURNING id")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+         VALUES ($1, $2, gen_random_uuid(), 'completed', $3, now()) RETURNING id",
+    )
+    .bind(task)
+    .bind(job)
+    .bind(admin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves)
+         SELECT $1, $2, $3, 'R' || g, 5 FROM generate_series(1, 150000) g",
+    )
+    .bind(claim)
+    .bind(task)
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_moves (record_id, rank, move, score, equity)
+         SELECT r.id, k, md5(random()::text), 10, random()
+         FROM position_analysis_records r, generate_series(1, 5) k WHERE r.job_id = $1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE").execute(&db.pool).await.unwrap();
+
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    for _ in 0..3 {
+        let response = app.clone().oneshot(get_request(&path, &headers)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        assert!(!body.frame().await.unwrap().unwrap().data_ref().unwrap().is_empty());
+        drop(body);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut running = corpus_scans_running(&db).await;
+    while running > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        running = corpus_scans_running(&db).await;
+    }
+    assert_eq!(running, 0, "a hung-up reader's corpus query is still running");
+    assert_eq!(state.result_streams.available_permits(), birdtest::state::MAX_CONCURRENT_RESULT_STREAMS);
+}

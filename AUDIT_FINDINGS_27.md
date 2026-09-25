@@ -26,6 +26,12 @@ pass with no high or medium finding (then one confirmation full pass).
   medium in the pass's own fixes from its adversarial check; all fixed and
   verified within the pass. Lows: most fixed, the rest KL-44, KL-54, KL-69 to
   KL-71. The loop continues.
+- **Pass 3 (follow-up: pass 2's diff, and job exports):** 1 high and 4 medium
+  from the reviewers (the high and one medium in pass 2's archive walk, which
+  was on its third correction and was redesigned), and 1 medium in the pass's
+  own fixes from its adversarial check; all fixed and verified. Lows: most
+  fixed, the rest KL-70 to KL-73. The loop continues to pass 4, the last the
+  budget allows.
 
 ---
 
@@ -495,3 +501,126 @@ deleted-completed job's status step (RUNBOOK §2.3) no longer says §2.0 brought
 the row back; the time-limit message. **Recorded:** a reused player-config name,
 clone lineage, and an old task definition's script (KL-69); an expired import's
 walk runs on (KL-70).
+
+---
+
+## Pass 3 — follow-up pass
+
+**Plan.** The diff since pass 1's commit (`7ca481e..b9b4ec5`; MAGPIE and infra
+unchanged), reviewed against every objective, one reviewer per part it touches:
+backend; frontend and the end-to-end spec; docs and procedures (RUNBOOK,
+README, PLAN, TESTING, `scripts/`). Plus one area not examined in recent passes:
+**job exports** — the build task and its time limit, the object-store uploads,
+the export rows' states and expiry, the download route, what a purge or delete
+does to an export in flight, and the admin UI for them.
+
+**Findings: 1 high, 4 medium** from the four reviewers (backend 1 high, 1
+medium, 3 low; frontend 1 medium outside the diff, 2 low; docs and procedures 1
+medium, 5 low; exports 1 medium, 6 low). All fixed and verified; the fixes'
+adversarial check is 3.6.
+
+### 3.1 High — GNU sparse extension blocks were expanded inside the tar reader, and a PAX `size` desynchronised the first pass (backend reviewer): the walk redesigned
+
+**Code updated.** Both came from the tar reader interpreting extensions inside
+its own `next()`, where no cap of the walk's reaches. A `GNUSparse` header with
+extension blocks made the reader build 64 bytes of bookkeeping per 24-byte slot
+before the walk could refuse the entry: reproduced, 1.1 GB peak from a 44 MB
+gzip, about 2 GiB from 78 MB (high). And a PAX `size` record ahead of an
+ordinary entry made pass 2's raw first pass and the interpreting walk disagree
+on where every later header starts, so a large PAX header slipped past the
+64 KiB refusal: reproduced, 508 MB peak, archive accepted (medium). This was
+the archive walk's **third correction** in the audit (2.1, 2.9, now), so it was
+redesigned rather than patched again: the walk reads the archive **raw**, in
+one pass, and reads extension headers itself — each bounded at 64 KiB, taking
+only a path or link target for the next entry — refusing a PAX `size` or sparse
+record and a sparse entry, none of which a release needs. Every entry's size is
+the header's own, which is what the raw reader follows, so nothing can
+desynchronise, and the first pass (a second full decompression) is gone.
+**Verified:** `U-ARCHIVE-8` (a PAX size refused, and one that cannot move the
+next header) and `U-ARCHIVE-11` (a sparse entry refused unexpanded, under
+16 MiB held) fail against the pass-2 walk ("no recognisable data files";
+85 MiB held) and pass; `U-ARCHIVE-12` (PAX `path` with `mtime`, GNU long
+names) passes on both. By hand: 51 release files (133 MB) from `~/MAGPIE/data`
+packed by GNU tar and, with a PAX header on every member, by Python's
+`tarfile`, both walk to the same 37 pinned files.
+
+### 3.2 Medium — a reader that stopped early left its corpus query running (exports reviewer)
+
+**Code updated.** sqlx drains a pool connection dropped mid-result before
+returning it, so each hung-up spot check of the results stream, and each export
+whose upload failed, left Postgres building the whole corpus on a connection
+neither cap counted: reproduced, ten spot checks held a ten-connection pool,
+`pool.acquire()` timed out at 30 s, and the scans ran on 90 s. PLAN's "at most
+two streams" did not hold. **Fix:** the stream's and the export's connection is
+acquired explicitly and closed on drop rather than drained. `I-EXPORT-9` failed
+before (a scan still running two seconds after the hang-up) and passes; the
+other export and stream tests pass.
+
+### 3.3 Medium — a purged job that completed again ended §2 completed, with a verdict from deleted results (docs and procedures reviewer)
+
+**Code updated.** A purge leaves an active job active; a small job or a
+force-complete can reach `completed` again before anyone notices, and then
+§2.0's deactivate and §2.5's activate are both refused and §2.3's status step
+does not apply: reproduced end to end with the RUNBOOK's own blocks.
+**Fix:** §2.0's transaction returns a job completed since the purge to
+`inactive` with its verdict cleared, and `restore-job.sh` refuses a `completed`
+job (a purge leaves a completed job inactive, so one completed now completed
+again). The block was run through psql on such a job; the check has the case.
+
+### 3.4 Medium — the site at phone width scrolled sideways, and E-10 could not see it (frontend reviewer, outside the diff)
+
+**Code updated.** The header's links ran to 533 px on a 393 px Pixel 5, "Sign
+in" and "Register" off screen, and a phone's browser widened its layout
+viewport to fit, so E-10's `scrollWidth <= innerWidth` always passed. TESTING
+guarantees E-10 "renders correctly at phone width". **Fix:** the header wraps
+(and the page padding is smaller on a phone); E-10 compares with the device's
+width. Checked with e2e's Playwright against a build of the pages, API mocked:
+the old layout 533 px (fails the new check), the new one 393 px with every
+header link wholly on screen. Tier 5 itself was not run (image builds).
+
+### 3.5 Low findings
+
+**Fixed:** the audit-row refusal also matches the row's action and job; RUNBOOK
+§2.2 says only the last purge or delete is checked; "two databases" (three now)
+in RUNBOOK §6 and the check's header; PLAN's "one transaction" description of
+the selective restore; the release's size (190 MB in five chunks, 1.3x, not
+94 MB and 3-4x) in `inputdata.rs`, PLAN and KL-44; the contributor
+instructions' "a directory of its own" (a `contribute.txt` of its own, most
+simply in a directory of its own).
+
+**Recorded:** KL-70 (an import timing out mid-commit), KL-71 (a chunked first
+claim's generic 413), KL-72 (exports: objects left by a delete, duplicate rows
+above redundancy 1, PITR and ready rows, a hidden older download, presigned
+link lifetime, delete markers and old rows), KL-73 (the instruction test's
+single phrasing).
+
+### 3.6 Adversarial check of the pass's fixes
+
+**Held:** the redesigned walk against GNU tar's gnu, oldgnu, posix, pax and
+ustar formats (a ustar prefix path, long names, a 120-character name, long link
+targets by `K` and PAX `linkpath`) and Python's gnu and pax archives — right
+names and digests; `..` and absolute paths, hard links and escaping links via
+PAX, sparse and `size` records, an over-long long name, truncated entries — all
+refused; `close_on_drop` discriminates (without it three scans ran on 15.7 s,
+with it none) and costs nothing that matters; the check script, the purge's own
+reset of a completed job, and E-10's assertion on the old and new header.
+
+**Medium, fixed — §2.0 left a since-completed job's export.** An export of the
+post-purge results (possible once the job completed again) survived §2.0, and
+once §2.3 completed the job again it would be served as the restored job's
+corpus, by the stream's redirect and the admin page — the reason a purge
+deletes exports. Reproduced with the block as written. **Fix:** §2.0 deletes the
+job's export rows, and the script refuses while any exist; both run (the block
+through psql, the refusal in the check).
+
+**Lows fixed:** a global PAX `path`, a second PAX header, and a long name beside
+a PAX path each named an entry differently from GNU tar — now refused (a
+comment-only global header, as `git archive` writes, still walks;
+`an_entry_given_two_names_is_refused`); a long username or the link column
+could still widen or squeeze the phone header (it truncates, and the links take
+their own row; E-10's check re-run on the build); the export held its
+connection through the tail upload; KLV generation's read had the same drain on
+an early exit (closed on drop too); POSIX-format extension headers counted
+toward the 5,000-entry cap (now only entries do; their bytes are counted).
+**Left:** E-10 was checked against a build with the API mocked, not run end to
+end (tier 5 builds images).

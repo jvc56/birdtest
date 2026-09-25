@@ -1653,6 +1653,11 @@ async fn generation_klv(
             .map_err(|e| AppError::internal(format!("could not write the rack equity csv: {e}")))?,
     );
 
+    // Closed rather than drained if this stops early (a write that fails): a
+    // pool connection dropped mid-result reads the rest of its 3.2 million rows
+    // first (see `exports::upload_rows`).
+    let mut conn = pool.acquire().await?;
+    conn.close_on_drop();
     let mut rows = sqlx::query(
         "SELECT rack, occurrence_count, equity_sum
          FROM leave_rack_progress
@@ -1661,7 +1666,7 @@ async fn generation_klv(
     )
     .bind(job_id)
     .bind(generation)
-    .fetch(pool);
+    .fetch(&mut *conn);
 
     let mut written: u64 = 0;
     while let Some(row) = rows.try_next().await? {

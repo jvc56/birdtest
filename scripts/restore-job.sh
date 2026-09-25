@@ -89,11 +89,18 @@ there=$(sql "$SCRATCH_URL" "$fingerprint") || { echo "stopped: cannot reach SCRA
 status=$(sql "$DATABASE_URL" "SELECT status FROM jobs WHERE id = '$job'") \
   || { echo "stopped: cannot read the job in production" >&2; exit 1; }
 [[ "$status" != active ]] || { echo "stopped: the job is active in production; deactivate it and clear it first (RUNBOOK §2.0)" >&2; exit 1; }
+# A purge leaves a completed job inactive, so one completed now has completed
+# again since, on the results §2.0 deletes: its status and verdict are theirs.
+[[ "$status" != completed ]] || { echo "stopped: the job has completed since the mistake; RUNBOOK §2.0 returns it to inactive with its verdict cleared" >&2; exit 1; }
+exports=$(sql "$DATABASE_URL" "SELECT count(*) FROM job_exports WHERE job_id = '$job'") \
+  || { echo "stopped: cannot read the job's exports in production" >&2; exit 1; }
+(( exports == 0 )) || { echo "stopped: production holds an export of the job made since the mistake, which would be served as the restored job's corpus; RUNBOOK §2.0 deletes it" >&2; exit 1; }
 mistake=$(sql "$DATABASE_URL" "SELECT max(id) FROM audit_log
                                 WHERE action IN ('job.purged', 'job.deleted') AND target_id = '$job'") \
   || { echo "stopped: cannot read production's audit log" >&2; exit 1; }
 if [[ -n "$mistake" ]]; then
-  after=$(sql "$SCRATCH_URL" "SELECT count(*) FROM audit_log WHERE id = $mistake") \
+  after=$(sql "$SCRATCH_URL" "SELECT count(*) FROM audit_log WHERE id = $mistake
+                               AND action IN ('job.purged', 'job.deleted') AND target_id = '$job'") \
     || { echo "stopped: cannot read the scratch copy's audit log" >&2; exit 1; }
   (( after == 0 )) || { echo "stopped: the scratch copy already holds job $job's purge or delete (audit row $mistake): it was taken after the mistake; use an earlier dump or point in time" >&2; exit 1; }
 else
