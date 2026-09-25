@@ -106,3 +106,44 @@ resource "aws_db_instance" "main" {
 
   tags = local.tags
 }
+
+# --- Database alarms -------------------------------------------------------
+# Storage autoscales only up to max_allocated_storage; past it every write
+# fails, the submissions and claims first. Nothing warned before that. Alarmed
+# at a fifth of the ceiling free, which at a claim's ~420 bytes with its
+# indexes is weeks of headroom, not hours.
+resource "aws_cloudwatch_metric_alarm" "db_storage_low" {
+  alarm_name          = "${local.name}-db-storage-low"
+  alarm_description   = "birdtest's database is within a fifth of its storage ceiling"
+  namespace           = "AWS/RDS"
+  metric_name         = "FreeStorageSpace"
+  dimensions          = { DBInstanceIdentifier = aws_db_instance.main.identifier }
+  statistic           = "Minimum"
+  period              = 300
+  evaluation_periods  = 3
+  threshold           = aws_db_instance.main.max_allocated_storage * 1073741824 / 5
+  comparison_operator = "LessThanThreshold"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  tags                = local.tags
+}
+
+# A burstable instance (the default db.t4g.micro) that spends its CPU credits
+# is throttled to its baseline -- a tenth of a vCPU -- and claims and
+# submissions slow with everything else. Only burstable classes report it.
+resource "aws_cloudwatch_metric_alarm" "db_cpu_credits_low" {
+  count               = startswith(var.db_instance_class, "db.t") ? 1 : 0
+  alarm_name          = "${local.name}-db-cpu-credits-low"
+  alarm_description   = "birdtest's database is running out of CPU credits"
+  namespace           = "AWS/RDS"
+  metric_name         = "CPUCreditBalance"
+  dimensions          = { DBInstanceIdentifier = aws_db_instance.main.identifier }
+  statistic           = "Minimum"
+  period              = 300
+  evaluation_periods  = 3
+  threshold           = 10
+  comparison_operator = "LessThanThreshold"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  tags                = local.tags
+}

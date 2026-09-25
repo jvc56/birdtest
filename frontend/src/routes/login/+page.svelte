@@ -16,8 +16,10 @@
       await api.login({ username, password });
       await refreshSession();
       // Come back to whatever the user was trying to reach before the guard
-      // redirected them here.
-      goto($page.url.searchParams.get('next') ?? '/account');
+      // redirected them here -- a path on this site only: `goto` refuses
+      // anything else, which left a signed-in user on this page, unmoved.
+      const next = $page.url.searchParams.get('next') ?? '';
+      await goto(next.startsWith('/') && !next.startsWith('//') ? next : '/account');
     } catch (e) {
       error = (e as Error).message;
     } finally {

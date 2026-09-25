@@ -1,4 +1,9 @@
 # syntax=docker/dockerfile:1.7
+
+# The commit this image's hashes are produced by, declared once for every
+# stage (each takes it with a bare `ARG MAGPIE_COMMIT`). CI reads it from this
+# line. MIN_MAGPIE_VERSION must never exceed the version this commit reports.
+ARG MAGPIE_COMMIT=8be92854b83bcfac98fbb3485c1b404645a4542c
 #
 # Backend and fake-worker.
 #
@@ -26,14 +31,12 @@
 
 FROM debian:bookworm-slim AS magpie-build
 
-# The commit this image's hashes are produced by. Passed as a build argument
-# and recorded on the image, so "which MAGPIE built this wordmap" is a `docker
-# inspect` rather than a guess. CI's magpie-contract and nightly jobs test the
-# head of `birdtest-contribute` rather than this commit, on purpose: they are
-# what notices a MAGPIE-side change before the pin is moved to it. Moving the
-# pin is a deliberate step, and MIN_MAGPIE_VERSION must never exceed the
-# version this commit reports.
-ARG MAGPIE_COMMIT=ac64d754591254f765f0b584e8698d9a9cf60bdb
+# Recorded on the image, so "which MAGPIE built this wordmap" is a `docker
+# inspect` rather than a guess. Pull requests' CI builds and tests this commit;
+# the nightly tests the head of `birdtest-contribute`, which is what notices a
+# MAGPIE-side change before the pin is moved to it. Moving the pin is a
+# deliberate step.
+ARG MAGPIE_COMMIT
 ARG MAGPIE_REPO=https://github.com/jvc56/MAGPIE.git
 
 RUN apt-get update \
@@ -108,7 +111,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=backend-build /usr/local/bin/birdtest /usr/local/bin/birdtest
 COPY --from=magpie-build /src/bin/magpie /usr/local/bin/magpie
-ARG MAGPIE_COMMIT=ac64d754591254f765f0b584e8698d9a9cf60bdb
+ARG MAGPIE_COMMIT
 LABEL org.birdtest.magpie-commit="$MAGPIE_COMMIT"
 # Still no data directory. MAGPIE is run against a throwaway directory built
 # per conversion from the bytes the job pins — the object store for lexica and

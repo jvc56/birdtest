@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 476 backend tests.
+--run-ignored all` runs 482 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -910,6 +910,14 @@ job creation touches needs one caller here.
 - `I-JOB-12` `delete_user` leaves their contributions attributed but anonymised,
   per the design, and does not cascade away results. *(Covered:
   `admin_api::a_user_with_history_can_be_deleted`.)*
+- `I-JOB-13` A job's `min_magpie_version` that is not `major.minor[.patch]` is
+  `400` (it was read as 0.0.0, the most permissive floor). *(Covered:
+  `jobs::a_malformed_magpie_floor_is_refused`, `version::tests::a_strict_parse_takes_only_a_whole_version`.)*
+  (Fifteenth audit.)
+- `I-JOB-14` A player config with more than 25 plies (MAGPIE's `MAX_PLIES`) or
+  more than 10 recorded plies (what a captured position keeps) is `400`.
+  *(Covered: `jobs::a_player_config_past_magpies_limits_is_refused`.)*
+  (Fifteenth audit.)
 
 ### `I-SUBMIT-*` — result submission (`jobs/mod.rs`, `jobs/*.rs`)
 
@@ -1079,6 +1087,12 @@ job creation touches needs one caller here.
   and merges; the same number staged by hand makes `merge_staged` fail, twice
   running. *(Covered:
   `leave_gen::a_count_no_game_could_produce_is_refused_before_it_can_wedge_the_merge`.)*
+- `I-LEAVE-18` **A missing generation-0 KLV heals.** A leave job whose zeroed
+  KLV was never written (its build failed after creation or a purge committed)
+  builds it on the next claim, one build at a time, and then dispatches.
+  *(Covered, tier 6 opt-in:
+  `magpie_leave::a_missing_generation_zero_klv_is_built_by_the_next_claim`.)*
+  (Fifteenth audit.)
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -1307,7 +1321,9 @@ runs against a real MinIO.
   `exports::a_purge_deletes_both_export_objects_and_the_row`.)*
 - `I-EXPORT-5` At startup an export still `running` is failed with a reason;
   ready and failed ones are left alone; and an export reaped while its task
-  still runs is not brought back `ready` when the task finishes. *(Covered:
+  still runs is not brought back `ready` when the task finishes, and removes
+  the objects it uploaded (fifteenth audit: they were left for the lifecycle
+  rule). *(Covered:
   `exports::startup_fails_exports_left_running_and_leaves_the_rest_alone`,
   `exports::an_export_reaped_while_it_ran_is_not_brought_back_ready`.)*
 - `I-EXPORT-6` Only a completed job can be exported, not until its last claims
@@ -1641,7 +1657,9 @@ below.
   (`admin_api::an_identity_can_be_banned_once_and_unbanning_lifts_it`;
   fourteenth audit).
 - `A-ADMIN-19` A purge or delete of a job whose purge or delete is already
-  running is `409`, and allowed once it has finished. *(Covered:
+  running is `409` (checked and held in one step: a double click got two), as
+  are activating, deactivating and completing it; all are allowed once it has
+  finished. *(Covered:
   `admin_api::a_second_purge_or_delete_is_refused_while_one_runs`.)* (Fourteenth
   audit.)
 
@@ -1727,9 +1745,11 @@ below.
   `account::deactivation_suspends_a_key_reactivation_restores_it_and_revocation_is_final`.)*
 - `A-ACCOUNT-5` One user cannot see or modify another's keys. *(Covered:
   `account::one_user_cannot_see_or_change_anothers_keys`.)*
-- `A-ACCOUNT-6` An account creates at most ten keys an hour; another account is
-  unaffected. *(Covered: `account::key_creation_is_rate_limited_per_account`.)*
-  (Fourteenth audit.)
+- `A-ACCOUNT-6` An account's key creation is a burst of a hundred (the cap), then
+  ten an hour: a hundred keys at once are allowed, a key made after revoking one
+  is `429`, and another account is unaffected. *(Covered:
+  `account::key_churn_is_rate_limited_per_account`.)* (Fourteenth audit; the
+  burst, fifteenth.)
 
 ### `A-BOUND-*` — boundaries (`backend/tests/boundaries.rs`)
 
@@ -2406,14 +2426,14 @@ GitHub Actions.
 3. **images** — the backend image (which builds the pinned MAGPIE too), a probe
    that the image's MAGPIE runs and reports its builders, the derived-file
    builder image, and the frontend image.
-4. **e2e** — tier 5: MAGPIE `birdtest-contribute` built `portable_release`
+4. **e2e** — tier 5: MAGPIE at the commit `docker/Dockerfile` pins, built `portable_release`
    inside `debian:bookworm-slim` (the backend image's glibc), Playwright's
    Chromium, then `e2e/run.sh`; the Playwright report and traces are uploaded
    on failure.
 5. **terraform** — `terraform fmt -check -recursive` and `terraform validate`
    (no AWS credentials).
-6. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE
-   `birdtest-contribute`, copy this branch's `contract-fixtures/` over its
+6. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
+   commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
    `test/birdtest_contract/`, and run `magpie_test contribute`; then
    `magpie_test builderhash` (the derived-file builders against their pinned
    hashes) and a check that the conversions the server invokes

@@ -881,6 +881,62 @@ async fn a_purge_writes_its_census_before_it_destroys_anything() {
     assert_eq!(remaining, (0, 0, 0), "and those rows are gone");
 }
 
+/// I-JOB-13: a job's MAGPIE floor that is not a version is refused. Read
+/// loosely it was 0.0.0 -- the lowest floor there is -- so a raise meant to
+/// keep older builds off the job let every build on.
+#[tokio::test]
+async fn a_malformed_magpie_floor_is_refused() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = admin.static_player("p1", kwg, klv, json!({})).await;
+    let p2 = admin.static_player("p2", kwg, klv, json!({})).await;
+    let job = |floor: &str| {
+        json!({
+            "job_type": "games", "redundancy": 1, "variant": "classic",
+            "letterdist_id": ld, "layout_id": layout, "min_magpie_version": floor,
+            "player1_config_id": p1, "player2_config_id": p2,
+            "min_games": 10, "max_games": 100,
+        })
+    };
+    for floor in ["v1.6.0", "1", "1,6"] {
+        let (status, body) = admin.create_job(job(floor)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{floor}: {body}");
+        assert_eq!(body["fields"][0]["field"], "min_magpie_version", "{floor}: {body}");
+    }
+    assert_eq!(job_count(&db).await, 0);
+    let (status, body) = admin.create_job(job("1.2")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// I-JOB-14: a player config MAGPIE would refuse, or cut short, is refused at
+/// creation: more than 25 plies failed every task of every job it was in, on
+/// every worker, and more than 10 recorded plies were cut to 10 silently.
+#[tokio::test]
+async fn a_player_config_past_magpies_limits_is_refused() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+    let body = |plies: i32, recorded: i32| {
+        json!({
+            "name": format!("p{plies}-{recorded}"), "recorder_type": "best", "kwg_id": kwg,
+            "klv_id": klv, "winpct_id": winpct, "num_plies": plies, "num_plays": 10,
+            "max_iterations": 100, "time_limit_secs": 0, "num_plays_recorded": 1,
+            "num_plies_recorded": recorded,
+        })
+    };
+    for (plies, recorded, field) in [(26, 2, "num_plies"), (5, 11, "num_plies_recorded")] {
+        let (status, response) = admin.post("/api/admin/player-configs", body(plies, recorded)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["fields"][0]["field"], field, "{response}");
+    }
+    admin.player(body(25, 10)).await;
+}
+
 /// I-JOB-11: a player config referenced by a job of any type -- either seat of
 /// a games or game-pairs job, or an opening-rack job's player -- cannot be
 /// deleted, and stays; one nothing references can, and one freed by deleting

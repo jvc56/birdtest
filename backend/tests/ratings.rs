@@ -130,6 +130,14 @@ async fn game_result(db: &TestDb, job: Uuid, tally: (i32, i32, i32), pent: Optio
     .execute(&db.pool)
     .await
     .unwrap();
+    // As the submission that stores a first result does: the sweep reads this
+    // running total to decide whether a pool's evidence moved.
+    sqlx::query("UPDATE jobs SET games_completed = games_completed + $2 WHERE id = $1")
+        .bind(job)
+        .bind(i64::from(wins + losses + ties))
+        .execute(&db.pool)
+        .await
+        .unwrap();
 }
 
 /// A pool over `scope` and `variant` whose members are `anchor` and `others`.

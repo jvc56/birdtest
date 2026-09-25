@@ -76,22 +76,78 @@ async fn artifact(
 
     // Only keys the server itself minted are reachable; an arbitrary key would
     // turn this into a read primitive for the whole bucket.
-    let known = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM leave_generation_artifacts WHERE artifact_key = $1)",
+    let served = sqlx::query_scalar::<_, String>(
+        "SELECT COALESCE(served_sha256, sha256) FROM leave_generation_artifacts
+         WHERE artifact_key = $1",
     )
     .bind(&query.key)
-    .fetch_one(&state.pool)
-    .await?;
-    if !known {
-        return Err(AppError::not_found("no such artifact"));
-    }
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such artifact"))?;
 
-    let body = state.artifacts.get(&query.key).await?;
+    let body = recent_artifacts::get(&state, &query.key, &served).await?;
     Ok((
         [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
         body,
     )
         .into_response())
+}
+
+/// The last few KLVs served, kept in memory.
+///
+/// Every leave worker fetches the new KLV within one idle interval of a
+/// generation opening, and each fetch was an S3 GET buffered whole (a few
+/// megabytes) and held until it had gone out over the contributor's link: a
+/// few hundred workers were a gigabyte or more at once on a 2 GB task. Now the
+/// first fetch reads it and the rest share one copy. Keyed by the hash
+/// workers are being sent as well as the key, so a rebuild that changes what
+/// is served is never answered from here, and only bytes that hash to it are
+/// kept; misses are fetched one at a time, so a generation's opening is one
+/// S3 GET, not one per worker.
+mod recent_artifacts {
+    use crate::error::AppResult;
+    use crate::state::AppState;
+    use axum::body::Bytes;
+
+    const KEPT: usize = 8;
+
+    type Entry = (String, String, Bytes);
+    static ENTRIES: std::sync::Mutex<Vec<Entry>> = std::sync::Mutex::new(Vec::new());
+    static FETCHING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn cached(key: &str, served: &str) -> Option<Bytes> {
+        ENTRIES
+            .lock()
+            .expect("artifact cache poisoned")
+            .iter()
+            .find(|(k, s, _)| k == key && s == served)
+            .map(|(_, _, bytes)| bytes.clone())
+    }
+
+    pub(super) async fn get(state: &AppState, key: &str, served: &str) -> AppResult<Bytes> {
+        if let Some(bytes) = cached(key, served) {
+            return Ok(bytes);
+        }
+        let _turn = FETCHING.lock().await;
+        if let Some(bytes) = cached(key, served) {
+            return Ok(bytes);
+        }
+        let bytes = state.artifacts.get_bytes(key).await?;
+        // Only bytes that are what workers are told to expect. An object that
+        // is not (RUNBOOK §3) is refused by every worker; kept here, it would
+        // go on being served after an admin had put the right one back.
+        use sha2::Digest;
+        if hex::encode(sha2::Sha256::digest(&bytes)) != served {
+            return Ok(bytes);
+        }
+        let mut entries = ENTRIES.lock().expect("artifact cache poisoned");
+        entries.retain(|(k, _, _)| k != key);
+        if entries.len() >= KEPT {
+            entries.remove(0);
+        }
+        entries.push((key.to_string(), served.to_string(), bytes.clone()));
+        Ok(bytes)
+    }
 }
 
 /// What the worker says about itself. Required, not optional: the version
@@ -319,17 +375,25 @@ async fn decline_task(
 
     scheduler::release_claim(&mut tx, claim_id, "declined").await?;
 
-    for file in body.missing.iter().take(MAX_MISSING_FILES) {
+    // One statement for all of them: this runs with the claim and its task
+    // locked, and a round trip per file was up to thirty-two.
+    let missing: Vec<_> = body.missing.iter().take(MAX_MISSING_FILES).collect();
+    if !missing.is_empty() {
+        let column = |f: fn(&MissingFile) -> Option<String>| -> Vec<Option<String>> {
+            missing.iter().map(|file| f(file)).collect()
+        };
         sqlx::query(
             "INSERT INTO worker_data_gaps (job_id, claim_id, role, name, expected, actual)
-             VALUES ($1, $2, $3, $4, $5, $6)",
+             SELECT $1, $2, role, name, expected, actual
+             FROM UNNEST($3::text[], $4::text[], $5::text[], $6::text[])
+                  AS f(role, name, expected, actual)",
         )
         .bind(job_id)
         .bind(claim_id)
-        .bind(bounded(&file.role))
-        .bind(bounded(&file.name))
-        .bind(bounded(&file.expected))
-        .bind(file.actual.as_deref().map(bounded))
+        .bind(column(|f| Some(bounded(&f.role))))
+        .bind(column(|f| Some(bounded(&f.name))))
+        .bind(column(|f| Some(bounded(&f.expected))))
+        .bind(column(|f| f.actual.as_deref().map(bounded)))
         .execute(&mut *tx)
         .await?;
     }
@@ -483,6 +547,37 @@ async fn submit_result(
     refuse_if_claims_held(&state, body.claim_token).await?;
     // Held until the handler returns, after the commit.
     let turn = crate::jobs::registry::large_result_turn(body.result.get().len()).await?;
+
+    // Decoded before the transaction, with nothing locked and no connection
+    // held: see `registry::decode_result`. The claim's job is read without a
+    // lock for it -- a task never changes job -- and the claim itself is
+    // locked and checked below as before, so a stale claim still ends as
+    // `accepted: false`, having cost only the decode.
+    let Some(job) = sqlx::query_as::<_, Job>(
+        "SELECT j.* FROM task_claims c
+         JOIN tasks t ON t.id = c.task_id
+         JOIN jobs j ON j.id = t.job_id
+         WHERE c.claim_token = $1 AND c.state = 'claimed'
+           AND c.claimed_by_user_id IS NOT DISTINCT FROM $2
+           AND c.claimed_by_anon_uuid IS NOT DISTINCT FROM $3",
+    )
+    .bind(body.claim_token)
+    .bind(identity.user_id())
+    .bind(identity.anon_uuid())
+    .fetch_optional(&state.pool)
+    .await?
+    else {
+        tracing::debug!(claim_token = %body.claim_token, "ignoring result for stale claim");
+        return Ok(Json(ResultAck { accepted: false }));
+    };
+    // The job's immutable half: its batch size, its players' reporting caps,
+    // its rack space. Read once per process.
+    let template = {
+        let mut conn = state.pool.acquire().await?;
+        state.templates.get_or_load(&mut conn, &job).await?
+    };
+    let decoded = crate::jobs::registry::decode_result(&template, body.result).await?;
+
     let mut tx = state.pool.begin().await?;
 
     // The claim is looked up and locked inside the transaction that completes
@@ -548,15 +643,9 @@ async fn submit_result(
             .fetch_one(&mut *tx)
             .await?;
 
-    let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
-        .bind(job_id)
-        .fetch_one(&mut *tx)
-        .await?;
-
-    // The job's immutable half: its batch size, its players' reporting caps,
-    // its rack space. Read once per process; a hit costs no round trip inside
-    // the locks held here.
-    let template = state.templates.get_or_load(&mut tx, &job).await?;
+    if job_id != job.id {
+        return Err(AppError::internal("a claim's task changed job"));
+    }
 
     let progress = crate::jobs::registry::store_result(
         &mut tx,
@@ -564,7 +653,7 @@ async fn submit_result(
         task_id,
         claim_id,
         prior_accepted == 0,
-        body.result,
+        decoded,
     )
     .await?;
 
@@ -674,10 +763,10 @@ async fn submit_result(
     // landed, so a failure here is logged and the next submission's check
     // picks the job up.
     //
-    // `job` is the row read inside the transaction above, before this result
-    // was stored and before the finish check reads any result -- which is the
-    // order `complete_unless_purged`'s witness needs -- so it is reused rather
-    // than read again on the path the worker waits on.
+    // `job` is the row read before the transaction above, so before this
+    // result was stored and before the finish check reads any result --
+    // which is the order `complete_unless_purged`'s witness needs -- and it
+    // is reused rather than read again on the path the worker waits on.
     if let Err(err) = after_submission(&state, &job).await {
         tracing::error!(job_id = %job_id, error = %err.message, "post-submission bookkeeping failed");
     }
@@ -750,12 +839,12 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // On the display pool: this is a dashboard payload, and must not take
         // a connection from the pool the submission that asked for it used.
         match jobstats::load_job(&state.read_pool, job_id).await {
-            Ok(job) => match jobstats::compute(&state.read_pool, &job).await {
-                Ok(stats) => {
-                    if let Ok(payload) = serde_json::to_string(&stats) {
-                        state.sse.publish(job_id, payload);
-                    }
-                }
+            // Built fresh -- this is what submissions asked for -- and kept,
+            // so the page and new subscribers read it rather than build it.
+            Ok(job) => match jobstats::refresh_payload(&state.read_pool, &job, state.cfg.stats_cache)
+                .await
+            {
+                Ok(payload) => state.sse.publish(job_id, payload.to_string()),
                 Err(err) => tracing::warn!(
                     job_id = %job_id, error = %err.message, "building live job stats failed"
                 ),
@@ -773,13 +862,13 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // another, for as long as a dashboard stayed open, on a pool of twenty
         // connections the claim and submit paths share. Submissions arriving
         // during the pause still coalesce into the one round that follows it.
-        tokio::time::sleep(MIN_STATS_PUSH_INTERVAL).await;
+        tokio::time::sleep(MIN_STATS_PUSH_INTERVAL.max(state.cfg.stats_cache)).await;
     }
 }
 
-/// The shortest gap between two live stats pushes for one job. The dashboard
-/// lags a busy job by at most this much, which a human watching it cannot tell
-/// from live.
+/// The shortest gap between two live stats pushes for one job, when
+/// `Config::stats_cache` is shorter still. The dashboard lags a busy job by
+/// the longer of the two.
 const MIN_STATS_PUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether this submission is the one that evaluates the job's finish

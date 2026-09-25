@@ -18,6 +18,7 @@
 #     TESTING.md, "Reading confirmation codes");
 #   * GitHub is a static-file server holding the fixture tarballs
 #     (fixtures/build.sh), so an import runs offline and on known bytes;
+#   * job stats are cached for a second, not ten (JOB_STATS_CACHE_SECONDS);
 #   * the fake worker supplies results. Test tooling only -- see
 #     worker/fake_worker.py -- and never pointed at anything but this stack.
 
@@ -57,6 +58,9 @@ services:
       # Must match fixtures/build.sh's REPO. Not a real repository, on purpose.
       MAGPIE_DATA_REPO: birdtest/fixtures
       MIN_MAGPIE_VERSION: 0.1.1
+      # A journey watches a job's page move as the fake worker submits; at
+      # the production default a push is up to ten seconds behind.
+      JOB_STATS_CACHE_SECONDS: 1
       RUST_LOG: birdtest=info,tower_http=warn
     volumes:
       # Written by the backend's uid 10001, so e2e/run.sh makes it world-

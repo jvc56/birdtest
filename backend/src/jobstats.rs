@@ -147,6 +147,9 @@ pub struct OpeningRackStats {
 pub struct LeaveGenStats {
     pub current_generation: i32,
     pub generation_count: i32,
+    /// Generations whose KLV is built. `current_generation` stops at the last
+    /// generation, so it cannot say a finished job's last one closed.
+    pub generations_closed: i32,
     pub target_rack_count: i32,
     /// Accepted tasks of the in-progress generation, and the games they played.
     pub tasks_completed: i64,
@@ -188,6 +191,63 @@ pub async fn load_job(pool: &PgPool, job_id: Uuid) -> AppResult<Job> {
 /// made on evidence rather than guessed. This log line is that evidence: when
 /// it starts appearing for real jobs, the refresh is worth building.
 const SLOW_STATS_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The job's stats as JSON, no older than `max_age`: from the last build
+/// when it is recent enough, built (and kept) otherwise. See
+/// `Config::stats_cache`.
+pub async fn payload(
+    pool: &PgPool,
+    job: &Job,
+    max_age: std::time::Duration,
+) -> AppResult<std::sync::Arc<str>> {
+    if let Some(cached) = cached_payload(job.id, max_age) {
+        return Ok(cached);
+    }
+    // Misses are built one at a time: when a popular job's payload expires,
+    // every viewer asking at once would otherwise build it at once.
+    let _turn = BUILDING.lock().await;
+    if let Some(cached) = cached_payload(job.id, max_age) {
+        return Ok(cached);
+    }
+    refresh_payload(pool, job, max_age).await
+}
+
+/// Builds the job's stats as JSON and keeps them for [`payload`].
+pub async fn refresh_payload(
+    pool: &PgPool,
+    job: &Job,
+    max_age: std::time::Duration,
+) -> AppResult<std::sync::Arc<str>> {
+    let stats = compute(pool, job).await?;
+    let json: std::sync::Arc<str> = serde_json::to_string(&stats)
+        .map_err(|e| crate::error::AppError::internal(format!("serializing job stats failed: {e}")))?
+        .into();
+    if !max_age.is_zero() {
+        let now = std::time::Instant::now();
+        let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
+        payloads.retain(|_, (built, _)| now.duration_since(*built) < max_age);
+        payloads.insert(job.id, (now, json.clone()));
+    }
+    Ok(json)
+}
+
+type CachedPayloads =
+    std::collections::HashMap<Uuid, (std::time::Instant, std::sync::Arc<str>)>;
+static PAYLOADS: std::sync::LazyLock<std::sync::Mutex<CachedPayloads>> =
+    std::sync::LazyLock::new(Default::default);
+static BUILDING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn cached_payload(job_id: Uuid, max_age: std::time::Duration) -> Option<std::sync::Arc<str>> {
+    if max_age.is_zero() {
+        return None;
+    }
+    PAYLOADS
+        .lock()
+        .expect("stats cache poisoned")
+        .get(&job_id)
+        .filter(|(built, _)| built.elapsed() < max_age)
+        .map(|(_, json)| json.clone())
+}
 
 pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
     let started = std::time::Instant::now();
@@ -532,7 +592,8 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
     .bind(job_id)
     .fetch_one(pool)
     .await?;
-    let current_generation = (completed as i32 + 1).min(config.generation_count);
+    let generations_closed = completed as i32;
+    let current_generation = (generations_closed + 1).min(config.generation_count);
 
     // One row, kept by the submit path (the live counters) and by each merge
     // (the rack summary). Absent until the generation's universe is seeded.
@@ -550,6 +611,7 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
         current_generation,
         generation_count: config.generation_count,
         target_rack_count: config.target_rack_count,
+        generations_closed,
         tasks_completed: row.as_ref().map_or(0, |r| r.get("tasks_completed")),
         games_played: row.as_ref().map_or(0, |r| r.get("games_played")),
         racks_at_target: row.as_ref().map_or(0, |r| r.get("racks_at_target")),
@@ -677,21 +739,30 @@ async fn estimate_eta(
         return Ok(Some(remaining_racks / racks_per_second));
     }
 
-    let remaining = match games {
-        Some(stats) => {
-            let done = stats.units_completed as f64;
-            let target = stats.max_units as f64;
-            if done >= target {
-                return Ok(Some(0.0));
-            }
-            // Convert remaining units into remaining tasks using the observed
-            // units-per-completed-task ratio.
-            let completed_tasks = tasks_completed.max(1) as f64;
-            let units_per_task = (done / completed_tasks).max(1.0);
-            (target - done) / units_per_task
+    if let Some(stats) = games {
+        let done = stats.units_completed as f64;
+        let target = stats.max_units as f64;
+        if done >= target {
+            return Ok(Some(0.0));
         }
-        None => (tasks_total - tasks_completed).max(0) as f64,
-    };
+        // Units per claim from the job's batch size, over the redundancy: a
+        // claim is one copy of a task, and a task's units count once. (From
+        // the observed units per completed task it was neither -- `done`
+        // counts a task's first result, `tasks_completed` only tasks with all
+        // of theirs -- and at redundancy 2 the page read half the time left.)
+        let per_batch: i32 = if job.job_type == crate::models::job::JobType::GamePairs {
+            sqlx::query_scalar("SELECT pairs_per_batch FROM job_game_pair_config WHERE job_id = $1")
+        } else {
+            sqlx::query_scalar("SELECT games_per_batch FROM job_game_config WHERE job_id = $1")
+        }
+        .bind(job.id)
+        .fetch_one(pool)
+        .await?;
+        let units_per_second =
+            per_second * f64::from(per_batch.max(1)) / f64::from(job.redundancy.max(1));
+        return Ok(Some((target - done) / units_per_second));
+    }
 
+    let remaining = (tasks_total - tasks_completed).max(0) as f64;
     Ok(Some(remaining / per_second))
 }

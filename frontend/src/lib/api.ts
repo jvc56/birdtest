@@ -180,6 +180,8 @@ export interface JobStats {
   };
   leave_generation?: {
     current_generation: number;
+    /** Generations whose KLV is built; `current_generation` stops at the last one. */
+    generations_closed: number;
     generation_count: number;
     target_rack_count: number;
     /** Live: accepted tasks of the in-progress generation, and the games they played. */
@@ -394,8 +396,16 @@ export interface ArtifactRebuild {
   matches: boolean;
   object_present: boolean;
   rewritten: boolean;
-  /** The hash workers are sent and verify against: that of the object as it now is. */
+  /** The hash workers are sent and verify against. */
   served_sha256: string;
+  /** The object's hash as the check found it; null when it was missing. */
+  object_sha256: string | null;
+  /**
+   * Whether the object held the first build, this rebuild, or what was being
+   * served. When not, and it was not rewritten, workers refuse it until an
+   * admin restores the right version or forces a rebuild.
+   */
+  object_accounted_for: boolean;
 }
 
 export interface ApiKey {

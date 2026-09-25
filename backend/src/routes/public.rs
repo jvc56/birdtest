@@ -1,5 +1,5 @@
 use crate::error::{AppError, AppResult};
-use crate::jobstats::{self, JobStats};
+use crate::jobstats;
 use crate::models::job::{Job, JobType};
 use crate::state::AppState;
 use axum::extract::{Path, Query, State};
@@ -164,9 +164,19 @@ async fn load_job(state: &AppState, id: Uuid) -> AppResult<Job> {
         .ok_or_else(|| AppError::not_found("no such job"))
 }
 
-async fn job_detail(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<JobStats>> {
+/// A `JobStats`, as JSON; see `Config::stats_cache` for how fresh.
+async fn job_detail(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     let job = load_job(&state, id).await?;
-    Ok(Json(jobstats::compute(&state.read_pool, &job).await?))
+    let payload = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache).await?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        payload.to_string(),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -461,7 +471,9 @@ struct WorkerFilter {
 async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<WorkerFilter>> {
     // Deleted accounts included: the contribution table still lists their
     // results, under the tombstone name, and that name filters like any other.
-    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE username = $1")
+    // Through the case-insensitive unique index, the only one on the name:
+    // names are unique whatever their case, so this is still one account.
+    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE lower(username) = lower($1)")
     .bind(name)
     .fetch_optional(&state.read_pool)
     .await?;
@@ -597,8 +609,9 @@ async fn job_stream(
     Path(id): Path<Uuid>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let job = load_job(&state, id).await?;
-    let initial = jobstats::compute(&state.read_pool, &job).await?;
-    let initial = serde_json::to_string(&initial).unwrap_or_else(|_| "{}".into());
+    let initial = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache)
+        .await?
+        .to_string();
 
     let receiver = state.sse.subscribe(id);
     let updates = tokio_stream::wrappers::BroadcastStream::new(receiver)

@@ -2,7 +2,9 @@
 
 CREATE TABLE users (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    username             TEXT NOT NULL UNIQUE,
+    -- Unique whatever its case: users_username_lower_idx, below, which a
+    -- plain UNIQUE here only duplicated (an index write per user update).
+    username             TEXT NOT NULL,
     email                TEXT NOT NULL UNIQUE,
     password_hash        TEXT NOT NULL,
     email_confirmed_at   TIMESTAMPTZ,
@@ -792,12 +794,18 @@ WITH (fillfactor = 85);
 -- task. 'declined' must be excluded alongside 'abandoned': a worker that
 -- declined a task for missing data and then fixed its data has to be able to
 -- claim that task again.
+--
+-- Each covers only its own kind of identity: a claim has exactly one, and a
+-- NULL key constrains nothing, so indexing the other kind's claims under NULL
+-- was dead weight -- nearly half of each index, and an index write per claim
+-- insert and per completion that nothing read. A lookup by `= $n` implies the
+-- `IS NOT NULL`, so every reader still uses them.
 CREATE UNIQUE INDEX task_claims_user_unique_idx
     ON task_claims (task_id, claimed_by_user_id)
-    WHERE state NOT IN ('abandoned', 'declined');
+    WHERE state NOT IN ('abandoned', 'declined') AND claimed_by_user_id IS NOT NULL;
 CREATE UNIQUE INDEX task_claims_anon_unique_idx
     ON task_claims (task_id, claimed_by_anon_uuid)
-    WHERE state NOT IN ('abandoned', 'declined');
+    WHERE state NOT IN ('abandoned', 'declined') AND claimed_by_anon_uuid IS NOT NULL;
 
 -- What a worker said it was missing when it declined. The server records gaps
 -- for humans; it does not route on them (the client sends its own unsupported
@@ -1252,14 +1260,14 @@ CREATE TABLE leave_generation_artifacts (
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    -- SHA-256 of the bytes the object store holds *now*, when a rebuild has
-    -- rewritten the object with different ones (`rebuild_artifacts`); NULL
-    -- while it still holds the bytes first written. Workers are sent this
-    -- (or `sha256` when it is NULL) and refuse bytes that do not match, so it
-    -- has to follow the object: a rebuild under a changed builder wrote new
-    -- bytes, the row kept the old hash, and every task of the next generation
-    -- failed its check on every worker. `sha256` stays the first hash, as the
-    -- evidence it is.
+    -- SHA-256 of the bytes the object store holds *now*, when they are not
+    -- the bytes first written; NULL while they are. Set by every
+    -- `rebuild_artifacts` check from the object it wrote, or found and could
+    -- account for. Workers are sent this (or `sha256` when it is NULL) and
+    -- refuse bytes that do not match, so it has to follow the object: a
+    -- rebuild under a changed builder wrote new bytes, the row kept the old
+    -- hash, and every task of the next generation failed its check on every
+    -- worker. `sha256` stays the first hash, as the evidence it is.
     served_sha256 TEXT CHECK (served_sha256 ~ '^[0-9a-f]{64}$'),
     -- The MAGPIE KLV builder that wrote these bytes ('klv-1').
     --
@@ -1380,7 +1388,13 @@ CREATE TABLE rating_runs (
     -- How much evidence went in, so a run can be compared to its predecessor
     -- without re-reading game_results.
     pairs_used    BIGINT NOT NULL,
-    jobs_used     INT NOT NULL
+    jobs_used     INT NOT NULL,
+    -- The pool's eligible jobs' `games_completed`, summed, as of the fit: what
+    -- the sweep compares before deciding to build the evidence matrix at all.
+    -- Building it to find nothing had changed was the sweep's whole cost, for
+    -- every pool every two minutes. NULL on a run that did not record it,
+    -- which the next sweep refits.
+    evidence_games BIGINT
 );
 
 CREATE INDEX rating_runs_pool_idx ON rating_runs (pool_id, computed_at DESC);
@@ -1496,8 +1510,11 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 -- recent completions instead, whatever the job's age.
 CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
-CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
-CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
+-- Partial for the reason the unique indexes above are.
+CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id)
+    WHERE claimed_by_user_id IS NOT NULL;
+CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid)
+    WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
 -- detail page's counts, which sum `accepted_count` and so read the heap
 -- anyway; the census; the opening-rack finish check, which needs `seed` --

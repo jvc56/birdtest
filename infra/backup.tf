@@ -6,9 +6,8 @@
 # --- Encryption key --------------------------------------------------------
 # A dump contains argon2 password hashes, email addresses, API key hashes and
 # unexpired reset tokens, so it is encrypted with a customer-managed key rather
-# than the S3 default. The key policy is where the asymmetry lives: the task
-# that writes backups may encrypt but never decrypt, so a compromised backup
-# task can create a backup and cannot read one.
+# than the S3 default. The asymmetry lives in the key policy and the task's
+# IAM: the task that writes backups can create one and cannot read one.
 
 resource "aws_kms_key" "backups" {
   description             = "${local.name} logical database backups"
@@ -35,14 +34,40 @@ data "aws_iam_policy_document" "backups_key" {
     }
   }
 
-  # Write-only. Note the absence of kms:Decrypt.
   statement {
-    sid       = "BackupTaskEncryptOnly"
+    sid       = "BackupTaskEncrypt"
     actions   = ["kms:Encrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]
     resources = ["*"]
     principals {
       type        = "AWS"
       identifiers = [aws_iam_role.backup_task.arn]
+    }
+  }
+
+  # A multipart upload under SSE-KMS needs kms:Decrypt: S3 decrypts the data
+  # key to complete it, on the caller's behalf. `aws s3 cp` goes multipart
+  # past 8 MB, and a directory-format dump has a file per table, so without
+  # this every nightly upload of a real database was refused. Only through S3,
+  # and only for this bucket (with a bucket key the context is the bucket's
+  # ARN): the task cannot decrypt anything itself, and it holds no
+  # s3:GetObject, so the backups stay unreadable to it.
+  statement {
+    sid       = "BackupTaskMultipartViaS3"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.backup_task.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["s3.${var.region}.amazonaws.com"]
+    }
+    condition {
+      test     = "StringLike"
+      variable = "kms:EncryptionContext:aws:s3:arn"
+      values   = ["${aws_s3_bucket.backups.arn}*"]
     }
   }
 

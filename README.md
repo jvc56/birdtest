@@ -277,7 +277,18 @@ certificate and addresses) and pass `-var-file=prod.tfvars` to every `apply`,
 without it evaluates the configuration in the default region, prompting for
 eight variables. Two values must be set out of band right after the first
 `terraform apply` — Terraform manages
-the parameter *names* but never their values.
+the parameter *names* but never their values — so make the first apply with
+`-var desired_count=0`, set them as below, and apply again with the service at
+one task: started against the placeholders, the service crash-loops. (The
+scheduled derived-data builder, every five minutes, fails the same way until
+they are set; so would a 03:00 backup, alarming. Set them straight away.)
+
+**Terraform's state is local** — `infra/terraform.tfstate`, ignored by git, on
+the machine that applied. RUNBOOK.md's recovery steps and both ops scripts read
+it (`terraform output`), so keep it somewhere that survives that machine and
+the stack's region: copy it off after every apply, or configure a remote
+backend (an S3 bucket in another region, versioned, with locking) before the
+first one. The repository does not choose one for you.
 
 The database master password is set by hand, not managed by RDS (RDS rotation
 would break the fixed `DATABASE_URL`). Terraform creates the instance with a
@@ -330,7 +341,8 @@ from GitHub, so that commit must be pushed to `birdtest-contribute` first.
 **SES starts in the sandbox.** A new account's SES sends only to verified
 addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
 is granted every registration and password reset to anyone else fails. Request
-it, and add the `ses_dkim_tokens` output as CNAME records, before opening
+it, and add the `ses_dkim_tokens` output as CNAME records and the
+`ses_mail_from_records` output's MX and TXT records, before opening
 registration.
 
 **The database is reachable only from inside the VPC** — no public address, no

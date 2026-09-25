@@ -103,7 +103,7 @@
         />
       {:else if stats.leave_generation}
         <ProgressBar
-          value={Math.max(stats.leave_generation.current_generation - 1, 0)}
+          value={stats.leave_generation.generations_closed}
           max={stats.leave_generation.generation_count}
           label="generations closed"
         />

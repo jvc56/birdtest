@@ -23,6 +23,12 @@ pub struct Config {
     pub mail_from: String,
     pub public_url: String,
     pub heartbeat_timeout: Duration,
+    /// How old a job's stats payload may be when served: the job page, the
+    /// stream's first event, and the spacing of live pushes. The payload
+    /// reads the job's whole history (its contributors, its game results),
+    /// which grows without bound; rebuilt on every view and every second a
+    /// busy job was watched, it cost a second of database time per second.
+    pub stats_cache: Duration,
     pub s3_bucket: String,
     pub s3_endpoint: Option<String>,
     /// The oldest MAGPIE that may contribute at all. Enforced, not advisory:
@@ -205,6 +211,7 @@ impl Config {
             mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
             public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
             heartbeat_timeout: Duration::from_secs(parsed_u64("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
+            stats_cache: Duration::from_secs(parsed_u64("JOB_STATS_CACHE_SECONDS", 10)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
             // 0.1.1 is the `birdtest-contribute` version the backend image
@@ -275,6 +282,7 @@ mod tests {
             ("HEARTBEAT_TIMEOUT_SECONDS", "300", "70", |c| {
                 c.heartbeat_timeout.as_secs().to_string()
             }),
+            ("JOB_STATS_CACHE_SECONDS", "10", "0", |c| c.stats_cache.as_secs().to_string()),
             ("S3_BUCKET", "birdtest-artifacts", "other", |c| c.s3_bucket.clone()),
             ("S3_ENDPOINT", "None", "http://minio:9000", |c| {
                 c.s3_endpoint.clone().unwrap_or_else(|| "None".into())

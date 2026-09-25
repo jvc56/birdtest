@@ -236,30 +236,71 @@ pg_restore -d "$SCRATCH_URL" -j4 --no-owner --no-privileges --exit-on-error /tmp
 
 ### 2.2 Copy the rows back, in dependency order
 
-Dump only the job's rows from the scratch copy and load them into production
-(`$DATABASE_URL`, in the same shell). `ON CONFLICT DO NOTHING` throughout, so a
-partial re-run is safe — which is all it is for, after §2.0:
+Dump only the job's rows from the scratch copy, a file per table, and load them
+into production (`$DATABASE_URL`, in the same shell) in dependency order. Each
+file is loaded into a temporary table and inserted from there with `ON CONFLICT
+DO NOTHING`, so a partial re-run is safe — which is all it is for, after §2.0.
+(`COPY` itself has no `ON CONFLICT`: loaded straight in, a re-run stopped at the
+first row already there.)
 
 ```bash
 JOB=00000000-0000-0000-0000-000000000000
+TASKS="SELECT id FROM tasks WHERE job_id = '$JOB'"
+RECORDS="SELECT id FROM position_analysis_records WHERE job_id = '$JOB'"
+MOVES="SELECT id FROM position_analysis_moves WHERE record_id IN ($RECORDS)"
+mkdir -p /tmp/restore
 
-psql "$SCRATCH_URL" -v job="$JOB" -At <<'SQL' > /tmp/restore.sql
-\set ON_ERROR_STOP on
--- Order matters: tasks, then claims, then everything hanging off a claim.
-COPY (SELECT * FROM tasks WHERE job_id = :'job') TO STDOUT;
+# Order matters: tasks, then what hangs off a task, then claims, then what
+# hangs off a claim.
+TABLES=(
+  "tasks|job_id = '$JOB'"
+  "opening_rack_requests|task_id IN ($TASKS)"
+  "game_requests|task_id IN ($TASKS)"
+  "leave_requests|task_id IN ($TASKS)"
+  "task_claims|task_id IN ($TASKS)"
+  "worker_data_gaps|job_id = '$JOB'"
+  "game_results|job_id = '$JOB'"
+  "leave_records|task_id IN ($TASKS)"
+  "position_analysis_records|job_id = '$JOB'"
+  "position_analysis_moves|record_id IN ($RECORDS)"
+  "position_analysis_plies|move_id IN ($MOVES)"
+  "leave_rack_progress|job_id = '$JOB'"
+  "leave_rack_staging|job_id = '$JOB'"
+  "leave_generation_progress|job_id = '$JOB'"
+  "leave_selection_cursors|job_id = '$JOB'"
+  "leave_generation_artifacts|job_id = '$JOB'"
+  "leave_generation_transitions|job_id = '$JOB'"
+)
+
+for entry in "${TABLES[@]}"; do
+  table=${entry%%|*} filter=${entry#*|}
+  psql "$SCRATCH_URL" -v ON_ERROR_STOP=1 -c \
+    "COPY (SELECT * FROM $table WHERE $filter) TO STDOUT" > "/tmp/restore/$table"
+done
+
+for entry in "${TABLES[@]}"; do
+  table=${entry%%|*}
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<SQL
+BEGIN;
+CREATE TEMP TABLE restoring (LIKE $table) ON COMMIT DROP;
+\copy restoring FROM '/tmp/restore/$table'
+INSERT INTO $table SELECT * FROM restoring ON CONFLICT DO NOTHING;
+COMMIT;
 SQL
+done
 ```
-
-In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
 
 | Order | Table | Filter |
 |---|---|---|
 | 1 | `tasks` | `job_id = :job` |
 | 2 | `opening_rack_requests` / `game_requests` / `leave_requests` | `task_id IN (...)` |
-| 3 | `task_claims` | `task_id IN (...)` |
+| 3 | `task_claims`, then `worker_data_gaps` | `task_id IN (...)` / `job_id = :job` |
 | 4 | `game_results`, `leave_records` | `job_id = :job` / `task_id IN (...)` |
 | 5 | `position_analysis_records` → `_moves` → `_plies` | `job_id = :job`, then by parent id |
 | 6 | `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_selection_cursors`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
+
+`worker_data_gaps` is what the admin page's data gaps and the job list's
+`stalled` flag read: left out, a job's declines are forgotten.
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
 are recomputed from `game_results` (see §2.4).
@@ -290,14 +331,23 @@ The job's counters are repaired in §2.3, and the contributors' in §2.3b — th
 latter globally rather than per job, because an identity's total spans every job
 it has worked on.
 
-`position_analysis_records.id` and `_moves.id` are `BIGSERIAL`. Restoring them
-with their original ids preserves the parent-child links; afterwards the
-sequences must be moved past what was inserted, or the next insert collides
-(`_plies` is keyed by `(move_id, ply)` and has no sequence):
+`position_analysis_records.id`, `_moves.id` and `leave_rack_staging.id` are
+`BIGSERIAL`, restored with their original ids so the parent-child links hold.
+Those ids came from these sequences, which a selective restore does not rewind,
+so nothing needs moving; the check below only ever moves a sequence forward
+(a plain `setval(..., max(id))` could move it *back* below ids the running
+fleet had taken since, and the next insert collided):
 
 ```sql
-SELECT setval('position_analysis_records_id_seq', (SELECT max(id) FROM position_analysis_records));
-SELECT setval('position_analysis_moves_id_seq',   (SELECT max(id) FROM position_analysis_moves));
+SELECT setval('position_analysis_records_id_seq', GREATEST(
+  (SELECT last_value FROM position_analysis_records_id_seq),
+  (SELECT COALESCE(max(id), 1) FROM position_analysis_records)));
+SELECT setval('position_analysis_moves_id_seq', GREATEST(
+  (SELECT last_value FROM position_analysis_moves_id_seq),
+  (SELECT COALESCE(max(id), 1) FROM position_analysis_moves)));
+SELECT setval('leave_rack_staging_id_seq', GREATEST(
+  (SELECT last_value FROM leave_rack_staging_id_seq),
+  (SELECT COALESCE(max(id), 1) FROM leave_rack_staging)));
 ```
 
 ### 2.3 Repair the counters
@@ -321,7 +371,10 @@ UPDATE tasks t
      WHERE t2.job_id = :'job'
      GROUP BY t2.id
   ) actual
- WHERE t.id = actual.id;
+ WHERE t.id = actual.id
+   -- Only rows that are wrong: every task of a large job rewritten was
+   -- seconds of writes and as many dead tuples, for rows already right.
+   AND (t.accepted_count, t.active_claim_count) IS DISTINCT FROM (actual.accepted, actual.active);
 
 -- State and completed_at follow from the counters and the job's redundancy,
 -- exactly as the submit path computes them.
@@ -334,7 +387,12 @@ UPDATE tasks t
        completed_at = CASE WHEN t.accepted_count >= j.redundancy
                            THEN COALESCE(t.completed_at, now()) ELSE NULL END
   FROM jobs j
- WHERE j.id = t.job_id AND t.job_id = :'job';
+ WHERE j.id = t.job_id AND t.job_id = :'job'
+   AND t.state IS DISTINCT FROM CASE
+         WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
+         WHEN t.accepted_count + t.active_claim_count >= j.redundancy THEN 'claimed'::task_state
+         ELSE 'available'::task_state
+       END;
 
 -- The job's own counters. claims_issued is the scheduler's deficit numerator,
 -- measured from claims_baseline; the statement after this one puts the
@@ -470,10 +528,17 @@ likely to be forgotten: nothing about a single job's restore makes a wrong
 leaderboard visible. An identity with no completed claims at all keeps whatever
 it had — the statements above only touch identities that appear in
 `task_claims` — so if claims were *dropped* rather than restored, zero those
-rows first (`UPDATE users SET tasks_completed = 0, last_completed_at = NULL
-WHERE tasks_completed > 0 AND id NOT IN (SELECT id::uuid FROM recount WHERE kind = 'u');`
-and the same for `anonymous_workers`) and let the statements above put back
-what the rows actually support.
+rows first, in batches like the rest (repeat until `UPDATE 0`; the same for
+`anonymous_workers` with `uuid` and kind `'a'`), and let the statements above
+put back what the rows actually support:
+
+```sql
+UPDATE users SET tasks_completed = 0, last_completed_at = NULL
+ WHERE id IN (SELECT u.id FROM users u
+               WHERE u.tasks_completed > 0
+                 AND u.id NOT IN (SELECT id::uuid FROM recount WHERE kind = 'u')
+               LIMIT 1000);
+```
 
 ### 2.4 Recompute derived state
 
@@ -530,6 +595,13 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   rebuild legitimately produces different bytes, and rewriting would replace
   the KLV that workers actually played with. Investigate before forcing
   (`?force=true`).
+- **Object nothing accounts for** (the **Served** column says so): the bytes
+  are neither the recorded build, nor the rebuild, nor what workers were being
+  sent — typically another run's KLV under the same key, after a purge, a
+  re-run and §2's copy-back of the old rows. When the rows reproduce the
+  recorded build exactly the check puts that build back itself; otherwise
+  workers refuse the object until you restore the version that matches the
+  recorded hash (below) or force a rebuild.
 - **Built by a different builder.** Read this column first. MAGPIE builds these
   KLVs, so a MAGPIE upgrade can legitimately change the bytes for the same
   leave values; the report says which builder wrote the artifact and which one
@@ -577,12 +649,17 @@ SELECT count(*) AS inputs_missing_content FROM input_data
 -- 3. Counter sanity. Must be zero.
 SELECT count(*) AS counter_disagreements
   FROM tasks t
-  JOIN LATERAL (
-    SELECT count(*) FILTER (WHERE c.state = 'completed') AS accepted,
+  LEFT JOIN (
+    -- One pass over the claims, grouped: a per-task probe (as a lateral
+    -- join) was a random index read per task, hours on the drill's disk
+    -- at tens of millions of tasks.
+    SELECT c.task_id,
+           count(*) FILTER (WHERE c.state = 'completed') AS accepted,
            count(*) FILTER (WHERE c.state = 'claimed')   AS active
-      FROM task_claims c WHERE c.task_id = t.id
-  ) actual ON true
- WHERE t.accepted_count <> actual.accepted OR t.active_claim_count <> actual.active;
+      FROM task_claims c GROUP BY c.task_id
+  ) actual ON actual.task_id = t.id
+ WHERE t.accepted_count <> COALESCE(actual.accepted, 0)
+    OR t.active_claim_count <> COALESCE(actual.active, 0);
 ```
 
 4. **Functional smoke**: run one real task against the restored stack with
@@ -626,7 +703,14 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    ```
 
    ACM certificates are regional, so the lost region's cannot be used; request
-   one in `$DR_REGION` first. `dr_region` must be a region that is up — the
+   one in `$DR_REGION` first. The three images must be pullable from
+   `$DR_REGION`: a registry in the lost region is lost with it, so push
+   releases to one that is not (ECR with cross-region replication, or a
+   registry outside AWS) — or rebuild them from this repository and the pinned
+   MAGPIE commit (README.md, "Deploying") first. And this needs Terraform's
+   state for the copy only — it is a new workspace — but §8's return to the
+   default workspace needs the original's, which README.md says to keep off
+   the lost machine and region. `dr_region` must be a region that is up — the
    copy replicates into it as the original did — not the one that was lost.
    `$CLUSTER` below is then `birdtest-dr`.
 2. Set the new instance's master password and the two SSM parameters by hand,

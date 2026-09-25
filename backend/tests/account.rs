@@ -107,21 +107,29 @@ async fn me_returns_the_caller_and_never_a_password_hash() {
     }
 }
 
-/// A-ACCOUNT-6: an account creates at most ten keys an hour. Each key is a
-/// worker rate-limit bucket of its own, so unmetered creation was unmetered
-/// submission; the hundred-key cap alone did not bound it, as revoking frees
-/// a slot.
+/// A-ACCOUNT-6: key creation is limited per account where it matters. Each
+/// key is a worker rate-limit bucket of its own, so revoking a key and making
+/// another was unmetered new capacity; the hundred-key cap alone did not
+/// bound it. A first hundred keys at once -- a machine each -- are not held
+/// back; making more by revoking is, at ten an hour.
 #[tokio::test]
-async fn key_creation_is_rate_limited_per_account() {
+async fn key_churn_is_rate_limited_per_account() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
     let user = db.user("churner", false).await;
     let headers = signed_in(&db, user);
-    for n in 0..10 {
-        create_key(&app, &headers, &format!("key {n}")).await;
+    let mut last = Value::Null;
+    for n in 0..100 {
+        last = create_key(&app, &headers, &format!("machine {n}")).await;
     }
+    let (status, body) = send(
+        &app,
+        request("DELETE", &format!("/api/me/api-keys/{}", last["id"].as_str().unwrap()), &headers, None),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
     let (status, body) =
-        send(&app, request("POST", "/api/me/api-keys", &headers, Some(json!({ "label": "one more" })))).await;
+        send(&app, request("POST", "/api/me/api-keys", &headers, Some(json!({ "label": "churned" })))).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
 
     // Another account is not held back by this one.

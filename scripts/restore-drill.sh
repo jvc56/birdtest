@@ -205,12 +205,17 @@ BEGIN
     -- silently wrong, and what the scheduler dispatches on.
     SELECT count(*) INTO bad
       FROM tasks t
-      JOIN LATERAL (
-        SELECT count(*) FILTER (WHERE c.state = 'completed') AS accepted,
+      LEFT JOIN (
+        -- One pass over the claims, grouped: a per-task probe (as a lateral
+        -- join) was a random index read per task, hours on the drill's disk
+        -- at tens of millions of tasks.
+        SELECT c.task_id,
+               count(*) FILTER (WHERE c.state = 'completed') AS accepted,
                count(*) FILTER (WHERE c.state = 'claimed')   AS active
-          FROM task_claims c WHERE c.task_id = t.id
-      ) actual ON true
-     WHERE t.accepted_count <> actual.accepted OR t.active_claim_count <> actual.active;
+          FROM task_claims c GROUP BY c.task_id
+      ) actual ON actual.task_id = t.id
+     WHERE t.accepted_count <> COALESCE(actual.accepted, 0)
+        OR t.active_claim_count <> COALESCE(actual.active, 0);
     IF bad > 0 THEN RAISE EXCEPTION 'tasks whose claim counters disagree with their claims: %', bad; END IF;
 END
 $$;

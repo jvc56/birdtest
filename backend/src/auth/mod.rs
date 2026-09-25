@@ -200,7 +200,7 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                 "WITH found AS (
                      SELECT k.id AS key_id, u.id AS user_id, k.last_used_at
                      FROM api_keys k JOIN users u ON u.id = k.user_id
-                     WHERE k.key_hash = $1 AND k.is_active
+                     WHERE k.key_hash = $1 AND k.is_active AND u.deleted_at IS NULL
                  ),
                  touched AS (
                      UPDATE api_keys k SET last_used_at = now()

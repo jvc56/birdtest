@@ -420,7 +420,7 @@ pool, from scratch, by `ratings::fit_and_store`, on exactly three triggers:
 
 | Trigger | When | Who | What is written |
 |---|---|---|---|
-| **evidence** | Every two minutes, from a sweep started by `main.rs` (`ratings::recompute_stale`), for each pool whose count of eligible pairs differs from its last run's `pairs_used` | The server, unattended | A new `rating_runs` row with a `player_config_ratings` row per member and a `rating_run_residuals` row per head-to-head — or nothing, if the evidence has not moved |
+| **evidence** | Every two minutes, from a sweep started by `main.rs` (`ratings::recompute_stale`), for each pool whose eligible jobs' `games_completed` sum, or whose members, differ from its last run's (`evidence_games`) | The server, unattended | A new `rating_runs` row with a `player_config_ratings` row per member and a `rating_run_residuals` row per head-to-head — or nothing, if the evidence has not moved |
 | **membership** | Immediately, inside the request, when an admin adds or removes a member (`POST`/`DELETE /api/admin/rating-pools/:id/members`) | An admin | The same, unconditionally |
 | **manual** | Immediately, on `POST /api/admin/rating-pools/:id/recompute` | An admin | The same, unconditionally |
 
@@ -563,13 +563,16 @@ than good enough for the distinction the page needs to draw: 1700 ± 15 and
 On membership change and on demand, immediately; on new evidence, from a periodic
 sweep (two minutes) rather than a hook on result submission. A fit is global to a
 pool, an active job submits results far faster than any rating needs to move, and
-— unlike SPRT — nothing blocks on the answer. The sweep compares the pool's
-current pair count against the last run's `pairs_used`, and its current members
-against the configs that run rated — so a membership change whose own refit
-never ran (the request dropped after the membership committed) is repaired too,
-even when the config added or removed had no pairs — and no dirty flag is
-needed anywhere; it reads the evidence once and fits from the same read, rather
-than reading it to decide and again to fit.
+— unlike SPRT — nothing blocks on the answer. The sweep first compares the sum
+of the pool's eligible jobs' `games_completed` (each job's first-result-per-task
+running total, kept by the submission that stores the result) against the last
+run's `evidence_games`, and its current members against the configs that run
+rated — so a membership change whose own refit never ran (the request dropped
+after the membership committed) is repaired too, even when the config added or
+removed had no pairs. Only when either moved does it build the evidence matrix,
+compare its pair count against the last run's `pairs_used`, and fit from that
+same read. (It built the matrix every time to find out, for every pool every two
+minutes: seconds each at millions of results.) No dirty flag is needed anywhere.
 
 **A fit holds the pool's lock while it runs** (`pg_advisory_xact_lock`, per
 pool, for the fitting transaction). It is a read-then-write over state an admin
@@ -635,8 +638,10 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
    - Username is 3–32 characters, trimmed, and unique whatever its case (a
      unique index on `lower(username)`): "Josh" and "josh" side by side on the
      public lists is an impersonation.
-   - Email contains `@` and is at least 3 characters, trimmed and lowercased — so
-     case is not a way to register the same address twice.
+   - Email is one bare address — `local@domain.tld`, printable ASCII, none of
+     `<>,;:"()[]\` and no spaces — trimmed and lowercased, so neither case nor a
+     display name (`x <victim@example.com>`) nor a list is a way to register, or
+     mail, the same inbox under another string.
    - Password scores at least **3** on zxcvbn, with the username and email passed
      in as context so a password derived from either is rejected. Scored
      server-side; the client shows the same feedback but is not trusted.
@@ -855,15 +860,18 @@ decision on evidence rather than on a guess about when it starts to matter.
 **ETA** is extrapolated from claims completed in the last hour. It is `null` for
 an inactive job and `null` when nothing completed in that window — there is
 nothing to extrapolate from, and a fabricated number is worse than a blank. For
-SPRT jobs the remaining work is measured in units against `max_units`, converted
-into tasks using the observed units-per-completed-task ratio. For an opening-rack
+SPRT jobs the remaining work is measured in units against `max_units`, at the
+rate units have been finishing (claims × games or pairs per batch ÷ redundancy —
+from the observed units per completed task, as it first was, it counted every
+redundant claim and read half the time left at redundancy 2). For an opening-rack
 job it is the racks left of its rack space, at the rate racks have been finishing
 (claims × batch ÷ redundancy). A leave job has no ETA: its generations' size
 depends on the draws. A job already past its cap reports 0. Tasks are made on
 demand, so "remaining tasks" was only what was in flight — a 3.2-million-rack
 job 1% done read three minutes left — and the job list's progress bar likewise
 counts each type's own units (games or pairs, racks analysed, generations
-closed) rather than tasks handed out so far.
+closed) rather than tasks handed out so far, as do the job pages (a leave job's
+`generations_closed`, not `current_generation`, which stops at the last).
 
 #### Live updates
 
@@ -1250,6 +1258,7 @@ start. The process has no SSM code path of its own.
 | `MAIL_FROM` | `no-reply@birdtest.local` | |
 | `PUBLIC_URL` | `http://localhost:5173` | The base for links in emails. |
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. |
+| `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. `0` builds it on every request (the tests). |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
 | `MIN_MAGPIE_VERSION` | `0.1.1` | The enforced global floor, and the default floor for a new job. Also a floor the server's own pinned MAGPIE must clear: startup fails if `MAGPIE_BIN` reports less, since the server would be publishing hashes built by a MAGPIE its workers may not run. |
@@ -2529,7 +2538,7 @@ At claim time:
 5. `INSERT INTO task_claims (...)`.
 6. Return the request and claim token.
 
-**Worker behaviour**: The worker downloads the previous generation's combined leave file through `GET /api/worker/artifact` — including generation 1, which fetches the server-built *zeroed* KLV stored as generation 0, so there is no first-generation branch and no fallback to the lexicon's shipped leaves. It seeds the run from the request's `seed`, hands the request's `forced_racks` to `leavegen` as an **in-memory rack list**, plays `num_games` games, and reads the rack-equity table out of `RackList`, submitting it as an inline `{rack, count, mean}` list in the `LeaveResponse`.
+**Worker behaviour**: The worker downloads the previous generation's combined leave file through `GET /api/worker/artifact` (a missing object is `404`, any other object-store failure `503` with `Retry-After`, which MAGPIE retries; the server keeps the last few KLVs it served in memory, verified against the hash it sends, so a generation's opening is one object-store read however many workers ask) — including generation 1, which fetches the server-built *zeroed* KLV stored as generation 0, so there is no first-generation branch and no fallback to the lexicon's shipped leaves. It seeds the run from the request's `seed`, hands the request's `forced_racks` to `leavegen` as an **in-memory rack list**, plays `num_games` games, and reads the rack-equity table out of `RackList`, submitting it as an inline `{rack, count, mean}` list in the `LeaveResponse`.
 
 Neither the forced racks nor the results touch the filesystem: they arrive in the task's JSON request and go back in its JSON response. (There is no `-forceracksfile` / `-writerackequitycsv` round trip through scratch files — see [Leave generation on the client](#leave-generation-on-the-client).)
 
@@ -3282,9 +3291,13 @@ nanosecond timestamps where the filesystem records them, so a 15 MB lexicon is
 hashed once per run rather than once per task. A cached digest must never be the
 reason a bad file passes.
 
-**Stopping is cooperative.** A stop request during a task lets the task finish and
-submit; a stop request while idle returns immediately. A hard interrupt simply
-abandons the claim, which the server's heartbeat timeout reclaims.
+**Stopping hands the task back.** A stop request (the REPL's `stop`, the API's)
+cuts a running task short — autoplay starts no more games, simulations end
+early — so what it would submit is not the task the server asked for. The loop
+declines the claim (`task_failed`, not counted as a failure) and ends; a stop
+while waiting between claims returns within a second. (It once submitted the
+truncated result, and kept claiming.) A hard interrupt simply abandons the
+claim, which the server's heartbeat timeout reclaims.
 
 **Errors during execution** are reported and the claim is handed back with a `task_failed` decline, so
 its slot does not wait out the heartbeat timeout — and so is a result the server
@@ -3393,6 +3406,7 @@ a new MAGPIE setting has a table it visibly is not in.
 | Output (`-hr`, print interval, board printing, game string options, `-ritmmap`) | No | `print_interval` is reset anyway: left over, it printed simulation progress per rack |
 | Data paths (`-path`) | Chooses files | Every file a task loads is digest-verified through the same resolver the load uses, and the task is declined on a mismatch |
 | Lexical data already in memory (a KWG, KLV, wordmap or rack info table of the name asked for) | Whatever that file held when it was read | Evicted and read again when its file has changed since this path read it, or when this path did not read it (settings.txt, an earlier command) — `config_contribute_evict_changed_data`, by file identity (size, inode, and mtime and ctime to the nanosecond) |
+| The letter distribution and board layout in memory | Whatever those files held when they were read — they were reloaded only when their *name* changed | Read again when the file is not the one this path last read, by the same identity — `config_contribute_reload_changed_ld_and_layout` |
 
 **What is verified is a file; what is played is what is in memory.** MAGPIE
 caches loaded lexical data by *name*: a load that finds a KLV of the requested
@@ -3895,8 +3909,10 @@ pair.
 `204`. `reason` is `missing_data`, `magpie_version`, `unknown_job_type`,
 `derived_mismatch` — the worker built the wordmap or rack info table the job pins
 and got different bytes, or (role `klv`) the leave KLV it fetched does not hash to
-`previous_artifact_sha256`; for that one the worker does not set the job aside,
-since it is the server's to fix, but waits its idle interval and claims again —
+`previous_artifact_sha256` or is not there (`404`); for that one the worker does
+not set the job aside, since it is the server's to fix, but waits and claims
+again — the idle interval, doubling to ten minutes while the same key and hash
+keep failing, and without downloading a KLV it already found wrong —
 or `task_failed` — the worker ran the task and could
 not produce a result the server accepted;
 `missing` is present for `missing_data` and `derived_mismatch`, where `actual`
@@ -4333,7 +4349,7 @@ In-memory token buckets, per process, reset on restart.
 | `POST /api/auth/login` | 10 / minute, and 100 / minute | Client IP; and, separately, the username tried from anywhere — ten times the address's, so that one address cannot lock an account out |
 | `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
 | `POST /api/worker/{task,result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Worker identity: the API key (`k:<key-id>`) or the anonymous UUID (`a:<uuid>`). Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
-| `POST /api/me/api-keys` | 10 / hour | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered creation was unmetered submission. A contributor setting up many machines at once makes ten keys, then one every six minutes |
+| `POST /api/me/api-keys` | 10 / hour, **burst 100** | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered churn was unmetered new capacity. The burst is the cap, so a contributor setting up a machine per key is not held back (at ten an hour from the start, fifty machines took five hours); what refills slowly is revoke-and-recreate |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
 
 "Client IP" is the `X-Forwarded-For` entry `TRUSTED_PROXY_HOPS` from the right —
@@ -4486,7 +4502,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/admin/player-configs` | List all player configurations. |
-| `POST` | `/api/admin/player-configs` | Create a new player configuration. |
+| `POST` | `/api/admin/player-configs` | Create a new player configuration. Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), as well as non-positive counts and out-of-range margins. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
 | `POST` | `/api/admin/jobs` | Create a new job. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. |
@@ -4592,7 +4608,9 @@ Beyond role matching, creation enforces six rules the schema cannot express:
   `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
   at most 10,000); `rack_size` 1–7; `max_*` at least 1 and
   `min_*` at least 0; `sprt_alpha` and `sprt_beta` strictly between 0 and 1 with a
-  sum below 1; `elo_low` below `elo_high`. Every violation is reported at once as
+  sum below 1; `elo_low` below `elo_high`; `min_magpie_version`, when given, a
+  version (`major.minor[.patch]`, digits only — read loosely, a typo was 0.0.0,
+  the most permissive floor). Every violation is reported at once as
   a field error. A zero batch would make every claim regenerate the seed the last
   one took and retry forever; inverted hypotheses flip the LLR's sign.
 
@@ -5012,7 +5030,9 @@ kept in step by hand -- if they ever disagree, the migration is right.
 
 CREATE TABLE users (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    username             TEXT NOT NULL UNIQUE,
+    -- Unique whatever its case: users_username_lower_idx, below, which a
+    -- plain UNIQUE here only duplicated (an index write per user update).
+    username             TEXT NOT NULL,
     email                TEXT NOT NULL UNIQUE,
     password_hash        TEXT NOT NULL,
     email_confirmed_at   TIMESTAMPTZ,
@@ -5802,12 +5822,18 @@ WITH (fillfactor = 85);
 -- task. 'declined' must be excluded alongside 'abandoned': a worker that
 -- declined a task for missing data and then fixed its data has to be able to
 -- claim that task again.
+--
+-- Each covers only its own kind of identity: a claim has exactly one, and a
+-- NULL key constrains nothing, so indexing the other kind's claims under NULL
+-- was dead weight -- nearly half of each index, and an index write per claim
+-- insert and per completion that nothing read. A lookup by `= $n` implies the
+-- `IS NOT NULL`, so every reader still uses them.
 CREATE UNIQUE INDEX task_claims_user_unique_idx
     ON task_claims (task_id, claimed_by_user_id)
-    WHERE state NOT IN ('abandoned', 'declined');
+    WHERE state NOT IN ('abandoned', 'declined') AND claimed_by_user_id IS NOT NULL;
 CREATE UNIQUE INDEX task_claims_anon_unique_idx
     ON task_claims (task_id, claimed_by_anon_uuid)
-    WHERE state NOT IN ('abandoned', 'declined');
+    WHERE state NOT IN ('abandoned', 'declined') AND claimed_by_anon_uuid IS NOT NULL;
 
 -- What a worker said it was missing when it declined. The server records gaps
 -- for humans; it does not route on them (the client sends its own unsupported
@@ -6262,14 +6288,14 @@ CREATE TABLE leave_generation_artifacts (
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
-    -- SHA-256 of the bytes the object store holds *now*, when a rebuild has
-    -- rewritten the object with different ones (`rebuild_artifacts`); NULL
-    -- while it still holds the bytes first written. Workers are sent this
-    -- (or `sha256` when it is NULL) and refuse bytes that do not match, so it
-    -- has to follow the object: a rebuild under a changed builder wrote new
-    -- bytes, the row kept the old hash, and every task of the next generation
-    -- failed its check on every worker. `sha256` stays the first hash, as the
-    -- evidence it is.
+    -- SHA-256 of the bytes the object store holds *now*, when they are not
+    -- the bytes first written; NULL while they are. Set by every
+    -- `rebuild_artifacts` check from the object it wrote, or found and could
+    -- account for. Workers are sent this (or `sha256` when it is NULL) and
+    -- refuse bytes that do not match, so it has to follow the object: a
+    -- rebuild under a changed builder wrote new bytes, the row kept the old
+    -- hash, and every task of the next generation failed its check on every
+    -- worker. `sha256` stays the first hash, as the evidence it is.
     served_sha256 TEXT CHECK (served_sha256 ~ '^[0-9a-f]{64}$'),
     -- The MAGPIE KLV builder that wrote these bytes ('klv-1').
     --
@@ -6390,7 +6416,13 @@ CREATE TABLE rating_runs (
     -- How much evidence went in, so a run can be compared to its predecessor
     -- without re-reading game_results.
     pairs_used    BIGINT NOT NULL,
-    jobs_used     INT NOT NULL
+    jobs_used     INT NOT NULL,
+    -- The pool's eligible jobs' `games_completed`, summed, as of the fit: what
+    -- the sweep compares before deciding to build the evidence matrix at all.
+    -- Building it to find nothing had changed was the sweep's whole cost, for
+    -- every pool every two minutes. NULL on a run that did not record it,
+    -- which the next sweep refits.
+    evidence_games BIGINT
 );
 
 CREATE INDEX rating_runs_pool_idx ON rating_runs (pool_id, computed_at DESC);
@@ -6506,8 +6538,11 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 -- recent completions instead, whatever the job's age.
 CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
-CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
-CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
+-- Partial for the reason the unique indexes above are.
+CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id)
+    WHERE claimed_by_user_id IS NOT NULL;
+CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid)
+    WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
 -- detail page's counts, which sum `accepted_count` and so read the heap
 -- anyway; the census; the opening-rack finish check, which needs `seed` --
@@ -6551,7 +6586,8 @@ CREATE INDEX leave_rack_progress_pick_idx
 Ten audits of this repository each left a findings record (`AUDIT_FINDINGS*.md`,
 now deleted; they are in the git history up to the commit that removed them).
 The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
-the thirteenth's `AUDIT_FINDINGS_9.md` and the fourteenth's `AUDIT_FINDINGS_10.md`.
+the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md` and
+the fifteenth's `AUDIT_FINDINGS_11.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -6836,6 +6872,15 @@ what would make it worth revisiting.
 
 ### Deployment
 
+- **Terraform's state is local.** `infra/main.tf` declares no backend, so the
+  state is a file on the machine that applied, and RUNBOOK.md's recovery steps
+  and both ops scripts read it. Lost with that machine, SQL can no longer
+  reach the database by the scripts, and the next apply tries to create every
+  named resource again. README.md says to keep it off the machine and the
+  region. *Open (fifteenth audit):* an S3 backend in a second region, versioned
+  and locked — a bootstrap bucket outside this configuration, and a choice of
+  region and account that is the operator's to make.
+
 - **The restore drill's disk stops at Fargate's 200 GiB**, which holds a
   database a little over 150 GiB with its dump beside it. Past that the drill
   refuses to start, naming the alternative: a hand-run drill with
@@ -6862,6 +6907,21 @@ what would make it worth revisiting.
   through `config` and `json`), and MAGPIE's CI lists circular dependencies
   among its required checks. They do not affect birdtest; whoever merges the
   branch upstream will meet them.
+- **A full disk while writing a wordmap or rack info table ends the worker.**
+  The writers are MAGPIE's CLI writers (`fwrite_or_die`), which exit; on the
+  contribute path the claim then waits out the heartbeat timeout, and the
+  partial temporary is removed by the next write an hour on. A declined task
+  would be kinder; it means error returns through writers the CLI shares.
+- **Local write failures are counted, not remembered.** A worker that cannot
+  write a table or a fetched KLV (a read-only data directory) counts a failure
+  rather than setting the job aside, and a success on another job resets the
+  count, so it keeps claiming the job it cannot run between the ones it can.
+- **A wordmap or table this build cannot reproduce ends in a `data_out_of_date`
+  shutdown** when it is the worker's last active job: it is remembered as
+  unsupported, and the server's shutdown message advises downloading data,
+  where the cause is the build. The worker's own summary prints the "built as"
+  lines, which say otherwise. Distinguishing them needs a shutdown reason for
+  builder mismatches on the server.
 
 ---
 
@@ -6881,6 +6941,21 @@ what would make it worth revisiting.
 ### Scaling
 
 - **Primary/secondary server split** — one instance owns task scheduling and mutations; read-only instances serve the dashboard. Eliminates concurrent scheduling conflicts under high worker load. Note that several things assume a single instance today and would have to move first: staged imports and their reaper, the in-process rate limiters, and the per-process SSE broadcaster (`desired_count` is validated to 1 for that reason).
+- **Deleting an unused player config scans the per-task request tables.** The
+  foreign keys from `game_requests` and `opening_rack_requests` have no index
+  (one would be a write per task issued, for a rare admin action), so the
+  delete's checks read every request row: tens of milliseconds at half a
+  million, seconds on a mature database. Accepted.
+- **`leave_rack_progress` is vacuumed at the default scale factor.** The table
+  keeps every generation's rows (3.2 million per English generation), so 20%
+  dead tuples is several merges' worth before autovacuum starts. A per-table
+  `autovacuum_vacuum_scale_factor` near 0.02 is a tuning choice left for when
+  a production table's bloat is measured. *(Fifteenth audit.)*
+- **`users` carries two contribution indexes** (`users_contribution_idx` for
+  `/api/users`, tie-broken by `created_at`, and `users_worker_rank_idx` for
+  `/api/workers`, by `id`), each written on every registered submission. One
+  would do if `/api/users` broke ties by id — a visible ordering change, left
+  for a decision. *(Fifteenth audit.)*
 - **The job list's `stalled` flag scans the fleet's last day.** For an active
   job with a recent decline, "no submission in 24 hours" is answered from the
   index of completed claims by time — every claim completed in the last day,
@@ -6890,7 +6965,7 @@ what would make it worth revisiting.
   Cheap while declines are rare, which is the normal case; if the list slows,
   keep a `last_completed_at` on `jobs`, bumped by the submission that already
   updates the job row.
-- **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least a second apart. What remains is moving the payload's own aggregates to a background refresh, which `compute`'s slow-query log line exists to decide on.
+- **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least `JOB_STATS_CACHE_SECONDS` (10) apart, the page and new subscribers reading the last push's payload. What remains is the payload's cost itself: its contributor list groups every completed claim of the job (and, `task_claims` having no `job_id`, the planner scans the fleet's claims for it), and its game statistics read every result — hundreds of milliseconds at a few hundred thousand tasks, growing with history. *Open (fifteenth audit):* a per-job contributor running total (`job_contributors`, upserted in the submit transaction like `users.tasks_completed`, given back by purge and delete, recounted by RUNBOOK §2.3b) would make the list an index read; it is a schema change and one more write per submission, left for a decision.
 
 ---
 
@@ -7088,9 +7163,13 @@ silently-truncated dump detectable without restoring it.
 
 The dump contains argon2 password hashes, API key hashes, email addresses and
 unexpired reset-token hashes. It is encrypted with SSE-KMS using a customer-managed
-key whose policy grants `Decrypt` only to the restore role, **not** to the backup
-task — the task needs `GenerateDataKey` and `Encrypt` to write, and nothing more. A
-compromised backup task can then create backups but not read old ones.
+key whose policy grants `Decrypt` to the restore role and, to the backup task,
+only through S3 and only for the backups bucket — a multipart upload under SSE-KMS
+needs it (S3 decrypts the data key to complete the upload, and `aws s3 cp` goes
+multipart past 8 MB; granting only `GenerateDataKey` and `Encrypt`, as first
+written, refused every upload of a real database's larger tables). The task holds
+no `s3:GetObject`, so a compromised backup task can create backups but not read
+old ones.
 
 The two SSM parameters are not covered by any of the above and are the thing most
 likely to be forgotten in a region-loss drill, because they are deliberately not
@@ -7155,10 +7234,16 @@ Two details a rebuild has to respect:
   by every worker. It is set on *every* rebuild, not only one that rewrites:
   from the bytes written, or the bytes read back when the object is left
   alone — so a rebuild whose write landed but whose update did not, or an
-  object version an operator copied back (RUNBOOK §3), or a restore's rows
-  describing other bytes, are all put right by running **Check artifacts**
-  again. A worker declines a KLV that fails the check and waits, leaving the
-  job claimable, since this is the server's to fix.
+  object version an operator copied back (RUNBOOK §3), are put right by
+  running **Check artifacts** again. But only bytes the check can account
+  for — the first build, the rebuild, or what was already served: taking any
+  object's hash approved, after a mistaken purge, a re-run and a copy-back of
+  the old rows, the re-run's KLV as the old run's leaves. An object nothing
+  accounts for is replaced with the first build when the rows reproduce it
+  exactly, and otherwise left, reported (`object_accounted_for`, shown on the
+  admin page) and refused by workers until an admin restores the right
+  version or forces a rebuild. A worker declines a KLV that fails the check
+  and waits, leaving the job claimable, since this is the server's to fix.
 - `seed_zero_generation` writes generation 0 as a zeroed KLV; a rebuild must
   reproduce generation 0 the same way rather than from `leave_rack_progress`, which
   for generation 0 does not exist.

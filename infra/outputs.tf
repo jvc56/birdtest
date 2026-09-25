@@ -25,6 +25,18 @@ output "ses_dkim_tokens" {
   value       = aws_sesv2_email_identity.domain.dkim_signing_attributes[0].tokens
 }
 
+# ses.tf sends from the custom MAIL FROM domain `mail.<ses_domain>`, which SES
+# uses only once these two records exist (until then it falls back to its own,
+# and SPF alignment for the domain fails).
+output "ses_mail_from_records" {
+  description = "Add these DNS records for the custom MAIL FROM domain."
+  value = {
+    name = "mail.${var.ses_domain}"
+    MX   = "10 feedback-smtp.${var.region}.amazonses.com"
+    TXT  = "\"v=spf1 include:amazonses.com ~all\""
+  }
+}
+
 output "backups_bucket" {
   description = "Where nightly logical dumps land. Restores read from here."
   value       = aws_s3_bucket.backups.bucket

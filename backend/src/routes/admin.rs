@@ -711,6 +711,9 @@ async fn create_player_config(
 /// job has been built on the config and dispatched: every worker would fail
 /// the task, and the job would sit there producing nothing. Refusing at
 /// creation puts the error in front of the admin who can fix it.
+const MAGPIE_MAX_PLIES: i32 = 25;
+const MAGPIE_MAX_CAPTURED_PLIES: i32 = 10;
+
 fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     let mut err = AppError::bad_request("player config is invalid");
     if body.name.trim().is_empty() {
@@ -732,6 +735,19 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     }
     if body.num_plies.is_some_and(|v| v < 0) {
         err = err.with_field("num_plies", "must not be negative");
+    }
+    // MAGPIE's own limits (`MAX_PLIES` in sim_defs.h; a captured position
+    // keeps at most `CAPTURED_PLAY_MAX_PLIES` in autoplay_results.c). Past the
+    // first every worker failed every task of the job; past the second the
+    // plies were cut off without a word.
+    if body.num_plies.is_some_and(|v| v > MAGPIE_MAX_PLIES) {
+        err = err.with_field("num_plies", format!("must be at most {MAGPIE_MAX_PLIES}"));
+    }
+    if body.num_plies_recorded.is_some_and(|v| v > MAGPIE_MAX_CAPTURED_PLIES) {
+        err = err.with_field(
+            "num_plies_recorded",
+            format!("must be at most {MAGPIE_MAX_CAPTURED_PLIES}"),
+        );
     }
     if body.time_limit_secs.is_some_and(|v| v < 0) {
         err = err.with_field("time_limit_secs", "must not be negative");
@@ -995,7 +1011,7 @@ async fn create_job(
     require_role(&state.pool, body.layout_id, "layout").await?;
 
     // Defaulted from config rather than typed, so the form shows the effective
-    // value; unparseable text is 0.0.0, which no job would accept.
+    // value; a typed one was checked above.
     let floor = crate::version::Version::parse_or_zero(
         body.min_magpie_version
             .as_deref()
@@ -1081,6 +1097,13 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
+    }
+    // Read loosely, a typo ("v1.6.0", "1") was 0.0.0: the lowest floor there
+    // is, so a raise meant to keep older builds off the job let them all on.
+    if let Some(text) = body.min_magpie_version.as_deref() {
+        if crate::version::Version::parse_strict(text).is_none() {
+            err = err.with_field("min_magpie_version", "must be a version such as 0.1.1");
+        }
     }
 
     let sprt = |mut err: AppError,
@@ -1534,6 +1557,7 @@ async fn activate_job(
     ApiJson(body): ApiJson<ActivateBody>,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
 
     if !(0..=100).contains(&body.allocation) {
         return Err(AppError::bad_request("allocation must be between 0 and 100"));
@@ -1619,6 +1643,7 @@ async fn deactivate_job(
     jar: CookieJar,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
@@ -1657,6 +1682,7 @@ async fn complete_job(
     jar: CookieJar,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
@@ -1881,20 +1907,34 @@ async fn purge_job(
     jar: CookieJar,
 ) -> AppResult<Json<PurgeResult>> {
     csrf::verify(&method, &headers, &jar)?;
-    refuse_if_already_running(&state, id)?;
-    run_to_completion(purge_body(state, admin.0.id, id)).await
+    let hold = hold_for_purge_or_delete(&state, id)?;
+    run_to_completion(purge_body(state, admin.0.id, id, hold)).await
 }
 
-/// A purge or delete of this job already running -- one the load balancer
-/// stopped waiting for, which the admin page shows as an error and invites a
-/// second click on -- is not started again: the second would park a pool
-/// connection on the first's locks and then do all of it over.
-fn refuse_if_already_running(state: &AppState, id: Uuid) -> AppResult<()> {
+const ALREADY_RUNNING: &str = "a purge or delete of this job is running; its result will show \
+     on the job's page and in the audit log when it finishes";
+
+/// The hold a purge or delete runs under, taken in the handler: claims skip
+/// the job while it runs, and submissions for its claims are answered at once
+/// (see `jobs::DispatchHolds`). A purge or delete of the job already running
+/// -- one the load balancer stopped waiting for, which the admin page shows as
+/// an error and invites a second click on -- is refused rather than started
+/// again: the second parked a pool connection on the first's locks and then
+/// did all of it over. Checked and taken in one step; checked and then taken
+/// in the spawned task, a double click got two.
+fn hold_for_purge_or_delete(state: &AppState, id: Uuid) -> AppResult<crate::jobs::DispatchHold> {
+    state
+        .dispatch_holds
+        .try_hold_claims(id, state.cfg.heartbeat_timeout)
+        .ok_or_else(|| AppError::conflict(ALREADY_RUNNING))
+}
+
+/// Activating, deactivating or completing a job being purged or deleted would
+/// wait out the whole operation on its row with a pool connection held --
+/// and completing it then finished a job the purge had just emptied.
+fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<()> {
     if state.dispatch_holds.claims_held(id) {
-        return Err(AppError::conflict(
-            "a purge or delete of this job is already running; its result will show on the \
-             job's page and in the audit log when it finishes",
-        ));
+        return Err(AppError::conflict(ALREADY_RUNNING));
     }
     Ok(())
 }
@@ -1917,15 +1957,12 @@ async fn run_to_completion<T: Send + 'static>(
         .map_err(|e| AppError::internal(format!("the operation's task failed: {e}")))?
 }
 
-async fn purge_body(state: AppState, admin_id: Uuid, id: Uuid) -> AppResult<Json<PurgeResult>> {
-    // Claims skip the job while this runs rather than each waiting on its
-    // dispatch lock with a pool connection held, and submissions for its
-    // claims are answered at once: see `jobs::DispatchHolds`.
-    let mut hold = state.dispatch_holds.hold(
-        id,
-        crate::jobs::HoldKind::Claims,
-        state.cfg.heartbeat_timeout,
-    );
+async fn purge_body(
+    state: AppState,
+    admin_id: Uuid,
+    id: Uuid,
+    mut hold: crate::jobs::DispatchHold,
+) -> AppResult<Json<PurgeResult>> {
     let mut tx = state.pool.begin().await?;
     // The same lock every claim takes before deciding what to hand out, and
     // for the same reason. A claim in flight has already read the seed cursor
@@ -2087,17 +2124,17 @@ async fn delete_job(
     jar: CookieJar,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
-    refuse_if_already_running(&state, id)?;
-    run_to_completion(delete_body(state, admin.0.id, id)).await
+    let hold = hold_for_purge_or_delete(&state, id)?;
+    run_to_completion(delete_body(state, admin.0.id, id, hold)).await
 }
 
-/// See [`run_to_completion`].
-async fn delete_body(state: AppState, admin_id: Uuid, id: Uuid) -> AppResult<StatusCode> {
-    let mut hold = state.dispatch_holds.hold(
-        id,
-        crate::jobs::HoldKind::Claims,
-        state.cfg.heartbeat_timeout,
-    );
+/// See [`run_to_completion`] and [`hold_for_purge_or_delete`].
+async fn delete_body(
+    state: AppState,
+    admin_id: Uuid,
+    id: Uuid,
+    mut hold: crate::jobs::DispatchHold,
+) -> AppResult<StatusCode> {
     let mut tx = state.pool.begin().await?;
     // The same locks a purge takes, in the same order and for the same
     // reasons: no claim is issued meanwhile, and no submission is between its

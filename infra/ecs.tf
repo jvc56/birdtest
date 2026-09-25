@@ -300,6 +300,10 @@ resource "aws_ecs_task_definition" "main" {
       image        = var.backend_image
       essential    = true
       portMappings = [{ containerPort = 8080, protocol = "tcp" }]
+      # Fargate's most. The default 30 s SIGKILLs the graceful shutdown's
+      # in-flight work -- a submission's insert, an artifact rebuild -- that
+      # it exists to let finish.
+      stopTimeout = 120
       environment = [
         { name = "BIND_ADDR", value = "0.0.0.0:8080" },
         { name = "SECURE_COOKIES", value = "true" },
@@ -391,6 +395,12 @@ resource "aws_ecs_service" "main" {
   # silently does not hold exactly when the code changes.
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
+
+  # The backend migrates before it binds, and the load balancer's checks
+  # (3 x 10 s) fail until it does. Without a grace period ECS replaced a task
+  # whose migration took more than about thirty seconds -- killed mid-way,
+  # rolled back, retried forever, with nothing serving.
+  health_check_grace_period_seconds = 600
 
   network_configuration {
     subnets          = aws_subnet.public[*].id

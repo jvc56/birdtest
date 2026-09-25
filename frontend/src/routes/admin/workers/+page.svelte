@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { api, type Page, type WorkerBan } from '$lib/api';
   import { workerLabel } from '$lib/format';
+  import Pagination from '$lib/components/Pagination.svelte';
 
   let workers: Page<Record<string, any>> | null = null;
   let bans: WorkerBan[] = [];
@@ -18,6 +19,18 @@
 
   async function loadBans() {
     bans = await api.workerBans();
+  }
+
+  // Every page, not the first: a nuisance with few completed tasks ranks far
+  // down the list. (One that has completed none is not listed at all; its
+  // UUID, from the contributor or the server's logs, can be typed above.)
+  async function loadWorkers(next: number) {
+    error = '';
+    try {
+      workers = await api.adminWorkers(next);
+    } catch (e) {
+      error = `Could not load the workers: ${message(e)}`;
+    }
   }
 
   onMount(async () => {
@@ -134,3 +147,6 @@
     </tbody>
   </table>
 </div>
+{#if workers}
+  <Pagination page={workers.page} perPage={workers.per_page} total={workers.total} onChange={loadWorkers} />
+{/if}

@@ -1388,9 +1388,18 @@ pub struct ArtifactRebuild {
     pub generation: i32,
     pub artifact_key: String,
     pub stored_sha256: String,
-    /// What the object holds now, and what workers are sent: `stored_sha256`
-    /// unless a rebuild rewrote it with other bytes.
+    /// What workers are sent to check the object against: the hash of what
+    /// the object holds, once this check has accounted for it.
     pub served_sha256: String,
+    /// The object's hash as this check found it, before any rewrite; `None`
+    /// when it was missing.
+    pub object_sha256: Option<String>,
+    /// Whether the object found is the first build, this rebuild, or what
+    /// was already served. When it is none of them and the rows do not
+    /// reproduce the recorded bytes, nothing is changed: workers go on being
+    /// sent `served_sha256` (and refuse the object) until an admin forces a
+    /// rebuild or restores the right object version.
+    pub object_accounted_for: bool,
     pub rebuilt_sha256: String,
     pub matches: bool,
     /// Whether the stored artifact was written by the builder this rebuild
@@ -1419,7 +1428,13 @@ pub struct ArtifactRebuild {
 ///   and that is evidence to look at rather than a fault to paper over: it is
 ///   equally consistent with a corrupted object and with a legitimate change to
 ///   MAGPIE's KLV builder. Rewriting on sight would destroy the only copy of
-///   whichever one it was. `force` is the deliberate override.
+///   whichever one it was. `force` is the deliberate override. The one
+///   exception is an object that is neither the first build, nor this
+///   rebuild, nor what was being served, while the rows reproduce the first
+///   build exactly: nothing here accounts for those bytes (another run's KLV
+///   under the same key, after a purge and a copy-back of the old rows), and
+///   the recorded ones are known, so they are put back -- the bucket is
+///   versioned, so the replaced object is kept as a noncurrent version.
 /// - **It does not treat a different builder as a mismatch.** Until MAGPIE
 ///   built these, there was one implementation and differing bytes could only
 ///   mean corruption. Now a MAGPIE upgrade can legitimately change them, so an
@@ -1440,7 +1455,8 @@ pub async fn rebuild_artifacts(
     force: bool,
 ) -> AppResult<Vec<ArtifactRebuild>> {
     let rows = sqlx::query(
-        "SELECT generation, artifact_key, sha256, builder
+        "SELECT generation, artifact_key, sha256, builder,
+                COALESCE(served_sha256, sha256) AS served_sha256
          FROM leave_generation_artifacts
          WHERE job_id = $1
          ORDER BY generation",
@@ -1456,6 +1472,7 @@ pub async fn rebuild_artifacts(
         let artifact_key: String = row.get("artifact_key");
         let stored_sha256: String = row.get("sha256");
         let stored_builder: String = row.get("builder");
+        let was_served: String = row.get("served_sha256");
 
         let klv = if generation == 0 {
             zero_klv(magpie, distribution).await?
@@ -1471,36 +1488,58 @@ pub async fn rebuild_artifacts(
         // permission. Replacing one that is present does -- and replacing one
         // built by a different builder needs it twice over, since the
         // difference is expected rather than evidence of anything.
-        let rewritten = !object_present || force;
+        let object_sha256 = if object_present {
+            Some(hex::encode(Sha256::digest(artifacts.get(&artifact_key).await?)))
+        } else {
+            None
+        };
+        // What workers are sent has to be what the object holds -- but only
+        // bytes something here accounts for: the first build, this rebuild,
+        // or what was already being served. Any object's hash was taken
+        // before, so after a mistaken purge, a re-run and a copy-back of the
+        // old rows, the re-run's KLV was approved and played as the old
+        // run's leaves. An object nothing accounts for is replaced when the
+        // rows reproduce the recorded bytes, and otherwise left for an admin
+        // (`object_accounted_for`, and `force`).
+        let object_accounted_for = object_sha256.as_ref().is_none_or(|object| {
+            *object == stored_sha256 || *object == rebuilt_sha256 || *object == was_served
+        });
+        let rewritten = !object_present || force || (!object_accounted_for && matches);
         let served_sha256 = if rewritten {
             artifacts.put(&artifact_key, klv).await?;
-            rebuilt_sha256.clone()
+            Some(rebuilt_sha256.clone())
+        } else if object_accounted_for {
+            object_sha256.clone()
         } else {
-            hex::encode(Sha256::digest(artifacts.get(&artifact_key).await?))
+            None
         };
-        // What workers are sent to check the object against has to be what
-        // the object holds; `sha256` keeps the first hash. Set from the bytes
-        // actually stored, every time, rather than only after a rewrite: a
-        // rebuild cut off between its upload and this update (the request
-        // dropped, the update failing) left the row on the old hash, and a
-        // re-run found the object present, rewrote nothing, and never fixed
-        // it -- every worker refusing the job until someone forced it.
-        sqlx::query(
-            "UPDATE leave_generation_artifacts
-             SET served_sha256 = NULLIF($3, sha256)
-             WHERE job_id = $1 AND generation = $2",
-        )
-        .bind(job_id)
-        .bind(generation)
-        .bind(&served_sha256)
-        .execute(pool)
-        .await?;
+        // Set from the bytes actually stored, every time, rather than only
+        // after a rewrite: a rebuild cut off between its upload and this
+        // update (the request dropped, the update failing) left the row on
+        // the old hash, and a re-run found the object present, rewrote
+        // nothing, and never fixed it -- every worker refusing the job until
+        // someone forced it. `sha256` keeps the first hash.
+        if let Some(served) = &served_sha256 {
+            sqlx::query(
+                "UPDATE leave_generation_artifacts
+                 SET served_sha256 = NULLIF($3, sha256)
+                 WHERE job_id = $1 AND generation = $2",
+            )
+            .bind(job_id)
+            .bind(generation)
+            .bind(served)
+            .execute(pool)
+            .await?;
+        }
+        let served_sha256 = served_sha256.unwrap_or(was_served);
 
         report.push(ArtifactRebuild {
             generation,
             artifact_key,
             stored_sha256,
             served_sha256,
+            object_sha256,
+            object_accounted_for,
             rebuilt_sha256,
             matches,
             same_builder,

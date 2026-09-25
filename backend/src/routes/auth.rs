@@ -85,6 +85,29 @@ fn too_weak(password: &str, username: &str, email: &str) -> AppResult<bool> {
     Ok(entropy.score() < MIN_PASSWORD_SCORE)
 }
 
+
+/// One bare address: `local@domain`, nothing else. Mail goes to whatever this
+/// string is, so the check is on what a mail API would do with it rather than
+/// on RFC 5322: `x <victim@example.com>` and `victim@example.com,x@y` were
+/// accepted, each a different string -- past the taken-address check and the
+/// per-address notice limit -- that mailed the same inbox.
+fn is_bare_address(email: &str) -> bool {
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    email.len() <= 254
+        && !local.is_empty()
+        && local.len() <= 64
+        && !domain.contains('@')
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && email.chars().all(|c| {
+            c.is_ascii_graphic() && !matches!(c, '<' | '>' | ',' | ';' | ':' | '"' | '(' | ')' | '[' | ']' | '\\')
+        })
+}
+
 async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -99,7 +122,7 @@ async fn register(
     if username.len() < 3 || username.len() > 32 {
         err = err.with_field("username", "must be between 3 and 32 characters");
     }
-    if !email.contains('@') || email.len() < 3 {
+    if !is_bare_address(&email) {
         err = err.with_field("email", "must be a valid email address");
     }
     // Scored server-side; the client shows the same feedback but is not trusted.
@@ -569,4 +592,21 @@ async fn confirm_password_reset(
     // caller's browser.
     let jar = jar.remove(removal(session::SESSION_COOKIE));
     Ok((jar, Json(MessageBody { message: "password updated" })))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn only_a_bare_address_is_an_email() {
+        for good in ["a@example.com", "first.last+tag@mail.example.co.uk", "x_y-z@b.io"] {
+            assert!(super::is_bare_address(good), "{good}");
+        }
+        for bad in [
+            "x <victim@example.com>", "victim@example.com,other@x.com", "a@b", "@example.com",
+            "a@@example.com", "a@example..com", "a b@example.com", "a@example.com.", "\"a\"@example.com",
+            "a@.example.com", "a;b@example.com", "é@example.com",
+        ] {
+            assert!(!super::is_bare_address(bad), "{bad}");
+        }
+    }
 }

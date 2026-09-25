@@ -41,9 +41,11 @@ pub struct RateLimiters {
     /// bound on a guesser spread over many addresses. Ten times `login`, so
     /// that one address cannot lock an account out.
     pub login_account: Arc<Keyed>,
-    /// 10 API keys created per hour per account. `worker` is per key, and
-    /// revoking a key and making another would be a fresh bucket each time;
-    /// this bounds that churn. (An account-wide worker bucket was tried and
+    /// API keys created per account: a burst of 100 (the key cap), then 10
+    /// an hour. `worker` is per key, and revoking a key and making another
+    /// would be a fresh bucket each time; this bounds that churn without
+    /// holding back a contributor setting up many machines at once (at ten
+    /// an hour from the start, fifty machines took five hours). (An account-wide worker bucket was tried and
     /// was too tight for the hundred keys an account may hold: fifty idle
     /// machines filled it, and heartbeats, which are not retried, lapsed.)
     pub key_creation: Arc<Keyed>,
@@ -59,7 +61,11 @@ impl RateLimiters {
         let resets_per_hour = Quota::per_hour(NonZeroU32::new(5).unwrap());
         let logins_per_minute = Quota::per_minute(NonZeroU32::new(10).unwrap());
         let account_logins_per_minute = Quota::per_minute(NonZeroU32::new(100).unwrap());
-        let keys_per_hour = Quota::per_hour(NonZeroU32::new(10).unwrap());
+        // The burst is the key cap: setting up a machine per key at once is
+        // not held back. What refills slowly is churn -- revoking a key and
+        // making another, a fresh bucket each time.
+        let keys_per_hour = Quota::per_hour(NonZeroU32::new(10).unwrap())
+            .allow_burst(NonZeroU32::new(100).unwrap());
         Self {
             register: Arc::new(RateLimiter::keyed(per_hour)),
             worker: Arc::new(RateLimiter::keyed(per_second)),

@@ -107,10 +107,15 @@
       // Counting it as drift would make every upgrade read as data loss.
       const drifted = rebuild.filter((r) => !r.matches && r.same_builder).length;
       const rebuilt = rebuild.filter((r) => !r.same_builder).length;
+      // Left for an admin: workers refuse these until one is resolved.
+      const foreign = rebuild.filter((r) => !r.object_accounted_for && !r.rewritten).length;
       notice =
-        `Checked ${rebuild.length} generations: ${missing} restored, ` +
+        `Checked ${rebuild.length} generations: ${missing} rewritten, ` +
         `${drifted} differing from the recorded hash` +
-        (rebuilt > 0 ? `, ${rebuilt} built by a different MAGPIE builder.` : '.');
+        (rebuilt > 0 ? `, ${rebuilt} built by a different MAGPIE builder` : '') +
+        (foreign > 0
+          ? `; ${foreign} holding bytes nothing here accounts for, which workers refuse — restore the right object version or force a rebuild.`
+          : '.');
     } catch (e) {
       error = (e as Error).message;
     }
@@ -227,6 +232,7 @@
                 <th>Generation</th>
                 <th>Object</th>
                 <th>Hash</th>
+                <th>Served</th>
                 <th>Action</th>
               </tr>
             </thead>
@@ -246,6 +252,15 @@
                     {:else}
                       {row.matches ? 'matches' : 'differs from the recorded hash'}
                     {/if}
+                  </td>
+                  <td
+                    class="font-mono text-xs {row.object_accounted_for || row.rewritten
+                      ? ''
+                      : 'text-destructive'}"
+                    title={row.object_sha256 ?? 'missing'}
+                  >
+                    {row.served_sha256.slice(0, 12)}{#if !row.object_accounted_for && !row.rewritten}
+                      <span class="font-sans">— the object holds {row.object_sha256?.slice(0, 12)}, which nothing accounts for</span>{/if}
                   </td>
                   <td>{row.rewritten ? 'rewritten' : 'left alone'}</td>
                 </tr>
@@ -337,7 +352,7 @@
         />
       {:else if stats.leave_generation}
         <ProgressBar
-          value={Math.max(stats.leave_generation.current_generation - 1, 0)}
+          value={stats.leave_generation.generations_closed}
           max={stats.leave_generation.generation_count}
           label="generations closed"
         />

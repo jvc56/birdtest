@@ -36,8 +36,10 @@ START_EPOCH="$(date -u +%s)"
 DEST="s3://${BACKUP_BUCKET}/${BACKUP_PREFIX}/${STAMP}"
 DUMP_DIR="${WORKDIR}/dump"
 
-# `aws s3 cp` needs these when the bucket's default encryption is SSE-KMS and
-# the caller has no kms:Decrypt: the upload must name the key explicitly.
+# The key, named on every upload rather than left to the bucket's default
+# encryption, so an upload can never land under another key. (A multipart
+# upload -- anything past 8 MB -- also needs kms:Decrypt, which the key policy
+# grants the task only through S3; see infra/backup.tf.)
 sse_args=()
 if [[ -n "${BACKUP_KMS_KEY_ARN:-}" ]]; then
   sse_args=(--sse aws:kms --sse-kms-key-id "${BACKUP_KMS_KEY_ARN}")

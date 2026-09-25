@@ -107,6 +107,19 @@ impl DispatchHolds {
         DispatchHold { holds: self.clone(), job_id, kind, grace, committed: false }
     }
 
+    /// A [`HoldKind::Claims`] hold, unless one is already held on the job:
+    /// the check and the hold under one lock, so of two purges or deletes
+    /// arriving together exactly one gets it.
+    pub fn try_hold_claims(&self, job_id: Uuid, grace: std::time::Duration) -> Option<DispatchHold> {
+        let mut inner = self.0.lock().expect("dispatch holds poisoned");
+        let counts = inner.held.entry(job_id).or_insert([0, 0]);
+        if counts[HoldKind::Claims as usize] > 0 {
+            return None;
+        }
+        counts[HoldKind::Claims as usize] += 1;
+        Some(DispatchHold { holds: self.clone(), job_id, kind: HoldKind::Claims, grace, committed: false })
+    }
+
     /// Whether claims should skip the job.
     pub fn is_held(&self, job_id: Uuid) -> bool {
         self.0.lock().expect("dispatch holds poisoned").held.contains_key(&job_id)
@@ -746,4 +759,23 @@ pub async fn expected_data(
             tarball_date: row.get("tarball_date"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod holds_tests {
+    use super::*;
+
+    #[test]
+    fn only_one_claims_hold_is_taken_at_a_time() {
+        let holds = DispatchHolds::default();
+        let job = Uuid::new_v4();
+        let grace = std::time::Duration::from_secs(1);
+        let seeding = holds.hold(job, HoldKind::DispatchOnly, grace);
+        let first = holds.try_hold_claims(job, grace).expect("a seeding does not hold claims");
+        assert!(holds.try_hold_claims(job, grace).is_none());
+        assert!(holds.try_hold_claims(Uuid::new_v4(), grace).is_some(), "per job");
+        drop(first);
+        assert!(holds.try_hold_claims(job, grace).is_some());
+        drop(seeding);
+    }
 }

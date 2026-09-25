@@ -446,7 +446,7 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
     // overlaps the two. Without the guard a reaped row would come back
     // `ready`, and an admin would be handed a download of an export nobody
     // was sure had finished.
-    sqlx::query(
+    let marked = sqlx::query(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
              row_count = $5, positions_artifact_key = $6, positions_bytes = $7,
@@ -463,7 +463,18 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
     .bind(positions.as_ref().map(|(_, p)| p.sha256.as_str()))
     .bind(positions.as_ref().map(|(_, p)| p.rows))
     .execute(&state.pool)
-    .await?;
+    .await?
+    .rows_affected();
+    // No row to hand them to -- a purge or delete removed it while this
+    // built, or a new process reaped it -- so nothing will ever name these
+    // objects. Removed now rather than left to the thirty-day lifecycle rule.
+    if marked == 0 {
+        for key in std::iter::once(&key).chain(positions.as_ref().map(|(key, _)| key)) {
+            if let Err(err) = state.artifacts.delete(key).await {
+                tracing::warn!(%export_id, key, error = %err.message, "removing an unclaimed export failed");
+            }
+        }
+    }
     Ok(())
 }
 

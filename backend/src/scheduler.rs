@@ -630,6 +630,35 @@ async fn try_claim_from_job(
             });
             Ok(None)
         }
+        Acquired::NeedsZeroGeneration => {
+            let _ = tx.rollback().await;
+            // One build per job at a time: every claim finds the KLV missing
+            // until the first build lands, and each would otherwise start one.
+            static BUILDING: std::sync::Mutex<Vec<Uuid>> = std::sync::Mutex::new(Vec::new());
+            {
+                let mut building = BUILDING.lock().expect("zero-generation builds poisoned");
+                if building.contains(&job.id) {
+                    return Ok(None);
+                }
+                building.push(job.id);
+            }
+            let (spawn_state, spawn_job) = (state.clone(), job.clone());
+            tokio::spawn(async move {
+                let built =
+                    crate::jobs::registry::initialize_job_artifacts(&spawn_state, &spawn_job).await;
+                BUILDING
+                    .lock()
+                    .expect("zero-generation builds poisoned")
+                    .retain(|id| *id != spawn_job.id);
+                if let Err(err) = built {
+                    tracing::error!(
+                        job_id = %spawn_job.id, error = %err.message,
+                        "building a leave job's generation-0 KLV failed"
+                    );
+                }
+            });
+            Ok(None)
+        }
         Acquired::NeedsLeaveMerge { generation } => {
             // Committed, like `NoWork` and for the same reason: the one thing
             // this transaction may have written is a sweep deleting the cursor

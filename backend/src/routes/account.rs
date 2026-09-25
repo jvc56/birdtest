@@ -100,10 +100,14 @@ async fn create_key(
     // The limit is enforced here rather than in the schema, so this is the
     // only thing that enforces it.
     let mut tx = state.pool.begin().await?;
-    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+    // `deleted_at` rechecked under the lock: a request that authenticated
+    // before its account's deletion committed waited here for it, and then
+    // inserted a key after the delete had removed the account's keys.
+    sqlx::query("SELECT 1 FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
         .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("this account no longer exists"))?;
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
         .bind(user.id)
         .fetch_one(&mut *tx)

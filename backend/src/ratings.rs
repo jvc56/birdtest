@@ -220,6 +220,54 @@ async fn fit_and_store(
     let mut tx = db.begin().await?;
     lock_pool_fit(&mut tx, pool_id).await?;
     let pool = load_pool(&mut tx, pool_id).await?;
+
+    // The cheap question first: have the pool's jobs completed any games, or
+    // its members changed, since the last run? `games_completed` is each
+    // job's first-result-per-task running total, kept by the submission that
+    // stores the result, so an unchanged sum is unchanged evidence. Read
+    // before the matrix: a result committed in between makes the stored sum
+    // short of the fit, and the next sweep refits, which is the safe side.
+    let evidence_games: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(j.games_completed), 0)::bigint
+         FROM jobs j
+         JOIN job_game_pair_config c ON c.job_id = j.id
+         JOIN rating_pools pool      ON pool.id = $1
+         WHERE j.job_type = 'game_pairs'
+           AND j.variant = pool.variant
+           AND j.letterdist_id = pool.letterdist_id
+           AND j.layout_id = pool.layout_id
+           AND c.player1_config_id IN
+               (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)
+           AND c.player2_config_id IN
+               (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)",
+    )
+    .bind(pool_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if only_if_evidence_changed {
+        let last: Option<(Option<i64>, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT r.evidence_games,
+                    ARRAY(SELECT p.player_config_id FROM player_config_ratings p
+                           WHERE p.run_id = r.id ORDER BY p.player_config_id)
+             FROM rating_runs r
+             WHERE r.pool_id = $1 ORDER BY r.computed_at DESC, r.id DESC LIMIT 1",
+        )
+        .bind(pool_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let members: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1
+             ORDER BY player_config_id",
+        )
+        .bind(pool_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if last == Some((Some(evidence_games), members)) {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+    }
+
     let (members, matrix, pairs_used, jobs_used) = build_matrix(&mut tx, pool_id).await?;
 
     if only_if_evidence_changed {
@@ -228,8 +276,8 @@ async fn fit_and_store(
         // request dropped, or the fit failing after the membership committed
         // -- was never repaired when the config added or removed had no pairs
         // in the pool, since the count did not move.
-        let last: Option<(i64, Vec<Uuid>)> = sqlx::query_as(
-            "SELECT r.pairs_used,
+        let last: Option<(Uuid, i64, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT r.id, r.pairs_used,
                     ARRAY(SELECT p.player_config_id FROM player_config_ratings p
                            WHERE p.run_id = r.id ORDER BY p.player_config_id)
              FROM rating_runs r
@@ -240,9 +288,19 @@ async fn fit_and_store(
         .await?;
         let mut current = members.clone();
         current.sort();
-        if last == Some((pairs_used as i64, current)) {
-            tx.rollback().await?;
-            return Ok(None);
+        if let Some((run_id, pairs, last_members)) = last {
+            if pairs == pairs_used as i64 && last_members == current {
+                // The same evidence under a sum that moved (a run from before
+                // the sum was recorded, a hand-repaired counter): recorded, so
+                // the next sweep's cheap check answers instead of this build.
+                sqlx::query("UPDATE rating_runs SET evidence_games = $2 WHERE id = $1")
+                    .bind(run_id)
+                    .bind(evidence_games)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                return Ok(None);
+            }
         }
     }
 
@@ -261,8 +319,8 @@ async fn fit_and_store(
         // and the page, which reads the newest, would show the older one.
         "INSERT INTO rating_runs
              (pool_id, trigger, method, iterations, converged, pairs_used, jobs_used,
-              computed_at)
-         VALUES ($1, $2, 'bradley_terry_mm', $3, $4, $5, $6, clock_timestamp())
+              evidence_games, computed_at)
+         VALUES ($1, $2, 'bradley_terry_mm', $3, $4, $5, $6, $7, clock_timestamp())
          RETURNING id",
     )
     .bind(pool_id)
@@ -271,6 +329,7 @@ async fn fit_and_store(
     .bind(fit.converged)
     .bind(pairs_used as i64)
     .bind(jobs_used)
+    .bind(evidence_games)
     .fetch_one(&mut *tx)
     .await?;
 

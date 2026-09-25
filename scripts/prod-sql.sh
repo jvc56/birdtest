@@ -58,14 +58,25 @@ echo "running $task_arn" >&2
 # Polled without a cap. `aws ecs wait tasks-stopped` gives up after ten
 # minutes and exits, with no output, while the SQL goes on running and
 # commits -- and running it again would run it twice. A task ECS no longer
-# describes (it forgets stopped ones after about an hour: a laptop that slept
-# through the run) reads `None`, and has stopped too; a failed call reads
-# empty, and is asked again.
+# describes reads `None`: just after run-task (ECS is eventually consistent,
+# so it is asked again) or long after it stopped (ECS forgets stopped tasks
+# after about an hour: a laptop that slept through the run), which counts as
+# stopped once the task has been seen, or after five minutes of it. A failed
+# call reads empty, and is asked again.
+seen=false
+unseen=0
 while :; do
+  sleep 10
   status=$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
     --query 'tasks[0].lastStatus' --output text 2>/dev/null) || status=""
-  [[ "$status" == STOPPED || "$status" == None ]] && break
-  sleep 10
+  [[ "$status" == STOPPED ]] && break
+  if [[ "$status" == None ]]; then
+    unseen=$((unseen + 1))
+    { $seen || (( unseen >= 30 )); } && break
+  elif [[ -n "$status" ]]; then
+    seen=true
+    unseen=0
+  fi
 done
 
 # All of psql's output, page by page: one call returns at most 10,000 events
@@ -90,4 +101,10 @@ done
 
 exit_code=$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
   --query 'tasks[0].containers[0].exitCode' --output text)
+if [[ "$exit_code" == None ]]; then
+  # Forgotten by ECS: whether psql succeeded is in its output above, and the
+  # SQL may well have committed -- read that before running anything again.
+  echo "the task's exit status is no longer known; read its output above" >&2
+  exit 2
+fi
 [[ "$exit_code" == "0" ]] || { echo "psql exited $exit_code" >&2; exit 1; }

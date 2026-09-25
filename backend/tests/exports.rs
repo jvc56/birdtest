@@ -450,7 +450,8 @@ async fn wait_for_lock_waiter(db: &TestDb, statement: &str) {
 /// `exports::build`'s guard: a process starting while an export runs --
 /// a rolling deployment overlaps the two -- reaps its row, and the export's
 /// own task finishing afterwards must not bring it back `ready`, or an admin
-/// is handed an export nobody was sure had finished.
+/// is handed an export nobody was sure had finished; and it removes the
+/// objects it uploaded, which nothing will name.
 ///
 /// Deterministic: the export is held at its first read of the results until
 /// the row has been reaped, and the app runs on a pool of its own, named, so
@@ -508,7 +509,13 @@ async fn an_export_reaped_while_it_ran_is_not_brought_back_ready() {
         assert!(Instant::now() < deadline, "the export never reached its final update");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(bucket.keys().await.len(), 2, "the export did run to the end");
+    // It ran to the end -- and, finding its row gone from `running`, removed
+    // the two objects it had uploaded, which nothing would ever name.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !bucket.keys().await.is_empty() {
+        assert!(Instant::now() < deadline, "the unclaimed objects were left behind");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let (state_, error, _) = export_state(&db, id).await;
     assert_eq!(state_, "failed");

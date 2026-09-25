@@ -1546,7 +1546,7 @@ async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
 }
 
 /// A-ADMIN-19: a purge or delete clicked again while one is running is refused
-/// with 409. Each ran to completion on a task of its own, so a re-click
+/// with 409, and so are activating, deactivating and completing the job. Each ran to completion on a task of its own, so a re-click
 /// stacked a second behind the first's locks, and the first to finish ended
 /// the hold the other still relied on.
 #[tokio::test]
@@ -1570,6 +1570,17 @@ async fn a_second_purge_or_delete_is_refused_while_one_runs() {
     let (status, body) =
         send(&app, request("DELETE", &format!("/api/admin/jobs/{job}"), &headers)).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    // Nor does anything else wait out the purge on the job's row -- and a
+    // completion would finish a job the purge had just emptied.
+    for (path, body) in [
+        ("activate", json!({ "allocation": 50 })),
+        ("deactivate", json!({})),
+        ("complete", json!({})),
+    ] {
+        let (status, response) =
+            send(&app, post_json(&format!("/api/admin/jobs/{job}/{path}"), &refs, body)).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path}: {response}");
+    }
 
     drop(hold);
     let (status, body) =

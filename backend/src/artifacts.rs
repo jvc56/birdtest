@@ -122,6 +122,17 @@ impl ArtifactStore {
     }
 
     pub async fn get(&self, key: &str) -> AppResult<Vec<u8>> {
+        Ok(self.get_bytes(key).await?.to_vec())
+    }
+
+    /// The object's bytes as S3 handed them over, without a copy.
+    ///
+    /// Only a missing key is a 404. Every other failure -- throttling, a
+    /// timeout, credentials -- was one too, and a worker told a leave
+    /// generation's KLV does not exist does not retry: every leave worker's
+    /// run ended on a transient S3 error. They are 503 with a `Retry-After`.
+    pub async fn get_bytes(&self, key: &str) -> AppResult<axum::body::Bytes> {
+        use aws_sdk_s3::operation::get_object::GetObjectError;
         let object = self
             .client
             .get_object()
@@ -129,14 +140,17 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::not_found(format!("no artifact at {key}: {e}")))?;
+            .map_err(|e| match e.into_service_error() {
+                GetObjectError::NoSuchKey(_) => AppError::not_found(format!("no artifact at {key}")),
+                other => unavailable(format!("S3 get {key} failed: {other}")),
+            })?;
 
         let bytes = object
             .body
             .collect()
             .await
-            .map_err(|e| AppError::internal(format!("S3 read {key} failed: {e}")))?;
-        Ok(bytes.into_bytes().to_vec())
+            .map_err(|e| unavailable(format!("S3 read {key} failed: {e}")))?;
+        Ok(bytes.into_bytes())
     }
 }
 
@@ -212,5 +226,13 @@ impl MultipartUpload {
         {
             tracing::warn!(key = %self.key, %err, "could not abort a multipart upload");
         }
+    }
+}
+
+/// An object-store failure worth retrying: 503, asked back in thirty seconds.
+fn unavailable(message: String) -> AppError {
+    AppError {
+        retry_after: Some(30),
+        ..AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
 }

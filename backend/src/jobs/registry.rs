@@ -31,6 +31,10 @@ pub enum Acquired {
     /// been written yet. It is seeded on its own task, and the job has nothing
     /// to hand out until that commits.
     NeedsUniverse { generation: i32 },
+    /// Leave generation only: generation 1 is due but the zeroed KLV it plays
+    /// with was never written -- its build failed after the job's creation or
+    /// purge committed. Built on its own task; nothing to hand out until then.
+    NeedsZeroGeneration,
     /// Leave generation only: nothing is left to hand out or in flight, but
     /// accepted results are still staged, so whether the generation is complete
     /// is not yet known. The caller merges them, off the request; this job has
@@ -285,6 +289,20 @@ async fn generate_leave_gen(
         return Ok(Acquired::NeedsUniverse { generation });
     }
 
+    // Without it every claim went on to fail in `next_step` -- logged and
+    // skipped, for good -- until an admin happened to activate the job again.
+    if generation == 1
+        && !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM leave_generation_artifacts
+                            WHERE job_id = $1 AND generation = 0)",
+        )
+        .bind(job.id)
+        .fetch_one(&mut *conn)
+        .await?
+    {
+        return Ok(Acquired::NeedsZeroGeneration);
+    }
+
     if let Some(task_id) = next_available(&mut *conn, job.id, identity, Some(generation)).await? {
         let request = load_request(conn, template, task_id).await?;
         return Ok(Acquired::Task { task_id, request, created: false });
@@ -332,7 +350,7 @@ async fn insert_on_demand_task(
     .await?)
 }
 
-/// Validate, normalize and store a worker submission.
+/// Store a worker submission [`decode_result`] has decoded and checked.
 ///
 /// `first_result` says whether this is the first accepted result for its task,
 /// which the caller reads from the task's `accepted_count` under the task's row
@@ -349,8 +367,67 @@ pub async fn store_result(
     task_id: Uuid,
     claim_id: Uuid,
     first_result: bool,
-    payload: Box<serde_json::value::RawValue>,
+    decoded: DecodedResult,
 ) -> AppResult<ProgressDelta> {
+    match decoded {
+        DecodedResult::OpeningRack(record) => {
+            let racks: Vec<String> =
+                record.positions.iter().map(|p| p.rack.clone()).collect();
+            opening_rack::check_batch_against_task(conn, template, task_id, &racks).await?;
+            opening_rack::OpeningRackHandler::insert_record(conn, template, task_id, claim_id, &record)
+                .await?;
+            // One row per rack, and the unique index on (task_claim_id, rack)
+            // means the insert above would have failed on a duplicate, so the
+            // submission's length is its distinct-rack count. Racks never
+            // repeat across tasks either: each task analyses its own slice of
+            // the enumerated space.
+            Ok(ProgressDelta::first_result(first_result, 0, record.positions.len() as i64))
+        }
+        DecodedResult::Games(record) => {
+            game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
+            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
+        }
+        DecodedResult::GamePairs(record) => {
+            game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
+                .await?;
+            // Games, not pairs, for both job types: the pairs count is half of
+            // it and is derived where it is displayed.
+            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
+        }
+        DecodedResult::LeaveGeneration(record) => {
+            if first_result {
+                leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
+                    .await?;
+            } else {
+                leave_gen::credit_claim(conn, task_id, claim_id, &record).await?;
+            }
+            Ok(ProgressDelta::default())
+        }
+    }
+}
+
+/// A submission decoded into its job type's record and checked against
+/// everything the job alone decides.
+pub enum DecodedResult {
+    OpeningRack(<opening_rack::OpeningRackHandler as JobHandler>::Record),
+    Games(<game::GameHandler as JobHandler>::Record),
+    GamePairs(<game_pair::GamePairHandler as JobHandler>::Record),
+    LeaveGeneration(<leave_gen::LeaveGenHandler as JobHandler>::Record),
+}
+
+/// Decode and check a submission, before the submit path takes any lock.
+///
+/// Nothing here reads the database: the record is a function of the payload
+/// and the job's type, and the checks of the job's settings -- batch size,
+/// occurrence totals -- are the template's. Done inside the transaction, as it
+/// was, the claim and task rows stayed locked and a pool connection held for
+/// the decode -- tens of milliseconds for an ordinary result, a second at the
+/// 64 MiB ceiling. What needs the task's own row (an opening-rack batch's
+/// racks) is checked by [`store_result`].
+pub async fn decode_result(
+    template: &JobTemplate,
+    payload: Box<serde_json::value::RawValue>,
+) -> AppResult<DecodedResult> {
     /// Straight from the submission's text into its typed response. It went
     /// through a `serde_json::Value` first, which holds every object as a
     /// B-tree node and every key as its own allocation -- ten to twenty times
@@ -369,7 +446,7 @@ pub async fn store_result(
     /// it is tens to hundreds of milliseconds of computation with no `await`
     /// in it, and an async worker thread that does not yield can hold up every
     /// other request the server has (see `exports::upload_rows`). The hop costs
-    /// microseconds, against a transaction of a dozen round trips.
+    /// microseconds.
     async fn normalize<H>(payload: Box<serde_json::value::RawValue>) -> AppResult<H::Record>
     where
         H: JobHandler,
@@ -382,20 +459,9 @@ pub async fn store_result(
     }
 
     match &template.kind {
-        JobKind::OpeningRack { .. } => {
-            let record = normalize::<opening_rack::OpeningRackHandler>(payload).await?;
-            let racks: Vec<String> =
-                record.positions.iter().map(|p| p.rack.clone()).collect();
-            opening_rack::check_batch_against_task(conn, template, task_id, &racks).await?;
-            opening_rack::OpeningRackHandler::insert_record(conn, template, task_id, claim_id, &record)
-                .await?;
-            // One row per rack, and the unique index on (task_claim_id, rack)
-            // means the insert above would have failed on a duplicate, so the
-            // submission's length is its distinct-rack count. Racks never
-            // repeat across tasks either: each task analyses its own slice of
-            // the enumerated space.
-            Ok(ProgressDelta::first_result(first_result, 0, record.positions.len() as i64))
-        }
+        JobKind::OpeningRack { .. } => Ok(DecodedResult::OpeningRack(
+            normalize::<opening_rack::OpeningRackHandler>(payload).await?,
+        )),
         JobKind::Games { config, .. } => {
             let record = normalize::<game::GameHandler>(payload).await?;
             // The batch size was fixed when the task was handed out -- it is
@@ -405,8 +471,7 @@ pub async fn store_result(
                 record.all_games.games,
                 super::plausibility::games_dispatched(config.games_per_batch, false),
             )?;
-            game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
-            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
+            Ok(DecodedResult::Games(record))
         }
         JobKind::GamePairs { config, .. } => {
             let record = normalize::<game_pair::GamePairHandler>(payload).await?;
@@ -415,11 +480,7 @@ pub async fn store_result(
                 record.all_games.games,
                 super::plausibility::games_dispatched(config.pairs_per_batch, true),
             )?;
-            game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
-                .await?;
-            // Games, not pairs, for both job types: the pairs count is half of
-            // it and is derived where it is displayed.
-            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
+            Ok(DecodedResult::GamePairs(record))
         }
         JobKind::LeaveGeneration { config, .. } => {
             let record = normalize::<leave_gen::LeaveGenHandler>(payload).await?;
@@ -428,13 +489,7 @@ pub async fn store_result(
             // on receipt, and an impossible count does not only mislead, it
             // overflows the merge that sums it.
             super::plausibility::check_rack_occurrence_total(&record.racks, config.num_iterations)?;
-            if first_result {
-                leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
-                    .await?;
-            } else {
-                leave_gen::credit_claim(conn, task_id, claim_id, &record).await?;
-            }
-            Ok(ProgressDelta::default())
+            Ok(DecodedResult::LeaveGeneration(record))
         }
     }
 }

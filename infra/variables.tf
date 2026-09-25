@@ -199,6 +199,12 @@ variable "alert_email" {
     SNS sends a subscription confirmation that has to be accepted once.
   EOT
   type        = string
+
+  # A typo leaves the subscription pending forever, and the alarms go nowhere.
+  validation {
+    condition     = can(regex("^[^@\\s<>,;]+@[^@\\s<>,;]+\\.[^@\\s<>,;]+$", var.alert_email))
+    error_message = "alert_email must be one plain email address."
+  }
 }
 
 variable "task_cpu" {
