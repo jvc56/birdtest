@@ -775,6 +775,13 @@ CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned', 'declined'
 CREATE TABLE task_claims (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id              UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- The task's job, copied at claim time and never changed (a task never
+    -- moves between jobs). Without it "this contributor's claims in this job"
+    -- -- the public feed's `?worker=` -- meant every claim the contributor ever
+    -- made, or every task of the job: seconds for a heavy contributor. With it,
+    -- one range of the identity indexes below. No foreign key of its own:
+    -- claims go with their task, and their task with its job.
+    job_id               UUID NOT NULL,
     claim_token          UUID NOT NULL,
     state                claim_state NOT NULL DEFAULT 'claimed',
     claimed_by_user_id   UUID REFERENCES users(id),
@@ -1511,7 +1518,7 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
 -- detail view and live push) asks "how many of this job's claims completed
 -- in the last hour" (the job list's `stalled` flag reads
--- `jobs.last_completed_at` instead), and task_claims has no job column, so
+-- `jobs.last_completed_at` instead), and no index on task_claims leads with the job, so
 -- the alternative plan walks every task of the job and every claim of each
 -- -- the job's whole history, for a question about its last hour. Through
 -- this index the scan is bounded by the fleet's recent completions instead,
@@ -1520,9 +1527,17 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
 -- Partial for the reason the unique indexes above are.
-CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id)
+-- Keyed by identity, job and completion time: an identity's completed claims
+-- in one job, newest first, are one backward range -- the results feed's
+-- `?worker=` reads a page through them whatever the contributor's share of the
+-- job. Only completed claims have a `completed_at`; the rest sit at the NULL
+-- end, outside the range. A lookup by identity alone still uses the leading
+-- column. The completion time adds nothing to a claim's updates: completing
+-- one changes `state`, which the open-claims index's predicate reads, so that
+-- update was never a HOT one, and a heartbeat touches neither.
+CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id, job_id, completed_at)
     WHERE claimed_by_user_id IS NOT NULL;
-CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid)
+CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
     WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
 -- detail page's counts, which sum `accepted_count` and so read the heap

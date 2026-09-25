@@ -46,7 +46,10 @@ server {
     # to run as a module, and the page stayed blank.
     location /_app/immutable/ {
         try_files $uri =404;
-        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        # Not `always`: that put a year's `immutable` on the 404 too, and a
+        # browser kept a missing chunk missing -- through a rollback or a
+        # release that brought the same content-hashed name back.
+        add_header Cache-Control "public, max-age=31536000, immutable";
         add_header X-Content-Type-Options "nosniff" always;
     }
 

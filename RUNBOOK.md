@@ -906,6 +906,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    DR_REGION=<the region the copy is built in>
    THIRD_REGION=<a third region, up, for the copy's own replicas>
    REPLICA_REGION=<the lost stack's dr_region>
+   # <account>: this account's id, the lost stack's (a drill: §6).
    REPLICA=s3://birdtest-backups-dr-<account>/pg
    MANIFEST=$(aws s3 ls --region $REPLICA_REGION "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
    DR_STORAGE_GB=$(aws s3 cp --region $REPLICA_REGION "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4))')
@@ -1089,29 +1090,83 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   region of this one). The manual drill exists to find the steps that live only
   in someone's head. In this account the drill's copy would hold §5's names --
   the `-dr` buckets are global, its IAM roles account-wide -- and a real region
-  loss would fail at step 1 on the first of them. Afterwards, tear the copy
-  down, in the `dr` workspace and with the scratch account's credentials:
+  loss would fail at step 1 on the first of them.
+
+  §5 reads production's replicas (`birdtest-backups-dr-<account>`,
+  `birdtest-artifacts-dr-<account>`, with production's account id), which the
+  scratch account cannot. Stage them first, through this machine, so neither
+  account is granted anything on the other's buckets:
 
   ```bash
+  # With PRODUCTION's credentials. PROD_REPLICA_REGION is production's
+  # dr_region; PROD_ACCOUNT its account id.
+  STAGE=$(mktemp -d)
+  PROD_REPLICA=s3://birdtest-backups-dr-$PROD_ACCOUNT/pg
+  M=$(aws s3 ls --region $PROD_REPLICA_REGION "$PROD_REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
+  if [ -n "$M" ] && [ -n "$PROD_ACCOUNT" ]; then
+    aws s3 cp --recursive --region $PROD_REPLICA_REGION "$PROD_REPLICA/${M%.manifest.json}/" "$STAGE/pg/${M%.manifest.json}/"
+    aws s3 cp --region $PROD_REPLICA_REGION "$PROD_REPLICA/$M" "$STAGE/pg/$M"
+    for P in leaves inputs; do
+      aws s3 sync --region $PROD_REPLICA_REGION "s3://birdtest-artifacts-dr-$PROD_ACCOUNT/$P" "$STAGE/$P"
+    done
+  else echo "set PROD_ACCOUNT and PROD_REPLICA_REGION first"; fi
+  # Then with the SCRATCH account's credentials: one bucket stands for both
+  # replicas. SCRATCH_ACCOUNT is its id.
+  aws s3 mb --region $PROD_REPLICA_REGION s3://birdtest-drill-stage-$SCRATCH_ACCOUNT
+  aws s3 sync --region $PROD_REPLICA_REGION "$STAGE" s3://birdtest-drill-stage-$SCRATCH_ACCOUNT/
+  rm -rf "$STAGE"   # production's data: users' emails and password hashes
+  ```
+
+  Then run §5 in the scratch account with `REPLICA_REGION=$PROD_REPLICA_REGION`
+  and `REPLICA=s3://birdtest-drill-stage-$SCRATCH_ACCOUNT/pg`. Step 4 syncs
+  `leaves/` and `inputs/` from the same bucket. Step 3's `kms:Decrypt` on the
+  replica's key does not apply: the staging bucket uses S3's own encryption.
+  Skip step 6: DNS stays on production. The copy holds production's data, so
+  tear it down the day the drill ends. Use the scratch account's credentials,
+  the `dr` workspace, and the drill's `DR_REGION` and `THIRD_REGION`:
+
+  ```bash
+  # Nothing writes while the buckets empty: the service is stopped, and the
+  # 03:00 backup and the derived builder are unscheduled.
+  terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars \
+    -var desired_count=0 -var scheduled_tasks_enabled=false
   aws rds modify-db-instance --region $DR_REGION --db-instance-identifier birdtest-dr \
     --no-deletion-protection --apply-immediately
-  # The backups buckets hold 30-day GOVERNANCE-locked versions; the copy's
-  # replica too (in THIRD_REGION). Every version, markers included, removed:
-  for B in "$(terraform -chdir=infra output -raw backups_bucket)" birdtest-dr-backups-dr-<account>; do
-    aws s3api list-object-versions --bucket "$B" \
-      --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
-      --output json > /tmp/versions.json
-    aws s3api delete-objects --bucket "$B" --bypass-governance-retention --delete file:///tmp/versions.json
-  done
+  # Destroy refuses a bucket that is not empty, and versioning keeps every
+  # version, delete markers included. A listing page holds at most 1,000 --
+  # all delete-objects takes -- so one page at a time (--no-paginate; the
+  # CLI otherwise merges every page into one request that is refused), until
+  # the listing is empty. The backups buckets' versions are GOVERNANCE-locked
+  # for 30 days, so only they take --bypass-governance-retention. A version
+  # that is not deleted stops the loop for that bucket.
+  empty() {  # bucket region [--bypass-governance-retention]
+    while aws s3api list-object-versions --bucket "$1" --region "$2" --no-paginate \
+        --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
+        --output json > /tmp/versions.json \
+      && grep -q '"Key"' /tmp/versions.json; do
+      aws s3api delete-objects --bucket "$1" --region "$2" $3 \
+        --delete file:///tmp/versions.json --query Errors --output json > /tmp/errors.json
+      if grep -q '"Key"' /tmp/errors.json; then echo "$1: not deleted:"; cat /tmp/errors.json; return 1; fi
+    done
+  }
+  A=$(aws sts get-caller-identity --query Account --output text)
+  empty birdtest-dr-backups-$A $DR_REGION --bypass-governance-retention
+  empty birdtest-dr-artifacts-$A $DR_REGION
+  empty birdtest-dr-backups-dr-$A $THIRD_REGION --bypass-governance-retention
+  empty birdtest-dr-artifacts-dr-$A $THIRD_REGION
   terraform -chdir=infra destroy -var-file=prod.tfvars -var-file=dr.tfvars
+  # Destroy leaves the instance's final snapshot behind, by design (rds.tf).
+  aws rds delete-db-snapshot --region $DR_REGION --db-snapshot-identifier birdtest-dr-final
+  aws s3 rb --force --region $PROD_REPLICA_REGION s3://birdtest-drill-stage-$A
   terraform -chdir=infra workspace select default
   terraform -chdir=infra workspace delete dr
   mv infra/dr.tfvars infra/dr.tfvars.drill-$(date +%Y%m%d)
   ```
 
-  (`delete-objects` takes at most 1,000 keys a call: run the pair again until
-  the listing is empty. A real §5 must not start from the drill's `dr.tfvars`,
-  so it is moved aside.)
+  (A source bucket is emptied before its replica, so replication has nothing
+  left to write into the replica. If `empty` stops on a bucket, fix what it
+  printed and run it again. A real §5 must not start from the drill's
+  `dr.tfvars`, so it is moved aside.)
 
 ---
 

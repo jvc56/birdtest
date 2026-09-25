@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 507 backend tests (the per-tier counts above are
+--run-ignored all` runs 508 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
 they had drifted by up to 17).
 
@@ -1839,6 +1839,12 @@ below.
   `public_api::the_results_feed_paginates_and_filters_without_counting`,
   `worker_api::the_results_feed_walks_every_row_exactly_once`,
   `worker_api::the_results_feed_filters_by_who_a_name_is`.)*
+- `A-PUBLIC-3b` A `?worker=` page is read through the contributor's claims in
+  the job, newest completion first, and pages exactly in the unfiltered feed's
+  order, including inside one opening-rack batch. A name that is both an
+  account and a pseudonym is both contributors' work, merged (twenty-seventh
+  audit). *(Covered:
+  `public_api::the_filtered_feed_pages_through_a_contributors_claims`.)*
 - `A-PUBLIC-4` `rack_lookup` finds an analysed rack, however it is typed, with
   its whole ranked list. A rack with no analysis yet is a `200` with an empty
   list, not a 404 as this entry first said — the rack is a valid question

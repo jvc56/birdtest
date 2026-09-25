@@ -337,7 +337,7 @@ pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> 
 /// The scan is the same either way: the planner reaches the expired claims
 /// through the partial index on open claims -- one entry per claim currently in
 /// flight across the fleet -- and filters by job afterwards, because
-/// `task_claims` has no job column to narrow on. Run per job, a claim request
+/// no index on `task_claims` leads with the job. Run per job, a claim request
 /// therefore paid that scan once per candidate, for a set of rows that does not
 /// depend on the job at all. Run once over all of them it is a single pass and
 /// a single round trip.
@@ -845,15 +845,16 @@ async fn issue_claim(
     let claim_token = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO task_claims
-             (task_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
+             (task_id, job_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
               magpie_version)
-         VALUES ($1, $2, $3, $4, $5)",
+         VALUES ($1, $6, $2, $3, $4, $5)",
     )
     .bind(task_id)
     .bind(claim_token)
     .bind(identity.user_id())
     .bind(identity.anon_uuid())
     .bind(caps.magpie_version.to_string())
+    .bind(job.id)
     .execute(&mut **tx)
     .await?;
 

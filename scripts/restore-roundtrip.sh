@@ -78,8 +78,8 @@ INSERT INTO tasks (job_id, seed, state, accepted_count)
 SELECT id, 42, 'completed', 1 FROM jobs
 WHERE NOT EXISTS (SELECT 1 FROM tasks);
 
-INSERT INTO task_claims (task_id, claim_token, state, claimed_by_user_id, completed_at)
-SELECT t.id, gen_random_uuid(), 'completed',
+INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+SELECT t.id, t.job_id, gen_random_uuid(), 'completed',
        (SELECT id FROM users WHERE username = 'roundtrip'), now()
 FROM tasks t
 WHERE NOT EXISTS (SELECT 1 FROM task_claims);

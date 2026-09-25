@@ -63,8 +63,8 @@ async fn claim(
     };
     let claim: Uuid = sqlx::query_scalar(
         "INSERT INTO task_claims
-             (task_id, claim_token, state, claimed_by_user_id, claimed_by_anon_uuid, completed_at)
-         VALUES ($1, gen_random_uuid(), $2::claim_state, $3, $4,
+             (task_id, job_id, claim_token, state, claimed_by_user_id, claimed_by_anon_uuid, completed_at)
+         VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), gen_random_uuid(), $2::claim_state, $3, $4,
                  CASE WHEN $2 = 'completed'
                       THEN now() - make_interval(mins => $5) END)
          RETURNING id",
@@ -424,11 +424,11 @@ async fn contributions_are_attributed_to_each_identity_across_both_kinds() {
          tasks AS (
              INSERT INTO tasks (job_id, seed, state, accepted_count)
              SELECT $1, 1000 + n, 'completed'::task_state, 1 FROM numbered
-             RETURNING id, seed
+             RETURNING id, job_id, seed
          )
          INSERT INTO task_claims
-             (task_id, claim_token, state, claimed_by_anon_uuid, completed_at)
-         SELECT t.id, gen_random_uuid(), 'completed'::claim_state, w.uuid, now()
+             (task_id, job_id, claim_token, state, claimed_by_anon_uuid, completed_at)
+         SELECT t.id, t.job_id, gen_random_uuid(), 'completed'::claim_state, w.uuid, now()
          FROM tasks t JOIN numbered w ON t.seed = 1000 + w.n",
     )
     .bind(job)

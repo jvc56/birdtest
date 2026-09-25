@@ -1124,7 +1124,7 @@ What the numbers settled:
   rather than twice (once to decide the pool was stale, once to fit).
 - **Recent completions are read from a time index or a column.** The ETA (on
   every detail view and live push) counts a job's claims completed in the last
-  hour. `task_claims` has no job column, so it used to walk every task of the
+  hour. No index on `task_claims` leads with the job, so it used to walk every task of the
   job and every claim of each — the job's whole history, for a question about
   its last hour — on a job whose age is exactly what makes the walk long. A
   partial index on completed claims by time (`task_claims_completed_idx`)
@@ -1176,17 +1176,23 @@ What the numbers settled:
   request at a million opening-rack records, on a public route. The name is
   resolved to an account or an anonymous worker first (two indexed probes; a
   name that is nobody's is an empty page), and the filter is an equality on
-  `task_claims`' indexed identity columns: 1–3 ms for the same requests. The
-  filtered query is sent unprepared, so it is planned for the identity asked
-  about — a heavy contributor is found at the head of the job's feed index and
-  a rare one through their own claims, and a cached generic plan picks one of
-  those for everybody. That plan still judged a contributor's share of *this*
-  job from their share of all claims, so someone who worked hard in another
-  job and never in this one walked all of it to return nothing (5.8 s cold at
-  two million records). Their claims in this job are now found first: none is
-  an empty page, and up to a thousand are read through directly
-  (`task_claim_id = ANY(...)`); past that they are dense enough in the job for
-  the walk.
+  `task_claims`' indexed identity columns. The page is then read through the
+  contributor's own claims in the job, newest completion first — one backward
+  range of the identity indexes, keyed `(identity, job_id, completed_at)` —
+  joined to each claim's records until the page is full. A claim's records
+  share its completion time (the same transaction), so this is the feed's own
+  order, and the cursor is the claim's time, so paging is exact. It costs a
+  page whoever the contributor is: 0.06–1.4 ms warm, 30 ms cold, at two
+  million claims and three million opening-rack records. The two readings it
+  replaced each failed someone. Walking the job's feed newest first and keeping
+  the contributor's rows costs the distance to their fiftieth: all of the job
+  for someone who never worked it (5.8 s cold at two million records), and
+  everything since for someone whose work was early (7.4 s for 150,000 early
+  results in a 1.5-million-result job). Reading through a list of their claims
+  in the job needs the list to be short, and the threshold between the two, a
+  thousand claims, only moved the walk to the contributors just past it. A name that is both an account and a pseudonym
+  reads both ranges and merges them. The opening-rack page is chosen before
+  its best moves and accounts are joined, so only its fifty rows are.
 - **A leave claim neither sorts the generation nor reads what is staged.**
   Selection used to order on `(occurrence_count, rack)` through an index on the
   count alone. Counts tie in their millions — every rack starts at zero and the
@@ -2073,7 +2079,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
    ORDER BY (j.claims_issued - j.claims_baseline)::float / j.allocation ASC, j.created_at ASC
    ```
 
-3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: `task_claims` has no job column, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all. Skipped entirely while the process is younger than the heartbeat timeout — see [Task States](#task-states) for why a restarted server has to hear from the fleet before it judges it.
+3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: no index on `task_claims` leads with the job, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all. Skipped entirely while the process is younger than the heartbeat timeout — see [Task States](#task-states) for why a restarted server has to hear from the fleet before it judges it.
 
 4. **Task acquisition** — strategy-dependent:
    - **Re-dispatch first**, under the job's dispatch lock like everything else here: `SELECT ... FOR UPDATE SKIP LOCKED` on the job's `available` tasks — a lapsed claim's task, or one with redundancy left to fill — **excluding any task this worker already holds a slot on**. Redundancy means independent workers; without the exclusion, a worker holding a slot on the oldest open task is offered it again on every attempt, refused by the per-identity unique index each time, and gets no work at all.
@@ -5870,6 +5876,13 @@ CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned', 'declined'
 CREATE TABLE task_claims (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id              UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- The task's job, copied at claim time and never changed (a task never
+    -- moves between jobs). Without it "this contributor's claims in this job"
+    -- -- the public feed's `?worker=` -- meant every claim the contributor ever
+    -- made, or every task of the job: seconds for a heavy contributor. With it,
+    -- one range of the identity indexes below. No foreign key of its own:
+    -- claims go with their task, and their task with its job.
+    job_id               UUID NOT NULL,
     claim_token          UUID NOT NULL,
     state                claim_state NOT NULL DEFAULT 'claimed',
     claimed_by_user_id   UUID REFERENCES users(id),
@@ -6606,7 +6619,7 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
 -- detail view and live push) asks "how many of this job's claims completed
 -- in the last hour" (the job list's `stalled` flag reads
--- `jobs.last_completed_at` instead), and task_claims has no job column, so
+-- `jobs.last_completed_at` instead), and no index on task_claims leads with the job, so
 -- the alternative plan walks every task of the job and every claim of each
 -- -- the job's whole history, for a question about its last hour. Through
 -- this index the scan is bounded by the fleet's recent completions instead,
@@ -6615,9 +6628,17 @@ CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE sta
 CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
 -- Partial for the reason the unique indexes above are.
-CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id)
+-- Keyed by identity, job and completion time: an identity's completed claims
+-- in one job, newest first, are one backward range -- the results feed's
+-- `?worker=` reads a page through them whatever the contributor's share of the
+-- job. Only completed claims have a `completed_at`; the rest sit at the NULL
+-- end, outside the range. A lookup by identity alone still uses the leading
+-- column. The completion time adds nothing to a claim's updates: completing
+-- one changes `state`, which the open-claims index's predicate reads, so that
+-- update was never a HOT one, and a heartbeat touches neither.
+CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id, job_id, completed_at)
     WHERE claimed_by_user_id IS NOT NULL;
-CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid)
+CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
     WHERE claimed_by_anon_uuid IS NOT NULL;
 -- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
 -- detail page's counts, which sum `accepted_count` and so read the heap
@@ -6667,9 +6688,10 @@ the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md`,
 the seventeenth's `AUDIT_FINDINGS_13.md`, the eighteenth's `AUDIT_FINDINGS_14.md`,
 the nineteenth's `AUDIT_FINDINGS_15.md`, the twentieth's `AUDIT_FINDINGS_16.md`,
 the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
-`AUDIT_FINDINGS_18.md`, the twenty-third's `AUDIT_FINDINGS_19.md` and the
-twenty-fourth's `AUDIT_FINDINGS_20.md` and the twenty-fifth's
-`AUDIT_FINDINGS_21.md` and the twenty-sixth's `AUDIT_FINDINGS_22.md`.
+`AUDIT_FINDINGS_18.md`, the twenty-third's `AUDIT_FINDINGS_19.md`, the
+twenty-fourth's `AUDIT_FINDINGS_20.md`, the twenty-fifth's
+`AUDIT_FINDINGS_21.md`, the twenty-sixth's `AUDIT_FINDINGS_22.md` and the
+twenty-seventh's `AUDIT_FINDINGS_23.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says

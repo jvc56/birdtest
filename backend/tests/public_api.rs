@@ -102,12 +102,15 @@ async fn game_result_at(
     .unwrap();
     let claim: Uuid = sqlx::query_scalar(
         "INSERT INTO task_claims
-             (task_id, claim_token, state, claimed_by_user_id, claimed_by_anon_uuid, completed_at)
-         VALUES ($1, gen_random_uuid(), 'completed', $2, $3, now()) RETURNING id",
+             (task_id, job_id, claim_token, state, claimed_by_user_id, claimed_by_anon_uuid, completed_at)
+         VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), gen_random_uuid(), 'completed', $2, $3,
+                 $4::timestamptz)
+         RETURNING id",
     )
     .bind(task)
     .bind(user)
     .bind(anon)
+    .bind(submitted_at)
     .fetch_one(&db.pool)
     .await
     .unwrap();
@@ -432,6 +435,120 @@ async fn the_results_feed_paginates_and_filters_without_counting() {
     assert_eq!(body["items"], json!([]));
     assert_eq!(body["total"], -1);
     assert!(body.get("next_cursor").is_none(), "{body}");
+}
+
+/// A-PUBLIC-3b: a contributor's page is read through their own claims, newest
+/// completion first, and pages exactly -- inside one opening-rack batch as
+/// well as across batches -- in the unfiltered feed's order. A name that is
+/// both an account and an anonymous pseudonym is both contributors' work,
+/// merged in that order.
+#[tokio::test]
+async fn the_filtered_feed_pages_through_a_contributors_claims() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let job = opening_rack_job(&db, 3).await;
+
+    // Claims and completes the next batch, answering every rack the same way.
+    let complete = |headers: Vec<(&'static str, String)>| {
+        let app = app.clone();
+        async move {
+            let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            let (status, assignment) =
+                send(&app, post_json("/api/worker/task", &headers, claim_body("1.0.0", &[]))).await;
+            assert_eq!(status, StatusCode::OK, "{assignment}");
+            let racks = assignment["task_request"]["racks"].as_array().unwrap().clone();
+            // A new anonymous worker submits as the identity it was just given.
+            let minted = assignment["worker_uuid"].as_str().map(str::to_string);
+            let headers = match &minted {
+                Some(uuid) if headers.is_empty() => vec![("x-worker-uuid", uuid.as_str())],
+                _ => headers,
+            };
+            let result = json!({
+                "racks": racks.iter().map(|rack| json!({
+                    "rack": rack,
+                    "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
+                })).collect::<Vec<_>>()
+            });
+            let (status, body) = send(
+                &app,
+                post_json(
+                    "/api/worker/result",
+                    &headers,
+                    json!({ "claim_token": assignment["claim_token"], "result": result }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            minted
+        }
+    };
+
+    let a = complete(Vec::new()).await.unwrap();
+    let b = complete(Vec::new()).await.unwrap();
+    // An account whose name is `b`'s pseudonym.
+    let b_pseudonym = birdtest::auth::public_anon_id(b.parse().unwrap());
+    let user = db.user(&b_pseudonym, false).await;
+    let raw_key = "bt_".to_string() + &"c".repeat(64);
+    sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)")
+        .bind(user)
+        .bind(birdtest::auth::api_key::hash_key(&raw_key))
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let bearer = vec![("authorization", format!("Bearer {raw_key}"))];
+    complete(vec![("x-worker-uuid", a.clone())]).await;
+    complete(bearer.clone()).await;
+    complete(vec![("x-worker-uuid", b.clone())]).await;
+    complete(vec![("x-worker-uuid", a.clone())]).await;
+
+    // Walks the feed at two a page, returning (task, rack, contributor) per
+    // item and the page sizes.
+    let walk = |query: String| {
+        let app = app.clone();
+        async move {
+            let mut items = Vec::new();
+            let mut sizes = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let path = match &cursor {
+                    Some(c) => format!("/api/jobs/{job}/results?per_page=2{query}&cursor={c}"),
+                    None => format!("/api/jobs/{job}/results?per_page=2{query}"),
+                };
+                let (status, body) = send(&app, get_request(&path, &[])).await;
+                assert_eq!(status, StatusCode::OK, "{path}: {body}");
+                let page = body["items"].as_array().unwrap();
+                sizes.push(page.len());
+                items.extend(page.iter().map(|item| {
+                    let who = item["username"].as_str().or(item["anon_id"].as_str());
+                    (
+                        item["task_id"].as_str().unwrap().to_string(),
+                        item["rack"].as_str().unwrap().to_string(),
+                        who.unwrap().to_string(),
+                    )
+                }));
+                match body["next_cursor"].as_str() {
+                    Some(next) => cursor = Some(next.to_string()),
+                    None => return (items, sizes),
+                }
+                assert!(sizes.len() < 20, "the cursor does not advance");
+            }
+        }
+    };
+
+    let (all, _) = walk(String::new()).await;
+    assert_eq!(all.len(), 18, "six batches of three");
+    let a_pseudonym = birdtest::auth::public_anon_id(a.parse().unwrap());
+    let by = |who: &str| all.iter().filter(|item| item.2 == who).cloned().collect::<Vec<_>>();
+
+    let (mine, sizes) = walk(format!("&worker={a_pseudonym}")).await;
+    assert_eq!(mine, by(&a_pseudonym), "the unfiltered feed's order, every record once");
+    assert_eq!(sizes, [2, 2, 2, 2, 1], "pages break inside a batch");
+
+    // `b`'s pseudonym is also the account's name: both contributors' work.
+    let (both, _) = walk(format!("&worker={b_pseudonym}")).await;
+    let expected: Vec<_> = all.iter().filter(|item| item.2 == b_pseudonym).cloned().collect();
+    assert_eq!(expected.len(), 9, "two anonymous batches and one of the account's");
+    assert_eq!(both, expected);
 }
 
 /// A-PUBLIC-4: `?rack=` on an opening-rack job returns an analysed rack's

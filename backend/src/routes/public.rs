@@ -244,42 +244,22 @@ async fn job_results(
     };
     let worker_predicate = worker_predicate(worker.as_ref());
 
-    // A named contributor's claims in this job, found first. Read the other
-    // way -- the job's records newest first, keeping that contributor's --
-    // the planner judges their share of this job from their share of all
-    // claims, so someone who worked hard in another job and never in this
-    // one walked all of it (5.8 s cold over two million records) to return
-    // nothing, on a public route. None here is an empty page; a few, and the
-    // page is read through them (`position_analysis_records_claim_idx`, and
-    // `game_results`' key); past that, their rows are dense enough in the job
-    // for the walk to find a page soon.
-    let claims_here: Option<Vec<Uuid>> = match (&worker, job.job_type) {
-        (Some(_), JobType::OpeningRack | JobType::Games | JobType::GamePairs) => {
-            let ids: Vec<Uuid> = sqlx::query_scalar(&format!(
-                "SELECT c.id FROM task_claims c JOIN tasks t ON t.id = c.task_id
-                 WHERE t.job_id = $1 {worker_predicate}
-                 LIMIT {}",
-                MAX_CLAIMS_READ_DIRECTLY + 1
-            ))
-            .persistent(false)
-            .bind(id)
-            .bind(worker_user)
-            .bind(worker_anon)
-            .fetch_all(&state.read_pool)
-            .await?;
-            if ids.is_empty() {
-                return Ok(Json(super::CursorPage {
-                    items: Vec::new(),
-                    total: -1,
-                    per_page: limit,
-                    next_cursor: None,
-                }));
-            }
-            (ids.len() <= MAX_CLAIMS_READ_DIRECTLY).then_some(ids)
-        }
-        _ => None,
-    };
-    let claims_clause = if claims_here.is_some() { "AND r.task_claim_id = ANY($7)" } else { "" };
+    // A named contributor's page is read through their own claims in this
+    // job, newest completion first: one backward range of
+    // `task_claims_user_idx` / `_anon_idx`, which are keyed by identity, job
+    // and completion time, joined to each claim's records until the page is
+    // full. It costs a page whoever the contributor is. Read the other way --
+    // the job's records newest first, keeping that contributor's -- the cost
+    // was the distance from the head of the feed to their fiftieth record: a
+    // contributor who never worked the job walked all of it (5.8 s cold over
+    // two million records) to return nothing, and one whose work was all early
+    // in a long job walked everything since, on a public route. A claim's
+    // records share its completion time (an opening-rack batch's
+    // `submitted_at` is the same transaction's `now()`; a games result's is
+    // taken moments later, in the same transaction), so this is the feed's
+    // own order; the cursor is the claim's time, so paging is exact either
+    // way.
+    let claims = worker.as_ref().map(filtered_claims);
 
     // Every branch below reads its rows through the job id the record tables
     // now carry, rather than by joining `tasks` to find out which rows belong
@@ -295,22 +275,45 @@ async fn job_results(
             // to now(), which is transaction time, so every record of one batch
             // shares it exactly and it is not a key on its own.
             let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
+            // The page is chosen first -- from the records alone, or from the
+            // contributor's claims and their records -- and only its rows are
+            // joined to their claim, best move and account. Joined first, a
+            // contributor with many records here had every one of them joined
+            // to its moves before the sort picked fifty. The LIMIT keeps the
+            // subquery from being flattened into the joins.
+            let page = match &claims {
+                None => "SELECT r.id, r.task_id, r.rack, r.num_moves, r.submitted_at,
+                                r.task_claim_id, r.submitted_at AS at
+                         FROM position_analysis_records r
+                         WHERE r.job_id = $1
+                           AND ($4::timestamptz IS NULL
+                                OR (r.submitted_at, r.id) < ($4, $5))
+                         ORDER BY r.submitted_at DESC, r.id DESC
+                         LIMIT $6"
+                    .to_string(),
+                Some(claims) => format!(
+                    "SELECT r.id, r.task_id, r.rack, r.num_moves, r.submitted_at,
+                            r.task_claim_id, cl.completed_at AS at
+                     FROM ({claims}) cl
+                     JOIN position_analysis_records r ON r.task_claim_id = cl.id
+                     WHERE $4::timestamptz IS NULL
+                           OR (cl.completed_at, r.id) < ($4, $5)
+                     ORDER BY cl.completed_at DESC, r.id DESC
+                     LIMIT $6"
+                ),
+            };
             let sql = format!(
-                "SELECT r.id, r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
-                        m.equity AS best_equity, r.num_moves, r.submitted_at,
+                "WITH page AS ({page})
+                 SELECT p.id, p.task_id, p.rack, m.move AS best_move, m.score AS best_score,
+                        m.equity AS best_equity, p.num_moves, p.submitted_at, p.at,
                         u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
-                 FROM position_analysis_records r
-                 JOIN task_claims c ON c.id = r.task_claim_id
+                 FROM page p
+                 JOIN task_claims c ON c.id = p.task_claim_id
                  LEFT JOIN position_analysis_moves m
-                     ON m.record_id = r.id AND m.rank = 1
+                     ON m.record_id = p.id AND m.rank = 1
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
-                 WHERE r.job_id = $1
-                   {worker_predicate}
-                   {claims_clause}
-                   AND ($4::timestamptz IS NULL
-                        OR (r.submitted_at, r.id) < ($4, $5))
-                 ORDER BY r.submitted_at DESC, r.id DESC
-                 LIMIT $6",
+                 WHERE TRUE {worker_predicate}
+                 ORDER BY p.at DESC, p.id DESC",
             );
             let rows = sqlx::query(&sql)
             // Planned for the values it is run with, not cached: see
@@ -321,18 +324,14 @@ async fn job_results(
             .bind(worker_anon)
             .bind(after_time)
             .bind(after_id)
-            .bind(limit);
-            let rows = match &claims_here {
-                Some(ids) => rows.bind(ids),
-                None => rows,
-            }
+            .bind(limit)
             .fetch_all(&state.read_pool)
             .await?;
 
             if rows.len() as i64 == limit {
                 if let Some(last) = rows.last() {
                     next_cursor = Some(super::encode_cursor(&[
-                        last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
+                        last.get::<chrono::DateTime<chrono::Utc>, _>("at")
                             .timestamp_micros()
                             .to_string(),
                         last.get::<i64, _>("id").to_string(),
@@ -363,23 +362,39 @@ async fn job_results(
             // rather than as the thing that decides which rows belong to the
             // job.
             let (after_time, after_claim) = game_result_cursor(cursor.as_deref());
+            let page = match &claims {
+                None => "SELECT r.task_claim_id, r.submitted_at AS at
+                         FROM game_results r
+                         WHERE r.job_id = $1
+                           AND ($4::timestamptz IS NULL
+                                OR (r.submitted_at, r.task_claim_id) < ($4, $5))
+                         ORDER BY r.submitted_at DESC, r.task_claim_id DESC
+                         LIMIT $6"
+                    .to_string(),
+                Some(claims) => format!(
+                    "SELECT r.task_claim_id, cl.completed_at AS at
+                     FROM ({claims}) cl
+                     JOIN game_results r ON r.task_claim_id = cl.id
+                     WHERE $4::timestamptz IS NULL
+                           OR (cl.completed_at, cl.id) < ($4, $5)
+                     ORDER BY cl.completed_at DESC, cl.id DESC
+                     LIMIT $6"
+                ),
+            };
             let sql = format!(
-                "SELECT r.task_claim_id, r.task_id, r.games, r.wins, r.losses, r.ties,
+                "WITH page AS ({page})
+                 SELECT r.task_claim_id, r.task_id, r.games, r.wins, r.losses, r.ties,
                         r.p1_score_mean, r.p1_score_sd, r.p2_score_mean, r.p2_score_sd,
                         r.divergent_games, r.divergent_wins, r.divergent_losses,
-                        r.divergent_ties, r.submitted_at,
+                        r.divergent_ties, r.submitted_at, p.at,
                         t.seed, u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
-                 FROM game_results r
+                 FROM page p
+                 JOIN game_results r ON r.task_claim_id = p.task_claim_id
                  JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
-                 WHERE r.job_id = $1
-                   {worker_predicate}
-                   {claims_clause}
-                   AND ($4::timestamptz IS NULL
-                        OR (r.submitted_at, r.task_claim_id) < ($4, $5))
-                 ORDER BY r.submitted_at DESC, r.task_claim_id DESC
-                 LIMIT $6",
+                 WHERE TRUE {worker_predicate}
+                 ORDER BY p.at DESC, p.task_claim_id DESC",
             );
             let rows = sqlx::query(&sql)
             .persistent(worker.is_none())
@@ -388,18 +403,14 @@ async fn job_results(
             .bind(worker_anon)
             .bind(after_time)
             .bind(after_claim)
-            .bind(limit);
-            let rows = match &claims_here {
-                Some(ids) => rows.bind(ids),
-                None => rows,
-            }
+            .bind(limit)
             .fetch_all(&state.read_pool)
             .await?;
 
             if rows.len() as i64 == limit {
                 if let Some(last) = rows.last() {
                     next_cursor = Some(super::encode_cursor(&[
-                        last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
+                        last.get::<chrono::DateTime<chrono::Utc>, _>("at")
                             .timestamp_micros()
                             .to_string(),
                         last.get::<Uuid, _>("task_claim_id").to_string(),
@@ -579,19 +590,40 @@ async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<Worker
     Ok((user_id.is_some() || anon_uuid.is_some()).then_some(WorkerFilter { user_id, anon_uuid }))
 }
 
+/// A named contributor's completed claims in the job (`$1`), from the cursor's
+/// time (`$4`) back, as `(id, completed_at)`: each identity's is one backward
+/// range of its index, `(identity, job_id, completed_at)`, which holds only
+/// completed claims above NULL. A name that is both an account and an
+/// anonymous pseudonym reads both ranges and merges them, rather than an `OR`
+/// that no single index range serves and would sort every claim of both.
+fn filtered_claims(worker: &WorkerFilter) -> String {
+    let range = |column: &str, param: &str| {
+        format!(
+            "SELECT c.id, c.completed_at FROM task_claims c
+             WHERE c.{column} = {param}::uuid AND c.job_id = $1
+               AND c.completed_at IS NOT NULL AND c.state = 'completed'
+               AND ($4::timestamptz IS NULL OR c.completed_at <= $4)"
+        )
+    };
+    match (worker.user_id, worker.anon_uuid) {
+        (Some(_), None) => range("claimed_by_user_id", "$2"),
+        (None, Some(_)) => range("claimed_by_anon_uuid", "$3"),
+        _ => format!(
+            "{} UNION ALL {}",
+            range("claimed_by_user_id", "$2"),
+            range("claimed_by_anon_uuid", "$3")
+        ),
+    }
+}
+
 /// The feed queries' worker clause, over `$2` (an account) and `$3` (an
 /// anonymous worker). Every variant mentions both, typed, so the statement
 /// prepares whichever are NULL.
 ///
-/// A filtered feed is sent unprepared (`persistent(false)`), so Postgres plans
-/// it for the identity actually asked about. The right plan differs by two
-/// orders of magnitude with who that is -- a heavy contributor is found at the
-/// head of the job's feed index, a rare one through their own claims -- and a
-/// cached generic plan picks one for everybody.
-/// Up to this many claims of a named contributor in a job, a filtered feed is
-/// read through the claims themselves rather than by walking the job.
-const MAX_CLAIMS_READ_DIRECTLY: usize = 1000;
-
+/// A filtered feed is sent unprepared (`persistent(false)`), so it is planned
+/// for the values it is run with: the claim range's bound, `completed_at <= $4`,
+/// is an index condition only once `$4 IS NULL` has been decided, which a
+/// cached generic plan cannot do.
 fn worker_predicate(worker: Option<&WorkerFilter>) -> &'static str {
     match worker {
         None => "AND $2::uuid IS NULL AND $3::uuid IS NULL",

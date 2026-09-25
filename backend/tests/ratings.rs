@@ -102,8 +102,8 @@ async fn game_result(db: &TestDb, job: Uuid, tally: (i32, i32, i32), pent: Optio
     .await
     .unwrap();
     let claim: Uuid = sqlx::query_scalar(
-        "INSERT INTO task_claims (task_id, claim_token, state, claimed_by_anon_uuid, completed_at)
-         VALUES ($1, gen_random_uuid(), 'completed', $2, now()) RETURNING id",
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_anon_uuid, completed_at)
+         VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), gen_random_uuid(), 'completed', $2, now()) RETURNING id",
     )
     .bind(task)
     .bind(worker)
@@ -422,8 +422,8 @@ async fn redundant_copy(db: &TestDb, job: Uuid, task: Uuid, pent: [i32; 5], seco
         .await
         .unwrap();
     let claim: Uuid = sqlx::query_scalar(
-        "INSERT INTO task_claims (task_id, claim_token, state, claimed_by_anon_uuid, completed_at)
-         VALUES ($1, gen_random_uuid(), 'completed', $2, now()) RETURNING id",
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_anon_uuid, completed_at)
+         VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), gen_random_uuid(), 'completed', $2, now()) RETURNING id",
     )
     .bind(task)
     .bind(worker)

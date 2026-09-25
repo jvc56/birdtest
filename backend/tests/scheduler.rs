@@ -633,8 +633,8 @@ async fn a_task_at_redundancy_is_not_handed_to_a_third_worker() {
         for claim_state in claim_states {
             let holder = anon(&db).await;
             sqlx::query(
-                "INSERT INTO task_claims (task_id, claim_token, state, claimed_by_anon_uuid)
-                 VALUES ($1, $2, $3::claim_state, $4)",
+                "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_anon_uuid)
+                 VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), $2, $3::claim_state, $4)",
             )
             .bind(task)
             .bind(Uuid::new_v4())
@@ -748,8 +748,8 @@ async fn one_worker_never_holds_two_live_claims_on_one_task() {
         assert_ne!(task_of(&db, second.claim_token).await, task, "{worker:?} got its own task's other slot");
 
         let err = sqlx::query(
-            "INSERT INTO task_claims (task_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid)
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO task_claims (task_id, job_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid)
+             VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), $2, $3, $4)",
         )
         .bind(task)
         .bind(Uuid::new_v4())
