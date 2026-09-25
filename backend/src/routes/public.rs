@@ -104,11 +104,8 @@ async fn list_jobs(
                  AND EXISTS (SELECT 1 FROM worker_data_gaps g
                               WHERE g.job_id = j.id
                                 AND g.reported_at > now() - interval '24 hours')
-                 AND NOT EXISTS (SELECT 1 FROM task_claims c
-                                 JOIN tasks t ON t.id = c.task_id
-                                 WHERE t.job_id = j.id
-                                   AND c.state = 'completed'
-                                   AND c.completed_at > now() - interval '24 hours')
+                 AND (j.last_completed_at IS NULL
+                      OR j.last_completed_at < now() - interval '24 hours')
                  AND NOT EXISTS (SELECT 1 FROM task_claims c
                                  JOIN tasks t ON t.id = c.task_id
                                  WHERE t.job_id = j.id AND c.state = 'claimed')

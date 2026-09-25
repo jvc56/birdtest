@@ -820,4 +820,12 @@ async fn malformed_paths_and_queries_answer_json() {
         send_raw(&app, Request::get("/api/jobs?page=many").body(Body::empty()).unwrap()).await;
     assert_eq!(response.status, StatusCode::BAD_REQUEST, "{response:?}");
     assert_eq!(response.body["code"], "bad_request", "{response:?}");
+    // And an endpoint that does not exist, or a method one does not take.
+    let response =
+        send_raw(&app, Request::get("/api/no-such-thing").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "{response:?}");
+    assert_eq!(response.body["code"], "not_found", "{response:?}");
+    let response = send_raw(&app, Request::delete("/api/jobs").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED, "{response:?}");
+    assert_eq!(response.body["code"], "method_not_allowed", "{response:?}");
 }

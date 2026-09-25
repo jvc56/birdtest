@@ -22,6 +22,8 @@ pub fn router() -> Router<AppState> {
         .route("/api/me", get(me))
         .route("/api/me/api-keys", get(list_keys).post(create_key))
         .route("/api/me/api-keys/:id", patch(set_key_active).delete(revoke_key))
+        // As the auth routes: nothing here takes more than a label.
+        .layer(axum::extract::DefaultBodyLimit::max(super::auth::SMALL_BODY_BYTES))
 }
 
 #[derive(Serialize)]

@@ -67,8 +67,20 @@ variable "db_max_wal_size_mb" {
 }
 
 variable "db_allocated_storage" {
-  type    = number
-  default = 20
+  description = <<-EOT
+    The database's storage in GiB. Autoscaling grows it up to five times this;
+    a value below the current (autoscaled) size is ignored rather than shrunk,
+    and a value above it grows the volume. RUNBOOK.md §5 sets it for the DR
+    copy from the size of the dump being restored.
+  EOT
+  type        = number
+  default     = 20
+}
+
+variable "db_apply_immediately" {
+  description = "Apply database class and Multi-AZ changes at once, not in the next maintenance window. Either way RDS may restart the instance."
+  type        = bool
+  default     = true
 }
 
 variable "db_backup_retention_days" {

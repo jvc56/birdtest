@@ -396,6 +396,17 @@ async fn a_username_is_taken_and_signs_in_whatever_its_case() {
     assert_eq!(response.json()["username"], "Josh", "the account's own spelling");
 }
 
+/// A-AUTH-4d: the auth routes take small bodies. A megabyte "username" was
+/// accepted and became a megabyte key in the per-username login limiter, kept
+/// until its sweep -- a few addresses could run the task out of memory.
+#[tokio::test]
+async fn an_oversized_auth_body_is_refused() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let response = login(&app, &"x".repeat(64 * 1024), PASSWORD).await;
+    assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE, "{response:?}");
+}
+
 /// A-AUTH-5: a weak password is refused, and so is one derived from the
 /// username or the email address -- each of which would score as strong
 /// without them as context, so it is the context that refuses it.

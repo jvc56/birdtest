@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 490 backend tests.
+--run-ignored all` runs 494 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -1227,8 +1227,10 @@ permanent.
   task is done. *(Covered:
   `finish::an_opening_rack_job_completes_once_its_racks_are_handed_out_and_all_accepted`,
   `finish::a_declined_opening_rack_task_keeps_its_job_active_until_it_is_done`.)*
-- `I-STATS-9d` A finish check overtaken by a purge does not complete the job,
-  and an SPRT job hands out nothing past its cap. *(Covered:
+- `I-STATS-9d` A finish check overtaken by a purge does not complete the job
+  -- by either witness: the claim counter below what was observed, or a purge
+  counted meanwhile however many claims followed it (nineteenth audit) -- and
+  an SPRT job hands out nothing past its cap. *(Covered:
   `admin_api::a_finish_check_overtaken_by_a_purge_does_not_complete_the_job`,
   `worker_api::sprt_jobs_hand_out_nothing_past_their_cap`.)*
 - `I-STATS-11` The stats payload cache serves a payload until it expires or is
@@ -1483,6 +1485,11 @@ below.
   case. *(Covered:
   `auth_routes::a_username_is_taken_and_signs_in_whatever_its_case`.)*
   (Thirteenth audit; the sign-in half, fourteenth.)
+- `A-AUTH-4d` The auth and account routes refuse bodies over 16 KiB (`413`),
+  and a rate-limit key longer than 128 bytes is kept as its digest. *(Covered:
+  `auth_routes::an_oversized_auth_body_is_refused`,
+  `ratelimit::key_tests::a_long_key_is_one_bucket_kept_small`.)* (Nineteenth
+  audit.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
   scored the new password without the account's context. *(Covered:
@@ -1706,6 +1713,10 @@ below.
   `public_api::the_job_list_paginates_and_clamps_its_page_size`,
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`; ties had no
   `id` tie-break.)*
+- `A-PUBLIC-1c` The job list's `stalled` flag is set for an active job with a
+  decline and no accepted result in a day, and cleared by a result.
+  *(Covered: `public_api::the_job_list_flags_a_stalled_job`.)* (Nineteenth
+  audit: nothing tested it.)
 - `A-PUBLIC-1b` `?status=` filters the job list and its total. *(Covered:
   `public_api::the_job_list_filters_by_status`.)* (Eighteenth audit.) Deleting
   a job ends its open streams (`sse::tests::closing_a_job_ends_its_streams`).
@@ -1819,7 +1830,8 @@ silent.
   `X-Content-Type-Options: nosniff`. *(Covered:
   `boundaries::api_responses_are_not_sniffed`.)* (Sixteenth audit.)
 - `A-BOUND-12` A malformed id in a path is a JSON `404` and a malformed query a
-  JSON `400`, like every other failure. *(Covered:
+  JSON `400`, like every other failure -- as are an unknown endpoint (`404`) and
+  a method an endpoint does not take (`405`, nineteenth audit). *(Covered:
   `boundaries::malformed_paths_and_queries_answer_json`.)* (Seventeenth audit.)
 
 ---
@@ -1873,12 +1885,17 @@ branch's copy.
 Client→server results are not only parsed: each runs through its job type's
 validation, as a submission would, so a captured result the server would
 refuse fails here.
-MAGPIE's half, in `test/contribute_test.c`, is two tests:
+MAGPIE's half, in `test/contribute_test.c`, is four tests:
 `test_contract_fixtures_carry_every_key_contribute_reads` (every key
-`contribute` reads off a server message is in its fixture) and
+`contribute` reads off a server message is in its fixture),
 `test_results_carry_every_key_the_server_reads` (the serializers a task's
 result is built with still produce every key the result fixtures carry, so a
-key renamed in MAGPIE fails there rather than every submission).
+key renamed in MAGPIE fails there rather than every submission),
+`test_only_a_data_shutdown_is_waited_out_for_a_set_aside_job` (the wait-or-exit
+decision on each of the three shutdown fixtures) and
+`test_the_claim_body_matches_the_claim_fixture` (the claim body, built from the
+fixture's version and ids, has its keys and values). MAGPIE's sanitizer CI
+shard runs them (`contribute` in its `rest` shard).
 
 Beyond the wire, `contribute_test.c` holds MAGPIE's regression tests for what
 the contribute path plays and how it talks. Two came from the eleventh audit:

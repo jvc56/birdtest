@@ -291,6 +291,12 @@ pub(crate) async fn try_lock_job_dispatch_now(
 /// in between leaves it below what was observed, and the update does nothing.
 /// Returns whether the job was completed.
 ///
+/// `purged_since` is a second witness, asked after the update and before its
+/// commit: a purge of a small job, then as many fresh claims as the check
+/// observed, all between its reads and its update, would pass the first. It
+/// is `DispatchHolds::claims_holds_taken` compared with a count read before
+/// the check read anything.
+///
 /// `decided` is the SPRT verdict the check completed a games job on, with the
 /// units it had, and is stored with the completion (`jobs.sprt_decided_*`).
 pub async fn complete_unless_purged(
@@ -298,9 +304,11 @@ pub async fn complete_unless_purged(
     job_id: Uuid,
     observed_claims_issued: i64,
     decided: Option<(crate::stats::sprt::SprtResult, u64)>,
+    purged_since: impl Fn() -> bool,
 ) -> AppResult<bool> {
     let status = decided.map(|(sprt, _)| sprt.status.as_str());
-    Ok(sqlx::query(
+    let mut tx = pool.begin().await?;
+    let completed = sqlx::query(
         "UPDATE jobs SET status = 'completed',
                          sprt_decided_status = $3, sprt_decided_llr = $4, sprt_decided_units = $5
          WHERE id = $1 AND status = 'active' AND claims_issued >= $2",
@@ -310,10 +318,19 @@ pub async fn complete_unless_purged(
     .bind(status)
     .bind(decided.map(|(sprt, _)| sprt.llr))
     .bind(decided.map(|(_, units)| units as i64))
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected()
-        > 0)
+        > 0;
+    // Asked with the job's row locked: a purge that has not yet committed
+    // waits for this commit, and then purges the completed job as it would
+    // any other.
+    if completed && purged_since() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(completed)
 }
 
 pub(crate) async fn load_player_spec(

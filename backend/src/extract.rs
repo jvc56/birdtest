@@ -112,10 +112,19 @@ where
             .map(|axum::extract::Path(value)| ApiPath(value))
             .map_err(|rejection| {
                 use axum::extract::rejection::PathRejection;
+                use axum::extract::path::ErrorKind;
+                let server_fault = match &rejection {
+                    PathRejection::MissingPathParams(_) => true,
+                    PathRejection::FailedToDeserializePathParams(failed) => matches!(
+                        failed.kind(),
+                        ErrorKind::WrongNumberOfParameters { .. } | ErrorKind::UnsupportedType { .. }
+                    ),
+                    _ => false,
+                };
                 match rejection {
                     // A route and its handler that disagree about the path:
                     // the server's fault, not the request's.
-                    PathRejection::MissingPathParams(_) => {
+                    _ if server_fault => {
                         AppError::internal(format!("path extraction failed: {rejection}"))
                     }
                     // The parser's own words (UUID grammar and the like)

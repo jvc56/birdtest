@@ -1159,16 +1159,21 @@ async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None).await.unwrap());
+    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || false).await.unwrap());
     assert_eq!(status(&db).await, "active");
 
-    // With no purge in between the counter has only grown, and it completes.
+    // The counter has grown past what was observed -- but a purge came and
+    // went (the second witness): the completion is rolled back.
     sqlx::query("UPDATE jobs SET claims_issued = 6 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None).await.unwrap());
+    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || true).await.unwrap());
+    assert_eq!(status(&db).await, "active");
+
+    // With no purge in between the counter has only grown, and it completes.
+    assert!(birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || false).await.unwrap());
     assert_eq!(status(&db).await, "completed");
 }
 
@@ -1586,6 +1591,107 @@ async fn a_second_purge_or_delete_is_refused_while_one_runs() {
     let (status, body) =
         send(&app, post_json(&format!("/api/admin/jobs/{job}/purge"), &refs, json!({}))).await;
     assert!(status.is_success(), "once it has finished: {body}");
+}
+
+/// A-ADMIN-20: a purge that waits for a rating fit (it marks every pool for a
+/// refit under their fit locks) does not hold its contributors' rows while it
+/// waits. It gave their counters back first, and every submission of theirs,
+/// for any job, waited on the purge -- holding a pool connection -- for as
+/// long as the fit ran.
+#[tokio::test]
+async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
+    let db = TestDb::new().await;
+    let purged = db.games_job(1, 2).await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let refs: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    // One anonymous worker completes a task of the job to be purged...
+    let (status, claim) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    let uuid = claim["worker_uuid"].as_str().unwrap().to_string();
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": claim["claim_token"], "result": games_result(2, 1) }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // ...and holds a claim on another job.
+    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1").bind(purged).execute(&db.pool).await.unwrap();
+    db.games_job(1, 2).await;
+    let (status, other) = send(
+        &app,
+        post_json("/api/worker/task", &[("x-worker-uuid", uuid.as_str())], claim_body("1.0.0", &[])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{other}");
+
+    // A fit is running on a pool: its lock is held on a side connection.
+    let pool_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO rating_pools (name, variant, letterdist_id, layout_id, anchor_player_config_id)
+         SELECT 'pool', j.variant, j.letterdist_id, j.layout_id, c.player1_config_id
+         FROM jobs j JOIN job_game_config c ON c.job_id = j.id WHERE j.id = $1
+         RETURNING id",
+    )
+    .bind(purged)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let mut fit = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(2, hashtext($1::text))")
+        .bind(pool_id)
+        .execute(&mut *fit)
+        .await
+        .unwrap();
+
+    let purge = {
+        let app = app.clone();
+        let refs: Vec<(String, String)> = refs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        tokio::spawn(async move {
+            let refs: Vec<(&str, &str)> = refs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            send(&app, post_json(&format!("/api/admin/jobs/{purged}/purge"), &refs, json!({}))).await
+        })
+    };
+    // The purge is waiting on the fit's lock.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                            WHERE wait_event_type = 'Lock' AND wait_event = 'advisory')",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "the purge never reached the fit's lock");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    // The worker's submission for the other job goes through meanwhile.
+    let started = std::time::Instant::now();
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": other["claim_token"], "result": games_result(2, 1) }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "the submission waited on the purge");
+
+    fit.commit().await.unwrap();
+    let (status, body) = purge.await.unwrap();
+    assert!(status.is_success(), "{body}");
 }
 
 /// A-ADMIN-17: a worker request's `last_seen_at` touch does not wait on its

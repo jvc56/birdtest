@@ -100,12 +100,16 @@ resource "aws_db_instance" "main" {
   final_snapshot_identifier = "${local.name}-final"
   deletion_protection       = true
 
+  # Class and Multi-AZ changes now rather than at the next maintenance
+  # window (up to a week): scaling up under the CPU alarm, or RUNBOOK §1's
+  # closing apply putting Multi-AZ back, otherwise waited for it.
+  apply_immediately = var.db_apply_immediately
+
   lifecycle {
-    # allocated_storage too: storage autoscaling grows it, and an apply that
-    # set it back to the variable would be asking RDS to shrink the volume,
-    # which it refuses -- every apply after the first autoscaling step failed.
-    # The variable is the starting size; max_allocated_storage is the bound.
-    ignore_changes = [password, allocated_storage]
+    # Not allocated_storage: the provider already ignores the variable being
+    # below an autoscaled size, and ignoring it here as well made raising the
+    # variable -- the way to grow the volume ahead of need -- do nothing.
+    ignore_changes = [password]
   }
 
   tags = local.tags
@@ -124,8 +128,11 @@ resource "aws_db_event_subscription" "db_storage" {
   source_type = "db-instance"
   source_ids  = [aws_db_instance.main.identifier]
   # "failure" too: an instance that has failed is the other thing nobody
-  # would otherwise hear about until the site was down.
-  event_categories = ["low storage", "failure"]
+  # would otherwise hear about until the site was down. "notification" for the
+  # early warning: allocation past 80% of the autoscaling ceiling
+  # (RDS-EVENT-0225) is there, as are low storage burst credits and critically
+  # low memory; "failure" says only that the ceiling has been reached.
+  event_categories = ["low storage", "failure", "notification"]
   tags             = local.tags
 
   # RDS checks it may publish when the subscription is made; the topic policy

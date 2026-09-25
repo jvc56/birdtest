@@ -26,7 +26,12 @@
     api
       .job(jobId)
       .then((value) => (stats = value))
-      .catch((e) => (error = e.message));
+      // Only while there is nothing to show: a late failure after the stream
+      // has delivered stats would otherwise hide them for good on a job no
+      // longer changing.
+      .catch((e) => {
+        if (stats === null) error = e.message;
+      });
     // The stream carries the same payload as the REST call, so an update is a
     // straight replacement rather than a merge.
     // A live payload also clears an error the first load hit (a deploy's

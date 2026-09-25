@@ -45,6 +45,16 @@ pub fn app(state: state::AppState) -> Router {
         .nest("/api/admin", routes::ratings::admin_router())
         .nest("/api", routes::public::router())
         .nest("/api", routes::ratings::public_router())
+        // Answered in the API's shape, like every other failure: axum's own
+        // were an empty 404 and an empty 405.
+        .fallback(|| async { error::AppError::not_found("no such endpoint") })
+        .method_not_allowed_fallback(|| async {
+            error::AppError::new(
+                axum::http::StatusCode::METHOD_NOT_ALLOWED,
+                "method_not_allowed",
+                "that endpoint does not take this method",
+            )
+        })
         // The pages get their headers from Nginx; the API, which the ALB
         // serves straight from here, did not have this one. Nothing it
         // answers should be sniffed into something else.

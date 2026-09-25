@@ -2045,7 +2045,7 @@ async fn purge_body(
     // meant to start it over. Active and inactive jobs keep their state.
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
-                         tasks_total = 0, tasks_completed = 0,
+                         tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
                          sprt_decided_status = NULL, sprt_decided_llr = NULL,
                          sprt_decided_units = NULL,
                          status = CASE WHEN status = 'completed' THEN 'inactive'::job_status
@@ -2123,9 +2123,10 @@ async fn purge_body(
     // purged job that far behind, heading every candidate list until it had
     // caught up.
     crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
-    contributions.give_back(&mut tx).await?;
     // One matrix build per pool on the next sweep, which is what the sweep
-    // did every time before it had its cheap check.
+    // did every time before it had its cheap check. Before the give-back:
+    // this can wait out a running fit, and waiting with every contributor's
+    // row locked stalled every submission of theirs, for any job.
     crate::ratings::mark_every_pool_for_refit(&mut tx).await?;
     // Exports describe results this purge deletes. A row left saying `ready`
     // would hand an admin -- and, once the job completed again, every
@@ -2133,6 +2134,8 @@ async fn purge_body(
     // longer holds any of it. Deleted with everything else; the objects go
     // once this commits.
     let export_objects = crate::exports::purge(&mut tx, id).await?;
+    // Last, and so held for as long as the commit takes: see `Contributions`.
+    contributions.give_back(&mut tx).await?;
     tx.commit().await?;
     hold.committed();
     super::worker::push_after_change(&state, id);
@@ -2222,9 +2225,10 @@ async fn delete_body(
     if deleted.rows_affected() == 0 {
         return Err(AppError::not_found("no such job"));
     }
-    contributions.give_back(&mut tx).await?;
-    // As a purge does: the pools this job fed must refit.
+    // As a purge does, and before the give-back for the same reason: the
+    // pools this job fed must refit, and marking them can wait out a fit.
     crate::ratings::mark_every_pool_for_refit(&mut tx).await?;
+    contributions.give_back(&mut tx).await?;
     tx.commit().await?;
     hold.committed();
     // Nothing to push: the job is gone. Its open streams are ended; the pages

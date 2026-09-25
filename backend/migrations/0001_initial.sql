@@ -467,6 +467,13 @@ CREATE TABLE jobs (
     -- partial restore recomputes them (RUNBOOK 2.3).
     tasks_total     BIGINT NOT NULL DEFAULT 0 CHECK (tasks_total >= 0),
     tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    -- When a result was last accepted for the job, to the minute (the
+    -- submission that stores one sets it at most once a minute). The job
+    -- list's `stalled` flag asks "none in a day"; answered from the claims, it
+    -- joined every task of the job to the day's completions -- growing with
+    -- the job's whole history, on every list view. Display only; a purge
+    -- clears it, a partial restore recomputes it (RUNBOOK 2.3).
+    last_completed_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ

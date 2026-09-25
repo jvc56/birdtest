@@ -72,12 +72,13 @@ INSTANCE_CLASS=$(aws rds describe-db-instances --region "$REGION" --db-instance-
 # carry over: without one the restored instance cannot grow at all. RDS
 # refuses a ceiling less than 10% above the allocation, which the source's own
 # is once autoscaling has taken it near the top (and it reads `None` if it was
-# ever switched off), so it is at least a quarter above.
+# ever switched off), so it is at least 30% above.
 read -r ALLOCATED MAX_STORAGE < <(aws rds describe-db-instances --region "$REGION" \
   --db-instance-identifier birdtest \
   --query 'DBInstances[0].[AllocatedStorage,MaxAllocatedStorage]' --output text)
 [[ "$MAX_STORAGE" =~ ^[0-9]+$ ]] || MAX_STORAGE=0
-MIN_CEILING=$(( (ALLOCATED * 125 + 99) / 100 ))
+# 130%: RDS warns once allocation passes 80% of the ceiling.
+MIN_CEILING=$(( (ALLOCATED * 130 + 99) / 100 ))
 (( MAX_STORAGE >= MIN_CEILING )) || MAX_STORAGE=$MIN_CEILING
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
@@ -287,9 +288,20 @@ DO NOTHING`, so a partial re-run is safe — which is all it is for, after §2.0
 (`COPY` itself has no `ON CONFLICT`: loaded straight in, a re-run stopped at the
 first row already there.)
 
-Save this as `/tmp/copyback.sh` and run it (`bash /tmp/copyback.sh`, or
-detached as below) — not pasted: its `exit` on a failure would end the
+Save this as `/tmp/copyback.sh` — `cat > /tmp/copyback.sh <<'EOF'` … `EOF`,
+the quotes mattering: unquoted, the shell fills in `$JOB` and the rest as it
+writes the file — and run it (`bash /tmp/copyback.sh`, or detached as §2.1
+runs `pg_restore`), not pasted: its `exit` on a failure would end the
 interactive shell.
+
+From a PITR scratch instance rather than a dump there is no restore to wait
+for; write what the script reads first:
+
+```bash
+SCRATCH_URL="postgres://birdtest:<the master password>@<the scratch instance's endpoint>:5432/birdtest"
+echo "export SCRATCH_URL='$SCRATCH_URL'" > /tmp/restore.env
+echo 'pg_restore exit 0' > /tmp/pg_restore.log   # nothing to wait for
+```
 
 ```bash
 source /tmp/restore.env
@@ -341,7 +353,7 @@ COMMIT;
 SQL
   # Every later table hangs off this one: carrying on buried the first error
   # under a foreign-key failure per table.
-  [[ $? -eq 0 ]] || { echo "stopped: could not load $table" >&2; break; }
+  [[ $? -eq 0 ]] || { echo "stopped: could not load $table" >&2; exit 1; }
 done
 ```
 
@@ -480,7 +492,10 @@ UPDATE jobs j
                           ) g),
        racks_analyzed = (SELECT count(DISTINCT p.rack)
                            FROM position_analysis_records p
-                          WHERE p.job_id = j.id AND p.game_index IS NULL)
+                          WHERE p.job_id = j.id AND p.game_index IS NULL),
+       last_completed_at = (SELECT max(c.completed_at) FROM task_claims c
+                              JOIN tasks t ON t.id = c.task_id
+                             WHERE t.job_id = j.id AND c.state = 'completed')
  WHERE j.id = :'job';
 
 -- Level with the jobs being *served* -- those that issued a claim within the
@@ -539,15 +554,25 @@ them globally, once, after every job has been restored — in the ops shell's
 psql (`scripts/prod-shell.sh`): the loops below commit as they go, which
 `scripts/prod-sql.sh`, running everything as one transaction, refuses.
 
+**Write it to a file and run it with `psql -f`**, not pasted: pasted into the
+interactive psql, an error stops only the statement it is in and the rest of
+the paste runs on, and pasting it again in the same session found the old
+snapshot's tables already there and applied that snapshot — zeroing everyone
+whose first result came after it. Run as a file, psql stops at the first error
+and exits, the temporary tables go with the session, and running the file
+again starts from a fresh count; rows already right are skipped, so a re-run
+costs little.
+
 Count first, into a temporary table, then apply in small batches. A single
 `UPDATE` over every account would hold each one's row lock until it finished,
 and every submission increments its worker's counter: submissions would wait,
 then be answered 503 after five seconds, for as long as the recount ran.
 
 ```sql
-\set ON_ERROR_STOP on
+-- /tmp/recount.sql; run as  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/recount.sql
 -- Room for the temporary tables below in memory; they are read once per batch.
-SET temp_buffers = '256MB';
+-- (Set before any temporary table is touched, which a fresh session is.)
+SET temp_buffers = '64MB';
 
 -- 1. Count. Reads only; nothing waits on this. `recount` is kept whole for
 --    the rest of the procedure (step 2 reads it); step 3 works through a copy.
@@ -570,11 +595,10 @@ CREATE TEMP TABLE pending AS SELECT * FROM recount;
 --    claims raised would otherwise stay, with nothing behind them. (An
 --    identity with no completed claims appears nowhere in step 1.)
 -- 3. Apply the counts, a thousand a transaction, only where they differ.
---    Each batch is taken out of `pending` as it is applied, so a run stopped
---    by a lock timeout -- it gives up rather than queue behind a submission
---    -- is simply run again (either step, or both) and continues where it
---    stopped. Both are safe to repeat: step 2 reads `recount`, which nothing
---    consumes.
+--    Each batch is taken out of `pending` as it is applied, so no batch
+--    rereads the ones before it. A run stopped by a lock timeout -- it gives
+--    up rather than queue behind a submission -- is run again, the whole
+--    file, from a fresh count.
 SET lock_timeout = '2s';
 
 DO $$
@@ -629,19 +653,13 @@ BEGIN
   END LOOP;
 END $$;
 
--- Both 0 when done.
-SELECT (SELECT count(*) FROM pending) AS left_to_apply,
-       (SELECT count(*) FROM users u WHERE u.tasks_completed > 0
-          AND NOT EXISTS (SELECT 1 FROM recount r WHERE r.kind = 'u' AND r.id = u.id))
-     + (SELECT count(*) FROM anonymous_workers w WHERE w.tasks_completed > 0
-          AND NOT EXISTS (SELECT 1 FROM recount r WHERE r.kind = 'a' AND r.id = w.uuid))
-       AS left_to_zero;
+-- Then §4's check 3b, which counts from the claims afresh: 0 when done.
 ```
 
 The counts are a snapshot: a submission accepted between step 1 and a row's
 update is overwritten by the older figure. Run this when the fleet is quiet, or
-run all three steps again afterwards (`DROP TABLE recount, pending;` first); a
-second run changes only what moved. §4 checks the result.
+run the file again afterwards; a second run changes only what moved. §4
+checks the result.
 
 This is the one recount a restore is most likely to need, and the one most
 likely to be forgotten: nothing about a single job's restore makes a wrong
@@ -819,7 +837,14 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
 
    ```bash
    terraform -chdir=infra workspace new dr
-   terraform -chdir=infra apply -var desired_count=0 \
+   # The stack's own settings first, the DR overrides after (a later -var
+   # wins): without prod.tfvars every other setting fell back to its default
+   # -- a micro instance, 20 GiB, and the fleet's MAGPIE floor back at 0.1.1.
+   # Storage sized for the restore in step 3 at creation: autoscaling cannot
+   # keep up with a bulk load, and Terraform does not grow it afterwards.
+   terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 \
+     -var db_allocated_storage=<at least the production allocation; the latest
+       "low storage" mail says it, or take three times the dump's size> \
      -var region=$DR_REGION -var 'azs=["'$DR_REGION'a","'$DR_REGION'b"]' \
      -var name_suffix=-dr -var dr_region=$THIRD_REGION \
      -var acm_certificate_arn=<a certificate issued in $DR_REGION> \
@@ -870,10 +895,14 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    dead until this is done, which means no confirmations and no password
    resets. SES production access is per region: request it again.
 6. Point DNS at the new ALB.
-7. Run §4, and **Check artifacts** on every leave-generation job (§3): the
+7. Confirm the new stack's alert subscription (SNS mails a confirmation) and
+   run README.md's alert-path checks with the `dr` names
+   (`birdtest-dr-backup-stale`, `birdtest-dr-db-storage`,
+   `birdtest-dr-backup`).
+8. Run §4, and **Check artifacts** on every leave-generation job (§3): the
    synced objects are the replicas' latest versions, which need not be the ones
    the restored rows describe.
-8. `terraform -chdir=infra workspace select default` when done. The workspace
+9. `terraform -chdir=infra workspace select default` when done. The workspace
    is remembered in `infra/.terraform`, and `scripts/prod-sql.sh`,
    `scripts/prod-shell.sh` and §1's outputs would otherwise go on reading the
    DR stack's state (both scripts print the workspace they are using).

@@ -777,12 +777,20 @@ async fn submit_result(
     // `issue_claim`), so it is held from here to the commit and no longer.
     // They were two separate updates, the first made while storing the result
     // -- a claim for the job then waited on this whole transaction.
-    if progress != crate::jobs::registry::ProgressDelta::default() || task_completed {
+    //
+    // `last_completed_at` rides along, at most once a minute when nothing else
+    // changes: a statement whose WHERE matches nothing takes no row lock, so
+    // a leave job's submissions do not all queue on the job's row for it.
+    {
         sqlx::query(
             "UPDATE jobs SET games_completed = games_completed + $2,
                              racks_analyzed = racks_analyzed + $3,
-                             tasks_completed = tasks_completed + $4
-             WHERE id = $1",
+                             tasks_completed = tasks_completed + $4,
+                             last_completed_at = now()
+             WHERE id = $1
+               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0
+                    OR last_completed_at IS NULL
+                    OR last_completed_at < now() - interval '1 minute')",
         )
         .bind(job_id)
         .bind(progress.games_completed)
@@ -839,6 +847,8 @@ async fn submit_result(
 /// ordered because one task issues them.
 async fn after_submission(state: &AppState, job: &Job) -> AppResult<()> {
     let job_id = job.id;
+    // Before the finish check reads anything: see `complete_unless_purged`.
+    let purges_before = state.dispatch_holds.claims_holds_taken(job_id);
 
     // Leave generation finishes in its own transition and has no finish
     // condition here, so it skips the in-flight query `should_check_finish`
@@ -858,11 +868,22 @@ async fn after_submission(state: &AppState, job: &Job) -> AppResult<()> {
     if let Some(decided) = finished {
         // `job` was loaded before the results were read, which is what lets
         // its `claims_issued` tell a purge in between from no purge at all.
-        if crate::jobs::complete_unless_purged(&state.pool, job.id, job.claims_issued, decided)
-            .await?
+        let purged_since = || {
+            state.dispatch_holds.claims_holds_taken(job_id) != purges_before
+                || state.dispatch_holds.claims_held(job_id)
+        };
+        if crate::jobs::complete_unless_purged(
+            &state.pool,
+            job.id,
+            job.claims_issued,
+            decided,
+            purged_since,
+        )
+        .await?
         {
             tracing::info!(job_id = %job.id, "job auto-completed");
-            jobstats::forget(job.id);
+            // No submission is coming to push this to open pages.
+            push_after_change(state, job.id);
             // Completion is final, so this job will never need checking again.
             state.finish_checks.forget(job_id);
         }

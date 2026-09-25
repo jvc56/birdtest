@@ -245,7 +245,11 @@ pub async fn refresh_payload(
 /// the form. A build that started before this is not kept either.
 pub fn forget(job_id: Uuid) {
     let now = std::time::Instant::now();
-    PAYLOADS.lock().expect("stats cache poisoned").remove(&job_id);
+    // Both under the payloads' lock, which a build also holds while it checks
+    // and keeps: taken one at a time, a build finishing between them was kept
+    // as current, from before the action.
+    let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
+    payloads.remove(&job_id);
     // Kept apart from the payloads, and for longer than any build takes:
     // pruned with them after `max_age`, a marker was gone by the time a build
     // slower than that finished, and the build -- begun before the action --
@@ -253,6 +257,8 @@ pub fn forget(job_id: Uuid) {
     let mut forgotten = FORGOTTEN.lock().expect("stats cache poisoned");
     forgotten.retain(|_, at| now.duration_since(*at) < FORGOTTEN_KEPT);
     forgotten.insert(job_id, now);
+    drop(forgotten);
+    drop(payloads);
 }
 
 /// Longer than any stats build can run: its statements are bounded by the
@@ -282,12 +288,13 @@ async fn build_payload(
     if max_age.is_zero() {
         return Ok((json, true));
     }
+    // The payloads' lock first, as `forget` takes them.
+    let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
     let forgotten_after_start = FORGOTTEN
         .lock()
         .expect("stats cache poisoned")
         .get(&job_id)
         .is_some_and(|at| *at > started);
-    let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
     let superseded = forgotten_after_start
         || payloads.get(&job_id).is_some_and(|entry| entry.started > started);
     payloads.retain(|_, entry| entry.started.elapsed() < max_age);

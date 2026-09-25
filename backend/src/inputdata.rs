@@ -124,6 +124,19 @@ pub fn input_object_key(sha256: &str) -> String {
 /// Resolves a git ref to a commit sha, so `main` is pinned at import time and
 /// the record names a commit rather than a branch.
 pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
+    // A ref is a git ref name. Put into the URL as given, `..` segments
+    // resolved -- `../../../user` asked GitHub's API for another endpoint,
+    // with the server's token -- and `?` or `#` rewrote the query.
+    let well_formed = !git_ref.is_empty()
+        && git_ref.len() <= 255
+        && !git_ref.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        && git_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+    if !well_formed {
+        return Err(AppError::bad_request("that is not a git ref name")
+            .with_field("git_ref", "letters, digits, '-', '_', '.' and '/' only"));
+    }
     let url = format!(
         "{}/repos/{}/commits/{}",
         state.cfg.github_api_url, state.cfg.magpie_data_repo, git_ref
@@ -176,7 +189,8 @@ pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
     let sha = response.text().await.map_err(github_error)?.trim().to_string();
     if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(AppError::bad_request(format!(
-            "GitHub returned something that is not a commit sha: {sha:?}"
+            "GitHub returned something that is not a commit sha: {:?}",
+            sha.chars().take(80).collect::<String>()
         )));
     }
     Ok(sha)

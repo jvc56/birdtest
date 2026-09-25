@@ -514,8 +514,9 @@ resource "aws_scheduler_schedule" "backup" {
       }
     }
 
-    # A dump that fails is retried once; a dump that fails twice is an alarm,
-    # not something to keep hammering the database with.
+    # Retries a RunTask call the scheduler could not make (a throttle, a
+    # capacity error) -- not a dump that ran and failed: that is the failure
+    # alarm's, and the next night's.
     retry_policy {
       maximum_retry_attempts       = 1
       maximum_event_age_in_seconds = 3600

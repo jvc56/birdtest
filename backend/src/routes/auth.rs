@@ -14,6 +14,9 @@ use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// The body limit of routes that take a handful of short strings.
+pub(crate) const SMALL_BODY_BYTES: usize = 16 * 1024;
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
@@ -23,6 +26,9 @@ pub fn router() -> Router<AppState> {
         .route("/confirm-email", post(confirm_email))
         .route("/reset-password/request", post(request_password_reset))
         .route("/reset-password/confirm", post(confirm_password_reset))
+        // Every body here is a few short strings; axum's default 2 MB let a
+        // caller send a megabyte-long "username" to every limiter keyed on one.
+        .layer(axum::extract::DefaultBodyLimit::max(SMALL_BODY_BYTES))
 }
 
 const MIN_PASSWORD_SCORE: u8 = 3;

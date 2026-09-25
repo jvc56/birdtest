@@ -462,17 +462,19 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
         (row.get("kwg_id"), row.get("klv_id"), row.get("letterdist_id"));
 
     // The lease as the database stores it (to the microsecond), so the
-    // outcome's `leased_until = $n` matches exactly.
+    // outcome's `leased_until = $n` matches exactly -- and on the database's
+    // clock, which is the one lapses are judged by.
     let leased_until: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
         "UPDATE derived_data
-         SET state = 'building', leased_until = $1, attempts = attempts + 1,
+         SET state = 'building', leased_until = now() + make_interval(secs => $1),
+             attempts = attempts + 1,
              error = NULL
          WHERE role = $2 AND name = $3 AND builder = $4
            AND kwg_id = $5 AND klv_id IS NOT DISTINCT FROM $6
            AND letterdist_id = $7
          RETURNING leased_until",
     )
-    .bind(chrono::Utc::now() + LEASE)
+    .bind(LEASE.num_seconds() as f64)
     .bind(&role)
     .bind(&name)
     .bind(&builder)

@@ -638,6 +638,12 @@ async fn an_import_is_started_polled_while_running_and_confirmed_over_http() {
     let (status, body) = start(json!({ "tarball_date": DATE, "git_ref": "no-such-branch" })).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["message"], "no such ref \"no-such-branch\" in example/data");
+    // A ref is a ref name: `..` segments walked GitHub's API elsewhere with the
+    // server's token.
+    for bad in ["../../../user", "main?per_page=100", "a//b", ""] {
+        let (status, body) = start(json!({ "tarball_date": DATE, "git_ref": bad })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
 
     let (status, started) = start(json!({ "tarball_date": DATE })).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{started}");

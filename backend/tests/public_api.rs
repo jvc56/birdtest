@@ -186,6 +186,52 @@ async fn the_job_list_filters_by_status() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
+/// A-PUBLIC-1c: the job list's `stalled` flag -- an active job with a
+/// decline in the last day, no result accepted in the last day, and nothing
+/// claimed -- and it clears once a result is accepted. Read from the job's
+/// `last_completed_at`, set by the submission that stores a result.
+#[tokio::test]
+async fn the_job_list_flags_a_stalled_job() {
+    let db = TestDb::new().await;
+    db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+    let stalled = |body: &serde_json::Value| body["items"][0]["stalled"].clone();
+
+    let (status, claim) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    let uuid = claim["worker_uuid"].as_str().unwrap().to_string();
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/decline",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": claim["claim_token"], "reason": "missing_data",
+                    "missing": [{ "role": "kwg", "name": "NWL23", "expected": "ab", "actual": null }] }),
+        ),
+    )
+    .await;
+    assert!(status.is_success(), "{body}");
+    let (_, list) = send(&app, get_request("/api/jobs", &[])).await;
+    assert_eq!(stalled(&list), json!(true), "{list}");
+
+    // A result accepted since, from another worker, clears it.
+    let (status, claim) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    let other = claim["worker_uuid"].as_str().unwrap().to_string();
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", other.as_str())],
+            json!({ "claim_token": claim["claim_token"], "result": games_result(2, 1) }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, list) = send(&app, get_request("/api/jobs", &[])).await;
+    assert_eq!(stalled(&list), json!(false), "{list}");
+}
+
 /// A-PUBLIC-1: the job list pages newest first with a total, and `per_page`
 /// is clamped to 1..=500 and a negative page read as the first -- so no
 /// request can ask for the whole table in one page.

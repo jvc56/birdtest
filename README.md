@@ -345,20 +345,32 @@ docker push ...   # all three, then apply with backend_image, derived_builder_im
 The backend image fetches MAGPIE at `docker/Dockerfile`'s `MAGPIE_COMMIT`
 from GitHub, so that commit must be pushed to `birdtest-contribute` first.
 
-**Check that the alarms reach you** after the first apply, and after any
-change to the alerts topic: nothing else will say an alert was dropped.
+**Check that the alarms reach you** after the first apply (once the SNS
+subscription is confirmed), and after any change to the alerts topic: nothing
+else will say an alert was dropped. With `REGION` set as above:
 
 ```bash
-aws cloudwatch set-alarm-state --alarm-name birdtest-backup-stale \
+TF="terraform -chdir=infra output -raw"
+# To OK first: a fresh stack's staleness alarm is already in ALARM (no backup
+# has run), and setting the state it is in sends nothing.
+aws cloudwatch set-alarm-state --region "$REGION" --alarm-name birdtest-backup-stale \
+  --state-value OK --state-reason "testing the alert path"
+aws cloudwatch set-alarm-state --region "$REGION" --alarm-name birdtest-backup-stale \
   --state-value ALARM --state-reason "testing the alert path"     # a mail arrives
-aws rds describe-event-subscriptions --subscription-name birdtest-db-storage \
+aws rds describe-event-subscriptions --region "$REGION" --subscription-name birdtest-db-storage \
   --query 'EventSubscriptionsList[0].Status' --output text      # "active"
+
+# A backup run that fails: its failure mail arrives. The task's entry point is
+# `bash -c`, so the override is the whole script, one string.
+aws ecs run-task --region "$REGION" --cluster "$($TF cluster_name)" \
+  --task-definition birdtest-backup --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$(terraform -chdir=infra output -json service_subnet_ids | jq -r 'join(",")')],securityGroups=[$($TF service_security_group_id)],assignPublicIp=ENABLED}" \
+  --overrides '{"containerOverrides":[{"name":"backup","command":["exit 1"]}]}'
 ```
 
-and run the backup task once with a failing command (`--overrides` with
-`"command": ["sh", "-c", "exit 1"]` on the backup task definition): the failure
-mail arrives, and `AWS/Events FailedInvocations` for `birdtest-backup-failed`
-stays 0.
+Then `AWS/Events` `TriggeredRules` for `birdtest-backup-failed` is 1 and its
+`FailedInvocations` 0. (The DR copy's names carry its `name_suffix`:
+`birdtest-dr-backup-stale` and so on — RUNBOOK §5 runs the same checks.)
 
 **SES starts in the sandbox.** A new account's SES sends only to verified
 addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)

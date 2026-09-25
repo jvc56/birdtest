@@ -4259,8 +4259,10 @@ Every failure is JSON with the same shape, whatever the status:
 ```
 
 `code` is a stable machine-readable string (`bad_request`, `unauthorized`,
-`forbidden`, `not_found`, `conflict`, `payload_too_large`, `rate_limited`,
-`unavailable`, `internal`) mapping one-to-one onto the status. `unavailable` is `503` with a `Retry-After`:
+`forbidden`, `not_found`, `method_not_allowed`, `conflict`, `payload_too_large`,
+`rate_limited`, `unavailable`, `internal`) mapping one-to-one onto the status. An
+unknown endpoint is `not_found` and a method an endpoint does not take
+`method_not_allowed`, in the same shape. `unavailable` is `503` with a `Retry-After`:
 every connection of the pool asked was busy for the whole acquire timeout, or a
 display read outran its statement timeout (see [Two connection
 pools](#two-connection-pools)). That is load rather than a fault, and MAGPIE's
@@ -5505,6 +5507,13 @@ CREATE TABLE jobs (
     -- partial restore recomputes them (RUNBOOK 2.3).
     tasks_total     BIGINT NOT NULL DEFAULT 0 CHECK (tasks_total >= 0),
     tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    -- When a result was last accepted for the job, to the minute (the
+    -- submission that stores one sets it at most once a minute). The job
+    -- list's `stalled` flag asks "none in a day"; answered from the claims, it
+    -- joined every task of the job to the day's completions -- growing with
+    -- the job's whole history, on every list view. Display only; a purge
+    -- clears it, a partial restore recomputes it (RUNBOOK 2.3).
+    last_completed_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ
@@ -6598,7 +6607,8 @@ now deleted; they are in the git history up to the commit that removed them).
 The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
 the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md`,
 the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md`,
-the seventeenth's `AUDIT_FINDINGS_13.md` and the eighteenth's `AUDIT_FINDINGS_14.md`.
+the seventeenth's `AUDIT_FINDINGS_13.md`, the eighteenth's `AUDIT_FINDINGS_14.md` and
+the nineteenth's `AUDIT_FINDINGS_15.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -6833,12 +6843,6 @@ what would make it worth revisiting.
 
 ### Abuse and input
 
-- **A username may be any Unicode.** `trim()` leaves zero-width and bidi
-  characters, and lookalike letters from other scripts are distinct, so
-  "josh" with a zero-width space, or in Cyrillic, gets past the
-  case-insensitive uniqueness meant to stop impersonation. *Open (eighteenth
-  audit):* refuse format and control characters, normalize (NFKC), or restrict
-  names to a script — a product decision.
 
 - **Recovering an account does not revoke its API keys.** A password reset and
   "sign out everywhere" end sessions; keys an attacker made while in control
@@ -6883,9 +6887,11 @@ what would make it worth revisiting.
   column with an index is the fix when that many exist.
 
 - **Usernames are unique whatever their case, and otherwise free text.** Any
-  3–32-byte string is accepted, so look-alike and zero-width variants of a name
-  can sit side by side on the public lists; a character-set rule is a product
-  decision (international names) left open.
+  string of 3–32 characters is accepted, so look-alike, zero-width and bidi
+  variants of a name (`trim()` leaves them) can sit side by side on the public
+  lists; a character-set rule -- refusing format and control characters,
+  normalizing (NFKC), or one script -- is a product decision (international
+  names) left open.
 - **A rating pool cannot be edited or deleted once created.** Its anchor and
   scope are fixed (creation now validates them: a variant a job can have,
   input-data rows of the right roles, an anchor rating whose scale does not
@@ -6991,15 +6997,11 @@ what would make it worth revisiting.
   `/api/workers`, by `id`), each written on every registered submission. One
   would do if `/api/users` broke ties by id — a visible ordering change, left
   for a decision. *(Fifteenth audit.)*
-- **The job list's `stalled` flag scans the fleet's last day.** For an active
-  job with a recent decline, "no submission in 24 hours" is answered from the
-  index of completed claims by time — every claim completed in the last day,
-  fleet-wide, joined to its task — once per such job per list view. Nothing
-  indexes claims by job and completion time (`tasks_job_idx` was dropped, and
-  a per-job index would be the widest on the busiest table for one badge).
-  Cheap while declines are rare, which is the normal case; if the list slows,
-  keep a `last_completed_at` on `jobs`, bumped by the submission that already
-  updates the job row.
+- **The job list's `stalled` flag reads `jobs.last_completed_at`** — done
+  (nineteenth audit). Answered from the claims, "no result in a day" joined
+  every task of the job to the day's completions (hundreds of milliseconds at a
+  million tasks, growing with history, on every list view); the submission that
+  stores a result now keeps the time, at most once a minute.
 - **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least `JOB_STATS_CACHE_SECONDS` (10) apart, the page and new subscribers reading the last push's payload. What remains is the payload's cost itself: its contributor list groups every completed claim of the job (and, `task_claims` having no `job_id`, the planner scans the fleet's claims for it), and its game statistics read every result — hundreds of milliseconds at a few hundred thousand tasks, growing with history. *Open (fifteenth audit):* a per-job contributor running total (`job_contributors`, upserted in the submit transaction like `users.tasks_completed`, given back by purge and delete, recounted by RUNBOOK §2.3b) would make the list an index read; it is a schema change and one more write per submission, left for a decision.
 
 ---
@@ -7307,19 +7309,20 @@ A backup that fails silently is not a backup. Three layers, cheapest first:
    non-zero exit of the backup task family → SNS → the admin's email. Catches
    crashes but not the schedule never firing.
 2. **Staleness alarm.** A CloudWatch alarm on `AWS/S3` `NumberOfObjects` is too
-   coarse; instead the backup task emits a `birdtest/backup SuccessTimestamp`
+   coarse; instead the backup task emits a `birdtest/backup Success`
    custom metric and the alarm fires on `missing data` for > 36 hours. Catches both
    crashes and a schedule that silently stopped.
 3. **In-app surface.** An admin page listing recent backups.
 
 The same topic carries the database's own warnings (`infra/rds.tf`): RDS's
-`low storage` and `failure` events, through an event subscription —
-autoscaled storage stops at five times its first allocation, and CloudWatch has
-no metric for how near the ceiling is (a `FreeStorageSpace` threshold fired from
-the first apply and never cleared) — and CPU over 80% for fifteen minutes. The
-`low storage` mail that arrives before each autoscaling step (RDS-EVENT-0089,
-over 90% of the current allocation) is routine; the one that matters is
-autoscaling having reached its ceiling (RDS-EVENT-0224, in `failure`).
+`low storage`, `failure` and `notification` events, through an event
+subscription — autoscaled storage stops at five times its first allocation, and
+CloudWatch has no metric for how near the ceiling is (a `FreeStorageSpace`
+threshold fired from the first apply and never cleared) — and CPU over 80% for
+fifteen minutes. The `low storage` mail before each autoscaling step
+(RDS-EVENT-0089, over 90% of the current allocation) is routine; the ones that
+matter are allocation past 80% of the ceiling (RDS-EVENT-0225, `notification`)
+and the ceiling reached (RDS-EVENT-0224, `failure`).
 
 Layer 3 had a design choice of its own. Having the backend list the backup bucket
 directly would require giving the task role `ListBucket` / `GetObject` on it,

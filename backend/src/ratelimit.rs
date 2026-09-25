@@ -110,8 +110,20 @@ impl Default for RateLimiters {
 }
 
 /// Returns 429 with a `Retry-After` header when the bucket is empty.
+/// Keys longer than this are kept as a digest; see [`check`].
+const MAX_KEY_BYTES: usize = 128;
+
 pub fn check(limiter: &Keyed, key: &str) -> Result<(), AppError> {
-    match limiter.check_key(&key.to_string()) {
+    // Bounded: a key is kept until the next sweep, and some are built from
+    // what a caller sends -- a username tried, an address asked for -- which
+    // could be megabytes each. A long key is kept as its digest.
+    let key = if key.len() > MAX_KEY_BYTES {
+        use sha2::Digest;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(key.as_bytes())))
+    } else {
+        key.to_string()
+    };
+    match limiter.check_key(&key) {
         Ok(()) => Ok(()),
         // `governor` tells us exactly how long the caller has to wait; rounding up
         // to the next whole second is what `Retry-After` can express.
@@ -120,5 +132,23 @@ pub fn check(limiter: &Keyed, key: &str) -> Result<(), AppError> {
                 .as_secs()
                 .max(1),
         )),
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    /// A caller-supplied key is kept as a digest past `MAX_KEY_BYTES`: a
+    /// megabyte "username" held a megabyte in the limiter until its sweep.
+    /// The same long key still lands in the same bucket.
+    #[test]
+    fn a_long_key_is_one_bucket_kept_small() {
+        let limiter: Keyed = RateLimiter::keyed(Quota::per_hour(NonZeroU32::new(1).unwrap()));
+        let long = format!("user:{}", "x".repeat(1 << 20));
+        assert!(check(&limiter, &long).is_ok());
+        assert!(check(&limiter, &long).is_err(), "the same key, the same bucket");
+        assert!(check(&limiter, &format!("{long}y")).is_ok(), "another key, another");
+        assert!(limiter.len() == 2);
     }
 }

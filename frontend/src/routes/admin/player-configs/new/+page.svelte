@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { api, type InputData } from '$lib/api';
+  import { api, ApiError, type InputData } from '$lib/api';
 
   let name = '';
   let recorderType = 'best';
@@ -101,7 +101,12 @@
       goto('/admin/player-configs');
       return created;
     } catch (e) {
-      error = (e as Error).message;
+      // The server says which setting is wrong in `fields`; the message alone
+      // ("job settings are invalid") told the admin nothing to change.
+      const fields = e instanceof ApiError ? Object.entries(e.fields) : [];
+      error = fields.length
+        ? `${(e as Error).message}: ${fields.map(([field, why]) => `${field} ${why}`).join('; ')}`
+        : (e as Error).message;
     } finally {
       busy = false;
     }
