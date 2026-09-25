@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 171 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
-| 1F Frontend unit | 114 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 148 | `backend/tests/`: `leave_gen.rs` (31), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 178 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (32), `auth_routes.rs` (17), `worker_routes.rs` (21), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
+| 1 Unit | 175 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (21), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1F Frontend unit | 115 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 148 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 179 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (32), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 524 backend tests (the per-tier counts above are
+--run-ignored all` runs 530 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-first audit;
 they had drifted by up to 17).
 
@@ -159,7 +159,8 @@ incidentally by higher tiers.
 | `worker/fake_worker.py` output shapes | 1 | Covered — a captured submission for every job type and every `--mode` (`U-FAKE-*`) |
 | `scripts/seed.py` | 5, 6 (used by both) | Covered by use: `e2e/run.sh` and `e2e_magpie.py` both seed through it |
 | `scripts/dev.py` | Manual | Deliberate — see [Not tested](#what-is-deliberately-not-tested) |
-| `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh` | Nightly | Covered (`S-BACKUP-*`) |
+| `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh` | Nightly | Covered (`S-BACKUP-*`) |
+| `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`) |
 | birdtest ↔ MAGPIE wire | 4 + 6 | Covered — `C-1`..`C-9` on both sides, and tier 6 |
 
 ---
@@ -525,6 +526,26 @@ path, nothing recognisable, and a bomb by compression ratio.)
   space, an empty name — is not importable, so no job can be pinned to it and
   stop every worker it reaches. *(Covered:
   `inputdata::tests::ignores_what_birdtest_does_not_pin`.)* (Twelfth audit.)
+- `U-ARCHIVE-8` An entry's size is the one its data has — a PAX `size` record
+  overrides the header's own field — and the per-entry cap and the expansion
+  ratio judge it before a byte is read, pinned or not. *(Covered:
+  `inputdata::tests::a_pax_size_is_judged_by_the_caps_before_the_entry_is_read`.)*
+  (Thirty-first audit: a header saying 0 and a PAX record saying 900 MiB passed
+  every cap and was read whole, 927 MiB resident from a 4 MiB gzip.)
+- `U-ARCHIVE-9` An archive naming one pinned path twice — two files, or a file
+  and an alias — is refused. *(Covered:
+  `inputdata::tests::an_archive_naming_a_path_twice_is_refused`.)* (Thirty-first
+  audit: both were staged and confirmed as rows, of which a worker extracting
+  the tarball holds only the last.)
+- `U-ARCHIVE-10` An extension header — a PAX record or a GNU long name, which
+  the tar reader reads whole before the walk sees an entry — larger than 64 KiB
+  is refused before it is read, and every decompressed byte, headers and
+  skipped data included, counts against the 1 GiB cap (and the ratio, past a
+  64 MiB floor for archives of many tiny entries). *(Covered:
+  `inputdata::tests::a_large_extension_header_is_refused_before_it_is_read`,
+  `inputdata::tests::skipped_data_counts_against_the_caps`.)* (Thirty-first
+  audit, second pass: a 400 KB gzip with a 400 MB PAX header held 465 MB and
+  was accepted.)
 
 ---
 
@@ -675,7 +696,9 @@ Test the pure functions; do not snapshot the SVG.
 - `F-DOCS-1` No page tells a contributor to pass an API key on the command line
   (`--api-key` is the test-only Python worker's flag; `magpie contribute` reads
   a key only from an `apikey` line in `contribute.txt`), and the account page
-  shows that line for a freshly created key. The pages' text, read as source.
+  shows that line for a freshly created key, under the test ids E-2 reads it
+  by; and none puts `contribute.txt` beside the binary (MAGPIE reads it from its
+  working directory). The pages' text, read as source.
   *(Covered: `contributeDocs.test.ts`.)* (Thirty-first audit: the account page
   said `--api-key`, which MAGPIE rejects.)
 
@@ -1400,6 +1423,11 @@ import can be watched) and a per-test MinIO bucket.
   `input_data::a_failed_import_records_its_error_and_stages_nothing`.)*
 - `I-INPUT-9` An import staged and never confirmed expires after a day and says
   so. *(Covered: `admin_api::an_unconfirmed_import_expires_after_a_day_and_says_so`.)*
+- `I-INPUT-10` An import has a time limit, download to staged (PLAN.md's "Whole
+  task"), and one that outlasts it fails and says so. *(Covered:
+  `input_data::an_import_that_outlasts_its_time_limit_fails`.)* (Thirty-first
+  audit: the client's timeouts are per read, and a trickling download kept its
+  import `running` as long as it lasted.)
 
 ### `I-AUDIT-*` — audit log (`audit.rs`)
 
@@ -1524,8 +1552,10 @@ runs against a real MinIO.
   exists to prevent. *(Covered:
   `derived::a_row_for_a_builder_this_binary_lacks_is_left_alone_and_blocks_nothing`;
   such a row at the head of the queue stopped every build behind it.)*
-- `I-DERIVED-7` A build whose `kwg` row predates `object_key` fails with a
-  message naming the remedy (re-import the tarball), and is retried the bounded
+- `I-DERIVED-7` A build whose `kwg` row has neither bytes nor an object key fails
+  with a message naming the remedy (delete the row and what pins it, and import
+  again: re-importing alone leaves a known row as it is, which the message
+  wrongly promised until the thirty-first audit), and is retried the bounded
   `MAX_ATTEMPTS` (3) times and then left `failed` — not retried forever, and
   not failed on the first attempt as this entry implied. *(Covered:
   `derived::a_build_from_a_lexicon_stored_before_object_keys_fails_naming_the_remedy`.)*
@@ -1772,7 +1802,10 @@ below.
   ones at once, but not a 60 MiB one beside them -- its reservations given back
   as they end. *(Covered:
   `worker_routes::a_heartbeat_never_waits_behind_other_bodies`,
-  `worker_routes::a_worker_may_send_a_share_of_large_results_at_once`.)*
+  `worker_routes::a_worker_may_send_a_share_of_large_results_at_once`,
+  `worker_routes::a_chunked_first_claim_is_held_to_its_bound` — a first claim
+  sent without a length is held to 16 KiB too, which the header check alone did
+  not do, in the audit's second pass.)*
   (Thirty-first audit; one at a time, as first written, serialized a fleet on
   one key.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
@@ -2443,7 +2476,13 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
   (`scripts/restore-job.sh`): not before the scratch restore has finished, not
   from production as its scratch copy, not into a job production has active,
   not for a job the scratch copy holds nothing of; nothing with
-  `COPYBACK_DUMP_ONLY`; the job's merge lock held while it loads;
+  `COPYBACK_DUMP_ONLY`; not from a copy taken after the purge — one already
+  holding the purge's audit row, whether of a games job that went on running or
+  of a leave job with only its generation-0 artifact written back; a deleted job
+  restored whole, its `jobs` row inactive, with its config, player config and
+  input data, and resumed after a run stopped once the `jobs` row was in;
+  batches smaller than a line;
+  the job's merge lock held while it loads;
   position analyses back through their parents' ids; a row production holds under a restored
   row's key with other contents stops the run with that batch not loaded and
   another job untouched; the same run, after §2.0, finishes what the stopped one
@@ -2456,18 +2495,18 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
   million progress rows: the queue peaked at 18.9 MB in one statement and at
   3.2 MB, whatever the job's size, in batches.)
 
+All three run nightly (`restore-roundtrip`, which runs `S-BACKUP-5` too, and
+`backup-drill` in `.github/workflows/nightly.yml`), each against the schema applied to an empty
+database — which is also the migration replay the nightly list asks for. The
+monthly production drill (`restore-drill.sh` on the newest real dump) remains
+the real check of the backups themselves.
+
 - `S-SCRUB-1` A scrubbed dump holds no credential: every anonymous worker's
   UUID is replaced, with its claims, ban and audit rows following it and what
   it did kept, and an open claim's token is replaced; twice over, as the script
   allows. *(Covered: `account::a_scrubbed_dump_keeps_no_worker_credential`,
   which also pins `anonymous_workers`' columns to the ones the script copies.)*
   (Thirty-first audit: the UUIDs, each a whole credential, survived scrubbing.)
-
-All three run nightly (`restore-roundtrip`, which runs `S-BACKUP-5` too, and
-`backup-drill` in `.github/workflows/nightly.yml`), each against the schema applied to an empty
-database — which is also the migration replay the nightly list asks for. The
-monthly production drill (`restore-drill.sh` on the newest real dump) remains
-the real check of the backups themselves.
 
 ---
 
@@ -2756,7 +2795,8 @@ GitHub Actions.
   every other check, twenty-third audit) and against the branch head.
   Dispatchable by hand against another MAGPIE ref (the head leg).
 - **restore-roundtrip** — the schema applied to an empty database (the
-  migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`).
+  migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`) and
+  `scripts/restore-job-check.sh` (`S-BACKUP-5`).
 - **backup-drill** — Postgres and MinIO up, the schema applied, then
   `scripts/backup-drill-check.sh` (`S-BACKUP-1`..`3`, and `S-BACKUP-2b`).
 

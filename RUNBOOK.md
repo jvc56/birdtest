@@ -230,10 +230,10 @@ DELETE FROM leave_generation_transitions WHERE job_id = :'job';
 COMMIT;
 ```
 
-(A deleted job has nothing to clear: re-insert its `jobs` row and its config
-rows from the scratch copy first, then the rest as below.) After this, any
-conflict in §2.2 means this step was missed — not that the row is safe to
-skip.
+(A deleted job has nothing to clear, and needs nothing re-inserted by hand:
+§2.2's script, finding no `jobs` row in production, restores it first.) After
+this, any conflict in §2.2 means this step was missed — not that the row is
+safe to skip.
 
 ### 2.1 Get a copy of the old data
 
@@ -301,17 +301,21 @@ The §2.2 script is best run the same way, detached.
 ### 2.2 Copy the rows back, in dependency order
 
 `/tmp/restore-job.sh` does this; `scripts/prod-shell.sh` writes it there when
-the shell's task starts (it is `scripts/restore-job.sh`, carried by the ops task
-definition). It dumps only the job's rows from the scratch copy, a file per
+the shell's task starts (it is `scripts/restore-job.sh` as of the last
+`terraform apply`, carried by the ops task definition; one from before that says
+so and exits). It dumps only the job's rows from the scratch copy, a file per
 table, and loads them into production (`$DATABASE_URL`, in the same shell) in
 dependency order — 16 MiB of rows at a time, each batch its own transaction,
 through a temporary table and `INSERT … ON CONFLICT DO NOTHING` — holding the
 job's merge lock while it loads, so the half-hourly merge cannot fold restored
 staged rows in mid-run. It refuses to start until `/tmp/pg_restore.log` ends in
 `pg_restore exit 0`, and refuses when `SCRATCH_URL` is production itself, when
-production has the job active (§2.0), or when the scratch copy holds no row of
-the job: a mistyped id, or a copy taken after the mistake. (Use a dump or a
-PITR point from *before* the mistake: the latest nightly dump may be after it.)
+production has the job active (§2.0), when the scratch copy holds no such job
+(a mistyped id), and when the scratch copy already holds the audit row of the
+job's last purge or delete — a copy taken after the mistake, which may hold a
+job that went on running, or only the generation-0 artifact a leave job's purge
+writes back. (Use a dump or a PITR point from *before* the mistake: the latest
+nightly dump may be after it.)
 
 It stops, with nothing of that batch loaded, if production already holds a row
 under a restored row's key with other contents: that is a row the job wrote
@@ -385,12 +389,16 @@ Postgres through each of these cases, nightly.
 `worker_data_gaps` is what the admin page's data gaps and the job list's
 `stalled` flag read: left out, a job's declines are forgotten.
 
-Restoring a *deleted* job also means its `jobs` row and its config row
-(`job_game_config`, `job_game_pair_config`, `job_opening_rack_config` or
-`job_leave_config`) first, from the scratch copy the same way — and any
-`player_configs` row they name that has been deleted since (nothing pinned it
-once the job was gone), with its `input_data` rows if those went too. Its
-`job_exports` rows are not restored: export the job again.
+A *deleted* job is restored whole by the same script: before the table above,
+and on every run (so one stopped part-way resumes), the scratch copy's `jobs`
+row (made `inactive`: §2.5 starts it) if production has none, its config row (`job_game_config`,
+`job_game_pair_config`, `job_opening_rack_config` or `job_leave_config`), and
+any `player_configs` row it names and `input_data` row those name that has
+been deleted since (nothing pinned them once the job was gone), each only if
+missing. A reference to an account deleted since is cleared. Its `job_exports`
+rows are not restored: export the job again. (An `input_data` row deleted and
+then imported again has a new id; the script stops on it, and the job must be
+recreated on the new row instead.)
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
 are recomputed from `game_results` (see §2.4).
@@ -534,8 +542,10 @@ tasks whose `state` is `completed`, which the second of those recomputes.
 
 **A purged job that had completed** comes back inactive with no verdict: a
 purge returns a completed job to inactive and clears the SPRT verdict it was
-completed on, and neither is a row the copy brings back. Put both back from the
-scratch copy's `jobs` row (for a deleted job, the whole row came back in §2.0):
+completed on, and neither is a row the copy brings back. **A deleted job that
+had completed** comes back inactive too: §2.2 restores its `jobs` row with its
+verdict but made `inactive`. Put the status (and, for a purged job, the
+verdict) back from the scratch copy's `jobs` row:
 
 ```sql
 -- Set each variable from the scratch copy's row
@@ -1045,6 +1055,10 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
 - `./scripts/restore-roundtrip.sh` — proves a dump of the current schema
   restores byte-identically into an empty database. Run it after any schema
   change; nightly CI runs it too.
+- `./scripts/restore-job-check.sh` — runs §2.2's `restore-job.sh` against two
+  databases of its own through its refusals, a stopped run and its resume, a
+  deleted job, and a re-run; `PG_EXEC="docker exec -i <container>"` points it
+  at any Postgres 16 container. Nightly CI runs it.
 - `./scripts/backup-drill-check.sh` — runs `backup.sh` and `restore-drill.sh`
   exactly as their Fargate tasks do (the `postgres:16` image, the script as
   `bash -c`) against the local stack's Postgres and MinIO: a backup taken while

@@ -1033,8 +1033,8 @@ async fn a_claim_body_is_small() {
 /// by every body, as the thirty-first audit first wrote it, 192 identity-less
 /// claims declaring 64 MiB filled it, and every heartbeat, login and ban got
 /// `503` after ten seconds -- in five minutes, every claim in the fleet
-/// lapsed. And a second large result from a worker already sending one, or a
-/// first claim declaring more than a first claim holds, is refused at once.
+/// lapsed. And a large result past what the budget has left, or a first claim
+/// declaring more than a first claim holds, is refused at once.
 #[tokio::test]
 async fn a_heartbeat_never_waits_behind_other_bodies() {
     let db = TestDb::new().await;
@@ -1132,4 +1132,26 @@ async fn a_worker_may_send_a_share_of_large_results_at_once() {
         let _ = upload.await.unwrap();
     }
     assert_eq!(birdtest::extract::LARGE_BODIES.available_kib(), full);
+}
+
+/// A-WORKER-18: a first claim sent without a length (chunked) is held to the
+/// same 16 KiB as one that declares it: refused as the bytes pass the bound,
+/// not read to the megabyte the other worker routes take (thirty-first audit,
+/// second pass: the bound read only the header).
+#[tokio::test]
+async fn a_chunked_first_claim_is_held_to_its_bound() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+    let request = Request::post("/api/worker/task")
+        .header("content-type", "application/json")
+        .body(Body::from_stream(tokio_stream::wrappers::ReceiverStream::new(receiver)))
+        .unwrap();
+    sender.send(Ok(vec![b' '; 20 * 1024])).await.unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), app.clone().oneshot(request))
+        .await
+        .expect("refused as it passed 16 KiB, not left to its deadline")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    drop(sender);
 }

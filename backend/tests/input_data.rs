@@ -901,3 +901,57 @@ async fn a_file_only_derived_data_refers_to_can_be_deleted_and_takes_that_data_w
         assert_eq!(audited, 1);
     }
 }
+
+/// I-INPUT (PLAN.md, "Whole task 30 min"): an import has a time limit from
+/// download to staged. The client's timeouts are per connection and per read,
+/// so a download that kept trickling kept its import `running` for as long as
+/// it lasted -- still `running` at 130 s with a 120 s read timeout, in the
+/// thirty-first audit's reproduction. Here the limit is 3 s and the tarball
+/// arrives a piece every 2 s.
+#[tokio::test]
+async fn an_import_that_outlasts_its_time_limit_fails() {
+    let db = TestDb::new().await;
+    let archive = tarball(&fixture_files());
+    let whole = format!("/example/data/{COMMIT}/versioned-tarballs/data-{DATE}.tgz");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Router::new().fallback(move |uri: Uri| {
+        let archive = archive.clone();
+        let whole = whole.clone();
+        async move {
+            if uri.path() != whole {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let pieces: Vec<Vec<u8>> = archive.chunks(archive.len() / 8 + 1).map(|c| c.to_vec()).collect();
+            let stream = futures::stream::unfold((pieces, 0usize), |(pieces, i)| async move {
+                if i >= pieces.len() {
+                    return None;
+                }
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                let chunk = axum::body::Bytes::from(pieces[i].clone());
+                Some((Ok::<_, std::io::Error>(chunk), (pieces, i + 1)))
+            });
+            Body::from_stream(stream).into_response()
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let (state, _bucket) = import_state(&db, &format!("http://{addr}")).await;
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO input_data_imports (tarball_date, commit_sha) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(DATE)
+    .bind(COMMIT)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    birdtest::inputdata::run_import_within(state, id, DATE.into(), COMMIT.into(), std::time::Duration::from_secs(3))
+        .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(6), "{:?}", started.elapsed());
+    let (state, error, _) = import_state_row(&db, id).await;
+    assert_eq!(state, "failed");
+    assert!(error.unwrap_or_default().contains("did not finish within"));
+}

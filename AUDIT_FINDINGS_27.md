@@ -21,6 +21,11 @@ pass with no high or medium finding (then one confirmation full pass).
   4 medium in the pass's own fixes from its adversarial checks; all fixed and
   verified within the pass. 31 low: 12 fixed, the rest KL-54 to KL-69. The
   loop continues (pass 1 found high and medium).
+- **Pass 2 (follow-up: pass 1's diff, and input-data import):** 1 high and 6
+  medium from the reviewers — four of the mediums in pass 1's own fixes — and 3
+  medium in the pass's own fixes from its adversarial check; all fixed and
+  verified within the pass. Lows: most fixed, the rest KL-44, KL-54, KL-69 to
+  KL-71. The loop continues.
 
 ---
 
@@ -330,3 +335,163 @@ route's `AdminUser` and CSRF; objective 3 in full — every outcome-affecting
 MAGPIE setting is set by the server and applied by contribute, and a hostile
 `settings.txt` gave a byte-identical result; the contract fixtures match
 byte for byte; the version floor; the backup and drill scripts.
+
+---
+
+## Pass 2 — follow-up pass
+
+**Plan.** The diff since pass 1's starting point (`7d51e3d..7ca481e`; MAGPIE
+unchanged), reviewed against every objective, one reviewer per part it
+touches: backend; frontend; docs and procedures (RUNBOOK, README, PLAN,
+TESTING, MAGPIE_DEPENDENCY, `scripts/`); infra (`infra/`, `docker/`, CI). Plus
+one area not examined in recent passes: **input-data import** — the GitHub
+fetch and resolve, the tarball walk and staging, confirm and its collision
+rule, expiry of staged imports, the import page's polling, and how imported
+rows reach jobs and derived builds.
+
+**Findings: 1 high, 6 medium, 26 low** from the five reviewers (backend 1
+medium and 4 low; frontend 1 medium and 2 low; docs and procedures 2 medium
+and 12 low; infra 2 low; input-data import 1 high, 2 medium and 7 low). Every
+high and medium is fixed and verified; the fixes' adversarial check is 2.9.
+
+### 2.1 High — a PAX `size` record walked past every archive cap (input-data import reviewer)
+
+**Code updated.** `walk_archive` judged an entry by `entry.header().size()`, the
+ustar field; the tar reader follows a PAX `size` record instead. A header
+saying 0 and a PAX record saying N passed the per-entry cap, was read whole,
+and only then counted: reproduced by the reviewer, a 4 MiB gzip took the walk
+to 927 MiB resident before "expands more than 20x", and a 300 MiB entry was
+accepted against the 128 MiB cap. About 12 MiB compressed would OOM the web
+task. **Fix:** the size is `entry.size()`, and the per-entry cap and the ratio
+judge it before the entry is read, pinned or not; reads are bounded and must
+equal it. `U-ARCHIVE-8` fails against the committed walk ("unexpected EOF during
+skip" — it read the entry) and passes now.
+
+### 2.2 Medium — a tarball naming one path twice staged and confirmed two rows (import reviewer)
+
+**Code updated.** Reproduced: two `lexica/NWL23.kwg` rows confirmed, of which a
+worker extracting the tarball holds only the last, so a job pinned to the other
+is declined by every worker. **Fix:** a pinned path (file or alias) seen twice
+refuses the archive. `U-ARCHIVE-9` failed against the committed walk, passes now.
+
+### 2.3 Medium — PLAN's 30-minute import limit was not enforced (import reviewer)
+
+**Code updated.** The client's timeouts are per connection and per read;
+reproduced, a download trickling a piece every 20 s was still `running` at
+130 s, and one at 1 KB/s would hold its import, and up to 512 MiB, for days.
+**Fix:** `run_import_within` bounds download-to-staged at 30 minutes and fails
+the row with the reason. `I-INPUT-10` (a 3 s limit, a piece every 2 s) passes;
+the failure first is the reviewer's run.
+
+### 2.4 Medium — an identity-less claim sent without a length was not held to 16 KiB (backend reviewer; pass 1's own fix)
+
+**Code updated.** Pass 1's check read only `Content-Length`; a chunked claim
+went to the small tier's 1 MiB. Reproduced natively: 300 such claims from 12
+addresses took the backend from 37 to 494 MiB. **Fix:** the identity-less
+claim's body itself is bounded (`http_body_util::Limited`, 16 KiB). The new test
+`a_chunked_first_claim_is_held_to_its_bound` timed out (5 s) against the
+committed handler and passes now.
+
+### 2.5 Medium — pass 1's account page broke end-to-end journey E-2 (frontend reviewer)
+
+**Code updated.** The fresh-key box's second `<code class="break-all">` made
+E-2's `locator('code.break-all')` match two elements, a strict-mode failure, so
+tier 5 and CI's `e2e` job would fail. Reproduced by the reviewer with e2e's own
+Playwright on the rendered markup. **Fix:** both elements have test ids, and E-2
+reads the key by id and checks its `apikey` line. Verified the same way (the
+old locator fails, the new one passes on the new markup) and by
+`playwright test --list`, which compiles every spec; `F-DOCS-1` pins the ids.
+**Tier 5 itself was not run:** it builds the Docker images, which this machine
+builds only with the user's go-ahead (see the final output).
+
+### 2.6 Medium — the copy-back restored a copy taken after the mistake (docs and procedures reviewer)
+
+**Code updated.** Pass 1's refusal caught only an empty copy. A purge leaves an
+active job dispatching (§2.0 says so), so a nightly dump taken after it holds
+the job's new rows; reproduced, the script loaded 3 tasks and printed
+`restored`. **Fix:** the script reads production's last `job.purged` or
+`job.deleted` audit row for the job and refuses a scratch copy holding any task
+of the job made at or after it. The check's new case failed against the
+committed script ("restored from a copy taken after the purge") and passes now.
+
+### 2.7 Medium — restoring a deleted job had no working procedure (docs and procedures reviewer)
+
+**Code updated.** The RUNBOOK said to re-insert the `jobs` and config rows "the
+same way", which was the pasted loop pass 1 removed; the script stopped on the
+first foreign key. **Fix:** with no `jobs` row in production the script
+restores, first, the `input_data` and `player_configs` rows the job names (only
+if missing; checked by key, since they are shared), the `jobs` row forced
+`inactive`, and its config row; references to accounts deleted since are
+cleared. RUNBOOK §2.0 and §2.2 say so; the check's new case restores a deleted
+job with a player config and a leaves row deleted with it, row for row.
+
+### 2.8 Low findings
+
+**Fixed:**
+- The ops shell no longer stops when its task definition predates
+  `RESTORE_JOB_SH`: `/tmp/restore-job.sh` is then a stub that says to apply
+  `infra/` (pass 1's `${…:?}` took §2.1, §2.3 and §5 down with §2.2). Run in
+  `postgres:16` both ways.
+- The copy-back: the merge-lock psql released the script's `flock` and waited
+  on the lock without limit (fd 9 closed, `lock_timeout` 60 s); `split -C` broke
+  a line longer than `BATCH_BYTES` (a batch is now at least the longest line);
+  "about 400,000 rows" was 170,000; the check leaves no lock file behind.
+- Contributor instructions put `contribute.txt` "beside" MAGPIE; MAGPIE reads it,
+  and `data/`, from its working directory (home page, account page, README).
+- The job form's duplicate-file refusal advised renaming a file, which the UI
+  cannot do; it says to choose players from one data release.
+- The derived build's remedy text promised re-importing fills in a missing
+  object key; it does not (I-DERIVED-7 updated).
+- Stale text: comments on the one-at-a-time rule and a `BODY_BUDGET` that no
+  longer exist; "fixed by activating it again"; PLAN's `/admin` rows and tree;
+  the 8 MiB threshold (now 1 MiB); KL-58's, KL-64's and KL-65's claims; "every
+  table a result touches" in README, PLAN and `restore-roundtrip.sh`; the
+  RUNBOOK §6 and TESTING coverage and nightly lists now name
+  `restore-job-check.sh` and `scrub.sql`; `S-SCRUB-1` moved out of the nightly
+  scripts' list; `leave_gen.rs` has 30 tests, not the 31 pass 1 wrote.
+
+**Recorded:** KL-44 (an import holds its lexica too, some 300 MB), KL-54
+(opening-rack results over 1 MiB; a slow link's large claim), KL-69 (a
+re-imported input row under a deleted job; a refused run's files), KL-70
+(small import items: progress, audit rows, concurrent collision labels,
+expiry), KL-71 (the claim's "update MAGPIE" message for other 400s).
+
+### 2.9 Adversarial check of the pass's fixes
+
+A reviewer who wrote none of it was given the diff (`7ca481e..` working tree).
+**Held:** `entry.size()` follows PAX and GNU sparse sizes; truncated entries are
+refused; the real release tarballs (built `cp -RL`) have no aliases or
+duplicates, and `classify` maps one to one, so nothing correct is newly
+refused; the claim bound gives `413` and MAGPIE's first claim is tiny; bash 5.2
+and mawk in `postgres:16` handle the script; the E-2 test ids match.
+
+**Medium, fixed — a copy taken after a leave job's purge still passed.** A purge
+writes the job's generation-0 artifact row back, so such a copy holds one row
+and no tasks, and the task-timestamp check never fired: reproduced, the script
+"restored" one artifact row and said so. The check now asks whether the scratch
+copy holds the audit row of production's last purge or delete; that row is
+written in the purge's own transaction, so its presence is exact — and it also
+ends a false refusal the timestamps allowed (a PITR point between a purge's
+start and its commit) and any dependence on DateStyle. The check covers a games
+job that went on running and a leave job with only its artifact back.
+
+**Medium, fixed — a deleted job stopped after its `jobs` row never got its
+config.** The prelude ran only while production had no `jobs` row, so a re-run
+skipped it and reported success: reproduced with a one-shot trigger. The
+prelude now runs every time (the `jobs` row checked by key only, since a purge
+changes its counters); the check stops a first run on the config and resumes.
+
+**Medium, fixed — tar extension headers were read whole, outside every cap.**
+The tar reader reads a PAX header's or a GNU long name's data in full before the
+walk sees an entry: reproduced, a 400 KB gzip with a 400 MB PAX header held
+465 MB and was accepted, and a 4 GB directory entry was inflated and discarded
+in 8 s. Now a first pass over the raw entries refuses an extension header over
+64 KiB before the walk reads it, and a counting reader bounds every
+decompressed byte at 1 GiB (and 20 times the download, past a 64 MiB floor).
+`U-ARCHIVE-10`'s two tests fail against the committed walk and pass now.
+
+**Lows fixed:** the split test now uses batches smaller than a line; the
+deleted-completed job's status step (RUNBOOK §2.3) no longer says §2.0 brought
+the row back; the time-limit message. **Recorded:** a reused player-config name,
+clone lineage, and an old task definition's script (KL-69); an expired import's
+walk runs on (KL-70).

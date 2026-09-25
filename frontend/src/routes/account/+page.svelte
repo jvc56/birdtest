@@ -100,7 +100,7 @@
     <div>
       <h2 class="text-lg font-medium">API keys</h2>
       <p class="text-sm text-muted-foreground">
-        Add one to the <code class="rounded bg-muted px-1">contribute.txt</code> beside MAGPIE, as a
+        Add one to the <code class="rounded bg-muted px-1">contribute.txt</code> you run MAGPIE with, as a
         line <code class="rounded bg-muted px-1">apikey &lt;key&gt;</code>, to credit your work to this
         account. Use one key per machine: machines sharing a key share its rate limit. Up to 100
         keys; deactivate one to suspend it without losing it.
@@ -110,9 +110,11 @@
     {#if freshKey}
       <div class="rounded-md border border-warning/40 bg-warning/10 p-3">
         <p class="text-sm font-medium text-warning">Copy this key now — it is not shown again.</p>
-        <code class="mt-2 block break-all font-mono text-xs">{freshKey}</code>
+        <code data-testid="fresh-key" class="mt-2 block break-all font-mono text-xs">{freshKey}</code>
         <p class="mt-2 text-sm text-muted-foreground">Its line for contribute.txt:</p>
-        <code class="mt-1 block break-all font-mono text-xs">apikey {freshKey}</code>
+        <code data-testid="fresh-key-line" class="mt-1 block break-all font-mono text-xs"
+          >apikey {freshKey}</code
+        >
       </div>
     {/if}
 

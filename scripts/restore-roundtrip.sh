@@ -9,7 +9,8 @@
 # This is what keeps scripts/backup.sh honest as the schema moves: the dump
 # path, the manifest's row counts, and the verification queries the production
 # restore drill runs (PLAN.md, "Verifying a restore") all execute here, against a
-# database seeded with a row in every table a result touches.
+# database seeded with a row in each of seven core tables (users, input_data,
+# jobs, tasks, task_claims, game_results, backups).
 #
 # It runs entirely inside the Postgres container, so the host needs no
 # Postgres client — Docker is the only dependency, as everywhere else.

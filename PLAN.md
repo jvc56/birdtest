@@ -1666,7 +1666,13 @@ transaction, with `tarball_date` set to this import's date.
 
 Every one aborts the import rather than skipping the entry. The ratio is checked
 continuously rather than at the end, since that is the zip-bomb case a total cap
-alone lets through. The archive URL is built from `MAGPIE_DATA_REPO` and never
+alone lets through. An entry's size is the one its data has — a PAX `size`
+record overrides the header's field — and the per-entry cap and the ratio judge
+it before a byte is read; an archive naming one pinned path twice is refused.
+(Until the thirty-first audit the size was the header's field, so a header
+saying 0 and a PAX record saying 900 MiB passed every cap and was read whole,
+and the 30-minute limit was not enforced at all: the client's timeouts are per
+read.) The archive URL is built from `MAGPIE_DATA_REPO` and never
 from user input, so the residual exposure is a compromised upstream; that is the
 threat model these checks are written against.
 
@@ -2346,7 +2352,8 @@ raw text kept by the extractor (`serde_json::value::RawValue`). It went through
 a `serde_json::Value` first, which holds every object as a B-tree node and every
 key as its own allocation — ten to twenty times the JSON's size, so a result near
 the 64 MiB ceiling became most of a gigabyte on a 2 GB task, and a few at once
-were enough to have it killed. A result of 8 MiB or more also waits for one of
+were enough to have it killed. A result of more than 1 MiB (one the body budget
+reserves for, § "What bounds a submission?") also waits for one of
 three slots (a quarter of a gigabyte each at the ceiling), for up to thirty
 seconds before its worker is answered `503`; ordinary results never wait. The
 wait is before the submission's transaction opens and the slot is held until
@@ -4896,7 +4903,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 
 | Route | Page |
 |---|---|
-| `/admin` | Admin overview — redirects to `/jobs`, the job list, where admin controls sit inline (there is no `/admin/jobs` list; `/admin/jobs/new` and `/admin/jobs/:id` exist). |
+| `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
 | `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields. |
 | `/admin/jobs/[id]` | Admin job view — same stats as the public detail page plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
@@ -5110,7 +5117,7 @@ birdtest/
 │           │   └── +page.svelte                    # /account
 │           └── admin/
 │               ├── +layout.svelte                  # auth guard: redirect to / if not is_admin
-│               ├── +page.svelte                    # /admin (redirects to /admin/jobs)
+│               ├── +page.svelte                    # /admin (redirects to /jobs)
 │               ├── jobs/
 │               │   ├── new/
 │               │   │   └── +page.svelte            # /admin/jobs/new
@@ -6868,7 +6875,8 @@ says so in its implemented option, rather than being removed.
   - What is left is milliseconds.
 
 **KL-6. Large results waiting their turn were still resident. Closed in the thirty-first audit.**
-- **Context:** The three-slot bound on storing results of 8 MiB or more is taken
+- **Context:** The three-slot bound on storing results of 8 MiB or more (1 MiB
+  since this audit) is taken
   after the body has been read.
 - **Problem:** Each waiter kept its body in memory for up to thirty seconds, and
   nothing bounded how many bodies were being read: some twenty-five
@@ -7023,8 +7031,12 @@ says so in its implemented option, rather than being removed.
   half minute, hold the whole budget until their deadlines (some seventeen
   minutes), and then again. Every other large result is refused with `503`
   meanwhile; MAGPIE retries for a quarter of an hour and then gives up the
-  result. Small bodies — every heartbeat, claim, decline and ordinary result —
-  are untouched, and memory stays bounded.
+  result. Small bodies — every heartbeat, claim, decline and result of 1 MiB or
+  less — are untouched, and memory stays bounded. Results over 1 MiB are
+  capture jobs' and some opening-rack jobs' (500 racks a task, with a simming
+  player recording ten or more moves, is some 2 MB). And a small body has a
+  fixed 30 seconds: a claim listing jobs its worker cannot run near the 1 MiB
+  bound, on a link under about 35 KB/s, never arrives in time.
 - **Options considered:**
   - charge a large body as its bytes arrive, so holding it costs the bytes (at
     the price of honest uploads holding part of the budget while they wait);
@@ -7032,9 +7044,9 @@ says so in its implemented option, rather than being removed.
     deadline;
   - rate rules at the load balancer (AWS WAF).
 - **Option implemented:** Reservation, per-identity, deadline and stall limit.
-- **Justification:** Only capture jobs send results over 1 MiB, the holders
-  need identities an admin can ban, and nothing else waits on it. Revisit if
-  capture jobs run at scale.
+- **Justification:** The holders need identities an admin can ban, and nothing
+  but large results waits on it. Revisit if capture or simming opening-rack
+  jobs run at scale, or the slow-link claim is ever seen.
 
 **KL-55. Redundancy above 1 has two untested edges.**
 - **Context:** No job runs above redundancy 1 today (see KL-3).
@@ -7286,7 +7298,8 @@ says so in its implemented option, rather than being removed.
   totals per contributor.
 - **Option implemented:** None.
 - **Justification:** Within the "decide on evidence" stance
-  (`SLOW_STATS_THRESHOLD` logs it). Revisit when it is logged.
+  (`SLOW_STATS_THRESHOLD`, one second, logs the whole stats computation this is
+  part of). Revisit when it is logged.
 
 ### Abuse and input
 
@@ -7423,13 +7436,52 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** Code-point order.
 - **Justification:** No such opening-rack job exists.
 
-**KL-44. Concurrent imports each hold a ~94 MB tarball in memory.**
-- **Context:** An input-data import buffers its tarball.
-- **Problem:** Two admins importing at once on a 2 GB task is survivable; five
-  is not.
+**KL-44. Concurrent imports each hold a ~94 MB tarball in memory, and more.**
+- **Context:** An input-data import buffers its tarball, and the walk keeps every
+  lexicon and leaves file's bytes until they are uploaded: some 300 MB of them
+  uncompressed for the current release (the thirty-first audit's count; this
+  entry said the tarball alone).
+- **Problem:** Two admins importing at once on a 2 GB task is survivable; three
+  is close, five is not.
 - **Options considered:** None recorded.
 - **Option implemented:** None.
 - **Justification:** Imports are admin-only.
+
+**KL-70. Small things in input-data import.**
+- **Context:** `inputdata.rs`, the admin import page (thirty-first audit).
+- **Problem:**
+  - The page's "files hashed" stays at 0 while an import runs (entries are
+    written only once staging succeeds), and its byte count stops during the
+    walk and the upload.
+  - Each network chunk of the download awaits its own progress `UPDATE`: some
+    thousands of serial round trips per tarball.
+  - The audit log's `input_data.import_staged` is written when the request
+    starts, failed imports included, and names no date, ref or commit;
+    `input_data.deleted` names only the id of a row that no longer exists.
+  - Two imports staged at the same time each label a path `new` that becomes a
+    collision once the other confirms, so the second admin misses the second
+    look; a staged import's expiry counts from the request, not from staging.
+  - An import past its time limit is failed, but the archive walk, on the
+    blocking pool, runs to its end with the tarball and its files in memory: an
+    admin starting it again at once holds two.
+- **Options considered:** write the entry count as the walk goes; throttle the
+  progress update to one a second; audit at staging and failure with the
+  commit; re-derive collision labels at confirmation; a cancellation flag the
+  walk checks between entries.
+- **Option implemented:** None.
+- **Justification:** Admin-only, rare, and none changes what is stored.
+
+**KL-71. A claim's "update MAGPIE" message covers more than old clients.**
+- **Context:** `claim_task` rewrites a `400` from reading its body into "a task
+  claim must carry a JSON body … update MAGPIE", the message an old MAGPIE's
+  contributor sees.
+- **Problem:** A body the server could not read (the client disconnected) or a
+  missing content type gets the same advice, which is wrong for them.
+- **Options considered:** rewrite only a body that parses and lacks the fields.
+- **Option implemented:** None; `413` and `503` are passed on as they are since
+  the thirty-first audit.
+- **Justification:** Cosmetic: the client that gets it has already gone, or
+  sends no content type, which only an old MAGPIE does.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
@@ -7543,7 +7595,8 @@ says so in its implemented option, rather than being removed.
 **KL-64. Infrastructure hardening not done.**
 - **Context:** `infra/`, `.github/workflows/`, `docker-compose.yml`.
 - **Problem:**
-  - Neither bucket's policy denies requests without `aws:SecureTransport`.
+  - No bucket's policy (the artifacts and backups buckets and their two DR
+    replicas) denies requests without `aws:SecureTransport`.
   - The ALB does not set `drop_invalid_header_fields`.
   - The alerts SNS topic is unencrypted.
   - `ses:SendEmail` is allowed on `*` rather than the domain identity.
@@ -7558,8 +7611,8 @@ says so in its implemented option, rather than being removed.
 **KL-65. Some failures raise no alarm.**
 - **Context:** The backup and drill failure rules match on a task's exit code.
 - **Problem:** A task that never starts its container (an image pull or secret
-  failure) is caught only by the 36-hour staleness alarm, and the derived
-  builder has no failure alarm at all.
+  failure) raises nothing: a backup's is caught only by the 36-hour staleness
+  alarm, and a drill's not at all. The derived builder has no failure alarm.
 - **Options considered:** match `stopCode`/`stoppedReason` too; an alarm on the
   builder's failures.
 - **Option implemented:** None.
@@ -7697,6 +7750,17 @@ says so in its implemented option, rather than being removed.
     script's hint says so), not a resume.
   - `scripts/scrub.sql` replaces anonymous UUIDs where they are keys, not
     where someone typed one into a ban's or an audit row's free-text reason.
+  - Restoring a deleted job whose `input_data` row was deleted and then
+    imported again stops on it: the new row has a new id, and the job's config
+    names the old one. The job has to be recreated on the new row.
+  - A run refused because the scratch copy holds no row of the job leaves its
+    dumped files in the work directory until the next run clears them.
+  - A deleted player config whose name was taken since stops the run with the
+    generic hint (the name is unique); a restored config whose clone parent is
+    gone loses its lineage rather than getting the parent back.
+  - The ops shell runs the script as of the last `terraform apply`: one from
+    before this audit's second pass cannot restore a deleted job, and the
+    RUNBOOK no longer says how to by hand. Apply first.
 - **Options considered:** copy the column list the two schemas share; keep the
   merge lock across runs (a marker the sweep reads); rewrite UUID-shaped text.
 - **Option implemented:** None.
@@ -8258,7 +8322,8 @@ invisible.
 **Phase 4 — restore tooling and drills.** [RUNBOOK.md](RUNBOOK.md) as literal
 copy-pasteable commands with the counter-repair SQL spelled out; the local
 dump/restore/scrub scripts; the monthly automated restore drill; a round-trip test
-that brings up `docker compose`, seeds a row in every table a result touches with
+that brings up `docker compose`, seeds a row in each of seven core tables (users, input data, jobs, tasks,
+claims, game results, backups) with
 plain SQL, dumps, drops, restores and asserts the verification checks pass.
 (`scripts/restore-roundtrip.sh` seeds directly rather than through a worker: what
 it is testing is `pg_dump`/`pg_restore`, and going through the worker API would

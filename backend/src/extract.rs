@@ -70,9 +70,9 @@ fn malformed(err: serde_json::Error) -> AppError {
 ///   from [`LargeBodies`] whole before a byte is read, or it is refused at once
 ///   with `503` and `Retry-After` (MAGPIE retries 5xx for a quarter of an
 ///   hour). No body holds part of the budget while waiting for more, so honest
-///   uploads cannot hold-and-wait each other. One identity has one large body
-///   in flight at a time, and each has a deadline in proportion to its size and
-///   may not stall.
+///   uploads cannot hold-and-wait each other. One identity may hold
+///   [`LARGE_BODY_SHARE_KIB`] of the budget at once, and each body has a
+///   deadline in proportion to its size and may not stall.
 pub const LARGE_BODY_BYTES: usize = 1024 * 1024;
 
 /// The time a small body has to arrive.
@@ -125,7 +125,7 @@ pub static LARGE_BODIES: LargeBodies = LargeBodies::new(
 /// gives up only on 120 seconds below a byte a second.
 const LARGE_BODY_MIN_RATE: u64 = 64 * 1024;
 
-/// Who a large body belongs to, for the one-at-a-time rule: put in the
+/// Who a large body belongs to, for its owner's share of the budget: put in the
 /// request's extensions by the extractor that checked the caller
 /// (`auth::RegisteredWorker`), which runs before the body is read.
 #[derive(Clone)]

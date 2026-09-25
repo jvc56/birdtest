@@ -329,7 +329,7 @@ async fn a_build_from_a_lexicon_stored_before_object_keys_fails_naming_the_remed
     let (row_state, attempts, error, leased) = queued(&db, "NWL20", "wmp-1").await;
     let error = error.expect("the failure is recorded on the row");
     assert!(error.contains("lexica/NWL20.kwg"), "names the file: {error}");
-    assert!(error.contains("Re-import that tarball"), "names the remedy: {error}");
+    assert!(error.contains("import its tarball again"), "names the remedy: {error}");
     assert_eq!((row_state.as_str(), attempts, leased), ("pending", 1, false));
 
     let mut builds = 1;
@@ -340,7 +340,7 @@ async fn a_build_from_a_lexicon_stored_before_object_keys_fails_naming_the_remed
     assert_eq!(builds, 3, "a bounded number of attempts");
     let (row_state, attempts, error, leased) = queued(&db, "NWL20", "wmp-1").await;
     assert_eq!((row_state.as_str(), attempts, leased), ("failed", 3, false));
-    assert!(error.unwrap().contains("Re-import that tarball"));
+    assert!(error.unwrap().contains("import its tarball again"));
     assert!(!build_next(&state).await, "a failed row stays failed");
 }
 

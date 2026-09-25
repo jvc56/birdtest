@@ -1401,8 +1401,8 @@ async fn refuse_one_name_for_two_files(conn: &mut sqlx::PgConnection, job: &Job)
         {
             return Err(AppError::bad_request(format!(
                 "this job would pin two different {} files named {:?} (from {} and {}): a worker \
-                 finds a file by its name and can hold only one of them. Give one player a \
-                 differently named file.",
+                 finds a file by its name and can hold only one of them. Choose players whose \
+                 files come from the same data release.",
                 file.role, file.name, file.tarball_date, other.tarball_date
             )));
         }
@@ -2456,7 +2456,8 @@ async fn backups(
 ///
 /// Logged rather than returned on failure: a job that exists without its
 /// derived files simply does not dispatch, which is visible at
-/// `GET /api/admin/derived-data` and fixed by activating it again. Failing the
+/// `GET /api/admin/derived-data`, and the next claim that considers the job
+/// queues what has no row (`derived::ready_for_job`). Failing the
 /// creation would leave the admin with no job and a rolled-back transaction
 /// that had already written the generation-0 artifact.
 async fn request_derived_data(state: &AppState, job_id: Uuid) -> AppResult<()> {

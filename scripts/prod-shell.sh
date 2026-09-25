@@ -55,9 +55,13 @@ fi
 command -v session-manager-plugin >/dev/null \
   || { echo "install the AWS CLI's Session Manager plugin first" >&2; exit 1; }
 
-# The task definition carries RUNBOOK.md §2.2's copy-back as RESTORE_JOB_SH;
-# written out here, it is /tmp/restore-job.sh in the shell.
-overrides=$(jq -n --arg command "printf '%s' \"\${RESTORE_JOB_SH:?}\" > /tmp/restore-job.sh && sleep $seconds" \
+# The task definition carries RUNBOOK.md §2.2's copy-back as RESTORE_JOB_SH, as
+# of the last `terraform apply`; written out here, it is /tmp/restore-job.sh in
+# the shell. A task definition from before it gets a /tmp/restore-job.sh that
+# says so and fails, and the shell is otherwise as usable as ever: stopping the
+# task instead, as this first did, took §2.1, §2.3 and §5 down with §2.2.
+write_script='if [ -n "${RESTORE_JOB_SH:-}" ]; then printf "%s" "$RESTORE_JOB_SH"; else printf "%s\n" "echo \"restore-job.sh is not in this task definition: terraform apply infra/ first\" >&2; exit 1"; fi > /tmp/restore-job.sh'
+overrides=$(jq -n --arg command "$write_script; sleep $seconds" \
   '{containerOverrides: [{name: "ops", command: [$command]}]}')
 started=$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" \
   --launch-type FARGATE --enable-execute-command \

@@ -199,7 +199,8 @@ and address it by range, so they are cheap to create.
 ### Contributing with MAGPIE
 
 A contributor needs only MAGPIE — no Python, no Docker, nothing else to
-install. Put a `contribute.txt` beside it:
+install. Put a `contribute.txt` in the directory you run it from, the one
+holding its `data/` (MAGPIE reads both from its working directory):
 
 ```
 server   http://localhost:5173
@@ -207,7 +208,9 @@ threads  7
 maxtasks 0
 ```
 
-then run `magpie contribute`. Settings never go on the command line, so an API
+then run `./bin/magpie contribute` there. A second process needs a directory of
+its own: MAGPIE appends the identity it is issued to that file. Settings never
+go on the command line, so an API
 key stays out of shell history and `ps` output. Wordmaps (`.wmp`) make game
 play dramatically faster, so MAGPIE always wants one for a lexicon it's
 contributing with; it derives the word list and the wordmap from the `.kwg` it
@@ -518,6 +521,6 @@ docker compose up -d postgres backend
 ./scripts/restore-roundtrip.sh
 ```
 
-It seeds a row in every table a result touches, dumps, restores into a fresh
+It seeds a row in each of seven core tables, dumps, restores into a fresh
 database, and checks row counts, referential integrity, the denormalized task
 counters, and that `BYTEA` and `DOUBLE PRECISION` columns survived intact.

@@ -33,7 +33,7 @@ pub const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 /// and does not cap it, at some 40 bytes a job, and a claim refused for its
 /// size ends the run -- so this leaves room for some 26,000 (the server reads
 /// the first `MAX_UNSUPPORTED_JOBS`). What bounds the memory all bodies take
-/// together is `extract::BODY_BUDGET`; this is the bound on one.
+/// together is `extract::read_body`'s tiers; this is the bound on one.
 pub const WORKER_BODY_BYTES: usize = 1024 * 1024;
 
 /// The largest claim a caller with no worker identity may send: see
@@ -272,7 +272,15 @@ async fn claim_task(
     // offered a job, no list -- rather than the megabyte a long run's list of
     // jobs it cannot run may need.
     identity.check_rate_limit(&state)?;
+    let mut request = request;
     if matches!(identity, WorkerIdentity::Unregistered { .. }) {
+        // The body itself is bounded, so one sent without a length (chunked)
+        // stops at 16 KiB too; the header check below only answers a declared
+        // one before a byte is read. Bounded by its header alone, as first
+        // written, a chunked identity-less claim took the megabyte.
+        request = request.map(|body| {
+            axum::body::Body::new(http_body_util::Limited::new(body, UNREGISTERED_CLAIM_BYTES))
+        });
         let declared = request
             .headers()
             .get(axum::http::header::CONTENT_LENGTH)

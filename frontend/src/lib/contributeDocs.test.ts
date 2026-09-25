@@ -26,5 +26,14 @@ describe('F-DOCS-1 contributor instructions', () => {
     const page = readFileSync(join(routes, 'account', '+page.svelte'), 'utf8');
     expect(page).toContain('contribute.txt');
     expect(page).toMatch(/apikey \{freshKey\}/);
+    // The hooks tier 5's E-2 reads the key by: a class both share matched two.
+    expect(page).toContain('data-testid="fresh-key"');
+    expect(page).toContain('data-testid="fresh-key-line"');
+  });
+
+  it('never put contribute.txt beside the binary', () => {
+    // MAGPIE reads it, and data/, from its working directory.
+    const offenders = svelteFiles(routes).filter((f) => /contribute\.txt<\/code>\s+beside/.test(readFileSync(f, 'utf8')));
+    expect(offenders).toEqual([]);
   });
 });

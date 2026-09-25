@@ -15,7 +15,10 @@
 # The cases:
 #   - it refuses to start before the scratch restore has finished, against a
 #     scratch copy that is production itself, for a job production has active,
-#     and for a job the scratch copy holds nothing of;
+#     for a job the scratch copy holds nothing of, and against a copy taken
+#     after the purge from a job that went on running;
+#   - a deleted job comes back whole: its jobs row (inactive), its config, and
+#     the player config and input data deleted with it;
 #   - COPYBACK_DUMP_ONLY loads nothing;
 #   - a row production holds under a restored row's key with other contents --
 #     a generation re-seeded because §2.0 was skipped -- stops it, with that
@@ -32,6 +35,7 @@ EXEC="${PG_EXEC:-docker compose exec -T postgres}"
 PGUSER_="${PGUSER_:-birdtest}"
 PROD=restorejob_prod
 SCRATCH=restorejob_scratch
+LATE=restorejob_late
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
 psql_() { ${EXEC} psql -U "${PGUSER_}" -X -q -v ON_ERROR_STOP=1 "$@"; }
@@ -39,10 +43,10 @@ val() { ${EXEC} psql -U "${PGUSER_}" -X -tA -v ON_ERROR_STOP=1 -d "$1" -c "$2"; 
 
 cleanup() {
   local status=$?
-  for db in "$PROD" "$SCRATCH"; do
+  for db in "$PROD" "$SCRATCH" "$LATE"; do
     psql_ -d postgres -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null 2>&1 || true
   done
-  ${EXEC} rm -rf /tmp/restore-job-check /tmp/restore-job-check.log >/dev/null 2>&1 || true
+  ${EXEC} rm -rf /tmp/restore-job-check /tmp/restore-job-check.lock /tmp/restore-job-check.log >/dev/null 2>&1 || true
   if (( status == 0 )); then echo "restore-job check passed"; else echo "restore-job check FAILED" >&2; fi
   exit "$status"
 }
@@ -82,14 +86,15 @@ digest() {
   echo "$out"
 }
 
-for db in "$PROD" "$SCRATCH"; do
+for db in "$PROD" "$SCRATCH" "$LATE"; do
   psql_ -d postgres -c "DROP DATABASE IF EXISTS $db WITH (FORCE)" >/dev/null
 done
 psql_ -d postgres -c "CREATE DATABASE $PROD" >/dev/null
 psql_ -d "$PROD" < "$HERE/../backend/migrations/0001_initial.sql" >/dev/null
 
-# Three jobs: a games job with 500 tasks (five batches of a hundred), a leave
-# job in its tail, and a third that is never purged.
+# Four jobs: a games job with 500 tasks (five batches of a hundred), a leave
+# job in its tail, a third that is never purged, and a fourth, with a player
+# config of its own, that is deleted.
 psql_ -d "$PROD" <<'SQL'
 BEGIN;
 INSERT INTO users (username, email, password_hash, is_admin)
@@ -132,16 +137,40 @@ VALUES ('00000000-0000-0000-0000-00000000000b', 0, 'leaves/check/generation-0.kl
 INSERT INTO leave_rack_staging (job_id, generation, task_id, racks, counts, equity_sums)
 SELECT '00000000-0000-0000-0000-00000000000b', 1, gen_random_uuid(), ARRAY['R00001'], ARRAY[3::bigint], ARRAY[1.5]
 FROM generate_series(1, 3);
+INSERT INTO input_data (id, path, role, name, sha256, bytes, tarball_date)
+VALUES ('00000000-0000-0000-0000-0000000000e1', 'lexica/CHECK.kwg', 'kwg', 'CHECK', repeat('e', 64), 3, '20260101'),
+       ('00000000-0000-0000-0000-0000000000e2', 'lexica/CHECK.klv2', 'klv', 'CHECK', repeat('f', 64), 3, '20260101');
+INSERT INTO player_configs (id, name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
+                            num_plies_recorded, num_plays_recorded, use_wordmap, use_rit, movegen_margin, created_by)
+VALUES ('00000000-0000-0000-0000-0000000000f1', 'check-static', 'best', 'equity',
+        '00000000-0000-0000-0000-0000000000e1', '00000000-0000-0000-0000-0000000000e2', 0, 100, 2, 10,
+        false, false, 5, (SELECT id FROM users));
+INSERT INTO jobs (id, job_type, status, allocation, redundancy, variant,
+                  letterdist_id, layout_id, created_by, bingo_bonus, sim_cutoff)
+SELECT '00000000-0000-0000-0000-00000000000d', 'games', 'active', 100, 1, 'classic',
+       (SELECT id FROM input_data WHERE role = 'letterdist'), (SELECT id FROM input_data WHERE role = 'layout'),
+       (SELECT id FROM users), 50, 0.1;
+INSERT INTO job_game_config (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
+VALUES ('00000000-0000-0000-0000-00000000000d', '00000000-0000-0000-0000-0000000000f1',
+        '00000000-0000-0000-0000-0000000000f1', 10, 100, 1000);
+INSERT INTO tasks (job_id, seed, state, accepted_count)
+SELECT '00000000-0000-0000-0000-00000000000d', s, 'completed', 1 FROM generate_series(1, 50) s;
+INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+SELECT t.id, t.job_id, gen_random_uuid(), 'completed', (SELECT id FROM users), now()
+FROM tasks t WHERE t.job_id = '00000000-0000-0000-0000-00000000000d';
 COMMIT;
 SQL
 
 GAMES=00000000-0000-0000-0000-00000000000a
 LEAVE=00000000-0000-0000-0000-00000000000b
 OTHER=00000000-0000-0000-0000-00000000000c
+DELETED=00000000-0000-0000-0000-00000000000d
 psql_ -d postgres -c "CREATE DATABASE $SCRATCH TEMPLATE $PROD" >/dev/null
 want_games=$(digest "$SCRATCH" "$GAMES")
 want_leave=$(digest "$SCRATCH" "$LEAVE")
 want_other=$(digest "$PROD" "$OTHER")
+want_deleted=$(digest "$SCRATCH" "$DELETED")
+want_deleted_job=$(val "$SCRATCH" "SELECT j::text FROM (SELECT id, job_type, allocation, letterdist_id, layout_id, created_by FROM jobs WHERE id = '$DELETED') j")
 
 # The purge, for both jobs, and a sequence behind the ids it removed.
 psql_ -d "$PROD" <<SQL
@@ -155,8 +184,20 @@ DELETE FROM leave_generation_artifacts WHERE job_id = '$LEAVE';
 SELECT setval('leave_rack_staging_id_seq', 1);
 SELECT setval('position_analysis_records_id_seq', 1);
 SELECT setval('position_analysis_moves_id_seq', 1);
+INSERT INTO audit_log (action, target_type, target_id, job_id)
+VALUES ('job.purged', 'job', '$GAMES', '$GAMES'), ('job.purged', 'job', '$LEAVE', '$LEAVE'),
+       ('job.deleted', 'job', '$DELETED', NULL);
+DELETE FROM jobs WHERE id = '$DELETED';
+DELETE FROM player_configs WHERE id = '00000000-0000-0000-0000-0000000000f1';
+DELETE FROM input_data WHERE id = '00000000-0000-0000-0000-0000000000e2';
 COMMIT;
 SQL
+# A copy taken after the purge: of a job that went on dispatching, and of a
+# leave job whose purge wrote its generation-0 artifact back and nothing else.
+psql_ -d postgres -c "CREATE DATABASE $LATE TEMPLATE $PROD" >/dev/null
+val "$LATE" "INSERT INTO tasks (job_id, seed, state) VALUES ('$GAMES', 9001, 'available')" >/dev/null
+val "$LATE" "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256, builder)
+             VALUES ('$LEAVE', 0, 'leaves/check/generation-0.klv2', repeat('0', 64), 'klv-1')" >/dev/null
 empty=$(digest "$PROD" "$GAMES")
 
 echo "-- refuses before the scratch restore has finished"
@@ -173,7 +214,11 @@ if out=$(restore "$GAMES"); then fail "restored into an active job: $out"; fi
 [[ "$out" == *"the job is active in production"* ]] || fail "not told why: $out"
 val "$PROD" "UPDATE jobs SET status = 'inactive' WHERE id = '$GAMES'" >/dev/null
 if out=$(restore 00000000-0000-0000-0000-0000000000ff); then fail "restored nothing and said so: $out"; fi
-[[ "$out" == *"holds no row of job"* ]] || fail "not told why: $out"
+[[ "$out" == *"holds no job"* ]] || fail "not told why: $out"
+for purged in "$GAMES" "$LEAVE"; do
+  if out=$(restore "$purged" SCRATCH_URL="postgresql:///$LATE?user=$PGUSER_"); then fail "restored from a copy taken after the purge: $out"; fi
+  [[ "$out" == *"it was taken after the mistake"* ]] || fail "not told why: $out"
+done
 
 echo "-- dump only loads nothing"
 out=$(restore "$GAMES" COPYBACK_DUMP_ONLY=1) || fail "dump only failed: $out"
@@ -190,7 +235,8 @@ if out=$(restore "$LEAVE"); then fail "loaded over a re-seeded row: $out"; fi
 
 echo "-- after §2.0 the same run finishes, holding the job's merge lock while it loads"
 val "$PROD" "DELETE FROM leave_rack_progress WHERE job_id = '$LEAVE'" >/dev/null
-restore "$LEAVE" BATCH_BYTES=200 > /tmp/restore-job-check.out &
+# Batches smaller than a line: each is one line, not a line broken in two.
+restore "$LEAVE" BATCH_BYTES=20 > /tmp/restore-job-check.out &
 running=$!
 held=
 for _ in $(seq 100); do
@@ -213,6 +259,23 @@ out=$(restore "$GAMES") || fail "running it again failed: $out"
 [[ "$out" == *"tasks: 500 rows, 0 loaded now, 500 already there as dumped"* ]] || fail "unexpected re-run: $out"
 [[ "$(digest "$PROD" "$GAMES")" == "$want_games" ]] || fail "running it again changed the job"
 [[ "$(digest "$PROD" "$OTHER")" == "$want_other" ]] || fail "another job was touched"
+
+echo "-- a deleted job comes back whole, inactive, and a stopped one resumes"
+# The first run stops once the jobs row is in: the config is refused.
+val "$PROD" "CREATE FUNCTION refuse() RETURNS trigger LANGUAGE plpgsql AS \$\$
+             BEGIN RAISE EXCEPTION 'refused'; END \$\$;
+             CREATE TRIGGER refuse BEFORE INSERT ON job_game_config FOR EACH ROW EXECUTE FUNCTION refuse()" >/dev/null
+if out=$(restore "$DELETED"); then fail "the refused config did not stop the run: $out"; fi
+[[ "$(val "$PROD" "SELECT count(*) FROM jobs WHERE id = '$DELETED'")" == 1 ]] || fail "the jobs row was not in before the stop"
+val "$PROD" "DROP TRIGGER refuse ON job_game_config; DROP FUNCTION refuse()" >/dev/null
+out=$(restore "$DELETED") || fail "the deleted job's restore failed: $(tail -5 <<<"$out")"
+[[ "$(digest "$PROD" "$DELETED")" == "$want_deleted" ]] || fail "the deleted job's rows came back different: $out"
+[[ "$(val "$PROD" "SELECT j::text FROM (SELECT id, job_type, allocation, letterdist_id, layout_id, created_by FROM jobs WHERE id = '$DELETED') j")" == "$want_deleted_job" ]] \
+  || fail "its jobs row came back different"
+[[ "$(val "$PROD" "SELECT status FROM jobs WHERE id = '$DELETED'")" == inactive ]] || fail "it came back dispatching"
+[[ "$(val "$PROD" "SELECT count(*) FROM job_game_config c JOIN player_configs p ON p.id = c.player1_config_id
+                    JOIN input_data k ON k.id = p.klv_id WHERE c.job_id = '$DELETED'")" == 1 ]] \
+  || fail "its config, player config or input data did not come back"
 
 echo "-- the sequences are past the restored ids"
 for table in leave_rack_staging position_analysis_records position_analysis_moves; do

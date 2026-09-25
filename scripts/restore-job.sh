@@ -17,15 +17,24 @@
 #   COPYBACK_DUMP_ONLY=1  dump the job's rows and print their sizes, load nothing
 #   WORK_DIR      where the job's rows are dumped (default /tmp/restore)
 #   BATCH_BYTES   the most text loaded per transaction (default 16 MiB): about
-#                 400,000 progress rows, or a few hundred staged results
+#                 170,000 progress rows, or a few hundred staged results
 #   FREE_DUMP_DIR removed first, since its contents are in the scratch database
 #                 now and would share the disk (default /tmp/dump; empty: none)
 #
 # It refuses to start when the scratch copy and production are one database,
-# when production has the job active (RUNBOOK §2.0 stops it), or when the
-# scratch copy holds nothing of the job -- a mistyped id, SCRATCH_URL pointing
-# at production, or a copy taken after the mistake, each of which would
-# otherwise "restore" nothing, say so, and be followed by the counter repair.
+# when production has the job active (RUNBOOK §2.0 stops it), when the scratch
+# copy holds nothing of the job (a mistyped id, or SCRATCH_URL pointing at
+# production), and when it already holds the audit row of the job's last purge
+# or delete -- a copy taken after the mistake, which may hold rows of a job that
+# went on running, or only the generation-0 artifact a leave job's purge writes
+# back. (That row is written in the purge's own transaction, so its presence is
+# exact; a comparison of timestamps was not.) Each would otherwise "restore"
+# the wrong rows, say so, and be followed by the counter repair.
+#
+# A deleted job is restored whole: before its rows, whichever of the input-data
+# rows, player configs, jobs row (made inactive) and config row it needs are
+# missing from production. They are part of every run, not only the first, so a
+# run stopped after the jobs row resumes with the rest.
 # While it loads it holds the job's merge lock, so the half-hourly merge cannot
 # fold restored staged rows into restored progress rows mid-run.
 #
@@ -80,6 +89,16 @@ there=$(sql "$SCRATCH_URL" "$fingerprint") || { echo "stopped: cannot reach SCRA
 status=$(sql "$DATABASE_URL" "SELECT status FROM jobs WHERE id = '$job'") \
   || { echo "stopped: cannot read the job in production" >&2; exit 1; }
 [[ "$status" != active ]] || { echo "stopped: the job is active in production; deactivate it and clear it first (RUNBOOK §2.0)" >&2; exit 1; }
+mistake=$(sql "$DATABASE_URL" "SELECT max(id) FROM audit_log
+                                WHERE action IN ('job.purged', 'job.deleted') AND target_id = '$job'") \
+  || { echo "stopped: cannot read production's audit log" >&2; exit 1; }
+if [[ -n "$mistake" ]]; then
+  after=$(sql "$SCRATCH_URL" "SELECT count(*) FROM audit_log WHERE id = $mistake") \
+    || { echo "stopped: cannot read the scratch copy's audit log" >&2; exit 1; }
+  (( after == 0 )) || { echo "stopped: the scratch copy already holds job $job's purge or delete (audit row $mistake): it was taken after the mistake; use an earlier dump or point in time" >&2; exit 1; }
+else
+  echo "warning: production's audit log records no purge or delete of job $job" >&2
+fi
 
 # One run at a time: a second would empty the first's work directory under it.
 mkdir -p "$work" || { echo "stopped: cannot create $work" >&2; exit 1; }
@@ -92,7 +111,41 @@ MOVES="SELECT id FROM position_analysis_moves WHERE record_id IN ($RECORDS)"
 
 # Order matters: tasks, then what hangs off a task, then claims, then what
 # hangs off a claim.
+PLAYERS="SELECT unnest(ARRAY[player1_config_id, player2_config_id]) FROM job_game_config WHERE job_id = '$job'
+         UNION SELECT unnest(ARRAY[player1_config_id, player2_config_id]) FROM job_game_pair_config WHERE job_id = '$job'
+         UNION SELECT player_config_id FROM job_opening_rack_config WHERE job_id = '$job'"
+INPUTS="SELECT letterdist_id FROM jobs WHERE id = '$job' UNION SELECT layout_id FROM jobs WHERE id = '$job'
+        UNION SELECT kwg_id FROM job_leave_config WHERE job_id = '$job'
+        UNION SELECT unnest(ARRAY[kwg_id, klv_id, winpct_id]) FROM player_configs WHERE id IN ($PLAYERS)"
+
+# What a deleted job needs back before its rows: what it names first, then the
+# job, then its config. For a purged job all of it is there, and nothing loads.
+PRELUDE=(
+  "input_data|id IN ($INPUTS)"
+  "player_configs|id IN ($PLAYERS)"
+  "jobs|id = '$job'"
+  "job_game_config|job_id = '$job'"
+  "job_game_pair_config|job_id = '$job'"
+  "job_opening_rack_config|job_id = '$job'"
+  "job_leave_config|job_id = '$job'"
+)
+# Changes to a table's rows before they go in: the job comes back inactive (a
+# restored job dispatching before its counters are repaired is what §2.0
+# prevents), and a reference to an account deleted since is cleared.
+declare -A ADJUST=(
+  [input_data]="UPDATE restoring r SET imported_by = NULL WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = r.imported_by);"
+  [player_configs]="UPDATE restoring r SET created_by = NULL WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = r.created_by);
+                    UPDATE restoring r SET cloned_from_id = NULL WHERE NOT EXISTS (SELECT 1 FROM player_configs p WHERE p.id = r.cloned_from_id) AND NOT EXISTS (SELECT 1 FROM restoring c WHERE c.id = r.cloned_from_id);"
+  [jobs]="UPDATE restoring SET status = 'inactive'; UPDATE restoring r SET created_by = NULL WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.id = r.created_by);"
+)
+# Rows whose production copy may rightly differ from the dump -- shared rows
+# another job may use (an object key filled in since), and the job's own row
+# (its counters, reset by a purge and repaired in §2.3) -- are checked for their
+# key alone.
+declare -A BY_KEY_ONLY=([input_data]=1 [player_configs]=1 [jobs]=1)
+
 TABLES=(
+  "${PRELUDE[@]}"
   "tasks|job_id = '$job'"
   "opening_rack_requests|task_id IN ($TASKS)"
   "game_requests|task_id IN ($TASKS)"
@@ -120,8 +173,7 @@ for entry in "${TABLES[@]}"; do
     || { echo "stopped: could not dump $table from the scratch copy" >&2; exit 1; }
 done
 du -ch "$work"/* | sort -h | tail -6   # the job's own rows, largest last
-total=$(cat "$work"/* | wc -l)
-(( total > 0 )) || { echo "stopped: the scratch copy holds no row of job $job -- a wrong id, SCRATCH_URL pointing at production, or a copy taken after the mistake" >&2; exit 1; }
+[[ -s "$work/jobs" ]] || { echo "stopped: the scratch copy holds no job $job -- a wrong id, or SCRATCH_URL pointing at production" >&2; exit 1; }
 if [[ "${COPYBACK_DUMP_ONLY:-}" == 1 ]]; then
   echo "dumped only; compare the sizes above with FreeStorageSpace (RUNBOOK §2.2)"
   exit 0
@@ -133,10 +185,13 @@ fi
 # It ends, and the lock with it, when this script does and its input closes:
 # nothing signals it (inside the ops container, a pid is as likely a server
 # process's as psql's).
-coproc HOLD { psql "$DATABASE_URL" -X -q -tA -v ON_ERROR_STOP=1; }
+# The coprocess lets go of this script's flock (fd 9), or a failed run left it
+# held by a psql still queued on the lock.
+coproc HOLD { exec 9>&-; exec psql "$DATABASE_URL" -X -q -tA -v ON_ERROR_STOP=1; }
 # Idle for the whole load, so never timed out for it, whatever the parameter
 # group says.
 echo "SET idle_session_timeout = 0; SET idle_in_transaction_session_timeout = 0;
+SET lock_timeout = '60s';
 SELECT 'held' FROM (SELECT pg_advisory_lock(3, hashtext('$job'))) taken;" >&"${HOLD[1]}"
 IFS= read -r -t 60 held <&"${HOLD[0]}"
 [[ "$held" == held ]] || { echo "stopped: could not take the job's merge lock" >&2; exit 1; }
@@ -158,10 +213,16 @@ for entry in "${TABLES[@]}"; do
     || { echo "stopped: could not read $table's primary key" >&2; exit 1; }
   [[ -n "$key" ]] || { echo "stopped: $table has no primary key to check its rows by" >&2; exit 1; }
   t_key="t.${key//,/, t.}" r_key="r.${key//,/, r.}" first=${key%%,*}
+  by_key_only=false
+  [[ -z "${BY_KEY_ONLY[$table]:-}" ]] || by_key_only=true
 
   rm -f "$work/$table".batch.*
   # By bytes, whole lines each: a staged leave result is tens of kilobytes.
-  split -C "$batch_bytes" -d -a 6 "$work/$table" "$work/$table.batch." \
+  # `split -C` breaks a line longer than its size, so a batch is at least the
+  # longest line.
+  longest=$(LC_ALL=C awk '{ if (length($0) > m) m = length($0) } END { print m + 1 }' "$work/$table")
+  chunk=$(( batch_bytes > longest ? batch_bytes : longest ))
+  split -C "$chunk" -d -a 6 "$work/$table" "$work/$table.batch." \
     || { echo "stopped: could not split $table" >&2; exit 1; }
   rm -f "$work/$table"   # the batches hold it now, on the same disk
   inserted=0
@@ -174,6 +235,7 @@ SET LOCAL enable_hashjoin = off;
 SET LOCAL enable_mergejoin = off;
 CREATE TEMP TABLE restoring (LIKE $table) ON COMMIT DROP;
 \copy restoring FROM '$batch'
+${ADJUST[$table]:-}
 WITH ins AS (INSERT INTO $table SELECT * FROM restoring ON CONFLICT DO NOTHING RETURNING 1)
 SELECT count(*) FROM ins;
 DO \$check\$
@@ -181,7 +243,7 @@ DECLARE differing bigint;
 BEGIN
   SELECT count(*) INTO differing
     FROM restoring r LEFT JOIN $table t ON ($t_key) = ($r_key)
-   WHERE t.$first IS NULL OR row(t.*) IS DISTINCT FROM row(r.*);
+   WHERE t.$first IS NULL OR ($by_key_only IS NOT TRUE AND row(t.*) IS DISTINCT FROM row(r.*));
   IF differing > 0 THEN
     RAISE EXCEPTION '% of these rows are not in $table as dumped: another row holds their key, or one of their unique values', differing
       USING HINT = 'the job wrote rows since the purge (do RUNBOOK §2.0, then run this again); or, for a leave job run again after a stop, a merge folded its staged rows in since (do §2.0 and run it from the start)';

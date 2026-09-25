@@ -527,9 +527,10 @@ async fn input_bytes(
     let Some(key) = row.get::<Option<String>, _>("object_key") else {
         let path: String = row.get("path");
         return Err(AppError::internal(format!(
-            "{path} was imported before the server stored lexicon bytes, so it cannot be built \
-             from. Re-import that tarball -- the import adds no rows for files whose bytes have \
-             not changed, and will fill in the missing ones."
+            "{path} has neither stored bytes nor an object key, so it cannot be built from, \
+             and no import writes such a row: it was put in by hand. Delete it, and what \
+             pins it, and import its tarball again (an import adds no row for a file already \
+             known, so re-importing leaves this one as it is)."
         )));
     };
     Ok((name, artifacts.get(&key).await?))

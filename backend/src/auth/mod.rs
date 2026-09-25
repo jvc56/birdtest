@@ -192,7 +192,7 @@ impl FromRequestParts<AppState> for RegisteredWorker {
         let identity = WorkerIdentity::resolve(parts, state, WorkerBucket::WorkInHand).await?;
         identity.check_rate_limit(state)?;
         identity.require_registered()?;
-        // Who a large body is from, for its one-at-a-time rule
+        // Who a large body is from, for its share of the large-body budget
         // (`extract::read_body`).
         parts.extensions.insert(crate::extract::BodyOwner(identity.rate_key()));
         Ok(Self(identity))
