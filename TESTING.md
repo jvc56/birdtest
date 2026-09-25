@@ -68,8 +68,8 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 165 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `ratelimit` (2), `routes::public` (2), `exports`, `jobs`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
-| 1F Frontend unit | 103 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1 Unit | 166 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (17), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::public` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1F Frontend unit | 111 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 144 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (11), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (7), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 168 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (31), `auth_routes.rs` (17), `worker_routes.rs` (16), `boundaries.rs` (18), `public_api.rs` (11), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (6), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 505 backend tests (the per-tier counts above are
+--run-ignored all` runs 506 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, twentieth audit;
 they had drifted by up to 17).
 
@@ -261,7 +261,10 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
   letter shifted the numbering. *(Covered:
   `racks::tests::it_reads_a_distribution_as_magpie_does`,
   `racks::tests::a_minimal_two_letter_distribution_parses`.)* (Twenty-third
-  audit.)
+  audit; since the twenty-fourth, also refused as MAGPIE refuses them or
+  cannot hold them: a CRLF blank line (a lone `\r`), a field that is only
+  `\r`, a count above 255 (MAGPIE keeps it in a byte), and a letter longer
+  than 4 bytes (MAGPIE's shipped maximum; some of its buffers hold no more).)
 - `U-ERR-1` Each `AppError` constructor maps to its documented HTTP status:
   `bad_request` → 400, `unauthorized` → 401, `forbidden` → 403, `not_found` →
   404, `conflict` → 409, `rate_limited` → 429, `internal` → 500. *(Covered:
@@ -375,6 +378,18 @@ process environment, so no test mutates `std::env` under another.
 - `U-WIRE-7` `SprtParams::from` reads the same alpha/beta/elo values out of a
   `GameConfig` and a `GamePairConfig`, so the two job types cannot diverge.
   *(Covered: `job::tests::sprt_params_read_the_same_settings_from_games_and_pairs`.)*
+
+### `U-DISPATCH-*` — the job template cache (`jobs/dispatch.rs`)
+
+- `U-DISPATCH-1` Forgetting a job drops its template, and forgetting an unknown
+  one is nothing. *(Covered: `dispatch::tests::a_forgotten_job_is_read_again`.)*
+- `U-DISPATCH-2` A job whose template failed to load is passed over for a
+  minute, without a connection or a log line, then tried again; forgetting the
+  job clears it. Without it, a job that never issues a claim heads every
+  candidate list, and every claim of every worker paid a pool connection, the
+  read and parse, and an error line for it. *(Covered:
+  `dispatch::tests::a_job_whose_template_failed_is_passed_over_for_a_while`.)*
+  (Twenty-fourth audit.)
 
 ### `U-PLAUS-*` — plausibility gaps (`jobs/plausibility.rs`)
 
@@ -572,6 +587,19 @@ Each entry's tests are the `describe` block named for its id.
   resets it. At a fixed 5 s, every page the server's stream cap refused asked
   again, with a stats read first, every five seconds (twenty-first audit).
   *(Covered: `sse.test.ts`.)*
+
+### `F-IMPORT-*` — `lib/importWatch.ts`
+
+- `F-IMPORT-1` The import page's polling: it reads at once and polls while the
+  import runs; it stops once staged (keeping the id) and forgets a failed one;
+  a late `running` cannot undo a newer `staged`; an earlier import's late answer
+  cannot touch a newer watch (it put that import on the page, stopped the new
+  one's poll and forgot its id, and Insert then confirmed the wrong import); a
+  503 or a network failure keeps it polling; a 404 forgets the import, a 401
+  keeps it and reports the lapsed session; an older read's error after a newer
+  success is ignored; stopping ignores answers in flight. *(Covered:
+  `importWatch.test.ts`.)* (Twenty-fourth audit: this logic was wrong three
+  audits running.)
 
 ### `F-CHART-*` — chart maths
 
@@ -2284,6 +2312,13 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
   it. The drill restores into a Postgres it starts inside its own container,
   as the production task does, and never into the stack's database (the check
   asserts it left nothing there). *(Covered: `backup-drill-check.sh`, step 2.)*
+- `S-BACKUP-2b` The drill of an empty bucket (a new stack before its first
+  backup) passes and says there is nothing to drill; the drill of a prefix with
+  no backups in a bucket that has some fails, with a message. The empty case
+  was meant to pass since the twenty-third audit but never could: `aws s3 ls`
+  exits 1 on an empty listing, and `set -e` ended the drill, silently, before
+  the check. *(Covered: `backup-drill-check.sh`, step 2b.)* (Twenty-fourth
+  audit.)
 - `S-BACKUP-3` A backup that cannot upload exits non-zero and leaves an
   `ok = false` row. *(Covered: `backup-drill-check.sh`, step 3.)*
 - `S-BACKUP-4` A dump of the current schema restores into an empty database and
@@ -2581,7 +2616,10 @@ GitHub Actions.
   `backend`) with its GitHub URLs on the script's stand-in, and
   `scripts/e2e_magpie.py` running every `M-*` case, then the opt-in Rust
   tests (`cargo nextest run --run-ignored ignored-only`) against the same
-  MAGPIE. Dispatchable by hand against another MAGPIE ref.
+  MAGPIE. Run twice, as a matrix: against the commit `docker/Dockerfile` pins
+  (what production runs -- a pin that refused every short opening rack passed
+  every other check, twenty-third audit) and against the branch head.
+  Dispatchable by hand against another MAGPIE ref (the head leg).
 - **restore-roundtrip** — the schema applied to an empty database (the
   migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`).
 - **backup-drill** — Postgres and MinIO up, the schema applied, then

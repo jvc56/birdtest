@@ -25,6 +25,13 @@ variable "region" {
   description = "AWS region to deploy into."
   type        = string
   default     = "us-east-1"
+
+  validation {
+    # An empty one is not refused by the provider: it falls back to the
+    # CLI's region, which during RUNBOOK §5 is likely the one that was lost.
+    condition     = can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]+$", var.region))
+    error_message = "region must be an AWS region name, such as us-east-1."
+  }
 }
 
 variable "vpc_cidr" {
@@ -149,6 +156,11 @@ variable "dr_region" {
   EOT
   type        = string
   default     = "us-west-2"
+
+  validation {
+    condition     = can(regex("^[a-z]{2}(-[a-z]+)+-[0-9]+$", var.dr_region))
+    error_message = "dr_region must be an AWS region name, such as us-west-2."
+  }
 
   validation {
     condition     = var.dr_region != var.region

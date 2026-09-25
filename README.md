@@ -297,7 +297,7 @@ A first deployment, in order (each step is described below):
    `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 -var scheduled_tasks_enabled=false`
    -- the scheduled builder and backup would fail against the placeholder
    parameters until step 6. Then pin the zones the stack chose:
-   `echo "azs = $(terraform -chdir=infra output -json azs)" >> infra/prod.tfvars`. Left to
+   `grep -q '^azs' infra/prod.tfvars || printf '\nazs = %s\n' "$(terraform -chdir=infra output -json azs)" >> infra/prod.tfvars`. Left to
    the default, the pair is recomputed on every plan, and a change to what the
    region reports would plan to replace the subnets the database sits in.
 5. Add the SES DNS records straight away (the `ses_dkim_tokens` and
@@ -331,7 +331,10 @@ the machine that applied. RUNBOOK.md's recovery steps and both ops scripts read
 it (`terraform output`), so keep it somewhere that survives that machine and
 the stack's region: copy it off after every apply, or configure a remote
 backend (an S3 bucket in another region, versioned, with locking) before the
-first one. The repository does not choose one for you.
+first one. The repository does not choose one for you. Keep `infra/prod.tfvars`
+(and RUNBOOK §5's `infra/dr.tfvars`, when there is one) with it: the state
+records no input variables, and every later apply and the region-loss rebuild
+read them. Neither holds a secret.
 
 The database master password is set by hand, not managed by RDS (RDS rotation
 would break the fixed `DATABASE_URL`). Terraform creates the instance with a

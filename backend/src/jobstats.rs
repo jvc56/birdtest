@@ -810,22 +810,24 @@ async fn estimate_eta(
     // reached the planner as a parameter it could not estimate, and every
     // live push seq-scanned both tables (~200 ms at two million claims, where
     // this is ~10).
-    let hour = chrono::Duration::hours(1);
-    let now = chrono::Utc::now();
-    let since = job
-        .activated_at
-        .map_or(now - hour, |at| at.max(now - hour))
-        .min(now - chrono::Duration::minutes(1));
-    let window_seconds = (now - since).num_milliseconds() as f64 / 1000.0;
-    let recent = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM task_claims c
-         JOIN tasks t ON t.id = c.task_id
-         WHERE t.job_id = $1 AND c.state = 'completed'
-           AND c.completed_at > now() - interval '1 hour'
-           AND c.completed_at > $2",
+    //
+    // The window's length is read in the same statement, from the database's
+    // own clock: measured in Rust before the query, it left out the wait for
+    // a connection and any skew between the two clocks.
+    let (recent, window_seconds) = sqlx::query_as::<_, (i64, f64)>(
+        "SELECT (SELECT COUNT(*) FROM task_claims c
+                   JOIN tasks t ON t.id = c.task_id
+                  WHERE t.job_id = $1 AND c.state = 'completed'
+                    AND c.completed_at > now() - interval '1 hour'
+                    AND c.completed_at > least(coalesce($2, '-infinity'::timestamptz),
+                                               now() - interval '1 minute')),
+                EXTRACT(EPOCH FROM now() - greatest(
+                    now() - interval '1 hour',
+                    least(coalesce($2, '-infinity'::timestamptz), now() - interval '1 minute')
+                ))::float8",
     )
     .bind(job.id)
-    .bind(since)
+    .bind(job.activated_at)
     .fetch_one(pool)
     .await?;
 

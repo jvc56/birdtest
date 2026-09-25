@@ -15,9 +15,17 @@ on:
         default: birdtest-contribute
 
 jobs:
+  # Twice: the MAGPIE commit docker/Dockerfile pins -- what production runs,
+  # which nothing else put through a real task: a pin that refused every
+  # short opening rack passed every PR check (AUDIT_FINDINGS_19 1.1) -- and
+  # the branch head, what the next pin will be.
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        magpie: [pin, head]
     # The checkout the compose file mounts into the backend (and the
     # derived-builder) as /magpie. Unset, compose falls back to ../MAGPIE,
     # which does not exist here, and the backend exits at start with no
@@ -26,10 +34,18 @@ jobs:
       MAGPIE_ROOT: ${{ github.workspace }}/magpie
     steps:
       - uses: actions/checkout@v4
+      - name: Which MAGPIE
+        id: magpie-ref
+        run: |
+          if [ "${{ matrix.magpie }}" = pin ]; then
+            echo "ref=$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ inputs.magpie_ref || 'birdtest-contribute' }}" >> "$GITHUB_OUTPUT"
+          fi
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE
-          ref: ${{ inputs.magpie_ref || 'birdtest-contribute' }}
+          ref: ${{ steps.magpie-ref.outputs.ref }}
           path: magpie
       - name: Cache MAGPIE data
         id: magpie-data

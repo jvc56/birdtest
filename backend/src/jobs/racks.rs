@@ -54,6 +54,11 @@ pub struct LetterDistribution {
 
 /// MAGPIE's `MAX_ALPHABET_SIZE` (`src/def/letter_distribution_defs.h`).
 pub const MAGPIE_MAX_ALPHABET_SIZE: usize = 50;
+/// MAGPIE's `MAX_SHIPPED_LETTER_BYTE_LENGTH`: the longest letter every one of
+/// its letter buffers holds (Catalan's `L·L`). Its parser's own ceiling is 5
+/// bytes (`MAX_LETTER_BYTE_LENGTH`, 6 with the terminator), but some buffers
+/// are sized for the shipped letters and would cut a longer one short.
+const MAGPIE_MAX_LETTER_BYTES: usize = 4;
 
 impl LetterDistribution {
     /// Parses a distribution from the bytes of the `input_data` row a job
@@ -87,14 +92,21 @@ impl LetterDistribution {
             ))
         };
         for raw in text.split('\n') {
-            let line = raw.strip_suffix('\r').unwrap_or(raw);
-            if line.is_empty() {
+            // Only a line that is empty before its '\r' is dropped: MAGPIE
+            // skips the empty items between two '\n's, but keeps a lone "\r"
+            // -- the blank line of a CRLF file -- and refuses it for having no
+            // columns.
+            if raw.is_empty() {
                 continue;
             }
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            // Empty fields dropped first, then a trailing '\r' stripped, in
+            // MAGPIE's order: a field that is only "\r" is a (then empty)
+            // column to it, and a line with one has a column too many.
             let cols: Vec<&str> = line
                 .split(',')
-                .map(|c| c.strip_suffix('\r').unwrap_or(c))
                 .filter(|c| !c.is_empty())
+                .map(|c| c.strip_suffix('\r').unwrap_or(c))
                 .collect();
             if cols.len() != 5 && cols.len() != 7 {
                 return Err(malformed(line, "expected 5 or 7 columns"));
@@ -104,6 +116,12 @@ impl LetterDistribution {
                 return Err(malformed(line, "space around a letter"));
             }
             let letter = token.chars().next().ok_or_else(|| malformed(line, "empty letter"))?;
+            // A letter MAGPIE can hold everywhere: past its parser's buffer a
+            // letter ran into the next row's, and past the shipped length
+            // some of its buffers cut it short.
+            if token.len() > MAGPIE_MAX_LETTER_BYTES || cols[1].len() > MAGPIE_MAX_LETTER_BYTES {
+                return Err(malformed(line, "a letter longer than 4 bytes"));
+            }
             // MAGPIE's string_to_int allows surrounding blanks around numbers.
             fn number(c: &str) -> &str {
                 c.trim_matches([' ', '\t'])
@@ -111,6 +129,11 @@ impl LetterDistribution {
             let count: u32 = number(cols[2]).parse().map_err(|_| {
                 AppError::internal(format!("non-numeric tile count in {origin}: {line:?}"))
             })?;
+            // MAGPIE stores a letter's count in a byte: 256 read as none, and
+            // a larger one overran its bag.
+            if count > 255 {
+                return Err(malformed(line, "a tile count above 255"));
+            }
             number(cols[3]).parse::<i32>().map_err(|_| malformed(line, "non-numeric score"))?;
             if !matches!(number(cols[4]), "0" | "1") {
                 return Err(malformed(line, "is_vowel must be 0 or 1"));
@@ -533,6 +556,11 @@ mod tests {
         for (text, why) in [
             ("# upper,lower,count,score,vowel\nA,a,1,1,1\n", "a comment"),
             ("A,a,1,1,1\n  \n", "a whitespace-only line"),
+            ("A,a,1,1,1\r\n\r\nB,b,1,1,0\r\n", "a CRLF blank line"),
+            ("A,a,1,1,1\r\n\r\n", "a trailing CRLF blank line"),
+            ("C,\r,c,2,3,0\n", "a field that is only a carriage return"),
+            ("A,a,256,1,1\n", "a count above 255"),
+            ("ABCDE,abcde,1,1,1\n", "a five-byte letter"),
             ("A,a,1,1\n", "four columns"),
             ("A,a,1,1,1,A\n", "six columns"),
             ("A,a,1,one,1\n", "a non-integer score"),

@@ -2481,6 +2481,14 @@ constant: the space, the unranking and `total_racks` are all computed at that
 size, so a job over 2-tile racks is the same code over a much smaller universe.
 The figures above are for the default.
 
+A short rack is analysed as the player's whole rack on an opening board with a
+full bag: the moves it can make now, and in a simulation the plies after them
+(a play draws back up to 7; a pass keeps the short rack). Neither situation
+arises in a real game; it is the question the job asks. The request does not
+restate the size, so MAGPIE requires only a rack of at least one letter it can
+draw (it required a full rack for one pin, which refused every task of a
+short-rack job; AUDIT_FINDINGS_19).
+
 The unranking order must stay stable: results are recorded against racks expanded from an index, so changing it would silently re-point existing results.
 
 At claim time (all in one transaction):
@@ -6642,7 +6650,8 @@ the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md`,
 the seventeenth's `AUDIT_FINDINGS_13.md`, the eighteenth's `AUDIT_FINDINGS_14.md`,
 the nineteenth's `AUDIT_FINDINGS_15.md`, the twentieth's `AUDIT_FINDINGS_16.md`,
 the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
-`AUDIT_FINDINGS_18.md` and the twenty-third's `AUDIT_FINDINGS_19.md`.
+`AUDIT_FINDINGS_18.md`, the twenty-third's `AUDIT_FINDINGS_19.md` and the
+twenty-fourth's `AUDIT_FINDINGS_20.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -7242,6 +7251,12 @@ tar of the directory. A tar carries mtimes and ownership, which S3 does not
 preserve, so a tar digest would report a mismatch for every dump that had merely
 made the round trip through the bucket. The restore drill found this the first time
 it ran, which is the argument for the drill in miniature.
+
+The drill of a bucket with nothing in it passes, saying so: a new stack (or
+RUNBOOK §5's copy) turns its schedules on before its first backup, and the drill
+runs on the 1st. A bucket with objects but no manifest under the prefix fails,
+since passing it would pass every drill of a misplaced prefix; a stack that
+should have backups and has none is the backup-stale alarm's to report.
 
 `migration_checksums` and `backend_image` together answer "what code can read this
 dump", which under a single mutable `0001_initial.sql` is otherwise unanswerable.

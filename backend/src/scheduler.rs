@@ -531,6 +531,12 @@ async fn try_claim_from_job(
     // claim. Only a miss on either takes a pool connection: the common case is
     // a hit, and a connection held for a lookup the cache answers is one a
     // worker's claim or submission is waiting for.
+    // A job whose template failed to load a moment ago is passed over as if it
+    // had no task, without a connection or a log line; it is tried (and
+    // logged) again once a minute (`JobTemplates::recently_failed`).
+    if state.templates.get(job.id).is_none() && state.templates.recently_failed(job.id) {
+        return Ok(None);
+    }
     let (derived, template) = match (state.derived_ready.get(job.id), state.templates.get(job.id)) {
         (Some(derived), Some(template)) => (derived, template),
         (derived, template) => {

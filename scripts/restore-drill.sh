@@ -123,16 +123,28 @@ mkdir -p "${WORKDIR}"
 # --- Fetch the newest backup ----------------------------------------------
 # The top-level manifest copies exist so that finding the latest backup is one
 # listing rather than a walk of every dump prefix.
-LATEST="$(aws "${s3_args[@]}" s3 ls "s3://${BACKUP_BUCKET}/${BACKUP_PREFIX}/" \
-  | awk '$NF ~ /\.manifest\.json$/ {print $NF}' | sort | tail -1)"
+# s3api, not `s3 ls`: `s3 ls` exits 1 on an empty listing, which under
+# `set -e` ended the drill here with no line in its log. This fails only on a
+# missing bucket or refused access.
+KEYS="$(aws "${s3_args[@]}" s3api list-objects-v2 --bucket "${BACKUP_BUCKET}" \
+  --prefix "${BACKUP_PREFIX}/" --delimiter / --query 'Contents[].Key' --output text)"
+LATEST="$(printf '%s\n' "${KEYS}" | tr '\t' '\n' | awk '/\.manifest\.json$/' | sort | tail -1)"
+LATEST="${LATEST##*/}"
 if [[ -z "${LATEST}" ]]; then
-  # Nothing to drill yet, which is not a drill failure: a new stack (or
-  # RUNBOOK §5's copy) has its schedules turned on before its first 03:00
-  # backup, and on the 1st between 03:00 and 05:00 the drill found an empty
-  # bucket and mailed "backups may not be restorable". A stack that should
-  # have backups and has none is the backup-stale alarm's to report.
-  log "no backups under s3://${BACKUP_BUCKET}/${BACKUP_PREFIX}/ yet; nothing to drill"
-  exit 0
+  # A bucket with nothing in it is a stack whose first backup has not run:
+  # a new one, or RUNBOOK §5's copy, turns its schedules on before its first
+  # 03:00 backup, and on the 1st the drill runs at 05:00. Not a drill
+  # failure. A bucket with objects but no manifest under the prefix is
+  # something else -- a wrong prefix, backups written elsewhere -- and passing
+  # it would pass every drill from then on.
+  OBJECTS="$(aws "${s3_args[@]}" s3api list-objects-v2 --bucket "${BACKUP_BUCKET}" \
+    --max-keys 1 --query KeyCount --output text)"
+  if [[ "${OBJECTS}" == 0 ]]; then
+    log "s3://${BACKUP_BUCKET} is empty: no backup has run yet, nothing to drill"
+    exit 0
+  fi
+  log "no backups under s3://${BACKUP_BUCKET}/${BACKUP_PREFIX}/, but the bucket is not empty"
+  exit 1
 fi
 STAMP="${LATEST%.manifest.json}"
 log "drilling ${STAMP}"

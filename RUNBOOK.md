@@ -253,7 +253,7 @@ This block can be run again as it is; do not go on to the next until it says
 # Inside scripts/prod-shell.sh.
 apt-get update -qq && apt-get install -y -qq awscli >/dev/null
 STAMP=2026-09-07T03-00-00Z
-BUCKET=${BUCKET:-$BACKUP_BUCKET}   # §5 sets the replica's, and S3_REGION
+BUCKET=${BUCKET:-$BACKUP_BUCKET}   # the stack's own; set BUCKET/S3_REGION only to read another
 rm -rf /tmp/dump   # a re-fetch must not keep files from an earlier one
 aws s3 cp ${S3_REGION:+--region $S3_REGION} "s3://$BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
 aws s3 cp ${S3_REGION:+--region $S3_REGION} "s3://$BUCKET/pg/$STAMP.manifest.json" /tmp/manifest.json
@@ -901,35 +901,49 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    # production's own allocation if that is larger and known.
    # The replica bucket is in the lost stack's dr_region, which need not be
    # $DR_REGION; with no --region the CLI asks the lost region first.
+   DR_REGION=<the region the copy is built in>
+   THIRD_REGION=<a third region, up, for the copy's own replicas>
    REPLICA_REGION=<the lost stack's dr_region>
    REPLICA=s3://birdtest-backups-dr-<account>/pg
    MANIFEST=$(aws s3 ls --region $REPLICA_REGION "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
    DR_STORAGE_GB=$(aws s3 cp --region $REPLICA_REGION "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4))')
    echo "restoring ${MANIFEST%.manifest.json}: $DR_STORAGE_GB GiB"
+   # Everything below needs these; an unset one wrote region = "" (the CLI's
+   # default region, likely the lost one) into dr.tfvars.
+   : "${DR_REGION:?}" "${THIRD_REGION:?}" "${REPLICA_REGION:?}" "${MANIFEST:?}" "${DR_STORAGE_GB:?}"
    # The DR overrides, in a file of their own beside prod.tfvars, so every
    # later DR command -- step 4's apply, the ones after it -- carries the same
    # ones (a later -var-file wins). Every ARN prod.tfvars names in the lost
    # region is overridden: a task whose secrets live there cannot start.
    # GITHUB_TOKEN is optional; leave it empty, or create the parameter in
    # $DR_REGION and put its ARN here. Fill in the <...> before applying.
-   cat > infra/dr.tfvars <<EOF
-   region                     = "$DR_REGION"
-   dr_region                  = "$THIRD_REGION"
-   name_suffix                = "-dr"
-   db_allocated_storage       = $DR_STORAGE_GB
-   github_token_parameter_arn = ""
-   acm_certificate_arn        = "<a certificate issued in $DR_REGION>"
-   backend_image              = "<pullable from $DR_REGION>"
-   derived_builder_image      = "<pullable from $DR_REGION>"
-   frontend_image             = "<pullable from $DR_REGION>"
-   EOF
+   # printf, not a heredoc: copied from this indented list, a heredoc's
+   # closing EOF keeps its indent and never ends it.
+   printf '%s\n' \
+     "region                     = \"$DR_REGION\"" \
+     "dr_region                  = \"$THIRD_REGION\"" \
+     'name_suffix                = "-dr"' \
+     "db_allocated_storage       = $DR_STORAGE_GB" \
+     'github_token_parameter_arn = ""' \
+     "acm_certificate_arn        = \"<a certificate issued in $DR_REGION>\"" \
+     "backend_image              = \"<pullable from $DR_REGION>\"" \
+     "derived_builder_image      = \"<pullable from $DR_REGION>\"" \
+     "frontend_image             = \"<pullable from $DR_REGION>\"" \
+     > infra/dr.tfvars
    # Scheduled tasks off until step 4: the derived builder would fail rows
    # whose inputs are not synced yet, and a 03:00 backup would dump the
    # half-restored database as the newest.
-   # azs=null undoes prod.tfvars' pinned zones, which are the lost region's:
-   # the copy takes $DR_REGION's first two, and step 4 pins those in dr.tfvars.
-   terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars \
-     -var desired_count=0 -var scheduled_tasks_enabled=false -var 'azs=null'
+   ```
+
+   Fill in the `<...>` in `infra/dr.tfvars`, then apply. (`azs=null` undoes
+   `prod.tfvars`' pinned zones, which are the lost region's: the copy takes
+   `$DR_REGION`'s first two, and step 4 pins those in `dr.tfvars`.)
+
+   ```bash
+   if grep -n '<' infra/dr.tfvars; then echo "fill these in first"; else
+     terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars \
+       -var desired_count=0 -var scheduled_tasks_enabled=false -var 'azs=null'
+   fi
    ```
 
    ACM certificates are regional, so the lost region's cannot be used; request
@@ -957,6 +971,10 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    machine, whose credentials can read the replica:
 
    ```bash
+   # In step 1's shell, or with its variables set again: an empty REPLICA made
+   # the source the local root, and --recursive would copy this machine's
+   # files into the Object-Locked bucket, where they stay for 30 days.
+   : "${REPLICA:?}" "${MANIFEST:?}" "${REPLICA_REGION:?}" "${DR_REGION:?}"
    STAMP=${MANIFEST%.manifest.json}
    NEW=s3://$(terraform -chdir=infra output -raw backups_bucket)/pg
    aws s3 cp --recursive --source-region $REPLICA_REGION --region $DR_REGION \
@@ -965,6 +983,12 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
      "$REPLICA/$MANIFEST" "$NEW/$MANIFEST"
    echo "$STAMP"   # for the ops shell, which has none of these variables
    ```
+
+   This needs `kms:Decrypt` on the lost stack's `backups-dr` key (in
+   `$REPLICA_REGION`) and `kms:GenerateDataKey` and `kms:Decrypt` on the new
+   stack's backups key; both keys leave that to IAM, so an administrator has
+   it and a narrower role needs it granted. The copies take the new bucket's
+   30-day Object Lock retention.
 
    Then, in `scripts/prod-shell.sh` against the new stack, fetch and check it
    with §2.1's first block with `STAMP=<the stamp printed above>` (and
@@ -990,7 +1014,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    service up and the schedules on (their defaults):
 
    ```bash
-   echo "azs = $(terraform -chdir=infra output -json azs)" >> infra/dr.tfvars
+   # Once, and on a line of its own: a second append redefines the attribute.
+   grep -q '^azs' infra/dr.tfvars \
+     || printf '\nazs = %s\n' "$(terraform -chdir=infra output -json azs)" >> infra/dr.tfvars
    terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars
    ```
 

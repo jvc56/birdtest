@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { api, ApiError, errorText, type ImportDetail, type InputData } from '$lib/api';
+  import { api, errorText, type ImportDetail, type InputData } from '$lib/api';
+  import { refreshSession } from '$lib/auth';
+  import { createImportWatcher } from '$lib/importWatch';
 
   let files: InputData[] = [];
   let error = '';
@@ -10,7 +12,8 @@
   let gitRef = 'main';
   let current: ImportDetail | null = null;
   let busy = false;
-  let poll: ReturnType<typeof setInterval> | null = null;
+  // Rows the last confirm inserted, as the server counted them.
+  let inserted: number | null = null;
 
   $: newRows = current?.files.filter((f) => f.disposition === 'new') ?? [];
   $: collisions = current?.files.filter((f) => f.disposition === 'collision') ?? [];
@@ -35,77 +38,36 @@
       // Storage unavailable (a private window): nothing to resume, no harm.
     }
   };
-  // The import is gone, or the id is not one: forget it. A 401 or 403 is
-  // about the session (it lapsed, or "sign out everywhere" ran elsewhere), not
-  // the import -- stop asking, but keep it for after signing in again.
-  // Anything else -- a deploy's 503, a network blip -- is worth asking again.
-  const status = (e: unknown) => (e instanceof ApiError ? e.status : 0);
-  const isGone = (e: unknown) => status(e) === 404 || status(e) === 400;
-  const stopsPolling = (e: unknown) => {
-    const s = status(e);
-    return s >= 400 && s < 500 && s !== 408 && s !== 429;
-  };
-  async function resume() {
+  // Polls the import until it stops running (lib/importWatch.ts).
+  const watcher = createImportWatcher({
+    read: (id) => api.getImport(id),
+    onState: (detail) => {
+      current = detail;
+      error = '';
+    },
+    onError: (e) => (error = errorText(e)),
+    forget: () => remember(null),
+    // Refreshed, the session store lets the admin layout send the admin to
+    // sign in and back here, where the kept id resumes.
+    signedOut: () => refreshSession()
+  });
+
+  // The import in this browser's storage, if any, is watched again: its first
+  // read says what it is now.
+  function resume() {
     let id: string | null = null;
     try {
       id = localStorage.getItem(IMPORT_KEY);
     } catch {
       return;
     }
-    if (!id) return;
-    try {
-      current = await api.getImport(id);
-      if (current.state === 'running') watch(id);
-      else if (current.state !== 'staged') remember(null);
-    } catch (e) {
-      if (isGone(e)) remember(null);
-      else if (!stopsPolling(e)) {
-        error = errorText(e);
-        watch(id);
-      } else error = errorText(e);
-    }
+    if (id) watcher.watch(id);
   }
   onMount(() => {
     load();
     resume();
   });
-  onDestroy(() => poll && clearInterval(poll));
-
-  function watch(id: string, now = false) {
-    poll && clearInterval(poll);
-    // Reads can overlap (a slow one, then the next tick); only the newest
-    // answer is applied, so a late `running` cannot undo a newer `staged`.
-    let asked = 0;
-    let applied = 0;
-    const tick = async () => {
-      const mine = ++asked;
-      try {
-        const read = await api.getImport(id);
-        if (mine < applied) return;
-        applied = mine;
-        current = read;
-        error = '';
-        if (current.state !== 'running') {
-          poll && clearInterval(poll);
-          poll = null;
-          if (current.state !== 'staged') remember(null);
-        }
-      } catch (e) {
-        error = errorText(e);
-        // Only a refusal that asking again will not change ends the watch.
-        // A deploy's 503 or a network blip used to end it for good, and with
-        // no list of imports the staged one could not be found again: the
-        // admin downloaded the ~94 MB again instead.
-        if (stopsPolling(e)) {
-          poll && clearInterval(poll);
-          poll = null;
-          if (isGone(e)) remember(null);
-        }
-      }
-    };
-    poll = setInterval(tick, 1000);
-    if (now) tick();
-  }
+  onDestroy(() => watcher.stop());
 
   async function start() {
     busy = true;
@@ -119,10 +81,8 @@
         git_ref: gitRef.trim() || undefined
       });
       remember(started.id);
-      // The poll's first tick is the first read: a separate one, answering
-      // after a quicker tick had seen the import stage or fail, put the older
-      // `running` back with nothing left polling.
-      watch(started.id, true);
+      inserted = null;
+      watcher.watch(started.id);
     } catch (e) {
       error = errorText(e);
     } finally {
@@ -135,8 +95,11 @@
     busy = true;
     error = '';
     try {
-      await api.confirmImport(current.id);
+      const confirmed = await api.confirmImport(current.id);
       remember(null);
+      // What the server inserted, not what was staged: rows another import
+      // confirmed first are skipped.
+      inserted = confirmed.inserted;
       // Confirmed whatever the next read says: a failed read left the button
       // live, and a second click was a 409.
       current = { ...current, state: 'confirmed' };
@@ -209,7 +172,9 @@
     {:else if current.state === 'failed'}
       <p class="text-destructive">Import failed: {current.error}</p>
     {:else if current.state === 'confirmed'}
-      <p class="text-sm">Confirmed. {newRows.length + collisions.length} rows inserted.</p>
+      <p class="text-sm">
+        Confirmed.{inserted !== null ? ` ${inserted} rows inserted.` : ''}
+      </p>
     {:else if current.state === 'staged'}
       <div class="space-y-2 text-sm">
         <p>

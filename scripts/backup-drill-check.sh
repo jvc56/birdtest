@@ -203,6 +203,26 @@ run_script restore-drill.sh "BACKUP_PREFIX=${PREFIX}" "DRILL_DB=${DRILL_DB}" "DR
 [[ "$(sql "SELECT count(*) FROM pg_database WHERE datname = '${DRILL_DB}'")" == 0 ]] \
   || fail "the server drill left ${DRILL_DB} behind"
 
+# --- 2b. A drill with nothing to drill -----------------------------------------
+# An empty bucket -- a new stack before its first backup -- passes, saying so.
+# A prefix with no backups in a bucket that has some fails: passing it would
+# pass every drill of a misplaced prefix from then on.
+empty_bucket="${BUCKET}-empty-${RANDOM}"
+tools "${TOOLS}" ${S3} s3 mb "s3://${empty_bucket}" >/dev/null
+log "restore-drill.sh on an empty bucket (expected to pass)"
+empty_log="$(mktemp)"
+run_script restore-drill.sh "BACKUP_BUCKET=${empty_bucket}" "BACKUP_PREFIX=pg" "DRILL_DB=${DRILL_DB}" \
+  2>"${empty_log}" || { cat "${empty_log}" >&2; fail "the drill failed on an empty bucket"; }
+grep -q "nothing to drill" "${empty_log}" || { cat "${empty_log}" >&2; fail "the empty-bucket drill did not say so"; }
+tools "${TOOLS}" ${S3} s3 rb "s3://${empty_bucket}" >/dev/null
+log "restore-drill.sh on a prefix with no backups in a bucket with some (expected to fail)"
+status=0
+run_script restore-drill.sh "BACKUP_PREFIX=${PREFIX}-nothing-here" "DRILL_DB=${DRILL_DB}" \
+  2>"${empty_log}" || status=$?
+grep -q "but the bucket is not empty" "${empty_log}" || { cat "${empty_log}" >&2; fail "no message for an empty prefix"; }
+rm -f "${empty_log}"
+(( status == 1 )) || fail "the drill of an empty prefix exited ${status}, not 1"
+
 # --- 3. A backup that cannot upload ------------------------------------------
 log "backup.sh to a bucket that does not exist (expected to fail)"
 # Its log names every file the upload refused; only the end of it is shown.
