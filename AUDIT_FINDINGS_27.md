@@ -38,7 +38,7 @@ pass with no high or medium finding (then one confirmation full pass).
   which needs a statistical decision). The adversarial check found no high or
   medium. The budget of four passes is spent, so **the loop stops here** with
   KL-74 open.
-- **Run total:** 5 high and 20 medium found by reviewers across four passes,
+- **Run total:** 5 high and 21 medium found by reviewers across four passes,
   plus 1 high and 8 medium in the run's own fixes found by its adversarial
   checks; all fixed and verified but one (KL-74). Known Limits KL-54 to KL-77
   added, KL-6 closed, KL-37, KL-44, KL-62 and others updated. Final green run
