@@ -3914,7 +3914,8 @@ and got different bytes, or (role `klv`) the leave KLV it fetched does not hash 
 fix, so the worker sets the job aside only for a while — sent as unsupported for
 the idle interval, doubling per job to ten minutes, then claimed and its KLV
 fetched afresh, so a repair is noticed — and goes on with other jobs meanwhile (a
-shutdown answered only because of such jobs is waited out, not obeyed) —
+`data_out_of_date` shutdown answering a claim that named such a job is waited
+out, not obeyed; a `magpie_too_old` one is obeyed at once) —
 or `task_failed` — the worker ran the task and could
 not produce a result the server accepted;
 `missing` is present for `missing_data` and `derived_mismatch`, where `actual`
@@ -4266,6 +4267,13 @@ pools](#two-connection-pools)). That is load rather than a fault, and MAGPIE's
 client already backs off and retries a `5xx`. `fields` is omitted when empty and carries per-field
 messages so form endpoints can mark individual inputs. A `rate_limited`
 response also carries a `Retry-After` header in whole seconds.
+
+**So is a path or query string that does not parse** (`extract::ApiPath`,
+`ApiQuery`): a malformed id in a URL is `404 not_found` — it names nothing — and
+a malformed query `400`, where axum's own extractors answered plain text.
+
+`message` is shown to people. A `500`'s is replaced by "internal error" when it
+came from the database; a `503`'s is not, since it says to try again.
 
 **A body that does not parse is answered in the same shape.** It never reaches
 a handler, so with axum's own `Json` extractor it was answered by axum: plain
@@ -6589,7 +6597,8 @@ Ten audits of this repository each left a findings record (`AUDIT_FINDINGS*.md`,
 now deleted; they are in the git history up to the commit that removed them).
 The eleventh's is `AUDIT_FINDINGS_7.md`, the twelfth's `AUDIT_FINDINGS_8.md`,
 the thirteenth's `AUDIT_FINDINGS_9.md`, the fourteenth's `AUDIT_FINDINGS_10.md`,
-the fifteenth's `AUDIT_FINDINGS_11.md` and the sixteenth's `AUDIT_FINDINGS_12.md`.
+the fifteenth's `AUDIT_FINDINGS_11.md`, the sixteenth's `AUDIT_FINDINGS_12.md` and
+the seventeenth's `AUDIT_FINDINGS_13.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -7300,7 +7309,10 @@ The same topic carries the database's own warnings (`infra/rds.tf`): RDS's
 `low storage` and `failure` events, through an event subscription —
 autoscaled storage stops at five times its first allocation, and CloudWatch has
 no metric for how near the ceiling is (a `FreeStorageSpace` threshold fired from
-the first apply and never cleared) — and CPU over 80% for fifteen minutes.
+the first apply and never cleared) — and CPU over 80% for fifteen minutes. The
+`low storage` mail that arrives before each autoscaling step (RDS-EVENT-0089,
+over 90% of the current allocation) is routine; the one that matters is
+autoscaling having reached its ceiling (RDS-EVENT-0224, in `failure`).
 
 Layer 3 had a design choice of its own. Having the backend list the backup bucket
 directly would require giving the task role `ListBucket` / `GetObject` on it,

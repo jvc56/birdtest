@@ -59,7 +59,10 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     throw new ApiError(
       response.status,
       payload?.code ?? 'error',
-      payload?.message ?? response.statusText,
+      // Over HTTP/2 -- the load balancer's -- `statusText` is always empty,
+      // so an answer with no JSON (the ALB's own 502/503 during a deploy)
+      // produced an error with no message, and pages showed nothing at all.
+      payload?.message ?? (response.statusText || `The server answered ${response.status}.`),
       fields
     );
   }

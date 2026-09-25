@@ -50,6 +50,11 @@ if [[ "${1:-}" == --attach ]]; then
   exit 0
 fi
 
+# ECS Exec needs the Session Manager plugin; without it the task would start
+# and nothing could open a shell in it.
+command -v session-manager-plugin >/dev/null \
+  || { echo "install the AWS CLI's Session Manager plugin first" >&2; exit 1; }
+
 overrides=$(jq -n --arg command "sleep $seconds" \
   '{containerOverrides: [{name: "ops", command: [$command]}]}')
 started=$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" \
@@ -75,5 +80,8 @@ for _ in $(seq 60); do
   [[ "$agent" == RUNNING ]] && break
   sleep 5
 done
+# Still under the trap: a task nobody can get into is stopped, not left to
+# sleep out SHELL_HOURS holding DATABASE_URL.
+[[ "${agent:-}" == RUNNING ]] || { echo "the task's ECS Exec agent never started" >&2; exit 1; }
 trap - EXIT
 attach "$task_arn"

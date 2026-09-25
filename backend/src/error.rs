@@ -107,7 +107,10 @@ impl IntoResponse for AppError {
         let retry_after = self.retry_after;
         // The API conventions promise a client never sees a database error or
         // a stack trace; the detail is in the log line above.
-        let message = if self.status.is_server_error() && self.db_code.is_some() {
+        // Scrubbed for a 500 only: a busy server's 503 (a statement timeout, a
+        // lock wait given up) carries a database code too, and "internal
+        // error" told the user it had failed rather than to try again.
+        let message = if self.status == StatusCode::INTERNAL_SERVER_ERROR && self.db_code.is_some() {
             "internal error".to_string()
         } else {
             self.message

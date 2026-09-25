@@ -123,6 +123,10 @@ resource "aws_db_event_subscription" "db_storage" {
   # would otherwise hear about until the site was down.
   event_categories = ["low storage", "failure"]
   tags             = local.tags
+
+  # RDS checks it may publish when the subscription is made; the topic policy
+  # that lets it is changed in the same apply.
+  depends_on = [aws_sns_topic_policy.alerts]
 }
 
 # Sustained load. The default class is burstable and runs in unlimited mode:

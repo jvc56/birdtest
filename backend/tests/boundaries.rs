@@ -804,3 +804,20 @@ async fn api_responses_are_not_sniffed() {
         );
     }
 }
+
+/// A-BOUND-12: a malformed id in a path is a JSON `404`, and a malformed query
+/// string a JSON `400` -- not axum's plain-text rejections, which broke the
+/// API's promise that every failure carries a `code` and a `message`.
+#[tokio::test]
+async fn malformed_paths_and_queries_answer_json() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let response =
+        send_raw(&app, Request::get("/api/jobs/not-a-uuid").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "{response:?}");
+    assert_eq!(response.body["code"], "not_found", "{response:?}");
+    let response =
+        send_raw(&app, Request::get("/api/jobs?page=many").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST, "{response:?}");
+    assert_eq!(response.body["code"], "bad_request", "{response:?}");
+}

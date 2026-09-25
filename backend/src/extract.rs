@@ -87,6 +87,57 @@ where
     }
 }
 
+/// `axum::extract::Path`, rejecting with an `AppError`.
+///
+/// axum's own rejection is a plain-text 400: a malformed id in a URL
+/// (`/api/jobs/not-a-uuid`) broke the API's promise that every failure is
+/// JSON with a `code` and a `message`, and the frontend showed nothing for it.
+/// A path that does not parse names nothing, so it is a 404.
+pub struct ApiPath<T>(pub T);
+
+#[axum::async_trait]
+impl<S, T> axum::extract::FromRequestParts<S> for ApiPath<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned + Send,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        axum::extract::Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Path(value)| ApiPath(value))
+            .map_err(|rejection| AppError::not_found(format!("no such resource: {rejection}")))
+    }
+}
+
+/// `axum::extract::Query`, rejecting with an `AppError` (400) for the same
+/// reason as [`ApiPath`].
+pub struct ApiQuery<T>(pub T);
+
+#[axum::async_trait]
+impl<S, T> axum::extract::FromRequestParts<S> for ApiQuery<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        axum::extract::Query::<T>::from_request_parts(parts, state)
+            .await
+            .map(|axum::extract::Query(value)| ApiQuery(value))
+            .map_err(|rejection| AppError::bad_request(format!("the query string is invalid: {rejection}")))
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

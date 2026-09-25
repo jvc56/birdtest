@@ -7,7 +7,8 @@ use crate::jobstats;
 use crate::models::job::{Job, JobStatus, JobType};
 use crate::scheduler;
 use crate::state::AppState;
-use axum::extract::{DefaultBodyLimit, Query, State};
+use crate::extract::ApiQuery as Query;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -887,20 +888,25 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // staleness the dashboard would notice.
         // On the display pool: this is a dashboard payload, and must not take
         // a connection from the pool the submission that asked for it used.
-        match jobstats::load_job(&state.read_pool, job_id).await {
-            // Built fresh -- this is what submissions asked for -- and kept,
-            // so the page and new subscribers read it rather than build it.
-            Ok(job) => match jobstats::refresh_payload(&state.read_pool, &job, state.cfg.stats_cache)
-                .await
-            {
-                Ok(payload) => state.sse.publish(job_id, payload.to_string()),
-                Err(err) => tracing::warn!(
-                    job_id = %job_id, error = %err.message, "building live job stats failed"
-                ),
-            },
-            Err(err) => tracing::warn!(
-                job_id = %job_id, error = %err.message, "loading a job for its live stats failed"
-            ),
+        // Built fresh -- this is what submissions asked for -- and kept, so
+        // the page and new subscribers read it rather than build it. A build
+        // an admin action (or a newer build) superseded while it ran is not
+        // sent: it would put the pre-action status back on every open page;
+        // it is built again instead, a bounded number of times.
+        for _ in 0..3 {
+            match jobstats::refresh_payload(&state.read_pool, job_id, state.cfg.stats_cache).await {
+                Ok(Some(payload)) => {
+                    state.sse.publish(job_id, payload.to_string());
+                    break;
+                }
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        job_id = %job_id, error = %err.message, "building live job stats failed"
+                    );
+                    break;
+                }
+            }
         }
         if !state.sse.end_push(job_id) {
             return;
@@ -912,6 +918,18 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // connections the claim and submit paths share. Submissions arriving
         // during the pause still coalesce into the one round that follows it.
         tokio::time::sleep(MIN_STATS_PUSH_INTERVAL.max(state.cfg.stats_cache)).await;
+    }
+}
+
+/// Sends open pages the job's stats after a change no submission pushes: an
+/// admin's activate, deactivate, complete, purge or merge. Without it an open
+/// page went on showing the job active after it was deactivated, until
+/// reloaded -- no submission would come to push the change.
+pub(crate) fn push_after_change(state: &AppState, job_id: Uuid) {
+    jobstats::forget(job_id);
+    if state.sse.has_subscribers(job_id) && state.sse.begin_push(job_id) {
+        let state = state.clone();
+        tokio::spawn(async move { push_stats_until_idle(&state, job_id).await });
     }
 }
 

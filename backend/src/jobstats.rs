@@ -201,33 +201,41 @@ pub async fn payload(
     max_age: std::time::Duration,
 ) -> AppResult<std::sync::Arc<str>> {
     if max_age.is_zero() {
-        return build_payload(pool, job, max_age).await;
+        return Ok(build_payload(pool, job.id, max_age).await?.0);
     }
-    if let Some(cached) = cached_payload(job.id, max_age) {
+    if let Some(cached) = cached_payload(job.id, max_age, None) {
         return Ok(cached);
     }
     // One build per job at a time: when a popular job's payload expires,
     // every viewer asking at once would otherwise build it at once. Per job,
     // not one lock for all: a slow build of one job (a second, for a large
     // one) held up every other job's page behind it.
+    let asked = std::time::Instant::now();
     let lock = build_lock(job.id);
     let turn = lock.lock().await;
-    let result = match cached_payload(job.id, max_age) {
+    // A build that started after this request asked answers it, however long
+    // it took: judged by age alone, a build slower than `max_age` was never
+    // shared, and every waiter built again in turn.
+    let result = match cached_payload(job.id, max_age, Some(asked)) {
         Some(cached) => Ok(cached),
-        None => build_payload(pool, job, max_age).await,
+        None => build_payload(pool, job.id, max_age).await.map(|(json, _)| json),
     };
     drop(turn);
     release_build_lock(job.id, lock);
     result
 }
 
-/// Builds the job's stats as JSON and keeps them for [`payload`].
+/// Builds the job's stats as JSON and keeps them for [`payload`] -- `None`
+/// if what it built was superseded before it finished (a newer build, or an
+/// admin action that [`forget`] was called for), which a live push must not
+/// send: it would put a status from before the action back on every page.
 pub async fn refresh_payload(
     pool: &PgPool,
-    job: &Job,
+    job_id: Uuid,
     max_age: std::time::Duration,
-) -> AppResult<std::sync::Arc<str>> {
-    build_payload(pool, job, max_age).await
+) -> AppResult<Option<std::sync::Arc<str>>> {
+    let (json, kept) = build_payload(pool, job_id, max_age).await?;
+    Ok((kept || max_age.is_zero()).then_some(json))
 }
 
 /// Drops what is kept for the job, for a change a submission does not push:
@@ -242,28 +250,33 @@ pub fn forget(job_id: Uuid) {
         .insert(job_id, CachedPayload { started: std::time::Instant::now(), json: None });
 }
 
+/// Builds from the job's row as it is when the build starts: one passed in,
+/// read before a wait for the build lock, could predate an admin action the
+/// build then outlived, and was kept as newer than it.
 async fn build_payload(
     pool: &PgPool,
-    job: &Job,
+    job_id: Uuid,
     max_age: std::time::Duration,
-) -> AppResult<std::sync::Arc<str>> {
+) -> AppResult<(std::sync::Arc<str>, bool)> {
     // Freshness runs from when the build *started* -- what it read -- and a
     // build replaces only an entry that started before it: two builds
     // finishing out of order left the older one kept.
     let started = std::time::Instant::now();
-    let stats = compute(pool, job).await?;
+    let job = load_job(pool, job_id).await?;
+    let stats = compute(pool, &job).await?;
     let json: std::sync::Arc<str> = serde_json::to_string(&stats)
         .map_err(|e| crate::error::AppError::internal(format!("serializing job stats failed: {e}")))?
         .into();
-    if !max_age.is_zero() {
-        let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
-        payloads.retain(|_, entry| entry.started.elapsed() < max_age);
-        let newer = payloads.get(&job.id).is_some_and(|entry| entry.started > started);
-        if !newer {
-            payloads.insert(job.id, CachedPayload { started, json: Some(json.clone()) });
-        }
+    if max_age.is_zero() {
+        return Ok((json, true));
     }
-    Ok(json)
+    let mut payloads = PAYLOADS.lock().expect("stats cache poisoned");
+    payloads.retain(|_, entry| entry.started.elapsed() < max_age);
+    let superseded = payloads.get(&job_id).is_some_and(|entry| entry.started > started);
+    if !superseded {
+        payloads.insert(job_id, CachedPayload { started, json: Some(json.clone()) });
+    }
+    Ok((json, !superseded))
 }
 
 struct CachedPayload {
@@ -292,12 +305,20 @@ fn release_build_lock(job_id: Uuid, lock: std::sync::Arc<tokio::sync::Mutex<()>>
     }
 }
 
-fn cached_payload(job_id: Uuid, max_age: std::time::Duration) -> Option<std::sync::Arc<str>> {
+/// The kept payload if it is younger than `max_age`, or if it started after
+/// `since` whatever its age.
+fn cached_payload(
+    job_id: Uuid,
+    max_age: std::time::Duration,
+    since: Option<std::time::Instant>,
+) -> Option<std::sync::Arc<str>> {
     PAYLOADS
         .lock()
         .expect("stats cache poisoned")
         .get(&job_id)
-        .filter(|entry| entry.started.elapsed() < max_age)
+        .filter(|entry| {
+            entry.started.elapsed() < max_age || since.is_some_and(|since| entry.started >= since)
+        })
         .and_then(|entry| entry.json.clone())
 }
 

@@ -10,7 +10,7 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-FROM nginx:1.28-alpine
+FROM nginx:1.30-alpine
 # A template, filled in at startup by the image's own entrypoint: see the
 # comment on BACKEND_UPSTREAM in it. The filter keeps envsubst to that one
 # variable, so Nginx's own `$host`, `$uri` and the rest are left alone.

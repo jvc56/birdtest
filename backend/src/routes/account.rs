@@ -3,7 +3,8 @@ use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::models::user::ApiKeyRow;
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use crate::extract::ApiPath as Path;
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{get, patch};
 use axum::{Json, Router};
@@ -14,6 +15,7 @@ use uuid::Uuid;
 /// The plan's cap. Enforced here rather than as a DB constraint so the error is
 /// a clean 409 instead of a constraint violation.
 const MAX_API_KEYS: i64 = 100;
+const MAX_KEY_LABEL_CHARS: usize = 100;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -89,6 +91,12 @@ async fn create_key(
     ApiJson(body): ApiJson<CreateKeyBody>,
 ) -> AppResult<(StatusCode, Json<CreatedKey>)> {
     csrf::verify(&method, &headers, &jar)?;
+    // Bounded: listed on every view of the account page and kept in every
+    // nightly dump, and only the request body's 2 MB limit stood in the way.
+    if body.label.as_ref().is_some_and(|label| label.chars().count() > MAX_KEY_LABEL_CHARS) {
+        return Err(AppError::bad_request("the key's label is too long")
+            .with_field("label", format!("must be at most {MAX_KEY_LABEL_CHARS} characters")));
+    }
     // Each key is a worker rate-limit bucket of its own, so making keys is
     // limited too: revoke-and-create would otherwise be unlimited rate.
     crate::ratelimit::check(&state.limits.key_creation, &format!("u:{}", user.id))?;

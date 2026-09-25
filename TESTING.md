@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 484 backend tests.
+--run-ignored all` runs 487 backend tests.
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -524,7 +524,9 @@ Each entry's tests are the `describe` block named for its id.
 - `F-API-3` A 4xx with a JSON error body rejects with an `ApiError` carrying
   `status`, `code`, `message` and `fields`. *(Covered: `api.test.ts`.)*
 - `F-API-4` A 4xx with an empty or non-JSON body still rejects with an
-  `ApiError`, not a `SyntaxError` — as does a 200 whose body is not JSON.
+  `ApiError`, not a `SyntaxError` — as does a 200 whose body is not JSON —
+  and its message is never empty, the status text being empty over HTTP/2
+  (seventeenth audit).
   *(Covered: `api.test.ts`.)*
 - `F-API-5` Every request sets `credentials: 'include'`. *(Covered:
   `api.test.ts`.)*
@@ -537,8 +539,9 @@ Each entry's tests are the `describe` block named for its id.
   *(Covered: `sse.test.ts`.)*
 - `F-SSE-3` The returned function closes the `EventSource`, and calling it twice
   is safe; a stream the browser gave up on is reopened after a pause, and an
-  unsubscribe cancels a pending reopen; a job that answers 404 (deleted, or a
-  bad id) is not subscribed to again (sixteenth audit). *(Covered: `sse.test.ts`.)*
+  unsubscribe cancels a pending reopen; a job that answers a 4xx other than
+  408 or 429 (deleted, or a bad id) is not subscribed to again (sixteenth and
+  seventeenth audits). *(Covered: `sse.test.ts`.)*
 
 ### `F-CHART-*` — chart maths
 
@@ -1228,6 +1231,10 @@ permanent.
   and an SPRT job hands out nothing past its cap. *(Covered:
   `admin_api::a_finish_check_overtaken_by_a_purge_does_not_complete_the_job`,
   `worker_api::sprt_jobs_hand_out_nothing_past_their_cap`.)*
+- `I-STATS-11` The stats payload cache serves a payload until it expires or is
+  forgotten (every admin action), and a build reads the job's row itself, so a
+  copy read before an admin action is not cached as newer than it. *(Covered:
+  `stats::the_stats_cache_follows_admin_changes`.)* (Seventeenth audit.)
 
 ### `I-INPUT-*` — input data import (`inputdata.rs`)
 
@@ -1754,6 +1761,8 @@ below.
   is `429`, and another account is unaffected. *(Covered:
   `account::key_churn_is_rate_limited_per_account`.)* (Fourteenth audit; the
   burst, fifteenth.)
+- `A-ACCOUNT-7` A key's label is at most 100 characters. *(Covered:
+  `account::a_key_label_is_bounded`.)* (Seventeenth audit.)
 
 ### `A-BOUND-*` — boundaries (`backend/tests/boundaries.rs`)
 
@@ -1806,6 +1815,9 @@ silent.
 - `A-BOUND-11` Every API answer, errors included, carries
   `X-Content-Type-Options: nosniff`. *(Covered:
   `boundaries::api_responses_are_not_sniffed`.)* (Sixteenth audit.)
+- `A-BOUND-12` A malformed id in a path is a JSON `404` and a malformed query a
+  JSON `400`, like every other failure. *(Covered:
+  `boundaries::malformed_paths_and_queries_answer_json`.)* (Seventeenth audit.)
 
 ---
 

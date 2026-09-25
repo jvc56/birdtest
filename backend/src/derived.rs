@@ -381,6 +381,9 @@ struct Lease {
     klv_id: Option<Uuid>,
     letterdist_id: Uuid,
     builder: String,
+    /// The lease this build holds, as stored: the token its outcome is
+    /// recorded against.
+    leased_until: chrono::DateTime<chrono::Utc>,
 }
 
 /// Takes the oldest row that needs building, or `None` if the queue is empty.
@@ -439,34 +442,33 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
         }
         return Ok(None);
     };
-    let lease = Lease {
-        role: row.get("role"),
-        name: row.get("name"),
-        kwg_id: row.get("kwg_id"),
-        klv_id: row.get("klv_id"),
-        letterdist_id: row.get("letterdist_id"),
-        builder: row.get("builder"),
-    };
+    let (role, name, builder): (String, String, String) =
+        (row.get("role"), row.get("name"), row.get("builder"));
+    let (kwg_id, klv_id, letterdist_id): (Uuid, Option<Uuid>, Uuid) =
+        (row.get("kwg_id"), row.get("klv_id"), row.get("letterdist_id"));
 
-    sqlx::query(
+    // The lease as the database stores it (to the microsecond), so the
+    // outcome's `leased_until = $n` matches exactly.
+    let leased_until: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
         "UPDATE derived_data
          SET state = 'building', leased_until = $1, attempts = attempts + 1,
              error = NULL
          WHERE role = $2 AND name = $3 AND builder = $4
            AND kwg_id = $5 AND klv_id IS NOT DISTINCT FROM $6
-           AND letterdist_id = $7",
+           AND letterdist_id = $7
+         RETURNING leased_until",
     )
     .bind(chrono::Utc::now() + LEASE)
-    .bind(&lease.role)
-    .bind(&lease.name)
-    .bind(&lease.builder)
-    .bind(lease.kwg_id)
-    .bind(lease.klv_id)
-    .bind(lease.letterdist_id)
-    .execute(&mut *tx)
+    .bind(&role)
+    .bind(&name)
+    .bind(&builder)
+    .bind(kwg_id)
+    .bind(klv_id)
+    .bind(letterdist_id)
+    .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Some(lease))
+    Ok(Some(Lease { role, name, kwg_id, klv_id, letterdist_id, builder, leased_until }))
 }
 
 /// The bytes of an `input_data` row, from the object store.
@@ -512,13 +514,14 @@ pub async fn build_next(
 
     match build(pool, artifacts, magpie, &lease).await {
         Ok((sha256, bytes)) => {
-            sqlx::query(
+            let recorded = sqlx::query(
                 "UPDATE derived_data
                  SET state = 'built', sha256 = $1, bytes = $2, build_target = $3,
                      built_at = now(), leased_until = NULL, error = NULL
                  WHERE role = $4 AND name = $5 AND builder = $6
                    AND kwg_id = $7 AND klv_id IS NOT DISTINCT FROM $8
-                   AND letterdist_id = $9",
+                   AND letterdist_id = $9
+                   AND state = 'building' AND leased_until = $10",
             )
             .bind(&sha256)
             .bind(bytes)
@@ -529,8 +532,10 @@ pub async fn build_next(
             .bind(lease.kwg_id)
             .bind(lease.klv_id)
             .bind(lease.letterdist_id)
+            .bind(lease.leased_until)
             .execute(pool)
             .await?;
+            lease_outcome(&lease, recorded.rows_affected());
             tracing::info!(
                 role = %lease.role, name = %lease.name, %sha256, bytes,
                 seconds = started.elapsed().as_secs(),
@@ -542,13 +547,14 @@ pub async fn build_next(
             // run; 'pending' says the same thing and reads correctly in the
             // admin view. The attempt counter, not the state, is what stops it
             // eventually.
-            sqlx::query(
+            let recorded = sqlx::query(
                 "UPDATE derived_data
                  SET state = CASE WHEN attempts >= $1 THEN 'failed' ELSE 'pending' END,
                      leased_until = NULL, error = $2
                  WHERE role = $3 AND name = $4 AND builder = $5
                    AND kwg_id = $6 AND klv_id IS NOT DISTINCT FROM $7
-                   AND letterdist_id = $8",
+                   AND letterdist_id = $8
+                   AND state = 'building' AND leased_until = $9",
             )
             .bind(MAX_ATTEMPTS)
             .bind(&err.message)
@@ -558,8 +564,10 @@ pub async fn build_next(
             .bind(lease.kwg_id)
             .bind(lease.klv_id)
             .bind(lease.letterdist_id)
+            .bind(lease.leased_until)
             .execute(pool)
             .await?;
+            lease_outcome(&lease, recorded.rows_affected());
             tracing::error!(
                 role = %lease.role, name = %lease.name, error = %err.message,
                 "could not build a derived file"
@@ -567,6 +575,19 @@ pub async fn build_next(
         }
     }
     Ok(true)
+}
+
+/// Every outcome is recorded against the lease it was built under: a build
+/// that outlived its lease (a slow convert, a hung input read) found another
+/// builder had taken the row over and recorded `built`, and then set it back
+/// to `pending` -- or `failed`, for good, once the attempts ran out.
+fn lease_outcome(lease: &Lease, rows: u64) {
+    if rows == 0 {
+        tracing::warn!(
+            role = %lease.role, name = %lease.name,
+            "a build outlived its lease; another builder has the row, and this outcome is dropped"
+        );
+    }
 }
 
 /// Writes the inputs into a scratch directory, runs MAGPIE, and hashes what it

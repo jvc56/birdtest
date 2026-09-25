@@ -102,8 +102,10 @@
     if (
       force &&
       !confirm(
-        'Rewrite every generation\'s KLV from the database, replacing objects that differ? ' +
-          'The replaced versions stay in the bucket as noncurrent versions.'
+        'Rewrite every generation\'s KLV from the database? Every object is replaced, ' +
+          'matching or not, and after a MAGPIE builder change they all differ. ' +
+          'The replaced versions stay in the bucket as noncurrent versions. ' +
+          'The job must be deactivated first.'
       )
     ) {
       return;

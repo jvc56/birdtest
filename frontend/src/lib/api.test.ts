@@ -148,6 +148,15 @@ describe('F-API-4 error without a JSON body', () => {
     expect((second as ApiError).status).toBe(400);
   });
 
+  it('says the status when there is neither a body nor a status text (HTTP/2)', async () => {
+    // Over HTTP/2 statusText is always empty, and the load balancer's own 503
+    // page is HTML: the error must still say something a page can show.
+    respond(503, '<html><body>Service Unavailable</body></html>', '');
+    const error = await api.job('j1').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).message).toBe('The server answered 503.');
+  });
+
   it('a 200 whose body is not JSON rejects with an ApiError too', async () => {
     // What a static host's index.html fallback looks like to an /api call.
     respond(200, '<!doctype html><html></html>');

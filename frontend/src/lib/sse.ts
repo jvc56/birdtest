@@ -30,8 +30,11 @@ export function subscribeToJob<T>(jobId: string, onUpdate: (stats: T) => void): 
         .then((response) => response.status)
         .catch(() => 0);
       if (unsubscribed) return;
-      if (status === 404) {
-        console.debug('job is gone; not subscribing again');
+      // Any refusal but a timeout or a rate limit will not change by asking
+      // again: a deleted job (404), or an id that is not one (a 400 before
+      // the API answered those as 404 too).
+      if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+        console.debug(`job stream refused (${status}); not subscribing again`);
         return;
       }
     }

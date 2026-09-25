@@ -579,6 +579,13 @@ data "aws_iam_policy_document" "alerts_topic" {
       # RDS's event subscription (rds.tf) publishes as events.rds.
       identifiers = ["events.amazonaws.com", "cloudwatch.amazonaws.com", "events.rds.amazonaws.com"]
     }
+    # Only on this account's behalf: a service principal alone would let any
+    # account's rule or alarm publish here.
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
+    }
   }
 }
 

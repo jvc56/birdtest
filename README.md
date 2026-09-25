@@ -299,7 +299,10 @@ DB_INSTANCE=birdtest   # the RDS identifier Terraform created
 # The stack's region on every command: with the CLI's default elsewhere,
 # put-parameter quietly creates the parameters in the wrong region, the real
 # ones stay `set-me`, and the service crash-loops on the second apply.
-export AWS_REGION=$(terraform -chdir=infra output -raw region)
+# Assigned first: `export X=$(...)` hides a failed command. Both names: the
+# CLI's version 1 reads only AWS_DEFAULT_REGION.
+REGION=$(terraform -chdir=infra output -raw region)
+export AWS_REGION=$REGION AWS_DEFAULT_REGION=$REGION
 DB_PASSWORD=$(openssl rand -hex 24)   # hex: nothing to percent-encode in a URL
 aws rds modify-db-instance --db-instance-identifier "$DB_INSTANCE" \
   --master-user-password "$DB_PASSWORD" --apply-immediately

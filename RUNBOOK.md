@@ -68,6 +68,10 @@ PARAMETER_GROUP=$(aws rds describe-db-instances --region "$REGION" --db-instance
 # `terraform apply` puts anything else back.
 INSTANCE_CLASS=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
   --query 'DBInstances[0].DBInstanceClass' --output text)
+# And its storage ceiling, which a point-in-time restore is not promised to
+# carry over: without it the restored instance cannot grow at all.
+MAX_STORAGE=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
+  --query 'DBInstances[0].MaxAllocatedStorage' --output text)
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
   --target-db-instance-identifier "birdtest-restore-$STAMP" \
@@ -76,7 +80,8 @@ aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --vpc-security-group-ids "$(terraform -chdir=infra output -raw db_security_group_id)" \
   --db-parameter-group-name "$PARAMETER_GROUP" \
   --no-publicly-accessible \
-  --db-instance-class "$INSTANCE_CLASS"
+  --db-instance-class "$INSTANCE_CLASS" \
+  --max-allocated-storage "$MAX_STORAGE"
 
 aws rds wait db-instance-available --region "$REGION" \
   --db-instance-identifier "birdtest-restore-$STAMP"
@@ -239,14 +244,23 @@ gosu postgres pg_ctl -D /tmp/scratch -w -l /tmp/scratch.log start \
       -c max_parallel_workers_per_gather=0 -c fsync=off -c full_page_writes=off \
       -c synchronous_commit=off"
 SCRATCH_URL="postgresql:///birdtest_scratch?host=/tmp/sock&user=postgres"
+# Kept in a file: an `--attach`ed shell, or the detached §2.2 script, does not
+# inherit this one's variables. `source /tmp/restore.env` in either.
+echo "export SCRATCH_URL='$SCRATCH_URL'" > /tmp/restore.env
 createdb -h /tmp/sock -U postgres birdtest_scratch
 # Detached, so the ECS Exec session ending (twenty idle minutes, a laptop
 # asleep) does not end the restore; `scripts/prod-shell.sh --attach <task>`
 # comes back to it.
-setsid nohup pg_restore -d "$SCRATCH_URL" -j4 --no-owner --no-privileges \
-  --exit-on-error /tmp/dump > /tmp/pg_restore.log 2>&1 &
+# pg_restore prints nothing when it succeeds, so the last line says it ended.
+setsid nohup sh -c 'pg_restore -d "$0" -j4 --no-owner --no-privileges \
+  --exit-on-error /tmp/dump; echo "pg_restore exit $?"' "$SCRATCH_URL" \
+  > /tmp/pg_restore.log 2>&1 &
 tail -f /tmp/pg_restore.log   # Ctrl-C leaves the restore running
 ```
+
+Do not start §2.2 until the log's last line is `pg_restore exit 0`: with `-j4`
+each table commits on its own, so a copy-back taken mid-restore finds some of
+the job's tables loaded and others empty, and reports success.
 
 The §2.2 loop is best run the same way (`setsid nohup bash /tmp/copyback.sh >
 /tmp/copyback.log 2>&1 &`, with the script written to a file first).
@@ -261,6 +275,9 @@ DO NOTHING`, so a partial re-run is safe — which is all it is for, after §2.0
 first row already there.)
 
 ```bash
+source /tmp/restore.env
+grep -qx 'pg_restore exit 0' /tmp/pg_restore.log \
+  || { echo "the scratch restore has not finished, or failed" >&2; exit 1; }
 JOB=00000000-0000-0000-0000-000000000000
 TASKS="SELECT id FROM tasks WHERE job_id = '$JOB'"
 RECORDS="SELECT id FROM position_analysis_records WHERE job_id = '$JOB'"
@@ -293,7 +310,7 @@ for entry in "${TABLES[@]}"; do
   table=${entry%%|*} filter=${entry#*|}
   psql "$SCRATCH_URL" -v ON_ERROR_STOP=1 -c \
     "COPY (SELECT * FROM $table WHERE $filter) TO STDOUT" > "/tmp/restore/$table" \
-    || { echo "stopped: could not dump $table" >&2; break; }
+    || { echo "stopped: could not dump $table" >&2; exit 1; }
 done
 
 for entry in "${TABLES[@]}"; do
@@ -501,7 +518,9 @@ Activating it instead would dispatch more work on a job that had finished.
 The counters on `users` and `anonymous_workers` are not scoped to one job — they
 span every job an identity ever worked on — so a partial restore of one job
 cannot repair them in isolation the way §2.3 repairs the job's own. Recompute
-them globally, once, after every job has been restored:
+them globally, once, after every job has been restored — in the ops shell's
+psql (`scripts/prod-shell.sh`): the loops below commit as they go, which
+`scripts/prod-sql.sh`, running everything as one transaction, refuses.
 
 Count first, into a temporary table, then apply in small batches. A single
 `UPDATE` over every account would hold each one's row lock until it finished,
@@ -509,28 +528,36 @@ and every submission increments its worker's counter: submissions would wait,
 then be answered 503 after five seconds, for as long as the recount ran.
 
 ```sql
--- 1. Count. Reads only; nothing waits on this.
+\set ON_ERROR_STOP on
+-- Room for the temporary tables below in memory; they are read once per batch.
+SET temp_buffers = '256MB';
+
+-- 1. Count. Reads only; nothing waits on this. `recount` is kept whole for
+--    the rest of the procedure (step 2 reads it); step 3 works through a copy.
 CREATE TEMP TABLE recount AS
-SELECT 'u' AS kind, c.claimed_by_user_id::text AS id, count(*) AS n, max(c.completed_at) AS last
+SELECT 'u' AS kind, c.claimed_by_user_id AS id, count(*) AS n, max(c.completed_at) AS last
   FROM task_claims c
  WHERE c.state = 'completed' AND c.claimed_by_user_id IS NOT NULL
  GROUP BY 2
 UNION ALL
-SELECT 'a', c.claimed_by_anon_uuid::text, count(*), max(c.completed_at)
+SELECT 'a', c.claimed_by_anon_uuid, count(*), max(c.completed_at)
   FROM task_claims c
  WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
  GROUP BY 2;
+CREATE INDEX ON recount (kind, id);
+ANALYZE recount;
+CREATE TEMP TABLE pending AS SELECT * FROM recount;
 
 -- 2. Zero the identities with no completed claims left. Required after
 --    §2.0, which deletes the claims made after the purge: the counters those
 --    claims raised would otherwise stay, with nothing behind them. (An
 --    identity with no completed claims appears nowhere in step 1.)
 -- 3. Apply the counts, a thousand a transaction, only where they differ.
---    Each batch is taken *out of* `recount` as it is applied, so a batch
---    never rereads the rows before it (rescanning made the last batches of a
---    million identities seconds each), and a run stopped by a lock timeout --
---    it gives up rather than queue behind a submission -- is simply run again
---    and continues where it stopped.
+--    Each batch is taken out of `pending` as it is applied, so a run stopped
+--    by a lock timeout -- it gives up rather than queue behind a submission
+--    -- is simply run again (either step, or both) and continues where it
+--    stopped. Both are safe to repeat: step 2 reads `recount`, which nothing
+--    consumes.
 SET lock_timeout = '2s';
 
 DO $$
@@ -541,14 +568,16 @@ BEGIN
       UPDATE users SET tasks_completed = 0, last_completed_at = NULL
        WHERE id IN (SELECT u.id FROM users u
                      WHERE u.tasks_completed > 0
-                       AND u.id NOT IN (SELECT id::uuid FROM recount WHERE kind = 'u')
+                       AND NOT EXISTS (SELECT 1 FROM recount r
+                                        WHERE r.kind = 'u' AND r.id = u.id)
                      LIMIT 1000)
       RETURNING 1),
     za AS (
       UPDATE anonymous_workers SET tasks_completed = 0, last_completed_at = NULL
        WHERE uuid IN (SELECT w.uuid FROM anonymous_workers w
                        WHERE w.tasks_completed > 0
-                         AND w.uuid NOT IN (SELECT id::uuid FROM recount WHERE kind = 'a')
+                         AND NOT EXISTS (SELECT 1 FROM recount r
+                                          WHERE r.kind = 'a' AND r.id = w.uuid)
                        LIMIT 1000)
       RETURNING 1)
     SELECT (SELECT count(*) FROM z) + (SELECT count(*) FROM za) INTO zeroed;
@@ -562,19 +591,19 @@ DECLARE taken int;
 BEGIN
   LOOP
     WITH batch AS (
-      DELETE FROM recount
-       WHERE ctid IN (SELECT ctid FROM recount LIMIT 1000)
+      DELETE FROM pending
+       WHERE ctid IN (SELECT ctid FROM pending LIMIT 1000)
       RETURNING kind, id, n, last),
     u AS (
       UPDATE users u SET tasks_completed = b.n, last_completed_at = b.last
         FROM batch b
-       WHERE b.kind = 'u' AND u.id = b.id::uuid
+       WHERE b.kind = 'u' AND u.id = b.id
          AND (u.tasks_completed, u.last_completed_at) IS DISTINCT FROM (b.n, b.last)
       RETURNING 1),
     a AS (
       UPDATE anonymous_workers w SET tasks_completed = b.n, last_completed_at = b.last
         FROM batch b
-       WHERE b.kind = 'a' AND w.uuid = b.id::uuid
+       WHERE b.kind = 'a' AND w.uuid = b.id
          AND (w.tasks_completed, w.last_completed_at) IS DISTINCT FROM (b.n, b.last)
       RETURNING 1)
     SELECT count(*) INTO taken FROM batch;
@@ -583,13 +612,19 @@ BEGIN
   END LOOP;
 END $$;
 
-SELECT count(*) AS left_to_apply FROM recount;  -- 0 when done
+-- Both 0 when done.
+SELECT (SELECT count(*) FROM pending) AS left_to_apply,
+       (SELECT count(*) FROM users u WHERE u.tasks_completed > 0
+          AND NOT EXISTS (SELECT 1 FROM recount r WHERE r.kind = 'u' AND r.id = u.id))
+     + (SELECT count(*) FROM anonymous_workers w WHERE w.tasks_completed > 0
+          AND NOT EXISTS (SELECT 1 FROM recount r WHERE r.kind = 'a' AND r.id = w.uuid))
+       AS left_to_zero;
 ```
 
 The counts are a snapshot: a submission accepted between step 1 and a row's
 update is overwritten by the older figure. Run this when the fleet is quiet, or
-run all three steps again afterwards (`DROP TABLE recount;` first if a run was
-cut short); a second run changes only what moved.
+run all three steps again afterwards (`DROP TABLE recount, pending;` first); a
+second run changes only what moved. §4 checks the result.
 
 This is the one recount a restore is most likely to need, and the one most
 likely to be forgotten: nothing about a single job's restore makes a wrong
@@ -649,7 +684,11 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   should not be: the results have moved on since the generation closed, so a
   rebuild legitimately produces different bytes, and rewriting would replace
   the KLV that workers actually played with. Investigate before forcing
-  (**Force rebuild** on the admin job page; `?force=true` on the API).
+  (**Force rebuild** on the admin job page; `?force=true` on the API), which
+  rewrites every generation and is refused while the job is active. A check
+  or a forced rebuild that started before a purge goes on writing objects
+  after it; if §2 then copies the old rows back, run **Check artifacts**
+  again, which puts the recorded builds back.
 - **Object nothing accounts for** (the **Served** column says so): the bytes
   are neither the recorded build, nor the rebuild, nor what workers were being
   sent — typically another run's KLV under the same key, after a purge, a
@@ -717,6 +756,19 @@ SELECT count(*) AS counter_disagreements
   ) actual ON actual.task_id = t.id
  WHERE t.accepted_count <> COALESCE(actual.accepted, 0)
     OR t.active_claim_count <> COALESCE(actual.active, 0);
+-- 3b. Contributor counters (§2.3b's result). Must be zero.
+SELECT
+  (SELECT count(*) FROM users u
+     LEFT JOIN (SELECT claimed_by_user_id AS id, count(*) AS n FROM task_claims
+                 WHERE state = 'completed' AND claimed_by_user_id IS NOT NULL
+                 GROUP BY 1) c ON c.id = u.id
+    WHERE u.tasks_completed <> COALESCE(c.n, 0))
++ (SELECT count(*) FROM anonymous_workers w
+     LEFT JOIN (SELECT claimed_by_anon_uuid AS id, count(*) AS n FROM task_claims
+                 WHERE state = 'completed' AND claimed_by_anon_uuid IS NOT NULL
+                 GROUP BY 1) c ON c.id = w.uuid
+    WHERE w.tasks_completed <> COALESCE(c.n, 0))
+  AS contributor_disagreements;
 ```
 
 4. **Functional smoke**: run one real task against the restored stack with
@@ -782,7 +834,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    `birdtest-backups-dr-<account>`, from `scripts/prod-shell.sh` against the
    new stack: the dump into the new instance, as in §2.1 but with
    `pg_restore -d "$DATABASE_URL"` — run detached as §2.1 does, since it takes
-   longer than an ECS Exec session lasts. The new ops task reads the new stack's
+   longer than an ECS Exec session lasts, and not finished until its log ends
+   `pg_restore exit 0`: step 4's `desired_count=1` against a half-restored
+   database serves it. The new ops task reads the new stack's
    backups bucket, so fetch the dump with the credentials of an operator who
    can read the replica, or copy it across first.
 4. The leave-generation KLVs (`leaves/`) and the imported input data

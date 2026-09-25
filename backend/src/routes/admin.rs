@@ -6,7 +6,8 @@ use crate::error::{AppError, AppResult};
 use crate::jobs::registry;
 use crate::models::job::{Job, JobStatus, JobType, PlayerConfig};
 use crate::state::AppState;
-use axum::extract::{Path, Query, State};
+use crate::extract::{ApiPath as Path, ApiQuery as Query};
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -1579,6 +1580,10 @@ async fn activate_job(
 
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
+    // Again under the row lock: a purge that took the job between the check
+    // above and this lock has now committed, and acting on the emptied job
+    // (completing it, above all) is what the check exists to prevent.
+    refuse_while_purging(&state, id)?;
     if job.status == JobStatus::Completed {
         return Err(AppError::conflict("a completed job cannot be reactivated"));
     }
@@ -1631,7 +1636,7 @@ async fn activate_job(
     )
     .await?;
     tx.commit().await?;
-    crate::jobstats::forget(id);
+    super::worker::push_after_change(&state, id);
     Ok(Json(updated))
 }
 
@@ -1648,6 +1653,10 @@ async fn deactivate_job(
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
+    // Again under the row lock: a purge that took the job between the check
+    // above and this lock has now committed, and acting on the emptied job
+    // (completing it, above all) is what the check exists to prevent.
+    refuse_while_purging(&state, id)?;
     // Completion is final. Flipping a completed job to inactive would be a
     // way around that rule: activation only refuses jobs that are *currently*
     // completed, so deactivate-then-activate would restart it.
@@ -1671,7 +1680,7 @@ async fn deactivate_job(
     )
     .await?;
     tx.commit().await?;
-    crate::jobstats::forget(id);
+    super::worker::push_after_change(&state, id);
     Ok(Json(job))
 }
 
@@ -1688,6 +1697,10 @@ async fn complete_job(
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
+    // Again under the row lock: a purge that took the job between the check
+    // above and this lock has now committed, and acting on the emptied job
+    // (completing it, above all) is what the check exists to prevent.
+    refuse_while_purging(&state, id)?;
     let job =
         sqlx::query_as::<_, Job>("UPDATE jobs SET status = 'completed' WHERE id = $1 RETURNING *")
             .bind(id)
@@ -1704,7 +1717,7 @@ async fn complete_job(
     )
     .await?;
     tx.commit().await?;
-    crate::jobstats::forget(id);
+    super::worker::push_after_change(&state, id);
     Ok(Json(job))
 }
 
@@ -2108,26 +2121,31 @@ async fn purge_body(
     // same count leave where it was. NULL is "refit" -- one matrix build per
     // pool, which is what the sweep did every time before it had the check.
     sqlx::query(
-        "UPDATE rating_runs SET evidence_games = NULL
-         WHERE evidence_games IS NOT NULL
-           AND id IN (SELECT DISTINCT ON (pool_id) id FROM rating_runs
-                      ORDER BY pool_id, computed_at DESC, id DESC)",
+        // Each pool's newest run, found by a seek into the pool's index --
+        // walking every run to find them was most of a second, inside the
+        // purge's locks, at a month's runs for a few dozen pools.
+        "UPDATE rating_runs r SET evidence_games = NULL
+           FROM rating_pools p
+           CROSS JOIN LATERAL (SELECT x.id FROM rating_runs x WHERE x.pool_id = p.id
+                               ORDER BY x.computed_at DESC, x.id DESC LIMIT 1) newest
+          WHERE r.id = newest.id AND r.evidence_games IS NOT NULL",
     )
     .execute(&mut *tx)
     .await?;
+    // Exports describe results this purge deletes. A row left saying `ready`
+    // would hand an admin -- and, once the job completed again, every
+    // download of its results -- a stable-looking artifact of a job that no
+    // longer holds any of it. Deleted with everything else; the objects go
+    // once this commits.
+    let export_objects = crate::exports::purge(&mut tx, id).await?;
     tx.commit().await?;
     hold.committed();
-    crate::jobstats::forget(id);
+    super::worker::push_after_change(&state, id);
+    crate::exports::remove_objects(&state, export_objects);
 
-    // Both after the commit, so a failure here is not the purge failing: it
+    // After the commit, so a failure here is not the purge failing: it
     // committed, and answering 500 invited a second one. Logged instead.
     //
-    // Exports describe results this purge has just deleted. A row left saying
-    // `ready` would hand an admin a stable-looking artifact of a job that no
-    // longer holds any of it.
-    if let Err(err) = crate::exports::purge(&state, id).await {
-        tracing::error!(job_id = %id, error = %err.message, "a purge's export cleanup failed");
-    }
     // The generation-0 KLV was deleted with the artifacts above; rebuilt here,
     // and if that fails, by the next claim (`Acquired::NeedsZeroGeneration`).
     if let Err(err) = registry::initialize_job_artifacts(&state, &job).await {
@@ -2212,15 +2230,20 @@ async fn delete_body(
     contributions.give_back(&mut tx).await?;
     // As a purge does: the pools this job fed must refit.
     sqlx::query(
-        "UPDATE rating_runs SET evidence_games = NULL
-         WHERE evidence_games IS NOT NULL
-           AND id IN (SELECT DISTINCT ON (pool_id) id FROM rating_runs
-                      ORDER BY pool_id, computed_at DESC, id DESC)",
+        // Each pool's newest run, found by a seek into the pool's index --
+        // walking every run to find them was most of a second, inside the
+        // purge's locks, at a month's runs for a few dozen pools.
+        "UPDATE rating_runs r SET evidence_games = NULL
+           FROM rating_pools p
+           CROSS JOIN LATERAL (SELECT x.id FROM rating_runs x WHERE x.pool_id = p.id
+                               ORDER BY x.computed_at DESC, x.id DESC LIMIT 1) newest
+          WHERE r.id = newest.id AND r.evidence_games IS NOT NULL",
     )
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
     hold.committed();
+    // Nothing to push: the job is gone, and its page's stream answers 404.
     crate::jobstats::forget(id);
     // Tidiness only: a remembered answer for a job that no longer exists is
     // never asked for, but there is no reason to keep it.
@@ -2496,7 +2519,7 @@ async fn merge_leave_progress(
     }
     let outcome = crate::jobs::leave_gen::merge_staged_for_job(&state.pool, id, true).await?;
     // The point of the button is current rack figures.
-    crate::jobstats::forget(id);
+    super::worker::push_after_change(&state, id);
     Ok(Json(outcome))
 }
 
@@ -2527,6 +2550,15 @@ async fn rebuild_artifacts(
     if job.job_type != JobType::LeaveGeneration {
         return Err(AppError::bad_request(
             "only leave generation jobs have artifacts to rebuild",
+        ));
+    }
+    // Forcing rewrites every generation's object, and a worker that claimed
+    // a task a moment before fetches the new bytes against the old hash,
+    // declines, and sets the job aside. Deactivate first.
+    if query.force && job.status == JobStatus::Active {
+        return Err(AppError::conflict(
+            "deactivate the job before forcing a rebuild: workers mid-task would refuse the \
+             rewritten objects",
         ));
     }
     let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;

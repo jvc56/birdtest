@@ -137,6 +137,24 @@ async fn key_churn_is_rate_limited_per_account() {
     create_key(&app, &signed_in(&db, other), "first").await;
 }
 
+/// A-ACCOUNT-7: a key's label is at most a hundred characters. Unbounded, a
+/// burst of keys with 2 MB labels was 200 MB an account, listed on every
+/// view of the account page and kept in every dump.
+#[tokio::test]
+async fn a_key_label_is_bounded() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let headers = signed_in(&db, db.user("labeller", false).await);
+    let (status, body) = send(
+        &app,
+        request("POST", "/api/me/api-keys", &headers, Some(json!({ "label": "x".repeat(101) }))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "label", "{body}");
+    create_key(&app, &headers, &"x".repeat(100)).await;
+}
+
 /// A-ACCOUNT-2: creating a key returns it in full once -- the key that
 /// actually authenticates -- and the list never returns it, or its hash,
 /// again.

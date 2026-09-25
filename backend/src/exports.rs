@@ -543,34 +543,38 @@ pub async fn newest_ready(pool: &sqlx::PgPool, job_id: Uuid) -> AppResult<Option
 /// Called by purge, which deletes the results an export describes. A row left
 /// saying `ready` would then hand an admin a stable-looking artifact of a job
 /// that no longer holds any of it, which is worse than no export at all.
-pub async fn purge(state: &AppState, job_id: Uuid) -> AppResult<()> {
+pub async fn purge(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Vec<String>> {
+    // In the purge's own transaction: removed after it, a failure left the
+    // old run's `ready` row to be served -- once the job had completed again
+    // -- as the new run's results. Returns the objects to remove once it has
+    // committed ([`remove_objects`]).
     let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
         "DELETE FROM job_exports WHERE job_id = $1
          RETURNING artifact_key, positions_artifact_key",
     )
     .bind(job_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *conn)
     .await?;
-    let keys: Vec<String> =
-        rows.into_iter().flat_map(|(results, positions)| [results, positions]).flatten().collect();
+    Ok(rows.into_iter().flat_map(|(results, positions)| [results, positions]).flatten().collect())
+}
 
-    // Off the request, because purge is a synchronous admin call and this is
-    // best-effort cleanup of derived data: the rows are already gone, so an
-    // object that survives is one the bucket's lifecycle rule expires rather
-    // than anything anyone can reach. Awaiting an unreachable object store here
-    // would hold the purge response open for the SDK's whole retry budget, once
-    // per object.
-    if !keys.is_empty() {
-        let artifacts = state.artifacts.clone();
-        tokio::spawn(async move {
-            for key in keys {
-                if let Err(err) = artifacts.delete(&key).await {
-                    tracing::warn!(%key, error = %err.message, "could not delete an export object");
-                }
-            }
-        });
+/// Removes a purge's export objects, off the request: best-effort cleanup of
+/// derived data whose rows are already gone, so an object that survives is
+/// one the bucket's lifecycle rule expires rather than anything anyone can
+/// reach. Awaiting an unreachable object store here would hold the purge
+/// response open for the SDK's whole retry budget, once per object.
+pub fn remove_objects(state: &AppState, keys: Vec<String>) {
+    if keys.is_empty() {
+        return;
     }
-    Ok(())
+    let artifacts = state.artifacts.clone();
+    tokio::spawn(async move {
+        for key in keys {
+            if let Err(err) = artifacts.delete(&key).await {
+                tracing::warn!(%key, error = %err.message, "could not delete an export object");
+            }
+        }
+    });
 }
 
 /// Startup reaper. Single instance, so a row left `running` belongs to a

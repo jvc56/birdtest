@@ -205,7 +205,20 @@ async fn rebuilding_artifacts_restores_what_is_missing_and_is_idempotent() {
     keys.sort();
     assert_eq!(keys, vec![gen0_key.clone(), artifact_key(id, 1)]);
 
-    // `force` rewrites what is present.
+    // `force` rewrites what is present -- once the job is not dispatching:
+    // a worker mid-task would refuse the rewritten bytes.
+    sqlx::query("UPDATE jobs SET status = 'active' WHERE id = $1")
+        .bind(id)
+        .execute(&stack.state.pool)
+        .await
+        .unwrap();
+    let (status, refused) = stack.post(&format!("{path}?force=true"), json!({})).await;
+    assert_eq!(status, axum::http::StatusCode::CONFLICT, "{refused}");
+    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+        .bind(id)
+        .execute(&stack.state.pool)
+        .await
+        .unwrap();
     let (status, forced) = stack.post(&format!("{path}?force=true"), json!({})).await;
     assert_eq!(status, axum::http::StatusCode::OK, "{forced}");
     assert!(forced.as_array().unwrap().iter().all(|g| g["rewritten"] == json!(true)), "{forced}");

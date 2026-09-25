@@ -486,6 +486,36 @@ async fn the_games_eta_divides_by_redundancy() {
     assert!((eta - expected).abs() < 1e-6 * expected, "{eta} vs {expected}");
 }
 
+/// I-STATS-11: the stats payload cache. A payload is served from the cache
+/// until it expires; `forget` (every admin action) makes the next read build
+/// again; and a build reads the job's row itself, so a caller's copy read
+/// before an admin action cannot be cached as newer than it.
+#[tokio::test]
+async fn the_stats_cache_follows_admin_changes() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 10).await;
+    let before = jobstats::load_job(&db.pool, job).await.unwrap();
+    let ttl = std::time::Duration::from_secs(600);
+    let allocation = |json: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(json).unwrap()["job"]["allocation"].clone()
+    };
+
+    let first = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    assert_eq!(allocation(&first), json!(50));
+    sqlx::query("UPDATE jobs SET allocation = 30 WHERE id = $1").bind(job).execute(&db.pool).await.unwrap();
+    let cached = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    assert_eq!(allocation(&cached), json!(50), "served from the cache until it is forgotten");
+
+    jobstats::forget(job);
+    // `before` still says 50: the build reads the row, not the caller's copy.
+    let fresh = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    assert_eq!(allocation(&fresh), json!(30));
+    // A build that starts after a forget is kept, and so is what a live push
+    // sends.
+    jobstats::forget(job);
+    assert!(jobstats::refresh_payload(&db.pool, job, ttl).await.unwrap().is_some());
+}
+
 // ---------------------------------------------------------------------------
 // The finish check
 // ---------------------------------------------------------------------------

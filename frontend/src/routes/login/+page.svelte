@@ -20,10 +20,15 @@
       // anything else, which left a signed-in user on this page, unmoved.
       // Resolved rather than pattern-matched: `/\evil.com` and a path with a
       // tab in it both start with a single '/' and resolve off-site.
-      const next = new URL($page.url.searchParams.get('next') ?? '/account', $page.url.origin);
-      await goto(
-        next.origin === $page.url.origin ? next.pathname + next.search + next.hash : '/account'
-      );
+      // The whole URL once it is known to be this site's: its path alone
+      // (`/.//evil.com` resolves to the path `//evil.com`) reads off-site.
+      let next: URL | null = null;
+      try {
+        next = new URL($page.url.searchParams.get('next') ?? '/account', $page.url.origin);
+      } catch {
+        next = null;
+      }
+      await goto(next && next.origin === $page.url.origin ? next.href : '/account');
     } catch (e) {
       error = (e as Error).message;
     } finally {
