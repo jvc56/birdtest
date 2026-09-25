@@ -67,7 +67,9 @@ pub async fn connect_read(database_url: &str) -> Result<PgPool> {
 /// through a deploy the rolled-back service crash-looped with nothing
 /// serving. Migrations after release are additive so the previous image can
 /// run on them (README, "After a schema change"; RUNBOOK, "Rolling back a
-/// deploy"). An applied migration whose file *changed* is still refused.
+/// deploy"). An applied migration whose file *changed* is still refused. The
+/// cost: an image left stale by mistake starts too, and fails at the first
+/// query that needs what it lacks rather than at startup.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     let mut migrator = sqlx::migrate!("./migrations");
     migrator.set_ignore_missing(true);

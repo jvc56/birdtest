@@ -262,7 +262,11 @@ docker compose restart backend
 After release, a schema change is a new numbered migration, never an edit, and
 it is **additive**: new tables, new nullable or defaulted columns, new
 indexes. A drop or a rename waits for a later release, once no image that
-reads the old shape can run. The previous image then runs on the newer
+reads the old shape can run. A new value in an enum type (`job_type`,
+`job_status`, `task_state`, `claim_state`) is not additive in this sense: the
+backend reads those into closed Rust enums, and one row the previous image
+cannot read fails every query that reads it, the claim's included. Ship the
+reading of a new value in one release and write it in a later one. The previous image then runs on the newer
 schema. The backend starts against a database with migrations it does not
 know (it refuses only an applied migration whose file changed), so rolling
 back is an image change (RUNBOOK, "Rolling back a deploy").
@@ -314,7 +318,9 @@ A first deployment, in order (each step is described below):
 6. Confirm the SNS subscription mail, set the database password and the two
    SSM parameters (below), then
    `terraform -chdir=infra apply -var-file=prod.tfvars` (one task, and the
-   scheduled tasks on).
+   scheduled tasks on). This apply creates the `-down` alarms before the
+   task is healthy, so expect an ALARM mail for each and an OK a few minutes
+   later.
 7. Point DNS at the load balancer, run the alert-path checks, and make the
    first admin. Until production access is granted SES sends only to verified
    identities, so the first admin's confirmation mail arrives only if their

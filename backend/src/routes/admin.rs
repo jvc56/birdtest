@@ -1268,8 +1268,8 @@ async fn validate_opening_rack_player(
             format!(
                 "this static config records the single best move, so every rack would come \
                  back with one move rather than the {recorded} it asks for. Use a config with \
-                 recorder_type 'all' or 'equity', a simulating one, or set \
-                 num_plays_recorded to 1."
+                 recorder_type 'all' ('equity' keeps only the moves within its equity \
+                 margin), a simulating one, or set num_plays_recorded to 1."
             ),
         ));
     }

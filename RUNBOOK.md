@@ -50,7 +50,8 @@ Loses at most ~5 minutes. Takes under an hour.
 
 ```bash
 # 1. STOP WRITES. Workers submitting into a database about to be replaced have
-#    their results silently discarded.
+#    their results silently discarded. The -down alarms fire ten minutes
+#    later, and clear when the service is back: expected here.
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 0 --region "$REGION"
 
 # 2. Pick the restore point: the latest possible instant before the damage.
@@ -1040,7 +1041,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    AZS=$(terraform -chdir=infra output -json azs) && ! grep -q '^azs' infra/dr.tfvars \
      && printf '\nazs = %s\n' "$AZS" >> infra/dr.tfvars
    # Only with the zones pinned: without them prod.tfvars' -- the lost
-   # region's -- apply, and the plan replaces the subnets.
+   # region's -- apply, and the plan replaces the subnets. This apply creates
+   # the copy's -down alarms before its task is healthy: an ALARM mail for
+   # each, then an OK.
    if grep -q '^azs' infra/dr.tfvars; then
      terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars
    else echo "no azs in infra/dr.tfvars: is this the dr workspace, with step 1's state?"; fi
@@ -1134,6 +1137,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   # then never have it).
   if [ -z "$SCRATCH_ACCOUNT" ] || [ -z "$PROD_REPLICA_REGION" ] || [ ! -e "$STAGE/.staged" ]; then
     echo "set SCRATCH_ACCOUNT, and run block 1 in this shell until it says staged"
+    echo "(after an upload, the local copy is gone and there is nothing to do)"
   elif [ "$(aws sts get-caller-identity --query Account --output text)" != "$SCRATCH_ACCOUNT" ]; then
     echo "these are not the scratch account's credentials"
   else
@@ -1191,10 +1195,11 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
     echo "there is no dr workspace here"
   elif ! RESOURCES=$(terraform -chdir=infra state list); then
     echo "the dr workspace's state could not be read"
-  elif ! grep -q '^aws_db_instance.main$' <<< "$RESOURCES"; then
+  elif AZ_HINT="with -var azs=null if infra/dr.tfvars has no azs"
+       ! grep -q '^aws_db_instance.main$' <<< "$RESOURCES"; then
     # Past destroy, the apply below would build the whole copy again.
     echo "the copy's instance is not in the state: after a destroy, go on to the next block;"
-    echo "after a destroy that stopped part way, run destroy again by hand"
+    echo "after a destroy that stopped part way, run destroy again by hand ($AZ_HINT)"
   else
     # prod.tfvars pins production's zones. dr.tfvars gets the copy's at §5
     # step 4, and a drill stopped before then was applied with azs=null: without
@@ -1264,16 +1269,39 @@ backend starts against a schema a newer release migrated (it ignores
 migrations it does not know), and migrations after release are additive
 (README, "After a schema change"), so the previous image runs on it. The
 service keeps no healthy task through a deploy, so the site is down from the
-moment the bad task stops until the old one is healthy.
+moment the bad task stops until the old one is healthy, and the `-down`
+alarms may fire and clear. Keep each release's three image tags (in its
+release notes, say): `prod.tfvars` holds only the current ones.
 
-1. Put the previous tags back in `prod.tfvars`: `backend_image`,
+1. If the release added a value to an enum the previous image reads -- a new
+   job type, say -- deactivate every job using it first: the previous image
+   fails to read such a row, and one active job of an unknown type stops every
+   claim. README's rule says to ship the reading of a new value a release
+   before anything writes it, which makes this step empty.
+2. Put the previous tags back in `prod.tfvars`: `backend_image`,
    `derived_builder_image` and `frontend_image` together (the builder must carry
    the backend's MAGPIE). If the release raised `min_magpie_version`, put the
    previous value back too, since the backend refuses to start when its own
-   MAGPIE is below the floor.
-2. Apply: `terraform -chdir=infra apply -var-file=prod.tfvars`.
-3. Watch the service reach one healthy task:
-   `aws ecs wait services-stable --region "$REGION" --cluster "$CLUSTER" --services birdtest`.
+   MAGPIE is below the floor. That readmits the builds the raise kept out.
+   The apply uses this checkout's `infra/`, so any change the release made to
+   the task definitions stays unless it is reverted too.
+3. Apply: `terraform -chdir=infra apply -var-file=prod.tfvars`.
+4. Wait for healthy targets, not only a running task. `aws ecs wait
+   services-stable` succeeds once the task *runs*, which a crash-looping task
+   does between restarts:
+
+   ```bash
+   NAME=birdtest   # birdtest-dr for §5's copy
+   for TG in backend frontend; do
+     aws elbv2 wait target-in-service --region "$REGION" --target-group-arn \
+       "$(aws elbv2 describe-target-groups --region "$REGION" --names "$NAME-$TG" \
+          --query 'TargetGroups[0].TargetGroupArn' --output text)" \
+       && echo "$TG healthy"
+   done
+   ```
+
+   A waiter gives up after ten minutes, and the health check's grace is as
+   long (migrations run inside it): run it again before concluding anything.
 
 If the release's migration was not additive (it dropped or renamed something
 the previous image reads), the previous image will fail on it: fix forward

@@ -47,20 +47,23 @@
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
-  // The combination job creation refuses, surfaced before the submit rather
-  // than as the error that comes back from it: `-r best` is MOVE_RECORD_BEST,
-  // so a static player's movegen keeps one play and the rest of the ranking
-  // never exists. A simmer ranks every play up to num_plays whatever its
-  // recorder, so it is not refused.
+  // The two combinations job creation refuses, surfaced before the submit
+  // rather than as the error that comes back from it. `-r best` is
+  // MOVE_RECORD_BEST, so a static player's movegen keeps one play and the rest
+  // of the ranking never exists (a simmer ranks every play up to num_plays
+  // whatever its recorder). And no player reports more plays than num_plays,
+  // which sizes the move list.
   $: selectedConfig = configs.find((config) => config.id === playerConfigId);
   $: openingRackConflict =
-    jobType === 'opening_rack' &&
-    selectedConfig &&
-    selectedConfig.recorder_type === 'best' &&
-    selectedConfig.num_plays_recorded > 1 &&
-    selectedConfig.num_plies === 0
-      ? `${selectedConfig.name} is static and records only the best move, so this job would store one play per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
-      : null;
+    jobType !== 'opening_rack' || !selectedConfig
+      ? null
+      : selectedConfig.recorder_type === 'best' &&
+          selectedConfig.num_plays_recorded > 1 &&
+          selectedConfig.num_plies === 0
+        ? `${selectedConfig.name} is static and records only the best move, so this job would store one play per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
+        : selectedConfig.num_plays < selectedConfig.num_plays_recorded
+          ? `${selectedConfig.name} generates ${selectedConfig.num_plays} plays, so this job would store at most that many per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
+          : null;
 
   function firstOfRole(role: string): string {
     return files.find((f) => f.role === role)?.id ?? '';
@@ -225,8 +228,9 @@
     </div>
     {#if openingRackConflict}
       <p class="field-error">
-        {openingRackConflict} Pick a config whose recorder is <strong>all</strong> or
-        <strong>equity</strong>, a simulating one, or one that records a single play.
+        {openingRackConflict} Pick a static config whose recorder is <strong>all</strong>
+        and that generates at least as many plays as it records, a simulating one that
+        does, or one that records a single play.
       </p>
     {/if}
     <p class="text-xs text-muted-foreground">

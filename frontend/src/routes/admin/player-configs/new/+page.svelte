@@ -17,6 +17,9 @@
   let maxIterations = 1000;
   let numPlies = 2;
   let numPlays = 10;
+  // MAGPIE's default. A static player's list is sized by it too: an opening-rack
+  // job cannot report more plays per rack than this.
+  let staticNumPlays = 100;
   let numPlaysRecorded = 10;
   let numPliesRecorded = 2;
   let stoppingPct = 99;
@@ -77,7 +80,7 @@
         winpct_id: simming ? winpctId || null : null,
         max_iterations: simming ? maxIterations : null,
         num_plies: simming ? numPlies : null,
-        num_plays: simming ? numPlays : null,
+        num_plays: simming ? numPlays : staticNumPlays,
         num_plays_recorded: numPlaysRecorded,
         num_plies_recorded: simming ? numPliesRecorded : null,
         stopping_pct: simming ? stoppingPct : null,
@@ -131,7 +134,8 @@
         using it can only ever report one move per position. A simmer is unaffected: it ranks
         every play up to its number of plays, whatever the recorder. Right for games jobs, where
         only the move played matters. A static opening-rack player wants a ranking, so it needs
-        <strong>all</strong> or <strong>equity</strong> unless it records exactly one play.
+        <strong>all</strong> unless it records exactly one play. (<strong>equity</strong> keeps only
+        the moves within the equity margin of the best, which can be fewer than it reports.)
       </p>
     </div>
     <div>
@@ -169,9 +173,21 @@
     <input id="npres" type="number" min="1" required class="input" bind:value={numPlaysRecorded} />
     <p class="mt-1 text-xs text-muted-foreground">
       How many ranked plays birdtest stores per analysed position. Separate from
-      how many are generated or simulated.
+      how many are generated or simulated, and never more than that: an
+      opening-rack job refuses a config that reports more plays than it generates.
     </p>
   </div>
+
+  {#if !simming}
+    <div>
+      <label class="label" for="nps">Plays to generate (-np)</label>
+      <input id="nps" type="number" min="1" required class="input" bind:value={staticNumPlays} />
+      <p class="mt-1 text-xs text-muted-foreground">
+        How many plays move generation keeps. An opening-rack analysis ranks these, so
+        it must be at least the plays to report.
+      </p>
+    </div>
+  {/if}
 
   <label class="flex items-center gap-2 text-sm">
     <input type="checkbox" bind:checked={simming} />

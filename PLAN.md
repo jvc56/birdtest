@@ -287,9 +287,17 @@ for. Job creation therefore refuses a static player (`num_plies` 0) with
 remedy. A simulating one is accepted: it ranks as many moves as it records.
 `best` with `num_plays_recorded` of 1 stays legal for any player, because "the
 best opening play for every rack" is a real job. The rule is scoped to opening
-racks: a `games` job's
-players go through autoplay, where a simmer's candidate list is sized by
-`num_plays` rather than by the move recorder, and `best` is right there.
+racks: a `games` job's players go through autoplay, where a simmer's candidate
+list is sized by `num_plays` rather than by the move recorder, and `best` is
+right there.
+
+The same shortfall has two other sources. `num_plays` sizes the move list for
+every player, static or simulating, so a config whose `num_plays` is below its
+`num_plays_recorded` is refused for an opening-rack job too (twenty-ninth
+audit). And a static `equity` recorder keeps only the moves within
+`movegen_margin` of the best, which can be fewer than it reports, so `all` is
+the recorder to rank with. A static `score` player's reported equity is the
+move's score: MAGPIE sets it so under a score sort.
 
 `position_analysis_plies` is populated only for **simming** player configs. A static player produces no per-ply statistics, so for the common case the table stays empty rather than filling with placeholder rows.
 
@@ -4716,7 +4724,8 @@ Beyond role matching, creation enforces six rules the schema cannot express:
 - **A recorder that can rank, for opening racks.** A static player with
   `recorder_type = 'best'` and `num_plays_recorded` above 1 is refused: `best`
   records one move, so the job would store one move per rack while claiming to
-  store ten. A simmer ranks every play up to `num_plays`, whatever its recorder. See
+  store ten. A simmer ranks every play up to `num_plays`, whatever its recorder.
+  Any player with `num_plays` below `num_plays_recorded` is refused too. See
   [How much of an analysis is kept](#how-much-of-an-analysis-is-kept).
 - **A capture job's simmers consider at least what is captured.** With
   `capture_positions` on, MAGPIE raises each simming player's `num_plays` to
@@ -6710,7 +6719,8 @@ the twenty-first's `AUDIT_FINDINGS_17.md`, the twenty-second's
 twenty-fourth's `AUDIT_FINDINGS_20.md`, the twenty-fifth's
 `AUDIT_FINDINGS_21.md`, the twenty-sixth's `AUDIT_FINDINGS_22.md`, the
 twenty-seventh's `AUDIT_FINDINGS_23.md`, the twenty-eighth's
-`AUDIT_FINDINGS_24.md` and the twenty-ninth's `AUDIT_FINDINGS_25.md`.
+`AUDIT_FINDINGS_24.md`, the twenty-ninth's `AUDIT_FINDINGS_25.md` and the
+thirtieth's `AUDIT_FINDINGS_26.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed. Each says
@@ -7456,7 +7466,10 @@ report a crash-looping task, a health check that never passes, or a rollback
 onto a schema its image refuses. Ten minutes, not one, because the service
 keeps no healthy task through a deploy, and migrations run inside the health
 check's grace. The alarms exist only while `desired_count` is above 0, so a
-first apply or RUNBOOK §5's first step does not page.
+first apply or RUNBOOK §5's first step does not page. The apply that raises
+it does, once: it creates the alarms before the task is healthy, and with no
+data yet they start in ALARM, then clear (README's first deploy says to expect
+it).
 
 Layer 3 had a design choice of its own. Having the backend list the backup bucket
 directly would require giving the task role `ListBucket` / `GetObject` on it,

@@ -274,8 +274,14 @@ def input_data_ids(client: Client, args) -> dict:
 # --- player configs and a job ----------------------------------------------
 
 
-def player_config(client: Client, name: str, sort_strategy: str, data: dict) -> str:
+def player_config(
+    client: Client, name: str, sort_strategy: str, data: dict, recorder: str = "best"
+) -> str:
     """A static player: no simulation parameters, and so no win% model either.
+
+    `best` for games, where only the move played matters. An opening-rack job
+    ranks moves, and job creation refuses a static `best` player that records
+    more than one, so its player records `all`.
 
     Two static players that sort differently are the cheapest way to get a job
     with real signal in it — they choose different moves on nearly every turn,
@@ -290,7 +296,7 @@ def player_config(client: Client, name: str, sort_strategy: str, data: dict) -> 
             "/api/admin/player-configs",
             {
                 "name": name,
-                "recorder_type": "best",
+                "recorder_type": recorder,
                 "sort_strategy": sort_strategy,
                 "kwg_id": data["kwg"],
                 "klv_id": data["klv"],
@@ -464,10 +470,13 @@ def seed(args) -> None:
     import_input_data(client, args)
     data = input_data_ids(client, args)
 
-    players = [
-        player_config(client, "static-equity", "equity", data),
-        player_config(client, "static-score", "score", data),
-    ]
+    if args.job_type == "opening_rack":
+        players = [player_config(client, "static-equity-all", "equity", data, recorder="all")]
+    else:
+        players = [
+            player_config(client, "static-equity", "equity", data),
+            player_config(client, "static-score", "score", data),
+        ]
     create_job(client, args, data, players)
     log("seeded — the job is active and workers can claim")
 
