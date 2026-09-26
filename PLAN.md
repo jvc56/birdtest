@@ -710,7 +710,7 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
 
 1. User fills out the registration form (`/register`) with username, email, and password.
 2. The server validates, and returns `400` with field-level errors listing **every** problem at once rather than the first:
-   - Username is 3–32 characters (counted as characters, not bytes), with no line break, control or invisible (format) character — it is written into mail to the address's owner, which may be a stranger's (KL-34) — trimmed, and unique whatever its case (a
+   - Username is 3–32 characters (counted as characters, not bytes), trimmed, with no line break, control or invisible character (it is written into mail to the address's owner, which may be a stranger's — KL-34; a zero-width joiner or non-joiner may stand between two letters of a script written with them — Arabic, Syriac, NKo, Mongolian, the Brahmic scripts — or inside an emoji sequence, and a variation selector after a pictograph or ideograph or on a keycap), and unique whatever its case (a
      unique index on `lower(username)`): "Josh" and "josh" side by side on the
      public lists is an impersonation.
    - Email is one bare address — `local@domain.tld`, printable ASCII, none of
@@ -787,7 +787,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
    caller's latency; a send that fails is logged and nothing else, since the
    caller was told the same thing either way.
 4. The user clicks the link, landing on `/reset-password/confirm?token=<raw-token>`. The page shows a new-password form.
-5. On submit, `POST /api/auth/reset-password/confirm` reads the token (hash match, not expired, not already used, its account not deleted) without a lock, so a wrong link costs nothing more; scores the new password against the account and hashes it, both on the password threads and outside any transaction, so neither wait holds a lock; then locks the account, spends the token (checked again), stores the new hash, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
+5. On submit, `POST /api/auth/reset-password/confirm` reads the token (hash match, not expired, not already used, its account not deleted) without a lock, so a wrong link costs nothing more; charges the link's own bucket (five scorings an hour, whoever sends them: a link refused a weak password still works); scores the new password against the account on scoring's own turns (two, on the blocking pool — never sign-in's) and hashes it on the password threads, both outside any transaction, so neither wait holds a lock; then locks the account, spends the token (checked again), stores the new hash, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
 
    The reset also **revokes every existing session**. Each session token carries the account's `session_generation`, and `CurrentUser` compares it with the `users` row it already reads on every request; the reset increments it, so every token minted before it — an attacker's included — stops working. `POST /api/auth/sign-out-everywhere` (the "Sign out everywhere" button on the account page) and account deletion increment it the same way.
 6. The user is redirected to `/login` (with no message; signing in with the new password is the confirmation).
@@ -2491,9 +2491,9 @@ do:
   two racks a turn. The other leave rules bound a count from below only, and
   this is the job type where an unbounded one is a wedge rather than a wrong
   number: occurrences are summed into `bigint` columns by a merge that folds
-  everything staged for the generation in one statement, so a count out of a
-  broken client's uninitialised buffer — as likely near 2^63 as anywhere —
-  made that statement fail with `bigint out of range` on every merge from then
+  everything staged for the generation (in passes over slices of the racks),
+  so a count out of a broken client's uninitialised buffer — as likely near
+  2^63 as anywhere — made the merge fail with `bigint out of range` on every merge from then
   on, including the drain no transition closes without. The generation could
   not close until someone deleted the staged row by hand.
 
@@ -2752,7 +2752,7 @@ The merge interval (`leave_gen::MERGE_INTERVAL`, thirty minutes) sets that volum
 
 **The selection index stays small, by giving up an order nothing needed.** For a while `leave_rack_progress_pick_idx` carried `rack`, so that selection's `(occurrence_count, rack)` order was an index walk rather than a sort of the generation. Measured on a full English generation that index was **180 MB where the one on the count alone is 22 MB** — nearly all of the narrow index's keys are equal, so Postgres deduplicates them, and unique keys cannot be — which made a generation 590 MB rather than 432, for the life of the job. Selection now orders on `occurrence_count` alone and lets ties fall in whatever order the index holds them, and the public feed pages by rack through the primary key; dispatch order among tied racks is no longer reproducible, and nothing depended on it.
 
-**A merge writes no temporary files.** As one statement, a merge of 200 staged results of 150,000 racks each wrote 2.9 GB of them (159 s), and a backlog after an outage is larger — on a volume of 20 GiB. Two things spilled: `UNNEST(a, b, c)` in `FROM` materializes each array before it is read (1.5 GB for 200), and the sum over every element staged was a sort of all of them — or would have been a hash table of every rack, 300 MB for English. The arrays are now unnested in the select list, where they stream, and the racks are summed a slice at a time, by hash, one pass per 400,000 racks of the generation (eight for English), each slice's hash table held in memory (`work_mem` 64 MB for the merge, and sorting off, since the planner cannot see how few racks a slice holds): 74 MB for a slice, and nothing written to disk. Measured on a full English generation: 153 s for 200 staged results and 253 s for 600, no temporary files at either — linear in the backlog, each rack's row written once. (A first version took a pass per fifty results; its spill was bounded, but each pass read everything staged, so its time grew as the square of the backlog: 7.7 minutes at a thousand.)
+**A merge writes no temporary files.** As one statement, a merge of 200 staged results of 150,000 racks each wrote 2.9 GB of them (159 s), and a backlog after an outage is larger — on a volume of 20 GiB. Two things spilled: `UNNEST(a, b, c)` in `FROM` materializes each array before it is read (1.5 GB for 200), and the sum over every element staged was a sort of all of them — or would have been a hash table of every rack, about 650 MB for English. The arrays are now unnested in the select list, where they stream, and the racks are summed a slice at a time, by hash, one pass per 400,000 racks of the generation (eight for English), each slice's hash table held in memory (`work_mem` 64 MB for the merge — a hash table may use it times `hash_mem_multiplier`, 2 by default, so 128 MB — and sorting off, since the planner cannot see how few racks a slice holds): 74–90 MB for a slice's hash table, about 130 MB for the database backend running the pass in all, and nothing written to disk. A merge sizes its passes from the generation's summary, and one with nothing staged runs none. Measured on a full English generation: 153 s for 200 staged results and 253 s for 600, no temporary files at either — linear in the backlog, each rack's row written once. Those figures had the generation in memory. On 1 GiB — the Terraform's `db.t4g.micro`, three generations of 3.2 million racks and thirty staged results each — a merge took 11 minutes, because each pass probed the primary key in hash order, a random read per rack; each slice's sums are now sorted by rack first, so the update walks the key in order: 132–145 s on the same machine (the unsorted single statement of before took 522). At most two merges run at once across every job, since each pass's backend holds about 130 MB (merges that would not wait give up, as they do at a job's own lock). Measure one on the real instance before the first leave job there. (A first version took a pass per fifty results; its spill was bounded, but each pass read everything staged, so its time grew as the square of the backlog: 7.7 minutes at a thousand.)
 
 What is left unsolved is that a merge still rewrites most of a 432 MB relation as non-HOT updates. Removing that means taking `occurrence_count` out of the index selection uses — for instance selecting "any rack below target" through a partial index on a flag the merge maintains, rather than "the racks furthest below" — which changes the selection policy, and has not been decided.
 
@@ -3853,10 +3853,11 @@ Before running a task, for each derived file the claim pins:
    cannot match.
 
 A claim that pins **nothing** for a wordmap — an older server — falls back to
-the `.wmp.src` sidecar, which is still what protects the CLI. A claim that pins
-nothing for a table means no table is loaded at all: a table that cannot be
-checked would rank every full rack on leave values nothing verified, and running
-without one is always correct, just slower.
+the `.wmp.src` sidecar, which is still what protects the CLI. A claim for a player
+that uses a table always pins one: the server does not dispatch the job until it
+has built and hashed it. MAGPIE declines a claim that asks for a table without
+pinning one (`derived_mismatch`, `config_contribute_ensure_rack_info_table`)
+rather than rank every full rack on leave values nothing verified.
 
 `dawg2wordmap` replaced the `dawg2text` + `text2wordmap` pair the client used to
 run. The two produce identical bytes, this is the one the server builds its
@@ -4581,7 +4582,8 @@ In-memory token buckets, per process, reset on restart.
 | `POST /api/me/api-keys` | 10 / hour, **burst 100** | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered churn was unmetered new capacity. The burst is the cap, so a contributor setting up a machine per key is not held back (at ten an hour from the start, fifty machines took five hours); what refills slowly is revoke-and-recreate |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
 | Any worker request with an API key or `X-Worker-UUID` that has not resolved in the last ten minutes | 5 / second, **burst 100**, charged **before the lookup**, match or not | Client IP. The identity lookup is a main-pool query; a credential that resolved recently skips this, so a bad neighbour behind a shared address does not lock out working machines (`ratelimit::CredentialGate`). The worker's own bucket (above) is charged before the lookup too, on the credential as presented |
-| `POST /api/auth/confirm-email`, `POST /api/auth/reset-password/confirm` | 20 / minute | Client IP. The codes are too long to guess; this bounds cost (unauthenticated writes on the main pool, and a password scored) |
+| `POST /api/auth/confirm-email`, `POST /api/auth/reset-password/confirm` | 20 / minute | Client IP. The codes are too long to guess; this bounds cost (unauthenticated writes on the main pool) |
+| A reset link's password scorings | 5 / hour | The link (`tok:`, on the reset limiter), from any address, charged once the link reads valid and a scoring turn is held (so a request turned away busy spends none): a link refused a weak password still works, and replayed from many addresses it bought a queue of scorings no per-address limit bounded. Its owner, after five weak tries, waits too |
 | `GET /api/jobs/:id/stream` | 2,000 open at once, at most 32 from one address | Open streams, not requests: past either a `503`. The page backs off from 5 s to a minute between attempts |
 
 "Client IP" is the `X-Forwarded-For` entry `TRUSTED_PROXY_HOPS` from the right —
@@ -4591,7 +4593,7 @@ on the peer behind a proxy would put the whole site in one bucket.
 The burst matters: a task costs at least two requests, so a strict one-per-second
 limit with no burst would throttle a well-behaved client.
 
-Password reset is checked twice, and both halves are load-bearing. Without a
+A reset request is checked twice, and both halves are load-bearing. Without a
 limit it is an unauthenticated endpoint that sends mail to any address it is
 given: a way to probe which addresses have accounts, and a way to bury a known
 contributor in reset emails at the operator's expense. Limiting by IP alone
@@ -5058,9 +5060,9 @@ birdtest/
 ├── .github/
 │   └── workflows/
 │       ├── ci.yml                  # per pull request: clippy + backend tests (with Postgres),
-│       │                           # frontend check/build, both images, terraform validate,
-│       │                           # dev-restore's SCRUB rule, and MAGPIE's half of the
-│       │                           # message contract
+│       │                           # frontend check/build, the three images, tier 5's
+│       │                           # journeys, terraform validate, dev-restore's SCRUB
+│       │                           # rule, and MAGPIE's half of the message contract
 │       └── nightly.yml             # tier 6: a real MAGPIE runs one task of every job type
 ├── docker-compose.yml               # the whole local stack: Postgres, MinIO (S3 stub), backend,
 │                                    # frontend, plus a `dev` profile — see Development
@@ -7221,15 +7223,17 @@ says so in its implemented option, rather than being removed.
 
 **KL-57. A job waiting on a derived build asks about it on every claim.**
 - **Context:** `derived::status_for_job` runs for a waiting job on every claim
-  that considers it, until the build lands (up to about 45 minutes for a rack
-  info table).
+  that considers it, until the build lands (minutes; at worst three attempts
+  of up to 70 minutes each, 5 and 15 minutes apart) — or, for a build that
+  has failed for good, until an admin retries it.
 - **Problem:** A few milliseconds on every such claim, and a waiting job heads
-  the candidate list because its claim count does not move.
+  the candidate list because its claim count does not move — for as long as a
+  failed build is left failed, which is not bounded by anything.
 - **Options considered:** throttle it like `JobTemplates::recently_failed`, once
   a few seconds per job.
 - **Option implemented:** None.
-- **Justification:** Small, and bounded by the build. Add the throttle if many
-  jobs ever wait at once.
+- **Justification:** Small; bounded by the build, or by an admin's reading
+  `/admin/derived-data`. Add the throttle if many jobs ever wait at once.
 
 ### Leave generation
 
@@ -7525,7 +7529,7 @@ says so in its implemented option, rather than being removed.
   that a taken one's notice does not (medians 31.8 against 30.2 ms, the
   Argon2 run being the same).
 - **Justification:** It is a schema and flow change, left for a decision. The
-  pending-registrations table would close all three.
+  pending-registrations table would close all four.
 
 **KL-38. Unconfirmed accounts, spent tokens and anonymous identities are never reaped.**
 - **Context:**
@@ -7857,6 +7861,9 @@ says so in its implemented option, rather than being removed.
     Leave generation runs at redundancy 1 (KL-14), so nothing cross-checks it;
     outside the broken-client threat model the checks are built for (not
     reproduced).
+  - An admin's "merge now", or an export settling a leave job, waits for a
+    merge turn as well as its own job's lock: behind at most two other jobs'
+    merges, which on the default database take a couple of minutes each.
   - An admin's change made just before a live push's build that then fails
     (not a `404`) waits out the interval: the build spent its wake-up. Built
     again at once, a failing build would most likely fail again.
@@ -7992,10 +7999,13 @@ says so in its implemented option, rather than being removed.
 - **Options considered:** hash inside the transaction; a timeout on the SES
   client; a dummy write for an unknown address; spending a link on a weak
   password; NFC-normalizing usernames at registration and sign-in.
-- **Option implemented:** The link read first, then the score and hash
-  outside the transaction (passes 5 and 6); the other two, none.
-- **Justification:** Resets are limited per address and per caller; the rest is
-  bounded or moot while KL-37 stands.
+- **Option implemented:** The link read first, then its own bucket (five
+  scorings an hour), then the score and hash outside the transaction (passes 5
+  and 6); UTF-8 on every SES part. Not built: the SES timeout, the dummy
+  write, spending a link on a weak password (a typo would cost the owner the
+  link), and normalizing usernames.
+- **Justification:** Resets are limited per address, per caller and per link;
+  the rest is bounded or moot while KL-37 stands.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the

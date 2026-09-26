@@ -739,9 +739,15 @@ leaderboard visible.
   the server hashes and discards them.
 
   A row whose `kwg_id` or `klv_id` points at an `input_data` row restored
-  without its object-store bytes will fail with that as its reason. Re-import
-  that tarball; the import is idempotent and adds no rows for files whose bytes
-  have not changed.
+  without its object-store bytes will fail with that as its reason; one whose
+  object holds other bytes than those imported fails saying so, and the build
+  deletes that object so the re-import below uploads it again. Re-import
+  that tarball; the import is idempotent, adds no rows for files whose bytes
+  have not changed, and uploads their bytes again. Then press **Retry** on
+  the row at `/admin/derived-data`: a row that has failed three times stays
+  failed until someone does, and its job hands out nothing meanwhile. (A
+  build that fails is tried again after 5 and then 15 minutes on its own, so
+  a passing S3 outage heals without anyone.)
 
 ### 2.5 Start the job again
 
@@ -761,10 +767,13 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   whose object is gone is rebuilt from the database and rewritten; every
   generation that is present is left alone.
 - **Object present but the hash differs** from what was recorded when the
-  generation closed. This is *not* automatically overwritten, and usually
-  should not be: the results have moved on since the generation closed, so a
-  rebuild legitimately produces different bytes, and rewriting would replace
-  the KLV that workers actually played with. Investigate before forcing
+  generation closed, by the same builder. This is *not* automatically
+  overwritten, and should not be until you know why: a closed generation's
+  rows do not change (a late result is credited, never folded), so a
+  difference means the object or the rows were damaged or replaced — a
+  restore from another point in time, a hand edit, an object written over —
+  and rewriting would replace the KLV that workers actually played with.
+  Investigate before forcing
   (**Force rebuild** on the admin job page; `?force=true` on the API), which
   rewrites every generation and is refused while the job is active. A check
   or a forced rebuild that started before a purge goes on writing objects

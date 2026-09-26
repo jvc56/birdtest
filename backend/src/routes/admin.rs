@@ -727,6 +727,10 @@ async fn create_player_config(
     Ok((StatusCode::CREATED, Json(config)))
 }
 
+/// The most blanks a distribution may have for MAGPIE to build a wordmap
+/// (`wmp_maker.c`), and with it a rack info table.
+const MAGPIE_MAX_WORDMAP_BLANKS: u32 = 2;
+
 /// The most racks one leave task forces: 200 times the form's default of 50,
 /// about 80 KB of racks in each claim.
 const MAX_RACKS_PER_TASK: i32 = 10_000;
@@ -1120,10 +1124,12 @@ async fn create_job(
         .bind(body.letterdist_id)
         .fetch_one(&state.pool)
         .await?;
-    crate::jobs::racks::LetterDistribution::parse(&content, &letterdist_name).map_err(|e| {
-        AppError::bad_request("the letter distribution cannot be used")
-            .with_field("letterdist_id", e.message)
-    })?;
+    let distribution = crate::jobs::racks::LetterDistribution::parse(&content, &letterdist_name)
+        .map_err(|e| {
+            AppError::bad_request("the letter distribution cannot be used")
+                .with_field("letterdist_id", e.message)
+        })?;
+    let blanks = distribution.tiles.iter().find(|t| t.letter == '?').map_or(0, |t| t.count);
 
     // Defaulted from config rather than typed, so the form shows the effective
     // value; a typed one was checked above.
@@ -1160,6 +1166,24 @@ async fn create_job(
 
     insert_job_config(&mut tx, &job, &body.config, &letterdist_name).await?;
     refuse_one_name_for_two_files(&mut tx, &job).await?;
+    // MAGPIE builds a wordmap, and so a rack info table, for at most two
+    // blanks (`cannot create WMP with more than 2 blanks`, an abort): a job
+    // that needs either on `english_super` was created, its build failed
+    // three times, and it never dispatched, with nothing on its page to say
+    // why (the audit's pass 7).
+    if blanks > MAGPIE_MAX_WORDMAP_BLANKS
+        && !crate::derived::needs_for_job(&mut tx, job.id).await?.is_empty()
+    {
+        return Err(AppError::bad_request(format!(
+            "{letterdist_name} has {blanks} blanks, and MAGPIE builds wordmaps and rack info \
+             tables for at most {MAGPIE_MAX_WORDMAP_BLANKS}: no player of this job may use \
+             either, and a leave job must not use a wordmap"
+        ))
+        .with_field(
+            "letterdist_id",
+            format!("{blanks} blanks: no wordmap or rack info table can be built for it"),
+        ));
+    }
 
     audit::log(
         &mut tx,
@@ -2575,6 +2599,13 @@ struct DerivedDataRow {
     role: String,
     name: String,
     builder: String,
+    // Which files it is built from: two rows can share a role, a name and a
+    // builder -- a lexicon re-released under its name, two distributions
+    // with one name -- and without these the page could not tell them apart,
+    // nor Retry say which it meant.
+    kwg_id: Uuid,
+    klv_id: Option<Uuid>,
+    letterdist_id: Uuid,
     state: String,
     sha256: Option<String>,
     bytes: Option<i64>,
@@ -2597,8 +2628,8 @@ async fn list_derived_data(
 ) -> AppResult<Json<Vec<DerivedDataRow>>> {
     Ok(Json(
         sqlx::query_as::<_, DerivedDataRow>(
-            "SELECT role, name, builder, state, sha256, bytes, build_target, error,
-                    attempts, requested_at, built_at
+            "SELECT role, name, builder, kwg_id, klv_id, letterdist_id, state, sha256, bytes,
+                    build_target, error, attempts, requested_at, built_at
              FROM derived_data
              ORDER BY state = 'built', requested_at DESC",
         )
@@ -2611,6 +2642,13 @@ async fn list_derived_data(
 struct RetryDerivedBody {
     role: String,
     name: String,
+    /// The one row meant, as the list gives it. Without these, every failed
+    /// row of that role and name is retried -- other builders' included,
+    /// which no builder of this MAGPIE then takes.
+    builder: Option<String>,
+    kwg_id: Option<Uuid>,
+    klv_id: Option<Uuid>,
+    letterdist_id: Option<Uuid>,
 }
 
 /// Puts a failed build back in the queue.
@@ -2619,7 +2657,8 @@ struct RetryDerivedBody {
 /// three times failed for a reason that a fourth attempt does not change, and
 /// re-queueing it automatically would spend every builder run on the same
 /// doomed row. An admin retries it after fixing what it named -- most often a
-/// lexicon imported before the server stored its bytes.
+/// lexicon's bytes missing from the object store, which re-importing its
+/// tarball uploads again.
 async fn retry_derived_data(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2632,10 +2671,17 @@ async fn retry_derived_data(
     let reset = sqlx::query(
         "UPDATE derived_data
          SET state = 'pending', attempts = 0, error = NULL, leased_until = NULL
-         WHERE role = $1 AND name = $2 AND state = 'failed'",
+         WHERE role = $1 AND name = $2 AND state = 'failed'
+           AND ($3::text IS NULL OR builder = $3)
+           AND ($4::uuid IS NULL OR (kwg_id = $4 AND klv_id IS NOT DISTINCT FROM $5
+                                     AND letterdist_id = $6))",
     )
     .bind(&body.role)
     .bind(&body.name)
+    .bind(&body.builder)
+    .bind(body.kwg_id)
+    .bind(body.klv_id)
+    .bind(body.letterdist_id)
     .execute(&state.pool)
     .await?
     .rows_affected();
@@ -2649,7 +2695,16 @@ async fn retry_derived_data(
         Some(admin.0.id),
         None,
         Some("derived_data"),
-        Some(format!("{} {}", body.role, body.name)),
+        Some(match (&body.builder, body.kwg_id) {
+            (Some(builder), Some(kwg)) => format!(
+                "{} {} {builder} kwg={kwg} klv={} letterdist={}",
+                body.role,
+                body.name,
+                body.klv_id.map_or("none".to_string(), |k| k.to_string()),
+                body.letterdist_id.map_or("none".to_string(), |l| l.to_string()),
+            ),
+            _ => format!("{} {}", body.role, body.name),
+        }),
         None,
     )
     .await?;

@@ -134,6 +134,17 @@ async fn queued(db: &TestDb, name: &str, builder: &str) -> (String, i32, Option<
     .unwrap()
 }
 
+/// Lets a failed row's wait before its next attempt pass, as the clock would.
+async fn let_the_wait_pass(db: &TestDb) {
+    sqlx::query(
+        "UPDATE derived_data SET leased_until = now() - interval '1 second'
+         WHERE state = 'pending' AND leased_until IS NOT NULL",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+}
+
 /// One pass of the builder task, as `build-derived` runs it. Bounded, so a
 /// builder that waited on a lock fails the test rather than hanging it.
 async fn build_next(state: &AppState) -> bool {
@@ -293,9 +304,11 @@ async fn a_row_for_a_builder_this_binary_lacks_is_left_alone_and_blocks_nothing(
     queue(&db, "wmp", "NWL23", "wmp-1", kwg, None, ld, 1).await;
 
     let mut builds = 0;
-    while build_next(&state).await {
-        builds += 1;
-        assert!(builds <= 10, "the queue never drained");
+    for _ in 0..10 {
+        while build_next(&state).await {
+            builds += 1;
+        }
+        let_the_wait_pass(&db).await;
     }
     // Ours was taken, failed on its inputs and was given up on; the others
     // were never touched.
@@ -330,12 +343,25 @@ async fn a_build_from_a_lexicon_stored_before_object_keys_fails_naming_the_remed
     let error = error.expect("the failure is recorded on the row");
     assert!(error.contains("lexica/NWL20.kwg"), "names the file: {error}");
     assert!(error.contains("import its tarball again"), "names the remedy: {error}");
-    assert_eq!((row_state.as_str(), attempts, leased), ("pending", 1, false));
+    // Pending, but not to be taken again until its wait has passed: taken at
+    // once, one run spent every attempt in seconds, and a passing outage
+    // failed a build for good.
+    assert_eq!((row_state.as_str(), attempts, leased), ("pending", 1, true));
+    let wait: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM leased_until - now())::float8 FROM derived_data WHERE name = 'NWL20'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!((290.0..=300.0).contains(&wait), "five minutes: {wait}");
+    assert!(!build_next(&state).await, "a failed row waits before its next attempt");
 
     let mut builds = 1;
-    while build_next(&state).await {
-        builds += 1;
-        assert!(builds <= 10, "retried without end");
+    for _ in 0..10 {
+        let_the_wait_pass(&db).await;
+        while build_next(&state).await {
+            builds += 1;
+        }
     }
     assert_eq!(builds, 3, "a bounded number of attempts");
     let (row_state, attempts, error, leased) = queued(&db, "NWL20", "wmp-1").await;

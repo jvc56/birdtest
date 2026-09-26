@@ -2,6 +2,12 @@ use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use std::sync::Arc;
 
+/// An SDK error with its causes. Displayed plainly it is "unhandled error"
+/// or "dispatch failure", which told an admin nothing (the audit's pass 7).
+fn cause(error: &impl std::error::Error) -> String {
+    aws_sdk_s3::error::DisplayErrorContext(error).to_string()
+}
+
 /// S3 (or MinIO in dev — the SDK is identical, only the endpoint differs).
 #[derive(Clone)]
 pub struct ArtifactStore {
@@ -28,7 +34,7 @@ impl ArtifactStore {
             .body(body.into())
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 put {key} failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("S3 put {key} failed: {}", cause(&e))))?;
         Ok(key.to_string())
     }
 
@@ -48,7 +54,7 @@ impl ArtifactStore {
             Ok(_) => Ok(true),
             Err(e) => match e.into_service_error() {
                 aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_) => Ok(false),
-                other => Err(AppError::internal(format!("S3 head {key} failed: {other}"))),
+                other => Err(AppError::internal(format!("S3 head {key} failed: {}", cause(&other)))),
             },
         }
     }
@@ -68,7 +74,7 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 multipart start {key} failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("S3 multipart start {key} failed: {}", cause(&e))))?;
         let upload_id = started
             .upload_id()
             .ok_or_else(|| AppError::internal("S3 returned no upload id"))?
@@ -104,7 +110,7 @@ impl ArtifactStore {
             .key(key)
             .presigned(config)
             .await
-            .map_err(|e| AppError::internal(format!("S3 presign {key} failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("S3 presign {key} failed: {}", cause(&e))))?;
         Ok(request.uri().to_string())
     }
 
@@ -117,7 +123,7 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 delete {key} failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("S3 delete {key} failed: {}", cause(&e))))?;
         Ok(())
     }
 
@@ -142,14 +148,14 @@ impl ArtifactStore {
             .await
             .map_err(|e| match e.into_service_error() {
                 GetObjectError::NoSuchKey(_) => AppError::not_found(format!("no artifact at {key}")),
-                other => unavailable(format!("S3 get {key} failed: {other}")),
+                other => unavailable(format!("S3 get {key} failed: {}", cause(&other))),
             })?;
 
         let bytes = object
             .body
             .collect()
             .await
-            .map_err(|e| unavailable(format!("S3 read {key} failed: {e}")))?;
+            .map_err(|e| unavailable(format!("S3 read {key} failed: {}", cause(&e))))?;
         Ok(bytes.into_bytes())
     }
 }
@@ -184,7 +190,7 @@ impl MultipartUpload {
             .send()
             .await
             .map_err(|e| {
-                AppError::internal(format!("S3 upload part {part_number} of {} failed: {e}", self.key))
+                AppError::internal(format!("S3 upload part {part_number} of {} failed: {}", self.key, cause(&e)))
             })?;
         self.parts.push(
             aws_sdk_s3::types::CompletedPart::builder()
@@ -207,7 +213,7 @@ impl MultipartUpload {
             .multipart_upload(completed)
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 multipart finish {} failed: {e}", self.key)))?;
+            .map_err(|e| AppError::internal(format!("S3 multipart finish {} failed: {}", self.key, cause(&e))))?;
         Ok(self.key)
     }
 

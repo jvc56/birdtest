@@ -70,8 +70,8 @@ at tier 5 names a symptom.
 |---|---|---|
 | 1 Unit | 208 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 117 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 152 | `backend/tests/`: `leave_gen.rs` (32), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 190 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (34), `auth_routes.rs` (22), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 2 Integration | 154 | `backend/tests/`: `leave_gen.rs` (33), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (13), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 192 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (36), `auth_routes.rs` (22), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 578 backend tests (the per-tier counts above are
+--run-ignored all` runs 582 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -1349,6 +1349,11 @@ job creation touches needs one caller here.
   exact. *(Covered:
   `leave_gen::a_merge_of_a_backlog_sums_it_in_passes_exactly`.)* (Thirty-second
   audit.)
+- `I-LEAVE-22` A merge takes one of the process's two merge turns only once it
+  holds its job's lock, so merges waiting on one job leave every other job
+  free to merge. *(Covered:
+  `leave_gen::merges_waiting_on_one_job_leave_other_jobs_free_to_merge`.)*
+  (Thirty-second audit.)
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -1533,6 +1538,12 @@ import can be watched) and a per-test MinIO bucket.
   whose lexica have not changed uploads nothing. *(Covered:
   `input_data::lexica_and_leaves_are_stored_once_by_digest`,
   `inputdata::tests::the_roles_a_derived_build_needs_go_to_the_object_store`.)*
+- `I-INPUT-8b` A lexicon object whose bytes are not those imported is deleted
+  by the build that finds it, and the next import uploads it again whole. An
+  import skips an object that exists, so while the damaged one stayed, the
+  build's remedy (import again) changed nothing. *(Covered:
+  `input_data::a_damaged_lexicon_object_is_replaced_by_the_next_import`.)*
+  (Thirty-second audit.)
 - `I-INPUT-4` A second import of the same tarball is a no-op. *(Covered:
   `input_data::a_second_import_of_the_same_tarball_is_a_no_op`.)*
 - `I-INPUT-5` `fail_orphaned_imports` fails a row left `running` by a restart
@@ -1689,8 +1700,14 @@ runs against a real MinIO.
   again: re-importing alone leaves a known row as it is, which the message
   wrongly promised until the thirty-first audit), and is retried the bounded
   `MAX_ATTEMPTS` (3) times and then left `failed` — not retried forever, and
-  not failed on the first attempt as this entry implied. *(Covered:
+  not failed on the first attempt as this entry implied. Between attempts it
+  waits, 5 and then 15 minutes: taken again at once it was still the oldest
+  row, so one builder run spent all three in seconds and a passing S3 outage
+  failed a build for good (thirty-second audit). *(Covered:
   `derived::a_build_from_a_lexicon_stored_before_object_keys_fails_naming_the_remedy`.)*
+  A stalled input fetch ends after five minutes and is recorded as a failure
+  (checked by hand against a listener that never answers: 300 s, the row back
+  to `pending`; it used to hold the builder task for good).
 - `I-DERIVED-8` A claim's `derived` entries name the table by
   `<lexicon>.<leaves>`, and two jobs on one lexicon with different leaves get
   two different names and two different hashes. *(Covered:
@@ -1766,7 +1783,7 @@ below.
 - `A-AUTH-3b` Scoring a password does not hold the executor: a hundred
   characters of zxcvbn's substitution letters take it close to a second, and
   on the executor one address's registrations or resets stalled every request
-  (`/health` 8.5 s). Scored on the password threads, a single-threaded test
+  (`/health` 8.5 s). Scored off the executor, a single-threaded test
   runtime ticks throughout (a 1.08 s gap on the executor). A reset with a
   wrong link is refused before any scoring. *(Covered:
   `auth_routes::scoring_a_crafted_password_does_not_stall_the_server`.)*
@@ -1801,13 +1818,17 @@ below.
   *(Covered: `auth_routes::the_owner_of_a_taken_address_is_told_their_username`,
   and the reset mail's in
   `auth_routes::a_reset_request_answers_the_same_for_known_and_unknown_addresses`.)*
+  (Thirty-second audit.)
 - `A-AUTH-4f` A username holds no line break, control or invisible (format)
   character: it is written into mail to an address's owner, and a stranger
   can register someone's address (KL-34). An account named so before the rule
-  is mailed with those characters as `?`. *(Covered:
+  is mailed with those characters as `?`. Joiners stand only between letters
+  of scripts written with them (Persian, Devanagari, Sinhala) or inside emoji
+  sequences (`🏳️‍🌈`), and variation selectors only after a pictograph, an
+  ideograph or on a keycap — never beside a Latin letter, accented or not, or
+  a Cyrillic one (pass 7's first version let `zoë` plus a selector through). *(Covered:
   `auth_routes::a_username_cannot_carry_a_message_into_mail`,
   `routes::auth::tests::a_username_holds_no_line_break_or_hidden_character`.)*
-  (Thirty-second audit.)
   (Thirty-second audit.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
@@ -2083,6 +2104,16 @@ below.
   with the account held, the delete waits holding none of its reset links.
   *(Covered: `admin_api::deleting_an_account_locks_it_before_its_rows`.)*
   (Thirty-second audit.)
+- `A-ADMIN-23` A job that needs a wordmap or a rack info table, on a
+  distribution with more than two blanks (`english_super`), is refused at
+  creation: MAGPIE builds neither for more than two and aborts, so the job
+  never dispatched. The same job without them is created. *(Covered:
+  `admin_api::a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused`.)*
+  (Thirty-second audit.)
+- `A-ADMIN-24` Retry resets the one failed build it names, by builder and by
+  the files it is built from; it reset every failed row of that role and name,
+  other builders' included. *(Covered:
+  `admin_api::a_retry_resets_only_the_build_it_names`.)* (Thirty-second audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
 

@@ -1669,6 +1669,63 @@ async fn a_merge_of_a_backlog_sums_it_in_passes_exactly() {
     assert_eq!(staged, 0);
 }
 
+/// I-LEAVE-22: a merge takes one of the process's merge turns only once it
+/// holds its job's lock. Taken before, two merges waiting on one job's
+/// running merge (or purge) held both turns, and every other job's merges
+/// gave up or waited behind them.
+#[tokio::test]
+async fn merges_waiting_on_one_job_leave_other_jobs_free_to_merge() {
+    let db = TestDb::new().await;
+    let (x, _) = leave_job(&db, 2).await;
+    let (y, _) = leave_job(&db, 2).await;
+    let rack: String = racks_in_sweep_order(&db, y).await.remove(0);
+    for job in [x, y] {
+        sqlx::query(
+            "INSERT INTO leave_rack_staging (job_id, generation, task_id, racks, counts, equity_sums)
+             VALUES ($1, 1, $2, ARRAY[$3], ARRAY[1::bigint], ARRAY[1.0::float8])",
+        )
+        .bind(job)
+        .bind(Uuid::new_v4())
+        .bind(&rack)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    // X's running merge, or a purge of X, holds X's merge lock.
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(3, hashtext($1::text))")
+        .bind(x)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let waiting: Vec<_> = (0..2)
+        .map(|_| {
+            let pool = db.pool.clone();
+            tokio::spawn(async move { birdtest::jobs::leave_gen::merge_staged(&pool, x, 1, true).await })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let merged = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        birdtest::jobs::leave_gen::merge_staged(&db.pool, y, 1, false),
+    )
+    .await
+    .expect("Y's merge is not held up by X")
+    .unwrap();
+    assert_eq!(merged.map(|m| m.folds_merged), Some(1), "Y merged while X was held");
+
+    holder.rollback().await.unwrap();
+    for merge in waiting {
+        merge.await.unwrap().unwrap();
+    }
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_staging")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
 /// The generation's racks in the order a sweep visits them: the primary key's,
 /// which is the database's collation and not byte order.
 async fn racks_in_sweep_order(db: &TestDb, job: Uuid) -> Vec<String> {

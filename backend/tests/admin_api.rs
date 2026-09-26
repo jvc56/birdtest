@@ -2033,3 +2033,105 @@ async fn deleting_an_account_locks_it_before_its_rows() {
     let (status, body) = delete.await.unwrap();
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }
+
+/// A-ADMIN-23: MAGPIE builds a wordmap, and so a rack info table, for at most
+/// two blanks, and aborts on more. A job whose players use either, on a
+/// distribution with three blanks, was created, its build failed three
+/// times, and it never dispatched, with nothing on its page to say why. It is
+/// refused; the same job without a wordmap is not.
+#[tokio::test]
+async fn a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let letterdist = db.input_data("letterdist", "english").await;
+    let three_blanks: Uuid = sqlx::query_scalar(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+         SELECT 'letterdistributions/english_super.csv', 'letterdist', 'english_super',
+                repeat('4', 64), bytes, tarball_date,
+                convert_to(replace(convert_from(content, 'UTF8'), '?,?,1,', '?,?,3,'), 'UTF8')
+         FROM input_data WHERE id = $1
+         RETURNING id",
+    )
+    .bind(letterdist)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+
+    let mut players = Vec::new();
+    for (name, use_wordmap) in [("with-wordmap", true), ("without", false)] {
+        let (status, player) = player_config(&app, &headers, json!({
+            "name": name, "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+            "use_wordmap": use_wordmap, "num_plays_recorded": 1,
+        })).await;
+        assert_eq!(status, StatusCode::CREATED, "{player}");
+        players.push(player["id"].clone());
+    }
+    let job = |player: &serde_json::Value| json!({
+        "job_type": "games", "variant": "classic",
+        "letterdist_id": three_blanks, "layout_id": layout,
+        "player1_config_id": player, "player2_config_id": player,
+        "min_games": 1, "max_games": 10,
+    });
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(&players[0]))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "letterdist_id", "{body}");
+    assert!(body["message"].as_str().unwrap().contains("3 blanks"), "{body}");
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs").fetch_one(&db.pool).await.unwrap();
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM derived_data").fetch_one(&db.pool).await.unwrap();
+    assert_eq!((jobs, queued), (0, 0), "nothing is created or queued");
+
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(&players[1]))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// A-ADMIN-24: Retry resets the one failed build it names. Rows can share a
+/// role and a name -- under another builder, or another copy of a lexicon --
+/// and it reset every failed one of them, other builders' included, which no
+/// builder of this MAGPIE then takes.
+#[tokio::test]
+async fn a_retry_resets_only_the_build_it_names() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let owned = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = owned.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let ld = db.input_data("letterdist", "english").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    for builder in ["wmp-1", "wmp-0"] {
+        sqlx::query(
+            "INSERT INTO derived_data (role, name, builder, kwg_id, letterdist_id, state, attempts, error)
+             VALUES ('wmp', 'NWL23', $1, $2, $3, 'failed', 3, 'gone')",
+        )
+        .bind(builder)
+        .bind(kwg)
+        .bind(ld)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let (status, list) = send(&app, get_request("/api/admin/derived-data", &owned)).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let row = list.as_array().unwrap().iter().find(|r| r["builder"] == "wmp-1").unwrap().clone();
+    assert_eq!(row["kwg_id"], json!(kwg), "{row}");
+    let (status, body) = send(&app, post_json("/api/admin/derived-data/retry", &headers, json!({
+        "role": row["role"], "name": row["name"], "builder": row["builder"],
+        "kwg_id": row["kwg_id"], "klv_id": row["klv_id"], "letterdist_id": row["letterdist_id"],
+    }))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let states: Vec<(String, String)> =
+        sqlx::query_as("SELECT builder, state FROM derived_data ORDER BY builder")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(states, vec![("wmp-0".into(), "failed".into()), ("wmp-1".into(), "pending".into())]);
+}
+

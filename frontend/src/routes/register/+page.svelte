@@ -56,12 +56,12 @@
     <div>
       <label class="label" for="username">Username</label>
       <input id="username" class="input" bind:value={username} autocomplete="username" required />
-      {#if fields.username}<p class="field-error">{fields.username}</p>{/if}
+      {#if fields.username}<p class="field-error" role="alert">{fields.username}</p>{/if}
     </div>
     <div>
       <label class="label" for="email">Email</label>
       <input id="email" type="email" class="input" bind:value={email} autocomplete="email" required />
-      {#if fields.email}<p class="field-error">{fields.email}</p>{/if}
+      {#if fields.email}<p class="field-error" role="alert">{fields.email}</p>{/if}
     </div>
     <div>
       <label class="label" for="password">Password</label>
@@ -76,7 +76,7 @@
       {#if password}
         <p class="mt-1 text-xs text-muted-foreground">Rough strength: {labels[strength]} — the server checks it properly when you register.</p>
       {/if}
-      {#if fields.password}<p class="field-error">{fields.password}</p>{/if}
+      {#if fields.password}<p class="field-error" role="alert">{fields.password}</p>{/if}
     </div>
     {#if error}<p class="field-error" role="alert">{error}</p>{/if}
     <button class="btn-primary w-full" disabled={busy}>{busy ? 'Creating…' : 'Register'}</button>

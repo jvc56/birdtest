@@ -92,7 +92,7 @@ impl JobHandler for LeaveGenHandler {
             return Err(AppError::bad_request("leave result carried no rack occurrences"));
         }
         for occurrence in &mut response.racks {
-            occurrence.rack = canonical_rack(&occurrence.rack);
+            spell_as_the_universe(&mut occurrence.rack);
         }
         // After spelling: one rack under two spellings is a duplicate too.
         super::plausibility::check_rack_occurrences(&response.racks)?;
@@ -125,14 +125,23 @@ impl JobHandler for LeaveGenHandler {
 /// and an English generation could never close (the audit's pass 6). A rack
 /// with a bracketed multi-character letter is left as it is: leave generation
 /// refuses such distributions, and it matches nothing either way.
-pub fn canonical_rack(rack: &str) -> String {
-    if rack.contains(['[', ']']) {
-        return rack.to_string();
+///
+/// In place, and only for a string that could be a rack: seven letters of at
+/// most four bytes. Anything else is left for plausibility to refuse without
+/// a copy -- spelled first, a 60 MiB "rack" cost 300 MB and a third of a
+/// second before it was refused, past the large-result budget (the audit's
+/// pass 7).
+pub fn spell_as_the_universe(rack: &mut String) {
+    if rack.len() > MAX_RACK_BYTES || rack.contains(['[', ']']) {
+        return;
     }
     let mut letters: Vec<char> = rack.chars().collect();
     letters.sort_unstable();
-    letters.into_iter().collect()
+    *rack = letters.into_iter().collect();
 }
+
+/// The longest a full rack's string can be: seven letters of up to four bytes.
+const MAX_RACK_BYTES: usize = 7 * 4;
 
 /// Records that a claim did a task's work, without adding its occurrences to
 /// the generation.
@@ -277,9 +286,14 @@ async fn stage_fold(
 const MERGE_LOCK_NAMESPACE: i32 = 3;
 
 /// About how many of the generation's racks one pass of a merge sums (see
-/// [`merge_staged`]): their hash table, 74 MB for 400,000, fits the pass's
-/// `work_mem`, so the pass spills nothing.
+/// [`merge_staged`]): their hash table, 74-90 MB for 400,000, fits the pass's
+/// hash memory (`work_mem` 64 MB times `hash_mem_multiplier`, 2 by default),
+/// so the pass spills nothing. The database backend running it peaks at about
+/// 130 MB in all, the statement's other rows included.
 pub const MERGE_RACKS_PER_PASS: i64 = 400_000;
+
+/// Merges running at once, across every job (see [`merge_staged_in_slices`]).
+static MERGE_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 /// Take `job_id`'s merge lock for the rest of the caller's transaction, waiting
 /// out a merge that is running.
@@ -371,6 +385,21 @@ pub async fn merge_staged_in_slices(
             return Ok(None);
         }
     }
+    // At most two merges at once, whatever their jobs: a pass's backend holds
+    // about 130 MB, and each job's claims and sweep start their own merges on
+    // a database the Terraform sizes at 1 GiB. Taken after the job's lock, so
+    // a turn is only ever held by a merge that is running: taken before it,
+    // two callers waiting on one job's running merge held both turns and
+    // every other job's merges gave up or waited behind them (the audit's
+    // pass 7). A caller that would not wait gives up here as at the lock.
+    let _turn = if wait {
+        MERGE_TURNS.acquire().await.map_err(|_| AppError::internal("merges are closed"))?
+    } else {
+        match MERGE_TURNS.try_acquire() {
+            Ok(turn) => turn,
+            Err(_) => return Ok(None),
+        }
+    };
 
     let started = std::time::Instant::now();
     // What this merge takes: the rows staged now. A result staged while it
@@ -388,26 +417,40 @@ pub async fn merge_staged_in_slices(
     // things spilled. `UNNEST(a, b, c)` in `FROM` materializes each array
     // before anything reads it; unnested in the select list, the arrays
     // stream. And the sum over every element staged was a sort of all of
-    // them, or a hash table of every rack of the generation -- 300 MB for
+    // them, or a hash table of every rack of the generation -- 650 MB for
     // English, past any sensible `work_mem`. So the racks are summed a slice
     // at a time, by hash, a pass per slice, with the slice's hash table held
-    // in memory: 400,000 racks take 74 MB, and a pass spills nothing however
+    // in memory: 400,000 racks take 74-90 MB, and a pass spills nothing however
     // much is staged. The number of passes follows the generation's size, not
     // the backlog (eight for English), so a merge's time grows linearly with
     // what is staged; each rack's row is still written once. (A first version
     // took a pass per fifty results, which bounded the spill but made the
     // time grow as the square of the backlog: 7.7 minutes at a thousand.)
-    let universe: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM leave_rack_progress WHERE job_id = $1 AND generation = $2",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .fetch_one(&mut *tx)
-    .await?;
+    // The generation's size from its summary, which every merge keeps; counted
+    // only before the first. Nothing to count at all when nothing is staged.
+    let universe: i64 = if ids.is_empty() {
+        0
+    } else {
+        sqlx::query_scalar(
+            "SELECT COALESCE(
+                 (SELECT racks_total FROM leave_generation_progress
+                  WHERE job_id = $1 AND generation = $2 AND merged_at IS NOT NULL),
+                 (SELECT COUNT(*) FROM leave_rack_progress WHERE job_id = $1 AND generation = $2))",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .fetch_one(&mut *tx)
+        .await?
+    };
     let per_pass = racks_per_pass.max(1);
-    let passes = ((universe + per_pass - 1) / per_pass).clamp(1, i64::from(i32::MAX)) as i32;
+    let passes = if ids.is_empty() {
+        0
+    } else {
+        ((universe + per_pass - 1) / per_pass).clamp(1, i64::from(i32::MAX)) as i32
+    };
     // The planner cannot see how few racks a slice holds (it guesses from
-    // `unnest`), and would sort every element staged instead.
+    // `unnest`), and would sort every element staged instead; with sorting
+    // off it sums them in a hash table and sorts only the slice's sums.
     sqlx::query("SET LOCAL work_mem = '64MB'").execute(&mut *tx).await?;
     sqlx::query("SET LOCAL enable_sort = off").execute(&mut *tx).await?;
     let (mut racks_updated, mut reported) = (0i64, 0i64);
@@ -424,6 +467,11 @@ pub async fn merge_staged_in_slices(
                        WHERE s.id = ANY($3)) u
                  WHERE $4 = 1 OR (hashtext(u.rack) & 2147483647) % $4 = $5
                  GROUP BY u.rack
+                 -- In key order, so the update walks the primary key rather
+                 -- than probing it at random: on a database whose memory
+                 -- does not hold the generation (1 GiB, the Terraform's
+                 -- default) a merge took 11 minutes unsorted and 2 sorted.
+                 ORDER BY u.rack
              ),
              applied AS (
                  UPDATE leave_rack_progress p SET
@@ -1884,17 +1932,26 @@ pub fn artifact_key(job_id: Uuid, generation: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn spelled(rack: &str) -> String {
+        let mut rack = rack.to_string();
+        super::spell_as_the_universe(&mut rack);
+        rack
+    }
+
     /// A reported rack is spelled as the universe spells it: letters in
     /// code-point order, blanks first, whatever order MAGPIE wrote them in.
     #[test]
     fn a_reported_rack_is_spelled_as_the_universe_spells_it() {
-        assert_eq!(super::canonical_rack("AEINST?"), "?AEINST");
-        assert_eq!(super::canonical_rack("AEINR??"), "??AEINR");
-        assert_eq!(super::canonical_rack("AEINRST"), "AEINRST");
+        assert_eq!(spelled("AEINST?"), "?AEINST");
+        assert_eq!(spelled("AEINR??"), "??AEINR");
+        assert_eq!(spelled("AEINRST"), "AEINRST");
         // German: MAGPIE's machine letters put Ä after A; the universe after Z.
-        assert_eq!(super::canonical_rack("AÄEINRS"), "AEINRSÄ");
-        assert_eq!(super::canonical_rack("ŻAĄ?"), "?AĄŻ");
+        assert_eq!(spelled("AÄEINRS"), "AEINRSÄ");
+        assert_eq!(spelled("ŻAĄ?"), "?AĄŻ");
         // A bracketed letter is not reordered: it matches nothing either way.
-        assert_eq!(super::canonical_rack("[L·L]AEIOU"), "[L·L]AEIOU");
+        assert_eq!(spelled("[L·L]AEIOU"), "[L·L]AEIOU");
+        // Nor is anything too long to be a rack, which plausibility refuses.
+        let long = "ZYX".repeat(1000);
+        assert_eq!(spelled(&long), long);
     }
 }

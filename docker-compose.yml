@@ -17,9 +17,9 @@
 #
 # And one service run on demand rather than kept up:
 #   docker compose run --rm derived-builder
-#                           drains the wordmap / rack info table build queue
-#                           once and exits, the way the scheduled ECS task
-#                           does in production. A job whose players ask for
+#                           builds what the wordmap / rack info table queue
+#                           holds, up to eight files, and exits, the way the
+#                           scheduled ECS task does in production. A job whose players ask for
 #                           either file is not dispatched until this has run.
 #
 # The end-to-end suite runs this file plus docker-compose.e2e.yml as its own
@@ -206,7 +206,7 @@ services:
   # --- on demand: derived-builder -------------------------------------------
   # The derived-file builder, as production runs it in a scheduled ECS task
   # (infra/derived.tf): the backend image with a different entrypoint, which
-  # drains `derived_data` and exits. Nothing else in this stack builds a
+  # builds what `derived_data` has queued, up to eight files, and exits. Nothing else in this stack builds a
   # wordmap or a rack info table, so a job that asks for one sits undispatched
   # -- visible at /admin/derived-data -- until this is run:
   #

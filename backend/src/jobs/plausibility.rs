@@ -305,9 +305,9 @@ const MAX_RACK_OCCURRENCES_PER_GAME: i64 = 1000;
 /// [`check_rack_occurrences`] bounds a count from below and nothing bounded it
 /// from above, and this is the one job type where that is not only wrong data
 /// but a wedge. Occurrences are **summed** -- into `bigint` columns, by a merge
-/// that folds every staged result of the generation in one statement. A count
-/// out of an uninitialised buffer is as likely to be near 2^63 as anywhere:
-/// staged, it made that statement fail with `bigint out of range`, every time,
+/// that folds every staged result of the generation, a slice of the racks per
+/// statement. A count out of an uninitialised buffer is as likely to be near
+/// 2^63 as anywhere: staged, it made its slice's statement fail with `bigint out of range`, every time,
 /// for every merge of the generation -- the periodic one, the one a claim asks
 /// for, and the drain a transition will not close without. The generation could
 /// never close and nothing short of deleting the staged row by hand fixed it.
@@ -526,9 +526,9 @@ mod tests {
         assert!(check_rack_occurrences(&[occurrence("AEINRST", 0)]).is_err());
     }
 
-    /// Occurrences are summed into `bigint` columns by one statement per
-    /// generation, so a count no game could produce is not only wrong: near
-    /// 2^63 it overflows that statement on every merge, and the generation can
+    /// Occurrences are summed into `bigint` columns across every staged result
+    /// of a generation, so a count no game could produce is not only wrong:
+    /// near 2^63 it overflows the merge's sum on every merge, and the generation can
     /// never close.
     #[test]
     fn a_leave_batch_cannot_report_more_occurrences_than_its_games_drew() {

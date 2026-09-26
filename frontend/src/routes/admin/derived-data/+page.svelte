@@ -17,10 +17,15 @@
 
   onMount(load);
 
+  // Two rows can share a role, a name and a builder (a lexicon re-released
+  // under its name), so a row is keyed by the files it is built from too.
+  const key = (row: DerivedData) =>
+    [row.role, row.name, row.builder, row.kwg_id, row.klv_id ?? '', row.letterdist_id].join(' ');
+
   async function retry(row: DerivedData) {
-    busy = `${row.role} ${row.name}`;
+    busy = key(row);
     try {
-      await api.retryDerivedData(row.role, row.name);
+      await api.retryDerivedData(row);
       await load();
     } catch (e) {
       error = e instanceof Error ? e.message : 'could not retry that build';
@@ -64,11 +69,10 @@
       {failed.length === 1 ? 'build has' : 'builds have'} given up.
     </p>
     <p class="mt-1 text-sm text-muted-foreground">
-      A build is a pure function of its inputs, so a repeated failure is a missing input or a
-      broken binary rather than bad luck — retrying without changing anything will fail the
-      same way. The commonest cause is a lexicon imported before the server stored lexicon
-      bytes: re-import that tarball, which adds no rows for files whose bytes have not
-      changed, then retry.
+      A build is tried three times, 5 and 15 minutes apart, so a passing outage heals by
+      itself; one that has given up failed for a reason that will not pass — a missing input
+      or a broken binary. The commonest is a lexicon whose bytes are missing from the object
+      store: re-import that tarball, which uploads them again, then retry.
     </p>
   </div>
 {:else if waiting.length > 0}
@@ -100,7 +104,7 @@
         </tr>
       </thead>
       <tbody>
-        {#each rows as row (row.role + row.name + row.builder)}
+        {#each rows as row (key(row))}
           <tr class:text-destructive={row.state === 'failed'}>
             <td>{kind(row.role)}</td>
             <td><code>{row.name}</code></td>
@@ -126,7 +130,7 @@
               {#if row.state === 'failed'}
                 <button
                   class="text-sm underline"
-                  disabled={busy === `${row.role} ${row.name}`}
+                  disabled={busy === key(row)}
                   on:click={() => retry(row)}
                 >
                   Retry

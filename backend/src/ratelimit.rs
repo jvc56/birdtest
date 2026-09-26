@@ -27,8 +27,10 @@ pub struct RateLimiters {
     /// issued a UUID. It exists at all because without it, omitting the
     /// identity header would be a way around the per-identity limit.
     pub unregistered_worker: Arc<Keyed>,
-    /// 5 password-reset requests per hour, checked twice: once against the
-    /// caller's IP and once against the address they asked for.
+    /// 5 an hour. Reset requests are checked twice, once against the caller's
+    /// IP and once against the address they asked for; the same limiter also
+    /// bounds the "already has an account" notices per address (`reg-em:`)
+    /// and the scorings one reset link buys (`tok:`).
     ///
     /// The per-address half is the one that matters. Without it this is an
     /// unauthenticated endpoint that sends mail to any address it is given, so
@@ -56,8 +58,7 @@ pub struct RateLimiters {
     pub worker_credentials: Arc<CredentialGate>,
     /// Confirmation and reset links redeemed, per client address: 20 a
     /// minute. The codes are too long to guess, so this is about cost, not
-    /// guessing -- both routes are unauthenticated and write on the main pool,
-    /// and a reset scores the new password first.
+    /// guessing -- both routes are unauthenticated and write on the main pool.
     pub redeem: Arc<Keyed>,
 }
 

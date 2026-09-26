@@ -78,6 +78,11 @@ variable "derived_builder_memory" {
     )
     error_message = "derived_builder_memory is not a Fargate memory size for derived_builder_cpu's CPU (256 CPU takes 512, 1024 or 2048 MiB; 512 takes 1024-4096; 1024, 2048-8192; 2048, 4096-16384; 4096, 8192-30720, all in 1024 steps; 8192, 16384-61440 in 4096 steps; 16384, 32768-122880 in 8192 steps)."
   }
+
+  validation {
+    condition     = var.derived_builder_memory >= 4096
+    error_message = "derived_builder_memory must be at least 4096 MiB: MAGPIE peaks at about 2.4 GB building a rack info table, and below 4 GB the build is killed."
+  }
 }
 
 variable "derived_builder_ephemeral_storage_gib" {
@@ -268,9 +273,11 @@ resource "aws_scheduler_schedule" "derived_builder" {
     }
 
     # No retries. The queue is the retry: a row whose build failed is left
-    # `pending` with its attempt counter raised, and the next scheduled run
-    # takes it again. Retrying the task instead would start a second builder
-    # against the same queue for no gain.
+    # `pending` with its attempt counter raised and a wait before its next
+    # attempt (5, then 15 minutes), and the first scheduled run after the
+    # wait takes it again; after three it is `failed` until an admin retries
+    # it. Retrying the task instead would start a second builder against the
+    # same queue for no gain.
     retry_policy {
       maximum_retry_attempts = 0
     }

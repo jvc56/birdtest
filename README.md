@@ -53,7 +53,8 @@ nothing about what your change did.
 builder.** The server publishes the hash of a copy it built itself, and nothing
 in the compose stack builds one on its own — production runs the builder as a
 scheduled task ([infra/derived.tf](infra/derived.tf)). Run it once, after
-creating such a job, and it drains the queue and exits:
+creating such a job, and it builds what is queued — up to eight files a run —
+and exits:
 
 ```bash
 docker compose run --rm derived-builder

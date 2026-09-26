@@ -955,3 +955,59 @@ async fn an_import_that_outlasts_its_time_limit_fails() {
     assert_eq!(state, "failed");
     assert!(error.unwrap_or_default().contains("did not finish within"));
 }
+
+/// I-INPUT-8b: a lexicon object whose bytes are not the ones imported is
+/// deleted by the build that finds it, so that re-importing the tarball
+/// uploads it again. An import skips an object that exists, so while the
+/// damaged one stayed, the remedy the build's error gave -- import again --
+/// changed nothing, and the build failed the same way after every retry.
+#[tokio::test]
+async fn a_damaged_lexicon_object_is_replaced_by_the_next_import() {
+    let db = TestDb::new().await;
+    let (_fixture, state, _bucket) = standard_import_setup(&db).await;
+    let admin = Admin::new(&db, state.clone()).await;
+    let import = run_import(&db, &state).await;
+    let (status, body) = admin.confirm(import).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (kwg, name, path, key): (Uuid, String, String, String) = sqlx::query_as(
+        "SELECT id, name, path, object_key FROM input_data WHERE role = 'kwg' ORDER BY path LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let letterdist: Uuid =
+        sqlx::query_scalar("SELECT id FROM input_data WHERE role = 'letterdist' ORDER BY path LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    state.artifacts.put(&key, b"damaged".to_vec()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO derived_data (role, name, builder, kwg_id, letterdist_id)
+         VALUES ('wmp', $1, $2, $3, $4)",
+    )
+    .bind(&name)
+    .bind(state.builders.wmp())
+    .bind(kwg)
+    .bind(letterdist)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let took = birdtest::derived::build_next(&state.pool, &state.artifacts, &state.magpie, &state.builders)
+        .await
+        .unwrap();
+    assert!(took);
+    let error: Option<String> = sqlx::query_scalar("SELECT error FROM derived_data")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let error = error.unwrap();
+    assert!(error.contains("has been deleted") && error.contains("import its tarball again"), "{error}");
+    assert!(!state.artifacts.exists(&key).await.unwrap(), "the damaged object is gone");
+
+    let again = run_import(&db, &state).await;
+    assert_eq!(import_state_row(&db, again).await.0, "staged");
+    assert_eq!(state.artifacts.get(&key).await.unwrap(), fixture_file(&path), "uploaded again, whole");
+}
+

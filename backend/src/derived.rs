@@ -32,11 +32,22 @@ use uuid::Uuid;
 
 /// How long a builder holds a row before another builder may take it over.
 ///
-/// Longer than the longest build (about three minutes for a rack info table on
-/// one core) with room for a slow fetch of the inputs, and short enough that a
-/// builder killed mid-build does not strand the job that is waiting on it for
-/// an afternoon.
-const LEASE: chrono::Duration = chrono::Duration::minutes(45);
+/// Longer than the longest a build is allowed ([`BUILD_DEADLINE`]), so a
+/// build still running is never taken over, and short enough that a builder
+/// killed mid-build does not strand the job that is waiting on it for an
+/// afternoon. A rack info table is two converts of up to thirty minutes each
+/// (`magpie::CONVERT_TIMEOUT`), and it used to be 45 minutes.
+const LEASE: chrono::Duration = chrono::Duration::minutes(75);
+
+/// How long one build may take, input fetches and converts together, before
+/// it is recorded as failed (and its MAGPIE killed). Without it a stalled S3
+/// read held the builder task, and the row, for good (the audit's pass 7).
+const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(70 * 60);
+
+/// How long one input's bytes may take to arrive from the object store. The
+/// client sets a connect timeout only; a connection that stalls after it
+/// never ended.
+const INPUT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// How many times a row is retried before it is left failed for an admin.
 ///
@@ -292,7 +303,11 @@ pub async fn status_for_job(
                 name,
                 sha256: row.get("sha256"),
                 bytes: row.get("bytes"),
-                build_target: builders.build_target.clone(),
+                // What built this hash, as the row records it: the builder
+                // task's target, which this process's need not be.
+                build_target: row
+                    .get::<Option<String>, _>("build_target")
+                    .unwrap_or_else(|| builders.build_target.clone()),
             }),
             Some("failed") => status.failed.push(label),
             _ => status.pending.push(label),
@@ -440,7 +455,7 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
     let row = sqlx::query(
         "SELECT role, name, builder, kwg_id, klv_id, letterdist_id
          FROM derived_data
-         WHERE (state = 'pending'
+         WHERE ((state = 'pending' AND (leased_until IS NULL OR leased_until < now()))
                 OR (state = 'building' AND leased_until < now()))
            AND attempts < $1
            AND builder = CASE role WHEN 'wmp' THEN $2 WHEN 'rit' THEN $3 END
@@ -514,7 +529,9 @@ async fn input_bytes(
     artifacts: &ArtifactStore,
     id: Uuid,
 ) -> AppResult<(String, Vec<u8>)> {
-    let row = sqlx::query("SELECT name, role, path, content, object_key FROM input_data WHERE id = $1")
+    let row = sqlx::query(
+        "SELECT name, role, path, sha256, content, object_key FROM input_data WHERE id = $1",
+    )
         .bind(id)
         .fetch_one(pool)
         .await?;
@@ -533,7 +550,39 @@ async fn input_bytes(
              known, so re-importing leaves this one as it is)."
         )));
     };
-    Ok((name, artifacts.get(&key).await?))
+    let bytes = tokio::time::timeout(INPUT_FETCH_TIMEOUT, artifacts.get(&key))
+        .await
+        .map_err(|_| {
+            AppError::internal(format!(
+                "fetching {key} from the object store took longer than {} minutes",
+                INPUT_FETCH_TIMEOUT.as_secs() / 60
+            ))
+        })??;
+    // The bytes the row names, or none: a replaced or damaged object built
+    // into a file whose hash every worker then declined as a mismatch.
+    let expected: String = row.get("sha256");
+    let actual = hex::encode(sha2::Sha256::digest(&bytes));
+    if actual != expected {
+        let path: String = row.get("path");
+        // Deleted, so that re-importing uploads it again: an import skips an
+        // object that exists, and the remedy the message gives did not work
+        // while the damaged one stayed (the audit's pass 7). Only an object
+        // under its own content address: that key can hold nothing but the
+        // imported bytes, so what is there is wrong for everyone who reads it.
+        let removed = key == format!("inputs/{expected}") && artifacts.delete(&key).await.is_ok();
+        return Err(AppError::internal(if removed {
+            format!(
+                "{path}: the object at {key} hashed to {actual}, not the {expected} imported, \
+                 and has been deleted; import its tarball again, then retry this build"
+            )
+        } else {
+            format!(
+                "{path}: the object at {key} hashes to {actual}, not the {expected} imported; \
+                 delete that object, import its tarball again, then retry this build"
+            )
+        }));
+    }
+    Ok((name, bytes))
 }
 
 /// Builds one derived file and records its hash. `Ok(true)` means a row was
@@ -550,7 +599,14 @@ pub async fn build_next(
     tracing::info!(role = %lease.role, name = %lease.name, "building a derived file");
     let started = std::time::Instant::now();
 
-    match build(pool, artifacts, magpie, &lease).await {
+    let outcome = match tokio::time::timeout(BUILD_DEADLINE, build(pool, artifacts, magpie, &lease)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(AppError::internal(format!(
+            "the build took longer than {} minutes and was stopped",
+            BUILD_DEADLINE.as_secs() / 60
+        ))),
+    };
+    match outcome {
         Ok((sha256, bytes)) => {
             let recorded = sqlx::query(
                 "UPDATE derived_data
@@ -581,14 +637,19 @@ pub async fn build_next(
             );
         }
         Err(err) => {
-            // Left 'building' with a lapsed lease would be retried by the next
-            // run; 'pending' says the same thing and reads correctly in the
-            // admin view. The attempt counter, not the state, is what stops it
-            // eventually.
+            // Back to 'pending', not to be taken again until a wait has
+            // passed -- 5, then 15 minutes -- which `leased_until` holds while
+            // the row is pending. Taken again at once, it was still the
+            // oldest row, so one run spent all three attempts in seconds and
+            // an S3 blip failed a build for good (the audit's pass 7). The
+            // attempt counter, not the state, is what stops it eventually.
             let recorded = sqlx::query(
                 "UPDATE derived_data
                  SET state = CASE WHEN attempts >= $1 THEN 'failed' ELSE 'pending' END,
-                     leased_until = NULL, error = $2
+                     leased_until = CASE WHEN attempts >= $1 THEN NULL
+                                         ELSE now() + make_interval(mins => 5 * (3 ^ (attempts - 1))::int)
+                                    END,
+                     error = $2
                  WHERE role = $3 AND name = $4 AND builder = $5
                    AND kwg_id = $6 AND klv_id IS NOT DISTINCT FROM $7
                    AND letterdist_id = $8

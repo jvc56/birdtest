@@ -105,11 +105,16 @@ static SCORING_PERMITS: tokio::sync::Semaphore =
 /// the executor a crafted password stalled every request (`/health` 8.5 s).
 /// The turn goes with the run, and a run whose requester has gone is skipped.
 async fn too_weak_off_the_executor(password: &str, username: &str, email: &str) -> AppResult<bool> {
-    let turn = match tokio::time::timeout(SCORING_QUEUE_WAIT, SCORING_PERMITS.acquire()).await {
-        Ok(Ok(turn)) => turn,
-        Ok(Err(_)) => return Err(AppError::internal("the password scoring queue is closed")),
+    score_in_turn(scoring_turn().await?, password, username, email).await
+}
+
+/// A turn to score a password, waited for at most `SCORING_QUEUE_WAIT`.
+async fn scoring_turn() -> AppResult<tokio::sync::SemaphorePermit<'static>> {
+    match tokio::time::timeout(SCORING_QUEUE_WAIT, SCORING_PERMITS.acquire()).await {
+        Ok(Ok(turn)) => Ok(turn),
+        Ok(Err(_)) => Err(AppError::internal("the password scoring queue is closed")),
         Err(_) => {
-            return Err(AppError {
+            Err(AppError {
                 retry_after: Some(10),
                 ..AppError::new(
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -118,7 +123,17 @@ async fn too_weak_off_the_executor(password: &str, username: &str, email: &str) 
                 )
             })
         }
-    };
+    }
+}
+
+/// [`too_weak`] on the blocking pool, in the turn given. The turn goes with
+/// the run, and a run whose requester has gone is skipped.
+async fn score_in_turn(
+    turn: tokio::sync::SemaphorePermit<'static>,
+    password: &str,
+    username: &str,
+    email: &str,
+) -> AppResult<bool> {
     let (password, username, email) = (password.to_owned(), username.to_owned(), email.to_owned());
     let (sender, receiver) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
@@ -174,19 +189,22 @@ fn is_hidden_or_breaking(c: char) -> bool {
                 | '\u{0890}'..='\u{0891}'
                 | '\u{08E2}'
                 | '\u{180E}'
-                | '\u{200B}'..='\u{200F}'
+                | '\u{200B}'
+                | '\u{200E}'..='\u{200F}'
                 | '\u{2028}'..='\u{202E}'
                 | '\u{2060}'..='\u{2064}'
-                | '\u{2066}'..='\u{206F}'
+                | '\u{2065}'..='\u{206F}'
                 | '\u{FEFF}'
-                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{FFF0}'..='\u{FFFB}'
                 | '\u{110BD}'
                 | '\u{110CD}'
                 | '\u{13430}'..='\u{1343F}'
                 | '\u{1BCA0}'..='\u{1BCA3}'
                 | '\u{1D173}'..='\u{1D17A}'
-                | '\u{E0001}'
-                | '\u{E0020}'..='\u{E007F}'
+                // Tags and unassigned default-ignorables, around the
+                // ideographic variation selectors placed below.
+                | '\u{E0000}'..='\u{E00FF}'
+                | '\u{E01F0}'..='\u{E0FFF}'
                 // Default-ignorable, but not Cf.
                 | '\u{034F}'
                 | '\u{115F}'..='\u{1160}'
@@ -194,12 +212,81 @@ fn is_hidden_or_breaking(c: char) -> bool {
                 | '\u{180B}'..='\u{180D}'
                 | '\u{180F}'
                 | '\u{3164}'
-                | '\u{FE00}'..='\u{FE0F}'
                 | '\u{FFA0}'
-                | '\u{E0100}'..='\u{E01EF}'
                 // Blank.
                 | '\u{2800}'
         )
+}
+
+/// Whether `name` holds an invisible mark where no script or emoji puts one.
+///
+/// A zero-width joiner or non-joiner (U+200D, U+200C) belongs between two
+/// letters of a script that writes with them -- Arabic and Persian (a Persian
+/// keyboard types one on shift+space), Syriac, NKo, Mongolian, the Brahmic
+/// scripts (`ශ්‍රී`) -- or between the pictographs of an emoji sequence
+/// (`🏳️‍🌈`). A variation selector (U+FE00-FE0F) belongs after a pictograph
+/// (`❤️`), an ideograph, or on a keycap (`1️⃣`), and an ideographic one
+/// (U+E0100-E01EF) after an ideograph. Anywhere else -- beside `r`, but also
+/// beside `ë` or a Cyrillic letter, which "not ASCII" let through -- they only
+/// make a second name look like the first (the audit's pass 7).
+fn misplaced_joiner(name: &str) -> bool {
+    let chars: Vec<char> = name.chars().collect();
+    let at = |i: usize| chars.get(i).copied();
+    let joins = |c: Option<char>| c.is_some_and(writes_with_joiners);
+    let picture = |c: Option<char>| c.is_some_and(pictographic);
+    let ideograph = |c: Option<char>| c.is_some_and(ideographic);
+    chars.iter().enumerate().any(|(i, &c)| {
+        let before = if i > 0 { at(i - 1) } else { None };
+        // An emoji's presentation selector sits between it and a joiner.
+        let base = if before == Some('\u{FE0F}') && i > 1 { at(i - 2) } else { before };
+        let after = at(i + 1);
+        match c {
+            '\u{200C}' | '\u{200D}' => {
+                !((joins(before) && joins(after)) || (picture(base) && picture(after)))
+            }
+            '\u{FE00}'..='\u{FE0F}' => {
+                let keycap = before.is_some_and(|b| b.is_ascii_digit() || b == '#' || b == '*')
+                    && after == Some('\u{20E3}');
+                !(picture(before) || ideograph(before) || keycap)
+            }
+            '\u{E0100}'..='\u{E01EF}' => !ideograph(before),
+            _ => false,
+        }
+    })
+}
+
+/// Letters (and their signs) of the scripts that are written with joiners.
+fn writes_with_joiners(c: char) -> bool {
+    matches!(c,
+        '\u{0600}'..='\u{06FF}' | '\u{0750}'..='\u{077F}' | '\u{08A0}'..='\u{08FF}'
+        | '\u{FB50}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFF}' // Arabic
+        | '\u{0700}'..='\u{074F}' // Syriac
+        | '\u{07C0}'..='\u{07FF}' // NKo
+        | '\u{1800}'..='\u{18AF}' // Mongolian
+        | '\u{0900}'..='\u{0DFF}' // Devanagari to Sinhala
+        | '\u{0F00}'..='\u{0FFF}' // Tibetan
+        | '\u{1000}'..='\u{109F}' // Myanmar
+        | '\u{1780}'..='\u{17FF}' // Khmer
+        | '\u{A840}'..='\u{A8FF}' | '\u{11000}'..='\u{111FF}' // other Brahmic
+    ) && !is_hidden_or_breaking(c)
+}
+
+/// Pictographs and symbols emoji are made of.
+fn pictographic(c: char) -> bool {
+    matches!(c,
+        '\u{00A9}' | '\u{00AE}' | '\u{203C}' | '\u{2049}' | '\u{2122}' | '\u{2139}'
+        | '\u{2190}'..='\u{21FF}' | '\u{2300}'..='\u{23FF}' | '\u{2460}'..='\u{27BF}'
+        | '\u{2900}'..='\u{297F}' | '\u{2B00}'..='\u{2BFF}' | '\u{3030}' | '\u{303D}'
+        | '\u{3297}' | '\u{3299}' | '\u{1F000}'..='\u{1FAFF}'
+    )
+}
+
+/// CJK ideographs.
+fn ideographic(c: char) -> bool {
+    matches!(c,
+        '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}'
+        | '\u{20000}'..='\u{3134F}'
+    )
 }
 
 /// A username as a mail shows it: an account named before the rule above
@@ -224,7 +311,7 @@ async fn register(
     let username_chars = username.chars().count();
     if !(3..=32).contains(&username_chars) {
         err = err.with_field("username", "must be between 3 and 32 characters");
-    } else if username.chars().any(is_hidden_or_breaking) {
+    } else if username.chars().any(is_hidden_or_breaking) || misplaced_joiner(&username) {
         err = err.with_field("username", "must not contain line breaks or invisible characters");
     }
     if !is_bare_address(&email) {
@@ -739,12 +826,14 @@ async fn confirm_password_reset(
     };
     // A link refused a weak password still works, so each scoring is also
     // counted against the link: replayed from many addresses it was a queue
-    // of scorings no per-address limit bounded.
+    // of scorings no per-address limit bounded. Counted once a turn is held,
+    // so a request turned away busy (`503`) does not spend the owner's tries.
+    let turn = scoring_turn().await?;
     ratelimit::check(&state.limits.reset, &format!("tok:{token_hash}"))?;
 
     // The same rule registration applies: not the username, not the address.
     // Refused here, the link still works for a better password.
-    if too_weak_off_the_executor(&body.password, &username, &email).await? {
+    if score_in_turn(turn, &body.password, &username, &email).await? {
         return Err(weak());
     }
 
@@ -817,12 +906,42 @@ mod tests {
         for bad in [
             "a\nb", "a\r\nb", "tab\there", "a\u{2028}b", "a\u{2029}b", "abc\u{202E}fdp.exe",
             "zero\u{200B}width", "a\u{2066}b", "bom\u{FEFF}", "del\u{7F}", "nel\u{85}", "tag\u{E0041}",
-            "walker\u{3164}", "walker\u{FE0F}", "walk\u{034F}er", "\u{2800}\u{2800}\u{2800}",
+            "walker\u{3164}", "walk\u{034F}er", "\u{2800}\u{2800}\u{2800}",
         ] {
             assert!(bad.chars().any(super::is_hidden_or_breaking), "{bad:?}");
             assert!(!super::as_mailed(bad).chars().any(super::is_hidden_or_breaking), "{bad:?}");
         }
         assert_eq!(super::as_mailed("Prize!\n\nevil.xyz"), "Prize!??evil.xyz");
+
+        // Joiners and selectors belong where scripts and emoji put them.
+        for good in [
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}", // Persian
+            "\u{0915}\u{094D}\u{200D}\u{0937}",                                   // Devanagari
+            "\u{0DC1}\u{0DCA}\u{200D}\u{0DBB}\u{0DD3}",                            // Sinhala ශ්‍රී
+            "\u{1F468}\u{200D}\u{1F469}",
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}",                                  // 🏳️‍🌈
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}",                                   // ❤️‍🔥
+            "\u{1F441}\u{FE0F}\u{200D}\u{1F5E8}\u{FE0F}",                           // 👁️‍🗨️
+            "\u{2764}\u{FE0F}",
+            "1\u{FE0F}\u{20E3}",                                                  // keycap
+            "\u{845B}\u{E0100}",                                                  // an ideograph's variant
+        ] {
+            assert!(!good.chars().any(super::is_hidden_or_breaking), "{good:?}");
+            assert!(!super::misplaced_joiner(good), "{good:?}");
+        }
+        for bad in [
+            "walker\u{200C}", "wal\u{200D}ker", "\u{200C}walker", "a \u{200C}\u{0628}",
+            "\u{0628}\u{200C}\u{200C}\u{0628}", "walker\u{FE0F}", "\u{FE0F}walker", "walker\u{E0100}",
+            // Non-ASCII Latin and Cyrillic are not scripts that join.
+            "zo\u{00EB}\u{FE0F}", "jos\u{00E9}\u{E0100}", "M\u{00FC}\u{200D}\u{00DF}ig",
+            "\u{0414}\u{200C}\u{043C}\u{0438}\u{0442}\u{0440}\u{0438}\u{0439}",
+            "Mu\u{0308}\u{200D}\u{00DF}ig", "1\u{FE0F}", "\u{1F468}\u{200D}x",
+        ] {
+            assert!(super::misplaced_joiner(bad), "{bad:?}");
+        }
+        for hidden in ["walker\u{2065}", "walk\u{FFF0}ers", "wal\u{E0000}ker", "walkerz\u{E0080}", "wal\u{E01F0}ker"] {
+            assert!(hidden.chars().any(super::is_hidden_or_breaking), "{hidden:?}");
+        }
     }
 
     #[test]

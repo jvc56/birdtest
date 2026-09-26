@@ -58,6 +58,16 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   files grew with the backlog — all fixed and verified; the adversarial check
   found 1 high (scoring on sign-in's turns), fixed. KL-2, 13, 34, 37, 78 and 81
   updated. The loop continues.
+- **Pass 7 (follow-up: pass 6's diff, and derived-file builds):** 0 high and 7
+  medium from the reviewers — a failed build retried at once, spending its
+  attempts in seconds; a stalled S3 read held the builder for good; a
+  wordmap job on a three-blank distribution never dispatched; a leave rack
+  spelled before its length was checked; PLAN putting scoring back on
+  sign-in's turns; RUNBOOK calling a differing KLV hash legitimate; merges
+  eleven minutes on the default database — all fixed and verified; the
+  adversarial check found 3 medium (a damaged object's remedy, invisible
+  username twins, merge turns held by waiters), fixed. KL-37, 57, 78 and 81
+  updated. The loop continues.
 
 ---
 
@@ -727,7 +737,7 @@ that "a real person who has forgotten they signed up still finds out". Both
 now name the account (both go only to the address's owner; the notice's lookup
 runs in its own task, so the request's timing does not change), and so did the
 confirmation mail, so an owner could see an account someone else registered on
-their address (KL-34) — reverted in 5.6, and usernames restricted in 6.1. **Verified:** `the_owner_of_a_taken_address_is_told_their_username`
+their address (KL-34) — reverted in 5.6, and usernames restricted in 6.3. **Verified:** `the_owner_of_a_taken_address_is_told_their_username`
 (`A-AUTH-4e`) and the reset test's new assertion.
 
 ### 5.3 Medium — PLAN said the registration form shows the server's password score; it does not (account reviewer)
@@ -855,8 +865,9 @@ it about 0.9 s (release). It ran on the async executor, in registration and —
 before any token was looked at — in the reset. Pinned to one CPU, twenty such
 resets from one address, within its limits, held `/health` for up to 8.5 s. The
 earlier audits that held "zxcvbn's input cap" measured length, not this.
-Scoring now runs on the four Argon2 threads, under the same turns
-(`too_weak_off_the_executor`), and the reset reads its link first, without a
+Scoring now runs off the executor (`too_weak_off_the_executor`) — first on
+the four Argon2 threads, under sign-in's turns, then, after 6.7, on two turns
+of its own — and the reset reads its link first, without a
 lock, so a wrong link costs neither a score nor a hash; it then scores and
 hashes outside any transaction, and only then locks the account and spends the
 link. **Verified:** `scoring_a_crafted_password_does_not_stall_the_server`
@@ -1022,4 +1033,195 @@ spelling and are dropped at the next merge, logged (nothing is deployed yet).
 - `scripts/dev-restore-check.sh` under a pseudo-terminal: passes (it hung).
 - Terraform unchanged (fmt and validate clean, infra reviewer); MAGPIE
   unchanged.
+
+
+---
+
+## Pass 7 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`6a609da..92544dc`; MAGPIE
+unchanged), one reviewer per part it touches: backend; frontend (tier 5
+natively); docs and procedures; infra and CI. Plus one area not examined in
+recent passes: **derived-file builds and the worker data gate** — the build
+queue and the `build-derived` task, the gate that holds a job until its files
+are built, and how workers prove they hold the right data.
+
+**Findings: 0 high, 7 medium** from the five reviewers (backend 1 medium, 4
+low, 2 unconfirmed; frontend 1 medium, 4 low — tier 5 natively 11 of 11; docs
+and procedures 1 medium, 8 low; infra and CI 1 medium, 2 low, 1 unconfirmed;
+derived builds 3 medium, 9 low, 1 unconfirmed). All fixed and verified.
+
+### 7.1 Medium — a failed build was retried at once, so one run spent all three attempts in seconds (derived-builds reviewer)
+
+**Code updated.** A failed build went back to `pending` and, still the oldest
+row, was taken again by the same run: an S3 outage of a few seconds used up
+`MAX_ATTEMPTS` and left the row `failed` until an admin pressed Retry, its job
+handing out nothing meanwhile (reproduced: three attempts in 5 s, then a second
+run with S3 back built nothing). A failed attempt now waits 5 and then 15
+minutes before the next (`leased_until` holds the time while the row is
+pending), and the builder takes a pending row only once it has passed.
+**Verified:** `I-DERIVED-7` now asserts the row pending with a five-minute wait
+and not taken again; it fails on the old code. `infra/derived.tf`'s comment and
+RUNBOOK (re-import, *then* Retry) say what happens.
+
+### 7.2 Medium — a stalled S3 read held the builder task for good (derived-builds reviewer)
+
+**Code updated.** The S3 client sets a connect timeout only; a connection that
+stalled after it held `build-derived` — a 4 vCPU, 8 GB task — past a 200-second
+test, and each five-minute run that met the same stall stranded another. An
+input fetch now gives up after five minutes, a whole build after seventy (its
+MAGPIE killed), and the lease is 75 minutes, longer than both (a rack info
+table is two converts of up to 30). **Verified** against a listener that
+accepts and never answers: the run ended after 300 s, the row `pending` with
+"fetching … took longer than 5 minutes" and its five-minute wait.
+
+### 7.3 Medium — a wordmap job on a distribution with more than two blanks was created and never dispatched (derived-builds reviewer)
+
+**Code updated.** MAGPIE aborts building a wordmap for more than two blanks
+(`english_super`), so such a job's build failed three times and it never
+dispatched, with nothing on its page to say why. Job creation now refuses a job
+that needs a wordmap or a rack info table on such a distribution, naming the
+distribution's field. **Verified:** `A-ADMIN-23` fails without the check (`201`)
+and passes; the same job with no wordmap is created.
+
+### 7.4 Medium — a leave result's rack was spelled before its length was checked (backend reviewer)
+
+**Code updated.** 6.2's spelling copied every reported rack before plausibility
+refused one that was too long: a 60 MiB "rack" cost 300 MB and 0.35 s in a
+standalone reproduction, past PLAN's quarter gigabyte per large-result slot. A
+rack is now spelled in place, and only when it could be one (at most 28 bytes,
+no brackets); anything else reaches the refusal uncopied. **Verified:** the
+unit test holds a 3,000-character string unchanged; `I-LEAVE-20` and M-4 still
+pass.
+
+### 7.5 Medium — PLAN, TESTING and 6.1 put scoring back on the password threads (docs reviewer)
+
+**Docs updated.** PLAN's reset flow, `A-AUTH-3b` and 6.1 described the
+arrangement 6.7 removed as a high; a reader matching the code to PLAN would
+have put it back. They now say scoring has two turns of its own, and the reset
+flow names the per-link bucket.
+
+### 7.6 Medium — RUNBOOK §3 called a differing KLV hash legitimate (frontend reviewer)
+
+**Docs updated.** §3 still said the results "have moved on since the generation
+closed, so a rebuild legitimately produces different bytes" — the reasoning
+6.6 removed from the admin page: a closed generation's rows do not change. It
+now says a difference means the object or the rows were damaged or replaced,
+and to find out which before forcing.
+
+### 7.7 Low findings
+
+**Fixed:**
+- Derived builds:
+  - the list returns each row's input ids, the page keys rows by them, and
+    Retry resets the one row it names (`A-ADMIN-24`), not every failed row of
+    a name, other builders' included;
+  - the builder checks an input's bytes against the hash imported before
+    building from them;
+  - S3 errors carry their causes (they read "unhandled error");
+  - a claim reports the build target that built the hash, not the web
+    process's;
+  - `derived_builder_memory` refuses less than 4 GB;
+  - the page's remedy text, README and compose ("up to eight files a run"),
+    KL-57 (a failed build is not bounded by the build), and PLAN's claim that
+    an unpinned table means "no table" (MAGPIE declines it).
+- Accounts:
+  - the reset link's bucket is charged only once a scoring turn is held, so a
+    request turned away busy does not spend the owner's tries;
+  - the reset page says when a link is out of tries and offers a new one;
+  - the register form's field errors are announced;
+  - joiners and variation selectors are allowed where scripts and emoji use
+    them (between or after non-ASCII characters), refused beside Latin
+    letters.
+- Merges: one with nothing staged runs no pass and counts nothing; passes are
+  sized from the generation's summary.
+- Docs:
+  - merge memory figures (650 MB for a whole generation's hash table; 74–90 MB
+    a slice, 130 MB for the backend);
+  - the rate-limit table and `ratelimit.rs`'s comments;
+  - KL-37 ("all four"), KL-81;
+  - the "one statement" wording in PLAN and `plausibility.rs`;
+  - TESTING's `A-AUTH-4e`/`4f`;
+  - 5.2's pointer to 6.3;
+  - PLAN's `ci.yml` tree comment.
+
+### 7.8 Medium — on the default database a merge took eleven minutes (infra reviewer)
+
+**Code updated.** Each pass summed its slice in a hash table and fed the sums to
+the update in hash order, so the primary key was probed at random. With the
+generation in memory that costs nothing, which is where 6.5's figures were
+measured; on 1 GiB — the Terraform's `db.t4g.micro`, reproduced in a container
+of that size with three full generations — a merge took 11 minutes (658 s; the
+unsorted single statement before pass 6, 522 s). Each slice's sums are now
+sorted by rack, so the update walks the key: 132–145 s on the same machine.
+And at most two merges run at once across every job, since each pass's
+backend holds about 130 MB and nothing bounded merges across jobs. PLAN's
+"What a merge costs" gives both figures and asks for one measurement on the
+real instance. **Verified:** the reviewer's timings with the committed SQL
+and with the sorted variant (plan: a 34 MB quicksort over the hash
+aggregate); the leave suite and M-4 pass.
+
+**Lows fixed:** every CI job has a timeout; `hash_mem_multiplier` is named as
+what keeps a slice in memory. **Checked:** `RESET` inside the transaction
+leaves the pooled connection at its defaults; zxcvbn's optimization affects
+tests only (the image is a release build); SES's policy allows the charset.
+
+### 7.9 Adversarial check of the pass's fixes
+
+**3 medium, fixed and verified.**
+
+- **Medium — the hash check's remedy did not repair a damaged object.** 7.7's
+  check refuses an input whose object holds other bytes than those imported,
+  and told the admin to import again; an import skips an object that exists,
+  so after re-import and Retry the build failed the same way. **Fix:** the
+  build deletes an object under its own content address whose bytes are
+  wrong, and says so; the next import uploads it again. **Verified:**
+  `a_damaged_lexicon_object_is_replaced_by_the_next_import` (`I-INPUT-8b`)
+  fails without the deletion (the object survives the re-import) and passes.
+- **Medium — usernames could again be invisible twins.** 7.7 allowed joiners
+  and selectors beside any non-ASCII character, and so beside `ë`, `é` or a
+  Cyrillic letter (`zoë` and `zoë` plus a selector both registered); the
+  unassigned default-ignorable ranges were missing from the list. **Fix:** a
+  joiner stands only between letters of a script written with joiners
+  (Arabic, Syriac, NKo, Mongolian, Brahmic) or inside an emoji sequence; a
+  variation selector only after a pictograph, an ideograph or on a keycap; an
+  ideographic selector only after an ideograph; and U+2065, U+FFF0–FFF8 and
+  the unassigned tags are refused. **Verified:** the unit test covers the
+  reviewer's twins and the names that must pass (Persian, Devanagari, Sinhala
+  `ශ්‍රී`, `🏳️‍🌈`, `❤️‍🔥`, `👁️‍🗨️`, a keycap, an ideograph's variant).
+- **Medium — merges waiting on one job held both merge turns.** 7.8's turn was
+  taken before the job's lock, so two callers waiting on job X's running
+  merge — an export's settle, the public stream of a completed job, an
+  admin's merge, X's transition — held both turns, and every other job's
+  merges gave up or waited behind them. **Fix:** the job's lock first, then
+  the turn. **Verified:** `merges_waiting_on_one_job_leave_other_jobs_free_to_merge`
+  (`I-LEAVE-22`) fails with the old order (Y's merge gave up) and passes.
+
+**Lows fixed:** the reset page's out-of-tries message no longer promises an
+hour (it may be the address's limit, and the link refills a try every 12
+minutes); Retry's audit row names the row it reset; KL-57's worst case is
+three attempts of up to 70 minutes. **Held:** a build stopped at its deadline
+kills its MAGPIE and leaves an empty scratch directory (a 4-second deadline, a
+fake MAGPIE); the lease exceeds the deadline on every path; nothing else reads
+`leased_until` on a pending row; tier 6's M-10 built a wordmap and a rack info
+table through the new hash check, a real import's objects matching their
+recorded digests. **Recorded (KL-78):** an admin's "merge now" or an export's
+settle may wait for other jobs' merges as well as its own. **Unconfirmed,
+left:** a wordmap for Polish (33 letters, past a 32-letter bit rack) — its
+build could not be run in the memory available; the blank is taken as `?`
+where MAGPIE takes row 0 (every shipped file puts `?` first). The derived-data
+page does not show when a waiting row will next be tried.
+
+### 7.10 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **582 of 582**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 117 of 117.
+- Tier 6 natively: M-4 and M-10 pass (a real leave merge; a real wordmap and
+  rack info table built through the input hash check).
+- **Tier 5, natively: 11 of 11** on 92544dc (frontend reviewer).
+- The stalled-S3 replay against `build-derived` (300 s, then `pending`).
+- `terraform fmt -check -recursive` and `validate`: clean.
+- MAGPIE unchanged.
 

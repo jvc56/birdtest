@@ -364,6 +364,10 @@ export interface DerivedData {
   name: string;
   /** The builder that produced the hash, e.g. `wmp-1`. */
   builder: string;
+  /** The files it is built from: what tells two rows of one name apart. */
+  kwg_id: string;
+  klv_id: string | null;
+  letterdist_id: string;
   /** `pending` | `building` | `built` | `failed`. */
   state: string;
   sha256: string | null;
@@ -533,8 +537,15 @@ export const api = {
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
   backups: () => get<BackupStatus>('/api/admin/backups'),
   derivedData: () => get<DerivedData[]>('/api/admin/derived-data'),
-  retryDerivedData: (role: string, name: string) =>
-    post<void>('/api/admin/derived-data/retry', { role, name }),
+  retryDerivedData: (row: DerivedData) =>
+    post<void>('/api/admin/derived-data/retry', {
+      role: row.role,
+      name: row.name,
+      builder: row.builder,
+      kwg_id: row.kwg_id,
+      klv_id: row.klv_id,
+      letterdist_id: row.letterdist_id
+    }),
   /** `409` unless the job is completed and its last claims have landed. */
   startExport: (id: string) =>
     post<{ id: string; state: string }>(`/api/admin/jobs/${id}/export`),
