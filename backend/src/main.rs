@@ -100,6 +100,13 @@ async fn main() -> Result<()> {
 
     let state = AppState::new(cfg.clone(), pool, read_pool, magpie, builders).await;
 
+    // The address is taken before the reapers below: a second process started
+    // on a taken address failed the first one's running imports, exports and
+    // transitions, and only then exited (the audit's pass 12). Connections
+    // wait in the backlog until serving starts, a moment later.
+    let addr: SocketAddr = cfg.bind_addr.parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+
     // Single instance: an import row left `running` belongs to a process that
     // is gone, so nothing else can be working on it.
     match inputdata::fail_orphaned_imports(&state.pool).await {
@@ -227,8 +234,6 @@ async fn main() -> Result<()> {
     let shutdown = state.shutdown.clone();
     let app = birdtest::app(state);
 
-    let addr: SocketAddr = cfg.bind_addr.parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "birdtest listening");
 
     // `ConnectInfo` is the peer address `clientip` falls back to.

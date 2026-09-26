@@ -215,21 +215,39 @@ pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
 }
 
 async fn resolve_branch_or_tag(state: &AppState, git_ref: &str) -> AppResult<String> {
-    let found = match github_json(state, &format!("git/ref/heads/{git_ref}")).await? {
-        Some(found) => found,
-        None => match github_json(state, &format!("git/ref/tags/{git_ref}")).await? {
-            Some(found) => found,
-            None => {
-                return Err(AppError::not_found(format!(
-                    "no branch or tag {git_ref:?} in {}",
-                    state.cfg.magpie_data_repo
-                )))
-            }
-        },
+    // A bare name is a branch, else a tag; `heads/`, `tags/` (or `refs/…`)
+    // picks one, for a name that is both.
+    let (kinds, name): (&[&str], &str) = if let Some(name) =
+        git_ref.strip_prefix("refs/heads/").or_else(|| git_ref.strip_prefix("heads/"))
+    {
+        (&["heads"], name)
+    } else if let Some(name) =
+        git_ref.strip_prefix("refs/tags/").or_else(|| git_ref.strip_prefix("tags/"))
+    {
+        (&["tags"], name)
+    } else {
+        (&["heads", "tags"], git_ref)
+    };
+    let mut found = None;
+    for kind in kinds {
+        if let Some(answer) = github_json(state, &format!("git/ref/{kind}/{name}")).await? {
+            found = Some(answer);
+            break;
+        }
+    }
+    let Some(found) = found else {
+        return Err(AppError::not_found(format!(
+            "no branch or tag {git_ref:?} in {}",
+            state.cfg.magpie_data_repo
+        )));
     };
     let (mut sha, mut kind) = ref_object(&found, git_ref)?;
-    // An annotated tag names a tag object, which names the commit.
-    if kind == "tag" {
+    // An annotated tag names a tag object, which names the commit -- or,
+    // rarely, another tag: followed a few hops.
+    for _ in 0..4 {
+        if kind != "tag" {
+            break;
+        }
         let tag = github_json(state, &format!("git/tags/{sha}")).await?.ok_or_else(|| {
             AppError::bad_request(format!("GitHub has no tag object {sha} for {git_ref:?}"))
         })?;
@@ -778,12 +796,16 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         let Some(file) = resolved else {
             return Err(unresolvable_link(&format!("data/{mapped_path}"), written));
         };
-        // An alias is its target's bytes again, for a worker extracting it and
-        // for its row: counted against the caps as they are. As a zero-byte
-        // entry, a few hundred aliases of one large file held and stored it a
-        // few hundred times (the audit's pass 11).
-        total_uncompressed += file.bytes as u64;
-        check_expansion(total_uncompressed, compressed.len() as u64)?;
+        // An alias whose row keeps its bytes (a distribution, a layout) is
+        // those bytes again: counted against the caps as they are. As a
+        // zero-byte entry, a few hundred aliases of one large file held and
+        // stored it a few hundred times (the audit's pass 11). A lexicon's
+        // alias copies nothing -- its row shares the target's object, and a
+        // worker extracts it as a link -- so it costs nothing to count.
+        if keeps_content(role) {
+            total_uncompressed += file.bytes as u64;
+            check_expansion(total_uncompressed, compressed.len() as u64)?;
+        }
         let alias = ImportedFile {
             path: mapped_path.clone(),
             role: role.clone(),

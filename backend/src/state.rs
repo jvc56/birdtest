@@ -115,9 +115,10 @@ impl FinishCheckCounters {
 /// for every open one to finish. A dashboard's SSE stream never finishes -- it
 /// is a keep-alive every fifteen seconds for as long as the tab stays open --
 /// so with one page open anywhere, `SIGTERM` was followed by nothing until the
-/// container runtime gave up and sent `SIGKILL` (ECS: thirty seconds). The
-/// service is a single instance whose old task must be gone before the new one
-/// starts, so that was thirty seconds added to every deployment's gap, for a
+/// container runtime gave up and sent `SIGKILL` (ECS: the task's stop timeout,
+/// then thirty seconds and now 120). The service is a single instance whose old
+/// task must be gone before the new one starts, so that was the whole stop
+/// timeout added to every deployment's gap, for a
 /// wait that could only ever time out. A stream ends when this is triggered;
 /// the page's `EventSource` reconnects by itself, to the new process.
 #[derive(Clone)]

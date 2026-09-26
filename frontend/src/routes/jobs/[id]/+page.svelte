@@ -132,7 +132,7 @@
         <div><dt class="text-muted-foreground">Created</dt><dd>{datetime(stats.job.created_at)}</dd></div>
       </dl>
       <p class="text-xs text-muted-foreground">
-        Created by {stats.job.created_by ?? 'unknown'}{#if stats.job.min_magpie_version}
+        Created by <span class="break-all">{stats.job.created_by ?? 'unknown'}</span>{#if stats.job.min_magpie_version}
           · requires MAGPIE ≥ {stats.job.min_magpie_version}{/if}
       </p>
     </div>

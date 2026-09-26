@@ -97,6 +97,15 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   adversarial check found 1 medium (the ref check still passing fork commits),
   fixed by resolving refs only among the repository's own branches and tags.
   KL-70 updated. The loop continues.
+- **Pass 12 (follow-up: pass 11's diff, and startup, configuration and the
+  background loops):** 0 high and 2 medium from the reviewers — a heartbeat
+  timeout below MAGPIE's cadence accepted, lapsing live claims; PLAN's
+  `MAIL_BACKEND` row — both fixed and verified; the checks of the fixes found
+  2 high (E-3 broken by a label rename; a RUNBOOK §1 command that no longer
+  parsed) and 3 medium (the rename block not refusing without `STAMP`; a
+  job's creator widening its page; the alias docs), all fixed —
+  `scripts/runbook-check.sh` now parses RUNBOOK's blocks in CI. KL-70 updated,
+  KL-82 added. The loop continues.
 
 ---
 
@@ -1823,3 +1832,154 @@ builder's error; its retry gets the true answer.
 - RUNBOOK §1's blocks parse; its count checked against a migrated schema.
 - MAGPIE and infra unchanged.
 
+
+## Pass 12 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`40380f9..0cfe839`; MAGPIE
+and infra unchanged), one reviewer per part it touches: backend; frontend
+(tier 5 natively); docs, procedures and fixtures. Plus one area not examined in
+this run: **startup, configuration and the background loops** — `config.rs`,
+`main.rs`'s startup order and reapers, the five periodic loops, graceful
+shutdown, the builder binary's start.
+
+**Findings: 0 high, 2 medium** from the four reviewers (backend none, 5 low;
+frontend none, 6 low — tier 5 natively 11 of 11; docs and procedures none, 6
+low; startup and loops 2 medium, 9 low, 1 unconfirmed). Both fixed and
+verified.
+
+### 12.1 Medium — a heartbeat timeout under MAGPIE's cadence was accepted, and every claim then handed out the fleet's live tasks (startup reviewer)
+
+`HEARTBEAT_TIMEOUT_SECONDS` took any whole number. MAGPIE heartbeats every
+thirty seconds, so below about a minute a live worker's claim reads as lapsed;
+at 0 the restart grace went too. Shown with a private tier-2 test that parses
+the value through `Config::from_lookup` and builds the state as `main` does:
+worker A claims, worker B claims — at 0 and at 20 s (A's last heartbeat 25 s
+old) A's claim is `abandoned` and B is handed A's task, and A's results would
+be answered `accepted: false`. Nothing refused the value, though `config.rs`
+promises a wrong value fails startup. A value near `u64::MAX` panicked at
+startup after the migrations (`overflow when adding duration to instant`).
+**Fix:** the timeout must lie in 180 s to a day — MAGPIE sends one heartbeat
+attempt every thirty seconds under a 120 s request timeout, so a live claim can
+go 30 + 120 + 30 s between recorded heartbeats (the first cut, 90 s, lapsed a
+claim whose heartbeat stalled; 12.4) — and the session TTL (0 issued sessions already expired; past what a date holds, every
+sign-in panicked) in a minute to a year; out of range fails startup naming the
+setting and the range. **Verified:** `a_malformed_value_is_refused_rather_than_defaulted`
+gained 0, 179, 86,401 and `u64::MAX` for the timeout, 0 and a year plus one
+for the TTL, and a host name for `BIND_ADDR` (12.4) — it fails on the committed `config.rs` (the first case is
+accepted) and passes; the expired-session test sets its zero TTL directly.
+PLAN's table states both ranges; TESTING's U-CFG-4 names them.
+
+### 12.2 Medium — PLAN said any `MAIL_BACKEND` but `console` or `ses` fails startup; `file` starts (startup reviewer)
+
+Reproduced: `MAIL_BACKEND=file MAIL_OUTBOX_DIR=…` starts and listens, as the
+end-to-end suite needs. PLAN's table also left out `MAIL_OUTBOX_DIR`,
+`GITHUB_API_URL` and `GITHUB_RAW_URL`, which the config reads. **Fix:** the
+table documents `file` (the end-to-end suite's, never production) and the three
+variables.
+
+### 12.3 Low findings
+
+**Fixed:**
+- Import refs: an explicit `heads/`, `tags/`, `refs/heads/` or `refs/tags/`
+  prefix is honoured (a tag that shares a branch's name can be chosen), and an
+  annotated tag is peeled through up to four tag objects (a tag of a tag
+  resolved); `A-ADMIN-5b` asserts both. The form's field is "Branch or tag",
+  its hint says what is resolved, and the handler's doc no longer offers a
+  commit sha.
+- Aliases count against the archive caps only when they copy content
+  (letterdist, layout); a `.kwg` or `.klv2` alias is a symlink on the worker
+  and no second copy on the server.
+- An object-store error with an empty body reads `HTTP 403`, not `HTTP 403: `.
+- A second process on the same address now exits before the startup reapers:
+  it had failed the running instance's import (shown with the committed
+  binary: `failed|the server restarted while this import was running`, then
+  `Address already in use`; with the fix the row stays `running`).
+- The public Users list breaks a long username, as `/workers` does (a
+  32-character name pushed "Tasks completed" out of the card, 484 px of 359);
+  pagination reads "Page 1 of 1", not "Page 1of 1".
+- E-10 asserts a contributor row before measuring (an empty table fits any
+  page), then answers both rankings with a 32-character username, a tombstone
+  and a pseudonym and measures `/workers` and `/users` — the `break-all` half
+  of pass 11's fix had no test.
+- Docs: the e2e compose comment names the refs endpoint; RUNBOOK §1 says a
+  fresh shell needs `STAMP` as well as `RESTORE_TIME`, and refuses without it
+  (an unset one made the rename loop wait forever on `birdtest-damaged-`;
+  the form of the refusal is 12.4's); PLAN's KL-70 justification, the one-to-three calls a
+  resolution costs against the 60-per-hour limit, the startup order (the
+  MAGPIE probe, the address, the five loops) and the 120 s stop timeout
+  (PLAN and `state.rs` still said thirty seconds); E-10's title.
+
+**Recorded (KL-82):** whether ECS starts a new task while the old one drains
+(unconfirmed; the single-instance invariant rests on it), no panic guard on the
+background loops, detached mail tasks at shutdown, the NDJSON stream not ended
+by the shutdown signal, a `TRUSTED_PROXY_HOPS` too high keying every limit on
+the ALB, the builder's missing version floor.
+
+### 12.4 Adversarial check of the pass's fixes
+
+Two checks: tier 5 run natively against the frontend fixes, failure first; and
+an adversarial reviewer on the rest. **1 high and 3 medium, all fixed.**
+
+- **High — the rename to "Branch or tag" broke E-3**, which found the field by
+  its old label: tier 5 was 10 of 11. **Fix:** E-3 finds the new label.
+- **High — a RUNBOOK §1 command no longer parsed.** The `${STAMP:?…}` message
+  added to the backup-settings command held an apostrophe, which bash reads as
+  an opening quote inside the expansion: `unexpected EOF while looking for
+  matching `''`, in every bash, with `STAMP` set or not; pasted, it left a
+  continuation prompt that swallowed what came next, so the restored instance
+  never got its retention or deletion protection. **Fix:** no apostrophe; and
+  `scripts/runbook-check.sh`, run in CI, parses every bash block in RUNBOOK
+  (`bash -n`) — it fails on the broken block (`the bash block starting at line
+  131 does not parse`) and passes on HEAD's and the fixed RUNBOOK (16 blocks).
+- **Medium — with `STAMP` unset the rename block did not refuse.** In an
+  interactive shell a failed `${STAMP:?}` stops one command: the renames were
+  refused, and `terraform state rm` and `import` then ran on the damaged
+  instance, and a failed import would leave no database in state. Shown by
+  pasting the block through a pty into `bash -i` with logging stubs. **Fix:**
+  the renames and the state surgery are one `if` with `&&` between the steps.
+  Replayed with the same harness, bracketed paste on and off: `STAMP` unset,
+  no call at all; set, every call in order; the first rename failing, nothing
+  after it.
+- **Medium — a job's "Created by" widened the job page** past a phone's
+  screen with a 32-character name of wide letters (421 px on a 393 px
+  screen). **Fix:** the name breaks; the job page's contributor table breaks a
+  long name too, so its count stays in view; `/users` drops "Joined" below
+  `sm` (at 320 px the count left the box whatever the name) and keeps the
+  admin badge whole. E-10 loads the job page again with that name as creator
+  and contributor and measures both, and uses 32 `W`s for every list. **Shown:**
+  E-10 fails on HEAD's job page at the new step (`the layout viewport was
+  widened to fit the page`) and passes on the fix; with HEAD's `/users` it
+  fails at 579 px of 359; with an empty contributor list its new row check
+  fails.
+- **Medium — PLAN and TESTING said every alias counts as its target's
+  bytes** after 12.3 limited that to distributions and layouts (a private
+  test: 60 aliases of a 60 KiB `.kwg`, ratio 60, accepted). **Fix:** both say
+  which aliases count.
+- **Unconfirmed, fixed:** the 90 s floor tolerated one lost heartbeat but not
+  one stalled for MAGPIE's 120 s request timeout (read from `contribute.c` and
+  `http_client.c`, not reproduced); the floor is 180 s.
+
+**Lows fixed:** PLAN's startup order says a second process migrates before it
+finds the address taken; a ref costs one call for a branch, two for a tag and
+one per tag object peeled (up to six), in PLAN and the handler; `A-ADMIN-5b`
+and PLAN describe the prefixes and nested tags; the form's hint names "the data
+repository", not MAGPIE-DATA; a `BIND_ADDR` that is not an IP address and port
+fails in the config, before the MAGPIE probe and the migrations. **Held:** the
+range checks (nothing in the repo sets a refused value; a day's timeout is
+safe in every use); the bind before the reapers (on 127.0.0.1, 0.0.0.0 and
+`[::]`); the ref prefixes (`refs/heads/` alone, `heads/../tags/v1`,
+`tags/refs/heads/main` refused; five tag hops and a self-referencing tag end in
+an error); the alias gate (alias rows carry no bytes); `sdk()`.
+
+### 12.5 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **592 of 592**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 119 of 119.
+- **Tier 5, natively: 11 of 11** on the final working tree.
+- `scripts/runbook-check.sh`: 16 blocks parse; RUNBOOK §1's modify and swap
+  blocks replayed through a pty with logging stubs (above).
+- A second backend on a taken address, committed binary against the fix
+  (12.3).
+- MAGPIE and infra unchanged (MAGPIE read only).

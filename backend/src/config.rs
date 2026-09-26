@@ -118,6 +118,16 @@ fn parsed<T: std::str::FromStr>(lookup: Lookup, key: &str, default: T) -> Result
     }
 }
 
+/// [`parsed`] for a number of seconds that must lie in `min..=max`: out of
+/// range, a value fails startup naming the setting and its range.
+fn seconds_in(lookup: Lookup, key: &str, default: u64, min: u64, max: u64) -> Result<Duration> {
+    let value = parsed(lookup, key, default)?;
+    if !(min..=max).contains(&value) {
+        anyhow::bail!("{key} must be between {min} and {max} seconds, got {value}");
+    }
+    Ok(Duration::from_secs(value))
+}
+
 /// `DATABASE_URL` if it is set; otherwise one assembled from `DB_HOST`,
 /// `DB_PORT`, `DB_NAME`, `DB_USER` and `DB_PASSWORD`.
 ///
@@ -202,17 +212,30 @@ impl Config {
             );
         }
 
+        let bind_addr = var_or("BIND_ADDR", "0.0.0.0:8080");
+        if bind_addr.parse::<std::net::SocketAddr>().is_err() {
+            anyhow::bail!("BIND_ADDR must be an IP address and port, got {bind_addr:?}");
+        }
+
         Ok(Self {
             database_url: resolve_database_url(var)?,
-            bind_addr: var_or("BIND_ADDR", "0.0.0.0:8080"),
+            bind_addr,
             session_signing_key,
-            session_ttl: Duration::from_secs(parsed_u64("SESSION_TTL_SECONDS", 604_800)?),
+            // A minute to a year: 0 issued sessions already expired, and a
+            // TTL past what a date can hold panicked every sign-in.
+            session_ttl: seconds_in(lookup, "SESSION_TTL_SECONDS", 604_800, 60, 31_536_000)?,
             secure_cookies,
             mail_backend,
             mail_outbox_dir,
             mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
             public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
-            heartbeat_timeout: Duration::from_secs(parsed_u64("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
+            // At least 180 s: MAGPIE heartbeats every thirty seconds, one
+            // attempt each under its 120 s request timeout, so a live claim can
+            // go 30 + 120 + 30 s between recorded heartbeats. Below MAGPIE's
+            // cadence a live claim lapsed, and each claim request handed the
+            // fleet's running tasks to someone else (the audit's pass 12). At
+            // most a day, which the restart grace and SQL intervals can hold.
+            heartbeat_timeout: seconds_in(lookup, "HEARTBEAT_TIMEOUT_SECONDS", 300, 180, 86_400)?,
             stats_cache: Duration::from_secs(parsed_u64("JOB_STATS_CACHE_SECONDS", 10)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
@@ -281,7 +304,7 @@ mod tests {
             ("MAIL_BACKEND", "Console", "ses", |c| format!("{:?}", c.mail_backend)),
             ("MAIL_FROM", "no-reply@birdtest.local", "a@b.c", |c| c.mail_from.clone()),
             ("PUBLIC_URL", "http://localhost:5173", "https://x.y", |c| c.public_url.clone()),
-            ("HEARTBEAT_TIMEOUT_SECONDS", "300", "70", |c| {
+            ("HEARTBEAT_TIMEOUT_SECONDS", "300", "180", |c| {
                 c.heartbeat_timeout.as_secs().to_string()
             }),
             ("JOB_STATS_CACHE_SECONDS", "10", "0", |c| c.stats_cache.as_secs().to_string()),
@@ -343,6 +366,16 @@ mod tests {
         for (key, value) in [
             ("HEARTBEAT_TIMEOUT_SECONDS", "5m"),
             ("SESSION_TTL_SECONDS", "-1"),
+            // Out of range: a claim lapsing between heartbeats, a session
+            // born expired, an instant past what a date holds.
+            ("HEARTBEAT_TIMEOUT_SECONDS", "0"),
+            ("HEARTBEAT_TIMEOUT_SECONDS", "179"),
+            ("HEARTBEAT_TIMEOUT_SECONDS", "86401"),
+            ("HEARTBEAT_TIMEOUT_SECONDS", "18446744073709551615"),
+            ("SESSION_TTL_SECONDS", "0"),
+            ("SESSION_TTL_SECONDS", "31536001"),
+            // A host name: it failed only after the migrations.
+            ("BIND_ADDR", "localhost:8080"),
             ("MAGPIE_THREADS", "two"),
             ("TRUSTED_PROXY_HOPS", "one"),
             ("SECURE_COOKIES", "yes"),

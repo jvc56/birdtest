@@ -32,7 +32,11 @@ where
                         .bytes()
                         .map(|b| String::from_utf8_lossy(&b[..b.len().min(200)]).into_owned())
                         .unwrap_or_default();
-                    format!("HTTP {}: {}", raw.status().as_u16(), body.trim())
+                    let status = raw.status().as_u16();
+                    match body.trim() {
+                        "" => format!("HTTP {status}"),
+                        body => format!("HTTP {status}: {body}"),
+                    }
                 }
             }
         }

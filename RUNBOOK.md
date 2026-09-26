@@ -123,11 +123,13 @@ aws rds wait db-instance-available --region "$REGION" \
 ```
 
 A restored instance does **not** inherit the source's backup settings. Fix that
-before it becomes the production database:
+before it becomes the production database. (The blocks below use `STAMP` and
+`RESTORE_TIME` from the one above; in a fresh shell set both again — `STAMP` is
+the suffix of the `birdtest-restore-…` instance — or each block refuses.)
 
 ```bash
 aws rds modify-db-instance --region "$REGION" \
-  --db-instance-identifier "birdtest-restore-$STAMP" \
+  --db-instance-identifier "birdtest-restore-${STAMP:?set STAMP to the suffix of the restore instance}" \
   --backup-retention-period 30 --deletion-protection --apply-immediately
 ```
 
@@ -160,22 +162,28 @@ renamed() {  # wait until instance $1 exists under its new name, then until it i
       >/dev/null 2>&1; do sleep 10; done
   aws rds wait db-instance-available --region "$REGION" --db-instance-identifier "$1"
 }
-aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
-  --new-db-instance-identifier "birdtest-damaged-$STAMP" --apply-immediately
-renamed "birdtest-damaged-$STAMP"
-aws rds modify-db-instance --region "$REGION" --db-instance-identifier "birdtest-restore-$STAMP" \
-  --new-db-instance-identifier birdtest --apply-immediately
-renamed birdtest
-
-# Terraform's state holds the damaged instance by its resource id (db-...),
-# not by name, so it would follow the damaged one under its new name. Point it
-# at the restored one instead; import takes the identifier.
-# With the stack's variables (README.md "Deploying" keeps them in
-# infra/prod.tfvars): import evaluates the whole configuration, in the
-# stack's region. The import must succeed before going on -- after the
-# `state rm`, a failed import leaves nothing in state for the next apply.
-terraform -chdir=infra state rm aws_db_instance.main
-terraform -chdir=infra import -var-file=prod.tfvars aws_db_instance.main birdtest
+# One command, so that nothing after a step that fails runs: an unset STAMP
+# refused the renames one line at a time, and the state surgery below them ran
+# on the damaged instance anyway.
+if [ -z "${STAMP:-}" ]; then
+  echo "STAMP is not set: the suffix of the birdtest-restore-... instance" >&2
+else
+  aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
+    --new-db-instance-identifier "birdtest-damaged-$STAMP" --apply-immediately &&
+  renamed "birdtest-damaged-$STAMP" &&
+  aws rds modify-db-instance --region "$REGION" --db-instance-identifier "birdtest-restore-$STAMP" \
+    --new-db-instance-identifier birdtest --apply-immediately &&
+  renamed birdtest &&
+  # Terraform's state holds the damaged instance by its resource id (db-...),
+  # not by name, so it would follow the damaged one under its new name. Point
+  # it at the restored one instead; import takes the identifier. With the
+  # stack's variables (README.md "Deploying" keeps them in infra/prod.tfvars):
+  # import evaluates the whole configuration, in the stack's region. The import
+  # must succeed before going on -- after the `state rm`, a failed import
+  # leaves nothing in state for the next apply.
+  terraform -chdir=infra state rm aws_db_instance.main &&
+  terraform -chdir=infra import -var-file=prod.tfvars aws_db_instance.main birdtest
+fi
 ```
 
 Left under its restore name, or left out of the state, the next `terraform

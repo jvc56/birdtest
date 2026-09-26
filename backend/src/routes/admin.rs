@@ -166,8 +166,8 @@ async fn delete_input_data(
 #[derive(Deserialize)]
 struct StartImportBody {
     tarball_date: String,
-    /// A tag, branch or commit sha, resolved to a commit at import time so the
-    /// record names a commit and never a moving branch.
+    /// A branch or tag of the data repository, resolved to a commit at import
+    /// time so the record names a commit and never a moving branch.
     #[serde(default = "default_ref")]
     git_ref: String,
 }
@@ -200,9 +200,9 @@ async fn start_import(
         return Err(AppError::bad_request("tarball_date must be YYYYMMDD"));
     }
 
-    // Resolving the ref is a single GitHub API call and its failure modes are
-    // worth reporting synchronously -- a typo'd ref should not become a failed
-    // background task.
+    // Resolving the ref is one to six GitHub API calls (a branch, a tag, the
+    // tag objects it peels) and its failure modes are worth reporting
+    // synchronously -- a typo'd ref should not become a failed background task.
     let commit_sha = crate::inputdata::resolve_ref(&state, &body.git_ref).await?;
 
     let mut tx = state.pool.begin().await?;

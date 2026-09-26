@@ -28,13 +28,15 @@
   <div class="card overflow-x-auto p-0">
     <table class="table">
       <thead>
-        <tr><th>Username</th><th>Joined</th><th class="text-right">Tasks completed</th></tr>
+        <!-- "Joined" is dropped on a phone, as on /workers: with it the count ran
+             out of the box at 320 pixels whatever the name. -->
+        <tr><th>Username</th><th class="hidden sm:table-cell">Joined</th><th class="text-right">Tasks completed</th></tr>
       </thead>
       <tbody>
         {#each result.items as user}
           <tr>
-            <td>{user.username}{#if user.is_admin}<span class="ml-2 text-xs text-primary">admin</span>{/if}</td>
-            <td>{datetime(user.created_at)}</td>
+            <td><span class="break-all">{user.username}</span>{#if user.is_admin}<span class="ml-2 whitespace-nowrap text-xs text-primary">admin</span>{/if}</td>
+            <td class="hidden sm:table-cell">{datetime(user.created_at)}</td>
             <td class="text-right tabular-nums">{Number(user.tasks_completed).toLocaleString()}</td>
           </tr>
         {:else}

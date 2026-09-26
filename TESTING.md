@@ -376,8 +376,11 @@ process environment, so no test mutates `std::env` under another.
   `config::tests::a_malformed_version_floor_fails_startup`.)*
 - `U-CFG-4` A value that is present but malformed — a duration, a count, a
   boolean, an unknown `MAIL_BACKEND`, `MAIL_BACKEND=file` with no
-  `MAIL_OUTBOX_DIR` — fails startup naming the setting rather than becoming its
-  default. *(Covered:
+  `MAIL_OUTBOX_DIR`, a heartbeat timeout outside 180 s to a day (below
+  MAGPIE's cadence a live claim lapsed and was handed on, thirty-second audit),
+  a session TTL outside a minute to a year, a `BIND_ADDR` that is not an
+  address — fails startup naming the setting
+  rather than becoming its default. *(Covered:
   `config::tests::a_malformed_value_is_refused_rather_than_defaulted`.)*
 
 ### `U-WIRE-*` — wire types (`jobs/handler.rs`, `models/job.rs`)
@@ -575,8 +578,9 @@ path, nothing recognisable, and a bomb by compression ratio.)
   and refusing them refused the whole release. *(Covered:
   `inputdata::tests::a_symlink_alias_is_pinned_with_its_targets_bytes`,
   `inputdata::tests::a_symlink_that_is_not_an_alias_inside_the_archive_is_refused`.)*
-- `U-ARCHIVE-5b` An alias counts as its target's bytes against the archive's
-  total and ratio, and a letter distribution or layout — kept in its row — is
+- `U-ARCHIVE-5b` An alias of a letter distribution or layout counts as its
+  target's bytes against the archive's total and ratio (a lexicon's is a link
+  on the worker and no second copy on the server, so costs nothing), and a letter distribution or layout — kept in its row — is
   at most 64 KiB. As a zero-byte entry, a few hundred aliases of one large
   layout were held, staged and inserted a few hundred times over (150 of a
   4 MiB one: 600 MiB from a 263 KiB gzip). *(Covered:
@@ -2084,8 +2088,9 @@ below.
   and `/commits/` is never asked (thirty-second audit). *(Covered:
   `input_data::an_import_is_started_polled_while_running_and_confirmed_over_http`.)*
 - `A-ADMIN-5b` A branch named like a sha (`20260101`, a real one), a
-  lightweight tag and an annotated tag (peeled to its commit) all resolve; a
-  tag naming a tree is refused. *(Covered:
+  lightweight tag, an annotated tag (peeled to its commit) and a tag of a tag
+  all resolve; a `heads/`, `tags/` or `refs/tags/` prefix picks a branch or a
+  tag sharing one name; a tag naming a tree is refused. *(Covered:
   `input_data::a_ref_resolves_among_the_repositorys_own_branches_and_tags`.)*
   (Thirty-second audit.)
 - `A-ADMIN-6` Confirming an import that is not `staged` is rejected. *(Covered:
@@ -2539,9 +2544,12 @@ admin in once and the admin journeys reuse its storage state.
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
 - `E-10` A page renders correctly at phone width — one journey, not all of them.
   *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list, a
-  job page and the contributors' ranking, nothing wider than the screen and the
-  ranking's own column inside its box — a pseudonym's sixteen characters
-  pushed it out, thirty-second audit.)* The screen is the device's width:
+  job page and both rankings, nothing wider than the screen and each ranking's
+  own column inside its box — a pseudonym's sixteen characters pushed it out,
+  thirty-second audit. The contributors' list is measured with a row in it;
+  the job page again with a 32-character creator and contributor, and both
+  lists with a 32-character username, a tombstone and a pseudonym, which the
+  seed does not register.)* The screen is the device's width:
   compared with `innerWidth`, as it was, the check could not fail, because a
   phone's browser widens its layout viewport to fit what overflows — and the
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
@@ -2816,6 +2824,12 @@ the real check of the backups themselves.
   call — `SCRUB=yes` used to skip the scrub, restoring a production dump's real
   addresses and password hashes. *(Covered: `scripts/dev-restore-check.sh`,
   a stub compose, in CI's `scripts` job.)* (Thirty-second audit.)
+- `S-RUNBOOK-1` Every bash block in RUNBOOK.md parses: an operator pastes them
+  during an incident, and one that does not leaves a continuation prompt that
+  swallows what is pasted next — an apostrophe in a `${STAMP:?…}` message did
+  that to the restore's backup-settings command. *(Covered:
+  `scripts/runbook-check.sh`, `bash -n` per block, in CI's `scripts` job.)*
+  (Thirty-second audit.)
 - `S-SCRUB-1` A scrubbed dump holds no credential: every anonymous worker's
   UUID is replaced, with its claims, ban and audit rows following it and what
   it did kept, and an open claim's token is replaced; twice over, as the script
@@ -3087,7 +3101,8 @@ GitHub Actions.
 5. **terraform** — `terraform fmt -check -recursive` and `terraform validate`
    (no AWS credentials).
 6. **scripts** — `scripts/dev-restore-check.sh`: `dev-restore.sh`'s `SCRUB`
-   rule against a stub `COMPOSE`, with no Docker (five minutes at most).
+   rule against a stub `COMPOSE`, with no Docker; `scripts/runbook-check.sh`:
+   every bash block in RUNBOOK.md parses (five minutes at most).
 7. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
    commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
    `test/birdtest_contract/`, and run `magpie_test contribute`; then

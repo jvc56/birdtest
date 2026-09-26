@@ -34,8 +34,8 @@ services:
       - "9302:9000"
       - "9303:9001"
 
-  # GitHub, for input-data import: `GET /api/repos/<repo>/commits/main` answers
-  # the fixture sha, and `/raw/<repo>/<sha>/versioned-tarballs/` holds the
+  # GitHub, for input-data import: `GET /api/repos/<repo>/git/ref/heads/main`
+  # answers the fixture sha as JSON, and `/raw/<repo>/<sha>/versioned-tarballs/` holds the
   # tarballs, one chunked and one not.
   fixtures:
     image: nginx:1.30-alpine

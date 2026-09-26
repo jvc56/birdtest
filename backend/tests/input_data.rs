@@ -1063,5 +1063,16 @@ async fn a_ref_resolves_among_the_repositorys_own_branches_and_tags() {
     assert_eq!(resolve("v2").await.unwrap(), sha(4), "an annotated tag, peeled");
     assert_eq!(resolve("tree").await.unwrap_err().status, StatusCode::BAD_REQUEST);
     assert_eq!(resolve("nope").await.unwrap_err().status, StatusCode::NOT_FOUND);
+    // A prefix picks the kind: a name that is both a branch and a tag
+    // resolves as the branch bare, as the tag with `tags/`.
+    fixture.put("/repos/example/data/git/ref/tags/main", ref_json(&sha(6), "commit"));
+    assert_eq!(resolve("main").await.unwrap(), COMMIT);
+    assert_eq!(resolve("heads/main").await.unwrap(), COMMIT);
+    assert_eq!(resolve("refs/tags/main").await.unwrap(), sha(6));
+    assert_eq!(resolve("tags/main").await.unwrap(), sha(6));
+    // A tag of a tag is followed to its commit.
+    fixture.put("/repos/example/data/git/ref/tags/v3", ref_json(&sha(7), "tag"));
+    fixture.put(&format!("/repos/example/data/git/tags/{}", sha(7)), ref_json(&sha(3), "tag"));
+    assert_eq!(resolve("v3").await.unwrap(), sha(4));
 }
 

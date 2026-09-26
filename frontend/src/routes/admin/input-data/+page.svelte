@@ -165,10 +165,10 @@
       <input id="date" class="input" bind:value={tarballDate} placeholder="20260101" />
     </div>
     <div>
-      <label class="label" for="ref">Ref</label>
+      <label class="label" for="ref">Branch or tag</label>
       <input id="ref" class="input" bind:value={gitRef} placeholder="main" />
       <p class="mt-1 text-xs text-muted-foreground">
-        Resolved to a commit at import time, so the record names a commit and never a branch.
+        A branch or tag of the data repository, resolved to its commit at import time, so the record names a commit and never a branch.
       </p>
     </div>
     <div class="flex items-end">

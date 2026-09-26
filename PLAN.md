@@ -1391,13 +1391,14 @@ start. The process has no SSM code path of its own.
 |---|---|---|
 | `DATABASE_URL` | — | **Required**, unless the `DB_*` parts below are set. |
 | `SESSION_SIGNING_KEY` | — | **Required.** 32 bytes, hex-encoded. Startup fails if absent or the wrong length. |
-| `BIND_ADDR` | `0.0.0.0:8080` | |
-| `SESSION_TTL_SECONDS` | `604800` (7 days) | |
+| `BIND_ADDR` | `0.0.0.0:8080` | An IP address and port; a host name fails startup. |
+| `SESSION_TTL_SECONDS` | `604800` (7 days) | 60 to 31,536,000 (a year); anything else fails startup. |
 | `SECURE_COOKIES` | `false` | `true` in any deployment served over TLS. |
-| `MAIL_BACKEND` | `console` | `console` or `ses`. Anything else fails startup. |
+| `MAIL_BACKEND` | `console` | `console`, `ses`, or `file` — the end-to-end suite's, never production: each mail written to `MAIL_OUTBOX_DIR`, which it requires. Anything else fails startup. |
+| `MAIL_OUTBOX_DIR` | unset | The `file` backend's directory. |
 | `MAIL_FROM` | `no-reply@birdtest.local` | |
 | `PUBLIC_URL` | `http://localhost:5173` | The base for links in emails. |
-| `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. |
+| `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. 180 to 86,400; anything else fails startup. MAGPIE heartbeats every thirty seconds, one attempt each under its 120 s request timeout, so a live claim can go 180 s between recorded heartbeats; below MAGPIE's cadence a live worker's claim lapses and is handed to the next claimant. |
 | `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. Built one at a time per job; dropped by every admin action on the job, by its completion and by a leave generation closing, so the admin page reloading after an action reads the change. `0` builds it on every request (the tests). |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
@@ -1407,7 +1408,8 @@ start. The process has no SSM code path of its own.
 | `MAGPIE_SCRATCH_DIR` | the system temp directory | Where a conversion's throwaway data directory goes. The builder task points it at its ephemeral volume, since a rack info table is 1.9 GB. |
 | `MAGPIE_DOWNLOAD_URL` | the MAGPIE repository | Sent in a shutdown directive. |
 | `MAGPIE_DATA_REPO` | `jvc56/MAGPIE-DATA` | Where import fetches tarballs from. Configuration, never user input. |
-| `GITHUB_TOKEN` | unset | Optional in development, set in production: unauthenticated ref resolution is 60 calls per hour per IP. |
+| `GITHUB_API_URL`, `GITHUB_RAW_URL` | `https://api.github.com`, `https://raw.githubusercontent.com` | Where import resolves refs and fetches tarballs; the end-to-end suite points them at its fixtures. |
+| `GITHUB_TOKEN` | unset | Optional in development, set in production: unauthenticated, GitHub allows 60 calls per hour per IP, and resolving a ref takes one call for a branch, two for a tag, and one more for each tag object peeled (at most six). |
 | `TRUSTED_PROXY_HOPS` | `0` | Reverse proxies in front of the process that append `X-Forwarded-For`. Per-IP rate limits key on the entry this many from the right; `0` keys on the TCP peer. `1` behind the ALB and behind the compose Nginx. |
 | `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SSLMODE` | unset | Read only when `DATABASE_URL` is unset, and assembled into one with the password percent-encoded — so a deployment can inject a managed password without hand-writing a URL. |
 
@@ -1744,7 +1746,7 @@ date; the known rows are already there.
 |---|---|
 | Compressed bytes downloaded | 512 MiB |
 | Chunks walked (`aa`, `ab`, …) | 64 |
-| Total uncompressed bytes (an alias counted as its target's) | 1 GiB |
+| Total uncompressed bytes (an alias of a distribution or layout counted as its target's; a lexicon's is a link and costs nothing) | 1 GiB |
 | Uncompressed : compressed ratio (the same total) | 20× |
 | Single entry | 128 MiB |
 | A letter distribution or layout (kept in its row) | 64 KiB |
@@ -1765,8 +1767,9 @@ passed every cap, a PAX header read whole, GNU sparse blocks expanded — before
 this replaced three patches; and the 30-minute limit was not enforced at all:
 the client's timeouts are per read.) The archive URL is built from `MAGPIE_DATA_REPO` and never
 from user input, and the ref an admin gives is resolved only among that repository's own
-branches and tags (`/git/ref/heads/…`, then `/git/ref/tags/…`, an annotated
-tag peeled to its commit) — `/commits/{ref}`, which it used, also resolves a
+branches and tags (`/git/ref/heads/…`, then `/git/ref/tags/…`, or only one of
+them for a `heads/`, `tags/`, `refs/heads/` or `refs/tags/` prefix; an annotated
+tag peeled to its commit through up to four tag objects) — `/commits/{ref}`, which it used, also resolves a
 sha, five characters of one, a pull request's ref or a `git describe` name
 from any fork, and GitHub serves a fork's files under the upstream's name
 (thirty-second audit) — so the residual exposure is a compromised upstream; that is the threat model these checks are written
@@ -1784,7 +1787,9 @@ own name?" one comparison. Both phases are audit-logged.
 
 Config gains `MAGPIE_DATA_REPO` (default `jvc56/MAGPIE-DATA`) and an optional
 `GITHUB_TOKEN` — optional in development, set in production, because
-unauthenticated ref resolution is 60 calls per hour per IP. A `403` from GitHub
+unauthenticated GitHub allows 60 calls per hour per IP, and resolving a ref
+takes one call for a branch, two for a tag, and one more for each tag object
+peeled (at most six). A `403` from GitHub
 is rendered with the `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers it
 carries, so the failure names its own remedy.
 
@@ -4663,20 +4668,25 @@ actions instead.
 
 `GET /health` returns `200 ok` and is what the container healthcheck and the ALB
 use. On startup the process, in order: loads config from the environment
-(`.env` locally, task-definition variables in ECS), connects the pool, **runs
-migrations before binding** so a container never serves traffic against an
-out-of-date schema, connects the display pool, fails any input-data import or
-export left `running` by a previous process, releases any leave-generation
-transition one left open (so the next claim takes it over rather than the
-half-hour takeover timeout), and only then listens.
+(`.env` locally, task-definition variables in ECS), asks the pinned MAGPIE
+(`MAGPIE_BIN`) for its version and builders and fails unless it clears
+`MIN_MAGPIE_VERSION`, connects the pool, **runs migrations before binding** so
+a container never serves traffic against an out-of-date schema, connects the
+display pool, takes its address (so a second process on a taken one exits
+before touching the running one's work — though after migrating, which a newer
+binary would do to the live schema), fails any input-data import or export left
+`running` by a previous process, releases any leave-generation transition one
+left open (so the next claim takes it over rather than the half-hour takeover
+timeout), starts the five background loops (rating fits, rate-limit sweep,
+import expiry, rating-run thinning, leave merges), and only then serves.
 
 On the way out it **shuts down gracefully**: `SIGTERM` (what ECS sends before it
 escalates to `SIGKILL` at the stop timeout) and `SIGINT` stop it accepting new
 connections and let in-flight requests finish. The dashboards' SSE streams are
 ended by the same signal (`state::Shutdown`): a stream is a request that never
 finishes, so with one job page open anywhere the wait for "in-flight requests"
-could only end at the `SIGKILL`, thirty seconds added to every deployment's
-gap. The page's `EventSource` reconnects by itself, to the new process. Without that, a deployment drops
+could only end at the `SIGKILL`, the whole stop timeout (now 120 seconds)
+added to every deployment's gap. The page's `EventSource` reconnects by itself, to the new process. Without that, a deployment drops
 whatever is in flight — and a worker that has just uploaded a completed batch
 loses it, because the claim it was for is still `claimed` and stays that way
 until the heartbeat timeout, so the retry is answered `accepted: false`.
@@ -5119,6 +5129,7 @@ birdtest/
 │   ├── dev-dump.sh                 # snapshot the local Postgres + MinIO state
 │   ├── dev-restore.sh              # put it back
 │   ├── dev-restore-check.sh        # its SCRUB rule against a stub compose (CI)
+│   ├── runbook-check.sh            # every bash block in RUNBOOK.md parses (CI)
 │   ├── restore-job.sh              # copy one purged or deleted job back from a scratch restore
 │   │                               # (RUNBOOK §2.2; also embedded in the ops task, infra/ops.tf)
 │   ├── restore-job-check.sh        # restore-job.sh through its failure and re-run cases (nightly)
@@ -7731,7 +7742,8 @@ says so in its implemented option, rather than being removed.
   commit; re-derive collision labels at confirmation; a cancellation flag the
   walk checks between entries.
 - **Option implemented:** None.
-- **Justification:** Admin-only, rare, and none changes what is stored.
+- **Justification:** Admin-only and rare; where one changes what is stored, it is
+  a row an admin sees and can import again.
 
 **KL-71. A claim's "update MAGPIE" message covers more than old clients.**
 - **Context:** `claim_task` rewrites a `400` from reading its body into "a task
@@ -8101,6 +8113,45 @@ says so in its implemented option, rather than being removed.
   link), and normalizing usernames.
 - **Justification:** Resets are limited per address, per caller and per link;
   the rest is bounded or moot while KL-37 stands.
+
+**KL-82. Small things in startup, configuration and the background loops.**
+- **Context:** `main.rs`, `config.rs`, `clientip.rs`, `bin/build-derived.rs`,
+  `routes/auth.rs`, `routes/public.rs`, `infra/ecs.tf` (thirty-second audit,
+  pass 12).
+- **Problem:**
+  - The single-instance invariant rests on the service's
+    `deployment_maximum_percent = 100`. AWS counts tasks `RUNNING` or
+    `PENDING` against it; whether a task already draining or stopping counts
+    is not established (not reproduced — ECS cannot be run here). If it does
+    not, a new task can start during the old one's 30 s of draining and up to
+    120 s of shutdown, and its startup fails the old one's running imports and
+    exports and releases its open transitions.
+  - The five background loops have no panic guard: a panic in a tick ends that
+    loop until the next restart, with no alarm (no panic path found).
+  - Registration and reset mails go out on detached tasks, which a graceful
+    shutdown does not wait for: a `SIGTERM` just after a registration can lose
+    its confirmation mail; the user can ask for another.
+  - The admin NDJSON results stream is not ended by the shutdown signal, as
+    SSE is: an open download holds the old task for up to the stop timeout.
+  - A `TRUSTED_PROXY_HOPS` above the real number of proxies keys every per-IP
+    limit on the peer — in production the ALB — so the site shares one bucket,
+    silently.
+  - The derived-file builder does not check its MAGPIE against
+    `MIN_MAGPIE_VERSION` as the web task does; both images are the same
+    binary, which the Terraform requires.
+- **Options considered:** a session-scoped advisory lock taken on a dedicated
+  connection before the reapers, so a second process waits for the first to
+  exit; `catch_unwind` around each tick; tracking the mail tasks for shutdown;
+  ending the NDJSON stream on the shutdown signal; a warning when
+  `X-Forwarded-For` routinely has fewer entries than configured; the version
+  check in the builder.
+- **Option implemented:** None of these (pass 12 took the address before the
+  reapers, so a second process on the same host exits before touching the
+  first one's work, and range-checked the heartbeat timeout and session TTL).
+- **Justification:** The lock would make a new task wait, unhealthy, behind a
+  draining one that ECS may already be waiting on; it is worth adding once the
+  overlap is shown to happen. The rest are rare, bounded by a restart or a
+  retry, or moot while the two images share a binary.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the

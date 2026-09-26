@@ -16,7 +16,7 @@ test('E-3: an admin imports a tarball, reviews the staged diff and confirms it',
   await expect(page.getByRole('heading', { name: 'Input data' })).toBeVisible();
 
   await page.getByLabel('Version (YYYYMMDD)').fill(IMPORTED_DATA);
-  await page.getByLabel('Ref').fill('main');
+  await page.getByLabel('Branch or tag').fill('main');
   await page.getByRole('button', { name: 'Fetch and diff' }).click();
 
   // The staged diff: one new file, one changed, the rest already known.
