@@ -2229,3 +2229,91 @@ async fn a_claim_without_a_usable_body_is_told_what_to_send() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
     assert_eq!(answer["code"], "bad_request", "{answer}");
 }
+
+async fn claim_fresh(app: &axum::Router) -> (StatusCode, serde_json::Value) {
+    send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await
+}
+
+async fn decline_as(app: &axum::Router, uuid: &str, token: &serde_json::Value, reason: &str) -> StatusCode {
+    send(
+        app,
+        post_json(
+            "/api/worker/decline",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": token, "reason": reason }),
+        ),
+    )
+    .await
+    .0
+}
+
+/// A-WORKER-19: a task its worker declined is not handed back to that worker
+/// for an hour. It went back to `available` and, the oldest, was every claim
+/// of its job, ahead of any new work -- the worker that had just failed it
+/// included -- and MAGPIE stops after five failures in a row, so one task
+/// that fails everywhere stopped every contributor claiming from the job.
+/// Another worker is still offered it.
+#[tokio::test]
+async fn a_declined_task_is_not_handed_back_to_the_worker_that_declined_it() {
+    let db = TestDb::new().await;
+    db.games_job(1, 1).await;
+    let app = birdtest::app(db.state().await);
+
+    let (status, first) = claim_fresh(&app).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let a = first["worker_uuid"].as_str().unwrap().to_string();
+    let failing = first["task_request"]["seed"].clone();
+    let mut token = first["claim_token"].clone();
+    let mut seeds = vec![failing.clone()];
+    for _ in 0..3 {
+        // The work-in-hand bucket refills one a second.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert_eq!(decline_as(&app, &a, &token, "task_failed").await, StatusCode::NO_CONTENT);
+        let (status, next) = claim_as(&app, &a).await;
+        assert_eq!(status, StatusCode::OK, "{next}");
+        seeds.push(next["task_request"]["seed"].clone());
+        token = next["claim_token"].clone();
+    }
+    let distinct: std::collections::HashSet<String> = seeds.iter().map(|s| s.to_string()).collect();
+    assert_eq!(distinct.len(), seeds.len(), "each claim a new task: {seeds:?}");
+
+    let (_, other) = claim_fresh(&app).await;
+    assert_eq!(other["task_request"]["seed"], failing, "another worker is offered it");
+}
+
+/// A-WORKER-20: a result carrying captured positions for a job that does not
+/// capture them is refused. They were stored, and the job's export then held
+/// a positions file nobody asked for.
+#[tokio::test]
+async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+    let (status, assignment) = claim_fresh(&app).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    assert_eq!(assignment["task_request"]["capture_positions"], json!(false));
+    let uuid = assignment["worker_uuid"].as_str().unwrap();
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([{
+        "game_index": 0, "turn_number": 0, "rack": "AEINRST",
+        "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
+        "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
+    }]);
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": assignment["claim_token"], "result": result }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_analysis_records WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+}
+

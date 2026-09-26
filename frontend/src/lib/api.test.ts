@@ -121,6 +121,21 @@ describe('F-API-3 JSON error body', () => {
     expect(error.code).toBe('conflict');
     expect(error.fields).toEqual({});
   });
+
+  it('carries Retry-After, so a page can say how long to wait', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: 'rate_limited', message: 'too many requests' }), {
+        status: 429,
+        headers: { 'content-type': 'application/json', 'retry-after': '718' }
+      })
+    );
+    const limited = (await api.confirmPasswordReset('t', 'p').catch((e: unknown) => e)) as ApiError;
+    expect(limited.status).toBe(429);
+    expect(limited.retryAfter).toBe(718);
+    respond(409, JSON.stringify({ code: 'conflict', message: 'Job is active.' }));
+    const without = (await api.deleteJob('j1').catch((e: unknown) => e)) as ApiError;
+    expect(without.retryAfter).toBeNull();
+  });
 });
 
 describe('F-API-4 error without a JSON body', () => {

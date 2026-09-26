@@ -550,7 +550,7 @@ async fn input_bytes(
              known, so re-importing leaves this one as it is)."
         )));
     };
-    let bytes = tokio::time::timeout(INPUT_FETCH_TIMEOUT, artifacts.get(&key))
+    let bytes = tokio::time::timeout(INPUT_FETCH_TIMEOUT, artifacts.get_for_build(&key))
         .await
         .map_err(|_| {
             AppError::internal(format!(
@@ -569,17 +569,27 @@ async fn input_bytes(
         // while the damaged one stayed (the audit's pass 7). Only an object
         // under its own content address: that key can hold nothing but the
         // imported bytes, so what is there is wrong for everyone who reads it.
-        let removed = key == format!("inputs/{expected}") && artifacts.delete(&key).await.is_ok();
-        return Err(AppError::internal(if removed {
-            format!(
+        let removed = if key == format!("inputs/{expected}") {
+            match artifacts.delete(&key).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    tracing::warn!(%key, error = %err.message, "could not delete a damaged input object");
+                    Err(err.message)
+                }
+            }
+        } else {
+            Err("it is not under its own content address".to_string())
+        };
+        return Err(AppError::internal(match removed {
+            Ok(()) => format!(
                 "{path}: the object at {key} hashed to {actual}, not the {expected} imported, \
                  and has been deleted; import its tarball again, then retry this build"
-            )
-        } else {
-            format!(
-                "{path}: the object at {key} hashes to {actual}, not the {expected} imported; \
-                 delete that object, import its tarball again, then retry this build"
-            )
+            ),
+            Err(why) => format!(
+                "{path}: the object at {key} hashes to {actual}, not the {expected} imported, \
+                 and could not be deleted ({why}); delete that object (RUNBOOK §2.4), import \
+                 its tarball again, then retry this build"
+            ),
         }));
     }
     Ok((name, bytes))

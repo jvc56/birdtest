@@ -300,8 +300,9 @@ data "aws_iam_policy_document" "task" {
   }
   # Purging a job deletes its exports' objects, which hold the results the
   # purge has just removed. Exports only: every other object here -- input
-  # data, derived files, leave-generation KLVs -- the backend never deletes,
-  # and a compromised process should not be able to either.
+  # data, derived files, leave-generation KLVs -- the web process never
+  # deletes, and a compromised one should not be able to either. (The derived
+  # builder's own role may delete a damaged `inputs/` object; derived.tf.)
   statement {
     actions   = ["s3:DeleteObject"]
     resources = ["${aws_s3_bucket.artifacts.arn}/exports/*"]

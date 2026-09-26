@@ -107,7 +107,10 @@
         {#each rows as row (key(row))}
           <tr class:text-destructive={row.state === 'failed'}>
             <td>{kind(row.role)}</td>
-            <td><code>{row.name}</code></td>
+            <td>
+              <code>{row.name}</code>
+              <p class="text-xs text-muted-foreground">{row.made_from}</p>
+            </td>
             <td>
               <code>{row.builder}</code>
               {#if row.build_target}
@@ -127,7 +130,9 @@
             <td><code class="text-xs">{row.sha256 ? row.sha256.slice(0, 12) : '—'}</code></td>
             <td>{datetime(row.requested_at)}</td>
             <td>
-              {#if row.state === 'failed'}
+              {#if row.state === 'failed' && !row.buildable}
+                <span class="text-xs text-muted-foreground">no builder of this version</span>
+              {:else if row.state === 'failed'}
                 <button
                   class="text-sm underline"
                   disabled={busy === key(row)}

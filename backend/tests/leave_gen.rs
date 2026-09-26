@@ -1726,6 +1726,61 @@ async fn merges_waiting_on_one_job_leave_other_jobs_free_to_merge() {
     assert_eq!(left, 0);
 }
 
+/// I-LEAVE-23: a declined leave task is reissued as it stands, the decliner
+/// included, and its racks are never forced by two open claims. Skipped for
+/// its decliner (as games tasks are, A-WORKER-19), the decliner's claim went
+/// to rack selection, which does not count an available task's racks as out:
+/// the same racks went out again on a second claim, and in the tail every
+/// decline made another task of them for the same worker.
+#[tokio::test]
+async fn a_declined_leave_task_is_reissued_as_it_stands() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let first = claim_one(&app).await;
+    let uuid = first["worker_uuid"].as_str().unwrap().to_string();
+    let declined = forced_racks(&first);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/decline",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": first["claim_token"], "reason": "task_failed" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, again) = send(
+        &app,
+        post_json("/api/worker/task", &[("x-worker-uuid", uuid.as_str())], claim_body("1.0.0", &[])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(forced_racks(&again), declined, "the same task, as it stands");
+    let _other = claim_one(&app).await;
+
+    let doubled: Vec<String> = sqlx::query_scalar(
+        "SELECT rack FROM (
+             SELECT unnest(r.forced_racks) AS rack
+             FROM task_claims c JOIN leave_requests r ON r.task_id = c.task_id
+             WHERE c.job_id = $1 AND c.state = 'claimed') out
+         GROUP BY rack HAVING COUNT(*) > 1",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(doubled.is_empty(), "racks forced by two open claims: {doubled:?}");
+    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(tasks <= 2, "no copy of the declined task was made: {tasks}");
+}
+
 /// The generation's racks in the order a sweep visits them: the primary key's,
 /// which is the database's collation and not byte order.
 async fn racks_in_sweep_order(db: &TestDb, job: Uuid) -> Vec<String> {

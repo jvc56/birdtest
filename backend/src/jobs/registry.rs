@@ -129,6 +129,21 @@ async fn generate_opening_rack(
 /// insert would fail every time, and the worker would get nothing at all until
 /// someone else filled the slot.
 ///
+/// And, except in leave generation, tasks this identity declined in the last
+/// hour. A declined task goes
+/// back to `available` and, the oldest, was handed straight back to whoever
+/// claimed next -- the worker that had just failed it included -- ahead of any
+/// new work: one task that fails everywhere was every claim of its job, and
+/// MAGPIE stops after five failures in a row, so it stopped each contributor
+/// claiming from the job (the audit's pass 8). Skipped by the one who
+/// declined it, it goes to the next worker; each fails it once and moves on.
+/// Not in leave generation: a declined leave task sits `available` with no
+/// claim, and skipping it sent the decliner to rack selection, which does
+/// not count an available task's racks as out -- it forced the same racks
+/// again, on a second open claim, and in the tail handed them to the same
+/// worker every time (the adversarial check of pass 8). There the task is
+/// reissued as it stands.
+///
 /// `leave_generation`, when set, restricts it to a leave job's tasks for that
 /// generation.
 async fn next_available(
@@ -143,7 +158,10 @@ async fn next_available(
            AND NOT EXISTS (
                SELECT 1 FROM task_claims c
                WHERE c.task_id = t.id
-                 AND c.state NOT IN ('abandoned', 'declined')
+                 AND (c.state NOT IN ('abandoned', 'declined')
+                      OR (c.state = 'declined' AND $4::int IS NULL
+                          AND COALESCE(c.last_heartbeat_at, c.claimed_at)
+                              > now() - interval '1 hour'))
                  AND (c.claimed_by_user_id = $2 OR c.claimed_by_anon_uuid = $3)
            )
            AND ($4::int IS NULL OR EXISTS (
@@ -464,6 +482,7 @@ pub async fn decode_result(
         )),
         JobKind::Games { config, .. } => {
             let record = normalize::<game::GameHandler>(payload).await?;
+            refuse_uncaptured_positions(config.capture_positions, &record.positions)?;
             // The batch size was fixed when the task was handed out -- it is
             // the job's, denormalized onto every request -- so a result of any
             // other size is answering a question nobody asked.
@@ -475,6 +494,7 @@ pub async fn decode_result(
         }
         JobKind::GamePairs { config, .. } => {
             let record = normalize::<game_pair::GamePairHandler>(payload).await?;
+            refuse_uncaptured_positions(config.capture_positions, &record.positions)?;
             // A pairs request counts pairs; each is two games.
             super::plausibility::check_batch_size(
                 record.all_games.games,
@@ -492,6 +512,18 @@ pub async fn decode_result(
             Ok(DecodedResult::LeaveGeneration(record))
         }
     }
+}
+
+/// Positions from a job that did not ask for them: they were stored, and the
+/// job's export then carried a positions file nobody asked for. MAGPIE sends
+/// them only when the request says so.
+fn refuse_uncaptured_positions<T>(capture: bool, positions: &[T]) -> AppResult<()> {
+    if !capture && !positions.is_empty() {
+        return Err(AppError::bad_request(
+            "this job does not capture positions, and the result carries some",
+        ));
+    }
+    Ok(())
 }
 
 /// A turn to store a large result, taken by the submit path *before* it opens

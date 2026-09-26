@@ -195,6 +195,19 @@ results are accepted; the claims of those that gave up lapse after the grace
 and are handed out again. Claims issued after the restore point do not exist in
 the restored database, so results for them are answered `accepted: false`.
 
+**Contributors whose identity is newer than the restore point are stopped.**
+The restored database has no anonymous worker UUID, API key or account created
+after the restore point. Such a worker's result is refused and its next claim
+is answered `401`, which ends its `contribute` run: it does **not** pick up
+again by itself. Say so where contributors will read it, with the remedy: an
+anonymous contributor deletes the `uuid` line from `contribute.txt` and starts
+again (a new UUID is issued); an account created in the window registers
+again; a key made in the window is made again on the account page. How many:
+the identities the damaged instance has that the restored one lacks — on the
+old instance, before it is deleted, `SELECT count(*) FROM anonymous_workers
+WHERE first_seen_at > '<restore time>'`, and the same over `api_keys` and
+`users` by `created_at`.
+
 ---
 
 ## 2. Selective restore (a mistaken purge or delete)
@@ -741,11 +754,17 @@ leaderboard visible.
   A row whose `kwg_id` or `klv_id` points at an `input_data` row restored
   without its object-store bytes will fail with that as its reason; one whose
   object holds other bytes than those imported fails saying so, and the build
-  deletes that object so the re-import below uploads it again. Re-import
+  deletes that object so the re-import below uploads it again. If its error
+  says the object could not be deleted, delete it by hand first —
+  `aws s3 rm "s3://$(terraform -chdir=infra output -raw artifacts_bucket)/inputs/<sha256>"`
+  (the bucket is versioned, so the damaged bytes stay as a noncurrent version
+  until they expire). Re-import
   that tarball; the import is idempotent, adds no rows for files whose bytes
-  have not changed, and uploads their bytes again. Then press **Retry** on
-  the row at `/admin/derived-data`: a row that has failed three times stays
-  failed until someone does, and its job hands out nothing meanwhile. (A
+  have not changed, and uploads their bytes again. Then, if the row has
+  failed three times, press **Retry** on it at `/admin/derived-data`: it stays
+  failed until someone does, and its job hands out nothing meanwhile. A row
+  still `pending` between attempts has no Retry and needs none: it is tried
+  again on its own within 15 minutes. (A
   build that fails is tried again after 5 and then 15 minutes on its own, so
   a passing S3 outage heals without anyone.)
 

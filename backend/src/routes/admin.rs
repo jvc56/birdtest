@@ -1174,14 +1174,16 @@ async fn create_job(
     if blanks > MAGPIE_MAX_WORDMAP_BLANKS
         && !crate::derived::needs_for_job(&mut tx, job.id).await?.is_empty()
     {
-        return Err(AppError::bad_request(format!(
-            "{letterdist_name} has {blanks} blanks, and MAGPIE builds wordmaps and rack info \
-             tables for at most {MAGPIE_MAX_WORDMAP_BLANKS}: no player of this job may use \
-             either, and a leave job must not use a wordmap"
-        ))
+        return Err(AppError::bad_request(
+            "no wordmap or rack info table can be built for this letter distribution",
+        )
         .with_field(
             "letterdist_id",
-            format!("{blanks} blanks: no wordmap or rack info table can be built for it"),
+            format!(
+                "{letterdist_name} has {blanks} blanks, and MAGPIE builds them for at most \
+                 {MAGPIE_MAX_WORDMAP_BLANKS}: no player of this job may use either, and a leave \
+                 job must not use a wordmap"
+            ),
         ));
     }
 
@@ -2606,6 +2608,13 @@ struct DerivedDataRow {
     kwg_id: Uuid,
     klv_id: Option<Uuid>,
     letterdist_id: Uuid,
+    /// The same, as an admin reads them: each file's path and the tarball it
+    /// was first imported from.
+    made_from: String,
+    /// Whether a builder of this MAGPIE takes the row. One queued under
+    /// another version is never built here, so retrying it only leaves it
+    /// pending for good.
+    buildable: bool,
     state: String,
     sha256: Option<String>,
     bytes: Option<i64>,
@@ -2628,11 +2637,21 @@ async fn list_derived_data(
 ) -> AppResult<Json<Vec<DerivedDataRow>>> {
     Ok(Json(
         sqlx::query_as::<_, DerivedDataRow>(
-            "SELECT role, name, builder, kwg_id, klv_id, letterdist_id, state, sha256, bytes,
-                    build_target, error, attempts, requested_at, built_at
-             FROM derived_data
-             ORDER BY state = 'built', requested_at DESC",
+            "SELECT d.role, d.name, d.builder, d.kwg_id, d.klv_id, d.letterdist_id,
+                    concat_ws(', ', k.path || ' (' || k.tarball_date || ')',
+                                    v.path || ' (' || v.tarball_date || ')',
+                                    l.path || ' (' || l.tarball_date || ')') AS made_from,
+                    d.builder = CASE d.role WHEN 'wmp' THEN $1 ELSE $2 END AS buildable,
+                    d.state, d.sha256, d.bytes, d.build_target, d.error, d.attempts,
+                    d.requested_at, d.built_at
+             FROM derived_data d
+             JOIN input_data k ON k.id = d.kwg_id
+             LEFT JOIN input_data v ON v.id = d.klv_id
+             JOIN input_data l ON l.id = d.letterdist_id
+             ORDER BY d.state = 'built', d.requested_at DESC",
         )
+        .bind(state.builders.wmp())
+        .bind(state.builders.rit())
         .fetch_all(&state.pool)
         .await?,
     ))
@@ -2642,9 +2661,8 @@ async fn list_derived_data(
 struct RetryDerivedBody {
     role: String,
     name: String,
-    /// The one row meant, as the list gives it. Without these, every failed
-    /// row of that role and name is retried -- other builders' included,
-    /// which no builder of this MAGPIE then takes.
+    /// The one row meant, as the list gives it; all but `klv_id` (null for a
+    /// wordmap) are required.
     builder: Option<String>,
     kwg_id: Option<Uuid>,
     klv_id: Option<Uuid>,
@@ -2668,20 +2686,29 @@ async fn retry_derived_data(
     ApiJson(body): ApiJson<RetryDerivedBody>,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
+    // The row, whole: by role and name alone every failed row of that name
+    // was reset, other builders' included, which no builder of this MAGPIE
+    // then takes; and a partial set matched nothing and was answered "no
+    // failed build". `klv_id` is null for a wordmap.
+    let (Some(builder), Some(kwg_id), Some(letterdist_id)) =
+        (&body.builder, body.kwg_id, body.letterdist_id)
+    else {
+        return Err(AppError::bad_request(
+            "name the build by role, name, builder, kwg_id, klv_id and letterdist_id, as the list gives them",
+        ));
+    };
     let reset = sqlx::query(
         "UPDATE derived_data
          SET state = 'pending', attempts = 0, error = NULL, leased_until = NULL
-         WHERE role = $1 AND name = $2 AND state = 'failed'
-           AND ($3::text IS NULL OR builder = $3)
-           AND ($4::uuid IS NULL OR (kwg_id = $4 AND klv_id IS NOT DISTINCT FROM $5
-                                     AND letterdist_id = $6))",
+         WHERE role = $1 AND name = $2 AND state = 'failed' AND builder = $3
+           AND kwg_id = $4 AND klv_id IS NOT DISTINCT FROM $5 AND letterdist_id = $6",
     )
     .bind(&body.role)
     .bind(&body.name)
-    .bind(&body.builder)
-    .bind(body.kwg_id)
+    .bind(builder)
+    .bind(kwg_id)
     .bind(body.klv_id)
-    .bind(body.letterdist_id)
+    .bind(letterdist_id)
     .execute(&state.pool)
     .await?
     .rows_affected();
@@ -2695,16 +2722,12 @@ async fn retry_derived_data(
         Some(admin.0.id),
         None,
         Some("derived_data"),
-        Some(match (&body.builder, body.kwg_id) {
-            (Some(builder), Some(kwg)) => format!(
-                "{} {} {builder} kwg={kwg} klv={} letterdist={}",
-                body.role,
-                body.name,
-                body.klv_id.map_or("none".to_string(), |k| k.to_string()),
-                body.letterdist_id.map_or("none".to_string(), |l| l.to_string()),
-            ),
-            _ => format!("{} {}", body.role, body.name),
-        }),
+        Some(format!(
+            "{} {} {builder} kwg={kwg_id} klv={} letterdist={letterdist_id}",
+            body.role,
+            body.name,
+            body.klv_id.map_or("none".to_string(), |k| k.to_string()),
+        )),
         None,
     )
     .await?;

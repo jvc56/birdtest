@@ -224,7 +224,12 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("POST", "/api/admin/jobs/:id/rebuild-artifacts", Admin, ""),
     ("POST", "/api/admin/jobs/:id/merge-progress", Admin, ""),
     ("GET", "/api/admin/derived-data", Admin, ""),
-    ("POST", "/api/admin/derived-data/retry", Admin, r#"{"role":"wmp","name":"NWL23"}"#),
+    (
+        "POST",
+        "/api/admin/derived-data/retry",
+        Admin,
+        r#"{"role":"wmp","name":"NWL23","builder":"wmp-1","kwg_id":"00000000-0000-0000-0000-000000000001","klv_id":null,"letterdist_id":"00000000-0000-0000-0000-000000000002"}"#,
+    ),
     ("GET", "/api/admin/backups", Admin, ""),
     ("GET", "/api/admin/fleet", Admin, ""),
     (

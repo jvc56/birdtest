@@ -186,7 +186,10 @@ which meant guessing at something the job can simply say.
 Job creation parses the pinned distribution as every claim will, and refuses
 one the server or MAGPIE cannot use: in particular one with more letters than
 MAGPIE's `MAX_ALPHABET_SIZE` (50), which MAGPIE now refuses too and used to load
-past the end of every per-letter array.
+past the end of every per-letter array. It also refuses a job that needs a
+wordmap or a rack info table on a distribution with more than two blanks
+(`english_super`): MAGPIE aborts building either (`wmp_maker.c`), so such a
+job's build failed three times and it never dispatched.
 
 #### Two generate/report pairs on the player config
 
@@ -787,7 +790,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
    caller's latency; a send that fails is logged and nothing else, since the
    caller was told the same thing either way.
 4. The user clicks the link, landing on `/reset-password/confirm?token=<raw-token>`. The page shows a new-password form.
-5. On submit, `POST /api/auth/reset-password/confirm` reads the token (hash match, not expired, not already used, its account not deleted) without a lock, so a wrong link costs nothing more; charges the link's own bucket (five scorings an hour, whoever sends them: a link refused a weak password still works); scores the new password against the account on scoring's own turns (two, on the blocking pool — never sign-in's) and hashes it on the password threads, both outside any transaction, so neither wait holds a lock; then locks the account, spends the token (checked again), stores the new hash, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
+5. On submit, `POST /api/auth/reset-password/confirm` reads the token (hash match, not expired, not already used, its account not deleted) without a lock, so a wrong link costs nothing more; takes one of scoring's own turns (two, on the blocking pool — never sign-in's), then charges the link's own bucket (five scorings an hour, whoever sends them: a link refused a weak password still works), and scores the new password against the account and hashes it on the password threads, both outside any transaction, so neither wait holds a lock; then locks the account, spends the token (checked again), stores the new hash, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
 
    The reset also **revokes every existing session**. Each session token carries the account's `session_generation`, and `CurrentUser` compares it with the `users` row it already reads on every request; the reset increments it, so every token minted before it — an attacker's included — stops working. `POST /api/auth/sign-out-everywhere` (the "Sign out everywhere" button on the account page) and account deletion increment it the same way.
 6. The user is redirected to `/login` (with no message; signing in with the new password is the confirmation).
@@ -2219,8 +2222,8 @@ Then, up to **three attempts**:
 
 1. Select candidate jobs (the CTE above). Empty → decide between `Shutdown`,
    `NoWorkExists` and `Idle`.
-2. For each candidate in deficit order: reclaim its expired claims, then try to
-   acquire a task from it. Acquisition returns one of four things:
+2. Reclaim the expired claims of every candidate at once, then, for each
+   candidate in deficit order, try to acquire a task from it. Acquisition returns one of four things:
    - **Task** — for a worker that arrived with no identity, insert its
      `anonymous_workers` row; insert the claim, bump the task's counters and the
      job's `claims_issued`, commit, and return it with the job's
@@ -2229,8 +2232,9 @@ Then, up to **three attempts**:
      completed or deactivated it waits on that update's row lock, then finds the
      job no longer active and hands out nothing.
    - **NoWork** — this job has nothing to hand out; try the next candidate.
-   - **JobFinished** — the job's space is exhausted; flip it to `completed` and
-     try the next candidate. The flip is written inside the claim transaction,
+   - **JobFinished** — leave generation only: its last generation is built;
+     flip it to `completed` and try the next candidate (games, game pairs and
+     opening racks complete through the finish checks instead). The flip is written inside the claim transaction,
      under the dispatch lock, so a purge cannot restart the job between the
      decision and the write.
    - **NeedsUniverse** — leave generation only: the current generation's rack
@@ -2239,8 +2243,9 @@ Then, up to **three attempts**:
      back), and try the next candidate.
    - **NeedsLeaveMerge** — leave generation only: nothing is left to hand out
      or in flight, but accepted results are still staged, so whether the
-     generation is complete is not yet known. Roll back, start the merge on its
-     own task (it gives up at once if one is already running, so a fleet asking
+     generation is complete is not yet known. Commit (its one possible
+     write, a sweep deleting a finished lap's cursor, would otherwise be redone
+     by every claim until the merge landed), start the merge on its own task (it gives up at once if one is already running, so a fleet asking
      together starts one), and try the next candidate.
    - **NeedsGenerationTransition** — leave generation only. **Commit** (the
      transaction's only write is the row claiming ownership of the transition),
@@ -2469,7 +2474,8 @@ detection](#why-impossibility-and-not-per-worker-anomaly-detection) for the
 reasoning and the full table.
 
 Three of them cannot run in the pure validation step, because they need the
-request. They run in `store_result`, where the task id is in hand, and they are
+request. They run in `decode_result` (the batch size, from the job's template)
+and `store_result` (what needs the task's own row), and they are
 the only submission-time checks that catch a worker reporting work it did not
 do:
 
@@ -3893,7 +3899,7 @@ none for a `leave_generation` job and the client loads none.
 
 On the server, in a separate scheduled ECS task (`infra/derived.tf`), not in the
 web task: a table build peaks at about 2.4 GB and writes a 1.9 GB file, against
-the web task's 1 vCPU and 2 GB. It drains a queue (`derived_data`) under a lease
+the web task's 1 vCPU and 2 GB. It builds from a queue (`derived_data`), at most eight files a run, under a lease
 and exits. **A job whose derived files are not built is not dispatched** — the
 same wait as a leave-generation job whose universe is not seeded — because
 dispatching without the hash would mean sending a worker no `derived` entry,
@@ -4137,8 +4143,11 @@ found at all, and a hex string means it was found with different content.
 
 The server derives the task and job from the token, releases the claim immediately
 rather than waiting out the heartbeat timeout, and records the gap so an admin can
-see what the fleet is missing. Declining is an ordinary outcome, not an error: the
-worker adds the job to its unsupported set and claims again.
+see what the fleet is missing. Declining is an ordinary outcome, not an error:
+for `missing_data`, `magpie_version` and `unknown_job_type` the worker adds the
+job to its unsupported set and claims again; `task_failed` (and a KLV that does
+not match, `derived_mismatch`) counts as a failure, five in a row ending its
+run. The server does not offer a worker a task it declined within the hour.
 
 #### `POST /api/worker/heartbeat`
 
@@ -4761,7 +4770,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready — and, for a games or game-pairs job that captured positions, a `positions_download_url` for the second object holding them. |
 | `GET` | `/api/admin/workers` | The contributor list with anonymous workers' real UUIDs, which banning one needs; the public list carries pseudonyms only. |
 | `GET` | `/api/admin/derived-data` | Every wordmap and rack info table the server has been asked to build: state, builder, hash, attempts and the last error. A job whose files are not `built` is not dispatched, and this is where that wait — or the failure behind it — is visible. |
-| `POST` | `/api/admin/derived-data/retry` | Put a `failed` build back in the queue (`{ role, name }`). Explicit rather than automatic: a build is a pure function of its inputs, so three failures mean a missing input or a broken binary, which a fourth attempt does not fix. |
+| `POST` | `/api/admin/derived-data/retry` | Put one `failed` build back in the queue: `{ role, name, builder, kwg_id, klv_id, letterdist_id }`, as `GET /api/admin/derived-data` lists them (`klv_id` null for a wordmap); anything less is a `400`, since rows can share a role and name. Explicit rather than automatic: a failed attempt is tried again after 5 and then 15 minutes, which a passing outage survives, so a build that has failed three times failed for a reason a fourth attempt does not change — a missing or damaged input, a broken binary. |
 | `GET` | `/api/admin/fleet` | What the field is running, from `task_claims.magpie_version`. |
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name, scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
@@ -6931,7 +6940,19 @@ says so in its implemented option, rather than being removed.
   fleet down within seconds, each contributor until its owner restarts it. The
   thirty-second audit found three ways job creation let one through (a 21x21
   layout, a margin past MAGPIE's ceiling, play counts it cannot allocate) and
-  refuses them now; the server still does nothing with `task_failed` declines.
+  refuses them now; the server still does nothing with `task_failed` declines
+  beyond this: outside leave generation, a worker is not offered again a
+  task it declined within the hour (a small fleet may then wait that hour on
+  a job's last task). Before that, the declined task was the oldest available and went
+  straight back to whoever claimed next — the worker that had just failed it
+  included — ahead of new work, so one task that fails everywhere stopped
+  every contributor claiming from its job (thirty-second audit, pass 8); now
+  each worker fails it once and moves on. Leave generation keeps the old rule —
+  a declined task is reissued as it stands — because its rack selection does
+  not count an available task's racks as out: skipped, the declined racks
+  went out again on a second claim. A claim has no maximum age: an
+  executor that hangs while its process goes on heartbeating holds its task
+  for good (reasoned, not reproduced).
   Batch and generation sizes (`games_per_batch`, `pairs_per_batch`,
   `num_iterations`, `max_iterations`, …) have no ceiling either, except
   `racks_per_task` (10,000 since the thirty-second audit: every claim and
@@ -7224,8 +7245,10 @@ says so in its implemented option, rather than being removed.
 **KL-57. A job waiting on a derived build asks about it on every claim.**
 - **Context:** `derived::status_for_job` runs for a waiting job on every claim
   that considers it, until the build lands (minutes; at worst three attempts
-  of up to 70 minutes each, 5 and 15 minutes apart) — or, for a build that
-  has failed for good, until an admin retries it.
+  of up to 70 minutes each, 5 and 15 minutes apart, each attempt a builder
+  killed mid-build holds for its 75-minute lease, and the next scheduled run
+  up to five minutes away) — or, for a build that has failed for good, until
+  an admin retries it.
 - **Problem:** A few milliseconds on every such claim, and a waiting job heads
   the candidate list because its claim count does not move — for as long as a
   failed build is left failed, which is not bounded by anything.
@@ -7555,17 +7578,27 @@ says so in its implemented option, rather than being removed.
 - **Justification:** Build it when that many anonymous contributors exist.
 
 **KL-40. Usernames are unique whatever their case, and otherwise free text.**
-- **Context:** Any string of 3–32 characters is accepted, and `trim()` leaves
-  look-alike, zero-width and bidi characters alone.
+- **Context:** Any string of 3–32 characters is accepted, less line breaks,
+  control, format (zero-width, bidi) and other invisible characters, which the
+  thirty-second audit refuses — joiners and variation selectors allowed only
+  where scripts and emoji place them, and a name that differs from a taken one
+  only in those is taken (and an expired, unconfirmed one gives it up) — even
+  where a non-joiner is visible, as in Persian, which merges `می‌خواهم` with
+  `میخواهم`. That check scans every name (about a quarter of a second at
+  200,000 accounts, under the registration limit) and is check-then-insert:
+  two twins registering at the same instant both succeed. A unique index on
+  the stripped name would close both, once existing twins are cleared. Look-alikes are left alone: another script's `а` for
+  `a`, composed and decomposed accents.
 - **Problem:** Variants of a name can sit side by side on the public lists. One
   such variant, a username of 16 hex characters, merges under `?worker=` with
   the anonymous worker whose pseudonym it matches.
 - **Options considered:**
-  - refuse format and control characters;
+  - refuse format and control characters (done, thirty-second audit);
   - normalize (NFKC);
   - allow one script only;
   - refuse pseudonym-shaped names.
-- **Option implemented:** None; a product decision left open.
+- **Option implemented:** Invisible characters refused; the rest is a product
+  decision left open.
 - **Justification:** A character-set rule has to allow for international names,
   which is a product decision.
 
@@ -7855,6 +7888,10 @@ says so in its implemented option, rather than being removed.
   - `GET /api/workers` answers a page past the end without its query now, but
     a page just short of the end still reads `offset + limit` rows of each
     arm's index: about 0.3 s at 300,000 contributing anonymous identities.
+  - SPRT on a run with no variance — every pair the same outcome — computes an
+    LLR of 0 whatever the mean, so a thousand straight wins runs to
+    `max_units` and is stored as stopped at its cap, where 999 wins and a draw
+    pass at once. Fishtest regularizes with pseudo-counts; not built.
   - One hostile leave result can hold a rack's count up to `num_games` × 1,000
     occurrences at a mean of ±5,000 — the plausibility ceilings — which fixes
     that rack's mean and puts it at target for good, shifting its sub-leaves.
@@ -7862,8 +7899,9 @@ says so in its implemented option, rather than being removed.
     outside the broken-client threat model the checks are built for (not
     reproduced).
   - An admin's "merge now", or an export settling a leave job, waits for a
-    merge turn as well as its own job's lock: behind at most two other jobs'
-    merges, which on the default database take a couple of minutes each.
+    merge turn as well as its own job's lock: behind the two merges running and
+    any other job's merges already waiting (turns go first come, first
+    served), each a couple of minutes on the default database.
   - An admin's change made just before a live push's build that then fails
     (not a `404`) waits out the interval: the build spent its wake-up. Built
     again at once, a failing build would most likely fail again.

@@ -68,6 +68,14 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   adversarial check found 3 medium (a damaged object's remedy, invisible
   username twins, merge turns held by waiters), fixed. KL-37, 57, 78 and 81
   updated. The loop continues.
+- **Pass 8 (follow-up: pass 7's diff, and the task lifecycle):** 0 high and 5
+  medium from the reviewers — the builder's role could not delete a damaged
+  input; one failing task was every claim of its job; RUNBOOK said
+  contributors resume after a restore; positions stored for a job that did
+  not capture them; Retry's documented body reset other builders' rows — all
+  fixed and verified; the adversarial check found 2 medium (the decline skip
+  forcing leave racks twice; an expired twin holding a name), fixed. KL-2,
+  40, 57 and 78 updated. The loop continues.
 
 ---
 
@@ -1223,5 +1231,167 @@ page does not show when a waiting row will next be tried.
 - **Tier 5, natively: 11 of 11** on 92544dc (frontend reviewer).
 - The stalled-S3 replay against `build-derived` (300 s, then `pending`).
 - `terraform fmt -check -recursive` and `validate`: clean.
+- MAGPIE unchanged.
+
+
+---
+
+## Pass 8 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`92544dc..9b28b9c`; MAGPIE
+unchanged), one reviewer per part it touches: backend; frontend (tier 5
+natively); docs and procedures; infra and CI. Plus one area not examined in
+recent passes: **the task lifecycle for games, game pairs and opening
+racks** — generation, claims, leases, heartbeats, reclaims, declines,
+submissions, redundancy and finishing, and MAGPIE's `contribute` side.
+
+**Findings: 0 high, 5 medium** from the five reviewers (backend none, 4 low, 2
+unconfirmed; frontend none, 5 low — tier 5 natively 11 of 11; docs and
+procedures 1 medium, 9 low; infra and CI 1 medium, 3 low; task lifecycle 3
+medium, 7 low, 2 unconfirmed). All fixed and verified; the adversarial check
+(8.7) found 2 medium in the fixes, fixed.
+
+### 8.1 Medium — the builder's role could not delete a damaged input, so 7.9's repair never happened in production (infra reviewer)
+
+**Code updated.** 7.9 had the build delete a damaged `inputs/` object so a
+re-import would replace it; the builder's IAM role granted only `GetObject`
+and `ListBucket`, the failed delete was swallowed, and an admin following
+RUNBOOK re-imported (skipped: the object existed) and retried into the same
+failure. Reproduced with a MinIO user holding the Terraform's policy, and with
+the committed test run under credentials denied `DeleteObject`. **Fix:** the
+role may delete `inputs/*` (and only that); a failed delete is logged and the
+row's error says why and names the manual `aws s3 rm` RUNBOOK §2.4 now gives;
+the stale "read-only" and "never deletes" comments are rewritten.
+**Verified:** `terraform validate`; `I-INPUT-8b` still passes; the policy is
+the only change the reproduction lacked.
+
+### 8.2 Medium — one task that failed everywhere was every claim of its job (task-lifecycle reviewer)
+
+**Code updated.** A declined task goes back to `available` and, the oldest,
+was handed straight back to whoever claimed next — the worker that had just
+failed it included — ahead of new work; MAGPIE stops after five failures in a
+row, so one such task stopped every contributor claiming from its job
+(reproduced on the server, six claims in a row the same seed, and with a real
+MAGPIE against a stub). **Fix:** a worker is not offered a task it declined
+within the hour (`registry::next_available`, keyed on the declined claim's
+last heartbeat; no schema change). Another worker still is; I-SCHED-15's
+index trap still holds an hour on. **Verified:** `A-WORKER-19` fails on the
+old code and passes; KL-2 rewritten.
+
+### 8.3 Medium — RUNBOOK said contributors pick up by themselves after a point-in-time restore (task-lifecycle reviewer)
+
+**Docs updated.** A contributor whose UUID, key or account was made after the
+restore point meets a `401` on its next claim, which ends its run (reproduced
+with a real MAGPIE against a stub). RUNBOOK §1 now says so, with each kind of
+contributor's remedy and how to count them on the old instance.
+
+### 8.4 Medium — positions from a job that does not capture them were stored (task-lifecycle reviewer)
+
+**Code updated.** PLAN lists "positions present only when the job set
+`capture_positions`" as server-side validation; nothing checked it, and the
+job's export then carried a positions file nobody asked for. Such a result is
+now refused, and so is one with two positions for one turn of one game (the
+row kept the first's position and the last's moves). **Verified:**
+`A-WORKER-20` fails on the old code (`accepted: true`) and passes; a unit test
+covers the duplicate.
+
+### 8.5 Medium — Retry with the body PLAN documents reset other builders' rows (docs reviewer)
+
+**Code updated.** 7.7 made Retry precise only when the caller sent the row's
+builder and ids; PLAN documented `{ role, name }`, which still reset every
+failed row of that name. Retry now requires the row whole (`klv_id` null for a
+wordmap) and answers `400` otherwise; PLAN documents the full body.
+**Verified:** `A-ADMIN-24` asserts `400` for `{ role, name }` and for a partial
+set.
+
+### 8.6 Low findings
+
+**Fixed:**
+- Accounts:
+  - a name differing from a taken one only in joiners or variation selectors
+    is taken (`A-AUTH-4g`; it fails on the old check), since a joiner between
+    letters that join anyway, or a selector on an emoji, changes nothing a
+    reader sees;
+  - a Malayalam chillu written with a trailing joiner is allowed;
+  - S3 error causes are logged, not sent in response bodies (they carried
+    request ids and, on a DNS failure, the bucket's host).
+- Derived builds:
+  - the derived-data page shows each row's files and tarball dates, and
+    offers no Retry on a row no builder of this version takes;
+  - `derived_builder_cpu` no longer accepts 256, which no permitted memory
+    pairs with;
+  - I-DERIVED-7 asserts the 15-minute wait too;
+  - RUNBOOK says a row between attempts retries on its own;
+  - README says a run straight after a failure builds nothing.
+- The reset page says how many minutes to wait (`ApiError` carries
+  `Retry-After`; F-API-3).
+- The job form's three-blank refusal no longer repeats itself.
+- PLAN:
+  - KL-40 (invisible characters now refused);
+  - the reset flow's order (turn, then the link's bucket);
+  - KL-57 and KL-78's waits;
+  - the builder "drains" wording;
+  - the three-blank refusal;
+  - the claim loop (reclaim once; `JobFinished` is leave-only;
+    `NeedsLeaveMerge` commits);
+  - where the batch-size check runs;
+  - which declines add a job to the unsupported set.
+- KL-78: SPRT on a run with no variance.
+
+**Recorded:** KL-2 (a claim has no maximum age: an executor that hangs while
+heartbeating holds its task; reasoned). **Unconfirmed, left:** a correct input
+object deleted by a slow builder that read the damaged one before a
+re-import (bounded: the next build fails and a re-import repairs it; a
+conditional delete would close it); merge waiters holding pool connections
+(about 15 leave jobs transitioning at once to matter); several processes on
+one key starving a long task's heartbeats. **Left:** `divergent_games`
+unchecked against the pentanomial buckets (diagnostic only); MAGPIE's comment
+above `config_contribute_ensure_rack_info_table` (MAGPIE's side).
+
+### 8.7 Adversarial check of the pass's fixes
+
+**2 medium, fixed and verified.**
+
+- **Medium — the decline skip forced a leave task's racks twice.** 8.2's
+  skip also applied to leave generation, where a declined task sits
+  `available` with no claim: the decliner's claim went to rack selection,
+  which does not count an available task's racks as out, so the same racks
+  went out again on a second claim, and in the tail every decline made another
+  task of them for the same worker — the failure 8.2 set out to end. **Fix:**
+  leave generation keeps the old rule, a declined task reissued as it stands.
+  **Verified:** `a_declined_leave_task_is_reissued_as_it_stands`
+  (`I-LEAVE-23`) fails with the skip ("racks forced by two open claims") and
+  passes; KL-2 and `A-WORKER-19` say which jobs skip.
+- **Medium — an expired twin held a username for good.** 8.6's twin check
+  refused a name differing only in joiners or selectors, but the release of
+  an expired, unconfirmed account matched exact names only, so such a twin
+  was never released (and a phone keyboard's U+FE0F after an emoji makes one
+  by accident). **Fix:** the release matches as the check does.
+  **Verified:** `A-AUTH-4g` registers an expired twin and then the name; it
+  fails with the old release (`409`) and passes.
+
+**Lows fixed:** the derived build's stored error keeps the S3 cause (a
+builder-only fetch; responses keep the plain message); RUNBOOK §1's account
+count uses `users.created_at`, which exists; the authz table sends Retry's
+full body; `derived.tf`'s unreachable 256-CPU arm and message are gone and
+its comment states the delete's real scope. **Recorded (KL-40):** the twin
+check scans every name (274 ms at 200,000) and is check-then-insert; it
+merges Persian names a non-joiner visibly separates. **Held:** an honest
+MAGPIE never reports two positions for one turn, and sends positions only
+when asked; the Retry page sends the full body. **Unconfirmed, recorded
+(KL-2):** a small fleet may wait an hour on a job's last task after a
+transient failure; a worker could skip outcomes it dislikes by declining
+(outside the threat model: it could forge them anyway).
+
+### 8.8 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **587 of 587**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 118 of 118.
+- `terraform fmt -check -recursive` and `validate`: clean.
+- **Tier 5, natively: 11 of 11** on 9b28b9c (frontend reviewer).
+- Real MAGPIE against stubs: the poison-task stop and the post-restore `401`
+  (task-lifecycle reviewer).
 - MAGPIE unchanged.
 

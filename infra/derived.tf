@@ -48,8 +48,9 @@ variable "derived_builder_cpu" {
   default     = 4096
 
   validation {
-    condition     = contains([256, 512, 1024, 2048, 4096, 8192, 16384], var.derived_builder_cpu)
-    error_message = "derived_builder_cpu must be a Fargate CPU size: 256, 512, 1024, 2048, 4096, 8192 or 16384."
+    # Not 256: it takes at most 2 GB, and a table build needs 4.
+    condition     = contains([512, 1024, 2048, 4096, 8192, 16384], var.derived_builder_cpu)
+    error_message = "derived_builder_cpu must be a Fargate CPU size that can hold 4 GB: 512, 1024, 2048, 4096, 8192 or 16384."
   }
 }
 
@@ -68,7 +69,6 @@ variable "derived_builder_memory" {
     # Fargate's CPU and memory pairs: refused otherwise only by
     # RegisterTaskDefinition, part-way through an apply.
     condition = (
-      (var.derived_builder_cpu == 256 && contains([512, 1024, 2048], var.derived_builder_memory)) ||
       (var.derived_builder_cpu == 512 && var.derived_builder_memory >= 1024 && var.derived_builder_memory <= 4096 && var.derived_builder_memory % 1024 == 0) ||
       (var.derived_builder_cpu == 1024 && var.derived_builder_memory >= 2048 && var.derived_builder_memory <= 8192 && var.derived_builder_memory % 1024 == 0) ||
       (var.derived_builder_cpu == 2048 && var.derived_builder_memory >= 4096 && var.derived_builder_memory <= 16384 && var.derived_builder_memory % 1024 == 0) ||
@@ -76,7 +76,7 @@ variable "derived_builder_memory" {
       (var.derived_builder_cpu == 8192 && var.derived_builder_memory >= 16384 && var.derived_builder_memory <= 61440 && var.derived_builder_memory % 4096 == 0) ||
       (var.derived_builder_cpu == 16384 && var.derived_builder_memory >= 32768 && var.derived_builder_memory <= 122880 && var.derived_builder_memory % 8192 == 0)
     )
-    error_message = "derived_builder_memory is not a Fargate memory size for derived_builder_cpu's CPU (256 CPU takes 512, 1024 or 2048 MiB; 512 takes 1024-4096; 1024, 2048-8192; 2048, 4096-16384; 4096, 8192-30720, all in 1024 steps; 8192, 16384-61440 in 4096 steps; 16384, 32768-122880 in 8192 steps)."
+    error_message = "derived_builder_memory is not a Fargate memory size for derived_builder_cpu's CPU (512 CPU takes 1024-4096; 1024, 2048-8192; 2048, 4096-16384; 4096, 8192-30720, all in 1024 steps; 8192, 16384-61440 in 4096 steps; 16384, 32768-122880 in 8192 steps)."
   }
 
   validation {
@@ -122,13 +122,20 @@ resource "aws_iam_role" "derived_builder_task" {
 
 # The builder reads the lexicon and leaves bytes the import stored, and writes
 # nothing to the bucket: the derived files themselves are hashed and thrown
-# away, so there is nothing to put. Read-only on the artifact bucket is
-# therefore the whole of it, and is worth stating rather than reusing the web
-# task's role, which can also write.
+# away, so there is nothing to put. It may delete input objects (`inputs/*`),
+# and does so only for one whose bytes are not the ones imported under its
+# content address, so that a re-import uploads it again (an import skips an
+# object that exists); inputs are re-importable and the bucket versioned, so
+# a delete leaves the bytes as a noncurrent version. Worth stating rather
+# than reusing the web task's role, which can also write.
 data "aws_iam_policy_document" "derived_builder_task" {
   statement {
     actions   = ["s3:GetObject"]
     resources = ["${aws_s3_bucket.artifacts.arn}/*"]
+  }
+  statement {
+    actions   = ["s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/inputs/*"]
   }
   statement {
     actions   = ["s3:ListBucket"]

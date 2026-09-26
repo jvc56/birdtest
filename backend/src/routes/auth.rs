@@ -242,7 +242,10 @@ fn misplaced_joiner(name: &str) -> bool {
         let after = at(i + 1);
         match c {
             '\u{200C}' | '\u{200D}' => {
-                !((joins(before) && joins(after)) || (picture(base) && picture(after)))
+                let word_end = after.is_none_or(char::is_whitespace);
+                !((joins(before) && joins(after))
+                    || (before.is_some_and(virama) && word_end)
+                    || (picture(base) && picture(after)))
             }
             '\u{FE00}'..='\u{FE0F}' => {
                 let keycap = before.is_some_and(|b| b.is_ascii_digit() || b == '#' || b == '*')
@@ -253,6 +256,17 @@ fn misplaced_joiner(name: &str) -> bool {
             _ => false,
         }
     })
+}
+
+/// The joiners and variation selectors a name may hold, as a Postgres regex
+/// class: names that differ only in these are one name.
+const INVISIBLE_MARKS: &str = "[\\u200C\\u200D\\uFE00-\\uFE0F\\U000E0100-\\U000E01EF]";
+
+/// A virama: after one, a joiner may end a word (Malayalam's chillu letters in
+/// their older encoding, `ന്‍`).
+fn virama(c: char) -> bool {
+    matches!(c, '\u{094D}' | '\u{09CD}' | '\u{0A4D}' | '\u{0ACD}' | '\u{0B4D}' | '\u{0BCD}'
+        | '\u{0C4D}' | '\u{0CCD}' | '\u{0D4D}' | '\u{0DCA}')
 }
 
 /// Letters (and their signs) of the scripts that are written with joiners.
@@ -334,8 +348,14 @@ async fn register(
     // Nothing else can hang off such an account (it has never signed in), and
     // an admin is never released this way.
     sqlx::query(
+        // Matched as the taken check below matches: an expired twin that
+        // differs only in joiners or selectors held the name for good, the
+        // check refusing it and this never releasing it.
         "DELETE FROM users u
-         WHERE (lower(u.username) = lower($1) OR u.email = $2)
+         WHERE (lower(u.username) = lower($1)
+                OR regexp_replace(lower(u.username), $3, '', 'g')
+                   = regexp_replace(lower($1), $3, '', 'g')
+                OR u.email = $2)
            AND u.email_confirmed_at IS NULL AND u.deleted_at IS NULL AND NOT u.is_admin
            AND NOT EXISTS (
                SELECT 1 FROM email_confirmations c
@@ -344,16 +364,25 @@ async fn register(
     )
     .bind(&username)
     .bind(&email)
+    .bind(INVISIBLE_MARKS)
     .execute(&state.pool)
     .await?;
 
     let taken = sqlx::query_as::<_, (bool, bool, bool)>(
-        "SELECT EXISTS (SELECT 1 FROM users WHERE lower(username) = lower($1)),
+        // Taken also by a name that differs only in joiners and variation
+        // selectors: where a script allows them they may still change nothing
+        // a reader sees, so `ب‍ببب` would sit beside `بببب` as a second
+        // account (the audit's pass 8).
+        "SELECT EXISTS (SELECT 1 FROM users
+                        WHERE lower(username) = lower($1)
+                           OR regexp_replace(lower(username), $3, '', 'g')
+                              = regexp_replace(lower($1), $3, '', 'g')),
                 EXISTS (SELECT 1 FROM users WHERE email = $2),
                 EXISTS (SELECT 1 FROM users WHERE email = $2 AND email_confirmed_at IS NOT NULL)",
     )
     .bind(&username)
     .bind(&email)
+    .bind(INVISIBLE_MARKS)
     .fetch_one(&state.pool)
     .await?;
     let (username_taken, email_taken, email_confirmed) = taken;
@@ -925,6 +954,7 @@ mod tests {
             "\u{2764}\u{FE0F}",
             "1\u{FE0F}\u{20E3}",                                                  // keycap
             "\u{845B}\u{E0100}",                                                  // an ideograph's variant
+            "\u{0D2C}\u{0D3E}\u{0D32}\u{0D28}\u{0D4D}\u{200D}",                           // Malayalam, a chillu at the end
         ] {
             assert!(!good.chars().any(super::is_hidden_or_breaking), "{good:?}");
             assert!(!super::misplaced_joiner(good), "{good:?}");

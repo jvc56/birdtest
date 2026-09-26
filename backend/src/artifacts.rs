@@ -2,10 +2,18 @@ use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use std::sync::Arc;
 
-/// An SDK error with its causes. Displayed plainly it is "unhandled error"
-/// or "dispatch failure", which told an admin nothing (the audit's pass 7).
-fn cause(error: &impl std::error::Error) -> String {
+/// An SDK error as a response may carry it, with its causes -- request ids,
+/// codes, a host name holding the bucket's -- logged beside it. Displayed
+/// plainly it is "unhandled error" or "dispatch failure", which told an admin
+/// nothing (the audit's pass 7); the causes in the body told any caller more
+/// than it needs (pass 8).
+fn chain(error: &dyn std::error::Error) -> String {
     aws_sdk_s3::error::DisplayErrorContext(error).to_string()
+}
+
+fn cause(error: &dyn std::error::Error) -> String {
+    tracing::warn!(error = %aws_sdk_s3::error::DisplayErrorContext(error), "an object store call failed");
+    error.to_string()
 }
 
 /// S3 (or MinIO in dev — the SDK is identical, only the endpoint differs).
@@ -131,6 +139,14 @@ impl ArtifactStore {
         Ok(self.get_bytes(key).await?.to_vec())
     }
 
+    /// [`Self::get`] for the derived-file builder, whose errors are stored for
+    /// an admin to read at `/admin/derived-data` and never sent to a client:
+    /// with the SDK's whole cause, where a response carries only the first
+    /// line ("dispatch failure" told the admin nothing -- the audit's pass 7).
+    pub async fn get_for_build(&self, key: &str) -> AppResult<Vec<u8>> {
+        Ok(self.get_bytes_as(key, chain).await?.to_vec())
+    }
+
     /// The object's bytes as S3 handed them over, without a copy.
     ///
     /// Only a missing key is a 404. Every other failure -- throttling, a
@@ -138,6 +154,14 @@ impl ArtifactStore {
     /// generation's KLV does not exist does not retry: every leave worker's
     /// run ended on a transient S3 error. They are 503 with a `Retry-After`.
     pub async fn get_bytes(&self, key: &str) -> AppResult<axum::body::Bytes> {
+        self.get_bytes_as(key, cause).await
+    }
+
+    async fn get_bytes_as(
+        &self,
+        key: &str,
+        described: fn(&dyn std::error::Error) -> String,
+    ) -> AppResult<axum::body::Bytes> {
         use aws_sdk_s3::operation::get_object::GetObjectError;
         let object = self
             .client
@@ -148,14 +172,14 @@ impl ArtifactStore {
             .await
             .map_err(|e| match e.into_service_error() {
                 GetObjectError::NoSuchKey(_) => AppError::not_found(format!("no artifact at {key}")),
-                other => unavailable(format!("S3 get {key} failed: {}", cause(&other))),
+                other => unavailable(format!("S3 get {key} failed: {}", described(&other))),
             })?;
 
         let bytes = object
             .body
             .collect()
             .await
-            .map_err(|e| unavailable(format!("S3 read {key} failed: {}", cause(&e))))?;
+            .map_err(|e| unavailable(format!("S3 read {key} failed: {}", described(&e))))?;
         Ok(bytes.into_bytes())
     }
 }

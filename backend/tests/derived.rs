@@ -355,8 +355,17 @@ async fn a_build_from_a_lexicon_stored_before_object_keys_fails_naming_the_remed
     .unwrap();
     assert!((290.0..=300.0).contains(&wait), "five minutes: {wait}");
     assert!(!build_next(&state).await, "a failed row waits before its next attempt");
+    let_the_wait_pass(&db).await;
+    assert!(build_next(&state).await);
+    let wait: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM leased_until - now())::float8 FROM derived_data WHERE name = 'NWL20'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!((890.0..=900.0).contains(&wait), "then fifteen: {wait}");
 
-    let mut builds = 1;
+    let mut builds = 2;
     for _ in 0..10 {
         let_the_wait_pass(&db).await;
         while build_next(&state).await {

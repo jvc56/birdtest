@@ -1052,3 +1052,39 @@ async fn scoring_never_holds_up_a_sign_in_and_a_link_buys_few() {
     }
 }
 
+/// A-AUTH-4g: a name that differs from a taken one only in joiners or
+/// variation selectors is taken too. Where a script allows them they may
+/// still change nothing a reader sees, and each such twin was an account.
+#[tokio::test]
+async fn a_name_differing_only_in_joiners_is_taken() {
+    let db = TestDb::new().await;
+    let (state, _outbox) = mail_state(&db, 1).await;
+    let app = birdtest::app(state);
+
+    let first = register(&app, "\u{0628}\u{0628}\u{0628}\u{0628}", "one@example.invalid", PASSWORD, "10.7.0.1").await;
+    assert_eq!(first.status, StatusCode::CREATED, "{first:?}");
+    for (i, twin) in ["\u{0628}\u{200D}\u{0628}\u{0628}\u{0628}", "\u{0628}\u{200C}\u{0628}\u{0628}\u{0628}"]
+        .into_iter()
+        .enumerate()
+    {
+        let again = register(&app, twin, &format!("twin{i}@example.invalid"), PASSWORD, &format!("10.7.1.{i}")).await;
+        assert_eq!(again.status, StatusCode::CONFLICT, "{twin:?}: {again:?}");
+    }
+    // An unconfirmed twin whose link has expired gives up the name, as an
+    // exact one does: refused as taken and never released, it held the name
+    // for good.
+    let lapsed = register(&app, "\u{0633}\u{200D}\u{0633}\u{0633}", "lapsed@example.invalid", PASSWORD, "10.7.3.1").await;
+    assert_eq!(lapsed.status, StatusCode::CREATED, "{lapsed:?}");
+    sqlx::query("UPDATE email_confirmations SET expires_at = now() - interval '1 minute'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let claimed = register(&app, "\u{0633}\u{0633}\u{0633}", "claimer@example.invalid", PASSWORD, "10.7.3.2").await;
+    assert_eq!(claimed.status, StatusCode::CREATED, "the expired twin gave it up: {claimed:?}");
+
+    let emoji = register(&app, "\u{2764}\u{2764}\u{2764}", "two@example.invalid", PASSWORD, "10.7.2.1").await;
+    assert_eq!(emoji.status, StatusCode::CREATED, "{emoji:?}");
+    let selected = register(&app, "\u{2764}\u{FE0F}\u{2764}\u{2764}", "three@example.invalid", PASSWORD, "10.7.2.2").await;
+    assert_eq!(selected.status, StatusCode::CONFLICT, "{selected:?}");
+}
+

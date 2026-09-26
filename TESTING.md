@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 208 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 117 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 154 | `backend/tests/`: `leave_gen.rs` (33), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (13), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 192 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (36), `auth_routes.rs` (22), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 1 Unit | 209 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 118 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 155 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (13), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 195 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 582 backend tests (the per-tier counts above are
+--run-ignored all` runs 587 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -689,7 +689,9 @@ Each entry's tests are the `describe` block named for its id.
 - `F-API-2` A 204 resolves to `undefined` rather than throwing on an empty body.
   *(Covered: `api.test.ts`.)*
 - `F-API-3` A 4xx with a JSON error body rejects with an `ApiError` carrying
-  `status`, `code`, `message` and `fields`. *(Covered: `api.test.ts`.)*
+  `status`, `code`, `message` and `fields`, and `Retry-After` in seconds when
+  the server sent one (the reset page says how long to wait). *(Covered:
+  `api.test.ts`.)*
 - `F-API-4` A 4xx with an empty or non-JSON body still rejects with an
   `ApiError`, not a `SyntaxError` — as does a 200 whose body is not JSON —
   and its message is never empty, the status text being empty over HTTP/2
@@ -1015,7 +1017,9 @@ The single most important group. Every entry is about a decision made in SQL.
   and `task_claims_anon_unique_idx` are partial on
   `WHERE state NOT IN ('abandoned','declined')`. Drop `'declined'` from either
   and a worker that declines a task is permanently barred from claiming it again
-  after fixing its data. Nothing else catches this. *(Covered:
+  after fixing its data. Nothing else catches this. (Within an hour of the
+  decline it is offered other work instead, `A-WORKER-19`; after it, the same
+  task.) *(Covered:
   `scheduler::a_worker_that_declined_a_task_can_claim_the_same_task_again`.)*
 - `I-SCHED-16` One worker cannot hold two simultaneous claims on the same task,
   by either identity type. *(Covered:
@@ -1353,6 +1357,12 @@ job creation touches needs one caller here.
   holds its job's lock, so merges waiting on one job leave every other job
   free to merge. *(Covered:
   `leave_gen::merges_waiting_on_one_job_leave_other_jobs_free_to_merge`.)*
+  (Thirty-second audit.)
+- `I-LEAVE-23` A declined leave task is reissued as it stands, the decliner
+  included, and no rack is forced by two open claims: skipped for its
+  decliner, the claim went to rack selection, which forced the same racks
+  again on a second claim. *(Covered:
+  `leave_gen::a_declined_leave_task_is_reissued_as_it_stands`.)*
   (Thirty-second audit.)
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
@@ -1830,6 +1840,13 @@ below.
   `auth_routes::a_username_cannot_carry_a_message_into_mail`,
   `routes::auth::tests::a_username_holds_no_line_break_or_hidden_character`.)*
   (Thirty-second audit.)
+- `A-AUTH-4g` A name that differs from a taken one only in joiners or variation
+  selectors is taken, since where a script allows them they may change nothing
+  a reader sees (`ب‍ببب` beside `بببب`, `❤️❤❤` beside `❤❤❤`); and an
+  unconfirmed twin whose link has expired gives the name up, as an exact one
+  does. *(Covered:
+  `auth_routes::a_name_differing_only_in_joiners_is_taken`.)* (Thirty-second
+  audit.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
   scored the new password without the account's context. *(Covered:
@@ -1997,6 +2014,19 @@ below.
   not do, in the audit's second pass.)*
   (Thirty-first audit; one at a time, as first written, serialized a fleet on
   one key.)
+- `A-WORKER-19` A task a worker declined is not offered to that worker again
+  for an hour (outside leave generation, `I-LEAVE-23`): declined, it was the oldest available task and went straight
+  back to whoever claimed next — the worker that had just failed it included —
+  so one task that fails everywhere stopped every contributor claiming from
+  its job (MAGPIE stops after five failures in a row). Another worker is still
+  offered it. *(Covered:
+  `worker_api::a_declined_task_is_not_handed_back_to_the_worker_that_declined_it`.)*
+  (Thirty-second audit.)
+- `A-WORKER-20` A result carrying captured positions for a job that does not
+  capture them is refused, and nothing is stored; a capturing job's result
+  with two positions for one turn of one game is refused too. *(Covered:
+  `worker_api::positions_from_a_job_that_does_not_capture_them_are_refused`,
+  `jobs::game::tests::one_captured_position_a_turn`.)* (Thirty-second audit.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*

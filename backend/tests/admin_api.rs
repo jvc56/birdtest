@@ -2082,7 +2082,7 @@ async fn a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused() {
     let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(&players[0]))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["fields"][0]["field"], "letterdist_id", "{body}");
-    assert!(body["message"].as_str().unwrap().contains("3 blanks"), "{body}");
+    assert!(body["fields"][0]["message"].as_str().unwrap().contains("3 blanks"), "{body}");
     let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs").fetch_one(&db.pool).await.unwrap();
     let queued: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM derived_data").fetch_one(&db.pool).await.unwrap();
@@ -2122,6 +2122,20 @@ async fn a_retry_resets_only_the_build_it_names() {
     assert_eq!(status, StatusCode::OK, "{list}");
     let row = list.as_array().unwrap().iter().find(|r| r["builder"] == "wmp-1").unwrap().clone();
     assert_eq!(row["kwg_id"], json!(kwg), "{row}");
+    assert_eq!(row["buildable"], json!(true), "{row}");
+    assert!(row["made_from"].as_str().unwrap().contains("NWL23"), "{row}");
+    let other = list.as_array().unwrap().iter().find(|r| r["builder"] == "wmp-0").unwrap();
+    assert_eq!(other["buildable"], json!(false), "no builder of this MAGPIE takes it: {other}");
+    // Some of a row's ids but not all, or none, is a mistake, said so: by
+    // role and name alone it reset both rows.
+    for partial in [
+        json!({ "role": "wmp", "name": "NWL23", "builder": "wmp-1", "kwg_id": kwg }),
+        json!({ "role": "wmp", "name": "NWL23" }),
+    ] {
+        let (status, body) =
+            send(&app, post_json("/api/admin/derived-data/retry", &headers, partial)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
     let (status, body) = send(&app, post_json("/api/admin/derived-data/retry", &headers, json!({
         "role": row["role"], "name": row["name"], "builder": row["builder"],
         "kwg_id": row["kwg_id"], "klv_id": row["klv_id"], "letterdist_id": row["letterdist_id"],

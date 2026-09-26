@@ -11,10 +11,18 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
-    readonly fields: Record<string, string> = {}
+    readonly fields: Record<string, string> = {},
+    /** Seconds to wait, from `Retry-After`, when the server gave one. */
+    readonly retryAfter: number | null = null
   ) {
     super(message);
   }
+}
+
+/** `Retry-After` in seconds; its HTTP-date form is not one the server sends. */
+function retryAfterSeconds(header: string | null): number | null {
+  const seconds = header === null ? NaN : Number(header);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
 }
 
 /**
@@ -76,7 +84,8 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
       // so an answer with no JSON (the ALB's own 502/503 during a deploy)
       // produced an error with no message, and pages showed nothing at all.
       payload?.message ?? (response.statusText || `The server answered ${response.status}.`),
-      fields
+      fields,
+      retryAfterSeconds(response.headers.get('retry-after'))
     );
   }
   return payload as T;
@@ -364,6 +373,10 @@ export interface DerivedData {
   name: string;
   /** The builder that produced the hash, e.g. `wmp-1`. */
   builder: string;
+  /** Its files, as paths and the tarballs they came from. */
+  made_from: string;
+  /** Whether a builder of this server's MAGPIE takes it. */
+  buildable: boolean;
   /** The files it is built from: what tells two rows of one name apart. */
   kwg_id: string;
   klv_id: string | null;

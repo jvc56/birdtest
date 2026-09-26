@@ -674,7 +674,7 @@ async fn a_task_at_redundancy_is_not_handed_to_a_third_worker() {
 /// I-SCHED-15: the per-identity unique indexes are partial on
 /// `state NOT IN ('abandoned', 'declined')`. A worker that declined a task --
 /// it was missing a file -- and then fixed its data claims that same task
-/// again, by anonymous UUID and by account alike. With `'declined'` dropped
+/// again an hour on, by anonymous UUID and by account alike. With `'declined'` dropped
 /// from either index, the second claim collides with the first and the worker
 /// is barred from that task for good.
 #[tokio::test]
@@ -709,6 +709,25 @@ async fn a_worker_that_declined_a_task_can_claim_the_same_task_again() {
                 .unwrap();
         tx.commit().await.unwrap();
         assert!(released);
+
+        // Within the hour it is offered other work: a task that fails on
+        // every worker must not be handed straight back to each (A-WORKER-19).
+        let meanwhile = claim_task(&state, &worker, &only_this).await;
+        assert_ne!(task_of(&db, meanwhile.claim_token).await, task, "{worker:?}: not straight back");
+        let mut tx = db.pool.begin().await.unwrap();
+        scheduler::release_claim(&mut tx, claim_id_of(&db, meanwhile.claim_token).await, "abandoned")
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        // An hour on -- its data fixed, say -- the same task, again.
+        sqlx::query(
+            "UPDATE task_claims SET claimed_at = now() - interval '2 hours', last_heartbeat_at = NULL
+             WHERE claim_token = $1",
+        )
+        .bind(first.claim_token)
+        .execute(&db.pool)
+        .await
+        .unwrap();
 
         let again = claim_task(&state, &worker, &only_this).await;
         assert_eq!(task_of(&db, again.claim_token).await, task, "{worker:?}: the same task, again");

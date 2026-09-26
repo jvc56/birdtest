@@ -26,7 +26,16 @@ pub(super) fn validate_positions(
     const MAX_TURNS_PER_GAME: i16 = 400;
 
     let mut out = Vec::with_capacity(positions.len());
+    // One position a turn of a game: a second was stored as neither (the row
+    // kept the first's position, the moves matched back to the last's).
+    let mut seen = std::collections::HashSet::with_capacity(positions.len());
     for position in positions {
+        if !seen.insert((position.game_index, position.turn_number)) {
+            return Err(AppError::bad_request(format!(
+                "two captured positions for turn {} of game {}",
+                position.turn_number, position.game_index
+            )));
+        }
         if position.game_index < 0 || position.game_index as i32 >= games_in_batch {
             return Err(AppError::bad_request(format!(
                 "captured position names game {} but the batch has {games_in_batch}",
@@ -202,6 +211,23 @@ pub(super) fn seed_from_row(row: &sqlx::postgres::PgRow) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::past_the_cap;
+
+    /// Two captured positions for one turn of one game are refused: stored,
+    /// the row kept the first's position and the moves the last's.
+    #[test]
+    fn one_captured_position_a_turn() {
+        let position = |turn: i16| -> crate::jobs::handler::CapturedPosition {
+            serde_json::from_value(serde_json::json!({
+                "game_index": 0, "turn_number": turn, "rack": "AEINRST",
+                "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
+                "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
+            }))
+            .unwrap()
+        };
+        assert!(super::validate_positions(vec![position(0), position(1)], 1).is_ok());
+        let err = super::validate_positions(vec![position(0), position(0)], 1).unwrap_err();
+        assert!(err.message.contains("two captured positions"), "{}", err.message);
+    }
 
     #[test]
     fn dispatch_stops_once_every_unit_up_to_the_cap_is_out() {
