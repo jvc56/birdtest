@@ -132,7 +132,7 @@ one of them rejects an arithmetic or physical impossibility:
 | Score means and standard deviations are finite | `NaN`/`Inf` is what an uninitialised or corrupted buffer serialises to |
 | A standard deviation is not negative | Arithmetically impossible; the number did not come from a variance calculation |
 | Mean scores lie within generous absolute bounds | A word game cannot average a negative or four-figure score |
-| A play scores between 0 and 2,000 | A pass scores 0 and the theoretical maximum play is a little over 1,700 |
+| A play scores between 0 and 100,000 | A pass scores 0; the theoretical maximum play is a little over 1,700 on the 15×15 board, and the 21×21 board's quadruple-word corners multiply an edge-long word by 144, so the bound sits far above both (it was 2,000 until the thirty-second audit) |
 | Win percentages and blended utilities are inside their ranges | A probability is bounded by definition |
 | A rack has 1–7 tiles | More tiles than a rack holds cannot be dealt |
 | `num_moves` is at least the number of moves reported | A worker cannot report more moves than it says it generated |
@@ -310,7 +310,14 @@ For game and game-pair jobs, results are evaluated using the Sequential Probabil
 
 SPRT is evaluated inline on the submission path (no background sweep), and
 **debounced**: every eighth submission for a job, plus unconditionally whenever
-that job has nothing left in flight. The server flips the job to `completed`
+that job has nothing left in flight. A submission checks only while its job is
+active, so one more trigger covers the results that land with nobody to check
+them — the last results of a job deactivated while they were out, or a last
+check that failed: a claim that finds a games, pairs or opening-rack job with
+nothing to hand out and no claim in flight checks it, off the claim request, at
+most every ten seconds per job and at once after an activation. Without it such
+a job, reactivated, stayed active at its allocation for good (thirty-second
+audit). The server flips the job to `completed`
 automatically when either condition is met, and **stores the verdict it completed
 on** — status, LLR and units (`jobs.sprt_decided_*`) — with the completion. The
 claims in flight at that moment are still played and accepted, and the live
@@ -483,7 +490,7 @@ a bot's rating be fixed once it is established?" has no good answer because
 
 What birdtest actually has is a static tournament: N configs and a matrix of
 pairwise results. The right tool is a **batch maximum-likelihood fit** over the
-whole matrix at once — Bradley-Terry, solved by minorization-maximization,
+whole matrix at once — Bradley-Terry, solved by Newton's method,
 anchored on one config at a fixed rating. Every rating is a joint solution to the
 entire graph, recomputed from scratch whenever the pool or the evidence changes.
 Three properties follow, and they are the reasons for the choice:
@@ -497,15 +504,20 @@ Three properties follow, and they are the reasons for the choice:
   (`rating_pools.anchor_player_config_id`, conventionally a static bot at 2000).
   No other rating is ever frozen.
 
-MM is used rather than a gradient method because each step is a closed-form
-ratio with no step size to tune, it cannot overshoot, and it converges
-monotonically. For a small, well-connected pool it lands in microseconds, which
-is what makes "refit everything on every change" affordable rather than
-aspirational. It converges very slowly on a group of configs that moves
-together, though: a large pool, or one tied to its anchor by a thin link, can
-stop at the 10,000-iteration cap short of the answer (the thirty-first audit
-measured −34 Elo on a 12-member cluster, and more on a 20-config chain), and
-the page then marks the fit unconverged. KL-74.
+The fit is Newton's method on the log-strengths, with a backtracking line
+search, no step moving any config more than about 1,400 Elo, a small step
+taken whole, and damping if rounding makes the curvature fail to factor. The
+objective, the likelihood plus the prior below, is strictly concave, so it has
+one answer; each step solves for every config at once through the full
+curvature, which is what a group of configs that moves together needs. (Without the step bound, clean sweeps that
+contradict the rest of a pool could throw one config thousands of Elo away in a
+single step, where every head-to-head it has saturates and the fit stalls; the
+thirty-second audit's adversarial check found that.) Minorization-maximization, which the fit used until the thirty-second
+audit, updated one config at a time and crept toward such a group's answer,
+stopping at its iteration cap short of it (KL-74). A step is a Cholesky
+factorisation of an `n × n` matrix, so a hundred-member pool fits in
+milliseconds, which is what makes "refit everything on every change"
+affordable rather than aspirational.
 
 #### Non-transitivity is displayed, not solved
 
@@ -526,8 +538,7 @@ table beside it, and says so when the residuals are large enough that the
 ranking should not be read as one: three or more head-to-heads at least five
 points off *and* at least three standard errors from zero on the pairs behind
 them (`charts/residuals.ts`). Without the second condition a young pool — a few
-pairs per head-to-head, and a prior that pulls lightly observed configs toward
-the anchor — showed the warning on sampling noise alone.
+pairs per head-to-head — showed the warning on sampling noise alone.
 
 #### What counts as evidence
 
@@ -565,30 +576,62 @@ scale.
 
 - **Separation.** A config that has never lost sends the unregularised maximum
   likelihood to infinity, and that is not an edge case — it is what a strong new
-  bot's first job looks like. The fit adds a small prior (virtual drawn games
-  against a player of the anchor's strength), which keeps every rating finite and
-  pulls the barely-observed toward the anchor, where a wide standard error then
-  says how little the number is worth.
+  bot's first job looks like — and undefined for a config with no games. So
+  every config, the anchor included, plays virtual drawn games against a
+  virtual config at the pool's *centre*, the plain mean of every rating, on a
+  logistic twice as wide as real games' (about 350 Elo against 174): two for a
+  config with no games, fading with its real ones as `2 / (1 + g/200)` but
+  never below a fifth, since the prior is for the barely played. That
+  keeps every rating finite and the objective strictly concave: one answer,
+  continuous in the scores, and conceding a point lowers a config against its
+  opponent (its own rating, too, all but about once in 500 fuzzed cases, by
+  under an Elo). The
+  pull is toward the pool's centre, not the anchor, so a field or group far
+  from the anchor is not dragged back to it; and it joins configs only through
+  the centre, never to each other. Its cost is a pull that levels off at a
+  constant per config, however far a config is from the centre, and adds up
+  along a thin chain: a 12-rung ladder, each rung 100 Elo above the last and
+  played only against it over 100 pairs, has its top some 40 Elo low, about a
+  third of its error (KL-79). The wider scale and the fade are what keep that
+  small: left whole on well played configs, the pulls held a strong tier joined
+  to the rest by one job some 345 Elo low, nearly four errors. The
+  thirty-second audit tried six other priors, and each pulled some shape of
+  pool where the evidence was fine: two draws per config against the anchor, a field or thinly linked group
+  far from it (a 30-member group 200 Elo low, KL-74); two per config spread
+  over its opponents, a config over a gauntlet of lightly played ones; draws
+  only where the maximum likelihood diverges, a 200-Elo jump when a newcomer
+  conceded a quarter point; Firth's penalty, which is not concave, two answers
+  for a config between far-apart opponents; the centre prior left whole, a
+  thinly joined strong tier held nearly four errors low; and a centre fitted as
+  a strength of its own, which followed a newcomer's unfaded virtual games in a
+  mature pool, leaving its first job barely shrunk.
 - **Connectivity.** If two configs only ever played each other and neither
   connects to the anchor's component, their ratings are unidentifiable — the fit
   would otherwise return a confident number produced entirely by the prior. Each
   rating carries `connected_to_anchor`, and the page shows an unconnected config
   as **unrated** rather than as a plausible-looking 1500.
 
-Standard errors come from the diagonal of the Fisher information, counting each
-paired game as one trial. Three approximations pull them different ways, so
-they bound the true uncertainty neither way. Ignoring the off-diagonal terms
-narrows them. Counting a pair (two games, scored in quarters) as one trial
-widens them by √(2/(1+ρ)), where ρ is the correlation between a pair's two
-games: √2 if they are independent, more when pairing works (ρ < 0), less when a
-config wins both halves on the same racks (ρ > 0), and never below 1. And the
-prior's virtual games are in the fit but not in the information, which widens
-them most for the barely-played. They are good enough for the distinction the page
-needs to draw, 1700 ± 15 against 1700 ± 200, **for a config tied closely to the
-anchor**. For a group linked to it thinly, the diagonal leaves out the
-uncertainty of that link, and the prior's pull adds up across the group: the
-thirty-first audit measured errors shown as ±2 to ±6 where the full covariance
-gives ±28, and a 30-member cluster fitted 200 Elo off (KL-74).
+Standard errors come from the inverse of the full Fisher information over the
+anchor's component, counting each paired game as one trial, so a config's
+error includes the uncertainty of every link between it and the anchor: a
+group joined to the anchor by one 300-pair job carries that job's ±28 Elo,
+where the diagonal the fit used until the thirty-second audit showed ±2 (KL-74).
+Each error is also widened by how far the prior holds that config from where
+its games alone would put it — one Newton step on the games from the answer,
+`I⁻¹ · ∇prior`, taken one and a half times since one step underestimates a
+pull that has saturated — added to its variance. The prior's pulls add up
+across a group joined to the rest thinly, which no weighting of it removes
+(KL-79): two tiers of lightly played configs 600 to 800 Elo apart, joined by
+one small job, put the upper one about two of the games' errors low, its 95%
+interval covering the truth 30 to 65% of the time; with the pull in its error,
+95 to 100%. Two further approximations remain, and both widen the errors. Counting a pair (two games,
+scored in quarters) as one trial widens them by √(2/(1+ρ)), where ρ is the
+correlation between a pair's two games: √2 if they are independent, more when
+pairing works (ρ < 0), less when a config wins both halves on the same racks
+(ρ > 0), and never below 1. And the prior's virtual games are in the fit but
+not in the information, which widens them most for the barely-played. They are
+good enough for the distinction the page needs to draw, 1700 ± 15 against
+1700 ± 200.
 
 #### When a fit runs
 
@@ -779,7 +822,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 **Games / Game pairs**
 
-- SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `terminated at max games`.
+- SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `stopped at its cap`.
 - The pentanomial (game pairs only): the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
 - Running result counts and percentages: wins / losses / draws for player 1.
 
@@ -1258,15 +1301,16 @@ What the numbers settled:
   every progress row the job has: 4.0 s a page over HTTP at one full-size
   generation, on a public route. It runs newest generation first and then by
   rack, read a generation at a time because the two directions differ: 7 ms.
-- **Copying the rack universe to the next generation is the one slow write**, and
-  it is slow on an under-provisioned database: a minute here, against about 15
-  seconds for a whole transition on the smaller dev database. It runs once per
-  generation, detached from the request, so it costs time rather than
-  correctness. The production instance class has not been measured;
-  `scripts/leave-gen-bench.sh` does it in one command, and if the copy is slow
-  there it can be removed rather than tuned — treat a missing row as zero
-  occurrences and select a generation's racks by anti-joining the previous
-  generation's rows instead of copying them.
+- **Writing a generation's rack universe is the one slow write**, and it is
+  slow on an under-provisioned database: a minute here for 3.2 million rows. It
+  runs once per generation, on a task of its own started by the generation's
+  first claim, generated from the pinned letter distribution and `COPY`ed in
+  (`seed_generation`; see [Leave Generation](#leave-generation--on-demand-partitioned-generations)), so it costs
+  the job time rather than correctness, and no worker waits on it. The
+  production instance class has not been measured. (A script that timed copying
+  the previous generation's rows against generating them settled that choice,
+  and was removed in the thirty-second audit once it no longer ran against the
+  schema.)
 
 ---
 
@@ -2647,7 +2691,7 @@ The derivation is MAGPIE's own `rack_list_write_to_klv`. Each full rack `R` has 
 
 **The server used to do this itself**, in a Rust translation of that function (`jobs/klv.rs`, 868 lines). It was a faithful translation, cross-validated against a real MAGPIE binary — but it had to change whenever MAGPIE's did and nothing made it, and its KLVs differed in bytes from MAGPIE's for the same leave values, because it built a plain trie where MAGPIE builds a minimized DAWG. Both are correct and they load to the same values; having two of them was a standing source of confusion, and the second one was the one nobody would notice going stale.
 
-So the transfer is a CSV instead: `generation_klv` streams the generation's roughly 3.2 million `rack,count,equity_sum` rows into a scratch directory, `convert rackequity2klv` reads them into a `RackList` and writes the KLV, and the server reads the bytes back and uploads them. Neither side holds a generation in memory. Before `klv.rs` was deleted, the two were run against each other over the whole 149-rack test distribution and agreed on every leave value.
+So the transfer is a CSV instead: `generation_klv` streams the generation's roughly 3.2 million `rack,count,equity_sum` rows into a scratch directory, `convert rackequity2klv` reads them into a `RackList` and writes the KLV, and the server reads the bytes back and uploads them. The server does not hold a generation in memory; MAGPIE's `RackList` does, some 375 MB at its peak for English in 32 seconds, in the web task (KL-44). Before `klv.rs` was deleted, the two were run against each other over the whole 149-rack test distribution and agreed on every leave value.
 
 `rackequity2klv` is new on the MAGPIE side, along with a `RackList` setter that takes a rack's count and mean outright: `rack_list_add_rack` folds one game's equity at a time, which is what a `leavegen` run has and not what a whole generation's aggregate is. Every full rack must appear exactly once in the CSV — a rack the file omits would contribute a mean of zero at full weight to every leave it contains, which is a real leave value and indistinguishable from a measured one — so MAGPIE marks every rack unset before reading and refuses a file that leaves any of them that way.
 
@@ -3334,8 +3378,9 @@ cryptographically secure random source at all.
 
 Because the file is resolved relative to the working directory, a contributor who
 runs MAGPIE from a different directory has no `contribute.txt` there and
-`contribute` stops with a clear error — a better failure than silently becoming a
-new anonymous worker and losing their contribution history.
+`contribute` stops rather than silently becoming a new anonymous worker and
+losing their contribution history. (Without `./data` it stops even earlier, on
+loading its default board layout, and exits 0 either way.)
 
 **The API key needs no special file handling.** `contribute.txt` holds a bearer
 credential when `apikey` is set, but nothing about that requires MAGPIE-side
@@ -4995,9 +5040,12 @@ birdtest/
 │   ├── prod-shell.sh               # an interactive psql-capable shell there, over ECS Exec (--attach to return)
 │   ├── dev-dump.sh                 # snapshot the local Postgres + MinIO state
 │   ├── dev-restore.sh              # put it back
-│   ├── leave-gen-bench.sh          # time a generation transition's SQL against any database,
-│   │                               # in a rolled-back transaction — see Dashboard,
-│   │                               # "What these reads cost"
+│   ├── restore-job.sh              # copy one purged or deleted job back from a scratch restore
+│   │                               # (RUNBOOK §2.2; also embedded in the ops task, infra/ops.tf)
+│   ├── restore-job-check.sh        # restore-job.sh through its failure and re-run cases (nightly)
+│   ├── backup-drill-check.sh       # backup.sh and restore-drill.sh against a local stack (nightly)
+│   ├── e2e_magpie_native.sh        # tier 6 natively: real MAGPIE, throwaway Postgres and MinIO
+│   ├── capture_contract.py         # capture the worker API's contract fixtures
 │   ├── dev.py                      # bring the stack up with real MAGPIE contributors
 │   ├── seed.py                     # seed an admin, input data, player configs and jobs
 │   ├── e2e_magpie.py               # tier 6: one real `magpie contribute` task per job type
@@ -5048,7 +5096,7 @@ birdtest/
 │       ├── stats/
 │       │   ├── mod.rs
 │       │   ├── sprt.rs             # SPRT LLR and boundaries
-│       │   └── bradley_terry.rs    # batch anchored rating fit (MM)
+│       │   └── bradley_terry.rs    # batch anchored rating fit (Newton)
 │       ├── jobs/                   # job type system
 │       │   ├── mod.rs              # shared request/record helpers
 │       │   ├── handler.rs          # JobHandler trait plus wire types
@@ -6589,7 +6637,7 @@ CREATE TABLE rating_runs (
     -- Why this run happened: 'membership' (an admin added or removed a config),
     -- 'evidence' (new results arrived), or 'manual'.
     trigger       TEXT NOT NULL,
-    method        TEXT NOT NULL DEFAULT 'bradley_terry_mm',
+    method        TEXT NOT NULL DEFAULT 'bradley_terry_newton',
     -- Fit provenance. A run that did not converge is still stored and still
     -- displayed, flagged: hiding it would leave the page silently stale.
     iterations    INT NOT NULL,
@@ -6787,8 +6835,8 @@ twenty-fourth's `AUDIT_FINDINGS_20.md`, the twenty-fifth's
 `AUDIT_FINDINGS_21.md`, the twenty-sixth's `AUDIT_FINDINGS_22.md`, the
 twenty-seventh's `AUDIT_FINDINGS_23.md`, the twenty-eighth's
 `AUDIT_FINDINGS_24.md`, the twenty-ninth's `AUDIT_FINDINGS_25.md`, the
-thirtieth's `AUDIT_FINDINGS_26.md` and the thirty-first's
-`AUDIT_FINDINGS_27.md`.
+thirtieth's `AUDIT_FINDINGS_26.md`, the thirty-first's `AUDIT_FINDINGS_27.md`
+and the thirty-second's `AUDIT_FINDINGS_28.md`.
 Everything they *changed* is described where it lives, above. This section is
 what they *left*: limits that were accepted on purpose, options that were
 considered and not built, and small things noted rather than fixed.
@@ -7051,13 +7099,17 @@ says so in its implemented option, rather than being removed.
   capture jobs' and some opening-rack jobs' (500 racks a task, with a simming
   player recording ten or more moves, is some 2 MB). And a small body has a
   fixed 30 seconds: a claim listing jobs its worker cannot run near the 1 MiB
-  bound, on a link under about 35 KB/s, never arrives in time.
+  bound, on a link under about 35 KB/s, never arrives in time. The same fixed
+  30 seconds applies to a result of up to 1 MiB, while one just over it gets
+  30 s plus its size at 64 KiB/s: a 1.0 MiB result on a 32 KB/s uplink is
+  refused on every retry where a 1.01 MiB one would pass (thirty-second audit).
 - **Options considered:**
   - charge a large body as its bytes arrive, so holding it costs the bytes (at
     the price of honest uploads holding part of the budget while they wait);
   - a minimum average rate enforced as the body arrives, not only by its
     deadline;
-  - rate rules at the load balancer (AWS WAF).
+  - rate rules at the load balancer (AWS WAF);
+  - the large tier's rate-based deadline for a registered result of any size.
 - **Option implemented:** Reservation, per-identity, deadline and stall limit.
 - **Justification:** The holders need identities an admin can ban, and nothing
   but large results waits on it. Revisit if capture or simming opening-rack
@@ -7146,7 +7198,12 @@ says so in its implemented option, rather than being removed.
   resolution of the last merge.
 
 **KL-17. Claims on one leave job serialize on its dispatch lock.**
-- **Context:** Selection is a fraction of a millisecond.
+- **Context:** Selection is a fraction of a millisecond for most of a lap. Late
+  in a lap, with about 2% of racks still below target and the heap no longer in
+  rack order (as repeated merges leave it), a sweep claim walks some 26,500 key
+  entries with a heap fetch each: 48–100 ms with the OS cache warm, measured in
+  the thirty-second audit; on an instance whose cache cannot hold the
+  generation it is thousands of random reads, inside the lock (not measured).
 - **Problem:** The claim rate has a ceiling per job.
 - **Options considered:** larger tasks.
 - **Option implemented:** `num_iterations` is the tuning knob: larger tasks mean
@@ -7457,8 +7514,13 @@ says so in its implemented option, rather than being removed.
   release's 250 MB uncompressed (the thirty-first audit's count; this entry said
   a 94 MB tarball alone).
 - **Problem:** Some 450 MB an import at the current release's size: two admins
-  importing at once on a 2 GB task is close, three is not.
-- **Options considered:** None recorded.
+  importing at once on a 2 GB task is close, three is not. The same task also
+  runs MAGPIE's `convert rackequity2klv` for every leave transition and every
+  "Check artifacts" rebuild, 375 MB at its peak for English, with nothing
+  bounding how many run at once (thirty-second audit); an import, the 192 MiB
+  large-result budget and two or three conversions together approach 2 GB.
+- **Options considered:** None recorded for imports; a semaphore of one or two
+  around KLV conversions.
 - **Option implemented:** None.
 - **Justification:** Imports are admin-only.
 
@@ -7538,32 +7600,69 @@ says so in its implemented option, rather than being removed.
 - **Justification:** The pages render no component tests today (tier 1F is
   plain TypeScript); the journeys (tier 5) read the account page.
 
-**KL-74. The rating fit biases large or thinly linked groups, and understates their errors.**
-- **Context:** `stats/bradley_terry.rs`: MM iteration capped at 10,000, a prior
-  of two virtual draws for every member against the anchor's strength, and
-  standard errors from the diagonal of the information (thirty-first audit,
-  pass 4).
-- **Problem:** The prior's pull adds up across any group of configs joined to
-  the anchor only through a few links, and MM converges very slowly on a group
-  that moves together. Measured with noiseless evidence against the real fit: a
-  12-member cluster linked by one 300-pair job is stored 42 Elo low with a shown
-  error of ±1.9 (the full-covariance error is about ±28), unconverged; a
-  20-config chain's top is 36.5 Elo low; a 30-member cluster about 200 low. A
-  well-played island with no path to the anchor holds the fit at the cap and
-  marks the whole pool unconverged. The page warns on an unconverged fit, not
-  on the prior's bias.
+**KL-74. The rating fit biased large or thinly linked groups, and understated their errors.** Closed in the thirty-second audit.
+- **Context:** `stats/bradley_terry.rs`: the fit was MM iteration capped at
+  10,000, with a prior of two virtual draws for every member against the
+  anchor's strength, and standard errors from the diagonal of the information
+  (opened in the thirty-first audit, pass 4).
+- **Problem:** The prior's pull added up across any group of configs joined to
+  the anchor only through a few links, and MM converged very slowly on a group
+  that moves together. Measured with noiseless evidence: a 12-member cluster
+  linked by one 300-pair job was stored 42 Elo low with a shown error of ±1.9
+  (the full-covariance error is about ±28), unconverged; a 20-config chain's
+  top 36.5 Elo low; a 30-member cluster about 200 low. A well-played island
+  with no path to the anchor held the fit at the cap and marked the whole pool
+  unconverged.
 - **Options considered:**
-  - a Newton / IRLS solve on log-strengths with the full Hessian, a few steps
-    for up to a hundred members;
+  - a Newton / IRLS solve on log-strengths with the full Hessian;
   - a much weaker prior, or one applied only to configs with a perfect or zero
     score, so it no longer ties every member to the anchor;
+  - a prior spread over each config's actual opponents;
   - standard errors from the inverse of the full information matrix.
-- **Option implemented:** None yet. *Open (thirty-first audit)*, medium; the
-  docs now say what the fit does.
-- **Justification:** Each option changes what every published rating is, and
-  the prior's strength is a statistical decision (how far to trust a
-  barely-played config) rather than a bug fix. The audit's last pass could not
-  make it and verify it; it is the first thing to take up next.
+- **Option implemented:** All three parts, in the thirty-second audit (pass 1),
+  the prior after seven versions that each failed an adversarial check. The fit
+  is Newton's method with a backtracking line search on a strictly concave
+  objective, each step bounded at 8 natural-log units (about 1,400 Elo), a step
+  under 0.5 taken whole, convergence judged on the full step, and damping if
+  the curvature fails to factor. The prior is virtual drawn games against the
+  pool's centre, the plain mean of every rating, on a logistic twice as wide as
+  real games', two for a config with no games and `2 / (1 + g/200)`, at least
+  0.2, for one with `g`. Errors are the diagonal of the inverse of the full information over
+  the anchor's component, the prior left out, as before. `U-STATS-5` pins the
+  shapes above and the ones the adversarial checks found; runs record
+  `method = 'bradley_terry_newton'`.
+- **Justification:** Each version tried in the audit pulled some shape of pool:
+  - two draws per config toward the anchor (the old prior), converged: a field
+    400 Elo from the anchor some 200 low, a 12-rung ladder's top 390 low;
+  - two per config spread over its opponents, split evenly and then by the
+    smaller degree: a newcomer in a star halved, then a config over a gauntlet
+    of lightly played opponents 2 to 4 errors low;
+  - virtual draws only where the maximum likelihood diverges: a 200-Elo jump
+    when a newcomer conceded a quarter point;
+  - Firth's penalty: not concave, so a config between far-apart opponents had
+    two answers and a quarter point moved it 600 to 900 Elo;
+  - two draws per config against a fitted centre, not faded: a strong tier
+    joined to the rest by one job, 345 Elo and nearly four errors low;
+  - faded, against a centre fitted as a strength of its own: in a mature pool
+    the centre followed the newcomer, whose virtual games alone had not faded,
+    and a 3-pair sweep rose 460 Elo as the rest of the pool played on; and,
+    faded to nothing, a million-pair sweep left no curvature and a fit at the
+    answer was stored as not converged;
+  - against the mean rating, floored at a twentieth: a block that swept, or was
+    swept by, everything outside it floated thousands of Elo on unrelated
+    configs' pulls, every error infinite.
+
+  The pool-centre prior was compared with the old one in a Monte Carlo of every
+  shape found (gauntlet, a hub with twenty leaves, twenty shared swept
+  baselines, young round-robins and stars centred and 400 away, newcomers,
+  a config between far-apart opponents, two ladders, two tiers): faded at 200
+  games, its worst bias is some 40 Elo (a ladder's top, a third of its error;
+  a thinly joined strong tier some 30), against the old prior's 390 and 540.
+  Concavity is what makes it one answer, continuous and monotone; a centre at
+  the mean of the ratings keeps a far field in place and does not move with a
+  pool's maturity; the wider scale and the
+  fade keep pulls that add up inside the errors, at the price of more swing
+  for a barely played config between far-apart opponents (KL-79).
 
 **KL-75. Small things in rating pools.**
 - **Context:** `ratings.rs`, `routes/ratings.rs` (thirty-first audit, pass 4).
@@ -7576,8 +7675,13 @@ says so in its implemented option, rather than being removed.
     rule sets in one pool.
   - Adding a member already in the pool, or removing one that is not, writes an
     audit row and refits.
+  - The history chart ranks every config it has points for by its last rating,
+    configs since removed and members now unrated included, so they can take
+    the six drawn slots from current members, and its "the table below lists
+    every one" note is then wrong (thirty-second audit).
 - **Options considered:** thin by time buckets; add the two settings to the
-  pool's scope; answer a no-op membership change without a write.
+  pool's scope; answer a no-op membership change without a write; draw only
+  current, rated members.
 - **Option implemented:** None.
 - **Justification:** None changes a rating today; the defaults have not moved.
 
@@ -7587,9 +7691,14 @@ says so in its implemented option, rather than being removed.
 - **Problem:** Header links are 20 px tall, 24 px apart when they wrap at
   280 px, which is borderline for WCAG 2.5.8; and E-10's seeded contributors are
   all anonymous, so a long registered name — which widened the job page until
-  this audit — is not in the journey's data.
+  this audit — is not in the journey's data. And the rating charts keep fixed
+  margins for names and labels (204 px around the dot plot, 184 px around the
+  history), so at 320 px the dot plot's scale is 34 px wide and its tick labels
+  run together, and at 280 px four configs 600 Elo apart sit on one another; the
+  page does not scroll sideways, so E-10 passes (thirty-second audit).
 - **Options considered:** larger tap targets; a registered contributor with a
-  32-character name in E-10's seed.
+  32-character name in E-10's seed; narrower chart margins below the `sm`
+  breakpoint, or names stacked above the dots.
 - **Option implemented:** None.
 - **Justification:** Checked by hand in the audit's sweep (744 page loads, none
   wider than the screen); the seed change needs a tier-5 run to prove.
@@ -7611,6 +7720,90 @@ says so in its implemented option, rather than being removed.
 - **Justification:** No real writer produces either, and both fail safe: a
   worker hashes what it extracts and declines a mismatch.
 
+**KL-78. Small things found in the thirty-second audit and left.**
+- **Context:** The job pages, the purge path, the worker list (thirty-second
+  audit, pass 1).
+- **Problem:**
+  - A games job force-completed by an admin has no stored verdict, so its SPRT
+    panel shows the live status — "running … not acted on until N pairs are
+    complete" — on a completed job.
+  - Two purge races were reasoned about and not reproduced: a leave universe
+    seeding spawned in the microseconds before a purge commits could seed a
+    generation of the purged job; and a leave transition running when its job
+    is purged still uploads its KLV to the generation's key, which a re-run's
+    same generation shares, so an upload hung for hours could land over the
+    re-run's.
+  - Deleting a player config reads every row of `game_requests` (twice),
+    `opening_rack_requests`, `player_config_ratings` and
+    `rating_run_residuals` (twice) for its foreign-key checks, none of those
+    columns being indexed: 1.9 s warm at 4 million requests and 818 MB of
+    residuals, for a config nothing references; admin-only and rare.
+  - `GET /api/workers` answers a page past the end without its query now, but
+    a page just short of the end still reads `offset + limit` rows of each
+    arm's index: about 0.3 s at 300,000 contributing anonymous identities.
+- **Options considered:** label a force-completed job's SPRT panel as such;
+  drop the per-task request tables' foreign keys to player configs (the job's
+  config already pins them), or index them;
+  re-check the purge counter inside the seeding and the transition's upload;
+  a cursor for the worker list, as the results feed has.
+- **Option implemented:** None.
+- **Justification:** None corrupts a stored result; the races need a window of
+  microseconds or an hours-long hung upload, and the list's cost needs hundreds
+  of thousands of identities (KL-38, KL-56).
+
+**KL-79. What the rating fit's prior still costs.**
+- **Context:** `stats/bradley_terry.rs`: virtual draws against the pool's
+  centre (the mean rating), on a logistic twice as wide as real games',
+  `2 / (1 + g/200)` for a config with `g` games, at least 0.2; each error
+  widened by one and a half times the prior's one-step shift (thirty-second
+  audit, KL-74). The
+  figures are the audit's adversarial check's, noiseless and Monte Carlo,
+  before the widening unless said.
+- **Problem:** Each config's pull levels off at a constant however far it is
+  from the centre, and the pulls add up through whatever joins a group to the
+  rest; no weighting tried removes that without moving it to another shape.
+  - *Tiers of lightly played configs joined by one small job*, at realistic
+    gaps: two tiers of 20, five pairs a head-to-head, one 20-pair link, 400
+    Elo apart, the upper one error low; 600 apart, 1.9 errors (its 95%
+    interval covered the truth 65% of the time); 800 apart, ten a tier, 2.2
+    (30%). Played at 100 pairs a head-to-head, under one error. With the pull
+    in the error, these intervals cover the truth 95 to 100% of the time, the
+    biases about one shown error (1.0 at 600, 1.3 to 1.4 at 800).
+  - Ladders, the top: 12 rungs of 100 Elo over 100 pairs, some 35 low (a third
+    of its error); 12 of 200, some 70 (half); 20 of 100, some 130 (nine
+    tenths); 20 of 50 over 300, 15.
+  - Mature tiers joined by one 300-pair job: at +600, 10; at +800, 64 (0.6
+    error); at +1,000, some 100 (0.6); 20 at +1,200, some 290 (1.6). Young
+    tiers at +1,000: 1.6 to 2.6 errors.
+  - A block that swept, or was swept by, everything outside it has its level
+    set by the prior, with an error of hundreds of Elo; other young configs'
+    pulls move it by a fraction of that.
+  - A config barely played swings more between refits than under the old
+    prior: one pair against each of two configs 1,000 Elo apart, RMSE about 170
+    to 190 Elo against 105; a newcomer on 3 pairs, 140 against 160.
+  - The widening is one Newton step, one and a half times over, which the
+    check fitted to these tiers: at 1 it covered 64 to 86% at 800 Elo. Most
+    errors grow a few percent (nine in ten under 2.5%); a thinly held
+    config's, or a newcomer's clean sweep's, by a fifth to a third, and in rare
+    cases more (one thinly held config at +1,600 went from 542 to 1,278).
+  - About once in 500 fuzzed cases, a config taking a quarter point more moves
+    its own rating the wrong way by under an Elo, its opponent's moving
+    further the right way.
+- **Options considered:** a narrower scale; no fade (a mature tier nearly four
+  errors low); a fitted centre (moved with a pool's maturity); a floor of a
+  twentieth (a swept block floated) or a half (tiers worse); the other priors
+  KL-74 lists; flagging a config the prior holds rather than widening its
+  error; refitting at half the prior to measure the pull.
+- **Option implemented:** Draws against the mean at twice the scale, faded at
+  200 games, floored at 0.2, and one and a half times the pull added to each
+  error.
+- **Justification:** The pulls are the thin-link limit of any prior that pulls
+  config by config, and every version tried had them, most worse (the old
+  prior held the 600 case 510 Elo low). What can be made honest is the error
+  bar, and the widening brings those intervals back to 95%. Worth revisiting — with
+  a flag on configs the prior holds, or pools built with more than one job
+  between tiers — if tiers like these appear.
+
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
   layout's sign-out has no error path (`F-AUTH-2` pins the store's side).
@@ -7630,7 +7823,11 @@ says so in its implemented option, rather than being removed.
     be made only through the API.
   - A blank password gets a generic `400` rather than a field error (the form's
     `required` normally stops it first).
-- **Options considered:** add the fields; map zxcvbn's blank-password error.
+  - The job form loads MAGPIE's version with the player configs and input
+    data, so its failure is reported as "Could not load player configs and
+    input data" (thirty-second audit).
+- **Options considered:** add the fields; map zxcvbn's blank-password error;
+  load the version separately.
 - **Option implemented:** None.
 - **Justification:** Admin-only, and the API is documented.
 
@@ -7713,9 +7910,13 @@ says so in its implemented option, rather than being removed.
     parsing lexica fetched from the network.
   - The backend does not verify the database's certificate: without
     `sslmode=verify-full` the connection is encrypted but not authenticated.
+  - Only a `500` carrying a database error code is scrubbed before it reaches
+    the client (`error.rs`); any other internal error's message — an object
+    store or MAGPIE subprocess failure — is sent as it is. None seen carries a
+    secret (thirty-second audit).
 - **Options considered:** a `log_format` without `$args` for those paths;
   `env_clear()` plus the few variables MAGPIE reads; `verify-full` with the RDS
-  CA bundle in the image.
+  CA bundle in the image; a generic message for every `500`, the detail logged.
 - **Option implemented:** None yet. *Open (thirty-first audit).*
 - **Justification:** Hardening with no demonstrated failure; each is a small
   change with its own deployment risk.
@@ -7861,7 +8062,21 @@ says so in its implemented option, rather than being removed.
   - `contribute_find_derived` takes the first matching entry; the server now
     refuses a job that would pin two files under one name, so only a server bug
     reaches it.
-- **Options considered:** each fix as named, on `birdtest-contribute`.
+  - `MAGPIE_VERSION` went to 0.1.1 in the first of `birdtest-contribute`'s
+    unpushed commits, and later ones changed results without a bump (a
+    simulating opening-rack player ranks every play, short opening racks,
+    racks with designated letters refused); the version's comment lists less
+    than 0.1.1 holds. No build of an intermediate commit exists outside this
+    machine — the remote is still 0.1.0 — so the version floor has nothing to
+    exclude yet (thirty-second audit).
+  - `magpie contribute` installs no SIGINT or SIGTERM handler, so Ctrl-C or
+    `docker stop` leaves the open claim to lapse on the heartbeat timeout,
+    though the decline path exists and the REPL's `stop` uses it.
+  - Replacing a stale wordmap, rack info table or fetched KLV renames over the
+    old file, which `rename()` does not do on Windows; the Windows build is
+    written but has never been compiled or run.
+- **Options considered:** each fix as named, on `birdtest-contribute`; bump
+  to 0.1.2 before the branch is first pushed if anything between is ever built.
 - **Option implemented:** None.
 - **Justification:** None changes a result. They go with the next MAGPIE change
   that has a reason of its own.

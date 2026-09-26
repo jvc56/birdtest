@@ -842,6 +842,11 @@ async fn tied_contributors_are_each_listed_exactly_once() {
         seen.sort();
         assert_eq!(seen, expected, "per_page={per_page}");
     }
+
+    // Far past the end: an empty page with the true total, not a scan.
+    let (status, body) = send(&app, get_request("/api/workers?page=1000000&per_page=500", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!((body["total"].as_i64(), body["items"].as_array().map(Vec::len)), (Some(18), Some(0)));
 }
 
 /// A-PUBLIC-1, A-PUBLIC-7: the job and user lists page every row exactly once

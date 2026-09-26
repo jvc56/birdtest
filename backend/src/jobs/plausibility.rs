@@ -39,14 +39,18 @@ const MAX_RACK_TILES: usize = 7;
 const MIN_SCORE_MEAN: f64 = -100.0;
 const MAX_SCORE_MEAN: f64 = 3000.0;
 
-/// The theoretical maximum for a single play is a little over 1,700 points.
-/// Rounded up; a play cannot score negative points, and a pass or exchange
-/// scores exactly zero.
-const MAX_MOVE_SCORE: i32 = 2000;
+/// Far above any play on any board MAGPIE ships. The theoretical maximum on
+/// the 15x15 board is a little over 1,700 points, but the 21x21 one
+/// (`standard21`) has quadruple-word corners with two triple-word squares
+/// between them on each edge -- an edge-long word is worth 144 times its
+/// tiles -- so a cap near 2,000 is not safe there, and a false positive would
+/// refuse the same seeded task on every retry. A play cannot score negative
+/// points, and a pass or exchange scores exactly zero.
+const MAX_MOVE_SCORE: i32 = 100_000;
 
 /// Equity is a score-scale quantity, so it lives in the same order of
 /// magnitude as a score plus a leave adjustment.
-const MAX_ABS_EQUITY: f64 = 5000.0;
+const MAX_ABS_EQUITY: f64 = 200_000.0;
 
 fn finite(value: f64, field: &str) -> AppResult<()> {
     if !value.is_finite() {
@@ -439,7 +443,10 @@ mod tests {
         assert!(check_moves(&[move_entry(74, 80.0)], None, "x").is_ok());
         assert!(check_moves(&[move_entry(0, -12.0)], None, "x").is_ok(), "a pass scores zero");
         assert!(check_moves(&[move_entry(-5, 0.0)], None, "x").is_err());
-        assert!(check_moves(&[move_entry(9_000, 0.0)], None, "x").is_err());
+        // A 21x21 board can score far past the 15x15 board's ~1,700.
+        assert!(check_moves(&[move_entry(9_000, 9_010.0)], None, "x").is_ok());
+        assert!(check_moves(&[move_entry(150_000, 0.0)], None, "x").is_err());
+        assert!(check_moves(&[move_entry(30, 250_000.0)], None, "x").is_err());
         assert!(check_moves(&[move_entry(30, f64::NAN)], None, "x").is_err());
     }
 

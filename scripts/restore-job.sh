@@ -280,7 +280,8 @@ done
 # selective restore does not rewind; each statement moves a sequence only
 # forward, and only when a table is ahead of it. A plain setval(max(id)) could
 # move it back below ids the fleet took since, and the next insert collided.
-psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 <<'SQL' || { echo "stopped: could not check the sequences" >&2; exit 1; }
+# Its result sets are empty or one number, and say nothing a reader needs.
+psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 > /dev/null <<'SQL' || { echo "stopped: could not check the sequences" >&2; exit 1; }
 SELECT setval('position_analysis_records_id_seq', m)
   FROM (SELECT max(id) AS m FROM position_analysis_records) x
  WHERE m > (SELECT last_value FROM position_analysis_records_id_seq);

@@ -58,7 +58,12 @@
   }
 
   onMount(async () => {
-    files = await api.inputData();
+    try {
+      files = await api.inputData();
+    } catch (e) {
+      error = `Could not load input data: ${e instanceof Error ? e.message : String(e)}`;
+      return;
+    }
     // Filtered from `files` here rather than read off the `$:` arrays above:
     // those are recomputed on the update cycle, not on assignment, so they
     // would still be empty on the next line and every default would be ''.

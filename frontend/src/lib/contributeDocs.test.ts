@@ -36,4 +36,13 @@ describe('F-DOCS-1 contributor instructions', () => {
     const offenders = svelteFiles(routes).filter((f) => /contribute\.txt<\/code>\s+beside/.test(readFileSync(f, 'utf8')));
     expect(offenders).toEqual([]);
   });
+
+  it('run a second process on a file of its own in the same directory', () => {
+    // MAGPIE loads its default board from ./data before it parses anything,
+    // so a directory holding only a contribute.txt cannot start.
+    const home = readFileSync(join(routes, '+page.svelte'), 'utf8');
+    expect(home).toContain('./bin/magpie contribute second.txt');
+    const offenders = svelteFiles(routes).filter((f) => /directory of its own/.test(readFileSync(f, 'utf8')));
+    expect(offenders).toEqual([]);
+  });
 });

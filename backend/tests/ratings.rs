@@ -532,7 +532,7 @@ async fn a_fit_stores_one_run_and_one_rating_per_member() {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-    assert_eq!((trigger.as_str(), method.as_str()), ("manual", "bradley_terry_mm"));
+    assert_eq!((trigger.as_str(), method.as_str()), ("manual", "bradley_terry_newton"));
 
     let stored = stored_ratings(&db, run).await;
     let mut rated: Vec<Uuid> = stored.keys().copied().collect();
@@ -1257,4 +1257,24 @@ async fn only_an_admin_can_recompute_and_it_stores_a_new_run() {
     assert_eq!(trigger, "manual");
     assert_eq!(evidence(&db, run).await, (2, 1));
     assert_eq!(run_count(&db, f.pool).await, 1);
+}
+
+/// A self-play job (both seats one config, which creation allows) is not
+/// counted as evidence the fit used: the fit ignores it, and the page's "over
+/// N pairs from M jobs" said otherwise.
+#[tokio::test]
+async fn a_self_play_job_is_not_counted_as_evidence() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let scope = scope(&db).await;
+    let anchor = db.static_player("a-anchor", admin).await;
+    let rival = db.static_player("b-rival", admin).await;
+    let real = pairs_job(&db, "classic", scope, anchor, rival).await;
+    pair_result(&db, real, [1, 2, 3, 2, 1]).await;
+    let mirror = pairs_job(&db, "classic", scope, rival, rival).await;
+    pair_result(&db, mirror, [0, 5, 10, 5, 0]).await;
+    let pool = pool(&db, "pool", "classic", scope, anchor, &[rival], 2000.0).await;
+
+    let run = ratings::recompute(&db.pool, pool, Trigger::Manual).await.unwrap();
+    assert_eq!(evidence(&db, run).await, (9, 1), "the real job's nine pairs, and it alone");
 }

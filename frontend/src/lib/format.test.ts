@@ -117,7 +117,8 @@ describe('F-FMT-5 sprtLabel', () => {
     expect(sprtLabel('running')).toBe('running');
     expect(sprtLabel('passed')).toBe('passed (H1 accepted)');
     expect(sprtLabel('failed')).toBe('failed (H0 accepted)');
-    expect(sprtLabel('terminated_at_max')).toBe('terminated at max games');
+    // Games and pairs jobs both have a cap; it is not always games.
+    expect(sprtLabel('terminated_at_max')).toBe('stopped at its cap');
   });
 
   it('falls back to the raw status for an unknown one', () => {

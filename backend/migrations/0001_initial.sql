@@ -1399,7 +1399,7 @@ CREATE TABLE rating_runs (
     -- Why this run happened: 'membership' (an admin added or removed a config),
     -- 'evidence' (new results arrived), or 'manual'.
     trigger       TEXT NOT NULL,
-    method        TEXT NOT NULL DEFAULT 'bradley_terry_mm',
+    method        TEXT NOT NULL DEFAULT 'bradley_terry_newton',
     -- Fit provenance. A run that did not converge is still stored and still
     -- displayed, flagged: hiding it would leave the page silently stale.
     iterations    INT NOT NULL,

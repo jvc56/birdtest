@@ -103,10 +103,10 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 | `--no-up` | off | Assume the stack is already running |
 
 Each contributor gets its own directory under `--workdir`, holding its
-`contribute.txt`, the `settings.txt` MAGPIE writes, a `contribute.log`, and a
-symlink to your data directory. They need separate directories because
-`magpie contribute` reads and writes both files in its working directory —
-sharing one would race on them and collapse every worker onto a single
+`contribute.txt`, a `contribute.log`, and a symlink to your data directory
+(MAGPIE loads its board from `./data` before anything else). Each needs a
+`contribute.txt` of its own because MAGPIE writes the identity it is issued
+into that file — sharing one would collapse every worker onto a single
 identity. Watch one with `tail -f .dev-workers/worker-01/contribute.log`.
 
 Ctrl-C stops the contributors and leaves the stack up, so the site stays
@@ -208,10 +208,12 @@ threads  7
 maxtasks 0
 ```
 
-then run `./bin/magpie contribute` there. A second process needs a
-`contribute.txt` of its own (`./bin/magpie contribute <file>`; a directory of its
-own is simplest, since MAGPIE also writes `settings.txt` there): MAGPIE appends
-the identity it is issued to that file. Settings never
+then run `./bin/magpie contribute` there. A second process in the same
+directory needs a file of its own — a copy of the one above, named on the
+command line (`./bin/magpie contribute second.txt`): MAGPIE appends the identity it is issued
+to that file. (A directory of its own does not work unless it also holds
+MAGPIE's `data/`, or a link to it: MAGPIE loads its default board from
+`./data` before it reads anything else.) Settings never
 go on the command line, so an API
 key stays out of shell history and `ps` output. Wordmaps (`.wmp`) make game
 play dramatically faster, so MAGPIE always wants one for a lexicon it's
@@ -401,10 +403,14 @@ recorded beside every hash comes from the binary that produced it.
 The three images are built from this repository and pushed to a registry of
 your choice (Terraform creates none), at one tag per release:
 
+Build for `linux/amd64`, which is what the Fargate task definitions run, even on
+an arm64 machine: the backend's MAGPIE build targets `-march=nehalem`, and an
+arm64 frontend image fails on Fargate with "exec format error".
+
 ```bash
-docker build -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
-docker build -f docker/Dockerfile --target derived-builder -t $REGISTRY/birdtest-derived-builder:$TAG .
-docker build frontend -t $REGISTRY/birdtest-frontend:$TAG
+docker build --platform linux/amd64 -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
+docker build --platform linux/amd64 -f docker/Dockerfile --target derived-builder -t $REGISTRY/birdtest-derived-builder:$TAG .
+docker build --platform linux/amd64 frontend -t $REGISTRY/birdtest-frontend:$TAG
 docker push ...   # all three, then apply with backend_image, derived_builder_image, frontend_image
 ```
 

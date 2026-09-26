@@ -12,9 +12,8 @@ export const SCALE_MAX = 0.25;
 export const NON_TRANSITIVE_MIN = 3;
 /**
  * How many standard errors a residual must be from zero to count toward that
- * call. Without it a young pool -- a handful of pairs per head-to-head, and a
- * fit whose prior pulls lightly observed configs toward the anchor -- showed
- * the banner on sampling noise alone.
+ * call. Without it a young pool -- a handful of pairs per head-to-head --
+ * showed the banner on sampling noise alone.
  */
 export const NON_TRANSITIVE_Z = 3;
 

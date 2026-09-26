@@ -1095,6 +1095,17 @@ async fn worker_page(
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
+    // Counted first, so a page past the end is answered without its query:
+    // each arm reads `offset + limit` rows of its index before the merge, and
+    // `?page=` is anyone's (a huge one read every contributor, 0.3 s at
+    // 300,000 of them).
+    let total = sqlx::query_scalar::<_, i64>(
+        "SELECT (SELECT COUNT(*) FROM users WHERE tasks_completed > 0)
+              + (SELECT COUNT(*) FROM anonymous_workers WHERE tasks_completed > 0)",
+    )
+    .fetch_one(&state.read_pool)
+    .await?;
+
     // Both kinds of contributor in one ranking, each from its own running
     // total. Each arm is an ordered scan of its own partial index, cut off at
     // the end of the requested page, and the two are merged. The arms must be
@@ -1118,7 +1129,10 @@ async fn worker_page(
     // The pseudonym is hashed after the page is chosen, for its rows only:
     // computed inside the anonymous arm, it was a SHA-256 of every contributing
     // anonymous identity on every view of a public, unmetered page.
-    let rows = sqlx::query(
+    let rows = if offset >= total {
+        Vec::new()
+    } else {
+        sqlx::query(
         "SELECT c.user_id, c.anon_uuid,
                 CASE WHEN c.anon_uuid IS NOT NULL
                      THEN left(encode(sha256(convert_to(c.anon_uuid::text, 'UTF8')), 'hex'), 16)
@@ -1146,14 +1160,9 @@ async fn worker_page(
     .bind(offset)
     .bind(offset.saturating_add(limit))
     .fetch_all(&state.read_pool)
-    .await?;
+    .await?
+    };
 
-    let total = sqlx::query_scalar::<_, i64>(
-        "SELECT (SELECT COUNT(*) FROM users WHERE tasks_completed > 0)
-              + (SELECT COUNT(*) FROM anonymous_workers WHERE tasks_completed > 0)",
-    )
-    .fetch_one(&state.read_pool)
-    .await?;
 
     Ok(Json(super::Page {
         items: rows

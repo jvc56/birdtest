@@ -2,6 +2,7 @@
   import { page } from '$app/stores';
   import { goto } from '$app/navigation';
   import { api, ApiError } from '$lib/api';
+  import { session } from '$lib/auth';
 
   let password = '';
   let error = '';
@@ -14,6 +15,8 @@
     error = '';
     try {
       await api.confirmPasswordReset(token, password);
+      // A reset signs out every session, this tab's included.
+      session.set(null);
       goto('/login');
     } catch (e) {
       error = e instanceof ApiError ? (e.fields.password ?? e.message) : (e as Error).message;

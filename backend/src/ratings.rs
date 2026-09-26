@@ -146,6 +146,11 @@ async fn build_matrix(
         let (Some(&i), Some(&j)) = (index.get(&p1), index.get(&p2)) else {
             continue;
         };
+        // A config against itself says nothing about its rating (the matrix
+        // ignores it), so it is not counted as evidence the fit used either.
+        if i == j {
+            continue;
+        }
         let mut pairs = 0.0;
         let mut score_p1 = 0.0;
         for bucket in 0..5 {
@@ -223,8 +228,8 @@ pub async fn mark_every_pool_for_refit(conn: &mut PgConnection) -> AppResult<()>
 ///
 /// Always a full refit, never a patch: adding or removing a config changes what
 /// counts as evidence for *everyone*, and a batch fit has no per-player history
-/// to unwind. Cheap enough to do this way — the MM iteration is microseconds
-/// for a pool of any plausible size, and the query above is one grouped scan.
+/// to unwind. Cheap enough to do this way — the Newton fit is milliseconds for
+/// a hundred-member pool, and the query above is one grouped scan.
 pub async fn recompute(db: &PgPool, pool_id: Uuid, trigger: Trigger) -> AppResult<Uuid> {
     fit_and_store(db, pool_id, trigger, false)
         .await?
@@ -347,7 +352,7 @@ async fn fit_and_store(
         "INSERT INTO rating_runs
              (pool_id, trigger, method, iterations, converged, pairs_used, jobs_used,
               evidence_games, computed_at)
-         VALUES ($1, $2, 'bradley_terry_mm', $3, $4, $5, $6, $7, clock_timestamp())
+         VALUES ($1, $2, 'bradley_terry_newton', $3, $4, $5, $6, $7, clock_timestamp())
          RETURNING id",
     )
     .bind(pool_id)

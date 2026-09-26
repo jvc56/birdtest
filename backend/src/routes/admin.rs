@@ -1712,6 +1712,7 @@ async fn activate_job(
     )
     .await?;
     tx.commit().await?;
+    state.finish_checks.rearm_idle(id);
     super::worker::push_after_change(&state, id);
     Ok(Json(updated))
 }
@@ -1787,6 +1788,8 @@ async fn complete_job(
     )
     .await?;
     tx.commit().await?;
+    // Completion is final: the job's finish-check counters are never read again.
+    state.finish_checks.forget(id);
     super::worker::push_after_change(&state, id);
     Ok(Json(job))
 }

@@ -353,6 +353,7 @@ async fn made_up_worker_credentials_are_limited_per_address_and_real_ones_are_no
         }
     };
     let mut limited = None;
+    let started = std::time::Instant::now();
     for i in 0..150 {
         let response = bogus(shared, i).await;
         if response.status == StatusCode::TOO_MANY_REQUESTS {
@@ -362,7 +363,10 @@ async fn made_up_worker_credentials_are_limited_per_address_and_real_ones_are_no
         }
         assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
     }
-    assert!(limited.is_some_and(|i| (99..=101).contains(&i)), "{limited:?}");
+    // A burst of 100, refilled at 5 a second while the loop runs: on a
+    // loaded machine the loop takes long enough to earn a few more.
+    let refilled = (started.elapsed().as_secs_f64() * 5.0).ceil() as usize;
+    assert!(limited.is_some_and(|i| (99..=101 + refilled).contains(&i)), "{limited:?} after {refilled} refilled");
 
     let still = heartbeat(uuid).await;
     assert_ne!(still.status, StatusCode::TOO_MANY_REQUESTS, "the real worker is served: {still:?}");

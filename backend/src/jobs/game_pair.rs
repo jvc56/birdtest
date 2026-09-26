@@ -123,7 +123,7 @@ impl JobHandler for GamePairHandler {
     }
 }
 
-/// Same seed-tiling scheme as `games`, with `pairs_per_batch` as the stride,
+/// Same seed scheme as `games`, with `pairs_per_batch` as the stride,
 /// and the players from the job's template the same way.
 pub async fn next_request(
     conn: &mut PgConnection,

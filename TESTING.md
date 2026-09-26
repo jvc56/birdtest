@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 183 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (12), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
-| 1F Frontend unit | 115 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (3), and `charts/`: `ratingDotPlot.test.ts` (17), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 149 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (25), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 179 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (32), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (3), `fake_worker.rs` (1) |
+| 1 Unit | 201 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1F Frontend unit | 117 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 150 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 181 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (32), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -460,6 +460,46 @@ computed outside the code, in 40-digit decimal from PLAN.md's formulas.
   (400/ln 10)/√(n·p·(1−p)): 49.1348… Elo for an even 50 games, a tenth of that
   at 5,000, and 1.2687… for 75% over 100,000. *(Covered:
   `bradley_terry::tests::more_games_narrow_the_standard_error`.)*
+- `U-STATS-5` The fit returns noiseless evidence's own ratings, within a few
+  Elo, for the shapes that defeated the old one-config-at-a-time solver and
+  its prior toward the anchor (KL-74): a 12-member group joined to the anchor
+  by one 300-pair job (every member's error at least the link's ≈28 Elo), a
+  30-member group, a disconnected island (unrated, its internal gap intact)
+  and a hundred-member pool (under a second in a debug build); a 20-config
+  chain and a 12-rung ladder within 0.6 of each config's error (KL-79). And for
+  the shapes the audit's adversarial checks found: a config over a gauntlet of
+  twenty lightly played opponents within half its error; conceding a quarter
+  or half point lowers the conceding config's rating in the cases pinned (the
+  rare exception, under an Elo, is KL-79's); twenty baselines swept by both the
+  anchor and a config 400 above it leave that config within one error; a
+  strong tier 1,000 above joined by one job within about half its error; two
+  tiers of lightly played configs 600 or 800 Elo apart, joined by one small
+  job, the upper within 1.5 of its shown error, which includes the prior's
+  pull (1.7 and more without it); a
+  newcomer's sweep shrunk the same in a young pool as a mature one; a field
+  that swept the anchor held in place by its virtual games, not floated by
+  unrelated young configs; clean
+  sweeps contradicting the rest of a pool converge with finite errors; a
+  newcomer's clean sweep rates higher the more pairs it swept; a well-played
+  head-to-head is its maximum likelihood; and a fit with million-pair
+  head-to-heads says it converged. *(Covered:
+  `bradley_terry::tests::a_thinly_linked_cluster_is_fitted_where_it_is_with_the_links_error`,
+  `a_long_chain_reaches_its_top`, `a_large_cluster_is_not_pulled_toward_the_anchor`,
+  `an_island_does_not_stop_the_fit_converging`,
+  `a_clean_sweep_of_a_group_stays_finite`, `a_hundred_member_pool_fits_quickly`,
+  `contradicting_clean_sweeps_do_not_throw_the_fit_into_saturation`,
+  `a_newcomers_clean_sweep_rates_higher_the_more_it_swept`,
+  `a_well_played_head_to_head_is_its_maximum_likelihood`,
+  `a_gauntlet_of_lightly_played_opponents_does_not_hold_a_config_back`,
+  `a_fit_at_the_answer_with_huge_head_to_heads_says_it_converged`,
+  `a_clean_sweep_rates_at_least_a_near_sweep`,
+  `shared_swept_baselines_do_not_pull_a_config_toward_the_anchor`,
+  `a_ladder_is_not_compressed_past_its_errors`,
+  `a_strong_tier_joined_thinly_is_not_pulled_to_the_centre`,
+  `a_newcomer_is_shrunk_the_same_in_a_young_pool_as_a_mature_one`,
+  `a_field_that_swept_the_anchor_does_not_float_on_young_configs`,
+  `the_error_shown_covers_what_the_prior_pulls_a_thin_tier`.)*
+  (Thirty-second audit.)
 
 ### `U-FAKE-*` — fake worker shapes (`worker/fake_worker.py`)
 
@@ -735,9 +775,12 @@ Test the pure functions; do not snapshot the SVG.
   a key only from an `apikey` line in `contribute.txt`), and the account page
   shows that line for a freshly created key, under the test ids E-2 reads it
   by; and none puts `contribute.txt` beside the binary (MAGPIE reads it from its
-  working directory). The pages' text, read as source.
-  *(Covered: `contributeDocs.test.ts`.)* (Thirty-first audit: the account page
-  said `--api-key`, which MAGPIE rejects.)
+  working directory); and a second process is run on a file of its own in the
+  same directory (`./bin/magpie contribute second.txt`), never "in a directory
+  of its own", where MAGPIE cannot load its board. The pages' text, read as
+  source. *(Covered: `contributeDocs.test.ts`.)* (Thirty-first audit: the
+  account page said `--api-key`, which MAGPIE rejects; thirty-second: the home
+  page's second-process advice could not start.)
 
 ---
 
@@ -1414,6 +1457,15 @@ permanent.
   an SPRT job hands out nothing past its cap. *(Covered:
   `admin_api::a_finish_check_overtaken_by_a_purge_does_not_complete_the_job`,
   `worker_api::sprt_jobs_hand_out_nothing_past_their_cap`.)*
+- `I-STATS-9f` **A job with nothing left to hand out and nothing in flight
+  completes on the next claim.** An opening-rack job, and a games job at its
+  cap, deactivated while their last tasks were out: the results land with no
+  finish check, and after reactivation the first claim that finds the job empty
+  completes it (off the request, at most every ten seconds per job, at once
+  after an activation). *(Covered:
+  `finish::a_job_whose_last_results_landed_while_inactive_completes_once_reactivated`,
+  `finish::a_games_job_at_its_cap_whose_results_landed_while_inactive_completes`.)*
+  (Thirty-second audit.)
 - `I-STATS-11` The stats payload cache serves a payload until it expires or is
   forgotten (every admin action), and a build reads the job's row itself, so a
   copy read before an admin action is not cached as newer than it. *(Covered:

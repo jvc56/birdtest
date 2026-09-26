@@ -39,9 +39,9 @@ export function splitByAnchorConnection(ratings: RatingRow[]): {
 /** Clamp runaway intervals so one barely-measured config cannot flatten the
  *  scale for everyone else; the table still reports the real number. */
 export function visibleError(row: RatingRow): number {
-  // The anchor is fixed by definition: its stored error is the fit's for
-  // that config, not an uncertainty in its rating, and with no games it is
-  // f64::MAX -- drawn at the cap, it stretched the scale.
+  // The anchor is fixed by definition. Runs before the thirty-second audit
+  // stored the fit's own error for it -- f64::MAX with no games -- which,
+  // drawn at the cap, stretched the scale; newer runs store 0.
   if (row.is_anchor) return 0;
   return Math.min(row.stderr, MAX_VISIBLE_ERROR);
 }
@@ -122,9 +122,14 @@ export function layoutDotPlot(
   };
 }
 
+/** The backend stores an unmeasurable error as f64::MAX. */
+function errorText(stderr: number): string {
+  return Number.isFinite(stderr) && stderr < 1e300 ? stderr.toFixed(1) : '∞';
+}
+
 /** The dot's tooltip. Reports the true standard error, not the clamped one. */
 export function dotTitle(row: RatingRow): string {
-  const spread = row.is_anchor ? ' (fixed)' : ` ± ${row.stderr.toFixed(1)}`;
+  const spread = row.is_anchor ? ' (fixed)' : ` ± ${errorText(row.stderr)}`;
   return `${row.name}: ${row.rating.toFixed(1)}${spread} over ${row.pairs_played.toLocaleString()} pairs`;
 }
 
@@ -136,5 +141,5 @@ export function ratingCell(row: RatingRow): string {
 /** The ratings table's ± column: the true, unclamped standard error. */
 export function stderrCell(row: RatingRow): string {
   if (row.is_anchor) return 'fixed';
-  return row.connected_to_anchor ? `±${row.stderr.toFixed(1)}` : 'unrated';
+  return row.connected_to_anchor ? `±${errorText(row.stderr)}` : 'unrated';
 }

@@ -50,7 +50,7 @@ const SPRT_LABELS: Record<string, string> = {
   running: 'running',
   passed: 'passed (H1 accepted)',
   failed: 'failed (H0 accepted)',
-  terminated_at_max: 'terminated at max games'
+  terminated_at_max: 'stopped at its cap'
 };
 
 export function sprtLabel(status: string): string {

@@ -39,18 +39,28 @@ pub const MAX_CONCURRENT_RESULT_STREAMS: usize = 2;
 /// having, and cuts the read rate by the same factor.
 pub const SPRT_CHECK_EVERY: u64 = 8;
 
-/// Submissions seen per job since that job's last finish-condition check.
+/// Submissions seen per job since that job's last finish-condition check, and
+/// when each job was last checked on a claim that found nothing.
 ///
 /// In memory rather than in the database: it is a source of truth for nothing,
 /// and losing it on a restart costs one extra check. Entries are dropped when a
-/// job completes, so this does not grow with the number of jobs ever created.
+/// job completes or is deleted, so this grows only with the jobs left
+/// inactive.
 #[derive(Clone, Default)]
-pub struct FinishCheckCounters(Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>>>);
+pub struct FinishCheckCounters {
+    submissions: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, u64>>>,
+    idle: Arc<std::sync::Mutex<std::collections::HashMap<uuid::Uuid, std::time::Instant>>>,
+}
+
+/// How often a job that answered a claim with nothing, and has no claim in
+/// flight, is checked for its finish condition; see
+/// [`FinishCheckCounters::should_check_idle`].
+pub const IDLE_FINISH_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl FinishCheckCounters {
     /// Counts this submission, and says whether it is the one that checks.
     pub fn should_check(&self, job_id: uuid::Uuid) -> bool {
-        let mut counters = self.0.lock().expect("finish-check counters poisoned");
+        let mut counters = self.submissions.lock().expect("finish-check counters poisoned");
         let count = counters.entry(job_id).or_insert(0);
         *count += 1;
         if *count >= SPRT_CHECK_EVERY {
@@ -61,9 +71,40 @@ impl FinishCheckCounters {
         }
     }
 
+    /// Whether a job that just handed a claim nothing is due a finish check.
+    ///
+    /// A submission is what normally finishes a job, and only while the job is
+    /// active. The last results of a job deactivated while they were out are
+    /// accepted with no check, and a last submission's check that failed is
+    /// never retried, so such a job, once active again, has nothing left to
+    /// hand out and nothing coming in: it stayed active at its allocation for
+    /// good. A claim finding nothing there is the one event left, and this
+    /// paces the check it triggers to once per job per
+    /// [`IDLE_FINISH_CHECK_EVERY`] -- a job in that state heads every claim's
+    /// candidate list.
+    pub fn should_check_idle(&self, job_id: uuid::Uuid) -> bool {
+        let now = std::time::Instant::now();
+        let mut idle = self.idle.lock().expect("finish-check counters poisoned");
+        match idle.get(&job_id) {
+            Some(last) if now.duration_since(*last) < IDLE_FINISH_CHECK_EVERY => false,
+            _ => {
+                idle.insert(job_id, now);
+                true
+            }
+        }
+    }
+
+    /// Lets the next claim that finds `job_id` empty check it at once. Called on
+    /// activation: a check paced out while the job's last claims were still
+    /// in flight must not delay the one that can now complete it.
+    pub fn rearm_idle(&self, job_id: uuid::Uuid) {
+        self.idle.lock().expect("finish-check counters poisoned").remove(&job_id);
+    }
+
     /// Forget a job, once it can never need checking again.
     pub fn forget(&self, job_id: uuid::Uuid) {
-        self.0.lock().expect("finish-check counters poisoned").remove(&job_id);
+        self.submissions.lock().expect("finish-check counters poisoned").remove(&job_id);
+        self.idle.lock().expect("finish-check counters poisoned").remove(&job_id);
     }
 }
 

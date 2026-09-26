@@ -118,11 +118,13 @@ impl JobHandler for GameHandler {
 
 /// On-demand task creation for a `games` job.
 ///
-/// MAGPIE plays seeds S..S+N-1 for a batch of N starting at S, so consecutive
-/// tasks are spaced `games_per_batch` apart and the seed space tiles with
-/// neither gaps nor overlaps. Two workers racing here both compute the same
-/// next seed; the `(job_id, seed)` unique index makes one of them lose, and the
-/// loser retries.
+/// Consecutive tasks' seeds are spaced `games_per_batch` apart, one task per
+/// seed. MAGPIE does not play seeds S..S+N-1 for a batch starting at S: it
+/// seeds a xoshiro stream with S and draws each game's seed from it, so a task's
+/// games are fixed by S alone, and two tasks' games are distinct streams
+/// whatever the spacing; the spacing only keeps the task seeds unique and
+/// ordered. Two workers racing here both compute the same next seed; the
+/// `(job_id, seed)` unique index makes one of them lose, and the loser retries.
 ///
 /// The players come from the job's template rather than a read per claim: the
 /// one read here is the seed cursor.

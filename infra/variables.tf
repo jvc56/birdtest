@@ -59,11 +59,21 @@ variable "azs" {
 variable "backend_image" {
   description = "ECR image for the Axum backend container."
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.backend_image)) > 0
+    error_message = "backend_image is the image built with --target backend."
+  }
 }
 
 variable "frontend_image" {
   description = "ECR image for the Nginx container serving the SvelteKit build."
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.frontend_image)) > 0
+    error_message = "frontend_image is the image built from frontend/."
+  }
 }
 
 variable "db_instance_class" {

@@ -66,9 +66,14 @@
     error = '';
     try {
       await action();
-      await load();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
+    }
+    // Reloaded either way: a change whose refit failed has still committed.
+    try {
+      await load();
+    } catch (e) {
+      error ||= e instanceof Error ? e.message : String(e);
     } finally {
       busy = false;
     }

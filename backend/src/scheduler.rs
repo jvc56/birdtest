@@ -595,6 +595,20 @@ async fn try_claim_from_job(
             // before answering `NoWork`, and a transaction the dispatch lock's
             // timeout aborted commits as the rollback it already is.
             let _ = tx.commit().await;
+            // A job with nothing to hand out may be done with nobody left to
+            // say so; checked off this request, and paced per job.
+            if job.job_type != JobType::LeaveGeneration
+                && state.finish_checks.should_check_idle(job.id)
+            {
+                let (spawn_state, job_id) = (state.clone(), job.id);
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        crate::routes::worker::finish_idle_job(&spawn_state, job_id).await
+                    {
+                        tracing::warn!(%job_id, error = %err.message, "idle finish check failed");
+                    }
+                });
+            }
             Ok(None)
         }
         Acquired::JobFinished => {

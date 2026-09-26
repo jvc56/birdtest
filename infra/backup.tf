@@ -463,8 +463,13 @@ resource "aws_iam_role" "scheduler" {
 
 data "aws_iam_policy_document" "scheduler" {
   statement {
-    actions   = ["ecs:RunTask"]
-    resources = ["${aws_ecs_task_definition.backup.arn_without_revision}:*"]
+    actions = ["ecs:RunTask"]
+    # Both forms: the schedule names the family without a revision, and
+    # which of the two IAM evaluates for that is not documented.
+    resources = [
+      aws_ecs_task_definition.backup.arn_without_revision,
+      "${aws_ecs_task_definition.backup.arn_without_revision}:*",
+    ]
     condition {
       test     = "ArnLike"
       variable = "ecs:cluster"
@@ -709,8 +714,13 @@ resource "aws_ecs_task_definition" "restore_drill" {
 
 data "aws_iam_policy_document" "drill_scheduler" {
   statement {
-    actions   = ["ecs:RunTask"]
-    resources = ["${aws_ecs_task_definition.restore_drill.arn_without_revision}:*"]
+    actions = ["ecs:RunTask"]
+    # Both forms: the schedule names the family without a revision, and
+    # which of the two IAM evaluates for that is not documented.
+    resources = [
+      aws_ecs_task_definition.restore_drill.arn_without_revision,
+      "${aws_ecs_task_definition.restore_drill.arn_without_revision}:*",
+    ]
     condition {
       test     = "ArnLike"
       variable = "ecs:cluster"

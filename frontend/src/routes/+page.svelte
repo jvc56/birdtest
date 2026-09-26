@@ -47,10 +47,10 @@ threads  7
 maxtasks 0</code
       ></pre>
     <p class="text-sm text-muted-foreground">
-      then run <code class="rounded bg-muted px-1">./bin/magpie contribute</code> there (a second
-      process needs a <code class="rounded bg-muted px-1">contribute.txt</code> of its own, most
-      simply in a directory of its own: MAGPIE writes the identity it is issued into that
-      file). Add an
+      then run <code class="rounded bg-muted px-1">./bin/magpie contribute</code> there. A second
+      process in the same directory needs a file of its own — a copy of the one above, named on
+      the command line: <code class="rounded bg-muted px-1">./bin/magpie contribute second.txt</code>
+      — since MAGPIE writes the identity it is issued into its file. Add an
       <code class="rounded bg-muted px-1">apikey</code> line to attribute your work to your account
       instead of an anonymous UUID.
     </p>

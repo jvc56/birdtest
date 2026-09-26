@@ -181,8 +181,13 @@ resource "aws_iam_role" "derived_builder_scheduler" {
 
 data "aws_iam_policy_document" "derived_builder_scheduler" {
   statement {
-    actions   = ["ecs:RunTask"]
-    resources = ["${aws_ecs_task_definition.derived_builder.arn_without_revision}:*"]
+    actions = ["ecs:RunTask"]
+    # Both forms: the schedule names the family without a revision, and
+    # which of the two IAM evaluates for that is not documented.
+    resources = [
+      aws_ecs_task_definition.derived_builder.arn_without_revision,
+      "${aws_ecs_task_definition.derived_builder.arn_without_revision}:*",
+    ]
     condition {
       test     = "ArnLike"
       variable = "ecs:cluster"

@@ -870,8 +870,9 @@ async fn submit_result(
 
     // The result is committed; nothing below can un-accept it. Failing the
     // request now would tell the worker to retry a submission that already
-    // landed, so a failure here is logged and the next submission's check
-    // picks the job up.
+    // landed, so a failure here is logged. The next submission's check picks
+    // the job up -- or, when this was the last, the first claim to find the
+    // job with nothing left to hand out (`finish_idle_job`).
     //
     // `job` is the row read before the transaction above, so before this
     // result was stored and before the finish check reads any result --
@@ -917,27 +918,7 @@ async fn after_submission(state: &AppState, job: &Job, purges_before: u64) -> Ap
         None
     };
     if let Some(decided) = finished {
-        // `job` was loaded before the results were read, which is what lets
-        // its `claims_issued` tell a purge in between from no purge at all.
-        let purged_since = || {
-            state.dispatch_holds.claims_holds_taken(job_id) != purges_before
-                || state.dispatch_holds.claims_held(job_id)
-        };
-        if crate::jobs::complete_unless_purged(
-            &state.pool,
-            job.id,
-            job.claims_issued,
-            decided,
-            purged_since,
-        )
-        .await?
-        {
-            tracing::info!(job_id = %job.id, "job auto-completed");
-            // No submission is coming to push this to open pages.
-            push_after_change(state, job.id);
-            // Completion is final, so this job will never need checking again.
-            state.finish_checks.forget(job_id);
-        }
+        complete_finished(state, job, decided, purges_before).await?;
     }
 
     // Checked here so a job nobody is watching costs nothing at all; the
@@ -947,6 +928,69 @@ async fn after_submission(state: &AppState, job: &Job, purges_before: u64) -> Ap
         tokio::spawn(async move { push_stats_until_idle(&state, job_id).await });
     }
     Ok(())
+}
+
+/// Completes `job`, whose finish condition `finish_condition_met` found met,
+/// unless it was purged since `job` and `purges_before` were read.
+async fn complete_finished(
+    state: &AppState,
+    job: &Job,
+    decided: Option<(crate::stats::sprt::SprtResult, u64)>,
+    purges_before: u64,
+) -> AppResult<bool> {
+    let job_id = job.id;
+    // `job` was loaded before the results were read, which is what lets
+    // its `claims_issued` tell a purge in between from no purge at all.
+    let purged_since = || {
+        state.dispatch_holds.claims_holds_taken(job_id) != purges_before
+            || state.dispatch_holds.claims_held(job_id)
+    };
+    let completed =
+        crate::jobs::complete_unless_purged(&state.pool, job_id, job.claims_issued, decided, purged_since)
+            .await?;
+    if completed {
+        tracing::info!(job_id = %job_id, "job auto-completed");
+        // No submission is coming to push this to open pages.
+        push_after_change(state, job_id);
+        // Completion is final, so this job will never need checking again.
+        state.finish_checks.forget(job_id);
+    }
+    Ok(completed)
+}
+
+/// The finish check for a games, pairs or opening-rack job that just answered
+/// a claim with nothing (see `FinishCheckCounters::should_check_idle`).
+///
+/// Only a submission to an active job checks the finish condition, so a job
+/// whose last results landed while it was inactive -- deactivated with its
+/// final tasks out -- or whose last check failed stayed active with nothing to
+/// hand out and nothing coming in, at its allocation, for good. With no claim
+/// in flight, nothing else will ever check it; with one, that claim's
+/// submission will.
+pub(crate) async fn finish_idle_job(state: &AppState, job_id: Uuid) -> AppResult<bool> {
+    // Read before the job and its results, as a submission reads it; see
+    // `complete_unless_purged`.
+    let purges_before = state.dispatch_holds.claims_holds_taken(job_id);
+    let job = jobstats::load_job(&state.pool, job_id).await?;
+    if job.status != JobStatus::Active || job.job_type == JobType::LeaveGeneration {
+        return Ok(false);
+    }
+    let in_flight: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'claimed'
+         )",
+    )
+    .bind(job_id)
+    .fetch_one(&state.pool)
+    .await?;
+    if in_flight {
+        return Ok(false);
+    }
+    match finish_condition_met(state, &job).await? {
+        Some(decided) => complete_finished(state, &job, decided, purges_before).await,
+        None => Ok(false),
+    }
 }
 
 /// Build and publish the job's stats, repeating while submissions asked for

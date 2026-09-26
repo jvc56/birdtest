@@ -147,6 +147,12 @@ describe('F-CHART-2 runaway error bars', () => {
     expect(ratingCell(barely)).toBe('1520.0');
   });
 
+  it('shows an error the fit could not measure as infinite, not as 1.8e308', () => {
+    const unmeasured = row('e', 1600, Number.MAX_VALUE, { pairs_played: 4 });
+    expect(stderrCell(unmeasured)).toBe('±∞');
+    expect(dotTitle(unmeasured)).toBe('E: 1600.0 ± ∞ over 4 pairs');
+  });
+
   it('labels the anchor as fixed rather than with a standard error', () => {
     expect(stderrCell(anchor)).toBe('fixed');
     expect(stderrCell(other)).toBe('±50.0');
