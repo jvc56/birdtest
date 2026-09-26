@@ -78,7 +78,7 @@
       {/if}
       {#if fields.password}<p class="field-error">{fields.password}</p>{/if}
     </div>
-    {#if error}<p class="field-error">{error}</p>{/if}
+    {#if error}<p class="field-error" role="alert">{error}</p>{/if}
     <button class="btn-primary w-full" disabled={busy}>{busy ? 'Creating…' : 'Register'}</button>
     <p class="text-center text-sm text-muted-foreground">
       Already registered? <a href="/login">Sign in</a>

@@ -35,7 +35,7 @@
       </p>
     </div>
   {:else}
-    {#if error}<p class="field-error mb-4">{error}</p>{/if}
+    {#if error}<p class="field-error mb-4" role="alert">{error}</p>{/if}
     <form class="card space-y-4" on:submit|preventDefault={submit}>
       <div>
         <label class="label" for="email">Email</label>

@@ -54,3 +54,8 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# Password scoring: close to a second for a crafted password even optimized,
+# so the tests that time it see what production does.
+[profile.dev.package.zxcvbn]
+opt-level = 3

@@ -317,7 +317,7 @@
       </div>
       <div>
         <label class="label" for="rpt">Racks per task</label>
-        <input id="rpt" type="number" min="1" class="input" bind:value={racksPerTask} />
+        <input id="rpt" type="number" min="1" max="10000" class="input" bind:value={racksPerTask} />
       </div>
     </div>
     <label class="flex items-center gap-2">

@@ -31,7 +31,7 @@ check() {
   : > "${log}"
   local status=0
   env "$@" STUBLOG="${log}" COMPOSE="${WORK}/compose" \
-    bash "${HERE}/dev-restore.sh" "${WORK}/dump" > /dev/null 2>&1 || status=$?
+    bash "${HERE}/dev-restore.sh" "${WORK}/dump" < /dev/null > /dev/null 2>&1 || status=$?
   local scrubs calls got
   scrubs=$(grep -c "ON_ERROR_STOP=1" "${log}" || true)
   calls=$(wc -l < "${log}")

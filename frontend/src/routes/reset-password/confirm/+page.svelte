@@ -43,7 +43,7 @@
           required
         />
       </div>
-      {#if error}<p class="field-error">{error}</p>{/if}
+      {#if error}<p class="field-error" role="alert">{error}</p>{/if}
       <button class="btn-primary w-full" disabled={busy}>
         {busy ? 'Saving…' : 'Set new password'}
       </button>

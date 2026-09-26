@@ -1556,6 +1556,119 @@ async fn submit(app: &axum::Router, assignment: &serde_json::Value, racks: &[(&s
     assert_eq!(accepted["accepted"], true, "{accepted}");
 }
 
+/// I-LEAVE-20: a rack counts however the worker spells it. MAGPIE writes a
+/// rack's letters in its own machine-letter order with blanks last
+/// (`AEINST?` for the forced `?AEINST`), and the merge matched racks exactly:
+/// every rack holding a blank went uncounted, was forced on every lap, and the
+/// generation never closed. Here the whole universe is forced in one task and
+/// reported reversed; every rack counts. One rack under two spellings in one
+/// result is a duplicate.
+#[tokio::test]
+async fn a_rack_counts_however_the_worker_spells_it() {
+    let db = TestDb::new().await;
+    let (job, seeded) = leave_job(&db, 200).await;
+    let app = birdtest::app(db.state().await);
+
+    let task = claim_one(&app).await;
+    let forced = forced_racks(&task);
+    assert_eq!(forced.len() as i64, seeded, "one task forces the whole universe");
+    assert!(forced.iter().any(|r| r.starts_with('?')), "the universe has blank racks: {forced:?}");
+    let reversed: Vec<String> = forced.iter().map(|r| r.chars().rev().collect()).collect();
+    let pairs: Vec<(&str, i64)> = reversed.iter().map(|r| (r.as_str(), 3)).collect();
+    submit(&app, &task, &pairs).await;
+    let merged = birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap().unwrap();
+    assert_eq!(merged.racks_updated, seeded, "{merged:?}");
+    let uncounted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = 1 AND occurrence_count <> 3",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(uncounted, 0);
+
+    let task = claim_one(&app).await;
+    let blank = forced.iter().find(|r| r.starts_with('?')).unwrap();
+    let blank_last = format!("{}?", &blank[1..]);
+    let result = json!({ "racks": [
+        { "rack": blank, "count": 1, "mean": 1.0 },
+        { "rack": blank_last, "count": 1, "mean": 1.0 },
+    ]});
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", task["worker_uuid"].as_str().unwrap())],
+            json!({ "claim_token": task["claim_token"], "result": result }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("more than once"), "{body}");
+}
+
+/// I-LEAVE-21: a merge sums what is staged in passes, a slice of the racks at
+/// a time, so a pass's hash table fits in memory however much is staged --
+/// and every rack's total is still exact, each row written once. A hundred
+/// and ten staged results over this universe of 149 racks, in slices of about
+/// fifty: three passes.
+#[tokio::test]
+async fn a_merge_of_a_backlog_sums_it_in_passes_exactly() {
+    let db = TestDb::new().await;
+    let (job, seeded) = leave_job(&db, 2).await;
+    let universe = racks_in_sweep_order(&db, job).await;
+    assert_eq!(universe.len() as i64, seeded);
+    // Result i reports every rack whose position is not a multiple of i+2,
+    // i+1 occurrences each at mean 1.
+    let mut expected = vec![0i64; universe.len()];
+    for i in 0..110usize {
+        let chosen: Vec<usize> = (0..universe.len()).filter(|k| k % (i + 2) != 0).collect();
+        let racks: Vec<&str> = chosen.iter().map(|&k| universe[k].as_str()).collect();
+        let counts: Vec<i64> = chosen.iter().map(|_| (i + 1) as i64).collect();
+        let sums: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+        for &k in &chosen {
+            expected[k] += (i + 1) as i64;
+        }
+        sqlx::query(
+            "INSERT INTO leave_rack_staging (job_id, generation, task_id, racks, counts, equity_sums)
+             VALUES ($1, 1, $2, $3, $4, $5)",
+        )
+        .bind(job)
+        .bind(Uuid::new_v4())
+        .bind(&racks)
+        .bind(&counts)
+        .bind(&sums)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let merged = birdtest::jobs::leave_gen::merge_staged_in_slices(&db.pool, job, 1, true, 50)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.folds_merged, 110);
+    assert_eq!(merged.racks_updated, expected.iter().filter(|&&e| e > 0).count() as i64);
+    let rows: Vec<(String, i64, f64)> = sqlx::query_as(
+        "SELECT rack, occurrence_count, equity_sum FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = 1 ORDER BY rack",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    for (k, (rack, count, sum)) in rows.iter().enumerate() {
+        assert_eq!(rack, &universe[k]);
+        assert_eq!((*count, *sum), (expected[k], expected[k] as f64), "{rack}");
+    }
+    let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(staged, 0);
+}
+
 /// The generation's racks in the order a sweep visits them: the primary key's,
 /// which is the database's collation and not byte order.
 async fn racks_in_sweep_order(db: &TestDb, job: Uuid) -> Vec<String> {

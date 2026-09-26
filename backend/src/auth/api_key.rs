@@ -67,7 +67,7 @@ async fn argon2_turn() -> AppResult<tokio::sync::SemaphorePermit<'static>> {
             ..AppError::new(
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 "unavailable",
-                "too many sign-ins at once; try again shortly",
+                "the server is busy checking passwords; try again in a few seconds",
             )
         }),
     }

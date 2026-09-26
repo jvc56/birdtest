@@ -710,7 +710,7 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
 
 1. User fills out the registration form (`/register`) with username, email, and password.
 2. The server validates, and returns `400` with field-level errors listing **every** problem at once rather than the first:
-   - Username is 3–32 characters (counted as characters, not bytes), trimmed, and unique whatever its case (a
+   - Username is 3–32 characters (counted as characters, not bytes), with no line break, control or invisible (format) character — it is written into mail to the address's owner, which may be a stranger's (KL-34) — trimmed, and unique whatever its case (a
      unique index on `lower(username)`): "Josh" and "josh" side by side on the
      public lists is an impersonation.
    - Email is one bare address — `local@domain.tld`, printable ASCII, none of
@@ -722,7 +722,8 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
      server-side only. The form shows a rough guide from length and character
      classes, which is not zxcvbn and can disagree with it either way (a
      keyboard walk it calls strong is refused; a long passphrase it calls good
-     is taken); the server's refusal says why.
+     is taken); the server's refusal says only that the password is too weak,
+     not why.
 
    A **taken username** returns `409` naming it. The user has to choose another
    one to get anywhere, and `GET /api/users` publishes the whole list anyway, so
@@ -786,7 +787,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
    caller's latency; a send that fails is logged and nothing else, since the
    caller was told the same thing either way.
 4. The user clicks the link, landing on `/reset-password/confirm?token=<raw-token>`. The page shows a new-password form.
-5. On submit, `POST /api/auth/reset-password/confirm` re-scores the new password, validates the token (hash match, not expired, not already used), sets `used_at`, hashes and stores the new password, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
+5. On submit, `POST /api/auth/reset-password/confirm` reads the token (hash match, not expired, not already used, its account not deleted) without a lock, so a wrong link costs nothing more; scores the new password against the account and hashes it, both on the password threads and outside any transaction, so neither wait holds a lock; then locks the account, spends the token (checked again), stores the new hash, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
 
    The reset also **revokes every existing session**. Each session token carries the account's `session_generation`, and `CurrentUser` compares it with the `users` row it already reads on every request; the reset increments it, so every token minted before it — an attacker's included — stops working. `POST /api/auth/sign-out-everywhere` (the "Sign out everywhere" button on the account page) and account deletion increment it the same way.
 6. The user is redirected to `/login` (with no message; signing in with the new password is the confirmation).
@@ -1050,15 +1051,21 @@ read as text Postgres has already serialized, gathered a mebibyte at a time,
 and compressed and hashed through `spawn_blocking`; the same export finishes in
 34 s with `/health` at 2 ms median and 8 ms at worst throughout. The rule is
 general, and the other computations of that size follow it: an import's
-gunzip-untar-hash of a whole tarball; every Argon2 hash and verify (on four
+gunzip-untar-hash of a whole tarball; every password's zxcvbn score (close to a
+second for a crafted hundred characters of its substitution letters: on the
+executor, one address within its limits held `/health` for 8.5 s until the
+thirty-second audit; two at a time, with turns of their own, since on sign-in's
+turns a reset link replayed with weak passwords from eight addresses held every
+sign-in at `503` — and each reset link buys five scorings an hour) and every
+Argon2 hash and verify (on four
 threads of their own, at most four at a time — each holds 19 MiB, and a flood
 of sign-ins and registrations from seven addresses, within every per-address
 limit, took the process past its 2 GiB task until the thirty-second audit; a
 request that waits ten seconds for a turn is told `503` to come back; the
 turn goes with the run, so a client that hangs up does not leave a run queued
 past the four; and the allocator's mmap threshold is pinned at 1 MiB so each
-run's buffer is given back, not kept by the thread that ran it — at 12–18% of
-Argon2's throughput, paid for a peak of 129 MB where 2.6 GB was measured);
+run's buffer is given back, not kept by the thread that ran it — at a cost of
+12–18% of Argon2's throughput, paid for a peak of 129 MB where 2.6 GB was measured);
 each
 50,000-rack chunk of a universe's `COPY` (`/health` reached 1.3 s while one was
 seeded, 3.6 ms after); the parse of a request body of 256 KiB or more; and the
@@ -2697,7 +2704,7 @@ The reported list covers **every rack that occurred during the batch, forced or 
 
 `num_games` is the only thing that ends the task. The generation's rack target is deliberately **not** sent: the server owns the running totals across every task in the generation, no single task can observe whether the target has been reached globally, and stopping early at the forced racks' own target would discard coverage the server would have folded in anyway.
 
-**On result acceptance**: every reported rack must be a full 7-tile rack (plausibility refuses anything else). A result for a generation that has already been aggregated is credited to the worker and *not* folded in: its KLV is built and uploaded, so the occurrences would change nothing anyone reads, and adding them would leave the rows disagreeing with the artifact built from them — which is the one signal reserved for a corrupted or stale object (see [Artifacts: back up, or rebuild?](#artifacts-back-up-or-rebuild)). The claim flow no longer produces that state: a generation closes only when none of its claims is still `claimed`, a timed-out claim is abandoned and its late submission refused before it reaches this point, and a closed generation's tasks are never reissued (step 2). The check stays as a guard against state the flow never writes, such as a partial restore. Otherwise, within the same transaction that accepts the task result, the submission is **staged**: one row in `leave_rack_staging` carrying its racks, counts and equity sums as three parallel arrays (which Postgres compresses and stores out of line), and a single-row bump of the generation's live counters in `leave_generation_progress` (tasks completed, games played). It touches no per-rack row. A **merge** (`leave_gen::merge_staged`) later takes everything staged for the generation and applies its sum in one statement — `DELETE … RETURNING` feeding an `UPDATE … FROM` over the aggregated racks, so a staged result is either still staged or folded in, never both and never neither — and refreshes the generation's summary (racks at target, the rack furthest from it) while the rows are warm. An update rather than an upsert: the universe is seeded, so a rack with no row is not a rack of this distribution and must not create one. Merges of one job serialize on an advisory lock, since two of them would update overlapping racks in whatever order their plans visited them; the transition *waits* for that lock and everything else gives up if it is held, because whoever holds it is doing the same work. Why it is built this way, and what it costs, is under [What a merge costs](#what-a-merge-costs).
+**On result acceptance**: every reported rack must be a full 7-tile rack (plausibility refuses anything else), and is spelled as the universe spells it — its letters in code-point order, a blank first — before anything else reads it. MAGPIE writes a rack in its own machine-letter order with blanks last (`AEINST?`, and German's `AEINRSÄ` as `AÄEINRS`); matched exactly, every rack holding a blank went uncounted, and an English generation could never close (thirty-second audit). One rack under two spellings in one result is a duplicate, and refused. A result for a generation that has already been aggregated is credited to the worker and *not* folded in: its KLV is built and uploaded, so the occurrences would change nothing anyone reads, and adding them would leave the rows disagreeing with the artifact built from them — which is the one signal reserved for a corrupted or stale object (see [Artifacts: back up, or rebuild?](#artifacts-back-up-or-rebuild)). The claim flow no longer produces that state: a generation closes only when none of its claims is still `claimed`, a timed-out claim is abandoned and its late submission refused before it reaches this point, and a closed generation's tasks are never reissued (step 2). The check stays as a guard against state the flow never writes, such as a partial restore. Otherwise, within the same transaction that accepts the task result, the submission is **staged**: one row in `leave_rack_staging` carrying its racks, counts and equity sums as three parallel arrays (which Postgres compresses and stores out of line), and a single-row bump of the generation's live counters in `leave_generation_progress` (tasks completed, games played). It touches no per-rack row. A **merge** (`leave_gen::merge_staged`) later takes everything staged for the generation and applies its sum in one transaction — in passes over slices of the racks by hash, one pass per 400,000 racks of the generation, each an `UPDATE … FROM` over that slice's aggregated occurrences, then the `DELETE` of exactly the rows it read, so a staged result is either still staged or folded in, never both and never neither — logs any reported rack that matched no row, and refreshes the generation's summary (racks at target, the rack furthest from it) while the rows are warm. An update rather than an upsert: the universe is seeded, so a rack with no row is not a rack of this distribution and must not create one. Merges of one job serialize on an advisory lock, since two of them would update overlapping racks in whatever order their plans visited them; the transition *waits* for that lock and everything else gives up if it is held, because whoever holds it is doing the same work. Why it is built this way, and what it costs, is under [What a merge costs](#what-a-merge-costs).
 
 **Generation transition (aggregation)**: once claim-time step 2 finds no rack below target, no claim in flight and nothing staged, the server first **drains** — a merge that waits for any merge already running, so the totals it is about to read hold every accepted result; nothing new can be staged meanwhile, since the generation closes only with no claim in flight and nothing is dispatched for it while its transition runs — and then streams that generation's full-rack results into a CSV, runs `magpie convert rackequity2klv` over it to build the generation's KLV artifact, uploads it to S3, records it in `leave_generation_artifacts` along with the builder that wrote it, and marks the generation complete.
 
@@ -2744,6 +2751,8 @@ Nothing needs the per-rack totals that promptly. Selection needs them roughly; c
 The merge interval (`leave_gen::MERGE_INTERVAL`, thirty minutes) sets that volume and the dashboard's lag, and nothing else: selection holds a staged task's racks out of play rather than trusting stale counts, claims near a generation's end ask for a merge themselves (`TAIL_MERGE_INTERVAL`, a minute), and a generation never closes with anything staged. A process that stops with results staged loses nothing — they are rows — and the sweep's first tick, at startup, merges them.
 
 **The selection index stays small, by giving up an order nothing needed.** For a while `leave_rack_progress_pick_idx` carried `rack`, so that selection's `(occurrence_count, rack)` order was an index walk rather than a sort of the generation. Measured on a full English generation that index was **180 MB where the one on the count alone is 22 MB** — nearly all of the narrow index's keys are equal, so Postgres deduplicates them, and unique keys cannot be — which made a generation 590 MB rather than 432, for the life of the job. Selection now orders on `occurrence_count` alone and lets ties fall in whatever order the index holds them, and the public feed pages by rack through the primary key; dispatch order among tied racks is no longer reproducible, and nothing depended on it.
+
+**A merge writes no temporary files.** As one statement, a merge of 200 staged results of 150,000 racks each wrote 2.9 GB of them (159 s), and a backlog after an outage is larger — on a volume of 20 GiB. Two things spilled: `UNNEST(a, b, c)` in `FROM` materializes each array before it is read (1.5 GB for 200), and the sum over every element staged was a sort of all of them — or would have been a hash table of every rack, 300 MB for English. The arrays are now unnested in the select list, where they stream, and the racks are summed a slice at a time, by hash, one pass per 400,000 racks of the generation (eight for English), each slice's hash table held in memory (`work_mem` 64 MB for the merge, and sorting off, since the planner cannot see how few racks a slice holds): 74 MB for a slice, and nothing written to disk. Measured on a full English generation: 153 s for 200 staged results and 253 s for 600, no temporary files at either — linear in the backlog, each rack's row written once. (A first version took a pass per fifty results; its spill was bounded, but each pass read everything staged, so its time grew as the square of the backlog: 7.7 minutes at a thousand.)
 
 What is left unsolved is that a merge still rewrites most of a 432 MB relation as non-HOT updates. Removing that means taking `occurrence_count` out of the index selection uses — for instance selecting "any rack below target" through a partial index on a flag the merge maintains, rather than "the racks furthest below" — which changes the selection policy, and has not been decided.
 
@@ -5050,7 +5059,8 @@ birdtest/
 │   └── workflows/
 │       ├── ci.yml                  # per pull request: clippy + backend tests (with Postgres),
 │       │                           # frontend check/build, both images, terraform validate,
-│       │                           # and MAGPIE's half of the message contract
+│       │                           # dev-restore's SCRUB rule, and MAGPIE's half of the
+│       │                           # message contract
 │       └── nightly.yml             # tier 6: a real MAGPIE runs one task of every job type
 ├── docker-compose.yml               # the whole local stack: Postgres, MinIO (S3 stub), backend,
 │                                    # frontend, plus a `dev` profile — see Development
@@ -6921,7 +6931,9 @@ says so in its implemented option, rather than being removed.
   layout, a margin past MAGPIE's ceiling, play counts it cannot allocate) and
   refuses them now; the server still does nothing with `task_failed` declines.
   Batch and generation sizes (`games_per_batch`, `pairs_per_batch`,
-  `num_iterations`, `max_iterations`, …) have no ceiling either; a typo makes
+  `num_iterations`, `max_iterations`, …) have no ceiling either, except
+  `racks_per_task` (10,000 since the thirty-second audit: every claim and
+  every `leave_requests` row carries a task's forced racks); a typo makes
   tasks that outlast their lease rather than fail, and past 2^30 pairs a batch's
   games overflow the dispatched count so every result is refused (reasoned, not
   run).
@@ -7128,7 +7140,12 @@ says so in its implemented option, rather than being removed.
 - **Options considered:** None recorded.
 - **Option implemented:** Accepted as it is.
 - **Justification:** The cost is duplicate coverage, never a closed generation
-  missing a result: closing reads what is in flight and staged afresh.
+  missing a result: closing reads what is in flight and staged afresh, and
+  then — on the tail's path too, since the thirty-second audit — whether any
+  rack is below target at all, holding nothing out. Before that, a decline, a
+  lapsed claim or a merge landing between the tail's selection and those
+  reads closed the generation with that task's racks short of target (a
+  declined task's at zero), which an instrumented test reproduced.
 
 **KL-14. A worker's thread count is its own.**
 - **Context:** A simulation's sampling, and a multi-threaded leave-generation
@@ -7458,8 +7475,12 @@ says so in its implemented option, rather than being removed.
   name, and the registrant's API keys go on working (KL-33). The confirmation
   mail does not name the account: it was named for a pass of the
   thirty-second audit, which carried a registrant's own 32 characters —
-  newlines included — to any address under birdtest's sender. A reset mail
-  names the account, so an owner who resets sees whose it is.
+  newlines included — to any address under birdtest's sender. Once a scanner
+  has confirmed such an account, the reset mail and the taken-address notice
+  do name it, so an owner who resets sees whose it is, and so a stranger's
+  name still reaches the owner — but only as a name: a username holds no line
+  break, control or invisible character (refused at registration; an older
+  account's are mailed as `?`).
 - **Options considered:** a button to press.
 - **Option implemented:** Confirm on open. *(Sixteenth audit.)*
 - **Justification:** A button would cost every registrant a click.
@@ -7499,7 +7520,10 @@ says so in its implemented option, rather than being removed.
   audit found two more channels for the same fact, left with it: two
   registrations of one fresh address racing past the taken check give the
   loser a `409` (the unique index) rather than the identical `201`, and
-  `/api/users` lists unconfirmed accounts.
+  `/api/users` lists unconfirmed accounts. The thirty-second audit measured the
+  statistical gap too: a fresh address's insert and commit take about 1.6 ms
+  that a taken one's notice does not (medians 31.8 against 30.2 ms, the
+  Argon2 run being the same).
 - **Justification:** It is a schema and flow change, left for a decision. The
   pending-registrations table would close all three.
 
@@ -7811,7 +7835,8 @@ says so in its implemented option, rather than being removed.
 - **Problem:**
   - A games job force-completed by an admin has no stored verdict, so its SPRT
     panel shows the live status — "running … not acted on until N pairs are
-    complete" — on a completed job.
+    complete", or with a minimum of 0 "SPRT is checked as pairs arrive" — on a
+    completed job.
   - Two purge races were reasoned about and not reproduced: a leave universe
     seeding spawned in the microseconds before a purge commits could seed a
     generation of the purged job; and a leave transition running when its job
@@ -7826,6 +7851,15 @@ says so in its implemented option, rather than being removed.
   - `GET /api/workers` answers a page past the end without its query now, but
     a page just short of the end still reads `offset + limit` rows of each
     arm's index: about 0.3 s at 300,000 contributing anonymous identities.
+  - One hostile leave result can hold a rack's count up to `num_games` × 1,000
+    occurrences at a mean of ±5,000 — the plausibility ceilings — which fixes
+    that rack's mean and puts it at target for good, shifting its sub-leaves.
+    Leave generation runs at redundancy 1 (KL-14), so nothing cross-checks it;
+    outside the broken-client threat model the checks are built for (not
+    reproduced).
+  - An admin's change made just before a live push's build that then fails
+    (not a `404`) waits out the interval: the build spent its wake-up. Built
+    again at once, a failing build would most likely fail again.
   - A live push overtaken by a newer page build (not an admin action) builds
     again, up to three times, rather than sending the newer payload the cache
     holds, and a page view in the gap between the cache's expiry and the next
@@ -7935,21 +7969,31 @@ says so in its implemented option, rather than being removed.
 **KL-81. Small things in the account lifecycle.**
 - **Context:** `routes/auth.rs`, `email.rs` (thirty-second audit, pass 5).
 - **Problem:**
-  - A password reset hashes the new password before it looks at the token, so
-    a wrong or spent link costs an Argon2 run (within the per-caller redeem
-    limit). Hashed inside the transaction, it held the account's row — which
-    the reset now locks first, in the order a delete does — for the whole wait
-    for a turn, up to ten seconds under a flood, against the account's own
-    submissions.
+  - A password reset scores and hashes the new password between reading its
+    link and spending it, outside any transaction, so an account deleted or a
+    link spent in between costs a wasted score and hash (the spend checks
+    again). Hashed inside the transaction, it held the account's row — which
+    the reset locks first, in the order a delete does — for the whole wait for
+    a turn, up to ten seconds under a flood, against the account's own
+    submissions; hashed before the link was read, a wrong link cost a run.
   - The SES client has no operation timeout, so if SES hangs, background sends
     accumulate (bounded by the rate limits on what sends them).
   - Resetting for a known address writes a token row that an unknown address
     does not: a statistical timing difference of a millisecond or so, beside
     KL-37's deterministic one (not measured).
+  - A reset link refused a weak password still works, so it can be tried
+    again: five scorings an hour per link (whoever sends them), after which the
+    owner waits for the bucket too. Scoring a crafted password is close to a
+    second, on two turns of its own; a flood of them makes registrations and
+    resets answer `503`, never sign-ins.
+  - A username is compared by `lower`, not by a normal form: `émile` composed
+    and decomposed are two accounts that look alike. Normalizing new names
+    only would lock out an existing decomposed one at sign-in.
 - **Options considered:** hash inside the transaction; a timeout on the SES
-  client; a dummy write for an unknown address.
-- **Option implemented:** The hash before the transaction (pass 5's
-  adversarial check); the other two, none.
+  client; a dummy write for an unknown address; spending a link on a weak
+  password; NFC-normalizing usernames at registration and sign-in.
+- **Option implemented:** The link read first, then the score and hash
+  outside the transaction (passes 5 and 6); the other two, none.
 - **Justification:** Resets are limited per address and per caller; the rest is
   bounded or moot while KL-37 stands.
 

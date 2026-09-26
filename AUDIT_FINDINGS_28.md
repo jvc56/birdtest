@@ -50,6 +50,14 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   adversarial check found 2 medium (aborted requests escaped the Argon2
   bound; the confirmation mail carried the registrant's text), both fixed.
   KL-34, KL-60 and KL-81 updated. The loop continues.
+- **Pass 6 (follow-up: pass 5's diff, and leave generation):** 2 high and 3
+  medium from the reviewers — password scoring ran on the executor (`/health`
+  8.5 s from one address); MAGPIE's rack spelling meant no blank rack was ever
+  counted and an English generation could never close; usernames carried text
+  into mail; the tail could close a generation short; a merge's temporary
+  files grew with the backlog — all fixed and verified; the adversarial check
+  found 1 high (scoring on sign-in's turns), fixed. KL-2, 13, 34, 37, 78 and 81
+  updated. The loop continues.
 
 ---
 
@@ -717,9 +725,9 @@ now (logins alone 129 MB); `argon2_runs_wait_for_a_turn` (`U-AUTH-9`).
 the notice sent when someone registers a taken address named it; PLAN promises
 that "a real person who has forgotten they signed up still finds out". Both
 now name the account (both go only to the address's owner; the notice's lookup
-runs in its own task, so the request's timing does not change), and so does the
-confirmation mail, so an owner can see an account someone else registered on
-their address (KL-34). **Verified:** `the_owner_of_a_taken_address_is_told_their_username`
+runs in its own task, so the request's timing does not change), and so did the
+confirmation mail, so an owner could see an account someone else registered on
+their address (KL-34) — reverted in 5.6, and usernames restricted in 6.1. **Verified:** `the_owner_of_a_taken_address_is_told_their_username`
 (`A-AUTH-4e`) and the reset test's new assertion.
 
 ### 5.3 Medium — PLAN said the registration form shows the server's password score; it does not (account reviewer)
@@ -747,7 +755,7 @@ not after the publish); a pool on a letter distribution no job can use is
 refused; a test that submissions during a cool-down are pushed when it ends;
 RUNBOOK's PITR and DR ceilings capped at RDS's bounds and §1's wording;
 `scripts/dev-restore-check.sh` (the SCRUB rule against a stub, in a new CI
-`scripts` job; fails against the committed script); the check-email page's
+`scripts` job; fails against pass 3's script, `7e75361`); the check-email page's
 developer hint only in development; form errors announced (`role="alert"`);
 stopping % bounded in the form; "acted on from the first pair" when the
 minimum is 0; PLAN's heading "An event per round", the deletion rationale, the
@@ -755,7 +763,8 @@ scrub list, the schema's seed comment (the migration's copy left for its
 checksum); TESTING's `A-ADMIN-21` boundaries now all tested, `A-RATE-3b`,
 `S-BACKUP-6`; the findings file's RUNBOOK section names. **Recorded:** KL-60
 (α/β arrow keys), KL-81 (a reset holds its transaction while it waits for a
-turn; no SES timeout; a known address's reset writes a row), KL-34.
+turn — resolved in 5.6; no SES timeout; a known address's reset writes a row),
+KL-34.
 
 ### 5.6 Adversarial check of the pass's fixes
 
@@ -768,7 +777,7 @@ turn; no SES timeout; a known address's reset writes a row), KL-34.
   run and is given back when the run ends, and a run whose requester has gone
   is skipped (`api_key::on_an_argon2_thread`). **Verified:** the new
   `abandoned_argon2_runs_do_not_queue_past_the_turns` (a thousand aborted
-  requests, then a fresh hash) fails on the old code, 8.4 s and timed out, and
+  requests, then a fresh hash) fails on the old code (the run took 8.4 s) and
   passes, under a second.
 - **Medium — the confirmation mail carried the registrant's text to any
   address.** Naming the account (5.2's companion change for KL-34) let anyone
@@ -785,9 +794,11 @@ turn; no SES timeout; a known address's reset writes a row), KL-34.
   A, then waits for B, and the reset's spend of the account's other links
   waits for A. Reproduced in psql with the adversary's script (the delete was
   the victim). Both now lock the account's row first: the delete
-  `FOR UPDATE`, the reset `FOR NO KEY UPDATE`, which the account's own
-  submissions do not wait on. Rerun in both start orders: both commit, and a
-  reset that starts second finds its link gone.
+  `FOR UPDATE`, the reset `FOR NO KEY UPDATE` — which the account's own
+  submissions do wait on (their `UPDATE users` takes the same lock; corrected
+  in pass 6), so the reset holds it only for a few statements. Rerun in both
+  start orders: both commit, and a reset that starts second finds its link
+  gone.
 - **The reset hashes before its transaction.** The new lock is held for a few
   statements; hashed inside, it would have held the account's row through a
   wait of up to ten seconds for an Argon2 turn, against the account's own
@@ -813,8 +824,202 @@ of 568; a flood that hangs up does not stall sign-in once the fix is in
 - Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
   **569 of 569**.
 - `npm run check`: 0 errors, 0 warnings; `npm test`: 117 of 117.
-- `scripts/dev-restore-check.sh`: passes, and fails against the committed
-  script.
+- `scripts/dev-restore-check.sh`: passes, and fails against pass 3's script
+  (`7e75361`).
 - The reset/delete race replayed in psql, old order and both new orders.
 - **Tier 5, natively: 11 of 11** (reviewer and adversarial check).
 - Terraform and MAGPIE unchanged since pass 4.
+
+---
+
+## Pass 6 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`dd8ae36..6a609da`; MAGPIE
+unchanged), one reviewer per part it touches: backend (the Argon2 threads and
+turns, the reset's order); frontend (tier 5 natively); docs and procedures;
+infra and CI. Plus one area not examined in recent passes: **leave
+generation** — its universe, dispatch, results, merges, generation close and
+MAGPIE's side of it.
+
+**Findings: 2 high, 3 medium** from the five reviewers (backend 1 high, 5 low;
+frontend none, 4 low — tier 5 natively 11 of 11; docs and procedures 1
+medium, 11 low; infra none, 3 low; leave generation 1 high, 2 medium, 3 low, 2
+unconfirmed). All fixed and verified; the adversarial check (6.7) found 1
+high in the fixes, fixed.
+
+### 6.1 High — password scoring ran on the executor: one address stalled the server for seconds (backend reviewer)
+
+**Code updated.** zxcvbn's cost depends on the characters, not only the
+length it truncates to: a hundred characters of its substitution letters take
+it about 0.9 s (release). It ran on the async executor, in registration and —
+before any token was looked at — in the reset. Pinned to one CPU, twenty such
+resets from one address, within its limits, held `/health` for up to 8.5 s. The
+earlier audits that held "zxcvbn's input cap" measured length, not this.
+Scoring now runs on the four Argon2 threads, under the same turns
+(`too_weak_off_the_executor`), and the reset reads its link first, without a
+lock, so a wrong link costs neither a score nor a hash; it then scores and
+hashes outside any transaction, and only then locks the account and spends the
+link. **Verified:** `scoring_a_crafted_password_does_not_stall_the_server`
+(`A-AUTH-3b`: a single-threaded runtime ticks throughout; on the old code the
+gap was 1.08 s) and a wrong link refused in under 100 ms with the crafted
+password; zxcvbn is built optimized in tests so they time what production
+does.
+
+### 6.2 High — MAGPIE spells a rack blanks last, the universe blanks first: no blank rack was ever counted (leave-generation reviewer)
+
+**Code updated.** The server forced `?AEINST`; MAGPIE played it and reported
+`AEINST?` (`rack_get_string(…, blanks_first = false)`); the merge matched racks
+exactly and dropped what matched nothing, silently. 715,540 of English's
+3,199,724 racks hold a blank: none gained an occurrence, each was forced on
+every lap, and an English generation could never close. German and Polish
+failed a second way (MAGPIE orders `AÄB…`, the universe by code point). No test
+could see it: the tier-6 tests submit the forced racks as sent, and M-4 only
+checked that something landed. A reported rack is now spelled as the universe
+spells it before anything reads it (`leave_gen::canonical_rack`), one rack
+under two spellings is a duplicate, and a merge logs racks that matched no row.
+**Verified:** `a_rack_counts_however_the_worker_spells_it` (`I-LEAVE-20`: the
+whole universe reported reversed; on the old code the merge updated 0 racks);
+the unit test covers German's `Ä`; and tier 6's M-4, now asserting that every
+rack a real MAGPIE reported matched and that a blank rack counted, **fails on
+the old code — 73 of 870 reported racks matched nothing — and passes**.
+
+### 6.3 Medium — a stranger's text still reached an address through the reset mail and the notice (docs reviewer)
+
+**Code updated.** 5.6 took the username out of the confirmation mail, but once
+a mail scanner confirms an account registered on someone else's address
+(KL-34), the reset mail and the taken-address notice name it — 32 characters of
+the registrant's own, newlines included, from birdtest's sender, repeatable
+five times an hour each. A username may no longer hold a control character, a
+line or paragraph separator or a format character (bidi overrides, zero-width
+marks); an older account's are mailed as `?`. **Verified:**
+`a_username_cannot_carry_a_message_into_mail` (`A-AUTH-4f`) fails on the old
+code (the newline name registered, `201`) and passes; a unit test covers the
+list. KL-34 says what still reaches the owner: a name, only as a name.
+
+### 6.4 Medium — in the tail, a decline or a merge between two reads closed a generation short (leave-generation reviewer)
+
+**Code updated.** The tail's selection holds out racks in flight or staged;
+when it comes back empty, two later statements ask whether anything is in
+flight or staged. A claim declined or lapsed, or a merge committed, between the
+selection and those reads left racks the first held out and the others no
+longer saw: the generation closed with them below target — a declined task's
+at zero, which the KLV weighs like a measured zero. KL-13's justification said
+this could not happen. The tail now reads, last, whether any rack is below
+target holding nothing out, and a rack that is answers "no work yet" for the
+next claim to hand it out. **Verified** with the reviewer's instrumentation (a
+sleep after an empty selection, in a private copy): on the old code both
+triggers started the transition with two racks below target; with the fix
+neither did, and the controls were unchanged. No committed test: the window
+cannot be widened without a hook in the code.
+
+### 6.5 Medium — a merge's temporary files grew with the backlog (leave-generation reviewer)
+
+**Code updated.** Measured on a full-size generation, one merge statement of
+200 staged results of 150,000 racks wrote 2.9 GB of temporary files (159 s),
+on a 20 GiB volume, and a backlog after an outage is larger. Two things
+spilled: `UNNEST(a, b, c)` in `FROM` materialized every array (1.5 GB for 200,
+found by `EXPLAIN`), and the sum over every element staged. The arrays are now
+unnested in the select list, where they stream, and a merge sums a slice of
+the racks by hash per pass — in the final version (6.7), one pass per 400,000
+racks of the generation, each slice's hash table held in memory. **Verified:**
+eight passes over a full English generation, 153 s for 200 staged results and
+253 s for 600, with no temporary files at all (the single statement: 159 s and
+2.9 GB at 200); `a_merge_of_a_backlog_sums_it_in_passes_exactly` (`I-LEAVE-21`: three passes, every total
+exact); tier 6's M-4 merges a real generation. Two versions came first: one
+kept the `FROM`-clause `UNNEST` (13 GB over eight passes; the plan showed
+why), and one took a pass per fifty results, whose time the adversarial check
+showed grows as the square of the backlog.
+
+### 6.6 Low findings
+
+**Fixed:**
+- An email confirmation and an admin's delete of one account deadlocked (the
+  confirmation took its code, then the account). Confirmations, resets and
+  deletes now all lock the account first, and `A-AUTH-9b` and `A-ADMIN-22` pin
+  it: with the account held, each waits holding none of its links. Both fail
+  on the old order.
+- A reset requested while its account was being deleted inserted a token for
+  the tombstone and mailed a link. The insert now takes a key-share lock on a
+  live account only.
+- The reset's hash moved again, out of the transaction: pass 5's lock order
+  had made the account's own submissions wait through the Argon2 turn. 5.6's
+  claim that they "do not wait on" the lock was wrong; corrected.
+- `racks_per_task` is capped at 10,000, in the server and the form.
+- The admin job page no longer says a KLV whose hash differs has "almost
+  certainly moved on": a closed generation's rows do not change.
+- `dev-restore-check.sh` hung when run by hand in a terminal (its stub read the
+  tty); CI's `scripts` job has a timeout; TESTING and PLAN list it.
+- Accessibility and wording:
+  - `role="alert"` on the public auth forms' errors;
+  - the check-email page's console-mail hint is back for `dev.py` and compose,
+    decided at run time from the host;
+  - the `503` says "the server is busy checking passwords" (it reaches
+    registration and resets too);
+  - the SPRT line with a minimum of 0 says "checked as pairs arrive".
+- Docs:
+  - RUNBOOK §1 drops the storage ceiling past 59,578 GiB, where none is legal;
+  - PLAN's password-refusal, reset-flow and cost wording, KL-37's measured
+    1.6 ms registration gap, KL-81;
+  - TESTING's CI and scripts tables and counts;
+  - pass 5's record: 5.2 and 5.5 marked as changed by 5.6, "the committed
+    script" named, and U-AUTH-9b's failure described as observed.
+
+**Recorded:** KL-78, for a push whose build fails after spending its wake-up,
+and a hostile leave result's reach (unconfirmed); KL-2 (the new cap).
+**Unconfirmed, left:** a universe seeding that runs after a purge (KL-78
+already holds its twin).
+
+### 6.7 Adversarial check of the pass's fixes
+
+**1 high, fixed and verified.**
+
+- **High — scoring on sign-in's turns let one reset link keep sign-in down.**
+  6.1 moved scoring onto the four Argon2 turns, the ones sign-in's verify
+  waits on. A reset link refused a weak password still works, and a weak
+  password can still be slow to score (a username of substitution letters,
+  three times over: 0.78 s), so one confirmed account's link, replayed from
+  eight addresses at their limit, kept logins at 10 s and `503` on one vCPU
+  (`/health` fine). **Fix:** scoring has two turns of its own, on the
+  blocking pool, with its own `503`; and each scoring a reset link buys is
+  counted against the link, five an hour from any number of addresses.
+  **Verified:** `scoring_never_holds_up_a_sign_in_and_a_link_buys_few`
+  (`A-AUTH-3c`): with sixteen crafted scorings queued, a sign-in waited 3.9 s
+  on the old code and answers at once now; the link's sixth attempt is `429`.
+
+**Lows fixed:**
+- The merge's passes follow the generation's size, not the backlog (see 6.5):
+  measured, a pass per fifty results would take 7.7 minutes at a thousand
+  staged and fall behind at a result a second.
+- SES parts are sent as UTF-8: with no charset SES reads 7-bit ASCII, and the
+  mails now carry names such as `李小龍`.
+- Usernames may not hold default-ignorable characters that are not Cf
+  (variation selectors, the Hangul fillers, `U+034F`) or the blank Braille
+  pattern: `walker` plus one of them registered as a second `walker`.
+- `merge_staged`'s comment described one statement.
+
+**Recorded:** KL-81 — a link's five scorings an hour; composed and decomposed
+lookalike usernames (normalizing only new names would lock out existing
+ones). **Held, by reasoning:** no deadlock among the account paths; no
+livelock in the tail's recheck; no staged row lost between passes (purges take
+the merge lock). **Left:** results staged before a deploy of 6.2 keep MAGPIE's
+spelling and are dropped at the next merge, logged (nothing is deployed yet).
+
+### 6.8 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **578 of 578**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 117 of 117.
+- Tier 6's M-4, natively against a real MAGPIE: fails on the old spelling (73
+  of 870 racks unmatched), passes with the fix, and passes after the merge's
+  redesign.
+- **Tier 5, natively: 11 of 11** on the committed pass-5 tree (frontend
+  reviewer).
+- The tail-close race, instrumented in a private copy: old code closes short,
+  new code does not.
+- Merge benchmarks on a full English generation (`p6-merge/` in the scratch
+  directory).
+- `scripts/dev-restore-check.sh` under a pseudo-terminal: passes (it hung).
+- Terraform unchanged (fmt and validate clean, infra reviewer); MAGPIE
+  unchanged.
+

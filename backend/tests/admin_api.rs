@@ -1974,3 +1974,62 @@ async fn a_job_cannot_pin_two_files_under_one_name() {
     let (status, body) = send(&app, create(&players[0], &players[2])).await;
     assert_eq!(status, StatusCode::CREATED, "two names, two files: {body}");
 }
+
+/// A-ADMIN-22: deleting an account locks the account before its own rows, the
+/// order a password reset and an email confirmation take them in
+/// (`auth_routes` pins theirs). Rows first, a delete deadlocked with either.
+#[tokio::test]
+async fn deleting_an_account_locks_it_before_its_rows() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let doomed = db.user("doomed", false).await;
+    sqlx::query(
+        "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
+         VALUES ($1, 'one', now() + interval '1 hour'), ($1, 'two', now() + interval '1 hour')",
+    )
+    .bind(doomed)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let admin = db.user("root", true).await;
+
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(doomed)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let delete = {
+        let (app, headers) = (app.clone(), admin_headers(&state.cfg, admin));
+        tokio::spawn(async move {
+            send(&app, request("DELETE", &format!("/api/admin/users/{doomed}"), &headers)).await
+        })
+    };
+    let mut waited = false;
+    for _ in 0..400 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            waited = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(waited, "the delete never waited for the account");
+    let mut probe = db.pool.begin().await.unwrap();
+    let free = sqlx::query("SELECT 1 FROM password_reset_tokens WHERE user_id = $1 FOR UPDATE NOWAIT")
+        .bind(doomed)
+        .fetch_all(&mut *probe)
+        .await;
+    assert!(free.is_ok(), "the delete took the account's reset links first: {free:?}");
+    probe.rollback().await.unwrap();
+    holder.rollback().await.unwrap();
+    let (status, body) = delete.await.unwrap();
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}

@@ -80,9 +80,12 @@ read -r ALLOCATED MAX_STORAGE < <(aws rds describe-db-instances --region "$REGIO
 [[ "$MAX_STORAGE" =~ ^[0-9]+$ ]] || MAX_STORAGE=0
 # 130%: RDS warns once allocation passes 80% of the ceiling.
 MIN_CEILING=$(( (ALLOCATED * 130 + 99) / 100 ))
-# Never past RDS's largest volume, 65,536 GiB.
+# Never past RDS's largest volume, 65,536 GiB. Past 59,578 GiB allocated no
+# ceiling is a tenth above the allocation, so the restore goes without one.
 (( MIN_CEILING <= 65536 )) || MIN_CEILING=65536
 (( MAX_STORAGE >= MIN_CEILING )) || MAX_STORAGE=$MIN_CEILING
+CEILING=(--max-allocated-storage "$MAX_STORAGE")
+(( ALLOCATED * 11 <= 655360 )) || CEILING=()
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
   --target-db-instance-identifier "birdtest-restore-$STAMP" \
@@ -92,7 +95,7 @@ aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --db-parameter-group-name "$PARAMETER_GROUP" \
   --no-publicly-accessible \
   --db-instance-class "$INSTANCE_CLASS" \
-  --max-allocated-storage "$MAX_STORAGE"
+  "${CEILING[@]}"
 
 aws rds wait db-instance-available --region "$REGION" \
   --db-instance-identifier "birdtest-restore-$STAMP"

@@ -11,8 +11,9 @@ Each case is selectable with `--cases` (default: every M case):
   and equity. The static player asks for a wordmap, so its job waits for the
   derived-file builder, and MAGPIE builds its own copy and finds it agrees.
 - `M-4` `leave_generation`: full-rack occurrences are staged, a merge folds
-  them into the generation's progress, and nothing is written into MAGPIE's
-  data directory. Real English, so creating the job seeds a 3.2M-rack
+  them into the generation's progress -- every reported rack, blank racks
+  included, matching a rack of the universe -- and nothing is written into
+  MAGPIE's data directory. Real English, so creating the job seeds a 3.2M-rack
   universe: the slow one.
 - `M-5` A worker whose data does not match the job's digests declines with
   `missing_data`, the gap reaches `worker_data_gaps`, and nothing is stored.
@@ -658,9 +659,23 @@ def case_leave(ctx: Context) -> None:
             "SELECT COALESCE(SUM(games_played), 0) FROM leave_generation_progress "
             f"WHERE job_id = '{job_id}'"))
         expect(played > 0, "the generation's live counters did not move")
+        # Every rack a real MAGPIE reported names a row of the universe. MAGPIE
+        # spells a rack blanks last (`AEINST?`), the universe blanks first, and
+        # until the thirty-second audit every blank rack was dropped silently.
+        distinct = int(ctx.psql(
+            "SELECT COUNT(DISTINCT r) FROM leave_rack_staging s, unnest(s.racks) r "
+            f"WHERE s.job_id = '{job_id}'"))
         outcome = ctx.post(f"/api/admin/jobs/{job_id}/merge-progress", "merge leave progress")
         expect(outcome["folds_merged"] == staged,
                f"merged {outcome['folds_merged']} staged results, expected {staged}")
+        expect(outcome["racks_updated"] == distinct,
+               f"{distinct - outcome['racks_updated']} of {distinct} reported racks "
+               "matched no rack of the universe")
+        blanks = int(ctx.psql(
+            "SELECT COUNT(*) FROM leave_rack_progress "
+            f"WHERE job_id = '{job_id}' AND generation = 1 AND occurrence_count > 0 "
+            "AND rack LIKE '?%'"))
+        expect(blanks > 0, "no rack holding a blank was counted")
         left = int(ctx.psql(
             f"SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = '{job_id}'"))
         expect(left == 0, f"{left} results still staged after a merge")

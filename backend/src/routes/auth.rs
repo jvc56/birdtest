@@ -91,6 +91,45 @@ fn too_weak(password: &str, username: &str, email: &str) -> AppResult<bool> {
     Ok(entropy.score() < MIN_PASSWORD_SCORE)
 }
 
+/// How many passwords may be scored at once, and how long a request waits
+/// for a turn before it is told to come back. Scoring has turns of its own:
+/// a crafted password costs zxcvbn close to a second, and on sign-in's four
+/// Argon2 turns a reset link replayed with weak passwords from eight
+/// addresses held every sign-in at `503` (the audit's pass 6).
+const SCORING_CONCURRENCY: usize = 2;
+const SCORING_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+static SCORING_PERMITS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(SCORING_CONCURRENCY);
+
+/// [`too_weak`] off the executor, at most `SCORING_CONCURRENCY` at a time: on
+/// the executor a crafted password stalled every request (`/health` 8.5 s).
+/// The turn goes with the run, and a run whose requester has gone is skipped.
+async fn too_weak_off_the_executor(password: &str, username: &str, email: &str) -> AppResult<bool> {
+    let turn = match tokio::time::timeout(SCORING_QUEUE_WAIT, SCORING_PERMITS.acquire()).await {
+        Ok(Ok(turn)) => turn,
+        Ok(Err(_)) => return Err(AppError::internal("the password scoring queue is closed")),
+        Err(_) => {
+            return Err(AppError {
+                retry_after: Some(10),
+                ..AppError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "unavailable",
+                    "the server is busy checking passwords; try again in a few seconds",
+                )
+            })
+        }
+    };
+    let (password, username, email) = (password.to_owned(), username.to_owned(), email.to_owned());
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        if !sender.is_closed() {
+            let _ = sender.send(too_weak(&password, &username, &email));
+        }
+    });
+    receiver.await.map_err(|_| AppError::internal("scoring a password did not finish"))?
+}
+
 
 /// One bare address: `local@domain`, nothing else. Mail goes to whatever this
 /// string is, so the check is on what a mail API would do with it rather than
@@ -114,6 +153,61 @@ fn is_bare_address(email: &str) -> bool {
         })
 }
 
+/// A character a username may not hold: a control character, a line or
+/// paragraph separator, a format character (Unicode's Cf: bidi overrides,
+/// zero-width marks and the like), or one that shows as nothing (the other
+/// default-ignorable characters, variation selectors among them, and the
+/// Hangul fillers and blank Braille pattern, which render as blanks). A username goes into mail to an address's
+/// owner — the reset mail, the taken-address notice — and a stranger can
+/// register someone's address under a name of their choosing (KL-34): with
+/// line breaks it was a message of their own in birdtest's mail, and with
+/// bidi overrides a name that reads as another.
+fn is_hidden_or_breaking(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{0600}'..='\u{0605}'
+                | '\u{061C}'
+                | '\u{06DD}'
+                | '\u{070F}'
+                | '\u{0890}'..='\u{0891}'
+                | '\u{08E2}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'..='\u{2064}'
+                | '\u{2066}'..='\u{206F}'
+                | '\u{FEFF}'
+                | '\u{FFF9}'..='\u{FFFB}'
+                | '\u{110BD}'
+                | '\u{110CD}'
+                | '\u{13430}'..='\u{1343F}'
+                | '\u{1BCA0}'..='\u{1BCA3}'
+                | '\u{1D173}'..='\u{1D17A}'
+                | '\u{E0001}'
+                | '\u{E0020}'..='\u{E007F}'
+                // Default-ignorable, but not Cf.
+                | '\u{034F}'
+                | '\u{115F}'..='\u{1160}'
+                | '\u{17B4}'..='\u{17B5}'
+                | '\u{180B}'..='\u{180D}'
+                | '\u{180F}'
+                | '\u{3164}'
+                | '\u{FE00}'..='\u{FE0F}'
+                | '\u{FFA0}'
+                | '\u{E0100}'..='\u{E01EF}'
+                // Blank.
+                | '\u{2800}'
+        )
+}
+
+/// A username as a mail shows it: an account named before the rule above
+/// keeps its name, but its hidden and breaking characters are shown as `?`.
+fn as_mailed(username: &str) -> String {
+    username.chars().map(|c| if is_hidden_or_breaking(c) { '?' } else { c }).collect()
+}
+
 async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -130,12 +224,14 @@ async fn register(
     let username_chars = username.chars().count();
     if !(3..=32).contains(&username_chars) {
         err = err.with_field("username", "must be between 3 and 32 characters");
+    } else if username.chars().any(is_hidden_or_breaking) {
+        err = err.with_field("username", "must not contain line breaks or invisible characters");
     }
     if !is_bare_address(&email) {
         err = err.with_field("email", "must be a valid email address");
     }
-    // Scored server-side; the client shows the same feedback but is not trusted.
-    if too_weak(&body.password, &username, &email)? {
+    // Scored here only: the form shows a length hint, not this score.
+    if too_weak_off_the_executor(&body.password, &username, &email).await? {
         err = err.with_field("password", "too weak — choose a longer, less predictable password");
     }
     if !err.fields.is_empty() {
@@ -236,6 +332,7 @@ async fn register(
                         .await
                         .ok()
                         .flatten();
+                let owner = owner.as_deref().map(as_mailed);
                 let body = notice.replace("{username}", owner.as_deref().unwrap_or("your account"));
                 if let Err(err) =
                     mailer.send(&to, "Someone tried to register with your email address", &body).await
@@ -470,6 +567,15 @@ async fn confirm_email(
     let code_hash = api_key::hash_code(body.code.trim());
 
     let mut tx = state.pool.begin().await?;
+    // The account first, then its code: the order an admin's delete takes
+    // them in. Code first, a confirm and a delete of one account deadlocked.
+    sqlx::query(
+        "SELECT u.id FROM users u JOIN email_confirmations c ON c.user_id = u.id
+         WHERE c.code_hash = $1 FOR NO KEY UPDATE OF u",
+    )
+    .bind(&code_hash)
+    .fetch_optional(&mut *tx)
+    .await?;
     let user_id = sqlx::query_scalar::<_, Uuid>(
         "UPDATE email_confirmations SET used_at = now()
          WHERE code_hash = $1 AND used_at IS NULL AND expires_at > now()
@@ -513,6 +619,9 @@ struct ResetRequestBody {
     email: String,
 }
 
+/// A reset request's one answer, for every address.
+const RESET_REQUESTED: &str = "if that address has an account, a reset link is on its way";
+
 async fn request_password_reset(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
@@ -535,15 +644,22 @@ async fn request_password_reset(
 
     if let Some((user_id, username)) = user {
         let raw_token = api_key::generate_code();
-        sqlx::query(
+        // Only for an account still there: the lock waits for a delete in
+        // progress and then sees its tombstone, where a plain insert waited
+        // for it and then went in, and mailed a link to a deleted account.
+        let inserted = sqlx::query(
             "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
-             VALUES ($1, $2, $3)",
+             SELECT id, $2, $3 FROM users WHERE id = $1 AND deleted_at IS NULL FOR KEY SHARE",
         )
         .bind(user_id)
         .bind(api_key::hash_code(&raw_token))
         .bind(Utc::now() + Duration::minutes(RESET_TTL_MINUTES))
         .execute(&state.pool)
-        .await?;
+        .await?
+        .rows_affected();
+        if inserted == 0 {
+            return Ok(Json(MessageBody { message: RESET_REQUESTED }));
+        }
 
         // See the same encoding note on the confirm-email link above.
         let encoded_token = utf8_percent_encode(&raw_token, NON_ALPHANUMERIC);
@@ -566,8 +682,9 @@ async fn request_password_reset(
                     // has forgotten their password may have forgotten that as
                     // well. The mail goes only to the address's owner.
                     &format!(
-                        "Your birdtest username is {username}.\n\n\
-                         Reset your password (valid for {RESET_TTL_MINUTES} minutes):\n{link}\n"
+                        "Your birdtest username is {}.\n\n\
+                         Reset your password (valid for {RESET_TTL_MINUTES} minutes):\n{link}\n",
+                        as_mailed(&username)
                     ),
                 )
                 .await
@@ -582,7 +699,7 @@ async fn request_password_reset(
 
     // Always 200, whether or not the address is registered — otherwise this
     // endpoint would confirm which addresses have accounts.
-    Ok(Json(MessageBody { message: "if that address has an account, a reset link is on its way" }))
+    Ok(Json(MessageBody { message: RESET_REQUESTED }))
 }
 
 #[derive(Deserialize)]
@@ -602,50 +719,63 @@ async fn confirm_password_reset(
         AppError::bad_request("password is invalid")
             .with_field("password", "too weak — choose a longer, less predictable password")
     };
-    // Scored once before the token is looked at, so a weak password costs no
-    // database work, and again below against the account it resets.
-    if too_weak(&body.password, "", "")? {
+    let token_hash = api_key::hash_code(body.token.trim());
+
+    // The link first, read without a lock: a wrong or spent one costs neither
+    // a score nor a hash, which are close to a second and tens of
+    // milliseconds of a password thread's turn. Scored first, a wrong link
+    // was enough to spend them.
+    let account = sqlx::query_as::<_, (String, String)>(
+        "SELECT u.username, u.email FROM password_reset_tokens t JOIN users u ON u.id = t.user_id
+         WHERE t.token_hash = $1 AND t.used_at IS NULL AND t.expires_at > now()
+           AND u.deleted_at IS NULL",
+    )
+    .bind(&token_hash)
+    .fetch_optional(&state.pool)
+    .await?;
+    let invalid = || AppError::bad_request("that reset link is invalid or has expired");
+    let Some((username, email)) = account else {
+        return Err(invalid());
+    };
+    // A link refused a weak password still works, so each scoring is also
+    // counted against the link: replayed from many addresses it was a queue
+    // of scorings no per-address limit bounded.
+    ratelimit::check(&state.limits.reset, &format!("tok:{token_hash}"))?;
+
+    // The same rule registration applies: not the username, not the address.
+    // Refused here, the link still works for a better password.
+    if too_weak_off_the_executor(&body.password, &username, &email).await? {
         return Err(weak());
     }
 
-    // Hashed before the transaction: the wait for an Argon2 turn can be ten
-    // seconds under a flood, and inside the transaction it held the account's
-    // row locked all that while — against the account's own submissions,
-    // which count its tasks on that row.
+    // Scored and hashed before the transaction: the wait for a turn can be
+    // ten seconds under a flood, and inside the transaction it held the
+    // account's row locked all that while — against the account's own
+    // submissions, which count its tasks on that row.
     let password_hash = api_key::hash_password_off_the_executor(body.password.clone()).await?;
 
     let mut tx = state.pool.begin().await?;
     // The account first, then its token: the order an admin's delete takes
     // them in. Token first, a reset and a delete deadlocked whenever the
-    // account had two reset links out (the delete took the other first).
+    // account had two reset links out (the delete took the other first). A
+    // delete that commits while this waits leaves no account to lock.
     sqlx::query(
         "SELECT u.id FROM users u JOIN password_reset_tokens t ON t.user_id = u.id
-         WHERE t.token_hash = $1 FOR NO KEY UPDATE OF u",
+         WHERE t.token_hash = $1 AND u.deleted_at IS NULL FOR NO KEY UPDATE OF u",
     )
-    .bind(api_key::hash_code(body.token.trim()))
+    .bind(&token_hash)
     .fetch_optional(&mut *tx)
-    .await?;
+    .await?
+    .ok_or_else(invalid)?;
     let user_id = sqlx::query_scalar::<_, Uuid>(
         "UPDATE password_reset_tokens SET used_at = now()
          WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
          RETURNING user_id",
     )
-    .bind(api_key::hash_code(body.token.trim()))
+    .bind(&token_hash)
     .fetch_optional(&mut *tx)
     .await?
-    .ok_or_else(|| AppError::bad_request("that reset link is invalid or has expired"))?;
-
-    // The same rule registration applies: not the username, not the address.
-    // Returning here rolls the transaction back, so the link still works for
-    // a better password.
-    let (username, email) =
-        sqlx::query_as::<_, (String, String)>("SELECT username, email FROM users WHERE id = $1")
-            .bind(user_id)
-            .fetch_one(&mut *tx)
-            .await?;
-    if too_weak(&body.password, &username, &email)? {
-        return Err(weak());
-    }
+    .ok_or_else(invalid)?;
 
     // The generation bump signs out every existing session, an attacker's
     // included: resetting a password is what someone does when they suspect
@@ -678,6 +808,23 @@ async fn confirm_password_reset(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_username_holds_no_line_break_or_hidden_character() {
+        for good in ["walker", "Jane Doe", "李小龍", "o'brien-2", "émile"] {
+            assert!(!good.chars().any(super::is_hidden_or_breaking), "{good}");
+            assert_eq!(super::as_mailed(good), good);
+        }
+        for bad in [
+            "a\nb", "a\r\nb", "tab\there", "a\u{2028}b", "a\u{2029}b", "abc\u{202E}fdp.exe",
+            "zero\u{200B}width", "a\u{2066}b", "bom\u{FEFF}", "del\u{7F}", "nel\u{85}", "tag\u{E0041}",
+            "walker\u{3164}", "walker\u{FE0F}", "walk\u{034F}er", "\u{2800}\u{2800}\u{2800}",
+        ] {
+            assert!(bad.chars().any(super::is_hidden_or_breaking), "{bad:?}");
+            assert!(!super::as_mailed(bad).chars().any(super::is_hidden_or_breaking), "{bad:?}");
+        }
+        assert_eq!(super::as_mailed("Prize!\n\nevil.xyz"), "Prize!??evil.xyz");
+    }
+
     #[test]
     fn only_a_bare_address_is_an_email() {
         for good in ["a@example.com", "first.last+tag@mail.example.co.uk", "x_y-z@b.io"] {

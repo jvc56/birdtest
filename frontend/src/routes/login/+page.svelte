@@ -55,7 +55,7 @@
         required
       />
     </div>
-    {#if error}<p class="field-error">{error}</p>{/if}
+    {#if error}<p class="field-error" role="alert">{error}</p>{/if}
     <button class="btn-primary w-full" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
     <div class="flex justify-between text-sm text-muted-foreground">
       <a href="/reset-password">Forgot password?</a>

@@ -44,8 +44,12 @@ impl Mailer {
                     .simple(
                         aws_sdk_sesv2::types::Message::builder()
                             .subject(
+                                // SES reads a part with no charset as 7-bit
+                                // ASCII; the mails name accounts, and a name
+                                // may be `李小龍` or `émile`.
                                 aws_sdk_sesv2::types::Content::builder()
                                     .data(subject)
+                                    .charset("UTF-8")
                                     .build()
                                     .map_err(|e| AppError::internal(e.to_string()))?,
                             )
@@ -54,6 +58,7 @@ impl Mailer {
                                     .text(
                                         aws_sdk_sesv2::types::Content::builder()
                                             .data(body)
+                                            .charset("UTF-8")
                                             .build()
                                             .map_err(|e| AppError::internal(e.to_string()))?,
                                     )

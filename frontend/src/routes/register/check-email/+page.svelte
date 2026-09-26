@@ -1,6 +1,10 @@
 <script lang="ts">
-  // The development hint is for a developer's own stack, not every registrant.
-  const dev = import.meta.env.DEV;
+  // The development hint is for a developer's own stack, not every registrant:
+  // the Vite server, or the built pages served on this machine (`dev.py` and
+  // `docker compose up`, which mail to the console). Pages are rendered in the
+  // browser only (`ssr = false`), so `location` is there.
+  const dev =
+    import.meta.env.DEV || ['localhost', '127.0.0.1', '[::1]'].includes(location.hostname);
 </script>
 
 <div class="mx-auto max-w-md text-center">

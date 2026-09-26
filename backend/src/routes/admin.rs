@@ -727,6 +727,10 @@ async fn create_player_config(
     Ok((StatusCode::CREATED, Json(config)))
 }
 
+/// The most racks one leave task forces: 200 times the form's default of 50,
+/// about 80 KB of racks in each claim.
+const MAX_RACKS_PER_TASK: i32 = 10_000;
+
 /// Numbers MAGPIE would refuse, or silently read as "use your own default".
 ///
 /// MAGPIE validates these too, but only on a contributor's machine, after a
@@ -1290,6 +1294,15 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
                 if value < 1 {
                     err = err.with_field(field, "must be at least 1");
                 }
+            }
+            // Every claim carries its task's forced racks, and so does every
+            // `leave_requests` row: a typo of millions sent the generation's
+            // whole universe with each.
+            if *racks_per_task > MAX_RACKS_PER_TASK {
+                err = err.with_field(
+                    "racks_per_task",
+                    format!("must be at most {MAX_RACKS_PER_TASK}"),
+                );
             }
             err
         }
@@ -3177,6 +3190,16 @@ mod tests {
             "racks_per_task": 0,
         }));
         assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "racks_per_task"]);
+        let mut leave = serde_json::json!({
+            "job_type": "leave_generation",
+            "kwg_id": Uuid::nil(),
+            "num_iterations": 10,
+            "target_rack_count": 10,
+            "racks_per_task": MAX_RACKS_PER_TASK,
+        });
+        assert!(validate_job_body(&body(leave.clone())).is_ok());
+        leave["racks_per_task"] = serde_json::json!(MAX_RACKS_PER_TASK + 1);
+        assert_eq!(fields(validate_job_body(&body(leave))), ["racks_per_task"]);
     }
 
     #[test]

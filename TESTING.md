@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 206 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1 Unit | 208 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 117 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 150 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 185 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (33), `auth_routes.rs` (18), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 2 Integration | 152 | `backend/tests/`: `leave_gen.rs` (32), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 190 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (34), `auth_routes.rs` (22), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 569 backend tests (the per-tier counts above are
+--run-ignored all` runs 578 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -161,6 +161,7 @@ incidentally by higher tiers.
 | `scripts/dev.py` | Manual | Deliberate — see [Not tested](#what-is-deliberately-not-tested) |
 | `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh` | Nightly | Covered (`S-BACKUP-*`) |
 | `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`) |
+| `scripts/dev-restore.sh` | CI (`scripts`) | Covered (`S-BACKUP-6`: its `SCRUB` rule against a stub `COMPOSE`) |
 | birdtest ↔ MAGPIE wire | 4 + 6 | Covered — `C-1`..`C-9` on both sides, and tier 6 |
 
 ---
@@ -350,7 +351,8 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
 - `U-AUTH-9b` A request that goes away does not leave its Argon2 run queued
   past the four turns: the turn goes with the run, and a run whose requester
   has gone is skipped. A thousand aborted requests leave a fresh hash under a
-  second (8 s, timed out, when the request held the turn). *(Covered:
+  second (it fails when the request holds the turn: the run took 8.4 s).
+  *(Covered:
   `api_key::tests::abandoned_argon2_runs_do_not_queue_past_the_turns`.)*
   (Thirty-second audit.)
 
@@ -1330,6 +1332,23 @@ job creation touches needs one caller here.
   `leave_gen::a_generation_turns_to_its_tail_only_where_a_lap_would_start`.)*
   (Thirty-first audit: it turned mid-lap, and each claim then hashed every sweep
   claim's racks inside the dispatch lock, 0.45 s a claim at a thousand workers.)
+- `I-LEAVE-20` **A rack counts however the worker spells it.** MAGPIE writes a
+  rack's letters in its machine-letter order with blanks last (`AEINST?` for
+  the forced `?AEINST`); matched exactly, every blank rack went uncounted and an
+  English generation never closed. The whole universe forced in one task and
+  reported reversed is counted rack for rack; one rack under two spellings in
+  one result is refused as a duplicate. *(Covered:
+  `leave_gen::a_rack_counts_however_the_worker_spells_it`,
+  `jobs::leave_gen::tests::a_reported_rack_is_spelled_as_the_universe_spells_it`
+  (German's `Ä` too), and tier 6's `M-4` against a real MAGPIE.)* (Thirty-second
+  audit.)
+- `I-LEAVE-21` **A merge sums what is staged in passes, exactly.** A pass per
+  400,000 racks of the generation, each over a slice of the racks by hash, so
+  a pass's hash table fits in memory however much is staged; here slices of
+  about fifty over 149 racks, 110 results, three passes, every rack's total
+  exact. *(Covered:
+  `leave_gen::a_merge_of_a_backlog_sums_it_in_passes_exactly`.)* (Thirty-second
+  audit.)
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -1744,6 +1763,20 @@ below.
 - `A-AUTH-3` **A wrong password and an unknown username return an identical
   401** — body and status both, so the endpoint cannot enumerate accounts.
   *(Covered: `auth_routes::a_wrong_password_and_an_unknown_username_answer_identically`.)*
+- `A-AUTH-3b` Scoring a password does not hold the executor: a hundred
+  characters of zxcvbn's substitution letters take it close to a second, and
+  on the executor one address's registrations or resets stalled every request
+  (`/health` 8.5 s). Scored on the password threads, a single-threaded test
+  runtime ticks throughout (a 1.08 s gap on the executor). A reset with a
+  wrong link is refused before any scoring. *(Covered:
+  `auth_routes::scoring_a_crafted_password_does_not_stall_the_server`.)*
+  (Thirty-second audit.)
+- `A-AUTH-3c` Scoring has turns of its own: sixteen crafted passwords being
+  scored do not hold up a sign-in (3.9 s behind them on sign-in's Argon2
+  turns), and each reset link buys five scorings an hour from any number of
+  addresses, then `429`. *(Covered:
+  `auth_routes::scoring_never_holds_up_a_sign_in_and_a_link_buys_few`.)*
+  (Thirty-second audit.)
 - `A-AUTH-4` **Registering a taken address returns the same body as a fresh
   registration.** Assert the bodies are byte-identical. *(Covered:
   `auth_routes::registering_a_taken_address_answers_exactly_like_a_new_registration`.)*
@@ -1768,6 +1801,13 @@ below.
   *(Covered: `auth_routes::the_owner_of_a_taken_address_is_told_their_username`,
   and the reset mail's in
   `auth_routes::a_reset_request_answers_the_same_for_known_and_unknown_addresses`.)*
+- `A-AUTH-4f` A username holds no line break, control or invisible (format)
+  character: it is written into mail to an address's owner, and a stranger
+  can register someone's address (KL-34). An account named so before the rule
+  is mailed with those characters as `?`. *(Covered:
+  `auth_routes::a_username_cannot_carry_a_message_into_mail`,
+  `routes::auth::tests::a_username_holds_no_line_break_or_hidden_character`.)*
+  (Thirty-second audit.)
   (Thirty-second audit.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
@@ -1791,6 +1831,12 @@ below.
 - `A-AUTH-9` A reset token is single-use, expires, and is invalidated by a
   successful reset. *(Covered:
   `auth_routes::a_reset_token_is_single_use_spent_by_any_reset_and_expires`.)*
+- `A-AUTH-9b` A password reset and an email confirmation lock the account
+  before its links, the order an admin's delete takes (`A-ADMIN-22`): with
+  the account held, each waits holding none of its links. Links first, each
+  deadlocked with a delete (a reset only when two links were out). *(Covered:
+  `auth_routes::a_reset_and_a_confirmation_lock_the_account_before_its_links`.)*
+  (Thirty-second audit.)
 - `A-AUTH-10` Logout clears the cookie, so the browser is signed out. It does
   not revoke the token: a session is a signed token, not a stored row, so there
   is nothing per-session to delete, and a copy of the cookie taken before
@@ -2032,6 +2078,10 @@ below.
   stricter only on parser quirks). *(Covered:
   `admin_api::a_config_or_job_no_worker_can_run_is_refused`,
   `routes::admin::tests::a_layout_magpie_would_refuse_is_refused`.)*
+  (Thirty-second audit.)
+- `A-ADMIN-22` Deleting an account locks the account before its own rows:
+  with the account held, the delete waits holding none of its reset links.
+  *(Covered: `admin_api::deleting_an_account_locks_it_before_its_rows`.)*
   (Thirty-second audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
@@ -2527,7 +2577,10 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   worker that required full racks refused every such task (MAGPIE `0a69b625`;
   reproduced, fixed in `34bf6f0c`; twenty-third audit).)*
 - `M-4` One `leave_generation` task lands, is staged, moves the generation's
-  live counters, and a merge folds it into `leave_rack_progress`. *(Covered:
+  live counters, and a merge folds it into `leave_rack_progress` -- every rack
+  a real MAGPIE reported matching a rack of the universe, and a rack holding a
+  blank counted (73 of 870 matched nothing before the thirty-second audit).
+  *(Covered:
   `case_leave`, which also checks that nothing is written into MAGPIE's data
   directory.)*
 - `M-5` A worker whose data digests do not match declines with `missing_data`
@@ -2912,7 +2965,7 @@ for `leave_generation` deliberately.
 
 GitHub Actions.
 
-**Per pull request** (`.github/workflows/ci.yml`), six jobs in parallel:
+**Per pull request** (`.github/workflows/ci.yml`), seven jobs in parallel:
 
 1. **backend** — a Postgres 16 service and a MinIO container, with
    `TEST_DATABASE_URL` and `TEST_S3_ENDPOINT` pointing at them; `cargo clippy
@@ -2931,7 +2984,9 @@ GitHub Actions.
    on failure.
 5. **terraform** — `terraform fmt -check -recursive` and `terraform validate`
    (no AWS credentials).
-6. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
+6. **scripts** — `scripts/dev-restore-check.sh`: `dev-restore.sh`'s `SCRUB`
+   rule against a stub `COMPOSE`, with no Docker (five minutes at most).
+7. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
    commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
    `test/birdtest_contract/`, and run `magpie_test contribute`; then
    `magpie_test builderhash` (the wordmap, rack info table and both KLV
@@ -2971,7 +3026,7 @@ branch it can reach, so until `docker/Dockerfile`'s `MAGPIE_COMMIT` is pushed to
 - The nightly's pin leg fails at its checkout. Its head leg builds whatever the
   branch's remote head is, which may be older than the backend's
   `MIN_MAGPIE_VERSION` allows.
-- `backend`, `frontend` and `terraform` are unaffected.
+- `backend`, `frontend`, `terraform` and `scripts` are unaffected.
 
 Push the pin before relying on CI. Once pushed, it must stay reachable: a
 rebase or force-push of the branch past it breaks rebuilding that release,

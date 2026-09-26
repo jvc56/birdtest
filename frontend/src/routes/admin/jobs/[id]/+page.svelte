@@ -97,8 +97,10 @@
   // closed. See PLAN.md, "Artifacts: back up, or rebuild?".
   async function rebuildArtifacts(force = false) {
     // Forcing replaces every generation's object with what the database
-    // rebuilds now -- including ones that differ because the results moved
-    // on after the generation closed, which is the KLV workers played.
+    // rebuilds now -- including ones that differ. A closed generation's rows
+    // do not move (a late result is credited, not folded), so a difference
+    // means the object or the rows were damaged or replaced, and the object
+    // may be the KLV workers played.
     if (
       force &&
       !confirm(
@@ -287,9 +289,10 @@
           </table>
         </div>
         <p class="text-xs text-muted-foreground">
-          A missing object is rebuilt from the job's rack progress. A differing hash is not: the
-          results have almost certainly moved on since the generation closed, and rewriting on that
-          basis would replace the KLV workers actually played with by one they never saw.
+          A missing object is rebuilt from the job's rack progress. A differing hash is not: a closed
+          generation's rows do not change, so a difference means the object or the rows were damaged
+          or replaced (a restore from another point, a hand edit). Find out which before forcing a
+          rebuild, which would replace the KLV workers actually played with.
         </p>
         <p class="text-xs text-muted-foreground">
           A generation built by a different MAGPIE builder is expected to differ and is not

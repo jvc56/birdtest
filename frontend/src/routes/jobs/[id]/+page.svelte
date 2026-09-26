@@ -159,7 +159,7 @@
               SPRT is not acted on until {stats.games.min_units.toLocaleString()}
               {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
             {:else}
-              SPRT can stop the job as soon as a bound is crossed, with no minimum number of {stats.games.unit}s.
+              SPRT is checked as {stats.games.unit}s arrive, with no minimum number of them.
             {/if}
           </p>
         {/if}
