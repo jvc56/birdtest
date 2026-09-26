@@ -373,7 +373,7 @@ export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 # Inside scripts/prod-shell.sh.
 apt-get update -qq && apt-get install -y -qq awscli >/dev/null
 STAMP=2026-09-07T03-00-00Z
-BUCKET=${BUCKET:-$BACKUP_BUCKET}   # the stack's own; set BUCKET/S3_REGION only to read another
+BUCKET=${BUCKET:-$BACKUP_BUCKET}   # the stack's own: the ops role can read no other
 rm -rf /tmp/dump   # a re-fetch must not keep files from an earlier one
 aws s3 cp ${S3_REGION:+--region $S3_REGION} "s3://$BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
 aws s3 cp ${S3_REGION:+--region $S3_REGION} "s3://$BUCKET/pg/$STAMP.manifest.json" /tmp/manifest.json
@@ -1104,8 +1104,8 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    as README.md "Deploying" does for a first deploy — but in `$DR_REGION`
    (`--region $DR_REGION` on every command; the CLI's default is likely the
    lost region) and with `DB_INSTANCE=birdtest-dr`. Terraform creates the
-   instance with a placeholder password and manages the parameters' names,
-   never their values. `SESSION_SIGNING_KEY` may be a fresh
+   instance with a placeholder password; the parameters it only names, and
+   `put-parameter` creates them. `SESSION_SIGNING_KEY` may be a fresh
    `openssl rand -hex 32`; every session cookie is invalidated, which costs a
    round of logins.
 3. Restore the database from the replicated dump. The new stack's ops task
@@ -1364,9 +1364,10 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
 
   Then what `destroy` leaves: the instance's final snapshot (rds.tf keeps
   one, and it exists only once the instance is gone), the staging bucket, the
-  workspace and `dr.tfvars`. The snapshot is a full copy of production's
-  database, and one left behind also stops the next drill's `destroy`, which
-  makes one of the same name:
+  two SSM parameters (Terraform only names them — and the session key may be
+  production's), the workspace and `dr.tfvars`. The snapshot is a full copy
+  of production's database, and one left behind also stops the next drill's
+  `destroy`, which makes one of the same name:
 
   ```bash
   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
@@ -1384,6 +1385,8 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
       && { aws s3 rb --force --region $PROD_REPLICA_REGION s3://birdtest-drill-stage-$A \
         || aws s3api head-bucket --region $PROD_REPLICA_REGION --bucket birdtest-drill-stage-$A 2>&1 \
            | grep -q '(404)'; } \
+      && aws ssm delete-parameters --region $DR_REGION \
+           --names /birdtest/DATABASE_URL /birdtest/SESSION_SIGNING_KEY > /dev/null \
       && terraform -chdir=infra workspace select default \
       && terraform -chdir=infra workspace delete dr \
       && mv infra/dr.tfvars infra/dr.tfvars.drill-$(date +%Y%m%d) \

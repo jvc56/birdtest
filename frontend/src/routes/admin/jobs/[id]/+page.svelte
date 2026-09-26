@@ -19,25 +19,35 @@
   // The [id] route only matches when the param is present.
   const jobId = $page.params.id as string;
 
+  // How this page's state is kept (redesigned in the audit's pass 17, after
+  // three passes of patches to it):
+  //
+  // - `stats` comes from two sources, the REST read and the live stream,
+  //   and neither carries an order. A REST read is applied only if it is the
+  //   newest one started and no stream payload arrived while it was out: a
+  //   read that landed late put back a status the stream had already moved
+  //   past, and an inactive or completed job sends nothing to correct it.
+  // - The allocation box is the admin's alone. It is filled once, from the
+  //   first payload that says the job's allocation, and no read touches it
+  //   after that; the job's current allocation is shown beside it. (Each
+  //   earlier attempt to keep the two in step lost a value the admin had
+  //   typed, and Activate sent the old one.)
+  // - The job, its data gaps and its export are read apart, so a failure of
+  //   one shows as that and not as an empty answer, and failed reads are
+  //   tried again on the next live payload and every five seconds.
   let stats: JobStats | null = null;
   // null until read: shown as "could not load", never as "none".
   let gaps: DataGap[] | null = null;
-  // The job's own allocation once any payload has said it; empty until then,
-  // so Activate cannot send a default the server never had.
   let allocation: number | null = null;
-  let allocationSeeded = false;
-  // Set when the admin types in the box: a read's result then leaves it be
-  // (a retry replaced a typed value, and Activate sent the old one), until an
-  // action's own read says what the server now holds.
-  let allocationEdited = false;
-  // Each read's number: a read that finishes after a newer one was started
-  // is dropped (a slow retry landed after an action and put back the state
-  // before it).
+  let allocationFilled = false;
   let reloadGen = 0;
-  // Why the page's reads last failed, if they did. Kept apart from `error`
+  let streamPayloads = 0;
+  // Why the page's reads last failed, if they did; kept apart from `error`
   // (an action's) so a later successful read can clear it.
   let loadError = '';
   let exportError = '';
+  // The job is gone (a 404): nothing to retry.
+  let gone = false;
   let reloading = false;
   let retry: number | undefined;
   let busy = false;
@@ -46,72 +56,80 @@
   let rebuild: ArtifactRebuild[] | null = null;
   let jobExport: JobExport | null = null;
   let exportPoll: number | undefined;
-  // Set when the page goes, so a poll whose request was in flight then does
-  // not schedule another one on a page nobody has open.
+  // Set when the page goes, so a request in flight then schedules nothing.
   let destroyed = false;
 
-  function seedAllocation(value: JobStats) {
-    if (allocationEdited) return;
-    if (value.job.allocation !== null) allocation = value.job.allocation;
-    else if (!allocationSeeded) allocation = 100;
-    allocationSeeded = true;
+  function fillAllocation(value: JobStats) {
+    if (allocationFilled) return;
+    allocation = value.job.allocation ?? 100;
+    allocationFilled = true;
   }
 
-  // The three reads settle apart: one after another, a 503 on the first left
-  // the other two unread, and the page -- its stats arriving on the stream --
-  // showed "no worker has declined" and an allocation of 100 as if the server
-  // had said so, and Activate sent the 100 (the audit's pass 16). A read that
-  // fails is tried again when the next live payload arrives.
   async function reload() {
     const gen = ++reloadGen;
+    const payloadsAtStart = streamPayloads;
     reloading = true;
     window.clearTimeout(retry);
     const [job, gapsRead, exportRead] = await Promise.allSettled([
       api.job(jobId),
       api.jobDataGaps(jobId),
-      loadExport()
+      fetchExport()
     ]);
-    if (gen !== reloadGen) return;
+    if (gen !== reloadGen || destroyed) return;
+    reloading = false;
     const failures: string[] = [];
     if (job.status === 'fulfilled') {
-      stats = job.value;
-      seedAllocation(job.value);
+      if (streamPayloads === payloadsAtStart) stats = job.value;
+      fillAllocation(job.value);
+    } else if (job.reason instanceof ApiError && job.reason.status === 404) {
+      gone = true;
     } else failures.push((job.reason as Error).message);
     if (gapsRead.status === 'fulfilled') gaps = gapsRead.value;
-    else failures.push((gapsRead.reason as Error).message);
-    if (exportRead.status === 'rejected') failures.push((exportRead.reason as Error).message);
-    loadError = failures.length ? `Could not load all of this job: ${[...new Set(failures)].join('; ')}` : '';
-    reloading = false;
+    else if (!gone) failures.push((gapsRead.reason as Error).message);
+    if (exportRead.status === 'fulfilled') applyExport(exportRead.value);
+    else if (!gone) exportError = `Could not check the export: ${(exportRead.reason as Error).message}`;
+    loadError = gone
+      ? 'This job no longer exists.'
+      : failures.length
+        ? `Could not load all of this job: ${[...new Set(failures)].join('; ')}`
+        : '';
     // And again in a few seconds: an inactive job sends no live payload.
-    if (loadError && !destroyed) retry = window.setTimeout(() => !reloading && reload(), 5000);
+    if (!gone && (failures.length || exportRead.status === 'rejected')) {
+      retry = window.setTimeout(() => !reloading && reload(), 5000);
+    }
   }
 
   // The export is built on a background task, so the page polls while one is
   // running. A job that has never been exported answers 404, which is not an
   // error worth showing.
-  // A failed poll polls again: one that stopped left "Building…" up and
-  // "Export again" disabled after the export was ready.
-  async function loadExport() {
-    window.clearTimeout(exportPoll);
+  async function fetchExport(): Promise<JobExport | null> {
     try {
-      jobExport = await api.jobExport(jobId);
-      exportError = '';
+      return await api.jobExport(jobId);
     } catch (e) {
-      if (e instanceof ApiError && e.status === 404) jobExport = null;
-      else {
-        if (jobExport?.state === 'running') pollExport();
-        throw e;
-      }
+      if (e instanceof ApiError && e.status === 404) return null;
+      throw e;
     }
-    if (jobExport?.state === 'running') pollExport();
   }
 
+  function applyExport(value: JobExport | null) {
+    jobExport = value;
+    exportError = '';
+    if (value?.state === 'running') pollExport();
+  }
+
+  // One poll at a time; a failed one polls again (one that stopped left
+  // "Building…" up after the export was ready).
   function pollExport() {
+    window.clearTimeout(exportPoll);
     if (destroyed) return;
-    exportPoll = window.setTimeout(
-      () => loadExport().catch((e) => (exportError = `Could not check the export: ${e.message}`)),
-      3000
-    );
+    exportPoll = window.setTimeout(async () => {
+      try {
+        applyExport(await fetchExport());
+      } catch (e) {
+        exportError = `Could not check the export: ${(e as Error).message}`;
+        pollExport();
+      }
+    }, 3000);
   }
 
   async function startExport() {
@@ -121,7 +139,7 @@
     notice = '';
     try {
       await api.startExport(jobId);
-      await loadExport();
+      applyExport(await fetchExport());
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -136,9 +154,10 @@
   onMount(() => {
     reload();
     const unsubscribe = subscribeToJob<JobStats>(jobId, (value) => {
+      streamPayloads += 1;
       stats = value;
-      if (!allocationSeeded) seedAllocation(value);
-      if (loadError && !reloading) reload();
+      fillAllocation(value);
+      if ((loadError || exportError) && !reloading && !gone) reload();
     });
     return () => {
       destroyed = true;
@@ -151,6 +170,7 @@
   function activate() {
     const value = allocation;
     if (value === null || !Number.isInteger(Number(value)) || value < 0 || value > 100) {
+      notice = '';
       error = 'Enter a whole-number allocation from 0 to 100.';
       return;
     }
@@ -167,7 +187,6 @@
     try {
       await action();
       notice = message;
-      allocationEdited = false;
       await reload();
     } catch (e) {
       error = (e as Error).message;
@@ -260,7 +279,6 @@
     notice = '';
     try {
       const merged = await api.mergeLeaveProgress(jobId);
-      allocationEdited = false;
       await reload();
       notice =
         `Merged ${merged.folds_merged.toLocaleString()} staged results into ` +
@@ -277,6 +295,8 @@
     if (!confirm('Delete this job and every task and result it holds? This cannot be undone.'))
       return;
     busy = true;
+    error = '';
+    notice = '';
     try {
       await api.deleteJob(jobId);
       goto('/jobs');
@@ -315,38 +335,41 @@
             max="100"
             class="input w-28"
             bind:value={allocation}
-            on:input={() => (allocationEdited = true)}
+            on:input={() => (allocationFilled = true)}
           />
+          <p class="mt-1 text-xs text-muted-foreground">
+            Now: {stats.job.allocation === null ? 'none' : `${stats.job.allocation}%`}
+          </p>
         </div>
         <button
           class="btn-primary"
-          disabled={busy}
+          disabled={busy || gone}
           on:click={activate}
         >
           Activate
         </button>
         <button
           class="btn-secondary"
-          disabled={busy}
+          disabled={busy || gone}
           on:click={() => run(() => api.deactivateJob(jobId), 'Job deactivated.')}
         >
           Deactivate
         </button>
-        <button class="btn-secondary" disabled={busy} on:click={forceComplete}>Force complete</button>
-        <button class="btn-secondary" disabled={busy} on:click={purge}>Purge results</button>
+        <button class="btn-secondary" disabled={busy || gone} on:click={forceComplete}>Force complete</button>
+        <button class="btn-secondary" disabled={busy || gone} on:click={purge}>Purge results</button>
         {#if stats.job.job_type === 'leave_generation'}
-          <button class="btn-secondary" disabled={busy} on:click={() => rebuildArtifacts()}>Check artifacts</button>
-          <button class="btn-destructive" disabled={busy} on:click={() => rebuildArtifacts(true)}>Force rebuild</button>
+          <button class="btn-secondary" disabled={busy || gone} on:click={() => rebuildArtifacts()}>Check artifacts</button>
+          <button class="btn-destructive" disabled={busy || gone} on:click={() => rebuildArtifacts(true)}>Force rebuild</button>
           <button
             class="btn-secondary"
             title="Fold staged results into the rack totals now, rather than at the next half-hourly merge"
-            disabled={busy}
+            disabled={busy || gone}
             on:click={mergeProgress}
           >
             Merge progress now
           </button>
         {/if}
-        <button class="btn-destructive" disabled={busy} on:click={remove}>Delete job</button>
+        <button class="btn-destructive" disabled={busy || gone} on:click={remove}>Delete job</button>
       </div>
       <p class="text-xs text-muted-foreground">
         The active jobs may allocate at most 100% between them; activation is rejected if this
@@ -426,7 +449,7 @@
           <button
             class="btn-secondary"
             on:click={startExport}
-            disabled={busy || jobExport?.state === 'running'}
+            disabled={busy || gone || jobExport?.state === 'running'}
           >
             {jobExport ? 'Export again' : 'Export results'}
           </button>

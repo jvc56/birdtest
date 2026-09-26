@@ -77,7 +77,7 @@ resource "aws_db_instance" "main" {
   # created with this placeholder, which the first deploy
   # replaces immediately (README.md, "Deploying"); ignore_changes keeps
   # Terraform from reverting it. The real password lives only in the
-  # DATABASE_URL SSM parameter declared in ssm.tf. The instance is reachable
+  # DATABASE_URL SSM parameter, which ssm.tf names and never reads. The instance is reachable
   # only from the ECS tasks' security group in the meantime. (Setting
   # `password` at all is what turns RDS-managed passwords off; the provider
   # refuses `manage_master_user_password` alongside it, even as false.)

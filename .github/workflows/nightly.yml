@@ -98,6 +98,10 @@ jobs:
           # variables, so docker-compose.yml reads these names instead.
           BIRDTEST_GITHUB_API_URL: http://host.docker.internal:8481/api
           BIRDTEST_GITHUB_RAW_URL: http://host.docker.internal:8481/raw
+          # Compose's defaults (2 and 3) suit a laptop; the runner has four
+          # cores and nothing else to do.
+          CARGO_BUILD_JOBS: "4"
+          MAKE_JOBS: "4"
         run: docker compose up -d --build --wait postgres minio minio-init backend
 
       - uses: actions/setup-python@v5

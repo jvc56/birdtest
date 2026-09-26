@@ -80,5 +80,76 @@ test('E-11: an admin job page whose first read fails shows only what the server 
   await page.getByRole('button', { name: 'Activate', exact: true }).click();
   await expect.poll(() => activations.length).toBe(1);
   expect(JSON.parse(activations[0])).toEqual({ allocation: 55 });
+
+  // And an action's read leaves it too: only Activate sends it (Deactivate's
+  // read put 7 back, and the next Activate sent that).
+  await page.route(`**/api/admin/jobs/${id}/deactivate`, (route) => route.fulfill({ status: 204, body: '' }));
+  await page.getByRole('button', { name: 'Deactivate', exact: true }).click();
+  await expect(page.getByText('Job deactivated.')).toBeVisible();
+  await expect(page.locator('#alloc')).toHaveValue('55');
+  await expect(page.getByText('Now: 7%')).toBeVisible();
+  await api.dispose();
+});
+
+/**
+ * E-11b: a read started before a live payload does not land over it. A retry
+ * whose job read was slow put back the status the stream had moved past, and
+ * a completed job sends nothing to correct it (thirty-second audit, pass 17).
+ */
+test('E-11b: a slow read does not undo what the stream has since said', async ({ page }) => {
+  const api = await AdminApi.open();
+  const a = await api.createStaticConfig(`e11b-a-${Date.now()}`, 'equity');
+  const b = await api.createStaticConfig(`e11b-b-${Date.now()}`, 'score');
+  const id = await api.activeJob(
+    {
+      job_type: 'game_pairs',
+      player1_config_id: a,
+      player2_config_id: b,
+      pairs_per_batch: 1,
+      min_pairs: 100000,
+      max_pairs: 200000
+    },
+    3
+  );
+  await api.post(`/api/admin/jobs/${id}/deactivate`);
+  const base = await api.get<{ job: Record<string, unknown> }>(`/api/jobs/${id}`);
+  const as = (status: string) => ({ ...base, job: { ...base.job, status, allocation: 7 } });
+  let current = as('active');
+
+  // The stream's second connection says the job completed; the page's second
+  // job read starts before that and is held until it has been said.
+  let saidCompleted: () => void = () => {};
+  const completedSaid = new Promise<void>((resolve) => (saidCompleted = resolve));
+  let streams = 0;
+  await page.route(`**/api/jobs/${id}/stream`, (route) => {
+    streams += 1;
+    if (streams >= 2) current = as('completed');
+    const body = `retry: ${streams === 1 ? 6000 : 600000}\nevent: stats\ndata: ${JSON.stringify(current)}\n\n`;
+    const fulfilled = route.fulfill({ headers: { 'content-type': 'text/event-stream' }, body });
+    if (streams >= 2) fulfilled.then(() => setTimeout(saidCompleted, 500));
+    return fulfilled.catch(() => {});
+  });
+  let jobReads = 0;
+  await page.route(`**/api/jobs/${id}`, async (route) => {
+    jobReads += 1;
+    const snapshot = JSON.stringify(current);
+    if (jobReads === 2) await completedSaid;
+    return route.fulfill({ contentType: 'application/json', body: snapshot }).catch(() => {});
+  });
+  // The first gap read fails, so the page retries (after five seconds).
+  let gapReads = 0;
+  await page.route(`**/api/admin/jobs/${id}/data-gaps`, (route) =>
+    ++gapReads === 1 ? route.fulfill({ status: 503, body: '' }) : route.fulfill({ json: [] })
+  );
+
+  await page.goto(`/admin/jobs/${id}`);
+  await expect(page.getByText(/Could not load all of this job/)).toBeVisible();
+  await expect.poll(() => jobReads, { timeout: 20_000 }).toBeGreaterThanOrEqual(2);
+  await completedSaid;
+  await expect(page.getByText(/Could not load all of this job/)).toBeHidden({ timeout: 10_000 });
+  const jobHeader = page.locator('header', { has: page.getByRole('heading', { level: 1 }) });
+  await expect(jobHeader.getByText('completed', { exact: true })).toBeVisible();
+  await page.waitForTimeout(1000);
+  await expect(jobHeader.getByText('completed', { exact: true })).toBeVisible();
   await api.dispose();
 });

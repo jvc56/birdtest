@@ -73,7 +73,7 @@ at tier 5 names a symptom.
 | 2 Integration | 158 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 196 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 11 | Playwright journeys `E-1`..`E-11` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 5 End-to-end | 12 | Playwright journeys `E-1`..`E-11` (`E-11` in two tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
@@ -2565,8 +2565,13 @@ admin in once and the admin journeys reuse its storage state.
   did not say: the data gaps it read apart, the job's own allocation (from the
   stream if the read failed), the failed reads tried again and their error
   cleared, a value the admin types kept through the retries, and Activate
-  sending it. *(Covered: `e11-admin-job-first-read.spec.ts`, the first
-  `GET /api/jobs/:id` and the first two gap reads answered `503`.)* The reads ran one after another: the page said
+  sending it — through an action's read too, since only Activate sends it
+  (the job's own allocation is shown beside the box). And `E-11b`: a read
+  started before a live payload does not land over it — a slow retry put back
+  the status the stream had moved past, on a job that sends nothing more.
+  *(Covered: `e11-admin-job-first-read.spec.ts`, two tests: the first
+  `GET /api/jobs/:id` and the first two gap reads answered `503`; and the
+  stream mocked to say `completed` while a retry's read is held.)* The reads ran one after another: the page said
   "No worker has declined this job", showed 100, and Activate sent it
   (thirty-second audit, pass 16).
 
@@ -2846,7 +2851,9 @@ the real check of the backups themselves.
   16 of 25), a fence labelled anything but exactly `bash`, `sql` or `text`
   (`Bash`, `sh`, `bash title=…`, unlabelled), a fence run after any other text
   on its line (a quote mark, a list marker, a nested list), a fence never
-  closed, or a line less indented than its block's fence is refused; a block
+  closed, a line less indented than its block's fence, or a closer indented
+  past it is refused; code must be printable ASCII (a no-break space after a
+  backslash ended the command); a block
   must parse with nothing said (`bash -n` only warns of a heredoc never
   terminated) and must not end in a backslash; and a block that mentions
   `aws` must turn the pager off in its first line of code (the pager

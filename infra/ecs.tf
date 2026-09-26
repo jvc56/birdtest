@@ -5,6 +5,17 @@
 resource "aws_ecs_cluster" "main" {
   name = local.name
   tags = local.tags
+
+  # ECS Exec (scripts/prod-shell.sh, RUNBOOK §2 and §5) is not logged. By
+  # default a session is logged through the task's awslogs driver, which asks
+  # the ops task role for CloudWatch Logs permissions it does not have -- and
+  # a transcript there would hold what the operator echoes, `DATABASE_URL`
+  # among it (thirty-second audit, pass 17).
+  configuration {
+    execute_command_configuration {
+      logging = "NONE"
+    }
+  }
 }
 
 resource "aws_cloudwatch_log_group" "main" {
@@ -292,8 +303,8 @@ data "aws_iam_policy_document" "execution_ssm" {
   statement {
     actions = ["ssm:GetParameters"]
     resources = compact([
-      aws_ssm_parameter.database_url.arn,
-      aws_ssm_parameter.session_signing_key.arn,
+      local.ssm_database_url_arn,
+      local.ssm_session_signing_key_arn,
       var.github_token_parameter_arn,
     ])
   }
@@ -387,8 +398,8 @@ resource "aws_ecs_task_definition" "main" {
       # definition or in Terraform state.
       secrets = concat(
         [
-          { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn },
-          { name = "SESSION_SIGNING_KEY", valueFrom = aws_ssm_parameter.session_signing_key.arn }
+          { name = "DATABASE_URL", valueFrom = local.ssm_database_url_arn },
+          { name = "SESSION_SIGNING_KEY", valueFrom = local.ssm_session_signing_key_arn }
         ],
         # Optional: unauthenticated GitHub ref resolution for input-data
         # imports is 60 calls an hour per IP.

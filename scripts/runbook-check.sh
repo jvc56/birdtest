@@ -19,7 +19,9 @@
 # checked. A bash block is read with its fence's indent removed and must parse;
 # a fence never closed is refused. A placeholder must parse: `X=''  # what goes
 # here`. A block that mentions `aws` must turn the pager off in its first line
-# of code. What it cannot see: an indented (unfenced) code block or `<pre>`, a
+# of code. What it cannot see: an indented (unfenced) code block, `<pre>` or
+# an HTML comment -- and a fence inside one pairs the fences after it wrongly,
+# so the page keeps none -- a
 # shell block labelled `text`, a block that turns the pager back on, and a `!`
 # inside double quotes, which an interactive shell expands as history and
 # `bash -n` does not. A fence indented four columns or more is read as one,
@@ -79,9 +81,10 @@ check() {
         refuse("a line less indented than its block'"'"'s fence (line " start - 1 "); indent the block'"'"'s every line, its closing fence too")
         inside = 0; if (file != "") close(file); next
       }
-      # A closer indented four or more past its opener is content, as a
-      # renderer reads it.
-      if (m >= flen && substr(t, m + 1) ~ /^[ \t]*$/ && length(lead) - indent <= 3) {
+      # A closer indented past its opener is refused below: a renderer
+      # measures its indent from the page or the list item, not the opener,
+      # and may read it as content.
+      if (m >= flen && substr(t, m + 1) ~ /^[ \t]*$/ && length(lead) <= indent) {
         inside = 0; if (file != "") close(file); next
       }
       # A fence at least as long as the opener that does not close the block
@@ -89,7 +92,7 @@ check() {
       # it, and in bash is a run of backquotes. (A shorter one is how a block
       # quotes a fence, and is left alone.)
       if (m >= flen) {
-        refuse("a fence inside a block that does not close it (line " start - 1 "); close the block, or open it with a longer fence")
+        refuse("a fence inside a block that does not close it (line " start - 1 "): indent a closer as its opener, or open the block with a longer fence")
         inside = 0; if (file != "") close(file); next
       }
       if (file != "") {
@@ -132,7 +135,17 @@ check() {
     elif grep -nE '\\[[:blank:]]+$' "${block}" > "${WORK}/err"; then
       # A backslash then blanks escapes a blank, not the newline: the line
       # after it ran as a command of its own.
-      sed -i 's/^/line /; s/$/: a backslash followed by blanks, not a continuation/' "${WORK}/err"
+      sed 's/^/line /; s/$/: a backslash followed by blanks, not a continuation/' \
+        "${WORK}/err" > "${WORK}/err2" && mv "${WORK}/err2" "${WORK}/err"
+      bad=yes
+    elif LC_ALL=C awk '
+        # Code, not comments, must be printable ASCII: a no-break space after
+        # a backslash, a CR or a smart quote reads as text to the eye and not
+        # to bash. (A comment may say what it likes.)
+        { code = $0; sub(/(^|[ \t])#.*$/, "", code) }
+        code ~ /[^ -~\t]/ { print "line " NR ": a byte in code that is not printable ASCII"; bad = 1 }
+        END { exit !bad }
+      ' "${block}" > "${WORK}/err"; then
       bad=yes
     elif ! bash -n "${block}" 2> "${WORK}/err" || [ -s "${WORK}/err" ]; then
       bad=yes

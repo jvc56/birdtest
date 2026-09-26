@@ -83,7 +83,7 @@ resource "aws_ecs_task_definition" "ops" {
         { name = "RESTORE_JOB_SH", value = file("${path.module}/../scripts/restore-job.sh") },
       ]
       secrets = [
-        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn }
+        { name = "DATABASE_URL", valueFrom = local.ssm_database_url_arn }
       ]
       logConfiguration = {
         logDriver = "awslogs"

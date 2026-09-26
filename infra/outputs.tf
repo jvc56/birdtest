@@ -13,10 +13,10 @@ output "database_endpoint" {
 }
 
 output "ssm_parameter_names" {
-  description = "Parameters whose values must be set out of band before the first deploy."
+  description = "Parameters to create out of band (put-parameter) before the service starts; Terraform never reads them."
   value = [
-    aws_ssm_parameter.database_url.name,
-    aws_ssm_parameter.session_signing_key.name,
+    local.ssm_database_url_name,
+    local.ssm_session_signing_key_name,
   ]
 }
 

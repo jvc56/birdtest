@@ -145,6 +145,15 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   replacing a typed allocation; a read landing after an action; the checker
   hanging on a line of backslashes; PLAN's output promise), all fixed. KL-64
   and KL-68 updated; KL-86 added. The loop continues.
+- **Pass 17 (follow-up: pass 16's diff, and the infrastructure as a whole):**
+  0 high and 4 medium from the reviewers — the database password and session
+  signing key decrypted into Terraform's state (now referenced, not managed,
+  and moved out of an existing state by `removed` blocks); a typed allocation
+  lost to any action and a slow read landing over a live payload (the admin
+  job page's state redesigned, with `E-11b`); a MAGPIE message still quoting a
+  value (MAGPIE `e98a5244`) — all fixed; the adversarial check found 1 medium
+  (a commented-out key refused; MAGPIE `f3fc1927`, pinned), fixed. KL-64,
+  KL-65, KL-68 and KL-86 updated. The loop continues.
 
 ---
 
@@ -2626,3 +2635,160 @@ quotes no key in any settings error; every doc block parses under bash 3.2.
   case file from passes 13–16 as above, none hanging.
 - README's ACM wait replayed with a stub carrying the real CLI's messages:
   pending then issued, never issued, timed out, failed, denied.
+
+## Pass 17 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`a4ea3b4..20a27fd`), and
+MAGPIE's `8ba24b7b..3565279b`, one reviewer per part: frontend (tier 5
+natively); MAGPIE; scripts, docs and backend. Plus one area not examined as a
+whole in this run: **the infrastructure** — every file in `infra/`, and the
+scripts that run as its tasks, against their roles.
+
+**Findings: 0 high, 4 medium** from the four reviewers (frontend 2 medium, 5
+low, 1 unconfirmed; MAGPIE 1 medium, 10 low; scripts, docs and backend none, 5
+low, 1 unconfirmed; infrastructure 1 medium, 6 low, 2 unconfirmed). All fixed;
+the admin job page's state handling, patched in passes 16 and 16.4, is
+redesigned rather than patched a third time.
+
+### 17.1 Medium — the database password and the session signing key sat in plain text in Terraform's state (infrastructure reviewer)
+
+The two SSM parameters were Terraform resources with a placeholder value and
+`ignore_changes = [value]`, which suppresses the diff but not the read: every
+refresh wrote the decrypted values into the state — the RDS password inside
+the URL, and the key that mints a session for any user. README said the state
+held no secret and to copy it off the machine. **Shown** with the stack's own
+`ssm.tf` against a local SSM emulator: after README's second apply, both
+values in `terraform.tfstate`, and `plan` said nothing. **Fix:** Terraform no
+longer manages them; the task definitions and roles reference them by an ARN
+built from their names, and `removed` blocks take them out of an existing
+stack's state without deleting them. README says the parameters are created
+by `put-parameter`, and that a stack applied before this pass must rotate
+both. **Verified:** against the emulator, the old config puts both values in
+the state; the new one drops them (state holds neither) and both parameters
+remain in SSM; `fmt` and `validate` pass. With it: the cluster's ECS Exec
+logging is off (its default asked the ops role for CloudWatch Logs
+permissions it lacks, and a transcript would hold what an operator echoes).
+
+### 17.2 Medium — a typed allocation was thrown away by any action (frontend reviewer)
+
+16.4 kept a typed allocation through retries but cleared the edit flag after
+every action, so Deactivate, Purge, Force complete and Merge put the job's
+value back over one the admin had typed and not sent, and Activate sent the
+old one (shown against the real backend: typed 12, Deactivate, Activate sent
+7). The third fix to how the page keeps the allocation in step, so the
+approach changed (17.4).
+
+### 17.3 Medium — a read started before a live payload landed over it (frontend reviewer)
+
+16.4 ordered reads against each other, not against the stream: a retry's slow
+read that started before the stream said `completed` landed after it and put
+`active` back, and a completed job sends nothing more (shown with mocks).
+Fixed by the same redesign (17.4).
+
+### 17.4 The admin job page's state, redesigned
+
+- The job's stats come from the REST read and the stream, neither ordered: a
+  REST read is applied only if it is the newest started and no stream payload
+  arrived while it was out.
+- The allocation box is the admin's alone: filled once, from the first
+  payload that says the job's allocation, and never touched by a read after
+  that; the job's current allocation is shown beside it ("Now: 7%").
+- The job, its gaps and its export are read apart; export results go through
+  one function, one poll timer at a time, and a 404 clears the export error; a
+  deleted job (404) says so and stops the retries; a validation error or a
+  delete clears the last action's notice.
+
+**Verified:** `E-11` now also types a value, deactivates, and asserts the value
+kept and the job's shown beside it; a new `E-11b` holds a retry's read until
+the stream has said `completed` and asserts the page still says completed.
+Both fail on the committed page (at the kept value, and at `completed`) and
+pass; four repeats of both pass; tier 5 is 13 of 13.
+
+### 17.5 Medium — PLAN said no settings error quotes a value; the negative-`maxtasks` one did (MAGPIE reviewer)
+
+It quoted only a whole negative number, so never a key, but broke the
+guarantee as written. **Fix** (MAGPIE `e98a5244`, pinned): it quotes nothing.
+With it: whole-number settings are refused past an `int`'s range rather than
+truncated (`maxtasks 4294967296` read as 0, "no limit"); a UTF-8 byte-order
+mark is skipped (it made `server` an unknown setting); a comment holding
+`apikey bt_` is refused (a key appended to a last comment line was swallowed
+and the run went anonymous); an `apikey` holding a space is refused; a
+setting's name in the wrong case is shown, saying settings are lowercase; the
+fixture README says which files birdtest's CI replaces. **Verified:**
+`test_client_state` fails on the committed parser and passes; MAGPIE's
+`contribute`, `config` and `layout` pass.
+
+### 17.6 Low findings
+
+**Fixed:**
+- Infrastructure: variables refuse what would break an apply or the stack —
+  `db_backup_retention_days` outside 1–35 (0 turns point-in-time recovery
+  off), `backup_retention_days` of 30 or less (before the Glacier move),
+  `backup_object_lock_days` and `backup_dump_jobs` below 1, a negative
+  `desired_count`, and `name_suffix = "-backup"` (the one suffix that rebuilds
+  a production name, `birdtest-backup-task`; checked against every name the
+  stack builds); RUNBOOK §2.1 no longer offers reading another bucket, which
+  the ops role cannot.
+- `runbook-check.sh`: a closer indented past its opener is refused; code (not
+  comments) must be printable ASCII — a no-break space after a backslash
+  ended the command; `sed -i` replaced for macOS; the header says a `<pre>` or
+  comment can hide a fence.
+- The nightly's image build uses the runner's four cores.
+- MAGPIE (above): the byte-order mark, ranges, comment and case messages.
+- Admin job page (above): the export's 404 clears its error, a deleted job
+  stops retrying, stale notices are cleared.
+
+**Recorded:** KL-64 (trust policies without a source condition; the builder
+given `SESSION_SIGNING_KEY` only for the shared configuration); KL-65 (S3
+replication has no metrics or failure alarm); KL-68 (`server` not held to a
+URL's shape; a NUL byte hides the lines after it). **Unconfirmed, left:**
+whether an ECS Exec session sees the container's environment (RUNBOOK §2
+relies on it); whether ACM ever reports a failed certificate with a pending
+domain (the ACM loop would then wait its ten rounds).
+
+### 17.7 Adversarial check of the pass's fixes
+
+**1 medium, fixed.**
+
+- **MAGPIE refused a key commented out on purpose.** 17.5's rule refused
+  any `#` line holding `apikey bt_`, so `# apikey bt_old (laptop,
+  deactivated)` — an ordinary edit, and PLAN says `#` lines are ignored —
+  stopped the run; and it still missed the case it was written for when the
+  key had `dev.py`'s aligned spacing (`apikey   bt_…`). **Fix** (MAGPIE
+  `f3fc1927`, pinned): only `apikey` glued to the text before it, then blanks
+  and `bt_` — what appending the setting to a last comment line with no
+  newline makes — is refused. **Verified:** the new cases (a glued key with
+  either spacing refused; three commented-out keys loaded, no key set) fail
+  on `e98a5244`'s rule and pass.
+
+**Lows fixed:** RUNBOOK §5 says `put-parameter` creates the parameters and §6's
+teardown deletes them (Terraform no longer does, and the drill's session key
+may be production's); `rds.tf`'s comment; README names
+`terraform.tfstate.backup` among the state copies that hold the old values;
+the checker's refusal of an over-indented closer says to indent it as its
+opener; a deleted job's page disables its actions; MAGPIE's range refusal
+says the range. **Recorded (KL-86):** while an export read fails its poll and
+the retry both ask; a poll already out can briefly restore "Building…".
+**Held:** the built ARNs match the provider's (a mock-provider test, and a
+plan after migration showing only "no longer managed"), including the DR
+copy; `removed` needs Terraform 1.7 and the repo pins 1.9; no default or
+documented value fails the new validations; E-11 and E-11b pass repeatedly and
+fail on the committed page; a deleted job stops retrying; MAGPIE's range check
+takes `+5`, `007` and `2147483647` and refuses `0x10`, `1e3` and
+`2147483648`; every real contributor's settings file loads.
+
+### 17.8 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **594 of 594**.
+- **MAGPIE's suite** at `e98a5244`: **70 of 70**; at `f3fc1927`, `contribute`,
+  `config` and `layout` pass; `format.py` passes.
+- **Tier 6, natively, every case**: passed at `e98a5244` and `f3fc1927`.
+- **Tier 5, natively: 13 of 13** on the final working tree; `E-11` and
+  `E-11b` fail on the committed page, and pass four times over.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 119 of 119.
+- `terraform fmt -check`, `validate`, and each new validation refusing its
+  bad value while the defaults pass; the state migration replayed against a
+  local SSM emulator.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks.

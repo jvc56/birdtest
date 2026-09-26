@@ -3425,10 +3425,11 @@ actually a task to hand out — and the client persists it and sends it as
 Only a UUID in canonical form (8-4-4-4-12 hex digits, either case) is taken
 (a newline in one wrote settings every later run obeyed); a settings file that
 cannot be written is said so, with the line to add by hand, since otherwise
-every run would be a new worker; and a `uuid` line that is not a UUID — the
-start of one, left by a save a full disk cut short — fails startup naming the
-line to correct or delete, rather than being sent; an empty one still means
-none (thirty-second audit, passes 14 and 15).
+every run would be a new worker; and if the last `uuid` line (the one that
+counts) is not a UUID — the start of one, left by a save a full disk cut
+short — startup fails naming the line to correct or delete, rather than
+sending it; an empty one still means none (thirty-second audit, passes 14 to
+16).
 
 This is a deliberate reversal from letting the client generate its own UUID: a
 client-generated identity trusts a value the server never gets to validate.
@@ -8285,12 +8286,18 @@ says so in its implemented option, rather than being removed.
     succeeds (pass 16 made it poll again; before, it stopped for good).
   - A request that never settles leaves the job page's actions disabled until
     a reload (`request()` has no timeout; reasoned, not reproduced).
+  - While the job page's export read fails, its poll and its retry both ask
+    again; a poll already out can briefly put back "Building…" after a newer
+    answer said ready (the next poll corrects it).
 - **Options considered:** disabling the fields, the button while running, a
   reload on a `409`, a confirmation.
 - **Option implemented:** None of these. Pass 16 made the job page's reads
-  settle apart and retry (a read overtaken by a newer one dropped, a typed
-  allocation kept), seeded its allocation from the server, guarded every
-  action on it against a double click, trimmed a ban's target, confirmed an unban,
+  settle apart and retry, and pass 17 redesigned how it keeps state: a REST
+  read is applied only if it is the newest and no live payload came while it
+  was out, the allocation box is filled once and then only the admin's (the
+  job's current value shown beside it), and a deleted job stops the retries
+  and disables its actions;
+  every action on it takes one click, trimmed a ban's target, confirmed an unban,
   required the job form's players, and named an input row's digest and its
   derived files in the delete confirmation.
 - **Justification:** Admin-only, each visible and recoverable by a reload or
@@ -8454,6 +8461,10 @@ says so in its implemented option, rather than being removed.
     interface, with committed credentials.
   - The pages are served uncompressed (nginx's gzip is off; the bundle is
     about 524 KB).
+  - The task roles' trust policies carry no `aws:SourceAccount` or
+    `aws:SourceArn` condition, which AWS recommends for Scheduler and S3; the
+    derived-file builder is given `SESSION_SIGNING_KEY` only because the
+    shared configuration requires it (thirty-second audit, pass 17).
   - The nightly's backup drill starts once `minio-init` is running, not
     finished; and MAGPIE's `convert_lexica.sh`, which CI caches the output of,
     has no `set -e` and exits 0 after a partial conversion (thirty-second
@@ -8470,8 +8481,12 @@ says so in its implemented option, rather than being removed.
   And a drill leaves no record anyone reads: its `DrillSuccess` metric has no
   alarm and no page, and it writes no row, so when it last passed is visible
   only in its logs (thirty-second audit; PLAN said it wrote a result row).
+  S3 replication to the DR region has no metrics, replication-time control or
+  failure event, so a replication that stops raises nothing, and the RPO
+  region loss depends on goes with it (pass 17).
 - **Options considered:** match `stopCode`/`stoppedReason` too; an alarm on the
-  builder's failures; an alarm on `DrillSuccess` missing for some 32 days.
+  builder's failures; an alarm on `DrillSuccess` missing for some 32 days;
+  replication metrics with an alarm on failed operations.
 - **Option implemented:** None.
 - **Justification:** Staleness catches the first within a day and a half, and
   a failed build shows on `/admin/derived-data`.
@@ -8617,8 +8632,8 @@ says so in its implemented option, rather than being removed.
     counted as an accepted task (reasoned, not run).
   - A decline's answer is not read: a `401` passes silently and the run claims
     again at once.
-  - `maxtasks` goes through `string_to_int`, which truncates a long:
-    `4294967296` reads as 0, no limit.
+  - Everything after a NUL byte in `contribute.txt` is ignored, so a crash's
+    zero-filled tail hides the lines after it (and a `uuid` appended there).
   - `server` is not held to a URL's shape: a bare key appended to it with no
     newline and no space is printed in the status line and in request errors
     (one with a space is refused, pass 16).

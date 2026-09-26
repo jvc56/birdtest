@@ -19,6 +19,14 @@ variable "name_suffix" {
     condition     = can(regex("^(-[a-z0-9]+)?$", var.name_suffix))
     error_message = "name_suffix is empty or a hyphen followed by lowercase letters and digits, such as \"-dr\"."
   }
+
+  # The one suffix that rebuilds a production name: "-backup" makes the copy's
+  # web task role birdtest-backup-task, production's backup role, and the
+  # apply fails half-way (checked against every name the stack builds).
+  validation {
+    condition     = var.name_suffix != "-backup"
+    error_message = "name_suffix must not be a suffix production's own resource names already use, such as \"-backup\"; use one such as \"-dr\"."
+  }
 }
 
 variable "region" {
@@ -151,6 +159,12 @@ variable "db_backup_retention_days" {
   description = "Length of the RDS point-in-time recovery window, in days."
   type        = number
   default     = 30
+
+  # 0 turns point-in-time recovery off and deletes the automated backups.
+  validation {
+    condition     = var.db_backup_retention_days >= 1 && var.db_backup_retention_days <= 35
+    error_message = "db_backup_retention_days must be 1 to 35 (RDS's range; 0 would turn point-in-time recovery off)."
+  }
 }
 
 variable "db_multi_az" {
@@ -202,6 +216,13 @@ variable "backup_retention_days" {
   description = "How long a nightly dump is kept before expiry."
   type        = number
   default     = 365
+
+  # After the move to Glacier Instant Retrieval at 30 days: S3 refuses a
+  # lifecycle rule that expires an object before it transitions it.
+  validation {
+    condition     = var.backup_retention_days > 30
+    error_message = "backup_retention_days must be more than 30 (dumps move to Glacier Instant Retrieval at 30)."
+  }
 }
 
 variable "backup_object_lock_days" {
@@ -214,6 +235,11 @@ variable "backup_object_lock_days" {
   EOT
   type        = number
   default     = 30
+
+  validation {
+    condition     = var.backup_object_lock_days >= 1
+    error_message = "backup_object_lock_days must be at least 1."
+  }
 }
 
 variable "backup_image" {
@@ -293,6 +319,11 @@ variable "backup_dump_jobs" {
   description = "pg_dump -j. Parallelism is what makes a large dump finish."
   type        = number
   default     = 4
+
+  validation {
+    condition     = var.backup_dump_jobs >= 1
+    error_message = "backup_dump_jobs must be at least 1: every nightly dump would fail."
+  }
 }
 
 variable "restore_drill_enabled" {
@@ -363,7 +394,7 @@ variable "desired_count" {
   default     = 1
 
   validation {
-    condition     = var.desired_count <= 1
+    condition     = var.desired_count >= 0 && var.desired_count <= 1
     error_message = "birdtest runs as a single instance; see the variable description."
   }
 }

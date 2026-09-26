@@ -366,8 +366,8 @@ A first deployment, in order (each step is described below):
    if the stack is in us-west-2: the two must differ. Then
    `terraform -chdir=infra init` and
    `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 -var scheduled_tasks_enabled=false`
-   -- the scheduled builder and backup would fail against the placeholder
-   parameters until step 6. Then pin the zones the stack chose:
+   -- the scheduled builder and backup would fail until step 6 creates the two
+   SSM parameters. Then pin the zones the stack chose:
    `AZS=$(terraform -chdir=infra output -json azs) && ! grep -q '^azs' infra/prod.tfvars && printf '\nazs = %s\n' "$AZS" >> infra/prod.tfvars`. Left to
    the default, the pair is recomputed on every plan, and a change to what the
    region reports would plan to replace the subnets the database sits in.
@@ -391,13 +391,14 @@ variables in `infra/prod.tfvars` (not committed: it names the account's
 certificate and addresses) and pass `-var-file=prod.tfvars` to every `apply`,
 `plan` and `import` — RUNBOOK.md's recovery steps assume it, and a command run
 without it evaluates the configuration in the default region, prompting for
-eight variables. Two values must be set out of band right after the first
-`terraform apply` — Terraform manages
-the parameter *names* but never their values — so make the first apply with
-`-var desired_count=0 -var scheduled_tasks_enabled=false`, set them as below,
-and apply again with the service at one task and the schedules on: started
-against the placeholders, the service crash-loops, the derived-data builder
-fails every five minutes, and a 03:00 backup fails and alarms.
+eight variables. Two SSM parameters must be created out of band right after
+the first `terraform apply` — Terraform only names them, and never reads or
+writes them, so their values stay out of its state — so make the first apply
+with `-var desired_count=0 -var scheduled_tasks_enabled=false`, create them as
+below, and apply again with the service at one task and the schedules on:
+started before they exist, the service's tasks cannot start, the
+derived-data builder fails every five minutes, and a 03:00 backup fails and
+alarms.
 
 **Terraform's state is local** — `infra/terraform.tfstate`, ignored by git, on
 the machine that applied. RUNBOOK.md's recovery steps and both ops scripts read
@@ -407,7 +408,13 @@ backend (an S3 bucket in another region, versioned, with locking) before the
 first one. The repository does not choose one for you. Keep `infra/prod.tfvars`
 (and RUNBOOK §5's `infra/dr.tfvars`, when there is one) with it: the state
 records no input variables, and every later apply and the region-loss rebuild
-read them. Neither holds a secret.
+read them. Neither holds a secret. (A stack applied before the thirty-second
+audit's pass 17 managed the two SSM parameters as resources, and every refresh
+wrote their decrypted values into the state: its next apply drops them from
+the state without deleting them, but older copies of the state —
+`infra/terraform.tfstate.backup` among them — and a versioned backend's
+history still hold them — rotate both, as below and in
+RUNBOOK.md, "Rotating the database password".)
 
 The database master password is set by hand, not managed by RDS (RDS rotation
 would break the fixed `DATABASE_URL`). Terraform creates the instance with a
@@ -418,7 +425,7 @@ export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 DB_INSTANCE=birdtest   # the RDS identifier Terraform created
 # The stack's region on every command: with the CLI's default elsewhere,
 # put-parameter quietly creates the parameters in the wrong region, the real
-# ones stay `set-me`, and the service crash-loops on the second apply.
+# ones are never created, and the service cannot start on the second apply.
 # Assigned first: `export X=$(...)` hides a failed command. Both names: the
 # CLI's version 1 reads only AWS_DEFAULT_REGION.
 REGION=$(terraform -chdir=infra output -raw region)

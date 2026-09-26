@@ -193,9 +193,9 @@ resource "aws_ecs_task_definition" "derived_builder" {
         { name = "MIN_MAGPIE_VERSION", value = var.min_magpie_version }
       ]
       secrets = [
-        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn },
+        { name = "DATABASE_URL", valueFrom = local.ssm_database_url_arn },
         # Config::from_env requires it, and this process never mints a session.
-        { name = "SESSION_SIGNING_KEY", valueFrom = aws_ssm_parameter.session_signing_key.arn }
+        { name = "SESSION_SIGNING_KEY", valueFrom = local.ssm_session_signing_key_arn }
       ]
       logConfiguration = {
         logDriver = "awslogs"

@@ -384,7 +384,7 @@ resource "aws_iam_role_policy" "backup_task" {
 data "aws_iam_policy_document" "backup_execution_ssm" {
   statement {
     actions   = ["ssm:GetParameters"]
-    resources = [aws_ssm_parameter.database_url.arn]
+    resources = [local.ssm_database_url_arn]
   }
 }
 
@@ -427,7 +427,7 @@ resource "aws_ecs_task_definition" "backup" {
         { name = "PGDUMP_JOBS", value = tostring(var.backup_dump_jobs) },
       ]
       secrets = [
-        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn }
+        { name = "DATABASE_URL", valueFrom = local.ssm_database_url_arn }
       ]
       logConfiguration = {
         logDriver = "awslogs"
