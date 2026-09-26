@@ -1717,7 +1717,8 @@ pub async fn rebuild_artifacts(
         // built by a different builder needs it twice over, since the
         // difference is expected rather than evidence of anything.
         let object_sha256 = if object_present {
-            Some(hex::encode(Sha256::digest(artifacts.get(&artifact_key).await?)))
+            // Its error is an admin's to read: with its cause.
+            Some(hex::encode(Sha256::digest(artifacts.get_for_build(&artifact_key).await?)))
         } else {
             None
         };

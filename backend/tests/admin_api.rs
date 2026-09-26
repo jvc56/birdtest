@@ -434,7 +434,8 @@ async fn only_a_completed_job_can_be_exported() {
         .await
         .unwrap();
 
-    let (status, body) = send(&app, start(headers)).await;
+    let headers_again = || headers.clone();
+    let (status, body) = send(&app, start(headers.clone())).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(body["id"].is_string(), "{body}");
 
@@ -449,6 +450,17 @@ async fn only_a_completed_job_can_be_exported() {
         .unwrap();
     assert_eq!(recorded, 1);
     assert_eq!(logged().await, 1, "one begun export, one row");
+
+    // A second while it runs -- or, if the first has finished, another
+    // begun -- never a row without its export.
+    let (status, body) = send(&app, start(headers_again())).await;
+    assert!(matches!(status, StatusCode::CONFLICT | StatusCode::ACCEPTED), "{status} {body}");
+    let exports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_exports WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(logged().await, exports, "one row per export begun");
 }
 
 /// An opening-rack job whose static player records only the best move cannot

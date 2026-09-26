@@ -69,8 +69,8 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 209 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 118 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 155 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (13), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 1F Frontend unit | 119 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 156 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (16), `input_data.rs` (13), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 195 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,11 +79,11 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 588 backend tests (the per-tier counts above are
+--run-ignored all` runs 589 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
-Tier 2 was the largest gap and the highest value, and is now the largest tier.
+Tier 2 was the largest gap and the highest value.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
 of exactly this shape shipped and were found by hand before the harness existed
 — a three-column `INSERT` into a table with a fourth `NOT NULL` column, and a
@@ -662,8 +662,10 @@ colours whenever their ratings crossed.
 
 Each entry's tests are the `describe` block named for its id.
 
-- `F-FMT-1` `workerLabel` renders a username when present, "Anonymous" plus a
-  short UUID prefix when not, and never leaks a full UUID. *(Covered:
+- `F-FMT-1` `workerLabel` renders a username when present, "Anonymous" plus
+  the whole sixteen-character pseudonym when not (what `?worker=` takes;
+  eight characters were shared by several contributors at a few hundred
+  thousand), and never leaks a full UUID passed by mistake. *(Covered:
   `format.test.ts`.)*
 - `F-FMT-2` `duration` renders seconds, minutes, hours and days at the right
   boundaries, and `null` as a dash rather than "null". *(Covered:
@@ -1517,6 +1519,12 @@ permanent.
   `finish::a_job_whose_last_results_landed_while_inactive_completes_once_reactivated`,
   `finish::a_games_job_at_its_cap_whose_results_landed_while_inactive_completes`.)*
   (Thirty-second audit.)
+- `I-STATS-10` A stats build takes one connection from its pool, not one per
+  statement (eight): on a saturated display pool a build waited out the
+  acquire timeout once per statement and answered in tens of seconds, where
+  one wait (two, with the job page's own read of the job) makes it a quick
+  `503`. *(Covered:
+  `stats::a_stats_build_takes_one_connection`.)* (Thirty-second audit.)
 - `I-STATS-11` The stats payload cache serves a payload until it expires or is
   forgotten (every admin action), and a build reads the job's row itself, so a
   copy read before an admin action is not cached as newer than it. *(Covered:

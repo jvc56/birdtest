@@ -29,6 +29,10 @@ describe('F-FMT-1 workerLabel', () => {
     expect(label).not.toContain('-');
   });
 
+  it('renders a pseudonym whole, as `?worker=` takes it', () => {
+    expect(workerLabel({ anon_id: '3f2b8c1e9d4a4e7b' })).toBe('Anonymous · 3f2b8c1e9d4a4e7b');
+  });
+
   it('treats an empty username as absent', () => {
     expect(workerLabel({ username: '', anon_id: uuid })).toBe('Anonymous · 3f2b8c1e');
   });

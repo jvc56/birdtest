@@ -2473,13 +2473,12 @@ rather than oddities. See [Why impossibility, and not per-worker anomaly
 detection](#why-impossibility-and-not-per-worker-anomaly-detection) for the
 reasoning and the full table.
 
-Three of them cannot run in the pure validation step, because they need the
-request. They run in `decode_result` (from the job's template: the batch size,
-a leave result's occurrence total, positions only when the job captures them)
-and `store_result` (what needs the task's own row: an opening-rack batch's
-racks), and they are
-the only submission-time checks that catch a worker reporting work it did not
-do:
+Some cannot run in the pure validation step, because they need the job's
+settings or the task's own row. They run in `decode_result`, from the job's
+template (the batch size, a leave result's occurrence total, positions only
+when the job captures them), and in `store_result`, from the task's row (an
+opening-rack batch's racks). Three of them are the only submission-time checks
+that catch a worker reporting work it did not do:
 
 - **A game batch must report exactly the games the task dispatched**
   (`num_games`, doubled for pairs).
@@ -4582,7 +4581,8 @@ their credentials is something a browser attaches automatically.
 
 Admin routes take an admin-only extractor rather than checking a flag in each
 handler, so the authorization check cannot be forgotten in a new route: a
-non-admin session gets `403`, and so does a worker credential.
+non-admin session gets `403`, and a request with no session — a worker
+credential included — `401`.
 
 #### Rate limits
 
@@ -4702,14 +4702,18 @@ of the log's growth.
 | `user.signed_out_everywhere` | "Sign out everywhere" on the account page |
 | `rating_pool.created` / `rating_pool.member_added` / `rating_pool.member_removed` | Rating pool membership, each of which refits the pool |
 | `derived_data.retried` | An admin re-queueing a failed wordmap or rack info table build |
+| `input_data.deleted` | An admin deleting an input data row (and the derived rows built from it) |
+| `player_config.deleted` | An admin deleting a player config |
 
 The `.census` rows are the reason the destructive ones are worth having.
-`purge_job`, `delete_job` and `delete_user` each count what they are about to
-destroy — tasks, claims, results, progress and artifact rows — and write that as a
-single line into `audit_log.reason` **before** the delete runs, inside the same
+`purge_job` and `delete_job` each count what they are about to destroy — tasks,
+claims, results, progress and artifact rows — and write that as a single line
+into `audit_log.reason` **before** the delete runs, inside the same
 transaction. After the delete commits, that row is the only surviving
-description of what the job or account held, and it is what a selective restore
-is scoped against. `audit_log` deliberately has no foreign keys: one to `jobs` or
+description of what the job held, and it is what a selective restore is scoped
+against. `delete_user` anonymizes rather than deletes, so its census says
+which counts go (API keys, confirmation codes, reset tokens — and, uncounted,
+the name, address and password) and which stay (claims, results). `audit_log` deliberately has no foreign keys: one to `jobs` or
 `users` would either block those deletions outright — every job has a
 `job.created` row, every user a `user.registered` one — or rewrite the history the
 log exists to keep.
@@ -8446,7 +8450,7 @@ says so in its implemented option, rather than being removed.
   every task of the job to the day's completions (hundreds of milliseconds at a
   million tasks, growing with history, on every list view); the submission that
   stores a result now keeps the time, at most once a minute.
-- **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least `JOB_STATS_CACHE_SECONDS` (10) apart — by a cool-down after every build since the thirty-second audit, before which it held only under steady load — the page and new subscribers reading the last push's payload. What remains is the payload's cost itself: its contributor list groups every completed claim of the job (and, `task_claims` having no `job_id`, the planner scans the fleet's claims for it), and its game statistics read every result — hundreds of milliseconds at a few hundred thousand tasks, growing with history. *Open (fifteenth audit):* a per-job contributor running total (`job_contributors`, upserted in the submit transaction like `users.tasks_completed`, given back by purge and delete, recounted by RUNBOOK §2.3b) would make the list an index read; it is a schema change and one more write per submission, left for a decision.
+- **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least `JOB_STATS_CACHE_SECONDS` (10) apart — by a cool-down after every build since the thirty-second audit, before which it held only under steady load — the page and new subscribers reading the last push's payload. What remains is the payload's cost itself: its contributor list groups every completed claim of the job (by `task_claims.job_id`, one range of the job's claims), and its game statistics read every result — hundreds of milliseconds at a few hundred thousand tasks, growing with history. *Open (fifteenth audit):* a per-job contributor running total (`job_contributors`, upserted in the submit transaction like `users.tasks_completed`, given back by purge and delete, recounted by RUNBOOK §2.3b) would make the list an index read; it is a schema change and one more write per submission, left for a decision.
 
 ---
 
@@ -8538,8 +8542,10 @@ deployment can actually promise:
 The scenarios worth designing against, in descending order of likelihood:
 
 1. **An admin destroys data through the API.** `purge_job` deletes every claim,
-   result, rating and progress row for a job in one transaction, and `delete_job` /
-   `delete_user` are similarly total. There is no confirmation dialogue in the API
+   result, rating and progress row for a job in one transaction, and `delete_job`
+   is similarly total. (`delete_user` is not: it anonymizes the account and keeps
+   its claims and results, destroying only its keys, outstanding codes, name,
+   address and password.) There is no confirmation dialogue in the API
    layer and no undo. This is the most likely way birdtest loses contributor work,
    and it is the scenario that most demands *selective* restore: the rest of the
    database has moved on and must not be rolled back.
@@ -8802,8 +8808,9 @@ the admin page shows the failure rather than a gap. The table is insert-only and
 nothing in the request path reads it.
 
 A related, cheap safety feature belongs in the same phase and is built:
-`purge_job`, `delete_job` and `delete_user` write the counts of what they are about
-to destroy into `audit_log` *before* destroying it. Restoring is far easier when the
+`purge_job` and `delete_job` write the counts of what they are about to destroy
+into `audit_log` *before* destroying it, and `delete_user` what it destroys and
+what it keeps. Restoring is far easier when the
 log says what was lost.
 
 ### Restore
@@ -8812,7 +8819,8 @@ log says what was lost.
 |---|---|---|
 | Instance/AZ failure | RDS PITR restore to new instance, repoint `DATABASE_URL` | ≤ 5 min |
 | Bad migration / dropped schema | RDS PITR to just before the statement | ≤ 5 min |
-| Mistaken purge/delete of one job or user | Restore latest dump into a **scratch** instance, extract, re-insert | Whatever arrived after the last dump, for those rows only |
+| Mistaken purge/delete of one job | Restore latest dump into a **scratch** instance, extract, re-insert (RUNBOOK §2) | Whatever arrived after the last dump, for those rows only |
+| Mistaken deletion of an account | None documented: its work is kept; the owner registers again and makes new keys (the old name is free once deleted) | The account's name, address, password and keys |
 | Corrupted or overwritten artifact | S3 object version restore, or rebuild from `leave_rack_progress` | None |
 | Region loss | Terraform apply in DR region, restore cross-region snapshot or replicated dump | ≤ 24 h |
 | Local dev database wedged | `docker compose down -v` and re-seed, or restore a scrubbed dump | N/A |

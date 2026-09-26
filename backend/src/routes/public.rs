@@ -1027,21 +1027,27 @@ async fn list_users(
     // `task_claims`. The page orders by it, so counting meant computing every
     // user's whole claim history before the LIMIT could apply; the partial
     // index on (tasks_completed DESC, created_at ASC) now serves both.
-    let rows = sqlx::query(
-        "SELECT u.id, u.username, u.is_admin, u.created_at, u.tasks_completed
-         FROM users u
-         WHERE u.deleted_at IS NULL
-         ORDER BY u.tasks_completed DESC, u.created_at ASC, u.id ASC
-         LIMIT $1 OFFSET $2",
-    )
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.read_pool)
-    .await?;
-
+    // Counted first, so a page past the end is answered without its query,
+    // as `/api/workers` is: `?page=` is anyone's, and a huge one read every
+    // account to return nothing.
     let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")
         .fetch_one(&state.read_pool)
         .await?;
+    let rows = if offset >= total {
+        Vec::new()
+    } else {
+        sqlx::query(
+            "SELECT u.id, u.username, u.is_admin, u.created_at, u.tasks_completed
+             FROM users u
+             WHERE u.deleted_at IS NULL
+             ORDER BY u.tasks_completed DESC, u.created_at ASC, u.id ASC
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.read_pool)
+        .await?
+    };
 
     Ok(Json(super::Page {
         items: rows

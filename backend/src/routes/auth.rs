@@ -354,7 +354,7 @@ async fn register(
         "DELETE FROM users u
          WHERE (lower(u.username) = lower($1)
                 OR regexp_replace(lower(u.username), $3, '', 'g')
-                   = regexp_replace(lower($1), $3, '', 'g')
+                   = (SELECT regexp_replace(lower($1), $3, '', 'g'))
                 OR u.email = $2)
            AND u.email_confirmed_at IS NULL AND u.deleted_at IS NULL AND NOT u.is_admin
            AND NOT EXISTS (

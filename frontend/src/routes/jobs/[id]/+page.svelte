@@ -278,8 +278,8 @@
         <p class="text-sm">
           <span class="tabular-nums">{lg.tasks_completed.toLocaleString()}</span> tasks and
           <span class="tabular-nums">{lg.games_played.toLocaleString()}</span> games played this
-          generation
-          <span class="text-muted-foreground">— live.</span>
+          generation{#if stats.job.status === 'active'}
+            <span class="text-muted-foreground">— live.</span>{:else}.{/if}
         </p>
         <ProgressBar
           value={lg.racks_at_target}

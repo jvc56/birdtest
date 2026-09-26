@@ -595,8 +595,9 @@ async fn input_bytes(
             // re-import uploads to `inputs/{expected}`, not here.
             Err(_) => format!(
                 "{path}: the object at {key} hashes to {actual}, not the {expected} imported, \
-                 and {key} is not this file's content address, so the row was written by hand; \
-                 delete the row and what pins it, and import its tarball again"
+                 and {key} is not this file's content address, so the key was written by hand; \
+                 set it back (UPDATE input_data SET object_key = 'inputs/' || sha256 WHERE \
+                 path = '{path}'), import its tarball again, then retry this build"
             ),
         }));
     }

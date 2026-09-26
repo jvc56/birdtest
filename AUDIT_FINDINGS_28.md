@@ -83,6 +83,12 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   verified; the adversarial check found 2 medium (refused exports logged as
   started; RUNBOOK counting identities on the wrong database), fixed. KL-40,
   56 and 78 updated. The loop continues.
+- **Pass 10 (follow-up: pass 9's diff, and the public read API):** 0 high and 2
+  medium from the reviewers — a job page waiting about fifty seconds on a
+  saturated display pool; an account deletion's census read as counting what
+  is lost — both fixed and verified; the adversarial check found 1 medium
+  (PLAN's backup section still calling account deletion destructive), fixed.
+  The loop continues.
 
 ---
 
@@ -1525,5 +1531,136 @@ check's subquery holds its plan (about 210–250 ms at 200,000 users against
 - **Tier 5, natively: 11 of 11** on 3f05fce (frontend reviewer).
 - The builder policy modelled in MinIO: `inputs/` deletable, `exports/`,
   `leaves/` and `derived/` not (infra reviewer).
+- MAGPIE unchanged.
+
+
+---
+
+## Pass 10 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`3f05fce..b2d9962`; MAGPIE
+unchanged), one reviewer per part it touches: backend; frontend (tier 5
+natively); docs and procedures; infra. Plus one area not examined in this
+run: **the public read API and pages** — `/api/jobs`, a job's stats, users,
+workers and `?worker=`, the results feed and its cursors, download redirects,
+the read pool and the stats cache, and the pages built on them.
+
+**Findings: 0 high, 2 medium** from the five reviewers (backend none, 5 low;
+frontend none, 3 low — tier 5 natively 11 of 11; docs and procedures 1
+medium, 8 low; infra none, 3 low; public read API 1 medium, 5 low, 1
+unconfirmed). All fixed and verified; the adversarial check (10.4) found 1
+medium in the fixes, fixed.
+
+### 10.1 Medium — on a saturated display pool a job page waited about fifty seconds, not a quick `503` (public read API reviewer)
+
+**Code updated.** PLAN promises that the display pool's short acquire timeout
+turns a saturated pool into a quick `503`. A stats build took a connection
+per statement — about eight — and on a saturated pool each could wait most of
+the timeout and then succeed, so a build took twenty seconds; and a request
+that arrived during a slow build refused it for having started before it
+asked, so a burst of viewers built twice (reproduced on a seeded database with
+the pool held by `?worker=` probes: 24–52 s per job page). **Fix:** a build
+runs on one connection, so it waits for the pool once; and a waiting request
+takes any build that was no older than `max_age` when it asked. A job page
+still waits for the pool twice at most — the route's own read of the job, and
+the build. **Verified:** `a_stats_build_takes_one_connection` (`I-STATS-10`)
+counts the pool's acquires: 8 on the old code, 1 now; and on the seeded
+database under load (10.4), twenty viewers were answered by one shared build
+in about fifteen seconds, where the old code took sixty-four and answered six
+with `503`.
+
+### 10.2 Medium — RUNBOOK and PLAN said an account deletion's census counts what is lost (docs reviewer)
+
+**Code and docs updated.** Deleting an account anonymizes it and keeps its
+claims and results, but its census read `claims=… accepted=… api_keys=…`
+under a sentence saying `reason` holds "the row counts that were about to be
+lost" — an operator would scope a restore around claims that were all still
+there (reproduced: a deleted account's claim survives its census). The census
+now reads `destroyed: api_keys=… confirmations=… reset_tokens=…; kept:
+claims=… accepted=…`; RUNBOOK §0, PLAN and the code say which goes.
+
+### 10.3 Low findings
+
+**Fixed:**
+- Errors and their causes:
+  - S3 service errors stored for an admin carry the service error, not the
+    raw response it came in (about 2 KB of headers and body);
+  - a forced rebuild's object read and presigning carry the whole cause (both
+    are admin-only, the reason 9.5 gave for presign was wrong);
+  - a hand-edited object key is told to set the key back, not to delete the
+    row and everything that pins it.
+- Registration: the expired-twin release uses the twin check's scalar
+  subquery.
+- Admin pages:
+  - the account-deletion dialog and the users page no longer promise that a
+    ban stops work, and name job deletion as discarding results too;
+  - a failed Retry reloads the list and says the row may have been retried
+    already.
+- Public:
+  - `/api/users` counts first and answers a page past the end without its
+    query;
+  - a worker's label shows its whole sixteen-character pseudonym (what
+    `?worker=` takes; eight characters collided at 300,000 contributors), and
+    the e2e patterns follow;
+  - a completed leave job's page no longer says "live".
+- RUNBOOK §1:
+  - the identity count is a step in the procedure before the rename;
+  - the restore time is set once;
+  - how to count after the rename is given.
+- PLAN and TESTING:
+  - the audit table lists `input_data.deleted` and `player_config.deleted`;
+  - admin routes answer a worker credential with `401`;
+  - the validation-placement paragraph;
+  - a job deletion's census gaps;
+  - the stale `task_claims`-has-no-`job_id` note;
+  - TESTING's "largest tier" and A-ADMIN-15b (a second export is tested).
+
+**Left:** the home page lists only the first fifty active jobs, 0%-allocation
+ones included (KL-78 already covers old allocations beside status); the job
+page's REST answer can briefly overwrite a newer pushed payload (reasoned,
+not reproduced).
+
+### 10.4 Adversarial check of the pass's fixes
+
+**1 medium, fixed.**
+
+- **Medium — PLAN still said account deletion destroys work, and promised an
+  account restore no procedure covers.** 10.2 corrected the audit section and
+  RUNBOOK §0 but left PLAN's backup section: "`delete_job` / `delete_user` are
+  similarly total", the census "of what they are about to destroy", and a
+  restore row for a mistakenly deleted *user* — while RUNBOOK §2 restores jobs
+  only, and §0 now said a restore "recovers" an account's name and password
+  (reproduced: a deleted account's claim and result survive, its census says
+  so). **Fix:** PLAN says `delete_user` anonymizes and keeps the work; the
+  restore table gives a deleted account its own row — none documented, the
+  owner registers again — and RUNBOOK §0 says so.
+
+**Lows fixed:** the census is taken after the account is locked (a key made in
+between was destroyed uncounted); a stored S3 service error is its code and
+message (`AccessDenied: …`, not 800 characters of repeated metadata); RUNBOOK
+§1 counts in one ops task, and `RESTORE_TIME` must be set rather than
+defaulting to the example date; a paused leave job's page no longer says
+"live"; 10.1 and `I-STATS-10` say a job page waits for the pool twice at most.
+**Held:** under the seeded load, twenty viewers of one job were answered by one
+shared build (about fifteen seconds, the database's CPU the rest) where the old
+code took sixty-four and answered six with `503`; no stale payload could be
+served (`forget` and the kept-entry rule unchanged); tier 5 natively on the
+patched tree, 11 of 11. **Recorded (trade-off):** at a one-second stats cache,
+holding one connection per build slows other display-pool routes under heavy
+job-page load while serving about twice as many pages; at the default ten
+seconds the two are the same. **Unconfirmed, left:** waiters on a build that
+fails its acquire each try again in turn.
+
+### 10.5 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **589 of 589**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 119 of 119.
+- **Tier 5, natively: 11 of 11** on b2d9962 (frontend reviewer) and on the
+  patched tree with the E-1/E-5 patterns at sixteen characters (adversarial
+  check).
+- `terraform fmt -check -recursive` and `validate`: clean (infra reviewer).
+- RUNBOOK §1's count, run against a migrated schema with a stub `prod-sql.sh`.
 - MAGPIE unchanged.
 

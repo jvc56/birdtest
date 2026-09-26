@@ -357,7 +357,7 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
             format!("/api/admin/users/{victim}"),
             None,
             vec![
-                census("user.deleted.census", "user", victim.to_string(), None, "claims=0 accepted=0 api_keys=0"),
+                census("user.deleted.census", "user", victim.to_string(), None, "destroyed: api_keys=0 confirmations=0 reset_tokens=0; kept: claims=0 accepted=0"),
                 admin_row("user.deleted", "user", victim.to_string()),
             ],
         ),

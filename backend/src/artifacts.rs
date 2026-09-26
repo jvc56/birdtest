@@ -2,18 +2,39 @@ use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use std::sync::Arc;
 
-/// An SDK error as a response to a worker may carry it, with its causes --
-/// request ids, codes, a host name holding the bucket's -- logged beside it:
-/// the causes in the body told any caller more than it needs (the audit's pass
-/// 8). The object fetch a worker's request makes and presigning (a public
-/// download's) use it; every other
-/// call's error is stored for an admin (an import's, an export's, a derived
-/// build's) or logged, and carries the whole [`chain`], since "dispatch
-/// failure" alone told the admin nothing (pass 7).
+/// An error with its causes, for errors only an admin reads (stored for an
+/// import, an export or a derived build, or answered on an admin route):
+/// "dispatch failure" alone told the admin nothing (the audit's pass 7).
 fn chain(error: &dyn std::error::Error) -> String {
     aws_sdk_s3::error::DisplayErrorContext(error).to_string()
 }
 
+/// [`chain`] for an SDK call's error: a service error as its code and message
+/// (`AccessDenied: Access Denied`) rather than with the raw response it came
+/// in, whose headers and body made a stored error of two kilobytes (pass 10);
+/// a transport failure with everything, since that is where its cause is.
+fn sdk<E, R>(error: &aws_sdk_s3::error::SdkError<E, R>) -> String
+where
+    E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
+    R: std::fmt::Debug,
+{
+    match error {
+        aws_sdk_s3::error::SdkError::ServiceError(service) => {
+            let err = service.err();
+            match (err.code(), err.message()) {
+                (Some(code), Some(message)) => format!("{code}: {message}"),
+                (Some(code), None) => code.to_string(),
+                _ => chain(err),
+            }
+        }
+        other => chain(other),
+    }
+}
+
+/// An SDK error as a response to a worker may carry it, with its causes --
+/// request ids, codes, a host name holding the bucket's -- logged beside it:
+/// the causes in the body told a worker more than it needs (pass 8). Only the
+/// object fetch a worker's request makes uses it.
 fn cause(error: &dyn std::error::Error) -> String {
     tracing::warn!(error = %aws_sdk_s3::error::DisplayErrorContext(error), "an object store call failed");
     error.to_string()
@@ -45,7 +66,7 @@ impl ArtifactStore {
             .body(body.into())
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 put {key} failed: {}", chain(&e))))?;
+            .map_err(|e| AppError::internal(format!("S3 put {key} failed: {}", sdk(&e))))?;
         Ok(key.to_string())
     }
 
@@ -85,7 +106,7 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 multipart start {key} failed: {}", chain(&e))))?;
+            .map_err(|e| AppError::internal(format!("S3 multipart start {key} failed: {}", sdk(&e))))?;
         let upload_id = started
             .upload_id()
             .ok_or_else(|| AppError::internal("S3 returned no upload id"))?
@@ -121,9 +142,7 @@ impl ArtifactStore {
             .key(key)
             .presigned(config)
             .await
-            // Plain: a presigned URL is made for a public download too, and a
-            // failure there reached an anonymous caller with the provider chain.
-            .map_err(|e| AppError::internal(format!("S3 presign {key} failed: {}", cause(&e))))?;
+            .map_err(|e| AppError::internal(format!("S3 presign {key} failed: {}", sdk(&e))))?;
         Ok(request.uri().to_string())
     }
 
@@ -137,7 +156,7 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 delete {key} failed: {}", chain(&e))))?;
+            .map_err(|e| AppError::internal(format!("S3 delete {key} failed: {}", sdk(&e))))?;
         Ok(())
     }
 
@@ -220,7 +239,7 @@ impl MultipartUpload {
             .send()
             .await
             .map_err(|e| {
-                AppError::internal(format!("S3 upload part {part_number} of {} failed: {}", self.key, chain(&e)))
+                AppError::internal(format!("S3 upload part {part_number} of {} failed: {}", self.key, sdk(&e)))
             })?;
         self.parts.push(
             aws_sdk_s3::types::CompletedPart::builder()
@@ -243,7 +262,7 @@ impl MultipartUpload {
             .multipart_upload(completed)
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 multipart finish {} failed: {}", self.key, chain(&e))))?;
+            .map_err(|e| AppError::internal(format!("S3 multipart finish {} failed: {}", self.key, sdk(&e))))?;
         Ok(self.key)
     }
 

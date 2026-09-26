@@ -1952,26 +1952,33 @@ rack_progress={} staged_results={} artifacts={}",
     ))
 }
 
-/// The same, for an account deletion: claims and results are removed with the
-/// user, and nothing else records how much work that was.
+/// The same, for an account deletion, which anonymizes the account and keeps
+/// its work: what is destroyed -- its keys and outstanding codes (and, not
+/// counted, its name, address and password) -- and, separately, the claims
+/// and results that stay under the tombstone. It said `claims=… accepted=…`
+/// as though they were lost with it (the audit's pass 10).
 async fn user_census(conn: &mut sqlx::PgConnection, user_id: Uuid) -> AppResult<String> {
     use sqlx::Row;
     let row = sqlx::query(
         "SELECT
+             (SELECT count(*) FROM api_keys WHERE user_id = $1)                    AS api_keys,
+             (SELECT count(*) FROM email_confirmations WHERE user_id = $1)         AS confirmations,
+             (SELECT count(*) FROM password_reset_tokens WHERE user_id = $1)       AS reset_tokens,
              (SELECT count(*) FROM task_claims WHERE claimed_by_user_id = $1)      AS claims,
              (SELECT count(*) FROM task_claims c
-               WHERE c.claimed_by_user_id = $1 AND c.state = 'completed')          AS accepted,
-             (SELECT count(*) FROM api_keys WHERE user_id = $1)                    AS api_keys",
+               WHERE c.claimed_by_user_id = $1 AND c.state = 'completed')          AS accepted",
     )
     .bind(user_id)
     .fetch_one(conn)
     .await?;
 
     Ok(format!(
-        "claims={} accepted={} api_keys={}",
+        "destroyed: api_keys={} confirmations={} reset_tokens={}; kept: claims={} accepted={}",
+        row.get::<i64, _>("api_keys"),
+        row.get::<i64, _>("confirmations"),
+        row.get::<i64, _>("reset_tokens"),
         row.get::<i64, _>("claims"),
         row.get::<i64, _>("accepted"),
-        row.get::<i64, _>("api_keys"),
     ))
 }
 
@@ -2711,7 +2718,8 @@ async fn retry_derived_data(
     .rows_affected();
     if reset == 0 {
         return Err(AppError::not_found(
-            "no failed build of that row that a builder of this version takes",
+            "no failed build of that row that a builder of this version takes \
+             (retried already, or queued for another version)",
         ));
     }
     audit::log(
@@ -2886,6 +2894,16 @@ async fn delete_user(
 
     let mut tx = state.pool.begin().await?;
 
+    // The account is locked first, then counted, then its own rows go, then it
+    // is anonymized: a password reset locks the account before its token too.
+    // Taken the other way round, a reset and a delete of one account
+    // deadlocked, and the delete lost; counted before the lock, a key or code
+    // made in between was destroyed uncounted.
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
     let census = user_census(&mut tx, id).await?;
     audit::log_detail(
         &mut tx,
@@ -2897,15 +2915,6 @@ async fn delete_user(
         census,
     )
     .await?;
-
-    // The account is locked first, then its own rows go, then the account is
-    // anonymized: a password reset locks the account before its token too.
-    // Taken the other way round, a reset and a delete of one account
-    // deadlocked, and the delete lost.
-    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
     for table in ["api_keys", "email_confirmations", "password_reset_tokens"] {
         sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
             .bind(id)

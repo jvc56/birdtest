@@ -29,7 +29,11 @@
       await api.retryDerivedData(row);
       await load();
     } catch (e) {
-      error = e instanceof Error ? e.message : 'could not retry that build';
+      // Reloaded, since the refusal is most often a row someone else already
+      // retried, and the page still showed it failed; the error kept after.
+      const message = e instanceof Error ? e.message : 'could not retry that build';
+      await load();
+      error = message;
     } finally {
       busy = '';
     }

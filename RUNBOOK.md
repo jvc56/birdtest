@@ -32,13 +32,19 @@ psql "$DATABASE_URL" -c "
   ORDER BY created_at DESC LIMIT 20"
 ```
 
-Purging or deleting a job and deleting an account write a `*.census` row
-*before* they destroy anything, so `reason` holds the row counts that were
-about to be lost: that is the scope of the restore. Other destructive actions
+Purging or deleting a job writes a `*.census` row *before* it destroys
+anything, so `reason` holds the row counts that were about to be lost: that is
+the scope of the restore. Deleting an account anonymizes it and keeps its
+claims and results; its census says which counts were destroyed (API keys,
+confirmation codes, reset tokens) and which were kept. No procedure here
+restores an account's name, address, password or keys: its owner registers
+again and makes new keys. Other
+destructive actions
 write their own row but no census — deleting input data (and the derived rows
 it takes) or a player config, an unban, a forced artifact rebuild — so for
-those the query above shows what was done, not how much; a purge's census
-does not count the data gaps and exports it also removes.
+those the query above shows what was done, not how much; a purge's or a
+job deletion's census does not count the data gaps and exports it also
+removes.
 
 ```bash
 # What is restorable, and how old it is.
@@ -63,6 +69,8 @@ aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 0
 # 2. Pick the restore point: the latest possible instant before the damage.
 aws rds describe-db-instances --db-instance-identifier birdtest --region "$REGION" \
   --query 'DBInstances[0].LatestRestorableTime'
+RESTORE_TIME=   # the instant chosen, e.g. '2026-09-07T02:55:00Z'; used again below
+[[ -n "$RESTORE_TIME" ]] || { echo "set RESTORE_TIME to the instant chosen" >&2; return 1 2>/dev/null || exit 1; }
 
 # 3. Restore to a NEW instance. The original is left untouched until the
 #    restore is confirmed good.
@@ -96,7 +104,7 @@ CEILING=(--max-allocated-storage "$MAX_STORAGE")
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
   --target-db-instance-identifier "birdtest-restore-$STAMP" \
-  --restore-time '2026-09-07T02:55:00Z' \
+  --restore-time "$RESTORE_TIME" \
   --db-subnet-group-name birdtest-db \
   --vpc-security-group-ids "$(terraform -chdir=infra output -raw db_security_group_id)" \
   --db-parameter-group-name "$PARAMETER_GROUP" \
@@ -129,6 +137,15 @@ renamed() {  # wait until instance $1 exists under its new name, then until it i
       >/dev/null 2>&1; do sleep 10; done
   aws rds wait db-instance-available --region "$REGION" --db-instance-identifier "$1"
 }
+# Before the rename, while `birdtest` is still the damaged instance: the
+# contributors the restore will stop, whose identities are newer than the
+# restore point (see "Contributors whose identity is newer…", below). After the
+# rename these queries reach the restored instance and answer 0.
+# One ops task for the three counts.
+scripts/prod-sql.sh "
+  SELECT 'anonymous_workers', count(*) FROM anonymous_workers WHERE first_seen_at > '$RESTORE_TIME'
+  UNION ALL SELECT 'api_keys', count(*) FROM api_keys WHERE created_at > '$RESTORE_TIME'
+  UNION ALL SELECT 'users', count(*) FROM users WHERE created_at > '$RESTORE_TIME'"
 aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
   --new-db-instance-identifier "birdtest-damaged-$STAMP" --apply-immediately
 renamed "birdtest-damaged-$STAMP"
@@ -211,13 +228,14 @@ anonymous contributor deletes the `uuid` line from `contribute.txt` and starts
 again (a new UUID is issued); an account created in the window registers
 again; a key made in the window is made again on the account page. How many:
 the identities the damaged instance has that the restored one lacks. Count them
-**before the rename**, while `birdtest` is still the damaged instance (any time
-after the restore is started): `scripts/prod-sql.sh "SELECT count(*) FROM
-anonymous_workers WHERE first_seen_at > '<restore time>'"`, and the same over
-`api_keys` and `users` by `created_at`. The rename moves the endpoint with it,
-so after it `DATABASE_URL` reaches the restored instance, which lacks exactly
-these rows; the damaged one is then reachable only at
-`birdtest-damaged-$STAMP`'s endpoint.
+**before the rename**, while `birdtest` is still the damaged instance — the loop
+just before the rename, above, does. The rename moves the endpoint with it, so
+after it `DATABASE_URL` reaches the restored instance, which lacks exactly
+these rows. Counting later means reaching the damaged instance at its new
+endpoint: `scripts/prod-shell.sh`, then inside it
+`psql "$(sed "s#@[^:/]*:#@<damaged endpoint>:#" <<<"$DATABASE_URL")" -c '…'`,
+with the endpoint from `aws rds describe-db-instances --db-instance-identifier
+"birdtest-damaged-$STAMP" --query 'DBInstances[0].Endpoint.Address'`.
 
 ---
 

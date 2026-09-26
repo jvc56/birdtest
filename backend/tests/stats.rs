@@ -682,3 +682,47 @@ async fn a_job_driven_to_h0_completes_with_its_sprt_failed() {
     assert_eq!(body["games"]["sprt"]["status"], json!("failed"), "{body}");
     assert_eq!(body["games"]["decided"]["status"], json!("failed"), "{body}");
 }
+
+/// I-STATS-10: a stats build takes one connection from its pool, not one per
+/// statement. Taken per statement, a build on a saturated display pool waited
+/// out the acquire timeout once for each of its eight or so reads and answered
+/// in tens of seconds, where the pool's short timeout was meant to make it a
+/// quick `503`.
+#[tokio::test]
+async fn a_stats_build_takes_one_connection() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let acquired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = acquired.clone();
+    let connects = acquired.clone();
+    // One connection, so every acquire after the first reuses it and passes
+    // the hook; a new one passes `after_connect` instead.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |_, _| {
+            let connects = connects.clone();
+            Box::pin(async move {
+                connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .before_acquire(move |_, _| {
+            let counter = counter.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            })
+        })
+        .connect(&db.url)
+        .await
+        .unwrap();
+    // The connection opened and returned first, so the build's acquires are
+    // all reuses of it.
+    drop(pool.acquire().await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    acquired.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    birdtest::jobstats::refresh_payload(&pool, job, std::time::Duration::ZERO).await.unwrap();
+    assert_eq!(acquired.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+

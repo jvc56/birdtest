@@ -6,7 +6,7 @@ use crate::error::AppResult;
 use crate::models::job::{GameConfig, GamePairConfig, Job, JobType, LeaveConfig, SprtParams};
 use crate::stats::sprt::{self, Pentanomial, Sample, SprtResult, Tally};
 use serde::Serialize;
-use sqlx::{PgPool, Row};
+use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 /// One `game_results` row per task of job `$1`: the first accepted.
@@ -175,9 +175,13 @@ pub struct WorkerContribution {
 }
 
 pub async fn load_job(pool: &PgPool, job_id: Uuid) -> AppResult<Job> {
+    load_job_on(&mut *pool.acquire().await?, job_id).await
+}
+
+async fn load_job_on(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Job> {
     Ok(sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(job_id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?)
 }
 
@@ -213,9 +217,12 @@ pub async fn payload(
     let asked = std::time::Instant::now();
     let lock = build_lock(job.id);
     let turn = lock.lock().await;
-    // A build that started after this request asked answers it, however long
-    // it took: judged by age alone, a build slower than `max_age` was never
-    // shared, and every waiter built again in turn.
+    // A build no older than `max_age` when this request asked answers it,
+    // however long it took: judged by age now, a build slower than `max_age`
+    // was never shared and every waiter built again in turn; and one that had
+    // merely started before the request asked -- the one it waited on --
+    // was refused, so on a slow database each burst of viewers built twice
+    // (the audit's pass 10).
     let result = match cached_payload(job.id, max_age, Some(asked)) {
         Some(cached) => Ok(cached),
         None => build_payload(pool, job.id, max_age).await.map(|(json, _)| json),
@@ -280,8 +287,10 @@ async fn build_payload(
     // build replaces only an entry that started before it: two builds
     // finishing out of order left the older one kept.
     let started = std::time::Instant::now();
-    let job = load_job(pool, job_id).await?;
-    let stats = compute(pool, &job).await?;
+    let mut conn = pool.acquire().await?;
+    let job = load_job_on(&mut conn, job_id).await?;
+    let stats = compute_on(&mut conn, &job).await?;
+    drop(conn);
     let json: std::sync::Arc<str> = serde_json::to_string(&stats)
         .map_err(|e| crate::error::AppError::internal(format!("serializing job stats failed: {e}")))?
         .into();
@@ -329,8 +338,8 @@ fn release_build_lock(job_id: Uuid, lock: std::sync::Arc<tokio::sync::Mutex<()>>
     }
 }
 
-/// The kept payload if it is younger than `max_age`, or if it started after
-/// `since` whatever its age.
+/// The kept payload if it is younger than `max_age`, or if it was younger than
+/// `max_age` at `since`, whatever its age now.
 fn cached_payload(
     job_id: Uuid,
     max_age: std::time::Duration,
@@ -341,14 +350,23 @@ fn cached_payload(
         .expect("stats cache poisoned")
         .get(&job_id)
         .filter(|entry| {
-            entry.started.elapsed() < max_age || since.is_some_and(|since| entry.started >= since)
+            entry.started.elapsed() < max_age
+                || since.is_some_and(|since| entry.started + max_age >= since)
         })
         .map(|entry| entry.json.clone())
 }
 
 pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
+    compute_on(&mut *pool.acquire().await?, job).await
+}
+
+/// [`compute`] on one connection, for a build: taken from the pool for each
+/// of its statements, a build on a saturated pool waited out the acquire
+/// timeout once per statement and answered in tens of seconds, where one wait
+/// makes it a quick `503` (the audit's pass 10).
+async fn compute_on(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
     let started = std::time::Instant::now();
-    let stats = compute_inner(pool, job).await;
+    let stats = compute_inner(conn, job).await;
     let elapsed = started.elapsed();
     if elapsed >= SLOW_STATS_THRESHOLD {
         tracing::warn!(
@@ -359,7 +377,7 @@ pub async fn compute(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
     stats
 }
 
-async fn compute_inner(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
+async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats> {
     let counts = sqlx::query(
         "SELECT
              COUNT(*)                                            AS total,
@@ -370,30 +388,30 @@ async fn compute_inner(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
          FROM tasks WHERE job_id = $1",
     )
     .bind(job.id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let created_by = match job.created_by {
         Some(id) => {
             sqlx::query_scalar::<_, String>("SELECT username FROM users WHERE id = $1")
                 .bind(id)
-                .fetch_optional(pool)
+                .fetch_optional(&mut *conn)
                 .await?
         }
         None => None,
     };
 
-    let (lexicon, variant) = lexicon_and_variant(pool, job).await?;
+    let (lexicon, variant) = lexicon_and_variant(&mut *conn, job).await?;
 
-    let games = game_stats(pool, job).await?;
+    let games = game_stats_on(&mut *conn, job).await?;
 
     let opening_racks = match job.job_type {
-        JobType::OpeningRack => Some(opening_rack_stats(pool, job.id).await?),
+        JobType::OpeningRack => Some(opening_rack_stats(&mut *conn, job.id).await?),
         _ => None,
     };
 
     let leave_generation = match job.job_type {
-        JobType::LeaveGeneration => Some(leave_gen_stats(pool, job.id).await?),
+        JobType::LeaveGeneration => Some(leave_gen_stats(&mut *conn, job.id).await?),
         _ => None,
     };
 
@@ -401,8 +419,8 @@ async fn compute_inner(pool: &PgPool, job: &Job) -> AppResult<JobStats> {
     let tasks_completed: i64 = counts.get("completed");
     let results_accepted: i64 = counts.get("accepted");
 
-    let eta_seconds = estimate_eta(pool, job, &games, tasks_total, tasks_completed).await?;
-    let (workers, other_workers) = worker_contributions(pool, job.id).await?;
+    let eta_seconds = estimate_eta(&mut *conn, job, &games, tasks_total, tasks_completed).await?;
+    let (workers, other_workers) = worker_contributions_on(&mut *conn, job.id).await?;
 
     Ok(JobStats {
         job: JobSummary {
@@ -447,7 +465,7 @@ fn status_label(job: &Job) -> &'static str {
 /// than picking one arbitrarily. Leave generation is the exception -- one bot,
 /// one lexicon, on the job config.
 async fn lexicon_and_variant(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     job: &Job,
 ) -> AppResult<(Option<String>, Option<String>)> {
     let query = match job.job_type {
@@ -483,7 +501,7 @@ async fn lexicon_and_variant(
     };
     let mut names = sqlx::query_scalar::<_, String>(query)
         .bind(job.id)
-        .fetch_all(pool)
+        .fetch_all(&mut *conn)
         .await?;
     names.sort();
     let lexicon = (!names.is_empty()).then(|| names.join(" vs "));
@@ -497,9 +515,13 @@ async fn lexicon_and_variant(
 /// which is why it is separate from [`compute`]: deciding whether a job is done
 /// needs these aggregates and nothing else.
 pub async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<Option<GameStats>> {
+    game_stats_on(&mut *pool.acquire().await?, job).await
+}
+
+async fn game_stats_on(conn: &mut PgConnection, job: &Job) -> AppResult<Option<GameStats>> {
     let mut stats = match job.job_type {
-        JobType::Games => plain_game_stats(pool, job).await?,
-        JobType::GamePairs => game_pair_stats(pool, job).await?,
+        JobType::Games => plain_game_stats(&mut *conn, job).await?,
+        JobType::GamePairs => game_pair_stats(&mut *conn, job).await?,
         JobType::OpeningRack | JobType::LeaveGeneration => return Ok(None),
     };
     if let (Some(status), Some(llr), Some(units)) =
@@ -512,10 +534,10 @@ pub async fn game_stats(pool: &PgPool, job: &Job) -> AppResult<Option<GameStats>
 
 /// Sum the per-task aggregates for a plain `games` job. The SPRT unit is a
 /// game, so the tally and the unit count are the same number.
-async fn plain_game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
+async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameStats> {
     let config = sqlx::query_as::<_, GameConfig>("SELECT * FROM job_game_config WHERE job_id = $1")
         .bind(job.id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
     let row = sqlx::query(&format!(
@@ -526,7 +548,7 @@ async fn plain_game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
          FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
     ))
     .bind(job.id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let tally = Tally {
@@ -553,11 +575,11 @@ async fn plain_game_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
 ///
 /// The per-game win/loss/tie tally is still reported for display, and the
 /// divergent counts alongside it as a diagnostic. Neither drives the test.
-async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
+async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameStats> {
     let config =
         sqlx::query_as::<_, GamePairConfig>("SELECT * FROM job_game_pair_config WHERE job_id = $1")
             .bind(job.id)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     let row = sqlx::query(&format!(
@@ -574,7 +596,7 @@ async fn game_pair_stats(pool: &PgPool, job: &Job) -> AppResult<GameStats> {
          FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
     ))
     .bind(job.id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     let tally = Tally {
@@ -651,7 +673,7 @@ fn build_game_stats(
     }
 }
 
-async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRackStats> {
+async fn opening_rack_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<OpeningRackStats> {
     // Two single-row reads, constant time at any job size. `racks_analyzed` is
     // `jobs.racks_analyzed`, maintained one task at a time in the submit
     // transaction; the aggregates that used to sit beside it here scanned the
@@ -659,25 +681,25 @@ async fn opening_rack_stats(pool: &PgPool, job_id: Uuid) -> AppResult<OpeningRac
     let racks_analyzed =
         sqlx::query_scalar::<_, i64>("SELECT racks_analyzed FROM jobs WHERE id = $1")
             .bind(job_id)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     let racks_total = sqlx::query_scalar::<_, i64>(
         "SELECT total_racks FROM job_opening_rack_config WHERE job_id = $1",
     )
     .bind(job_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?
     .unwrap_or(0);
 
     Ok(OpeningRackStats { racks_analyzed, racks_total })
 }
 
-async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats> {
+async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<LeaveGenStats> {
     let config =
         sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
             .bind(job_id)
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     // Generation 0 is the zeroed KLV generation 1 plays with, not a completed
@@ -687,7 +709,7 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
         "SELECT COUNT(*) FROM leave_generation_artifacts WHERE job_id = $1 AND generation >= 1",
     )
     .bind(job_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
     let generations_closed = completed as i32;
     let current_generation = (generations_closed + 1).min(config.generation_count);
@@ -701,7 +723,7 @@ async fn leave_gen_stats(pool: &PgPool, job_id: Uuid) -> AppResult<LeaveGenStats
     )
     .bind(job_id)
     .bind(current_generation)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *conn)
     .await?;
 
     Ok(LeaveGenStats {
@@ -732,6 +754,13 @@ pub async fn worker_contributions(
     pool: &PgPool,
     job_id: Uuid,
 ) -> AppResult<(Vec<WorkerContribution>, i64)> {
+    worker_contributions_on(&mut *pool.acquire().await?, job_id).await
+}
+
+async fn worker_contributions_on(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+) -> AppResult<(Vec<WorkerContribution>, i64)> {
     // One more than the cap, as the list was always read.
     //
     // Grouped by the raw identity first and hashed after the limit: grouped by
@@ -759,7 +788,7 @@ pub async fn worker_contributions(
     )
     .bind(job_id)
     .bind(MAX_WORKER_CONTRIBUTIONS + 1)
-    .fetch_all(pool)
+    .fetch_all(&mut *conn)
     .await?;
 
     // How many contributors there are in all, from the same scan: the window
@@ -789,7 +818,7 @@ pub async fn worker_contributions(
 /// jobs "what's left" is the distance to `max_units`, which is a ceiling — the
 /// job may well stop earlier when the LLR crosses.
 async fn estimate_eta(
-    pool: &PgPool,
+    conn: &mut PgConnection,
     job: &Job,
     games: &Option<GameStats>,
     tasks_total: i64,
@@ -828,7 +857,7 @@ async fn estimate_eta(
     )
     .bind(job.id)
     .bind(job.activated_at)
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     if recent == 0 {
@@ -849,7 +878,7 @@ async fn estimate_eta(
             "SELECT total_racks, racks_per_batch FROM job_opening_rack_config WHERE job_id = $1",
         )
         .bind(job.id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
         let remaining_racks = (total_racks - job.racks_analyzed).max(0) as f64;
         // A claim is one copy of a task, and a task's racks count once.
@@ -875,7 +904,7 @@ async fn estimate_eta(
             sqlx::query_scalar("SELECT games_per_batch FROM job_game_config WHERE job_id = $1")
         }
         .bind(job.id)
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
         let units_per_second =
             per_second * f64::from(per_batch.max(1)) / f64::from(job.redundancy.max(1));

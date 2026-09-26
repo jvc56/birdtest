@@ -7,7 +7,14 @@ export function workerLabel(worker: {
   if (worker.username) return worker.username;
   // A pseudonym derived from the anonymous worker's UUID, never the UUID
   // itself, which is the worker's credential.
-  if (worker.anon_id) return `Anonymous · ${worker.anon_id.slice(0, 8)}`;
+  // The pseudonym whole, sixteen hex characters: it is what `?worker=` takes,
+  // and eight were shared by several contributors at a few hundred thousand.
+  // Anything else -- never what the server sends -- only by a prefix, so a
+  // credential passed here by mistake does not appear.
+  if (worker.anon_id) {
+    const whole = /^[0-9a-f]{16}$/.test(worker.anon_id);
+    return `Anonymous · ${whole ? worker.anon_id : worker.anon_id.slice(0, 8)}`;
+  }
   return 'Unknown';
 }
 
