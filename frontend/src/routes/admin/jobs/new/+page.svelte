@@ -193,7 +193,10 @@
   <div class="grid grid-cols-3 gap-3">
     <div>
       <label class="label" for="variant">Variant</label>
-      <input id="variant" class="input" bind:value={variant} />
+      <select id="variant" class="input" bind:value={variant}>
+        <option value="classic">classic</option>
+        <option value="wordsmog">wordsmog</option>
+      </select>
     </div>
     <div>
       <label class="label" for="ld">Letter distribution</label>

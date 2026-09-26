@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 201 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1 Unit | 202 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
 | 1F Frontend unit | 117 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 150 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 181 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (32), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 182 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (33), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -729,8 +729,8 @@ Test the pure functions; do not snapshot the SVG.
   barely-measured config flatten the scale, and still reports the true number in
   the table. The anchor has no bar at all, whatever error the fit stored for it
   (with no games, `f64::MAX`, which was drawn at the cap). An error the fit
-  could not measure (`f64::MAX`) reads `±∞` in the table and tooltip, not
-  `±1.8e308`. *(Covered: `charts/ratingDotPlot.test.ts`.)*
+  could not measure (`f64::MAX`) reads `±∞` in the table (`± ∞` in the
+  tooltip), not `±1.8e308`. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-3` A config with `connected_to_anchor: false` is listed as unrated
   and **not** drawn at a position. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-4` `RatingHistoryChart` caps at six series, picks them by latest
@@ -1997,6 +1997,19 @@ below.
   same file on both sides, and two differently named files, are still a job.
   *(Covered: `admin_api::a_job_cannot_pin_two_files_under_one_name`.)*
   (Thirty-first audit.)
+- `A-ADMIN-21` A config or job no worker can run is refused at creation, each
+  at its boundary: a margin past MAGPIE's largest equity (2,147,483.645 taken,
+  .646 refused, either margin), `num_plays` past 200,000, `num_plays_recorded`
+  past 32,767, and a board layout MAGPIE's loader would refuse — every worker
+  failed every task of such a job, and `magpie contribute` stops after five
+  failures in a row; and an SPRT `alpha` or `beta` below 0.000001, whose
+  infinite bound the job page could not print. The layout check never accepts
+  what MAGPIE's loader refuses, and agrees with it on CRLF files, blank lines,
+  trailing whitespace, row widths, unknown squares and start squares (it is
+  stricter only on parser quirks). *(Covered:
+  `admin_api::a_config_or_job_no_worker_can_run_is_refused`,
+  `routes::admin::tests::a_layout_magpie_would_refuse_is_refused`.)*
+  (Thirty-second audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
 

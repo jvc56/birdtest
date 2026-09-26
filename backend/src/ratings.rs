@@ -229,7 +229,9 @@ pub async fn mark_every_pool_for_refit(conn: &mut PgConnection) -> AppResult<()>
 /// Always a full refit, never a patch: adding or removing a config changes what
 /// counts as evidence for *everyone*, and a batch fit has no per-player history
 /// to unwind. Cheap enough to do this way — the Newton fit is milliseconds for
-/// a hundred-member pool, and the query above is one grouped scan.
+/// a hundred-member pool (seconds only for hundreds of members or a long ladder
+/// of sweeps, on a blocking thread: see `fit_and_store`), and the query above is
+/// one grouped scan.
 pub async fn recompute(db: &PgPool, pool_id: Uuid, trigger: Trigger) -> AppResult<Uuid> {
     fit_and_store(db, pool_id, trigger, false)
         .await?
@@ -351,7 +353,10 @@ async fn fit_and_store(
         (bradley_terry::fit(&matrix, anchor_index, anchor_rating), matrix)
     })
     .await
-    .map_err(|err| AppError::internal(format!("the rating fit did not finish: {err}")))?;
+    .map_err(|err| {
+        tracing::error!(%pool_id, error = %err, "the rating fit did not finish");
+        AppError::internal("the rating fit did not finish")
+    })?;
 
     let run_id: Uuid = sqlx::query_scalar(
         // `computed_at` is the moment of the insert, under the pool's lock,

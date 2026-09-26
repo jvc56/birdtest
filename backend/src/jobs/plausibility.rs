@@ -44,7 +44,9 @@ const MAX_SCORE_MEAN: f64 = 3000.0;
 /// (`standard21`) has quadruple-word corners with two triple-word squares
 /// between them on each edge -- an edge-long word is worth 144 times its
 /// tiles -- so a cap near 2,000 is not safe there, and a false positive would
-/// refuse the same seeded task on every retry. A play cannot score negative
+/// refuse the same seeded task on every retry. (Job creation now refuses any
+/// board but 15x15, which is all the fleet's MAGPIE builds play; the bound
+/// stays wide for a build that plays the other.) A play cannot score negative
 /// points, and a pass or exchange scores exactly zero.
 const MAX_MOVE_SCORE: i32 = 100_000;
 
@@ -56,8 +58,8 @@ const MAX_ABS_EQUITY: f64 = 200_000.0;
 /// that full rack — score plus leave — so a 21x21 board raises it too. It keeps
 /// the bound move equities had before they were widened for that board: the
 /// shipped lexicons stop at 15 letters, which caps a play at ×36 (a quadruple
-/// and two triples), low thousands at most, and a mean over games sits far
-/// below its best play; only a 21-letter edge word reaches ×144.
+/// and two triples), low thousands at most, and a rack's mean is at most its
+/// best play; only a 21-letter edge word reaches ×144.
 const MAX_ABS_RACK_MEAN: f64 = 5_000.0;
 
 fn finite(value: f64, field: &str) -> AppResult<()> {

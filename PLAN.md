@@ -48,7 +48,7 @@ Tasks are the atomic units of work that workers execute. The following task type
 - Play a batch of game pairs from a given starting seed
 - Play a batch of leave-generation games over a forced subset of racks
 
-Every task carries a **seed** — a `uint64` value — because every job type plays games, and what a game samples must be a function of the task and never of the worker. The combination of `(job_id, seed)` must be unique; duplicate tasks are prevented at the database level. Games and game pairs seed their batch from it and step by one per game, so the seed is also the cursor that tiles the job's seed space. An opening-rack task's seed is the index of its first rack in the job's rack space — rack `i` of the batch is analysed from `seed + i`, the same number on every worker — so the same column and the same index tile that space too. A leave-generation task's seed is drawn when the task is created and stored with it, so a reissued task replays it; two leave tasks are otherwise kept apart by the rule that a claim is never handed a rack another open claim is already forcing (see claim step 2 under Leave Generation), and a collision between two random draws is a unique violation the claim path retries.
+Every task carries a **seed** — a `uint64` value — because every job type plays games, and what a game samples must be a function of the task and never of the worker. The combination of `(job_id, seed)` must be unique; duplicate tasks are prevented at the database level. Games and game pairs seed their batch from it — MAGPIE draws each of the batch's game seeds from a stream seeded with it — and consecutive tasks' seeds step by the batch size, so the seed is also the job's cursor. An opening-rack task's seed is the index of its first rack in the job's rack space — rack `i` of the batch is analysed from `seed + i`, the same number on every worker — so the same column and the same index tile that space too. A leave-generation task's seed is drawn when the task is created and stored with it, so a reissued task replays it; two leave tasks are otherwise kept apart by the rule that a claim is never handed a rack another open claim is already forcing (see claim step 2 under Leave Generation), and a collision between two random draws is a unique violation the claim path retries.
 
 #### Task States
 
@@ -1413,7 +1413,7 @@ what the workers are checked against.
 | Named `player_configs` table | Reusable across jobs; maps directly to MAGPIE per-player arguments (`-r1`/`-r2`, `-s1`/`-s2`, etc.); **immutable once created** — no update endpoint exists; deletion only if no job references the config |
 | Frontend dark mode only | Single theme simplifies the component library configuration; no light/dark toggle in v1 |
 | Deficit-based job selection, measured from when a job joins | Deterministic; guarantees long-run allocation accuracy regardless of claim timing; no randomness means reproducible behavior. No starvation of any job above 0% — which holds because a job's deficit is measured from a baseline reset to parity on activation, allocation change and purge (`claims_baseline`), not over its lifetime: a lifetime deficit let a newly activated job take every claim until it had issued as many as the oldest job beside it |
-| Seed gap of batch size | Prevents two tasks from covering overlapping game seeds; `next_seed = MAX(seed) + batch_size` so seeds tile without gaps or overlaps |
+| Seed gap of batch size | Keeps task seeds unique and ordered, `next_seed = MAX(seed) + batch_size`; a batch's games are drawn from a stream seeded with its task's seed, so no two tasks share them |
 | Ratings pooled across jobs, scoped by (variant, letterdist, layout) | A rating is only comparable under fixed conditions, but it is not a property of one job; pooling is what lets a config's whole record produce one number |
 | Only paired jobs feed ratings | `-gp` swaps seats on every seed, so a pair is side-balanced; unpaired games would need an explicit side-advantage term to avoid biasing every rating |
 | Two finish conditions for SPRT jobs | `min_games`/`min_pairs` prevents early false-positive termination; `max_games`/`max_pairs` bounds compute cost |
@@ -2603,7 +2603,7 @@ At claim time (all in one transaction):
 
 #### Games — On-demand
 
-Each task represents one batch of games (`games_per_batch` from the job config) played starting at a given seed. MAGPIE uses seeds S, S+1, …, S+N−1 for a batch starting at seed S with batch size N. To prevent two tasks from overlapping on the same game seeds, consecutive task seeds are spaced `games_per_batch` apart.
+Each task represents one batch of games (`games_per_batch` from the job config) played starting at a given seed. MAGPIE seeds a random stream with S and draws each of the batch's N game seeds from it, so a task's games are fixed by S alone. Consecutive task seeds are spaced `games_per_batch` apart, which keeps them unique and ordered.
 
 At claim time (all in one transaction):
 1. Compute next seed: `SELECT COALESCE(MAX(seed) + $games_per_batch, 1) FROM tasks WHERE job_id = $job_id`. This yields seed 1 for the first task, then `1 + games_per_batch`, `1 + 2*games_per_batch`, etc. The insert in step 2 will conflict on the unique seed index if two workers race; the loser retries.
@@ -4707,10 +4707,10 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/admin/player-configs` | List all player configurations. |
-| `POST` | `/api/admin/player-configs` | Create a new player configuration. Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), as well as non-positive counts and out-of-range margins. |
+| `POST` | `/api/admin/player-configs` | Create a new player configuration. Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), more than 200,000 plays generated (MAGPIE allocates every one up front, and a static player ranking every opening play needs up to some 64,000) or 32,767 recorded (a stored rank is a `SMALLINT`), a margin past MAGPIE's largest equity (2,147,483.645), as well as non-positive counts. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
-| `POST` | `/api/admin/jobs` | Create a new job. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. |
+| `POST` | `/api/admin/jobs` | Create a new job. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (every MAGPIE build the fleet runs has `BOARD_DIM` 15, so every worker would fail every task) and an SPRT `alpha` or `beta` below 0.000001 (an infinite bound). |
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. |
@@ -4807,17 +4807,24 @@ and `sim_cutoff` (0.005) are written onto the job from MAGPIE's defaults at
 creation and stated on every request, for the reason player configs state
 theirs.
 
-Beyond role matching, creation enforces six rules the schema cannot express:
+Beyond role matching, creation enforces seven rules the schema cannot express:
 
 - **Settings a worker can run and a test can evaluate.** `redundancy` at least 1;
   `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
   at most 10,000); `rack_size` 1–7; `max_*` at least 1 and
-  `min_*` at least 0; `sprt_alpha` and `sprt_beta` strictly between 0 and 1 with a
-  sum below 1; `elo_low` below `elo_high`; `min_magpie_version`, when given, a
+  `min_*` at least 0; `sprt_alpha` and `sprt_beta` at least 0.000001 and below 1
+  with a sum below 1 (a subnormal one made a bound infinite); `elo_low` below `elo_high`; `min_magpie_version`, when given, a
   version (`major.minor[.patch]`, digits only — read loosely, a typo was 0.0.0,
   the most permissive floor). Every violation is reported at once as
   a field error. A zero batch would make every claim regenerate the seed the last
   one took and retry forever; inverted hypotheses flip the LLR's sign.
+
+- **A board MAGPIE loads.** The layout is checked as MAGPIE's loader checks it,
+  never accepting one it refuses (and stricter only on its parser's quirks):
+  a start square inside the board, then exactly 15 rows of 15 known bonus
+  squares, since every MAGPIE build the fleet runs has `BOARD_DIM` 15. A 21×21
+  layout ships in the data release beside the super-board lexica, and a job on
+  it failed every task on every worker (thirty-second audit).
 
 - **Cross-player compatibility**, ported from MAGPIE's own name-prefix rules.
   Both players' lexicons must be compatible with each other and each with its own
@@ -6881,11 +6888,26 @@ says so in its implemented option, rather than being removed.
   cap completes only when every task handed out has a result. Opening racks
   have always had this property.
 - **Problem:** A task that every worker fails keeps the job `active`. It shows as
-  repeated `task_failed` declines on one task.
+  repeated `task_failed` declines on one task. Worse, a job *every* task of
+  which every worker fails is dispatched on and on: MAGPIE stops `contribute`
+  after five failures in a row, so such a job alone on offer takes the whole
+  fleet down within seconds, each contributor until its owner restarts it. The
+  thirty-second audit found three ways job creation let one through (a 21x21
+  layout, a margin past MAGPIE's ceiling, play counts it cannot allocate) and
+  refuses them now; the server still does nothing with `task_failed` declines.
+  Batch and generation sizes (`games_per_batch`, `pairs_per_batch`,
+  `num_iterations`, `max_iterations`, …) have no ceiling either; a typo makes
+  tasks that outlast their lease rather than fail, and past 2^30 pairs a batch's
+  games overflow the dispatched count so every result is refused (reasoned, not
+  run).
 - **Options considered:** let a job past its cap complete when its only
-  unfinished tasks have failed more than N times.
-- **Option implemented:** None; not built.
-- **Justification:** No job has been seen stuck this way. Revisit if one ever is.
+  unfinished tasks have failed more than N times; deactivate, or flag, a job
+  after N `task_failed` declines with no accepted result.
+- **Option implemented:** None; not built. Creation refuses the configurations
+  known to fail everywhere.
+- **Justification:** No job has been seen stuck this way, and a guard on
+  declines needs a policy (how many, from how many workers, and whether a
+  broken release rather than the job is to blame). Revisit if one ever is.
 
 **KL-3. Re-dispatch at redundancy above 1 walks every task the claimant has already filled.**
 - **Context:** `registry::next_available` takes the oldest `available` task the
@@ -7835,8 +7857,8 @@ says so in its implemented option, rather than being removed.
     foreground — bash defers it until the child exits, and the kill comes
     first (measured in `postgres:16`, exit 137, trap not run); the long steps
     would have to run in the background under `wait`.
-  - `restore-roundtrip.sh` reads its row counts before and after the dump,
-    not inside its snapshot, so a writer on a live stack fails it (it wants an
+  - `restore-roundtrip.sh` reads the source's row counts after the dump,
+    outside its snapshot, so a writer on a live stack fails it (it wants an
     idle one, and says so); `backup.sh` takes them inside the snapshot.
   - A rating refit whose admin request is dropped releases its transaction
     and lock while the fit it started runs on to the end on the blocking pool,
@@ -7867,7 +7889,8 @@ says so in its implemented option, rather than being removed.
   trigger is an outage during sign-out.
 
 **KL-60. Admin UI gaps the API covers.**
-- **Context:** The job form (`/admin/jobs/new`) and the password form.
+- **Context:** The job form (`/admin/jobs/new`), the player-config pages and the
+  password form.
 - **Problem:**
   - The job form sends no `capture_positions`, `racks_per_batch` or
     `rack_size`, so capture jobs and opening-rack jobs of another rack size can
@@ -7877,8 +7900,19 @@ says so in its implemented option, rather than being removed.
   - The job form loads MAGPIE's version with the player configs and input
     data, so its failure is reported as "Could not load player configs and
     input data" (thirty-second audit).
+  - No page shows a player config in full: the list leaves out `num_plays`,
+    `num_plays_recorded` and the margins, and `GET /player-configs/:id` has no
+    page. A duplicate config name gets a generic `409` with no field error.
+    The job form defaults to the newest layout, which a release that changes
+    only `standard21` would make one creation refuses; it lists every layout.
+    Creating a config writes no audit row, where creating a job or a pool does.
+  - A leave job whose generation-0 KLV fails to build after the job row
+    commits is answered `500`, but exists; the form stays, and a second click
+    makes a second job.
 - **Options considered:** add the fields; map zxcvbn's blank-password error;
-  load the version separately.
+  load the version separately; a config page; a `name` field error on the
+  conflict; a `player_config.created` audit row; answer a failed KLV build
+  with the created job and a warning.
 - **Option implemented:** None.
 - **Justification:** Admin-only, and the API is documented.
 
@@ -8129,6 +8163,10 @@ says so in its implemented option, rather than being removed.
   - Replacing a stale wordmap, rack info table or fetched KLV renames over the
     old file, which `rename()` does not do on Windows; the Windows build is
     written but has never been compiled or run.
+  - `bonus_square_from_char` indexes its table with a `char`, so a layout byte
+    above 0x7f is a negative index — an out-of-bounds read that accepted `é`
+    as a square. birdtest refuses such a layout at job creation (thirty-second
+    audit); the cast belongs with the next MAGPIE change.
 - **Options considered:** each fix as named, on `birdtest-contribute`; bump
   to 0.1.2 before the branch is first pushed if anything between is ever built.
 - **Option implemented:** None.

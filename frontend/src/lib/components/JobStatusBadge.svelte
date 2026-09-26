@@ -12,12 +12,19 @@
   };
   // A games or pairs job's cap is not always games.
   const labels: Record<string, string> = { terminated_at_max: 'at its cap' };
+  // Own keys only: a plain lookup of `constructor` would find a function.
+  // (`Object.hasOwn` is newer than the build's browser targets.)
+  const own = (map: Record<string, string>, key: string) =>
+    Object.prototype.hasOwnProperty.call(map, key);
 </script>
 
 <span
-  class="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium {styles[
+  class="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium {own(
+    styles,
     status
-  ] ?? styles.inactive}"
+  )
+    ? styles[status]
+    : styles.inactive}"
 >
-  {labels[status] ?? status.replace(/_/g, ' ')}
+  {own(labels, status) ? labels[status] : status.replace(/_/g, ' ')}
 </span>

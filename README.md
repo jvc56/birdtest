@@ -516,14 +516,16 @@ Recovering from anything is [RUNBOOK.md](RUNBOOK.md).
 ### Locally
 
 ```bash
-./scripts/dev-dump.sh before-experiment      # database + artifact bucket
-./scripts/dev-restore.sh .dev-backups/before-experiment
+./scripts/dev-dump.sh before-experiment                # database + artifact bucket
+SCRUB=0 ./scripts/dev-restore.sh .dev-backups/before-experiment
 ```
 
-`dev-restore.sh` also takes a production dump directory, and scrubs it on the
-way in (`scripts/scrub.sql`: emails become `@example.invalid`, every password
-becomes `birdtest-local`, credentials and tokens are truncated, and every
-anonymous worker's UUID -- its whole credential -- is replaced). Restoring
+`dev-restore.sh` scrubs every restore unless `SCRUB=0` is set — your own
+snapshot too, whose API keys and worker identities it would reset, hence the
+`SCRUB=0` above. It also takes a production dump directory, which must be
+scrubbed on the way in (`scripts/scrub.sql`: emails become `@example.invalid`,
+every password becomes `birdtest-local`, credentials and tokens are truncated,
+and every anonymous worker's UUID -- its whole credential -- is replaced). Restoring
 production data locally without that is a disclosure risk, not a shortcut.
 
 After any schema change, prove a dump still round-trips:

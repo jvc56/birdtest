@@ -356,7 +356,11 @@ impl TestDb {
     pub async fn input_data(&self, role: &str, name: &str) -> Uuid {
         let (path, content): (String, Option<&[u8]>) = match role {
             "letterdist" => (format!("letterdistributions/{name}.csv"), Some(TESTDIST)),
-            "layout" => (format!("layouts/{name}.txt"), Some(b"layout".as_slice())),
+            // A real 15x15 layout: job creation refuses a board of any other size.
+            "layout" => (
+                format!("layouts/{name}.txt"),
+                Some(include_bytes!("../../../fixtures/versions/20260101/layouts/standard15.txt").as_slice()),
+            ),
             "kwg" => (format!("lexica/{name}.kwg"), None),
             "klv" => (format!("lexica/{name}.klv2"), None),
             _ => (format!("strategy/{name}.csv"), None),

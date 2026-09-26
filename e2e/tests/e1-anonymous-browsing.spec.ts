@@ -26,7 +26,9 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible();
   const row = page.locator('tr', { has: page.locator(`a[href="/jobs/${job.id}"]`) });
   await expect(row).toContainText('Game pairs');
-  await expect(row).toContainText('units');
+  // Progress in the job's own unit (the list said `units` until the
+  // fourteenth audit).
+  await expect(row).toContainText(/\d[\d,]* \/ [\d,]+ pairs/);
 
   await row.getByRole('link', { name: 'Game pairs' }).click();
   await expect(page).toHaveURL(new RegExp(`/jobs/${job.id}$`));

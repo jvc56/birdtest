@@ -96,7 +96,8 @@ variable "db_max_wal_size_mb" {
 
 variable "db_allocated_storage" {
   description = <<-EOT
-    The database's storage in GiB. Autoscaling grows it up to five times this;
+    The database's storage in GiB. Autoscaling grows it up to five times this,
+    and never past RDS's ceiling of 65,536 GiB;
     a value below the current (autoscaled) size is ignored rather than shrunk,
     and a value above it grows the volume. RUNBOOK.md §5 sets it for the DR
     copy from the size of the dump being restored.
@@ -227,6 +228,21 @@ variable "backup_task_cpu" {
 variable "backup_task_memory" {
   type    = number
   default = 4096
+
+  validation {
+    # Fargate's CPU and memory pairs: refused otherwise only by
+    # RegisterTaskDefinition, part-way through an apply.
+    condition = (
+      (var.backup_task_cpu == 256 && contains([512, 1024, 2048], var.backup_task_memory)) ||
+      (var.backup_task_cpu == 512 && var.backup_task_memory >= 1024 && var.backup_task_memory <= 4096 && var.backup_task_memory % 1024 == 0) ||
+      (var.backup_task_cpu == 1024 && var.backup_task_memory >= 2048 && var.backup_task_memory <= 8192 && var.backup_task_memory % 1024 == 0) ||
+      (var.backup_task_cpu == 2048 && var.backup_task_memory >= 4096 && var.backup_task_memory <= 16384 && var.backup_task_memory % 1024 == 0) ||
+      (var.backup_task_cpu == 4096 && var.backup_task_memory >= 8192 && var.backup_task_memory <= 30720 && var.backup_task_memory % 1024 == 0) ||
+      (var.backup_task_cpu == 8192 && var.backup_task_memory >= 16384 && var.backup_task_memory <= 61440 && var.backup_task_memory % 4096 == 0) ||
+      (var.backup_task_cpu == 16384 && var.backup_task_memory >= 32768 && var.backup_task_memory <= 122880 && var.backup_task_memory % 8192 == 0)
+    )
+    error_message = "backup_task_memory is not a Fargate memory size for backup_task_cpu's CPU (1024 CPU takes 2048 to 8192 MiB, 4096 takes 8192 to 30720, in 1024 steps)."
+  }
 }
 
 variable "backup_ephemeral_storage_gib" {
@@ -301,6 +317,21 @@ variable "task_cpu" {
 variable "task_memory" {
   type    = number
   default = 2048
+
+  validation {
+    # Fargate's CPU and memory pairs: refused otherwise only by
+    # RegisterTaskDefinition, part-way through an apply.
+    condition = (
+      (var.task_cpu == 256 && contains([512, 1024, 2048], var.task_memory)) ||
+      (var.task_cpu == 512 && var.task_memory >= 1024 && var.task_memory <= 4096 && var.task_memory % 1024 == 0) ||
+      (var.task_cpu == 1024 && var.task_memory >= 2048 && var.task_memory <= 8192 && var.task_memory % 1024 == 0) ||
+      (var.task_cpu == 2048 && var.task_memory >= 4096 && var.task_memory <= 16384 && var.task_memory % 1024 == 0) ||
+      (var.task_cpu == 4096 && var.task_memory >= 8192 && var.task_memory <= 30720 && var.task_memory % 1024 == 0) ||
+      (var.task_cpu == 8192 && var.task_memory >= 16384 && var.task_memory <= 61440 && var.task_memory % 4096 == 0) ||
+      (var.task_cpu == 16384 && var.task_memory >= 32768 && var.task_memory <= 122880 && var.task_memory % 8192 == 0)
+    )
+    error_message = "task_memory is not a Fargate memory size for task_cpu's CPU (1024 CPU takes 2048 to 8192 MiB, 4096 takes 8192 to 30720, in 1024 steps)."
+  }
 }
 
 variable "desired_count" {

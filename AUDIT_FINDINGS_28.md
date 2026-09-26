@@ -29,7 +29,12 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   drill):** 0 high and 2 medium from the reviewers (E-8 could not pass; PLAN
   said the drill writes a result row), both fixed and verified; the
   adversarial check found no high or medium. Lows mostly fixed; KL-80 added,
-  KL-65, 75, 76 updated. The loop continues (pass 2 found medium).
+  KL-17, 65, 74, 75, 76 and 79 updated. The loop continues (pass 2 found medium).
+- **Pass 3 (follow-up: pass 2's diff, and job creation and player-config
+  validation):** 0 high and 2 medium from the reviewers (E-1 and E-5 could not
+  pass — tier 5 now run natively, 11 of 11; job creation accepted jobs no
+  worker can run), both fixed; the adversarial check found 1 medium (the play
+  cap too low), fixed. KL-2 and KL-60 updated. The loop continues.
 
 ---
 
@@ -391,4 +396,129 @@ running on the blocking pool.
   (users only, empty, re-run); `scripts/backup-drill-check.sh`: passed.
 - E-8's new assertion against a build of the pages with the API mocked. Tier 5
   itself not run (image builds).
+- MAGPIE unchanged.
+
+---
+
+## Pass 3 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`3fdbc27..9753314`; MAGPIE
+unchanged), reviewed against every objective, one reviewer per part it
+touches: backend; frontend and the e2e spec; docs and procedures (PLAN,
+TESTING, README, RUNBOOK, `scripts/`); infra. Plus one area not examined in
+recent passes: **job creation and player-config validation** — the admin
+create-job and player-config routes, their validation of every parameter,
+`magpie_defaults`, the job templates they produce, the admin forms, and what a
+malformed or extreme config does downstream (dispatch, MAGPIE, the fit).
+
+**Findings: 0 high, 2 medium** from the five reviewers (backend none, 3 low;
+frontend and e2e 1 medium, 3 low; docs and procedures none, 6 low; infra none,
+3 low; job creation 1 medium, 7 low, 1 unconfirmed). Both fixed and verified;
+the adversarial check is 3.4.
+
+### 3.1 Medium — tier 5 still failed: E-1 and E-5 asserted text their pages dropped in the thirteenth and fourteenth audits (frontend reviewer)
+
+**Tests updated.** E-1 looked for `units` in the job list's row, which since
+the fourteenth audit says `pairs` (or games, racks, generations); E-5 looked
+for a form label "User ID or anonymous UUID", which the thirteenth audit split
+into "Anonymous UUID" and "User ID". So CI's per-PR `e2e` job failed on every
+run, as E-8 did (2.1). **Verified by running tier 5** — for the first time
+since AUDIT_FINDINGS_14 — natively, without images: the backend built and run
+on its own database with the e2e compose file's settings, the built pages
+behind nginx with the image's `/api` proxy, the GitHub fixtures served
+locally, `seed.py` with `run.sh`'s arguments, and the fake workers with the
+compose arguments. The committed specs: 2 failed (E-1, E-5), 9 passed; with
+the two lines changed: 11 of 11, and again 11 of 11 on a fresh database.
+E-8's new assertion passed in both runs (the seeded job decided `passed`).
+**Lows fixed:** the badge's lookups use own keys only; "after 1 pairs"; E-8's
+comment.
+
+### 3.2 Medium — job creation accepted jobs no worker can run, and five failures in a row stop `magpie contribute` (job-creation reviewer)
+
+**Code updated.** Three configurations passed validation and failed on every
+contributor: a 21×21 layout (it ships beside the super-board lexica; every
+MAGPIE the fleet runs is built 15×15 — "invalid number of rows … expected 16,
+got 22"); a `movegen_margin` or `inference_margin` past MAGPIE's largest
+equity ("server sent an invalid movegen_margin"); and `num_plays` or
+`num_plays_recorded` of millions (MAGPIE allocates them all up front: 2e9 was a
+16 GB malloc and a core dump). The server does nothing with `task_failed`
+declines and MAGPIE ends `contribute` after five in a row, so such a job alone
+on offer took the fleet down within seconds. Reproduced through the API
+(created and dispatched) and against the real binary behind a stand-in server.
+PLAN says birdtest "must not be able to build a job MAGPIE would refuse to
+load". **Fix:** a job's layout is checked as MAGPIE's loader checks it (a
+start square on the board, then exactly 15 rows of 15 known squares); margins
+stop at MAGPIE's largest equity, 2,147,483.645, which it takes; `num_plays` at
+200,000 and `num_plays_recorded` at 32,767 (a stored rank is a `SMALLINT`);
+and, a low, SPRT `alpha` and `beta` at 0.000001 (a subnormal alpha made the
+bound infinite and the job page threw). The first version counted rows and
+capped `num_plays` at 32,767 too; the adversarial check (3.4) broke both. **Verified:**
+`a_config_or_job_no_worker_can_run_is_refused` (`A-ADMIN-21`, now at every
+boundary) fails against the committed validation (the super-board job
+created, 201) and passes, as does a unit test of the layout check on the
+cases where MAGPIE's loader and a row count disagreed (CRLF, blank lines,
+trailing whitespace, widths, squares, start squares). A confirmation round
+compared the check with the real binary on 43 files: it never accepts what
+MAGPIE refuses, and is stricter only on six parser quirks (a coordinate past
+`int`, a NUL, a byte above 0x7f, which MAGPIE reads out of bounds — KL-68).
+The test helper's layout is now the real `standard15.txt`; the full suite
+passes.
+KL-2 records the deeper gap: nothing acts on a job every worker fails.
+
+### 3.3 Low findings
+
+**Fixed:** the refit's panic text no longer reaches the `500` body; the
+`recompute` doc; the rack-mean comment; README's `dev-restore.sh` example uses
+`SCRUB=0` for your own snapshot and says every restore is scrubbed;
+`restore-roundtrip.sh`'s and KL-80's "before and after" (after the dump);
+RUNBOOK's "byte-identically"; TESTING's `± ∞`; the pass-2 summary's KL list;
+the drill header's wrap; PLAN's "seeds S, S+1, …" (MAGPIE draws a batch's
+seeds from a stream seeded with S); the variant field is a select; Fargate
+CPU/memory pairs, the builder's ephemeral storage (21–200) and RDS's
+`max_allocated_storage` (capped at 65,536 GiB) are validated at plan — a mock
+`terraform test` refuses the bad pairs and passes the defaults.
+
+**Recorded:** KL-2 (a job every worker fails), KL-60 (no page shows a config
+in full; a duplicate name's generic 409; no audit row for a new config; a leave
+job created twice when its KLV build fails).
+
+### 3.4 Adversarial check of the pass's fixes
+
+**Medium, fixed — `num_plays` capped below what real opening racks need.** The
+32,767 cap was the recorded rank's, applied to plays generated too, and
+blank-heavy opening racks have more: 63,585 plays for ??EIRST in CSW24
+(measured with the pinned binary), so a static player could no longer rank
+every opening play, where PLAN promises `num_moves` keeps the whole count.
+100,000 plays ran without trouble. **Fix:** `num_plays` stops at 200,000 (some
+11 MB a player a thread) and only `num_plays_recorded` at 32,767; the test
+creates a config at 63,585.
+
+**Lows fixed:** the layout check counted rows, where MAGPIE also checks row
+widths, squares and the start square, ignores blank lines and refuses a
+trailing whitespace line — six layouts it refuses were accepted and two it
+loads refused; it now ports MAGPIE's check. MAGPIE takes a margin of exactly
+2,147,483.645 (it refuses only above), which the first cap refused.
+`Object.hasOwn` is newer than the build's browser targets (own-key checks now
+use `hasOwnProperty.call`). PLAN's seed sentences at the Task and design-table
+entries contradicted the corrected one; its creation rules still said "strictly
+between 0 and 1" and "six rules". TESTING's `A-ADMIN-21` said alpha only.
+`db_allocated_storage`'s description names RDS's ceiling. **Recorded:** batch
+and generation sizes have no ceiling (KL-2); the job form defaults to the
+newest layout, which could be one creation refuses (KL-60). **Held:** the
+Fargate table and its boundaries in a 61-run mock `terraform test`; every
+default; `fmt` and `validate`; 227 backend tests with the real MAGPIE; and
+**tier 5 on the whole working tree, natively: 11 of 11**, the seed's layout
+accepted by the new check.
+
+### 3.5 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **562 of 562**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 117 of 117.
+- `terraform fmt -check -recursive`, `validate`, and a mock `terraform test`
+  of the new validations: clean.
+- **Tier 5, natively (no image builds): 11 of 11**, twice by the frontend
+  reviewer with the E-1 and E-5 fixes and once by the adversarial check on the
+  whole working tree.
 - MAGPIE unchanged.

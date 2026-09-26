@@ -54,7 +54,7 @@ test('E-5: an admin bans a worker and that worker can no longer claim', async ({
     const row = page.locator('tbody tr', { hasText: uuid });
     await expect(row).toContainText(/Anonymous · [0-9a-f]{8}/);
     await row.getByRole('button', { name: 'Select' }).click();
-    await expect(page.getByLabel('User ID or anonymous UUID')).toHaveValue(uuid);
+    await expect(page.getByLabel('Anonymous UUID', { exact: true })).toHaveValue(uuid);
     await page.getByLabel('Reason').fill('e2e: submitting nonsense');
     await page.getByRole('button', { name: 'Ban worker' }).click();
     await expect(page.getByText(`Banned ${uuid}.`)).toBeVisible();

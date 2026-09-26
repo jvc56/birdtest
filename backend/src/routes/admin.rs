@@ -735,6 +735,61 @@ async fn create_player_config(
 /// creation puts the error in front of the admin who can fix it.
 const MAGPIE_MAX_PLIES: i32 = 25;
 const MAGPIE_MAX_CAPTURED_PLIES: i32 = 10;
+/// MAGPIE's largest equity (`EQUITY_MAX_DOUBLE`, `-(INT32_MIN + 3) / 1000`),
+/// which it accepts as a margin; above it every worker refuses the task,
+/// "server sent an invalid movegen_margin".
+const MAGPIE_MAX_MARGIN: f64 = 2_147_483.645;
+/// Plays generated. MAGPIE allocates `num_plays + 1` moves per player per
+/// thread before it plays — 2e9 was a 16 GB allocation and a core dump on
+/// every worker — but a static player ranking every opening play needs more
+/// than a rack has: 63,585 for ??EIRST in CSW24. 200,000 is some 11 MB a
+/// player a thread.
+const MAX_NUM_PLAYS: i32 = 200_000;
+/// Plays recorded: each is stored with its rank as a `SMALLINT`.
+const MAX_NUM_PLAYS_RECORDED: i32 = i16::MAX as i32;
+/// The board every MAGPIE the fleet runs is built for (`BOARD_DIM`). A layout
+/// of another size, or one MAGPIE otherwise refuses, loads on no worker: each
+/// fails the task, and after five in a row `magpie contribute` stops.
+const MAGPIE_BOARD_DIM: usize = 15;
+
+/// Why MAGPIE would refuse this board layout — never accepting one its loader
+/// (`board_layout.c`) refuses, and stricter than it only on parser quirks — the file split on newlines with empty lines
+/// ignored, a line's trailing `\r` dropped; a start square `row, col` inside
+/// the board; then exactly `BOARD_DIM` rows of `BOARD_DIM` bonus squares.
+fn layout_problem(content: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(content);
+    let lines: Vec<&str> = text
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    if lines.len() != MAGPIE_BOARD_DIM + 1 {
+        return Some(format!(
+            "has {} rows; every MAGPIE build the fleet runs plays on {MAGPIE_BOARD_DIM}x{MAGPIE_BOARD_DIM}",
+            lines.len().saturating_sub(1)
+        ));
+    }
+    let coords: Vec<&str> = lines[0].split(',').filter(|part| !part.is_empty()).collect();
+    let in_board = |part: &str| {
+        part.trim_matches([' ', '\t', '\n', '\r'])
+            .parse::<i64>()
+            .is_ok_and(|v| (0..MAGPIE_BOARD_DIM as i64).contains(&v))
+    };
+    if coords.len() != 2 || !coords.iter().all(|part| in_board(part)) {
+        return Some(format!("has a start square MAGPIE cannot read: {:?}", lines[0]));
+    }
+    for (row, line) in lines[1..].iter().enumerate() {
+        // Bytes, as MAGPIE counts them (a non-UTF-8 byte reads as three here,
+        // after the lossy decode, and is refused either way).
+        if line.len() != MAGPIE_BOARD_DIM {
+            return Some(format!("row {} is {} squares wide, not {MAGPIE_BOARD_DIM}", row + 1, line.len()));
+        }
+        if let Some(square) = line.chars().find(|c| !matches!(c, ' ' | '\'' | '-' | '"' | '=' | '^' | '~' | '#')) {
+            return Some(format!("row {} has a square MAGPIE does not know: {square:?}", row + 1));
+        }
+    }
+    None
+}
 
 fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     let mut err = AppError::bad_request("player config is invalid");
@@ -754,6 +809,14 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     }
     if body.num_plays_recorded < 1 {
         err = err.with_field("num_plays_recorded", "must be at least 1");
+    }
+    for (field, value, most) in [
+        ("num_plays", body.num_plays, MAX_NUM_PLAYS),
+        ("num_plays_recorded", Some(body.num_plays_recorded), MAX_NUM_PLAYS_RECORDED),
+    ] {
+        if value.is_some_and(|v| v > most) {
+            err = err.with_field(field, format!("must be at most {most}"));
+        }
     }
     if body.num_plies.is_some_and(|v| v < 0) {
         err = err.with_field("num_plies", "must not be negative");
@@ -786,6 +849,11 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     for (field, value) in non_negative {
         if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
             err = err.with_field(field, "must be a finite, non-negative number");
+        }
+    }
+    for (field, value) in [("inference_margin", body.inference_margin), ("movegen_margin", body.movegen_margin)] {
+        if value.is_some_and(|v| v > MAGPIE_MAX_MARGIN) {
+            err = err.with_field(field, format!("must be at most {MAGPIE_MAX_MARGIN}"));
         }
     }
     if body.utility_spread_scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
@@ -1031,6 +1099,16 @@ async fn create_job(
 
     let letterdist_name = require_role(&state.pool, body.letterdist_id, "letterdist").await?;
     require_role(&state.pool, body.layout_id, "layout").await?;
+    let layout: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(body.layout_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if let Some(problem) = layout_problem(&layout) {
+        return Err(AppError::bad_request(
+            "the board layout cannot be used: every worker would fail every task",
+        )
+        .with_field("layout_id", problem));
+    }
     // Parsed now as every claim will parse it: a file the server or MAGPIE
     // cannot use -- more letters than MAGPIE holds, a malformed row -- was
     // found by the first claim, as a 500, on a job already created.
@@ -1158,9 +1236,11 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         if max_units < 1 {
             err = err.with_field(format!("max_{unit}s"), "must be at least 1");
         }
+        // Not merely above 0: a subnormal alpha made the upper bound
+        // infinite, serialised as `null`, and the public job page threw on it.
         for (field, value) in [("sprt_alpha", alpha), ("sprt_beta", beta)] {
-            if !(value > 0.0 && value < 1.0) {
-                err = err.with_field(field, "must be strictly between 0 and 1");
+            if !(1e-6..1.0).contains(&value) {
+                err = err.with_field(field, "must be at least 0.000001 and below 1");
             }
         }
         if alpha + beta >= 1.0 {
@@ -2979,6 +3059,41 @@ async fn load_job_for_update(conn: &mut sqlx::PgConnection, id: Uuid) -> AppResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Nothing MAGPIE's loader (`board_layout.c`) refuses is accepted, and what
+    /// it loads is too, but for a few parser quirks birdtest is stricter about
+    /// (a start coordinate past `int`, a NUL, a byte above 0x7f). Counting rows
+    /// alone accepted six layouts MAGPIE refuses and refused two it loads.
+    #[test]
+    fn a_layout_magpie_would_refuse_is_refused() {
+        let standard15 = include_str!("../../../fixtures/versions/20260101/layouts/standard15.txt");
+        assert_eq!(layout_problem(standard15.as_bytes()), None);
+        assert_eq!(layout_problem(standard15.replace('\n', "\r\n").as_bytes()), None, "CRLF");
+        assert_eq!(layout_problem(standard15.trim_end().as_bytes()), None, "no final newline");
+        let blank_inside = standard15.replacen('\n', "\n\n", 3);
+        assert_eq!(layout_problem(blank_inside.as_bytes()), None, "blank lines are skipped");
+
+        let mut super21 = String::from("10, 10\n");
+        for _ in 0..21 {
+            super21.push_str(&" ".repeat(21));
+            super21.push('\n');
+        }
+        let refused = |text: &str, why: &str| {
+            assert!(layout_problem(text.as_bytes()).is_some(), "{why} should be refused");
+        };
+        refused(&super21, "a 21x21 board");
+        refused("\n\n", "an empty file");
+        let body = standard15.trim_end();
+        refused(&format!("{body}\n   \n"), "a trailing line of spaces");
+        refused(&format!("{body}\n\r\n"), "a trailing CRLF blank line");
+        refused(&standard15.replacen("7, 7", "20, 20", 1), "a start square off the board");
+        refused(&standard15.replacen("7, 7", "7", 1), "a start square with one coordinate");
+        let rows: Vec<&str> = standard15.lines().collect();
+        let narrow = format!("{}\n{}\n{}", rows[0], &rows[1][..14], rows[2..].join("\n"));
+        refused(&narrow, "a row 14 squares wide");
+        let odd = standard15.replacen('=', "x", 1);
+        refused(&odd, "an unknown square");
+    }
 
     fn body(config: serde_json::Value) -> CreateJobBody {
         let mut value = serde_json::json!({

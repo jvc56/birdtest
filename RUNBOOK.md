@@ -1069,7 +1069,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
 ## 6. Testing this runbook
 
 - `./scripts/restore-roundtrip.sh` — proves a dump of the current schema
-  restores byte-identically into an empty database. Run it after any schema
+  restores intact into an empty database. Run it after any schema
   change, on a fresh schema (it seeds only an empty database) with nothing
   writing; nightly CI runs it that way.
 - `./scripts/restore-job-check.sh` — runs §2.2's `restore-job.sh` against three

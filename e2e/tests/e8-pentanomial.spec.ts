@@ -8,9 +8,7 @@ import { seededJob, waitUntilSettled } from '../lib/api';
  * The seeded job, once the fake workers have finished it. They favour player
  * 1, so its test must have ended for player 1 -- by accepting H1 or at the
  * cap -- and never by accepting H0. A job the finish check completed shows the
- * verdict it was completed on (`Completed: ...`), not the live status line;
- * this spec looked for the live line until the thirty-second audit, which a
- * settled job has not shown since the eleventh.
+ * verdict it was completed on (`Completed: ...`), not the live status line.
  */
 test('E-8: a finished game-pairs job shows its labelled pentanomial and SPRT verdict', async ({
   page,

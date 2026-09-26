@@ -12,9 +12,9 @@
 # database (a fresh schema, as nightly CI gives it) is first seeded with a row in
 # each of seven core tables (users, input_data, jobs, tasks, task_claims,
 # game_results, backups); any other is round-tripped as it is, and then proves
-# only as much as its own rows do. Run it against an idle stack: the row counts
-# are read before and after the dump, not inside its snapshot, so a writer
-# makes it fail.
+# only as much as its own rows do. Run it against an idle stack: the source's
+# row counts are read after the dump, outside its snapshot, so a writer makes it
+# fail.
 #
 # It runs entirely inside the Postgres container, so the host needs no
 # Postgres client — Docker is the only dependency, as everywhere else.

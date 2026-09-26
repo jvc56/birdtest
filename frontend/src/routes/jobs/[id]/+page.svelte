@@ -147,7 +147,7 @@
           <p class="text-sm text-muted-foreground">
             Completed: {sprtLabel(stats.games.decided.status)}, LLR
             {stats.games.decided.llr.toFixed(3)} after {stats.games.decided.units.toLocaleString()}
-            {stats.games.unit}s. With the {stats.games.unit}s that were in flight then, LLR
+            {stats.games.unit}{stats.games.decided.units === 1 ? '' : 's'}. With the {stats.games.unit}s that were in flight then, LLR
             {stats.games.sprt.llr.toFixed(3)} within [{stats.games.sprt.lower_bound.toFixed(2)},
             {stats.games.sprt.upper_bound.toFixed(2)}].
           </p>

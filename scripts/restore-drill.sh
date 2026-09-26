@@ -2,8 +2,9 @@
 #
 # Automated restore drill (PLAN.md, "Drills"). Restores the most recent
 # nightly dump into a throwaway database, runs the SQL verification queries
-# from PLAN.md's "Verifying a restore" against it, and drops it again. Scheduled monthly by infra/backup.tf;
-# runnable by hand the same way as scripts/backup.sh.
+# from PLAN.md's "Verifying a restore" against it, and drops it again.
+# Scheduled monthly by infra/backup.tf; runnable by hand the same way as
+# scripts/backup.sh.
 #
 # This is the only check that catches a dump which has been silently producing
 # unusable output: everything else verifies that a backup *ran*.

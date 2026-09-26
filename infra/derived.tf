@@ -53,21 +53,43 @@ variable "derived_builder_memory" {
     MAGPIE peaks at about 2.4 GB building a rack info table and 710 MB building
     a wordmap, and the builder hashes the output in 8 MB chunks rather than
     reading it in. 8 GB leaves room for a larger lexicon than any shipped
-    today; below 4 GB a table build is killed rather than slow.
+    today; below 4 GB a table build is killed rather than slow. It must also be
+    a Fargate size for derived_builder_cpu: 8 GB is the least 4 vCPU takes.
   EOT
   type        = number
   default     = 8192
+
+  validation {
+    # Fargate's CPU and memory pairs: refused otherwise only by
+    # RegisterTaskDefinition, part-way through an apply.
+    condition = (
+      (var.derived_builder_cpu == 256 && contains([512, 1024, 2048], var.derived_builder_memory)) ||
+      (var.derived_builder_cpu == 512 && var.derived_builder_memory >= 1024 && var.derived_builder_memory <= 4096 && var.derived_builder_memory % 1024 == 0) ||
+      (var.derived_builder_cpu == 1024 && var.derived_builder_memory >= 2048 && var.derived_builder_memory <= 8192 && var.derived_builder_memory % 1024 == 0) ||
+      (var.derived_builder_cpu == 2048 && var.derived_builder_memory >= 4096 && var.derived_builder_memory <= 16384 && var.derived_builder_memory % 1024 == 0) ||
+      (var.derived_builder_cpu == 4096 && var.derived_builder_memory >= 8192 && var.derived_builder_memory <= 30720 && var.derived_builder_memory % 1024 == 0) ||
+      (var.derived_builder_cpu == 8192 && var.derived_builder_memory >= 16384 && var.derived_builder_memory <= 61440 && var.derived_builder_memory % 4096 == 0) ||
+      (var.derived_builder_cpu == 16384 && var.derived_builder_memory >= 32768 && var.derived_builder_memory <= 122880 && var.derived_builder_memory % 8192 == 0)
+    )
+    error_message = "derived_builder_memory is not a Fargate memory size for derived_builder_cpu's CPU (1024 CPU takes 2048 to 8192 MiB, 4096 takes 8192 to 30720, in 1024 steps)."
+  }
 }
 
 variable "derived_builder_ephemeral_storage_gib" {
   description = <<-EOT
     Scratch space for one conversion at a time: a 1.9 GB rack info table plus
-    the 179 MB wordmap it is built from plus their inputs. The 20 GB Fargate
-    default would do; this is explicit so that a lexicon twice CSW24's size is
-    a number to change rather than a task that dies mid-build.
+    the 179 MB wordmap it is built from plus their inputs. The 20 GiB Fargate
+    default would do (21 is the least that can be set); this is explicit so
+    that a lexicon twice CSW24's size is a number to change rather than a task
+    that dies mid-build.
   EOT
   type        = number
   default     = 30
+
+  validation {
+    condition     = var.derived_builder_ephemeral_storage_gib >= 21 && var.derived_builder_ephemeral_storage_gib <= 200
+    error_message = "Fargate ephemeral storage is 21 to 200 GiB."
+  }
 }
 
 variable "derived_builder_schedule" {

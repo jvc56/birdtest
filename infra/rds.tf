@@ -66,7 +66,7 @@ resource "aws_db_instance" "main" {
 
   instance_class        = var.db_instance_class
   allocated_storage     = var.db_allocated_storage
-  max_allocated_storage = var.db_allocated_storage * 5
+  max_allocated_storage = min(var.db_allocated_storage * 5, 65536) # RDS's ceiling
   storage_encrypted     = true
 
   db_name  = var.project

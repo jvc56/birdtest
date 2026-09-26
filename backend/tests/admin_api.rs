@@ -1104,6 +1104,95 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
     assert_eq!(created["job"]["sim_cutoff"], json!(0.005), "{created}");
 }
 
+/// A config or job no worker can run is refused at creation. Each of these
+/// used to be accepted and dispatched: every worker then failed every task,
+/// and after five failures in a row `magpie contribute` stops — so a job built
+/// on one, alone on offer, took the whole fleet down within seconds.
+#[tokio::test]
+async fn a_config_or_job_no_worker_can_run_is_refused() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+
+    // MAGPIE's own ceilings: a margin past its largest equity, and play
+    // counts it would allocate gigabytes for (2e9 was a 16 GB malloc and a
+    // core dump) or that a stored rank cannot hold.
+    for (field, value) in [
+        ("movegen_margin", json!(2_147_483.646)),
+        ("inference_margin", json!(3_000_000.0)),
+        ("num_plays", json!(200_001)),
+        ("num_plays", json!(2_000_000_000)),
+        ("num_plays_recorded", json!(32_768)),
+    ] {
+        let mut body = json!({
+            "name": format!("too-big-{field}"), "recorder_type": "best", "kwg_id": kwg,
+            "klv_id": klv, "num_plays_recorded": 1,
+        });
+        body[field] = value;
+        let (status, refused) = player_config(&app, &headers, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{field}: {refused}");
+        assert_eq!(refused["fields"][0]["field"], field, "{refused}");
+    }
+    // At the ceilings themselves: MAGPIE's largest equity is a margin it
+    // takes, and a static player ranking every play of a blank-heavy opening
+    // rack needs more than 32,767 (63,585 for ??EIRST in CSW24).
+    let (status, at_ceilings) = player_config(&app, &headers, json!({
+        "name": "ceilings", "recorder_type": "all", "kwg_id": kwg, "klv_id": klv,
+        "movegen_margin": 2_147_483.645, "num_plays": 63_585, "num_plays_recorded": 32_767,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED, "{at_ceilings}");
+    let (status, player) = player_config(&app, &headers, json!({
+        "name": "ok", "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+        "num_plays_recorded": 1,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED, "{player}");
+
+    // A 21x21 board: it ships in the data release beside the super-board
+    // lexica, and no MAGPIE the fleet runs loads it.
+    let mut super_board = b"10, 10\n".to_vec();
+    for _ in 0..21 {
+        super_board.extend_from_slice(&[b' '; 21]);
+        super_board.push(b'\n');
+    }
+    let super21: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+         VALUES ('layouts/standard21.txt', 'layout', 'standard21', repeat('2', 64), $1, '20260101', $2)
+         RETURNING id",
+    )
+    .bind(super_board.len() as i64)
+    .bind(&super_board)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let job = |layout_id: uuid::Uuid, alpha: f64| {
+        json!({
+            "job_type": "games", "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout_id,
+            "player1_config_id": player["id"], "player2_config_id": player["id"],
+            "min_games": 1, "max_games": 10, "sprt_alpha": alpha,
+        })
+    };
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(super21, 0.05))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "layout_id", "{body}");
+
+    // A subnormal alpha made the SPRT's upper bound infinite, which the job
+    // page could not print.
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(layout, 1e-309))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "sprt_alpha", "{body}");
+
+    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(layout, 0.05))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
 /// Banning is the only lever there is against a bad contributor — nothing bans
 /// automatically — so unban has to mean what it says.
 ///
