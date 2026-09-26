@@ -95,6 +95,11 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       target: backend
+      # Capped as e2e/run.sh caps them: uncapped, cargo and MAGPIE's LTO build
+      # each take every core at once. Raise them on a machine with room.
+      args:
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-2}
+        MAKE_JOBS: ${MAKE_JOBS:-3}
     depends_on:
       postgres:
         condition: service_healthy
@@ -222,6 +227,9 @@ services:
       context: .
       dockerfile: docker/Dockerfile
       target: derived-builder
+      args:
+        CARGO_BUILD_JOBS: ${CARGO_BUILD_JOBS:-2}
+        MAKE_JOBS: ${MAKE_JOBS:-3}
     depends_on:
       postgres:
         condition: service_healthy

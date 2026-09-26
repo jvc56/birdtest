@@ -137,6 +137,14 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   pinned; `backend/build.rs`); the adversarial check found 2 medium (a
   closing fence less indented than its opener; zsh without
   `interactive_comments`), both fixed. KL-64 updated. The loop continues.
+- **Pass 16 (follow-up: pass 15's diff, and the admin frontend):** 0 high and
+  2 medium from the reviewers — the admin job page showing defaults as the
+  server's state after a failed first read, and MAGPIE printing an API key
+  written on the wrong line — both fixed (a new journey, `E-11`; MAGPIE
+  `3565279b`, pinned); the adversarial check found 4 medium (a retry
+  replacing a typed allocation; a read landing after an action; the checker
+  hanging on a line of backslashes; PLAN's output promise), all fixed. KL-64
+  and KL-68 updated; KL-86 added. The loop continues.
 
 ---
 
@@ -2245,9 +2253,9 @@ README's first-deploy password block (which rotation reuses) called
 `modify-db-instance` with the pager on: without bracketed paste, `less` ate
 the `wait` and the endpoint lookup, and `put-parameter` wrote
 `postgres://birdtest:…@:5432/birdtest` to SSM. **Fix:** README's `aws` blocks
-(three then, four once 14.7 split one) turn the pager off, its example `contribute.txt` is labelled `text`, its
-ACM block parses (the ARN captured, not `<arn>`), and CI runs the check over
-README too.
+(three then, four once 14.7 split one) turn the pager off, its example
+`contribute.txt` is labelled `text`, its ACM block parses (the ARN captured,
+not `<arn>`), and CI runs the check over README too.
 
 ### 14.5 Medium — the pager check did not check "first" (docs reviewer)
 
@@ -2366,7 +2374,7 @@ check. **Verified:** the new load test fails with the check removed
 (`Assertion '!client_state_load(path, error_stack)' failed`) and passes with
 it; MAGPIE's `contribute` and `layout` tests pass; formatting passes.
 
-### 15.2 Medium — README's ACM wait gives up after five minutes, not forty (docs reviewer)
+### 15.2 Medium — README's ACM wait gives up after four minutes, not forty (docs reviewer)
 
 The real AWS CLI 2.37.4's `CertificateValidated` waiter polls 60 s × 5 (shown
 against a fake ACM endpoint: `Max attempts exceeded`, rc 255, 241 s); README
@@ -2450,10 +2458,10 @@ a fence indented four columns read as a fence.
   **Verified:** the four closer cases fail; RUNBOOK and README pass; the
   earlier cases are unchanged.
 - **In stock zsh, every commented block failed when pasted.** Without
-  `interactive_comments`, `#` is a word: with bracketed paste the first line's
-  `export AWS_PAGER=""   # …` failed and zsh dropped the paste; without it, an
-  apostrophe in a comment opened a quote that swallowed the rest (shown in
-  zsh 5.9; bash correct in both modes). **Fix:** README's deployment preamble
+  `interactive_comments`, `#` is a word: the first line's
+  `export AWS_PAGER=""   # …` failed, and an apostrophe in a comment opened a
+  quote that swallowed the rest of the paste — with bracketed paste, before
+  anything ran (shown in zsh 5.9; bash correct in both modes). **Fix:** README's deployment preamble
   and RUNBOOK's header say the blocks are bash, and to run `bash` first in
   zsh.
 
@@ -2489,3 +2497,132 @@ continuation; a tab counted as one column of indentation.
 - README's ACM blocks replayed with stubs (retry, terminal failure, empty
   placeholders).
 - The frontend is unchanged this pass; Terraform unchanged.
+
+## Pass 16 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`97fd887..a4ea3b4`), and
+MAGPIE's `5753e212..8ba24b7b`, one reviewer per part: build, backend and
+scripts; docs and procedures; MAGPIE. Plus one area not examined in this run:
+**the admin frontend** — every page under `routes/admin/` and what they share.
+
+**Findings: 0 high, 2 medium** from the four reviewers (build, backend and
+scripts none, 7 low; docs and procedures none, 6 low, 2 unconfirmed; MAGPIE 1
+medium, 4 low; admin frontend 1 medium, 11 low, 1 unconfirmed — tier 5
+natively 11 of 11, every admin page driven with Playwright). Both fixed.
+
+### 16.1 Medium — after a failed first read, the admin job page showed defaults as the server's state (admin frontend reviewer)
+
+The page read the job, then its data gaps, then its export, one after another,
+and stopped at the first failure; the stream still filled in the stats, so the
+page looked whole. After a transient `503` on the first read it showed the
+allocation box's initial 100, "No worker has declined this job" though the
+gaps were never read, and Activate sent `{"allocation":100}`. **Fix:** the
+three reads settle apart; the allocation is the job's own, seeded from the
+first payload (REST or stream) and empty until one arrives; a failed read is
+tried again on the next live payload and after five seconds, with its error
+kept apart from an action's and cleared on success; the data-gaps card says
+"Could not load" rather than "none"; actions and the artifact checks take no
+second click while one runs; Activate checks for a whole number. **Verified:**
+a new journey, `E-11` (the first read answered `503`, the gaps mocked), fails
+on the committed page (`No worker has declined` shown) and passes; tier 5 is
+12 of 12.
+
+### 16.2 Medium — an API key on the wrong line was printed by MAGPIE (MAGPIE reviewer)
+
+A key appended to a `contribute.txt` whose last line had no newline landed in
+that line's value, and a key pasted alone was a line of its own: MAGPIE
+printed it in "'0apikey bt_…' is not a valid integer", in "contributing to
+https://…apikey bt_…", and in "unknown setting 'bt_…'", though PLAN promises a
+key never appears in output or errors. Nothing reached the network. **Fix**
+(MAGPIE `3565279b`, pinned): settings messages name the file, line and setting
+only; an unknown word is shown only if it could be a setting's name; a
+`server` value holding a space is refused. With it, the `uuid` check moved
+after the file is read, so the last `uuid` line is the one checked (a partial
+line then a whole one — what adding the line by hand after a failed save
+leaves — loads). **Verified:** `test_client_state` fails on the committed
+parser and passes; the three cases replayed with the built binary print no key.
+
+### 16.3 Low findings
+
+**Fixed:**
+- `runbook-check.sh`: a closing fence indented four or more past its opener,
+  or any fence-like line inside a block, is refused (a renderer shows it as
+  text; in bash it is backquotes); a trailing backslash counts only as an odd
+  run; a backslash followed by blanks is refused, with the line; bash 3.2's
+  silence on an unterminated heredoc is in the header.
+- Build: compose caps `CARGO_BUILD_JOBS` and `MAKE_JOBS` as `e2e/run.sh`
+  does (`.env.example` names them).
+- The contract: the server's `a_first_claim_is_assigned_a_worker_uuid` checks
+  it sends the fixture's exact `worker_uuid`, so a change of form fails on both
+  sides; TESTING says so.
+- Admin pages: a ban's target is trimmed and a double click sends one ban;
+  unbanning asks first; the job form's players are required; the input-data
+  delete names the row's digest and says its derived files go with it; the
+  force-complete dialog no longer contradicts purge; PLAN's admin job page row.
+- README: the ACM wait retries only when the wait ran out (a failed
+  certificate, a wrong region, denied access or expired credentials stop at
+  once), ten rounds of about four minutes, and "waiting again" only when
+  another follows; the zsh note is at the top, covering every block.
+- KL-64 names the MinIO client image; 14.4's paragraph reflowed.
+
+**Recorded:** KL-68 (a failed save's partial line — now refused naming it —
+could be truncated away); KL-86 (the admin pages' remaining small things).
+**Left:** `MAKE_JOBS` splitting the Docker build cache between run.sh and
+other builds; a refusal inside an indented block cascading into a second
+message.
+
+### 16.4 Adversarial check of the pass's fixes
+
+**4 medium, all fixed.**
+
+- **A retry replaced the allocation the admin had typed.** 16.1's reload
+  seeded the allocation on every successful read, the retries included, so a
+  value typed after a failed read was put back to the job's (shown: typed 55,
+  six seconds later 7, Activate sent 7). **Fix:** typing marks the box edited;
+  reads leave it alone until an action's own read. **Verified:** E-11 now
+  types 55 while two gap reads fail and asserts 55 is kept and sent; with the
+  guard removed it fails at that assertion.
+- **A read started before an action could land after it.** The retry and an
+  action's reload ran unordered: a slow retry finishing after Deactivate put
+  back `active` and cleared the error, and an inactive job gets no payload to
+  correct it (shown). **Fix:** each read is numbered and one overtaken by a
+  newer is dropped; the retry skips while a read runs.
+- **`runbook-check.sh` hung on a line of only backslashes** — 16.3's
+  odd-run loop read past the start of the line in every awk (mawk, nawk,
+  busybox). **Fix:** the loop is bounded. **Verified:** both cases now fail
+  at once instead of hanging.
+- **PLAN promised no settings value appears in output;** the status line
+  prints `server`, and a bare key glued to it with no space shows there
+  (shown with the built binary). **Fix:** PLAN says no settings *error*
+  quotes a value, and that the status line prints `server`; KL-68 records the
+  URL shape MAGPIE does not check.
+
+**Lows fixed:** Purge, Force complete, Merge, Export and Delete take no
+second click and show no dialog while an action runs; an export poll's error
+is kept apart and cleared by the next good poll; `runbook-check.sh` leaves a
+shorter fence inside a longer one alone (the CommonMark way to quote a fence),
+refuses a continuation into a blank or comment line (an option dropped), and
+its advice no longer points the wrong way; README's ACM loop retries only a
+certificate still pending (a timed-out one stopped too) and its last message
+names credentials; the contract comment says hex, either case; the unban
+dialog says the reason stays in the audit log; PLAN's admin row names the data
+gaps and ETA. **Held:** E-11 fails on the committed page and passes;
+navigating away mid-retry sends nothing more; `busy` resets in `finally`; the
+real CLI's timed-out wait says "Max attempts exceeded" and, still pending,
+names `PENDING_VALIDATION`; MAGPIE loads CRLF, tabs and uppercase UUIDs and
+quotes no key in any settings error; every doc block parses under bash 3.2.
+
+### 16.5 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **594 of 594**.
+- **MAGPIE's suite** at `3565279b`: **70 of 70**; `format.py` passes.
+- **Tier 6, natively, every case** at `3565279b`: passed.
+- **Tier 5, natively: 12 of 12** with `E-11` on the final working tree; `E-11`
+  fails on the committed page and on the page without the edit guard.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 119 of 119.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks; every
+  case file from passes 13–16 as above, none hanging.
+- README's ACM wait replayed with a stub carrying the real CLI's messages:
+  pending then issued, never issued, timed out, failed, denied.

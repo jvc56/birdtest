@@ -133,7 +133,15 @@
 
   async function remove(file: InputData) {
     error = '';
-    if (!confirm2(`Delete ${file.path}?`)) return;
+    // Named by digest as well as path, which two rows share after a
+    // collision import; and what goes with it said.
+    if (
+      !confirm2(
+        `Delete ${file.path} (sha256 ${file.sha256.slice(0, 12)}…, imported from ${file.tarball_date})? ` +
+          'Derived files built from it are deleted with it.'
+      )
+    )
+      return;
     try {
       await api.deleteInputData(file.id);
       await load();

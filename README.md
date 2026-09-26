@@ -14,6 +14,11 @@ with workers](PLAN.md#input-data-and-capability-negotiation), and what is
 [TESTING.md](TESTING.md) is what is guaranteed and how it is checked, and
 [RUNBOOK.md](RUNBOOK.md) is the recovery procedure itself.
 
+The command blocks here and in RUNBOOK.md are bash: in zsh, run `bash` first.
+Stock zsh treats a `#` as a word, so a commented line fails or passes its
+comment on as arguments, and an apostrophe in a comment opens a quote that
+swallows the rest of the paste.
+
 ## Layout
 
 | Path | What it is |
@@ -294,10 +299,7 @@ minio minio-init` gives you one without the rest of the stack.
 
 ## Deploying
 
-A first deployment, in order (each step is described below). The blocks
-here and in RUNBOOK.md are bash: in zsh, run `bash` first — stock zsh treats a
-`#` as a word, so a commented line fails, and an apostrophe in a comment opens
-a quote that swallows the rest of the paste.
+A first deployment, in order (each step is described below):
 
 1. Tools: Terraform 1.9, the AWS CLI with the Session Manager plugin, `jq`,
    `openssl`, and `python3` for RUNBOOK.md's procedures.
@@ -332,27 +334,29 @@ a quote that swallows the rest of the paste.
    fi
    ```
    Then, with the CNAME in DNS, wait for it. DNS validation can take half an
-   hour, and the CLI's own wait gives up after about five minutes (older CLIs
-   waited forty), so it is asked again, up to eight times:
+   hour, and the CLI's own wait gives up after about four minutes (older CLIs
+   waited forty), so it is asked again, up to ten times:
    ```bash
    export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
    if [ -z "${ARN:-}" ] || [ -z "${REGION:-}" ]; then
      echo "no ARN or REGION: run the block above first (or set both from it)" >&2
    else
      validated=''
-     for _ in $(seq 8); do
+     for round in $(seq 10); do
        if out=$(aws acm wait certificate-validated --region "$REGION" --certificate-arn "$ARN" 2>&1); then
          validated=yes
          break
        fi
        echo "$out" >&2
-       # A certificate that failed validation, or one this region does not
-       # have, will not pass however long this waits.
-       case "$out" in *"terminal failure"*|*ResourceNotFound*) break ;; esac
-       echo "not validated yet; waiting again" >&2
+       # Only a wait that ran out on a certificate still pending is worth
+       # another: one that failed validation or timed out, one this region
+       # does not have, denied access, expired credentials or no network fail
+       # the same way each time.
+       case "$out" in *"Max attempts exceeded"*PENDING_VALIDATION*) ;; *) break ;; esac
+       [ "$round" -lt 10 ] && echo "not validated yet; waiting again" >&2
      done
      if [ -n "$validated" ]; then echo "acm_certificate_arn = \"$ARN\""   # for prod.tfvars, step 4
-     else echo "not validated: check the CNAME and REGION; a failed certificate needs a new request" >&2; fi
+     else echo "not validated: see the error above (check the CNAME, REGION and credentials); a failed or timed-out certificate needs a new request" >&2; fi
    fi
    ```
 4. Write `infra/prod.tfvars` with the eight variables that have no default --

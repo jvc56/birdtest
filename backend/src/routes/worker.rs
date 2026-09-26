@@ -1351,11 +1351,15 @@ mod contract_fixtures {
         // key out: a missing key reads to a client as a server that checks
         // nothing.
         assert_eq!(fixture["expected_data"]["derived"], serde_json::json!([]));
-        assert_same_shape(
-            &fixture,
-            &envelope_for(&fixture, Some(minted)),
-            "anon-uuid-assignment envelope",
-        );
+        let envelope = envelope_for(&fixture, Some(minted));
+        assert_same_shape(&fixture, &envelope, "anon-uuid-assignment envelope");
+        // The value, not only the key: MAGPIE takes an identity only in the
+        // fixture's form (8-4-4-4-12 hex digits) and ignores any other, so a
+        // server that began sending another form would pass the shape check
+        // while every new anonymous worker threw its identity away.
+        assert_eq!(envelope["worker_uuid"], fixture["worker_uuid"]);
+        let text = fixture["worker_uuid"].as_str().unwrap();
+        assert_eq!(text, minted.hyphenated().to_string());
     }
 
     /// C-8: the digest list on an assignment -- input files and derived ones

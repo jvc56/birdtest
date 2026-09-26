@@ -73,7 +73,7 @@ at tier 5 names a symptom.
 | 2 Integration | 158 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 196 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 5 End-to-end | 11 | Playwright journeys `E-1`..`E-11` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
@@ -150,7 +150,7 @@ incidentally by higher tiers.
 | `lib/sse.ts` | 1F | Covered (`F-SSE-*`) |
 | `lib/auth.ts` | 1F | Covered (`F-AUTH-*`) |
 | Chart maths | 1F | Covered (`F-CHART-*`). The arithmetic moved out of the components into `lib/charts/*.ts` so it could be tested; the `.svelte` files that draw it are exercised only by tier 5 |
-| Every page under `routes/` | 5 | Partial — the ten journeys. `/users`, `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them; their endpoints are tier 3 |
+| Every page under `routes/` | 5 | Partial — the eleven journeys (E-10 visits `/users`). `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them; their endpoints are tier 3 |
 
 ### Scripts and cross-repo
 
@@ -2447,7 +2447,9 @@ validation, as a submission would, so a captured result the server would
 refuse fails here.
 MAGPIE's half, in `test/contribute_test.c`, is four tests:
 `test_contract_fixtures_carry_every_key_contribute_reads` (every key
-`contribute` reads off a server message is in its fixture),
+`contribute` reads off a server message is in its fixture, and the assigned
+`worker_uuid` is in the form the client takes — the server's
+`a_first_claim_is_assigned_a_worker_uuid` checks it sends that exact value),
 `test_results_carry_every_key_the_server_reads` (the serializers a task's
 result is built with still produce every key the result fixtures carry, so a
 key renamed in MAGPIE fails there rather than every submission),
@@ -2559,6 +2561,14 @@ admin in once and the admin journeys reuse its storage state.
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
   "Register" off it (thirty-first audit; the header now wraps). Checked against
   a build of the pages with the API mocked: 533 before, 393 after.
+- `E-11` An admin job page whose first read fails shows nothing the server
+  did not say: the data gaps it read apart, the job's own allocation (from the
+  stream if the read failed), the failed reads tried again and their error
+  cleared, a value the admin types kept through the retries, and Activate
+  sending it. *(Covered: `e11-admin-job-first-read.spec.ts`, the first
+  `GET /api/jobs/:id` and the first two gap reads answered `503`.)* The reads ran one after another: the page said
+  "No worker has declined this job", showed 100, and Activate sent it
+  (thirty-second audit, pass 16).
 
 ### Reading confirmation codes
 
@@ -2566,10 +2576,10 @@ Two journeys need to read an emailed code, and they do it through
 `MAIL_BACKEND=file`.
 
 **First, shrink the problem.** Only `E-2` (register → confirm → log in) and
-`E-9` (password reset) need a code at all. The other eight need a *confirmed
+`E-9` (password reset) need a code at all. The other nine need a *confirmed
 admin*, which `e2e/run.sh` seeds through `scripts/seed.py` before Playwright
 starts — so those journeys start at login. That turns "how does the browser
-read mail" into a question about two tests rather than ten.
+read mail" into a question about two tests rather than eleven.
 
 **`MAIL_BACKEND=file`** writes one message per file into `MAIL_OUTBOX_DIR`,
 named by timestamp and sanitised recipient

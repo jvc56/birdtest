@@ -4256,7 +4256,11 @@ backoff, not as an error.
   request, silently — so a misconfigured worker fails on its first request, the
   one that has already disclosed its credential (KL-84).
 - The API key is never accepted on the command line, never written to
-  `settings.txt`, and never appears in status output, logs or errors.
+  `settings.txt`, and never appears in status output, logs or errors; no
+  settings error quotes a value either, since a key appended to a last line
+  with no newline landed in another setting's (MAGPIE's `test_client_state`,
+  thirty-second audit, pass 16). The status line does print the `server`
+  value, so a bare key glued to it with no space would show there (KL-68).
 - The worker UUID is minted by the server, never trusted from the client, so a
   client cannot pick or collide an identity on its own.
 - **Every field of a task request is untrusted input.** It becomes file paths
@@ -5077,7 +5081,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 |---|---|
 | `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
 | `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields. |
-| `/admin/jobs/[id]` | Admin job view — same stats as the public detail page plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
+| `/admin/jobs/[id]` | Admin job view — the job's progress, ETA, status, contributors and data gaps (what workers declined it for; the public page has the rest: pentanomial, W/L/D, SPRT bounds) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form. |
 | `/admin/users` | User account list — delete accounts. (Contribution stats are shown publicly at `/users`.) |
@@ -5156,7 +5160,7 @@ birdtest/
 │   ├── dev-restore.sh              # put it back
 │   ├── dev-restore-check.sh        # its SCRUB rule against a stub compose (CI)
 │   ├── runbook-check.sh            # every bash block in RUNBOOK.md and README.md parses,
-│   │                               # and turns the AWS CLI's pager off (CI)
+│   │                               # and each that calls aws turns its pager off (CI)
 │   ├── restore-job.sh              # copy one purged or deleted job back from a scratch restore
 │   │                               # (RUNBOOK §2.2; also embedded in the ops task, infra/ops.tf)
 │   ├── restore-job-check.sh        # restore-job.sh through its failure and re-run cases (nightly)
@@ -8266,6 +8270,32 @@ says so in its implemented option, rather than being removed.
   PLAN had said otherwise until pass 14. Worth doing with the next MAGPIE
   release that touches the executors.
 
+**KL-86. Small things on the admin pages.**
+- **Context:** `frontend/src/routes/admin/` (thirty-second audit, pass 16).
+- **Problem:**
+  - A static player's simulation-only fields stay editable on the new-config
+    form and are sent as null.
+  - "Fetch and diff" stays enabled while an import runs; a second start drops
+    the first from the page, which then stages and expires unseen (there is
+    no list of imports).
+  - Confirming an import that expired while staged answers `409`, and the
+    page keeps showing it staged until reloaded (reasoned, not reproduced).
+  - A rating pool's member is removed without a confirmation.
+  - An export poll that fails keeps polling every three seconds until one
+    succeeds (pass 16 made it poll again; before, it stopped for good).
+  - A request that never settles leaves the job page's actions disabled until
+    a reload (`request()` has no timeout; reasoned, not reproduced).
+- **Options considered:** disabling the fields, the button while running, a
+  reload on a `409`, a confirmation.
+- **Option implemented:** None of these. Pass 16 made the job page's reads
+  settle apart and retry (a read overtaken by a newer one dropped, a typed
+  allocation kept), seeded its allocation from the server, guarded every
+  action on it against a double click, trimmed a ban's target, confirmed an unban,
+  required the job form's players, and named an input row's digest and its
+  derived files in the delete confirmation.
+- **Justification:** Admin-only, each visible and recoverable by a reload or
+  a second action.
+
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
   layout's sign-out has no error path (`F-AUTH-2` pins the store's side).
@@ -8414,7 +8444,8 @@ says so in its implemented option, rather than being removed.
   - Third-party CI actions are pinned by tag, not commit; base images
     (`rust:1-slim-bookworm`, `debian:bookworm-slim`, `node:22-alpine`,
     `nginx:1.30-alpine`, `python:3.11-slim`, `postgres:16`, Chainguard's
-    MinIO at `latest`) and `# syntax=docker/dockerfile:1.7` by floating tag,
+    MinIO at `latest` and its client at `latest-dev`) and
+    `# syntax=docker/dockerfile:1.7` by floating tag,
     not digest; the fake worker's `pip install requests` by no version; and
     `rust:1` with the stable toolchain takes new clippy lints on its own.
   - README's release build (`--pull` since pass 15) builds from the working
@@ -8588,6 +8619,12 @@ says so in its implemented option, rather than being removed.
     again at once.
   - `maxtasks` goes through `string_to_int`, which truncates a long:
     `4294967296` reads as 0, no limit.
+  - `server` is not held to a URL's shape: a bare key appended to it with no
+    newline and no space is printed in the status line and in request errors
+    (one with a space is refused, pass 16).
+  - A UUID save cut short by a full disk leaves the part it wrote; the next
+    run refuses it naming the line (pass 15), where truncating back to the
+    file's old length on a failed write would leave nothing to fix.
 - **Options considered:** each fix as named, on `birdtest-contribute`; bump
   to 0.1.2 before the branch is first pushed if anything between is ever built.
 - **Option implemented:** Pass 14 fixed a negative `maxtasks` (now refused),

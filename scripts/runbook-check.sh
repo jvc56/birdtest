@@ -23,7 +23,9 @@
 # shell block labelled `text`, a block that turns the pager back on, and a `!`
 # inside double quotes, which an interactive shell expands as history and
 # `bash -n` does not. A fence indented four columns or more is read as one,
-# though a renderer outside a list shows it as indented code.
+# though a renderer outside a list shows it as indented code. And bash 3.2
+# (macOS's /bin/bash) does not warn of a heredoc never terminated; CI's bash
+# does.
 
 set -Eeuo pipefail
 
@@ -77,7 +79,19 @@ check() {
         refuse("a line less indented than its block'"'"'s fence (line " start - 1 "); indent the block'"'"'s every line, its closing fence too")
         inside = 0; if (file != "") close(file); next
       }
-      if (m >= flen && substr(t, m + 1) ~ /^[ \t]*$/) { inside = 0; if (file != "") close(file); next }
+      # A closer indented four or more past its opener is content, as a
+      # renderer reads it.
+      if (m >= flen && substr(t, m + 1) ~ /^[ \t]*$/ && length(lead) - indent <= 3) {
+        inside = 0; if (file != "") close(file); next
+      }
+      # A fence at least as long as the opener that does not close the block
+      # -- one indented four past it, or labelled -- is shown as text inside
+      # it, and in bash is a run of backquotes. (A shorter one is how a block
+      # quotes a fence, and is left alone.)
+      if (m >= flen) {
+        refuse("a fence inside a block that does not close it (line " start - 1 "); close the block, or open it with a longer fence")
+        inside = 0; if (file != "") close(file); next
+      }
       if (file != "") {
         line = $0; k = 0
         while (k < indent && substr(line, 1, 1) ~ /[ \t]/) { line = substr(line, 2); k++ }
@@ -102,8 +116,23 @@ check() {
     # only warns, and a backslash ending the last line says nothing. Any
     # output from it, or that backslash, fails the block.
     bad=''
-    if awk 'NF { last = $0 } END { exit !(last ~ /\\$/) }' "${block}"; then
+    # An odd run of backslashes ends the line in a continuation; an even
+    # run is a backslash, escaped.
+    if awk 'NF { last = $0 } END { n = 0; while (n < length(last) && substr(last, length(last) - n, 1) == "\\") n++; exit !(n % 2) }' "${block}"; then
       echo "its last line ends in a backslash, which waits for another line" > "${WORK}/err"
+      bad=yes
+    elif awk '
+        # A continuation into a blank or comment line: bash ends the command
+        # there, and the line after runs on its own -- an option dropped.
+        cont && /^[ \t]*(#|$)/ { print "line " NR ": a continuation into a blank or comment line"; bad = 1 }
+        { n = 0; while (n < length($0) && substr($0, length($0) - n, 1) == "\\") n++; cont = n % 2 }
+        END { exit !bad }
+      ' "${block}" > "${WORK}/err"; then
+      bad=yes
+    elif grep -nE '\\[[:blank:]]+$' "${block}" > "${WORK}/err"; then
+      # A backslash then blanks escapes a blank, not the newline: the line
+      # after it ran as a command of its own.
+      sed -i 's/^/line /; s/$/: a backslash followed by blanks, not a continuation/' "${WORK}/err"
       bad=yes
     elif ! bash -n "${block}" 2> "${WORK}/err" || [ -s "${WORK}/err" ]; then
       bad=yes

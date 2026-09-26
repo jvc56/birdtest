@@ -20,8 +20,27 @@
   const jobId = $page.params.id as string;
 
   let stats: JobStats | null = null;
-  let gaps: DataGap[] = [];
-  let allocation = 100;
+  // null until read: shown as "could not load", never as "none".
+  let gaps: DataGap[] | null = null;
+  // The job's own allocation once any payload has said it; empty until then,
+  // so Activate cannot send a default the server never had.
+  let allocation: number | null = null;
+  let allocationSeeded = false;
+  // Set when the admin types in the box: a read's result then leaves it be
+  // (a retry replaced a typed value, and Activate sent the old one), until an
+  // action's own read says what the server now holds.
+  let allocationEdited = false;
+  // Each read's number: a read that finishes after a newer one was started
+  // is dropped (a slow retry landed after an action and put back the state
+  // before it).
+  let reloadGen = 0;
+  // Why the page's reads last failed, if they did. Kept apart from `error`
+  // (an action's) so a later successful read can clear it.
+  let loadError = '';
+  let exportError = '';
+  let reloading = false;
+  let retry: number | undefined;
+  let busy = false;
   let error = '';
   let notice = '';
   let rebuild: ArtifactRebuild[] | null = null;
@@ -31,30 +50,73 @@
   // not schedule another one on a page nobody has open.
   let destroyed = false;
 
+  function seedAllocation(value: JobStats) {
+    if (allocationEdited) return;
+    if (value.job.allocation !== null) allocation = value.job.allocation;
+    else if (!allocationSeeded) allocation = 100;
+    allocationSeeded = true;
+  }
+
+  // The three reads settle apart: one after another, a 503 on the first left
+  // the other two unread, and the page -- its stats arriving on the stream --
+  // showed "no worker has declined" and an allocation of 100 as if the server
+  // had said so, and Activate sent the 100 (the audit's pass 16). A read that
+  // fails is tried again when the next live payload arrives.
   async function reload() {
-    stats = await api.job(jobId);
-    if (stats.job.allocation !== null) allocation = stats.job.allocation;
-    gaps = await api.jobDataGaps(jobId);
-    await loadExport();
+    const gen = ++reloadGen;
+    reloading = true;
+    window.clearTimeout(retry);
+    const [job, gapsRead, exportRead] = await Promise.allSettled([
+      api.job(jobId),
+      api.jobDataGaps(jobId),
+      loadExport()
+    ]);
+    if (gen !== reloadGen) return;
+    const failures: string[] = [];
+    if (job.status === 'fulfilled') {
+      stats = job.value;
+      seedAllocation(job.value);
+    } else failures.push((job.reason as Error).message);
+    if (gapsRead.status === 'fulfilled') gaps = gapsRead.value;
+    else failures.push((gapsRead.reason as Error).message);
+    if (exportRead.status === 'rejected') failures.push((exportRead.reason as Error).message);
+    loadError = failures.length ? `Could not load all of this job: ${[...new Set(failures)].join('; ')}` : '';
+    reloading = false;
+    // And again in a few seconds: an inactive job sends no live payload.
+    if (loadError && !destroyed) retry = window.setTimeout(() => !reloading && reload(), 5000);
   }
 
   // The export is built on a background task, so the page polls while one is
   // running. A job that has never been exported answers 404, which is not an
   // error worth showing.
+  // A failed poll polls again: one that stopped left "Building…" up and
+  // "Export again" disabled after the export was ready.
   async function loadExport() {
     window.clearTimeout(exportPoll);
     try {
       jobExport = await api.jobExport(jobId);
+      exportError = '';
     } catch (e) {
       if (e instanceof ApiError && e.status === 404) jobExport = null;
-      else throw e;
+      else {
+        if (jobExport?.state === 'running') pollExport();
+        throw e;
+      }
     }
-    if (jobExport?.state === 'running' && !destroyed) {
-      exportPoll = window.setTimeout(() => loadExport().catch((e) => (error = e.message)), 3000);
-    }
+    if (jobExport?.state === 'running') pollExport();
+  }
+
+  function pollExport() {
+    if (destroyed) return;
+    exportPoll = window.setTimeout(
+      () => loadExport().catch((e) => (exportError = `Could not check the export: ${e.message}`)),
+      3000
+    );
   }
 
   async function startExport() {
+    if (busy) return;
+    busy = true;
     error = '';
     notice = '';
     try {
@@ -62,6 +124,8 @@
       await loadExport();
     } catch (e) {
       error = (e as Error).message;
+    } finally {
+      busy = false;
     }
   }
 
@@ -70,24 +134,45 @@
   }
 
   onMount(() => {
-    reload().catch((e) => (error = e.message));
-    const unsubscribe = subscribeToJob<JobStats>(jobId, (value) => (stats = value));
+    reload();
+    const unsubscribe = subscribeToJob<JobStats>(jobId, (value) => {
+      stats = value;
+      if (!allocationSeeded) seedAllocation(value);
+      if (loadError && !reloading) reload();
+    });
     return () => {
       destroyed = true;
       window.clearTimeout(exportPoll);
+      window.clearTimeout(retry);
       unsubscribe();
     };
   });
 
+  function activate() {
+    const value = allocation;
+    if (value === null || !Number.isInteger(Number(value)) || value < 0 || value > 100) {
+      error = 'Enter a whole-number allocation from 0 to 100.';
+      return;
+    }
+    run(() => api.activateJob(jobId, Number(value)), 'Job activated.');
+  }
+
+  // One action at a time: a double click sent two activations, or rebuilt
+  // every generation twice.
   async function run(action: () => Promise<unknown>, message: string) {
+    if (busy) return;
+    busy = true;
     error = '';
     notice = '';
     try {
       await action();
       notice = message;
+      allocationEdited = false;
       await reload();
     } catch (e) {
       error = (e as Error).message;
+    } finally {
+      busy = false;
     }
   }
 
@@ -96,6 +181,7 @@
   // whether each object still holds the bytes recorded when the generation
   // closed. See PLAN.md, "Artifacts: back up, or rebuild?".
   async function rebuildArtifacts(force = false) {
+    if (busy) return;
     // Forcing replaces every generation's object with what the database
     // rebuilds now -- including ones that differ. A closed generation's rows
     // do not move (a late result is credited, not folded), so a difference
@@ -112,6 +198,7 @@
     ) {
       return;
     }
+    busy = true;
     error = '';
     notice = '';
     rebuild = null;
@@ -134,6 +221,8 @@
           : '.');
     } catch (e) {
       error = (e as Error).message;
+    } finally {
+      busy = false;
     }
   }
 
@@ -141,6 +230,7 @@
   // purge deletes every task, claim and result the job holds, and a completed
   // job can never be reactivated. Delete already asked; these did not.
   function purge() {
+    if (busy) return;
     if (
       !confirm(
         'Purge this job? Every task, claim and result it holds is deleted and the job starts over (a completed job returns to inactive, to be activated again). This cannot be undone.'
@@ -151,9 +241,10 @@
   }
 
   function forceComplete() {
+    if (busy) return;
     if (
       !confirm(
-        'Force-complete this job? It stops dispatching for good: a completed job cannot be reactivated.'
+        'Force-complete this job? It stops dispatching: a completed job cannot be reactivated (only a purge, which deletes its results, starts it over).'
       )
     )
       return;
@@ -163,32 +254,43 @@
   // Accepted leave results are staged and merged into the per-rack totals in
   // batches; this merges now, for an admin who wants the rack figures current.
   async function mergeProgress() {
+    if (busy) return;
+    busy = true;
     error = '';
     notice = '';
     try {
       const merged = await api.mergeLeaveProgress(jobId);
+      allocationEdited = false;
       await reload();
       notice =
         `Merged ${merged.folds_merged.toLocaleString()} staged results into ` +
         `${merged.racks_updated.toLocaleString()} racks.`;
     } catch (e) {
       error = (e as Error).message;
+    } finally {
+      busy = false;
     }
   }
 
   async function remove() {
+    if (busy) return;
     if (!confirm('Delete this job and every task and result it holds? This cannot be undone.'))
       return;
+    busy = true;
     try {
       await api.deleteJob(jobId);
       goto('/jobs');
     } catch (e) {
       error = (e as Error).message;
+    } finally {
+      busy = false;
     }
   }
 </script>
 
 {#if error}<p class="mb-4 text-destructive">{error}</p>{/if}
+{#if loadError}<p class="mb-4 text-destructive">{loadError}</p>{/if}
+{#if exportError}<p class="mb-4 text-destructive">{exportError}</p>{/if}
 {#if notice}<p class="mb-4 text-success">{notice}</p>{/if}
 
 {#if !stats}
@@ -206,37 +308,45 @@
       <div class="flex flex-wrap items-end gap-3">
         <div>
           <label class="label" for="alloc">Allocation %</label>
-          <input id="alloc" type="number" min="0" max="100" class="input w-28" bind:value={allocation} />
+          <input
+            id="alloc"
+            type="number"
+            min="0"
+            max="100"
+            class="input w-28"
+            bind:value={allocation}
+            on:input={() => (allocationEdited = true)}
+          />
         </div>
         <button
           class="btn-primary"
-          on:click={() =>
-            allocation === null || Number.isNaN(Number(allocation))
-              ? (error = 'Enter an allocation from 0 to 100.')
-              : run(() => api.activateJob(jobId, allocation), 'Job activated.')}
+          disabled={busy}
+          on:click={activate}
         >
           Activate
         </button>
         <button
           class="btn-secondary"
+          disabled={busy}
           on:click={() => run(() => api.deactivateJob(jobId), 'Job deactivated.')}
         >
           Deactivate
         </button>
-        <button class="btn-secondary" on:click={forceComplete}>Force complete</button>
-        <button class="btn-secondary" on:click={purge}>Purge results</button>
+        <button class="btn-secondary" disabled={busy} on:click={forceComplete}>Force complete</button>
+        <button class="btn-secondary" disabled={busy} on:click={purge}>Purge results</button>
         {#if stats.job.job_type === 'leave_generation'}
-          <button class="btn-secondary" on:click={() => rebuildArtifacts()}>Check artifacts</button>
-          <button class="btn-destructive" on:click={() => rebuildArtifacts(true)}>Force rebuild</button>
+          <button class="btn-secondary" disabled={busy} on:click={() => rebuildArtifacts()}>Check artifacts</button>
+          <button class="btn-destructive" disabled={busy} on:click={() => rebuildArtifacts(true)}>Force rebuild</button>
           <button
             class="btn-secondary"
             title="Fold staged results into the rack totals now, rather than at the next half-hourly merge"
+            disabled={busy}
             on:click={mergeProgress}
           >
             Merge progress now
           </button>
         {/if}
-        <button class="btn-destructive" on:click={remove}>Delete job</button>
+        <button class="btn-destructive" disabled={busy} on:click={remove}>Delete job</button>
       </div>
       <p class="text-xs text-muted-foreground">
         The active jobs may allocate at most 100% between them; activation is rejected if this
@@ -316,7 +426,7 @@
           <button
             class="btn-secondary"
             on:click={startExport}
-            disabled={jobExport?.state === 'running'}
+            disabled={busy || jobExport?.state === 'running'}
           >
             {jobExport ? 'Export again' : 'Export results'}
           </button>
@@ -395,7 +505,11 @@
         absence into a statement. The fix is an admin decision — wait for the MAGPIE release that
         installs the data, or pin the job to the older rows.
       </p>
-      {#if gaps.length}
+      {#if gaps === null}
+        <p class="text-sm text-muted-foreground">
+          {loadError ? 'Could not load the data gaps.' : 'Loading…'}
+        </p>
+      {:else if gaps.length}
         <table class="table">
           <thead>
             <tr>

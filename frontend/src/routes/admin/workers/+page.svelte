@@ -41,29 +41,40 @@
     }
   });
 
+  let banning = false;
+
   async function ban() {
+    if (banning) return;
+    banning = true;
     error = '';
     notice = '';
+    // Trimmed: a pasted UUID's leading space was refused as a malformed one.
+    const id = target.trim();
     try {
       await api.banWorker({
-        ...(kind === 'anon' ? { anon_uuid: target } : { user_id: target }),
+        ...(kind === 'anon' ? { anon_uuid: id } : { user_id: id }),
         ...(reason ? { reason } : {})
       });
-      notice = `Banned ${target}.`;
+      notice = `Banned ${id}.`;
       target = '';
       reason = '';
       await loadBans();
     } catch (e) {
       error = message(e);
+    } finally {
+      banning = false;
     }
   }
 
   async function unban(entry: WorkerBan) {
+    const who = entry.username ?? entry.user_id ?? entry.anon_uuid;
+    // The ban row goes; its reason stays only in the audit log.
+    if (!window.confirm(`Lift the ban on ${who}? Its reason stays in the audit log.`)) return;
     error = '';
     notice = '';
     try {
       await api.unbanWorker(entry.id);
-      notice = `Lifted the ban on ${entry.username ?? entry.user_id ?? entry.anon_uuid}.`;
+      notice = `Lifted the ban on ${who}.`;
       await loadBans();
     } catch (e) {
       error = message(e);

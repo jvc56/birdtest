@@ -226,7 +226,7 @@
   {#if jobType === 'opening_rack'}
     <div>
       <label class="label" for="pc">Player config</label>
-      <select id="pc" class="input" bind:value={playerConfigId}>
+      <select id="pc" class="input" bind:value={playerConfigId} required>
         {#each configs as config}
           <option value={config.id}>
             {config.name} — recorder {config.recorder_type}, {config.num_plays_recorded} play{config.num_plays_recorded === 1
@@ -255,13 +255,13 @@
     <div class="grid grid-cols-2 gap-3">
       <div>
         <label class="label" for="p1">Player 1</label>
-        <select id="p1" class="input" bind:value={player1}>
+        <select id="p1" class="input" bind:value={player1} required>
           {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
         </select>
       </div>
       <div>
         <label class="label" for="p2">Player 2</label>
-        <select id="p2" class="input" bind:value={player2}>
+        <select id="p2" class="input" bind:value={player2} required>
           {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
         </select>
       </div>
