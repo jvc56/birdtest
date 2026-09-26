@@ -3,21 +3,31 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-/// One broadcast channel per job that currently has at least one dashboard
-/// subscriber. Channels are created on first subscribe and dropped once nobody
-/// is listening, so an idle server holds no per-job state.
+/// One broadcast channel per job that has had a dashboard subscriber. Channels
+/// are created on first subscribe and dropped when a later publish or
+/// subscriber check finds nobody listening, so a job nobody has watched since
+/// its last subscriber left keeps a small channel until then (bounded by the
+/// jobs there are).
 #[derive(Clone, Default)]
 pub struct SseBroadcaster {
     /// Payloads are shared, not copied: a receiver clones what it receives,
     /// and a `String` was a whole payload per subscriber per push.
     channels: Arc<Mutex<HashMap<Uuid, broadcast::Sender<Arc<str>>>>>,
-    /// Jobs with a stats push in flight, and whether a further one has been
-    /// asked for while it ran. Building the payload is several aggregates over
-    /// a job's history, so it runs on a spawned task rather than on the
-    /// submission that triggered it -- and this is what stops a busy job
-    /// spawning one of those per submission, all reading the same rows and
-    /// racing each other to publish out of order.
-    pushes: Arc<Mutex<HashMap<Uuid, bool>>>,
+    /// Jobs with a stats push in flight -- building, or in the cool-down after
+    /// a build -- and whether a further one has been asked for meanwhile.
+    /// Building the payload is several aggregates over a job's history, so it
+    /// runs on a spawned task rather than on the submission that triggered it
+    /// -- and this is what stops a busy job spawning one of those per
+    /// submission, all reading the same rows and racing each other to publish
+    /// out of order.
+    pushes: Arc<Mutex<HashMap<Uuid, Push>>>,
+}
+
+struct Push {
+    pending: bool,
+    /// Wakes the loop from its cool-down: an admin's change should reach open
+    /// pages now, not after the interval that spaces submissions' pushes.
+    urgent: Arc<tokio::sync::Notify>,
 }
 
 impl SseBroadcaster {
@@ -66,25 +76,49 @@ impl SseBroadcaster {
     /// one queued, and keeps the pushes ordered, since a single task issues
     /// them.
     pub fn begin_push(&self, job_id: Uuid) -> bool {
+        self.ask_for_push(job_id, false)
+    }
+
+    /// As [`Self::begin_push`], and cuts a running loop's cool-down short.
+    pub fn begin_urgent_push(&self, job_id: Uuid) -> bool {
+        self.ask_for_push(job_id, true)
+    }
+
+    fn ask_for_push(&self, job_id: Uuid, urgent: bool) -> bool {
         let mut pushes = self.pushes.lock().expect("sse push map poisoned");
         match pushes.get_mut(&job_id) {
-            Some(pending) => {
-                *pending = true;
+            Some(push) => {
+                push.pending = true;
+                if urgent {
+                    push.urgent.notify_one();
+                }
                 false
             }
             None => {
-                pushes.insert(job_id, false);
+                let push = Push { pending: false, urgent: Arc::new(tokio::sync::Notify::new()) };
+                pushes.insert(job_id, push);
                 true
             }
         }
+    }
+
+    /// What wakes a push loop's cool-down early, while one is in flight.
+    pub fn urgent(&self, job_id: Uuid) -> Option<Arc<tokio::sync::Notify>> {
+        let pushes = self.pushes.lock().expect("sse push map poisoned");
+        pushes.get(&job_id).map(|push| push.urgent.clone())
+    }
+
+    /// Forget a push for good: its job is gone.
+    pub fn abandon_push(&self, job_id: Uuid) {
+        self.pushes.lock().expect("sse push map poisoned").remove(&job_id);
     }
 
     /// Finish a push, returning whether another round was asked for meanwhile.
     pub fn end_push(&self, job_id: Uuid) -> bool {
         let mut pushes = self.pushes.lock().expect("sse push map poisoned");
         match pushes.get_mut(&job_id) {
-            Some(pending) if *pending => {
-                *pending = false;
+            Some(push) if push.pending => {
+                push.pending = false;
                 true
             }
             _ => {
@@ -142,6 +176,38 @@ mod tests {
         // Back to idle, so the next submission owns the loop again.
         assert!(sse.begin_push(job));
         assert!(!sse.end_push(job));
+    }
+
+    /// An urgent ask wakes a loop's cool-down; a plain one only marks it.
+    #[tokio::test]
+    async fn an_urgent_push_cuts_the_cool_down_short() {
+        let sse = SseBroadcaster::new();
+        let job = Uuid::new_v4();
+        assert!(sse.begin_push(job));
+        let urgent = sse.urgent(job).expect("in flight");
+        assert!(!sse.begin_push(job));
+        let slept = tokio::time::timeout(std::time::Duration::from_millis(50), urgent.notified()).await;
+        assert!(slept.is_err(), "a submission does not wake it");
+        assert!(!sse.begin_urgent_push(job));
+        tokio::time::timeout(std::time::Duration::from_secs(1), urgent.notified())
+            .await
+            .expect("an admin's change does");
+        assert!(sse.end_push(job));
+        assert!(!sse.end_push(job));
+        assert!(sse.urgent(job).is_none(), "idle again");
+    }
+
+    /// A push for a deleted job is forgotten even with a round pending, where
+    /// returning without it left the entry for good.
+    #[test]
+    fn an_abandoned_push_leaves_nothing_behind() {
+        let sse = SseBroadcaster::new();
+        let job = Uuid::new_v4();
+        assert!(sse.begin_push(job));
+        assert!(!sse.begin_push(job), "a round pending");
+        sse.abandon_push(job);
+        assert!(sse.urgent(job).is_none());
+        assert!(sse.begin_push(job), "the next ask owns a fresh loop");
     }
 
     #[test]

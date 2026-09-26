@@ -1169,7 +1169,7 @@ pub async fn seed_generation(
                 rows.into_bytes()
             })
             .await
-            .map_err(|e| AppError::internal(format!("enumerating a rack universe failed: {e}")))?
+            .map_err(|e| AppError::task_failed("enumerating a rack universe", e))?
         };
         copy.send(rows).await?;
         start += CHUNK;

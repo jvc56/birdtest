@@ -806,7 +806,7 @@ API keys and session tokens are handled as described in the Auth tech stack note
 
 The dashboard has two levels: a **job list page** and a **job detail page** per job.
 
-Live updates are delivered via **Server-Sent Events (SSE)**. The client subscribes to a per-job SSE stream; the server pushes a new event after accepted task results — coalesced, at most one a second (see [Live updates](#live-updates)). SSE is one-way (server → client) and sufficient since the client never needs to send data over the live connection.
+Live updates are delivered via **Server-Sent Events (SSE)**. The client subscribes to a per-job SSE stream; the server pushes a new event after accepted task results — coalesced, at most one per `JOB_STATS_CACHE_SECONDS` (see [Live updates](#live-updates)). SSE is one-way (server → client) and sufficient since the client never needs to send data over the live connection.
 
 #### Job List Page
 
@@ -847,7 +847,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 **Leave generation**
 
 - Current generation number and the configured per-generation minimum rack target (e.g., "Generation 3 — target: 500 occurrences per rack").
-- **Live**, on every accepted result: tasks completed and games played in the in-progress generation.
+- **Live**, pushed as results land: tasks completed and games played in the in-progress generation.
 - **As of the last merge**, and labelled with its time: racks at target out of the generation's total, and the rack with the fewest occurrences with its count. Accepted results are staged and merged into the per-rack totals in batches — every half hour, and about once a minute as a generation nears its end — so these lag by that much; see [What a merge costs](#what-a-merge-costs). Neither comes from a worker's heartbeat.
 
 ---
@@ -955,10 +955,11 @@ closed) rather than tasks handed out so far, as do the job pages (a leave job's
 #### Live updates
 
 Each job with at least one dashboard subscriber gets a broadcast channel, created
-on first subscribe and dropped when the last receiver goes away, so an idle
-server holds no per-job state. The submission path checks for a subscriber before
-building a payload at all. `GET /api/jobs/:id/stream` sends the current stats
-immediately as its first event, then an event per accepted result, all named
+on first subscribe and dropped when a later publish or subscriber check finds
+nobody listening (a few kilobytes a job until then). The submission path checks
+for a subscriber before building a payload at all. `GET /api/jobs/:id/stream`
+sends the current stats immediately as its first event, then pushes as results
+land, at most one per `JOB_STATS_CACHE_SECONDS`, all named
 `stats`, with a 15-second keep-alive so an idle connection survives an
 intermediary's timeout. The route is public, and each open stream holds a
 connection, a task and a receiver, so at most 2,000 are open at once across
@@ -976,9 +977,12 @@ collapses into the one payload that follows it, which is both fewer reads and
 strictly fresher data than a queue of payloads would deliver. What the page
 loses is a guaranteed event per result, which it was not counting: every event
 carries the whole payload rather than a delta, so a merged one says everything
-the ones it replaced would have. Rounds are also spaced at least a second apart:
-on a busy job another round is always pending, and without the gap the payload
-was rebuilt back to back for as long as a dashboard stayed open.
+the ones it replaced would have. Every build is followed by a cool-down of
+`JOB_STATS_CACHE_SECONDS` (10 by default, never under a second) with the push
+still in flight, so a job's pushes are at most one per interval however its
+submissions arrive; an admin's change, a job's completion or a leave generation closing cuts the cool-down short. Paused only
+after a build during which another was asked for, a job whose submissions came
+slower than a build was rebuilt for each (thirty-second audit).
 
 ---
 
@@ -1136,7 +1140,7 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 | Query | Runs | Time |
 |---|---|---|
 | `game_pair_stats` over 400,000 pairs | every paired submission and SSE push | 54 ms |
-| `game_stats` over 400,000 games | every game submission and SSE push | 50 ms |
+| `game_stats` over 400,000 games | every game submission and SSE push | 50 ms (the thirty-second audit measured 340–620 ms at 400,000 *result rows*, a batch of one game each, the form's default; the sort spills at the default `work_mem`) |
 | `list_jobs`, 42 game jobs — **as it was**, re-deriving per-task game totals | every job-list page view | **2,188 ms** |
 | `list_jobs` task counts — **as they were**, two `COUNT(*)`s over `tasks` per job | every job-list page view | linear in every listed job's task history |
 | Contributor lists — **as they were**, grouping every completed claim in the database | every `/api/users` and `/api/workers` page view | 93 ms at 44,000 claims, linear from there |
@@ -1157,7 +1161,8 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 What the numbers settled:
 
 - **The SPRT path still reads the rows, but not on every submission.** About
-  50 ms at 400,000 units, and linear in the job's history from there. The
+  50 ms at 400,000 units in large batches, but 340–620 ms at 400,000 result rows
+  (batches of one), and linear in the job's history from there. The
   stopping rule keeps reading `game_results` rather than a counter — it cannot
   be wrong because a counter drifted — and is debounced to every eighth
   submission instead, which is late rather than wrong. See [Statistical Result
@@ -1392,7 +1397,7 @@ There is deliberately no `DATA_PATH`. The server reads letter distributions out
 of the `input_data` row a job pins, so there is no filesystem copy to drift from
 what the workers are checked against.
 
-**Live dashboard updates**: Each job detail page subscribes to `GET /api/jobs/:id/stream` (SSE). The server pushes an event after accepted task results for that job — coalesced, and at most one a second — carrying the updated aggregate stats. The client merges the event into its local state without a full page reload. Axum supports SSE natively via `axum::response::sse`.
+**Live dashboard updates**: Each job detail page subscribes to `GET /api/jobs/:id/stream` (SSE). The server pushes an event after accepted task results for that job — coalesced, and at most one per `JOB_STATS_CACHE_SECONDS` — carrying the updated aggregate stats. The client merges the event into its local state without a full page reload. Axum supports SSE natively via `axum::response::sse`.
 
 ---
 
@@ -2379,8 +2384,9 @@ The mirror of the claim, and the only place results enter the system.
    the first submission to find no push running owns one, later ones only mark
    it to go round again when it finishes, so a busy job builds one payload at a
    time instead of one per submission, and the pushes stay ordered because one
-   task issues them, at most once a second. The dashboard can therefore lag up to
-   a second behind under load, which is the intended trade.
+   task issues them, at most once per `JOB_STATS_CACHE_SECONDS` (10 by default).
+   The dashboard can therefore lag up to that interval behind, which is the
+   intended trade; an admin's change is pushed at once.
 
 #### What a submission has to satisfy
 
@@ -2698,7 +2704,7 @@ So the transfer is a CSV instead: `generation_klv` streams the generation's roug
 The generation-0 zeroed KLV is `magpie createdata klv`, which builds exactly that from the letter distribution alone. MAGPIE_DEPENDENCY.md proposed a `convert zero2klv` for it; `createdata klv` already is it, through the same `klv_create_empty`, and one spelling is better than two.
 
 
-**Dashboard progress**: two kinds of figure, and the page says which is which. *Live*, on every accepted result through the per-job SSE stream: tasks completed and games played in the in-progress generation, from the counters the submit transaction bumps. *As of the last merge*, shown with its time: racks at target and the rack with the fewest occurrences, from the summary each merge writes. Both are one row read (`leave_generation_progress`); counted from `leave_rack_progress` on read, as they were, the rack figures were a pass over 3.2 million rows on every detail view and every live push (210 ms measured). No heartbeat payload is needed for either. An admin who wants the rack figures current can merge on demand (`POST /api/admin/jobs/:id/merge-progress`, "Merge progress now" on the admin job page).
+**Dashboard progress**: two kinds of figure, and the page says which is which. *Live*, pushed as results land through the per-job SSE stream: tasks completed and games played in the in-progress generation, from the counters the submit transaction bumps. *As of the last merge*, shown with its time: racks at target and the rack with the fewest occurrences, from the summary each merge writes. Both are one row read (`leave_generation_progress`); counted from `leave_rack_progress` on read, as they were, the rack figures were a pass over 3.2 million rows on every detail view and every live push (210 ms measured). No heartbeat payload is needed for either. An admin who wants the rack figures current can merge on demand (`POST /api/admin/jobs/:id/merge-progress`, "Merge progress now" on the admin job page).
 
 #### What a merge costs
 
@@ -4707,10 +4713,10 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/admin/player-configs` | List all player configurations. |
-| `POST` | `/api/admin/player-configs` | Create a new player configuration. Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), more than 200,000 plays generated (MAGPIE allocates every one up front, and a static player ranking every opening play needs up to some 64,000) or 32,767 recorded (a stored rank is a `SMALLINT`), a margin past MAGPIE's largest equity (2,147,483.645), as well as non-positive counts. |
+| `POST` | `/api/admin/player-configs` | Create a new player configuration. Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), more than 200,000 plays generated (MAGPIE allocates every one up front, and a static player ranking every opening play needs up to some 64,000) or 32,767 recorded (a stored rank is a `SMALLINT`), a margin that is negative, not finite or past MAGPIE's largest equity (2,147,483.645), as well as non-positive counts. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
-| `POST` | `/api/admin/jobs` | Create a new job. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (every MAGPIE build the fleet runs has `BOARD_DIM` 15, so every worker would fail every task) and an SPRT `alpha` or `beta` below 0.000001 (an infinite bound). |
+| `POST` | `/api/admin/jobs` | Create a new job. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (every MAGPIE build the fleet runs has `BOARD_DIM` 15, so every worker would fail every task) and an SPRT `alpha` below 0.000001 (an infinite upper bound; `beta` has the same floor for symmetry). |
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. |
@@ -4756,8 +4762,10 @@ foreign keys points at the same table, so the database cannot express it and it
 is validated wherever a role column is written. Configs are immutable: there is
 no update endpoint. Deletion is refused with `409` while any job, rating pool,
 rating history or clone references the config. Numbers are range-checked — play,
-iteration and recorded counts at least 1, `stopping_pct` strictly between 0 and
-100, margins and weights finite and non-negative — and a config with any
+iteration and recorded counts at least 1, `num_plays` at most 200,000 and
+`num_plays_recorded` at most 32,767, plies at most 25 (10 recorded),
+`stopping_pct` strictly between 0 and 100, margins and weights finite and
+non-negative and margins at most MAGPIE's largest equity, 2,147,483.645 — and a config with any
 simulation setting must simulate at least one ply, because MAGPIE decides whether
 a player simulates on plies alone: a "simmer" without plies would play
 statically on every worker. A simmer must also set `max_iterations`, and
@@ -4813,7 +4821,8 @@ Beyond role matching, creation enforces seven rules the schema cannot express:
   `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
   at most 10,000); `rack_size` 1–7; `max_*` at least 1 and
   `min_*` at least 0; `sprt_alpha` and `sprt_beta` at least 0.000001 and below 1
-  with a sum below 1 (a subnormal one made a bound infinite); `elo_low` below `elo_high`; `min_magpie_version`, when given, a
+  with a sum below 1 (a subnormal alpha made the upper bound infinite; beta
+  has the same floor for symmetry); `elo_low` below `elo_high`; `min_magpie_version`, when given, a
   version (`major.minor[.patch]`, digits only — read loosely, a typo was 0.0.0,
   the most permissive floor). Every violation is reported at once as
   a field error. A zero batch would make every claim regenerate the seed the last
@@ -4854,7 +4863,8 @@ The response is `{ job }`. Creation writes no rows up front for any job type: no
 tasks, and no leave-generation rack universe, which the first claim seeds as it
 does every generation's.
 
-Job creation also writes generation 1's zeroed KLV, **after** the transaction
+Job creation also writes the zeroed KLV that generation 1 starts from (stored as
+generation 0), **after** the transaction
 commits rather than inside it: it is a multi-megabyte build and an object-store
 write, and holding a transaction open across it would be wrong.
 
@@ -4909,7 +4919,7 @@ do not exist.
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated; `?status=active` (or `inactive`, `completed`) lists only those, with a matching total. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics. |
 | `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
-| `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one a second. |
+| `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated), paginated. |
@@ -5970,7 +5980,8 @@ CREATE TABLE tasks (
     job_id               UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     -- The seed the task's games are played from. Every job type plays games,
     -- so every task has one, stated on its request: games and game pairs seed
-    -- their batch from it and step by one per game; an opening-rack task's is
+    -- their batch from it (MAGPIE draws each game's seed from a stream seeded
+    -- with it); an opening-rack task's is
     -- the index of its first rack in the job's rack space, and rack i of the
     -- batch is analysed from seed + i; a leave-generation task's is drawn
     -- when the task is created. Stored as signed int64; interpreted as uint64
@@ -6900,6 +6911,9 @@ says so in its implemented option, rather than being removed.
   tasks that outlast their lease rather than fail, and past 2^30 pairs a batch's
   games overflow the dispatched count so every result is refused (reasoned, not
   run).
+  And the checks run at creation only: a job or player config written before a
+  ceiling tightens (none exists before launch) is not re-checked when it is
+  reactivated, or when a new job names the config.
 - **Options considered:** let a job past its cap complete when its only
   unfinished tasks have failed more than N times; deactivate, or flag, a job
   after N `task_failed` declines with no accepted result.
@@ -7031,14 +7045,23 @@ says so in its implemented option, rather than being removed.
 **KL-10. The finish check runs before the worker is answered.**
 - **Context:** The check is not display. It decides whether the job goes on
   dispatching.
-- **Problem:** One submission in eight pays an aggregate over the job's results,
-  tens of milliseconds at 400,000 units; the rest pay an `EXISTS`. The worker
-  waits for it.
-- **Options considered:** move it off the worker's wait (eleventh audit).
-- **Option implemented:** Kept inline.
-- **Justification:** It gates dispatch, a correctness input. Moving it gains
-  milliseconds per claim, and would need per-job coalescing of its own to avoid
-  stacking aggregates.
+- **Problem:** One submission in eight pays an aggregate over the job's results;
+  the rest pay an `EXISTS`. The worker waits for it, holding a main-pool
+  connection. It is a sort of every result row: some 0.4 s (340–620 ms) at
+  400,000 rows, a job of 400,000 games at the form's default batch of one,
+  where this entry said tens of milliseconds (thirty-second audit); half of
+  every live stats build is the same read.
+- **Options considered:** move it off the worker's wait (eleventh audit);
+  per-job win/loss/tie and pentanomial running totals kept in the submit
+  transaction beside `jobs.games_completed`, for SPRT and the page, with the
+  full read as a periodic cross-check; a finish-check stride that grows with
+  the job; a leaner form of the first-result-per-task read (about 200–280 ms).
+- **Option implemented:** Kept inline, and unchanged.
+- **Justification:** It gates dispatch, a correctness input, and a counter the
+  stopping rule trusts is what the read was kept to avoid; running totals are a
+  schema change and a write per submission. Worth taking when a job of
+  hundreds of thousands of one-game batches is run; larger batches make the
+  read proportionally smaller.
 
 **KL-11. A claim whose response is lost is a second claim when it is retried.**
 - **Context:** The claim commits before the response is written, and MAGPIE
@@ -7779,7 +7802,15 @@ says so in its implemented option, rather than being removed.
   - `GET /api/workers` answers a page past the end without its query now, but
     a page just short of the end still reads `offset + limit` rows of each
     arm's index: about 0.3 s at 300,000 contributing anonymous identities.
+  - A live push overtaken by a newer page build (not an admin action) builds
+    again, up to three times, rather than sending the newer payload the cache
+    holds, and a page view in the gap between the cache's expiry and the next
+    push builds one of its own (so a watched and visited job can cost two
+    builds an interval; not measured); and when a job's stream ends for good (a `404` after a delete) its
+    page goes on showing the last stats with nothing to say the job is gone.
 - **Options considered:** label a force-completed job's SPRT panel as such;
+  publish the cached payload when a push is overtaken; an `onGone` callback
+  that tells the page;
   drop the per-task request tables' foreign keys to player configs (the job's
   config already pins them), or index them;
   re-check the purge counter inside the seeding and the transition's upload;
@@ -7903,9 +7934,14 @@ says so in its implemented option, rather than being removed.
   - No page shows a player config in full: the list leaves out `num_plays`,
     `num_plays_recorded` and the margins, and `GET /player-configs/:id` has no
     page. A duplicate config name gets a generic `409` with no field error.
-    The job form defaults to the newest layout, which a release that changes
-    only `standard21` would make one creation refuses; it lists every layout.
+    The job form lists every layout and defaults to the newest, so a release
+    that changes only `standard21` would make its default a layout creation
+    refuses.
     Creating a config writes no audit row, where creating a job or a pool does.
+  - The job and player-config forms show a server refusal as one line at the
+    foot of the form, by API field name (`layout_id`, `sprt_alpha`), not at the
+    input under its label; and job creation checks the layout only once the
+    other settings pass, so an admin can fix one error and meet a second.
   - A leave job whose generation-0 KLV fails to build after the job row
     commits is answered `500`, but exists; the form stays, and a second click
     makes a second job.
@@ -8241,7 +8277,7 @@ says so in its implemented option, rather than being removed.
   every task of the job to the day's completions (hundreds of milliseconds at a
   million tasks, growing with history, on every list view); the submission that
   stores a result now keeps the time, at most once a minute.
-- **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least `JOB_STATS_CACHE_SECONDS` (10) apart, the page and new subscribers reading the last push's payload. What remains is the payload's cost itself: its contributor list groups every completed claim of the job (and, `task_claims` having no `job_id`, the planner scans the fleet's claims for it), and its game statistics read every result — hundreds of milliseconds at a few hundred thousand tasks, growing with history. *Open (fifteenth audit):* a per-job contributor running total (`job_contributors`, upserted in the submit transaction like `users.tasks_completed`, given back by purge and delete, recounted by RUNBOOK §2.3b) would make the list an index read; it is a schema change and one more write per submission, left for a decision.
+- **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least `JOB_STATS_CACHE_SECONDS` (10) apart — by a cool-down after every build since the thirty-second audit, before which it held only under steady load — the page and new subscribers reading the last push's payload. What remains is the payload's cost itself: its contributor list groups every completed claim of the job (and, `task_claims` having no `job_id`, the planner scans the fleet's claims for it), and its game statistics read every result — hundreds of milliseconds at a few hundred thousand tasks, growing with history. *Open (fifteenth audit):* a per-job contributor running total (`job_contributors`, upserted in the submit transaction like `users.tasks_completed`, given back by purge and delete, recounted by RUNBOOK §2.3b) would make the list an index read; it is a schema change and one more write per submission, left for a decision.
 
 ---
 

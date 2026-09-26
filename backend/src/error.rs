@@ -82,6 +82,15 @@ impl AppError {
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", message)
     }
+    /// A blocking task that did not finish — it panicked, or the runtime is
+    /// shutting down. The join error, a panic's message included, is logged
+    /// and not sent: only a database error's text is scrubbed from a `500`
+    /// otherwise.
+    pub fn task_failed(what: &str, err: tokio::task::JoinError) -> Self {
+        tracing::error!(error = %err, "{what} did not finish");
+        Self::internal(format!("{what} did not finish"))
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }

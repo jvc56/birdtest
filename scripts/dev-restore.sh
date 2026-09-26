@@ -10,13 +10,20 @@
 # then resets. A production dump needs it: it carries real email addresses and
 # password hashes, and the whole point of restoring it locally is the shape of
 # the data, not those (PLAN.md, "Local development"). Set SCRUB=0 to restore
-# your own snapshot as it was.
+# your own snapshot as it was; any value but 0 or 1 is refused.
 
 set -Eeuo pipefail
 
 SRC="${1:?usage: dev-restore.sh <snapshot-dir-or-dump>}"
 COMPOSE="${COMPOSE:-docker compose}"
 SCRUB="${SCRUB:-1}"
+# Only 0 turns the scrub off, and only 0 or 1 is taken: `SCRUB=true` or `yes`
+# used to mean "off" too, restoring a production dump's real addresses and
+# password hashes onto a laptop with no word. Refused before anything changes.
+if [[ "${SCRUB}" != 0 && "${SCRUB}" != 1 ]]; then
+  echo "SCRUB must be 0 (keep the data as it is) or 1 (scrub it, the default), not '${SCRUB}'" >&2
+  exit 2
+fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Nothing may hold a connection while the schema is replaced.
@@ -56,7 +63,7 @@ if [[ -d "${SRC}/artifacts" ]]; then
     '
 fi
 
-if [[ "${SCRUB}" == "1" ]]; then
+if [[ "${SCRUB}" != 0 ]]; then
   echo "scrubbing"
   ${COMPOSE} exec -T postgres psql -U birdtest -d birdtest -q -v ON_ERROR_STOP=1 \
     < "${SCRIPT_DIR}/scrub.sql"

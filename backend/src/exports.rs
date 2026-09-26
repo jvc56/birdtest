@@ -265,7 +265,8 @@ async fn run(state: AppState, job: Job, export_id: Uuid) {
     }
     let result = match outcome {
         Ok(Ok(result)) => result,
-        Ok(Err(panicked)) => Err(AppError::internal(format!("the export task failed: {panicked}"))),
+        // Logged, not stored: the row's error is shown on the admin page.
+        Ok(Err(panicked)) => Err(AppError::task_failed("the export", panicked)),
         Err(_) => Err(AppError::internal("the export did not finish within its time limit")),
     };
     match result {
@@ -339,7 +340,7 @@ async fn off_the_executor<T: Send + 'static>(
 ) -> AppResult<T> {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|e| AppError::internal(format!("export compression task failed: {e}")))?
+        .map_err(|e| AppError::task_failed("compressing an export", e))?
 }
 
 /// Stream one query's rows out as gzipped NDJSON, straight into a multipart

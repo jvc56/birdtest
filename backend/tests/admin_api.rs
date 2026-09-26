@@ -1126,7 +1126,7 @@ async fn a_config_or_job_no_worker_can_run_is_refused() {
     // core dump) or that a stored rank cannot hold.
     for (field, value) in [
         ("movegen_margin", json!(2_147_483.646)),
-        ("inference_margin", json!(3_000_000.0)),
+        ("inference_margin", json!(2_147_483.646)),
         ("num_plays", json!(200_001)),
         ("num_plays", json!(2_000_000_000)),
         ("num_plays_recorded", json!(32_768)),
@@ -1171,23 +1171,34 @@ async fn a_config_or_job_no_worker_can_run_is_refused() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
-    let job = |layout_id: uuid::Uuid, alpha: f64| {
+    let job_with = |layout_id: uuid::Uuid, alpha: f64, beta: f64| {
         json!({
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout_id,
             "player1_config_id": player["id"], "player2_config_id": player["id"],
-            "min_games": 1, "max_games": 10, "sprt_alpha": alpha,
+            "min_games": 1, "max_games": 10, "sprt_alpha": alpha, "sprt_beta": beta,
         })
     };
+    let job = |layout_id: uuid::Uuid, alpha: f64| job_with(layout_id, alpha, 0.05);
     let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(super21, 0.05))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["fields"][0]["field"], "layout_id", "{body}");
 
     // A subnormal alpha made the SPRT's upper bound infinite, which the job
-    // page could not print.
-    let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(layout, 1e-309))).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["fields"][0]["field"], "sprt_alpha", "{body}");
+    // page could not print; beta keeps the same floor for symmetry.
+    for (alpha, beta, field) in [
+        (1e-309, 0.05, "sprt_alpha"),
+        (0.000_000_9, 0.05, "sprt_alpha"),
+        (0.05, 0.000_000_9, "sprt_beta"),
+    ] {
+        let (status, body) =
+            send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, alpha, beta))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{alpha} {beta}: {body}");
+        assert_eq!(body["fields"][0]["field"], field, "{body}");
+    }
+    let (status, body) =
+        send(&app, post_json("/api/admin/jobs", &headers, job_with(layout, 0.000_001, 0.000_001))).await;
+    assert_eq!(status, StatusCode::CREATED, "at the floor: {body}");
 
     let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(layout, 0.05))).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");

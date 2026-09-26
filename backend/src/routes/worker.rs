@@ -993,9 +993,9 @@ pub(crate) async fn finish_idle_job(state: &AppState, job_id: Uuid) -> AppResult
     }
 }
 
-/// Build and publish the job's stats, repeating while submissions asked for
-/// another round while the last was building. Owned by one task per job, so
-/// pushes never overtake each other.
+/// Build and publish the job's stats, then wait out the interval, and go round
+/// again if anything asked meanwhile. Owned by one task per job, so pushes never
+/// overtake each other, and at most one build per interval per job.
 async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
     loop {
         // Reloaded each round rather than carried in: the status may have
@@ -1009,13 +1009,23 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // an admin action (or a newer build) superseded while it ran is not
         // sent: it would put the pre-action status back on every open page;
         // it is built again instead, a bounded number of times.
+        let mut superseded = false;
         for _ in 0..3 {
             match jobstats::refresh_payload(&state.read_pool, job_id, state.cfg.stats_cache).await {
                 Ok(Some(payload)) => {
                     state.sse.publish(job_id, payload);
                     break;
                 }
-                Ok(None) => continue,
+                Ok(None) => {
+                    superseded = true;
+                    continue;
+                }
+                // Deleted since the push was asked for: nothing to send, and
+                // nothing wrong -- and nothing more to push, ever.
+                Err(err) if err.status == axum::http::StatusCode::NOT_FOUND => {
+                    state.sse.abandon_push(job_id);
+                    return;
+                }
                 Err(err) => {
                     tracing::warn!(
                         job_id = %job_id, error = %err.message, "building live job stats failed"
@@ -1024,16 +1034,29 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
                 }
             }
         }
+        // The cool-down comes after every build, with the push still in
+        // flight, so a submission meanwhile only marks it to go round again.
+        // Paused only when a submission had arrived during the build, a job
+        // whose submissions came slower than a build was rebuilt from scratch
+        // for each one -- six full builds in two seconds under a ten-second
+        // interval (thirty-second audit). An admin's change cuts the wait
+        // short: its pages should not show the job active for ten seconds more.
+        let interval = MIN_STATS_PUSH_INTERVAL.max(state.cfg.stats_cache);
+        if let Some(urgent) = state.sse.urgent(job_id) {
+            // A build superseded by an admin's change was built again, after
+            // the change: the wake-up that change left is spent, and would
+            // otherwise skip this cool-down for an identical push.
+            if superseded {
+                let _ = futures::FutureExt::now_or_never(urgent.notified());
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(interval) => {}
+                _ = urgent.notified() => {}
+            }
+        }
         if !state.sse.end_push(job_id) {
             return;
         }
-        // Another round was asked for while this one built. On a busy job that
-        // is every round, so without a pause the loop rebuilt the payload back
-        // to back -- several aggregates over the job's history, one after
-        // another, for as long as a dashboard stayed open, on a pool of twenty
-        // connections the claim and submit paths share. Submissions arriving
-        // during the pause still coalesce into the one round that follows it.
-        tokio::time::sleep(MIN_STATS_PUSH_INTERVAL.max(state.cfg.stats_cache)).await;
     }
 }
 
@@ -1043,7 +1066,7 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
 /// reloaded -- no submission would come to push the change.
 pub(crate) fn push_after_change(state: &AppState, job_id: Uuid) {
     jobstats::forget(job_id);
-    if state.sse.has_subscribers(job_id) && state.sse.begin_push(job_id) {
+    if state.sse.has_subscribers(job_id) && state.sse.begin_urgent_push(job_id) {
         let state = state.clone();
         tokio::spawn(async move { push_stats_until_idle(&state, job_id).await });
     }

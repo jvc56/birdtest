@@ -156,7 +156,7 @@
             {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)} within
             [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
             SPRT is not acted on until {stats.games.min_units.toLocaleString()}
-            {stats.games.unit}s are complete.
+            {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
           </p>
         {/if}
         <OutcomeChart
@@ -275,7 +275,7 @@
           <span class="tabular-nums">{lg.tasks_completed.toLocaleString()}</span> tasks and
           <span class="tabular-nums">{lg.games_played.toLocaleString()}</span> games played this
           generation
-          <span class="text-muted-foreground">— live, on every accepted result.</span>
+          <span class="text-muted-foreground">— live.</span>
         </p>
         <ProgressBar
           value={lg.racks_at_target}

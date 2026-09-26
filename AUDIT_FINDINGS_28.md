@@ -34,7 +34,14 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   validation):** 0 high and 2 medium from the reviewers (E-1 and E-5 could not
   pass — tier 5 now run natively, 11 of 11; job creation accepted jobs no
   worker can run), both fixed; the adversarial check found 1 medium (the play
-  cap too low), fixed. KL-2 and KL-60 updated. The loop continues.
+  cap too low), fixed. KL-2, KL-60, KL-68 and KL-80 updated. The loop
+  continues.
+- **Pass 4 (follow-up: pass 3's diff, and the live stats stream and cache):**
+  0 high and 4 medium from the reviewers (live pushes not spaced; the finish
+  check's read seven times its documented cost; the job form refusing valid
+  SPRT settings; `dev-restore.sh` skipping the scrub on `SCRUB=yes`), all fixed
+  and verified; the adversarial check found no high or medium. KL-2, KL-10,
+  KL-60 and KL-78 updated. The loop continues.
 
 ---
 
@@ -54,7 +61,7 @@ Plus the carried open medium KL-74, taken up by the run itself.
 low; auth, statistics and frontend none, 9 low, 1 unconfirmed; storage,
 performance and docs 1 medium, 4 low, 1 unconfirmed; deployment, CI and
 security none, 4 low, 1 unconfirmed; MAGPIE 1 medium, 3 low, 1 unconfirmed),
-plus KL-74 carried. All fixed and verified; the adversarial checks are 1.6.
+plus KL-74 carried. All fixed and verified; the adversarial checks are 1.5.
 
 ### 1.1 Medium — a job whose last results landed while it was inactive never completed (dispatch reviewer)
 
@@ -178,7 +185,7 @@ re-weighted once it reached its third correction.
   centre. Its costs are KL-79.
 - Runs record `method = 'bradley_terry_newton'` (schema default too).
 
-**The versions the adversarial checks broke** (1.6 has the detail):
+**The versions the adversarial checks broke** (1.5 has the detail):
 1. Two draws per config against the anchor, with an unbounded Newton step:
    clean sweeps contradicting a pool threw one config 18,000 Elo into
    saturation (medium); fixed by the step bound and damping.
@@ -230,7 +237,7 @@ against the version they broke and pass, as do the 12 fit tests that predate
 the run; the analytic `U-STATS-4` errors
 still hold; the ratings and public API integration tests pass.
 
-### 1.6 Adversarial checks of the pass's fixes
+### 1.5 Adversarial checks of the pass's fixes
 
 Two reviewers who did not write the fixes, each given only them.
 
@@ -264,7 +271,7 @@ found while testing:** two worker-route tests used values between the old and
 new plausibility caps, and a rate-limit test assumed its 150 requests finished
 inside a refill (it failed at load average 13): both corrected.
 
-### 1.7 Tests
+### 1.6 Tests
 
 - `cargo clippy --all-targets -- -D warnings`: clean.
 - Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included
@@ -360,8 +367,9 @@ make. Recorded in KL-80.
 
 **Recorded:** KL-65 (the drill's record), new KL-80 (backup timing excludes
 the upload, the StopTask case above, the check's leftover bucket, two
-unreproduced suspicions), and the frontend's remaining lows in KL-75 and
-KL-76 below.
+unreproduced suspicions), and the frontend's remaining lows in KL-75 (the
+history's jump at a pool's first Newton fit) and KL-76 (a clamped error bar
+has no mark).
 
 ### 2.4 Adversarial check of the pass's fixes
 
@@ -459,8 +467,10 @@ created, 201) and passes, as does a unit test of the layout check on the
 cases where MAGPIE's loader and a row count disagreed (CRLF, blank lines,
 trailing whitespace, widths, squares, start squares). A confirmation round
 compared the check with the real binary on 43 files: it never accepts what
-MAGPIE refuses, and is stricter only on six parser quirks (a coordinate past
-`int`, a NUL, a byte above 0x7f, which MAGPIE reads out of bounds — KL-68).
+MAGPIE refuses, and differs only on six files MAGPIE accepts through parser
+quirks (a coordinate past `int`, a whitespace-only or `\v`-led coordinate, a
+NUL after the last row, a byte above 0x7f, which MAGPIE reads out of bounds —
+KL-68).
 The test helper's layout is now the real `standard15.txt`; the full suite
 passes.
 KL-2 records the deeper gap: nothing acts on a job every worker fails.
@@ -480,7 +490,9 @@ CPU/memory pairs, the builder's ephemeral storage (21–200) and RDS's
 
 **Recorded:** KL-2 (a job every worker fails), KL-60 (no page shows a config
 in full; a duplicate name's generic 409; no audit row for a new config; a leave
-job created twice when its KLV build fails).
+job created twice when its KLV build fails); KL-68 (MAGPIE's out-of-bounds read
+of a layout byte above 0x7f) and KL-80 (the round trip's counts, after the
+dump) corrected.
 
 ### 3.4 Adversarial check of the pass's fixes
 
@@ -521,4 +533,135 @@ accepted by the new check.
 - **Tier 5, natively (no image builds): 11 of 11**, twice by the frontend
   reviewer with the E-1 and E-5 fixes and once by the adversarial check on the
   whole working tree.
+- MAGPIE unchanged.
+
+---
+
+## Pass 4 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`9753314..7e75361`; MAGPIE
+unchanged), one reviewer per part it touches: backend; frontend and the e2e
+specs; docs and procedures; infra. Plus one area not examined in recent
+passes: **the live stats stream and the stats cache** — `sse.rs`, the job
+stream route and its caps, `push_stats_until_idle` and its coalescing, the
+stats payload cache (`JOB_STATS_CACHE_SECONDS`), `jobstats::compute`'s cost,
+and the pages' `EventSource` handling and reconnection.
+
+**Findings: 0 high, 4 medium** from the five reviewers (backend none, 4 low;
+frontend and e2e 1 medium, 6 low — tier 5 natively 11 of 11; docs and
+procedures 1 medium, 11 low; infra none, 4 low; the live stats stream 2
+medium, 6 low, 2 unconfirmed). All fixed and verified; the adversarial check
+is 4.6.
+
+### 4.1 Medium — live pushes were not spaced (live-stats reviewer)
+
+**Code updated.** The push loop paused only after a build during which another
+submission had asked for one; when none had, it forgot the job, and the next
+submission started a fresh, uncached build at once. So a job whose submissions
+came slower than one build was rebuilt and pushed for each — reproduced, six
+full builds in 2.1 s under a ten-second `JOB_STATS_CACHE_SECONDS` — where PLAN
+said pushes are "spaced at least `JOB_STATS_CACHE_SECONDS` apart" (and, in
+other places, once a second). At 400,000 results a build is 0.7–1 s. **Fix:**
+every build is followed by the cool-down with the push still in flight, so a
+submission meanwhile only marks it to go round again; an admin's change (a
+per-job `Notify`) cuts the cool-down short, so a deactivation or completion
+still reaches the page at once. **Verified:**
+`live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not`
+(`A-PUBLIC-6d`) fails with the loop as committed and passes, including a
+mid-interval deactivation pushed within seconds; `an_urgent_push_cuts_the_cool_down_short`;
+PLAN now says one rule.
+
+### 4.2 Medium — PLAN's cost for the finish check's read understated it some sevenfold (live-stats reviewer)
+
+**PLAN updated.** `game_stats` at 400,000 result rows — a job of 400,000 games
+at the form's default batch of one — measured 340–620 ms warm (its sort spills
+at the default `work_mem`), where PLAN's table said 50 ms and KL-10 "tens of
+milliseconds"; KL-10's justification ("moving it gains milliseconds") rested
+on that. The read gates dispatch, so rewriting it was not taken lightly within
+a pass: PLAN's table and summary give both figures, and KL-10 now records the
+real cost and the options (running win/loss/tie and pentanomial totals beside
+`games_completed`, a stride that grows with the job, a leaner query at about
+200–280 ms), open.
+
+### 4.3 Medium — the job form refused SPRT settings the server accepts (frontend reviewer)
+
+**Code updated.** α and β took only multiples of 0.01 and the Elo bounds only
+whole numbers (the inputs' `step`), so the browser blocked, with no request
+and no page message, α = 0.025 or the whole [0.000001, 0.01) range pass 3
+documented, and bounds such as [0.5, 2.5]. Reproduced against the native
+tier-5 stack. **Fix:** `step="any"` with the server's bounds on α and β, and on
+the Elo bounds; with it, `min_*` may be 0, the player-config form's 0.1 steps
+are `any`, both forms clear a server error on the next edit (a submit the
+browser blocked left the previous one showing), and "until 1 games" reads
+right. Checked by the adversarial check (4.6) driving the forms.
+
+### 4.4 Medium — `dev-restore.sh` scrubbed only when `SCRUB` was exactly 1 (docs reviewer)
+
+**Code updated.** README (pass 3) and the header said every restore is scrubbed
+unless `SCRUB=0`, but `SCRUB=true`, `yes` or `TRUE` turned the scrub off —
+reproduced with a stub `COMPOSE`: no `scrub.sql` — restoring a production
+dump's real addresses and password hashes onto a laptop. **Fix:** only `0` or
+`1` is taken, anything else refused before any change, and the scrub runs
+unless `0`. Re-run with the stub: unset and `1` scrub, `0` does not, `true`,
+`yes` and `TRUE` exit 2 with no compose call.
+
+### 4.5 Low findings
+
+**Fixed:** no `spawn_blocking` join error's text (a panic's message) reaches a
+`500` body any more (`AppError::task_failed`, six sites); a rating pool on a
+board no job can use is refused; the layout test's comment; KL-2 (checks run
+at creation only); Fargate CPU sizes validated, the memory message gives the
+whole table, and `db_allocated_storage` stops at 59,578 GiB (past it RDS's
+ceiling is under a tenth above the allocation) — a mock `terraform test` of
+11 runs passes; RUNBOOK §5's ceiling wording; a push after a delete ends
+quietly; `sse.rs`'s and PLAN's "an idle server holds no per-job state"; the job
+page's "live, on every accepted result"; TESTING's `A-ADMIN-21` claims now
+tested (β, the 0.000001 boundary, the inference margin); PLAN's schema seed
+comment, the player-config paragraph and API row, the generation-0 KLV wording
+in PLAN and `create_job`, KL-60's sentence; README's scrub list; the findings
+file's section numbering, KL lists and a dangling pointer. **Recorded:** KL-60
+(errors by API name at the foot of the form; the layout checked after the other
+rules), KL-78 (a push overtaken by a page build rebuilds; a deleted job's page
+says nothing). The mock `terraform test` guards `outputs.tf`'s DKIM index with
+`try()` in its own copy — the committed file cannot be mocked as it stands,
+which matters only if a `terraform test` is ever put in CI.
+
+### 4.6 Adversarial check of the pass's fixes
+
+**No high or medium.** **Held:** the spacing test fails against the committed
+loop (six pushes in 2.6 s) and passes; on a native backend with a 30-second
+interval and four fake workers, pushes came exactly 30 s apart; a SIGTERM with
+a loop asleep in its cool-down exits in 0.1 s; no lost wake-up (a `Notify`
+permit waits for the next `notified()`), no second loop per job, completion,
+the scheduler's `JobFinished` and a leave generation closing all push urgently;
+`dev-restore.sh` through 14 values with a stub and for real on an isolated
+stack (`yes` refused, the database untouched; `0` kept real addresses and a
+key; unset and `1` scrubbed); the forms, driven with Playwright, submit α =
+0.025, α = β = 0.0000015, Elo 0.5→2.5 and −0.5→2.5, `min` 0, and margins of
+2.55; the Terraform validations in a 12-run mock test; TESTING's counts; and
+**tier 5 natively on the working tree: 11 of 11** (twice). **Lows fixed:** a
+job deleted with a round pending left its push entry for good (now abandoned);
+an admin's change during a build left a wake-up that skipped the next
+cool-down for an identical push (spent after the rebuild); two more joins let
+a panic's text reach an admin (the purge/delete operation, an export's stored
+error); the refit's failure log names its pool again; an edit cleared a
+failure to load the form's choices as well as a submit's error (only the
+submit's now); "live, at most every few seconds"; the remaining "on every
+accepted result" and "one a second" in PLAN, `public.rs` and `sse.ts`; a stray
+comma in RUNBOOK §5. **Unconfirmed, recorded under KL-78:** a page view in the
+gap between the cache's expiry and the next push can cost a second build per
+interval.
+
+### 4.7 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **565 of 565**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 117 of 117.
+- `terraform fmt -check -recursive`, `validate`, and a mock `terraform test` of
+  the new validations: clean.
+- `scripts/dev-restore.sh` through its values with a stub `COMPOSE`, and for
+  real on an isolated stack (adversarial check).
+- **Tier 5, natively: 11 of 11** — on the committed pass-3 tree by the frontend
+  reviewer, and on the working tree by the adversarial check.
 - MAGPIE unchanged.

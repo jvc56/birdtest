@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 202 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (3), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1 Unit | 204 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
 | 1F Frontend unit | 117 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 150 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 182 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (33), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (12), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 183 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (33), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (13), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -2002,8 +2002,9 @@ below.
   .646 refused, either margin), `num_plays` past 200,000, `num_plays_recorded`
   past 32,767, and a board layout MAGPIE's loader would refuse — every worker
   failed every task of such a job, and `magpie contribute` stops after five
-  failures in a row; and an SPRT `alpha` or `beta` below 0.000001, whose
-  infinite bound the job page could not print. The layout check never accepts
+  failures in a row; and an SPRT `alpha` below 0.000001, whose infinite upper
+  bound the job page could not print (and `beta`, for symmetry), each checked
+  just below the floor and at it. The layout check never accepts
   what MAGPIE's loader refuses, and agrees with it on CRLF files, blank lines,
   trailing whitespace, row widths, unknown squares and start squares (it is
   stricter only on parser quirks). *(Covered:
@@ -2101,6 +2102,14 @@ below.
   and on the router `boundaries::one_address_holds_at_most_its_share_of_live_streams`,
   which fails if the handler stops holding its place for the stream's life.)*
   (Twenty-first audit: the global cap alone let one host hold every place.)
+- `A-PUBLIC-6d` A job's live pushes are at most one per `JOB_STATS_CACHE_SECONDS`
+  however its submissions arrive — six submissions over two and a half seconds
+  under a ten-second interval push at most once — while an admin's change is
+  pushed at once, mid-interval. *(Covered:
+  `public_api::live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not`,
+  `sse::tests::an_urgent_push_cuts_the_cool_down_short`.)* (Thirty-second audit:
+  a job whose submissions came slower than one build was rebuilt and pushed for
+  each.)
 - `A-PUBLIC-6a` The SSE stream ends when the process is told to stop: it has no
   end of its own, and graceful shutdown waits for every open response, so an
   open dashboard used to hold every deployment until the runtime's `SIGKILL`

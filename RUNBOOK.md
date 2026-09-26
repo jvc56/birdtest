@@ -163,9 +163,9 @@ aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type Se
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
 ```
 
-(If the ceiling had to be raised above the stack's `db_allocated_storage * 5`,
-raise `db_allocated_storage` in `prod.tfvars` before the closing apply below:
-it sets the ceiling back to five times that, and RDS refuses one less than a
+(If the ceiling had to be raised above the stack's `db_allocated_storage * 5`
+— never past RDS's 65,536 GiB — raise `db_allocated_storage` in `prod.tfvars`
+before the closing apply below: it sets the ceiling back to five times that, and RDS refuses one less than a
 tenth above the current allocation. The allocation itself Terraform leaves
 alone — autoscaling owns it.)
 

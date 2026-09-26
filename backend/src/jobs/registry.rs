@@ -455,7 +455,7 @@ pub async fn decode_result(
     {
         tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(&payload)?))
             .await
-            .map_err(|e| AppError::internal(format!("validating a task response failed: {e}")))?
+            .map_err(|e| AppError::task_failed("validating a task response", e))?
     }
 
     match &template.kind {

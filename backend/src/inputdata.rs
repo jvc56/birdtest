@@ -913,7 +913,7 @@ async fn stage(
             Ok::<_, AppError>((files, body))
         })
         .await
-        .map_err(|e| AppError::internal(format!("reading the archive failed: {e}")))??
+        .map_err(|e| AppError::task_failed("reading the archive", e))??
     };
     // Before anything is staged: a row that names an object has to be a row
     // whose object is there, or the first derived build from it fails with a

@@ -25,7 +25,7 @@ export function resubscribeDelay(failures: number, random: () => number = Math.r
 
 /**
  * Subscribe to a job's live stat stream. The server pushes the same payload
- * `GET /api/jobs/:id` returns after every accepted result, so the handler can
+ * `GET /api/jobs/:id` returns as results land (coalesced), so the handler can
  * simply replace local state rather than merging deltas.
  *
  * Returns the unsubscribe function. Callers subscribe from `onMount` and return

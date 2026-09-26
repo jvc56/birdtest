@@ -41,6 +41,9 @@
   let utilitySpreadScale: number | '' = '';
   let movegenMargin: number | '' = '';
   let error = '';
+  // Whether `error` is the last submit's: only that is cleared by an edit, not
+  // a failure to load the form's choices.
+  let fromSubmit = false;
   let busy = false;
 
   $: lexica = files.filter((f) => f.role === 'kwg');
@@ -111,6 +114,7 @@
       return created;
     } catch (e) {
       error = errorText(e);
+      fromSubmit = true;
     } finally {
       busy = false;
     }
@@ -119,7 +123,7 @@
 
 <h1 class="mb-6 text-2xl font-semibold">New player config</h1>
 
-<form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit}>
+<form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
     <label class="label" for="name">Name</label>
     <input id="name" class="input" bind:value={name} placeholder="simmer-NWL23-4ply" required />
@@ -205,7 +209,7 @@
       <div><label class="label" for="num_plies">Plies (-pl)</label><input id="num_plies" type="number" class="input" bind:value={numPlies} /></div>
       <div><label class="label" for="np">Plays to simulate (-np)</label><input id="np" type="number" class="input" bind:value={numPlays} /></div>
       <div><label class="label" for="npr">Plies to report (shplies)</label><input id="npr" type="number" class="input" bind:value={numPliesRecorded} /></div>
-      <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="0.1" class="input" bind:value={stoppingPct} /></div>
+      <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="any" class="input" bind:value={stoppingPct} /></div>
       <p class="text-sm">No time limit: a simulation stops at its iteration budget, so what it finds does not depend on the contributor's hardware.</p>
       <label class="flex items-end gap-2 text-sm">
         <input type="checkbox" bind:checked={useInference} />
@@ -266,23 +270,23 @@
       </div>
       <div>
         <label class="label" for="im">Inference margin (-im)</label>
-        <input id="im" type="number" step="0.1" class="input" bind:value={inferenceMargin} />
+        <input id="im" type="number" step="any" class="input" bind:value={inferenceMargin} />
       </div>
       <div>
         <label class="label" for="uwin">Utility weight: win% (-uwin)</label>
-        <input id="uwin" type="number" step="0.1" class="input" bind:value={utilityWWinpct} />
+        <input id="uwin" type="number" step="any" class="input" bind:value={utilityWWinpct} />
       </div>
       <div>
         <label class="label" for="uspread">Utility weight: spread (-uspread)</label>
-        <input id="uspread" type="number" step="0.1" class="input" bind:value={utilityWSpread} />
+        <input id="uspread" type="number" step="any" class="input" bind:value={utilityWSpread} />
       </div>
       <div>
         <label class="label" for="uspreadscale">Utility spread scale (-uspreadscale)</label>
-        <input id="uspreadscale" type="number" step="0.1" class="input" bind:value={utilitySpreadScale} />
+        <input id="uspreadscale" type="number" step="any" class="input" bind:value={utilitySpreadScale} />
       </div>
       <div>
         <label class="label" for="mmargin">Move-gen equity margin (-mmargin)</label>
-        <input id="mmargin" type="number" step="0.1" class="input" bind:value={movegenMargin} />
+        <input id="mmargin" type="number" step="any" class="input" bind:value={movegenMargin} />
         <p class="mt-1 text-xs text-muted-foreground">
           Shared across both players in a job, same as win% model.
         </p>

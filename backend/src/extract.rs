@@ -262,7 +262,7 @@ async fn parse<T: DeserializeOwned + Send + 'static>(body: Bytes) -> Result<T, A
     } else {
         tokio::task::spawn_blocking(move || serde_json::from_slice::<T>(&body))
             .await
-            .map_err(|e| AppError::internal(format!("parsing a request body failed: {e}")))?
+            .map_err(|e| AppError::task_failed("parsing a request body", e))?
             .map_err(malformed)
     }
 }

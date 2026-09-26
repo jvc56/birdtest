@@ -370,6 +370,16 @@ async fn create_pool(
     }
     super::admin::require_role(&state.pool, body.letterdist_id, "letterdist").await?;
     super::admin::require_role(&state.pool, body.layout_id, "layout").await?;
+    // A board no job can be created on is a pool no job will ever match: it
+    // would rate no one, silently.
+    let layout: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(body.layout_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if let Some(problem) = super::admin::layout_problem(&layout) {
+        return Err(AppError::bad_request("no job can be created on that board layout")
+            .with_field("layout_id", problem));
+    }
 
     let mut tx = state.pool.begin().await?;
     let pool_id: Uuid = sqlx::query_scalar(

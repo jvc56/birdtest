@@ -354,8 +354,8 @@ async fn fit_and_store(
     })
     .await
     .map_err(|err| {
-        tracing::error!(%pool_id, error = %err, "the rating fit did not finish");
-        AppError::internal("the rating fit did not finish")
+        tracing::error!(%pool_id, "the rating fit for this pool did not finish");
+        AppError::task_failed("the rating fit", err)
     })?;
 
     let run_id: Uuid = sqlx::query_scalar(

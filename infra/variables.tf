@@ -112,6 +112,13 @@ variable "db_allocated_storage" {
     condition     = var.db_allocated_storage >= 20
     error_message = "db_allocated_storage must be at least 20 (GiB): RDS refuses less."
   }
+
+  validation {
+    # Past this the ceiling, capped at RDS's 65,536 GiB, is less than a tenth
+    # above the allocation, which RDS refuses at apply.
+    condition     = var.db_allocated_storage <= 59578
+    error_message = "db_allocated_storage must be at most 59,578 GiB: the autoscaling ceiling stops at RDS's 65,536 and must be a tenth above it."
+  }
 }
 
 variable "scheduled_tasks_enabled" {
@@ -223,6 +230,11 @@ variable "backup_image" {
 variable "backup_task_cpu" {
   type    = number
   default = 1024
+
+  validation {
+    condition     = contains([256, 512, 1024, 2048, 4096, 8192, 16384], var.backup_task_cpu)
+    error_message = "backup_task_cpu must be a Fargate CPU size: 256, 512, 1024, 2048, 4096, 8192 or 16384."
+  }
 }
 
 variable "backup_task_memory" {
@@ -241,7 +253,7 @@ variable "backup_task_memory" {
       (var.backup_task_cpu == 8192 && var.backup_task_memory >= 16384 && var.backup_task_memory <= 61440 && var.backup_task_memory % 4096 == 0) ||
       (var.backup_task_cpu == 16384 && var.backup_task_memory >= 32768 && var.backup_task_memory <= 122880 && var.backup_task_memory % 8192 == 0)
     )
-    error_message = "backup_task_memory is not a Fargate memory size for backup_task_cpu's CPU (1024 CPU takes 2048 to 8192 MiB, 4096 takes 8192 to 30720, in 1024 steps)."
+    error_message = "backup_task_memory is not a Fargate memory size for backup_task_cpu's CPU (256 CPU takes 512, 1024 or 2048 MiB; 512 takes 1024-4096; 1024, 2048-8192; 2048, 4096-16384; 4096, 8192-30720, all in 1024 steps; 8192, 16384-61440 in 4096 steps; 16384, 32768-122880 in 8192 steps)."
   }
 }
 
@@ -312,6 +324,11 @@ variable "alert_email" {
 variable "task_cpu" {
   type    = number
   default = 1024
+
+  validation {
+    condition     = contains([256, 512, 1024, 2048, 4096, 8192, 16384], var.task_cpu)
+    error_message = "task_cpu must be a Fargate CPU size: 256, 512, 1024, 2048, 4096, 8192 or 16384."
+  }
 }
 
 variable "task_memory" {
@@ -330,7 +347,7 @@ variable "task_memory" {
       (var.task_cpu == 8192 && var.task_memory >= 16384 && var.task_memory <= 61440 && var.task_memory % 4096 == 0) ||
       (var.task_cpu == 16384 && var.task_memory >= 32768 && var.task_memory <= 122880 && var.task_memory % 8192 == 0)
     )
-    error_message = "task_memory is not a Fargate memory size for task_cpu's CPU (1024 CPU takes 2048 to 8192 MiB, 4096 takes 8192 to 30720, in 1024 steps)."
+    error_message = "task_memory is not a Fargate memory size for task_cpu's CPU (256 CPU takes 512, 1024 or 2048 MiB; 512 takes 1024-4096; 1024, 2048-8192; 2048, 4096-16384; 4096, 8192-30720, all in 1024 steps; 8192, 16384-61440 in 4096 steps; 16384, 32768-122880 in 8192 steps)."
   }
 }
 

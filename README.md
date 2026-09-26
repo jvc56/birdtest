@@ -520,9 +520,10 @@ Recovering from anything is [RUNBOOK.md](RUNBOOK.md).
 SCRUB=0 ./scripts/dev-restore.sh .dev-backups/before-experiment
 ```
 
-`dev-restore.sh` scrubs every restore unless `SCRUB=0` is set — your own
-snapshot too, whose API keys and worker identities it would reset, hence the
-`SCRUB=0` above. It also takes a production dump directory, which must be
+`dev-restore.sh` scrubs every restore unless `SCRUB=0` is set (and refuses any
+value but 0 or 1) — your own snapshot too, whose addresses, passwords (your
+admin's included), API keys, worker identities and backup history it would
+reset, hence the `SCRUB=0` above. It also takes a production dump directory, which must be
 scrubbed on the way in (`scripts/scrub.sql`: emails become `@example.invalid`,
 every password becomes `birdtest-local`, credentials and tokens are truncated,
 and every anonymous worker's UUID -- its whole credential -- is replaced). Restoring

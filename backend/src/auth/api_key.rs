@@ -50,7 +50,7 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
 pub async fn hash_password_off_the_executor(password: String) -> AppResult<String> {
     tokio::task::spawn_blocking(move || hash_password(&password))
         .await
-        .map_err(|e| AppError::internal(format!("password hashing task failed: {e}")))?
+        .map_err(|e| AppError::task_failed("hashing a password", e))?
 }
 
 /// [`verify_password`] on the blocking pool. A task that fails verifies

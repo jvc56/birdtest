@@ -902,3 +902,66 @@ async fn tied_jobs_and_users_are_each_listed_exactly_once() {
         assert_eq!(seen_users, user_names, "users, per_page={per_page}");
     }
 }
+
+/// A-PUBLIC-6d: live pushes for one job are spaced by the stats interval,
+/// however submissions arrive. The loop paused only when a submission came in
+/// during a build, so a job whose submissions came slower than one build was
+/// rebuilt and pushed for each: six full builds in two seconds under a
+/// ten-second interval. An admin's change still reaches the page at once.
+#[tokio::test]
+async fn live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let admin = db.user("root", true).await;
+    let mut cfg = db.config();
+    cfg.stats_cache = std::time::Duration::from_secs(10);
+    let headers = admin_headers(&cfg, admin);
+    let app = birdtest::app(db.state_with(cfg).await);
+    let response = app
+        .clone()
+        .oneshot(get_request(&format!("/api/jobs/{job}/stream"), &[]))
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    let mut buffer = String::new();
+    next_stats_event(&mut body, &mut buffer).await;
+
+    let (mut assignment, uuid) = first_claim(&app).await;
+    let started = std::time::Instant::now();
+    let mut pushes = 0;
+    for i in 0..6 {
+        submit(&app, &assignment, &uuid, games_result(2, 1)).await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        while tokio::time::timeout_at(deadline, next_stats_event(&mut body, &mut buffer)).await.is_ok() {
+            pushes += 1;
+        }
+        if i < 5 {
+            let (status, next) = send(
+                &app,
+                post_json("/api/worker/task", &[("x-worker-uuid", &uuid)], claim_body("1.0.0", &[])),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{next}");
+            assignment = next;
+        }
+    }
+    assert!(pushes <= 1, "{pushes} pushes in {} ms under a 10 s interval", started.elapsed().as_millis());
+
+    // Mid-interval, a deactivation is pushed within a second or two.
+    let refs: Vec<(&str, &str)> = headers.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let (status, deactivated) =
+        send(&app, post_json(&format!("/api/admin/jobs/{job}/deactivate"), &refs, serde_json::json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{deactivated}");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let event = next_stats_event(&mut body, &mut buffer).await;
+            let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+            if parsed["job"]["status"] == "inactive" {
+                return parsed;
+            }
+        }
+    })
+    .await
+    .expect("the deactivation reaches the page without waiting out the interval");
+    assert_eq!(event["job"]["status"], "inactive");
+}

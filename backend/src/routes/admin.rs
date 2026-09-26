@@ -756,7 +756,7 @@ const MAGPIE_BOARD_DIM: usize = 15;
 /// (`board_layout.c`) refuses, and stricter than it only on parser quirks — the file split on newlines with empty lines
 /// ignored, a line's trailing `\r` dropped; a start square `row, col` inside
 /// the board; then exactly `BOARD_DIM` rows of `BOARD_DIM` bonus squares.
-fn layout_problem(content: &[u8]) -> Option<String> {
+pub(crate) fn layout_problem(content: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(content);
     let lines: Vec<&str> = text
         .split('\n')
@@ -1169,7 +1169,8 @@ async fn create_job(
     .await?;
     tx.commit().await?;
 
-    // Generation 1's zeroed KLV: a multi-megabyte build and an object-store
+    // The zeroed KLV generation 1 starts from (stored as generation 0): a
+    // multi-megabyte build and an object-store
     // write, so it happens after the transaction commits rather than inside it.
     registry::initialize_job_artifacts(&state, &job).await?;
 
@@ -2143,7 +2144,7 @@ async fn run_to_completion<T: Send + 'static>(
 ) -> AppResult<T> {
     tokio::spawn(operation)
         .await
-        .map_err(|e| AppError::internal(format!("the operation's task failed: {e}")))?
+        .map_err(|e| AppError::task_failed("the operation", e))?
 }
 
 async fn purge_body(
@@ -3061,8 +3062,9 @@ mod tests {
     use super::*;
 
     /// Nothing MAGPIE's loader (`board_layout.c`) refuses is accepted, and what
-    /// it loads is too, but for a few parser quirks birdtest is stricter about
-    /// (a start coordinate past `int`, a NUL, a byte above 0x7f). Counting rows
+    /// it loads is too, but for parser quirks birdtest is stricter about (e.g. a
+    /// start coordinate past `int` or padded with a vertical tab, a
+    /// whitespace-only coordinate, a NUL, a byte above 0x7f). Counting rows
     /// alone accepted six layouts MAGPIE refuses and refused two it loads.
     #[test]
     fn a_layout_magpie_would_refuse_is_refused() {

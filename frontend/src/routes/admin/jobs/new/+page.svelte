@@ -7,6 +7,9 @@
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
   let error = '';
+  // Whether `error` is the last submit's: only that is cleared by an edit, not
+  // a failure to load the form's choices.
+  let fromSubmit = false;
   let busy = false;
 
   let jobType: JobType = 'game_pairs';
@@ -147,6 +150,7 @@
     const blank = blankFields(request);
     if (blank.length) {
       error = `Fill in every setting: ${blank.join(', ')} is empty.`;
+      fromSubmit = true;
       return;
     }
     busy = true;
@@ -155,6 +159,7 @@
       goto(`/admin/jobs/${created.job.id}`);
     } catch (e) {
       error = errorText(e);
+      fromSubmit = true;
     } finally {
       busy = false;
     }
@@ -167,7 +172,9 @@
   whole active set first.
 </p>
 
-<form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit}>
+<!-- Any edit clears the last server error: a submit the browser blocks never
+     reaches submit(), which is where it was cleared, so it lingered. -->
+<form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
     <label class="label" for="type">Job type</label>
     <select id="type" class="input" bind:value={jobType}>
@@ -268,7 +275,7 @@
       </div>
       <div>
         <label class="label" for="min">Min before SPRT</label>
-        <input id="min" type="number" min="1" class="input" bind:value={minUnits} />
+        <input id="min" type="number" min="0" class="input" bind:value={minUnits} />
       </div>
       <div>
         <label class="label" for="max">Hard cap</label>
@@ -276,10 +283,10 @@
       </div>
     </div>
     <div class="grid grid-cols-4 gap-3">
-      <div><label class="label" for="alpha">α</label><input id="alpha" type="number" step="0.01" class="input" bind:value={sprtAlpha} /></div>
-      <div><label class="label" for="beta">β</label><input id="beta" type="number" step="0.01" class="input" bind:value={sprtBeta} /></div>
-      <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" class="input" bind:value={eloLow} /></div>
-      <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" class="input" bind:value={eloHigh} /></div>
+      <div><label class="label" for="alpha">α</label><input id="alpha" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtAlpha} /></div>
+      <div><label class="label" for="beta">β</label><input id="beta" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtBeta} /></div>
+      <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" step="any" class="input" bind:value={eloLow} /></div>
+      <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" step="any" class="input" bind:value={eloHigh} /></div>
     </div>
   {:else}
     <div>

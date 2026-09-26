@@ -1009,6 +1009,27 @@ async fn a_pool_that_could_rate_no_one_is_refused() {
             b["anchor_player_config_id"] = json!(Uuid::new_v4());
             b
         }),
+        ("a board no job can be created on", {
+            let mut board = b"10, 10\n".to_vec();
+            for _ in 0..21 {
+                board.extend_from_slice(&[b' '; 21]);
+                board.push(b'\n');
+            }
+            let super21: Uuid = sqlx::query_scalar(
+                "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+                 VALUES ('layouts/standard21.txt', 'layout', 'standard21', repeat('2', 64), $1,
+                         '20260101', $2)
+                 RETURNING id",
+            )
+            .bind(board.len() as i64)
+            .bind(&board)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            let mut b = body("classic", scope.letterdist, 2000.0);
+            b["layout_id"] = json!(super21);
+            b
+        }),
     ] {
         let (status, response) = send(
             &app,

@@ -46,6 +46,11 @@ variable "derived_builder_cpu" {
   EOT
   type        = number
   default     = 4096
+
+  validation {
+    condition     = contains([256, 512, 1024, 2048, 4096, 8192, 16384], var.derived_builder_cpu)
+    error_message = "derived_builder_cpu must be a Fargate CPU size: 256, 512, 1024, 2048, 4096, 8192 or 16384."
+  }
 }
 
 variable "derived_builder_memory" {
@@ -71,7 +76,7 @@ variable "derived_builder_memory" {
       (var.derived_builder_cpu == 8192 && var.derived_builder_memory >= 16384 && var.derived_builder_memory <= 61440 && var.derived_builder_memory % 4096 == 0) ||
       (var.derived_builder_cpu == 16384 && var.derived_builder_memory >= 32768 && var.derived_builder_memory <= 122880 && var.derived_builder_memory % 8192 == 0)
     )
-    error_message = "derived_builder_memory is not a Fargate memory size for derived_builder_cpu's CPU (1024 CPU takes 2048 to 8192 MiB, 4096 takes 8192 to 30720, in 1024 steps)."
+    error_message = "derived_builder_memory is not a Fargate memory size for derived_builder_cpu's CPU (256 CPU takes 512, 1024 or 2048 MiB; 512 takes 1024-4096; 1024, 2048-8192; 2048, 4096-16384; 4096, 8192-30720, all in 1024 steps; 8192, 16384-61440 in 4096 steps; 16384, 32768-122880 in 8192 steps)."
   }
 }
 

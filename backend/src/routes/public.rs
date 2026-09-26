@@ -837,8 +837,9 @@ fn stream_permit<'a>(
     Ok((mine, global))
 }
 
-/// One SSE event per accepted result, carrying the same payload `GET
-/// /api/jobs/:id` would return.
+/// SSE events as results land -- coalesced, at most one per
+/// `JOB_STATS_CACHE_SECONDS` -- each carrying the payload `GET /api/jobs/:id`
+/// would return.
 async fn job_stream(
     State(state): State<AppState>,
     ClientIp(address): ClientIp,
