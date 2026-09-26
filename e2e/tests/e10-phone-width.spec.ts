@@ -4,6 +4,10 @@ import { seededJob } from '../lib/api';
 // A phone, in Chromium: Pixel 5 is 393 CSS pixels wide.
 test.use({ ...devices['Pixel 5'] });
 
+/** The widest names a ranking can hold: 32 wide characters, a tombstone, a pseudonym. */
+const LONGEST = 'W'.repeat(32);
+const TOMBSTONE = 'deleted-0b6f7c6e-3f1d-4c55-9e3a-2f4b8d6a1c90';
+
 /**
  * Nothing on the page is wider than the screen, so nothing scrolls sideways.
  * Measured against the device's width, not `innerWidth`: a phone's browser
@@ -11,6 +15,16 @@ test.use({ ...devices['Pixel 5'] });
  * grew with the page and the comparison always passed -- while the header's
  * links ran 140 pixels off a Pixel 5 (thirty-first audit).
  */
+async function expectNoSidewaysScroll(page: Page) {
+  const screen = page.viewportSize()!.width;
+  const { scrollWidth, innerWidth } = await page.evaluate(() => ({
+    scrollWidth: document.documentElement.scrollWidth,
+    innerWidth: window.innerWidth
+  }));
+  expect(innerWidth, 'the layout viewport was widened to fit the page').toBeLessThanOrEqual(screen);
+  expect(scrollWidth, 'page is wider than the screen').toBeLessThanOrEqual(screen);
+}
+
 /**
  * A table's box is no wider than itself: the table wraps rather than scrolls,
  * so the column a list is ranked by stays in view. The page's first table
@@ -23,20 +37,6 @@ async function expectTableFits(page: Page, box?: Locator) {
     clientWidth: el.clientWidth
   }));
   expect(scrollWidth, 'the ranking is wider than its box').toBeLessThanOrEqual(clientWidth);
-}
-
-/** The widest names a ranking can hold: 32 wide characters, a tombstone, a pseudonym. */
-const LONGEST = 'W'.repeat(32);
-const TOMBSTONE = 'deleted-0b6f7c6e-3f1d-4c55-9e3a-2f4b8d6a1c90';
-
-async function expectNoSidewaysScroll(page: Page) {
-  const screen = page.viewportSize()!.width;
-  const { scrollWidth, innerWidth } = await page.evaluate(() => ({
-    scrollWidth: document.documentElement.scrollWidth,
-    innerWidth: window.innerWidth
-  }));
-  expect(innerWidth, 'the layout viewport was widened to fit the page').toBeLessThanOrEqual(screen);
-  expect(scrollWidth, 'page is wider than the screen').toBeLessThanOrEqual(screen);
 }
 
 /**

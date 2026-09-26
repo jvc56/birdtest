@@ -106,6 +106,17 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   job's creator widening its page; the alias docs), all fixed —
   `scripts/runbook-check.sh` now parses RUNBOOK's blocks in CI. KL-70 updated,
   KL-82 added. The loop continues.
+- **Pass 13 (follow-up: pass 12's diff, and request authentication and rate
+  limiting):** 0 high and 6 medium from the reviewers — the RUNBOOK check
+  reading 16 of 25 blocks; the heartbeat floor's stated reason; MAGPIE sending
+  credentials in the clear to an `http://` server, followed through the ALB's
+  redirect (the ALB now refuses `/api/*` on port 80); PLAN's worker rate limit;
+  PLAN's alias rule; the AWS CLI pager swallowing a pasted `wait` — all fixed
+  or, where MAGPIE must change, bounded and recorded; the adversarial check
+  found 4 medium (fence variants the check skipped — it now parses fences;
+  §6's drill broken by §5's new line; eleven more blocks without the pager
+  off, now enforced; the floor's reason again), all fixed. KL-76, 81 and 82
+  updated; KL-83 and KL-84 added. The loop continues.
 
 ---
 
@@ -1904,7 +1915,7 @@ variables.
 - Docs: the e2e compose comment names the refs endpoint; RUNBOOK §1 says a
   fresh shell needs `STAMP` as well as `RESTORE_TIME`, and refuses without it
   (an unset one made the rename loop wait forever on `birdtest-damaged-`;
-  the form of the refusal is 12.4's); PLAN's KL-70 justification, the one-to-three calls a
+  the form of the refusal is 12.4's); PLAN's KL-70 justification, the calls a
   resolution costs against the 60-per-hour limit, the startup order (the
   MAGPIE probe, the address, the five loops) and the 120 s stop timeout
   (PLAN and `state.rs` still said thirty seconds); E-10's title.
@@ -1918,7 +1929,7 @@ the ALB, the builder's missing version floor.
 ### 12.4 Adversarial check of the pass's fixes
 
 Two checks: tier 5 run natively against the frontend fixes, failure first; and
-an adversarial reviewer on the rest. **1 high and 3 medium, all fixed.**
+an adversarial reviewer on the rest. **2 high and 3 medium, all fixed.**
 
 - **High — the rename to "Branch or tag" broke E-3**, which found the field by
   its old label: tier 5 was 10 of 11. **Fix:** E-3 finds the new label.
@@ -1983,3 +1994,178 @@ an error); the alias gate (alias rows carry no bytes); `sdk()`.
 - A second backend on a taken address, committed binary against the fix
   (12.3).
 - MAGPIE and infra unchanged (MAGPIE read only).
+
+## Pass 13 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`0cfe839..7c88905`; MAGPIE
+and infra unchanged), one reviewer per part it touches: backend; frontend
+(tier 5 natively); docs, procedures and CI. Plus one area not examined in this
+run: **request authentication and rate limiting** — API keys, anonymous worker
+identities, bans, session cookies, CSRF, the admin guard, the client address
+and the rate limiters.
+
+**Findings: 0 high, 6 medium** from the four reviewers (backend 2 medium, 6
+low; frontend none, 6 low — tier 5 natively 11 of 11; docs and procedures 3
+medium, 7 low, 1 unconfirmed; authentication and rate limiting 2 medium, 4
+low, 2 unconfirmed). One medium was found by two reviewers. All fixed or, where
+the fix is MAGPIE's, bounded and recorded.
+
+### 13.1 Medium — `runbook-check.sh` read 16 of RUNBOOK's 25 bash blocks (backend and docs reviewers)
+
+Its fence pattern was anchored at column 0; the nine blocks indented inside
+numbered lists — all of §5 and §6 — were never read, and a broken one passed
+(`ok: 16 bash blocks`). Widened, the check failed on HEAD: §5's
+`DR_REGION=<the region the copy is built in>` placeholders do not parse.
+**Fix:** blocks are read at any indent with the fence's indent removed; a shell
+block fenced `sh`, `shell`, `console` or `zsh`, or a bash fence never closed,
+is refused; the count read must equal the fences. §5's placeholders are
+`DR_REGION=''  # …` (and `DR_ACCOUNT`), which its `if` already refuses empty.
+**Verified:** 25 blocks parse; HEAD's RUNBOOK fails at line 975, an indented
+block with an apostrophe'd `${…:?}` fails at 1042, an unclosed fence and a
+`shell` fence fail.
+
+### 13.2 Medium — the heartbeat floor's reason was wrong: MAGPIE's 120 s bounds a stall, not a request (backend reviewer)
+
+Pass 12 set the floor to 180 s on "30 + 120 + 30". `chttp.h` says the 120 s is
+a no-progress timeout; the exchange may run an hour. With MAGPIE's own libcurl
+options against a server that stalled twice mid-reply, every heartbeat
+succeeded, 250 s apart. No floor short of an hour covers a crawling link, and
+the default 300 s does not either. A third change of the number would be a
+patch on a patch; instead what the floor does is stated: it keeps a timeout
+above MAGPIE's cadence and one stalled heartbeat, and nothing more is promised.
+**Fix:** `config.rs` and PLAN's row say so; KL-83 records the slow-link case
+and the real fix (a whole-exchange bound on MAGPIE's heartbeat, a MAGPIE
+release).
+
+### 13.3 Medium — MAGPIE sent its credential in the clear to an `http://` server, silently (authentication reviewer)
+
+MAGPIE accepts any scheme, and the ALB's port 80 redirected every path to
+https, which libcurl followed. Shown with `strace` on MAGPIE: an anonymous
+worker's `X-Worker-UUID` crossed in the clear on every request and everything
+worked; a keyed worker's `Authorization: Bearer bt_…` crossed in the clear,
+was dropped at the scheme change, and its heartbeats and results were refused
+— while MAGPIE printed "as an authenticated worker". **Fix:** the ALB answers
+`/api/*` on port 80 with `426` and a message ("served over https only … treat
+any API key sent over http as disclosed") instead of redirecting; the page is
+still redirected. **Verified:** MAGPIE against a stand-in giving that answer
+stops after one request: `claiming a task failed with HTTP 426: birdtest's API
+is served over https only…`; `terraform fmt` and `validate` pass. The first
+request still discloses; the client-side refusal needs a MAGPIE release
+(KL-84).
+
+### 13.4 Medium — PLAN's worker rate limit was one bucket per identity; each credential has two (authentication reviewer)
+
+The thirty-first audit split claims from work in hand and never updated the
+table: one key made ten requests in a burst where PLAN allowed five, and the
+key's bucket is keyed by its hash, not its id. **Fix:** the table has a row
+for claims and one for work in hand, with why; the "Rate limiting" paragraph
+matches.
+
+### 13.5 Medium — PLAN's import step still said every alias counts against the caps (docs reviewer)
+
+12.4 corrected the limits table and not the step above it. **Fix:** the step
+says which aliases count; `aliases_count_as_their_targets_bytes_and_kept_files_are_small`
+now also walks sixty aliases of a lexicon, which counting them would refuse.
+
+### 13.6 Medium — the AWS CLI's pager swallowed a pasted `wait` (docs reviewer)
+
+AWS CLI v2 pages output longer than a screen through `less`, which read the
+rest of a paste (without bracketed paste) as keystrokes: the restore's
+`wait` never ran, and the next blocks met an instance still being created.
+Shown with a stub that pages as v2 does. **Fix:** §1, §5 and §6 begin with
+`export AWS_PAGER=""`, and the header says to set it first.
+
+### 13.7 Low findings
+
+**Fixed:**
+- Worker authentication: the `Bearer` scheme is matched in any case (a
+  lowercase `bearer` with a deactivated key minted an anonymous identity and
+  got `204` — `A-ACCOUNT-4b`, which fails on HEAD); a banned credential is no
+  longer remembered as known, so it pays its address's bucket every time; an
+  `X-Forwarded-For` with a byte that is not visible ASCII is read as bytes,
+  not dropped (it keyed the request on an ALB node — a unit test, failing on
+  HEAD); the CSRF comparison takes the same time wherever the tokens differ.
+- RUNBOOK §1: the rename block checks the restored instance exists before
+  renaming production (a mistyped `STAMP` renamed production and then found
+  nothing — now it stops at the check, shown with the stubs); `renamed()`
+  gives up after fifteen minutes (it looped for ever on expired credentials);
+  what to do if the block stops part-way.
+- Ref resolution: a chain of more than four tags says so; PLAN says a branch
+  named `tags/…` is given as `heads/tags/…`.
+- Frontend: the import form is one column on a phone (three columns of 74 px
+  at 320); the unban notice breaks a long name (the one spill in a 156-page
+  sweep); E-10's helpers are in order under their comments.
+- `birdtest listening` logs the bound address; `fake_worker.py`'s abandon
+  mode names the 180 s floor; KL-82 no longer says the Terraform requires one
+  binary for both images; TESTING's E-10 text; 12.3 and 12.4's counts.
+
+**Recorded:** KL-76 (E-10 measures at 393 px only; a pool's ratings table at
+320 px scrolls in its box); KL-81 (the CSRF cookie is not `__Host-`); KL-83;
+KL-84 (with the unconfirmed case of a client's second `X-Forwarded-For` header
+passed by the ALB). **Unconfirmed, left:** the 180 s floor equals the worst
+case after one stalled heartbeat rather than exceeding it by the nap's
+overshoot — covered by KL-83's statement that the floor promises nothing more.
+
+### 13.8 Adversarial check of the pass's fixes
+
+**4 medium, all fixed.**
+
+- **`runbook-check.sh` still passed on fence variants** — `bash title="x"`,
+  `Bash`, `` ``` bash ``, ```` ````bash ````, `~~~bash`, `sh title`, a quoted
+  fence: none was read, counted or refused (`ok: 1`, rc 0, around a block that
+  does not parse). Its patterns had been widened once already (13.1), so they
+  are replaced: the script now **parses** every fence — any run of backticks
+  or tildes at any indent opens one, which closes only on the same character
+  at least as long — and an opener must be labelled exactly `bash` (read) or
+  `sql` (skipped); anything else, unlabelled or quoted, is refused, as is a
+  fence never closed. **Verified:** each of the thirteen variants now fails
+  (refused, or read and found not to parse); a heredoc holding fence text
+  inside a block reads correctly; RUNBOOK passes with 25 blocks.
+- **§6's drill could no longer run as written.** 13.1 made §5's `REPLICA` a
+  computed line from a new `DR_ACCOUNT`, overwriting the staging bucket the
+  drill sets. **Fix:** `REPLICA=''` is itself the quoted placeholder (no
+  `DR_ACCOUNT`), the refusal names it, and §6 says to fill it in. **Shown:**
+  step 1 replayed with stubs reads the drill's bucket when filled and refuses
+  when empty.
+- **"Rotating the database password" and eleven other blocks had no
+  `AWS_PAGER`** (13.6 covered §1, §5, §6): a pasted rotation set the new
+  password in RDS and never reached SSM. **Fix:** every block that calls `aws`
+  begins with `export AWS_PAGER=""` (fourteen added), and `runbook-check.sh`
+  refuses one that does not — HEAD's RUNBOOK fails with 17 such blocks.
+- **The heartbeat floor's reason was wrong again.** libcurl averages speed over
+  a few seconds, so a stalled heartbeat is abandoned at about 127 s, not 120
+  (`curl` with MAGPIE's options: 127.03 s), and one stalled heartbeat leaves
+  some 187 s between recorded ones — past the 180 s floor. The floor is not
+  moved a third time: `config.rs`, PLAN's row and KL-83 now say it keeps a
+  timeout above MAGPIE's cadence and nothing more, and that the default, 300 s,
+  covers one stalled heartbeat.
+
+**Lows fixed:** README and `ecs.tf`'s comments say port 80 refuses the API
+rather than only redirecting (and that a copied `http://…/api/…` link reads the
+`426`); the unban notice wraps only the long name (`overflow-wrap:anywhere`,
+not `break-all`). **Held:** the listener rule (`fmt`, `validate`; the provider
+takes only `2xx`/`4xx`/`5xx`; priorities are per listener; health checks do not
+pass through it; MAGPIE sends no `/api` path it would miss, and does not retry
+a `426`); the bearer parse (two spaces authenticate the trimmed key; a tab,
+`Bearerx` or `Basic` fall to the UUID path as before; no panic); the gate
+(a banned credential pays its address's bucket once its known entry expires);
+the byte-wise `X-Forwarded-For` (the trusted hop's entry stays out of the
+client's reach); `same_token`; the tag chain; the resume guidance in every stop
+state of the rename block; 594 tests listed.
+
+### 13.9 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **594 of 594** (two new: `A-ACCOUNT-4b` and the `X-Forwarded-For` unit test,
+  each failing on HEAD; the tag-loop and lexicon-alias assertions added to
+  existing tests, the first failing on HEAD).
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 119 of 119.
+- **Tier 5, natively: 11 of 11** on the final working tree.
+- `terraform fmt -check` and `validate` (offline): pass.
+- `scripts/runbook-check.sh`: 25 blocks; the variants, HEAD's RUNBOOK and a
+  stalled `aws` pager check as above; RUNBOOK §1's rename block replayed with
+  `STAMP` set, mistyped and unset, and with its wait never satisfied (it gives
+  up after 90 tries); §5's step 1 empty and filled.
+- MAGPIE against a stand-in answering `426` (one request, the message shown).
+- MAGPIE unchanged (read only).

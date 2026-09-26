@@ -393,7 +393,9 @@ To rotate the password later, run the same `modify-db-instance` and
 (RUNBOOK.md, "Rotating the database password").
 
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
-redirects — because the backend sets `Secure` cookies, which a browser will not
+redirects pages and refuses `/api/*` with a `426`, so a worker set to
+`http://` fails at once rather than sending its credential in the clear on
+every request — because the backend sets `Secure` cookies, which a browser will not
 keep over plain HTTP. `public_url`, `ses_domain` and `mail_from_address` have
 none: they are what every confirmation and reset mail links to and is sent
 from, and a placeholder left in is refused. `min_magpie_version` defaults to

@@ -7,6 +7,11 @@ explains why; this one is what to type at 2am. Read the whole procedure before s
 Placeholders throughout: `$REGION` (default `us-east-1`), `$CLUSTER`
 (`birdtest`), `$BUCKET` (the `backups_bucket` Terraform output).
 
+**No pager.** AWS CLI v2 sends output longer than a screen through `less`,
+which reads the rest of a pasted block as keystrokes: a restore's `wait` never
+ran. Every block here that calls `aws` begins with `export AWS_PAGER=""`
+(`scripts/runbook-check.sh` refuses one that does not).
+
 **Where the SQL runs.** The database has no public address and admits only the
 service's security group, so no `psql` on an operator's machine can reach it.
 Every `psql "$DATABASE_URL" ...` below runs inside the VPC, in the ops task
@@ -47,6 +52,7 @@ job deletion's census does not count the data gaps and exports it also
 removes.
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 # What is restorable, and how old it is.
 aws s3 ls "s3://$BUCKET/pg/" | grep manifest | tail -5
 psql "$DATABASE_URL" -c "SELECT finished_at, ok, dump_bytes, s3_key FROM backups ORDER BY finished_at DESC LIMIT 5"
@@ -61,6 +67,9 @@ The same information is on `/admin/backups` if the site is up.
 Loses at most ~5 minutes. Takes under an hour.
 
 ```bash
+# No pager: one would swallow the rest of a paste (above).
+export AWS_PAGER=""
+
 # 1. STOP WRITES. Workers submitting into a database about to be replaced have
 #    their results silently discarded. The -down alarms fire ten minutes
 #    later, and clear when the service is back: expected here.
@@ -76,6 +85,7 @@ until it is set, rather than a check here that would close the shell it was
 pasted into:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 RESTORE_TIME=''   # the instant chosen, e.g. '2026-09-07T02:55:00Z'; used again below
 
 # 3. Restore to a NEW instance. The original is left untouched until the
@@ -128,6 +138,7 @@ before it becomes the production database. (The blocks below use `STAMP` and
 the suffix of the `birdtest-restore-…` instance — or each block refuses.)
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 aws rds modify-db-instance --region "$REGION" \
   --db-instance-identifier "birdtest-restore-${STAMP:?set STAMP to the suffix of the restore instance}" \
   --backup-retention-period 30 --deletion-protection --apply-immediately
@@ -157,9 +168,18 @@ exist yet fails at once rather than waiting, so each wait is preceded by a poll
 for the new name:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 renamed() {  # wait until instance $1 exists under its new name, then until it is available
+  local tries=0
   until aws rds describe-db-instances --region "$REGION" --db-instance-identifier "$1" \
-      >/dev/null 2>&1; do sleep 10; done
+      >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 90 ]; then
+      echo "no instance named $1 after 15 minutes (or the credentials expired)" >&2
+      return 1
+    fi
+    sleep 10
+  done
   aws rds wait db-instance-available --region "$REGION" --db-instance-identifier "$1"
 }
 # One command, so that nothing after a step that fails runs: an unset STAMP
@@ -168,6 +188,10 @@ renamed() {  # wait until instance $1 exists under its new name, then until it i
 if [ -z "${STAMP:-}" ]; then
   echo "STAMP is not set: the suffix of the birdtest-restore-... instance" >&2
 else
+  # The restored instance first: a mistyped STAMP renamed production and then
+  # found nothing to put in its place.
+  aws rds describe-db-instances --region "$REGION" \
+    --db-instance-identifier "birdtest-restore-$STAMP" >/dev/null &&
   aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
     --new-db-instance-identifier "birdtest-damaged-$STAMP" --apply-immediately &&
   renamed "birdtest-damaged-$STAMP" &&
@@ -190,12 +214,21 @@ Left under its restore name, or left out of the state, the next `terraform
 apply` would find `birdtest` missing once the damaged one was retired and
 create a new, empty database in its place.
 
+If the block stops part-way, it says where; nothing after the failed step ran.
+List the names (`aws rds describe-db-instances --region "$REGION" --query
+'DBInstances[].DBInstanceIdentifier'`) and run the remaining steps by hand, in
+order, from the first whose result is not there: `birdtest-damaged-$STAMP`
+and `birdtest-restore-$STAMP` present and no `birdtest` means the second
+rename is next.
+Pasting the block again stops at its first check or rename.
+
 Repoint the application. The master password is set by hand and lives only in
 the `DATABASE_URL` parameter, so keep it and swap the host. A PITR copy keeps
 the password the source had at the restore point; if it was rotated after that
 point, set it on the new instance first (see "Rotating the database password"):
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 ENDPOINT=$(aws rds describe-db-instances --region "$REGION" \
   --db-instance-identifier birdtest \
   --query 'DBInstances[0].Endpoint.Address' --output text)
@@ -332,6 +365,7 @@ This block can be run again as it is; do not go on to the next until it says
 `checksum matches`.
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 # Inside scripts/prod-shell.sh.
 apt-get update -qq && apt-get install -y -qq awscli >/dev/null
 STAMP=2026-09-07T03-00-00Z
@@ -869,6 +903,7 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   bucket back:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 # On your own machine, with the Terraform state in infra/: the ops task can
 # read only the backups bucket.
 ARTIFACTS_BUCKET=$(terraform -chdir=infra output -raw artifacts_bucket)
@@ -896,6 +931,7 @@ allowed to be newer than the database, never older (PLAN.md, "Artifacts: back up
 Do not declare it finished because the page loads.
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 # 1. Row counts, against the manifest of the dump that was restored (after a
 #    dump restore, §2.1 or §5: STAMP is the dump's stamp. After §1's PITR there
 #    is no dump; skip this one).
@@ -972,6 +1008,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    instance would stop the restore in step 3 at its first object:
 
    ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
    terraform -chdir=infra workspace select -or-create dr
    # The stack's own settings first, the DR overrides after (a later -var
    # wins): without prod.tfvars every other setting fell back to its default
@@ -988,13 +1025,14 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    # allocation if that is larger and known, within the same bound.
    # The replica bucket is in the lost stack's dr_region, which need not be
    # $DR_REGION; with no --region the CLI asks the lost region first.
-   DR_REGION=<the region the copy is built in>
-   THIRD_REGION=<a third region, up, for the copy's own replicas>
-   REPLICA_REGION=<the lost stack's dr_region>
-   # <account>: this account's id, the lost stack's (a drill: §6).
-   REPLICA=s3://birdtest-backups-dr-<account>/pg
-   MANIFEST=$(aws s3 ls --region $REPLICA_REGION "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
-   DR_STORAGE_GB=$(aws s3 cp --region $REPLICA_REGION "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(min(59578, max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4)))')
+   # Fill in the four quoted values (left empty, the `if` below refuses).
+   DR_REGION=''        # the region the copy is built in
+   THIRD_REGION=''     # a third region, up, for the copy's own replicas
+   REPLICA_REGION=''   # the lost stack's dr_region
+   REPLICA=''          # s3://birdtest-backups-dr-<account id>/pg, the lost stack's
+                       # (a drill: §6's staging bucket)
+   MANIFEST=$(aws s3 ls --region "$REPLICA_REGION" "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
+   DR_STORAGE_GB=$(aws s3 cp --region "$REPLICA_REGION" "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(min(59578, max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4)))')
    echo "restoring ${MANIFEST%.manifest.json}: $DR_STORAGE_GB GiB"
    # Everything below needs these; an unset one wrote region = "" (the CLI's
    # default region, likely the lost one) into dr.tfvars. One `if`, not a
@@ -1008,7 +1046,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    elif [ -e infra/dr.tfvars ]; then
      echo "infra/dr.tfvars is for another region or size (a drill's?): move it aside first"
    elif [ -n "$DR_REGION" ] && [ -n "$THIRD_REGION" ] && [ -n "$REPLICA_REGION" ] \
-      && [ -n "$MANIFEST" ] && [ -n "$DR_STORAGE_GB" ]; then
+      && [ -n "$REPLICA" ] && [ -n "$MANIFEST" ] && [ -n "$DR_STORAGE_GB" ]; then
      # The DR overrides, in a file of their own beside prod.tfvars, so every
      # later DR command -- step 4's apply, the ones after it -- carries the same
      # ones (a later -var-file wins). Every ARN prod.tfvars names in the lost
@@ -1028,7 +1066,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
        "derived_builder_image      = \"<pullable from $DR_REGION>\"" \
        "frontend_image             = \"<pullable from $DR_REGION>\"" \
        > infra/dr.tfvars
-   else echo "set DR_REGION, THIRD_REGION, REPLICA_REGION, MANIFEST and DR_STORAGE_GB first"; fi
+   else echo "set DR_REGION, THIRD_REGION, REPLICA_REGION and REPLICA, and check MANIFEST and DR_STORAGE_GB, first"; fi
    # Scheduled tasks off until step 4: the derived builder would fail rows
    # whose inputs are not synced yet, and a 03:00 backup would dump the
    # half-restored database as the newest.
@@ -1072,6 +1110,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    machine, whose credentials can read the replica:
 
    ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
    # In step 1's shell, or with its variables set again: an empty REPLICA made
    # the source the local root, and --recursive would copy this machine's
    # files into the Object-Locked bucket, where they stay for 30 days. One
@@ -1194,6 +1233,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   account's credentials; each runs only with the account it names:
 
   ```bash
+  export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
   # 1. With PRODUCTION's credentials. PROD_ACCOUNT is its id, PROD_REPLICA_REGION
   # its dr_region.
   PROD_REPLICA=s3://birdtest-backups-dr-$PROD_ACCOUNT/pg
@@ -1222,6 +1262,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   ```
 
   ```bash
+  export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
   # 2. With the SCRATCH account's credentials, in the same shell. SCRATCH_ACCOUNT
   # is its id. One bucket stands for both replicas; it is created here, so a
   # block pasted with production's credentials cannot create it in
@@ -1243,8 +1284,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   fi
   ```
 
-  Then run §5 in the scratch account with `REPLICA_REGION=$PROD_REPLICA_REGION`
-  and `REPLICA=s3://birdtest-drill-stage-$SCRATCH_ACCOUNT/pg`. Step 4 syncs
+  Then run §5 in the scratch account, filling in step 1's `REPLICA_REGION` with
+  `$PROD_REPLICA_REGION`'s value and `REPLICA` with
+  `s3://birdtest-drill-stage-<the scratch account's id>/pg`. Step 4 syncs
   `leaves/` and `inputs/` from the same bucket. Step 3's `kms:Decrypt` on the
   replica's key does not apply: the staging bucket uses S3's own encryption.
   Skip step 6: DNS stays on production. The copy holds production's data, so
@@ -1255,6 +1297,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   state.
 
   ```bash
+  export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
   empty() {  # bucket region [--bypass-governance-retention]
     # Destroy refuses a bucket that is not empty, and versioning keeps every
     # version, delete markers included. A listing page holds at most 1,000 --
@@ -1322,6 +1365,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   makes one of the same name:
 
   ```bash
+  export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
   A=$(aws sts get-caller-identity --query Account --output text)
   if [ -z "$DR_REGION" ] || [ -z "$PROD_REPLICA_REGION" ] || [ -z "$A" ] \
      || [ "$A" != "$SCRATCH_ACCOUNT" ]; then
@@ -1383,6 +1427,7 @@ release notes, say): `prod.tfvars` holds only the current ones.
    does between restarts:
 
    ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
    NAME=birdtest   # birdtest-dr for §5's copy
    for TG in backend frontend; do
      aws elbv2 wait target-in-service --region "$REGION" --target-group-arn \
@@ -1411,6 +1456,7 @@ this, in order; the service fails new connections between the first and last
 step, so do it in a quiet moment:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 DB_PASSWORD=$(openssl rand -hex 24)
 aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
   --master-user-password "$DB_PASSWORD" --apply-immediately

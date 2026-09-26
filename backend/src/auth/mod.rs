@@ -222,8 +222,11 @@ impl WorkerIdentity {
             .headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::to_owned);
+            // The scheme is case-insensitive (RFC 7235): `bearer <key>` was
+            // read as no credential and minted an anonymous identity.
+            .and_then(|v| v.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, key)| key.trim().to_owned());
 
         let identity = if let Some(raw_key) = bearer {
             let hash = api_key::hash_key(&raw_key);
@@ -264,11 +267,12 @@ impl WorkerIdentity {
             .fetch_optional(&state.pool)
             .await?
             .ok_or_else(|| AppError::unauthorized("unknown or inactive API key"))?;
-            gate.remember(&presented);
-
             if row.2 {
                 return Err(AppError::forbidden("this worker identity is banned"));
             }
+            // Only once it is known not to be banned: a banned credential
+            // remembered never paid its address's bucket again.
+            gate.remember(&presented);
             WorkerIdentity::User { user_id: row.0, key_id: row.1 }
         } else {
             let raw = parts
@@ -327,10 +331,10 @@ impl WorkerIdentity {
                              API key.",
                         ));
                     };
-                    gate.remember(&presented);
                     if banned {
                         return Err(AppError::forbidden("this worker identity is banned"));
                     }
+                    gate.remember(&presented);
                     WorkerIdentity::Anonymous { uuid }
                 }
                 None => {

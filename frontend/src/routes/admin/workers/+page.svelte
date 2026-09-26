@@ -92,7 +92,7 @@
     <input id="reason" class="input" bind:value={reason} placeholder="optional" />
   </div>
   {#if error}<p class="field-error">{error}</p>{/if}
-  {#if notice}<p class="text-sm text-success">{notice}</p>{/if}
+  {#if notice}<p class="text-sm text-success [overflow-wrap:anywhere]">{notice}</p>{/if}
   <button class="btn-destructive">Ban worker</button>
 </form>
 

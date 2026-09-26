@@ -234,6 +234,8 @@ async fn main() -> Result<()> {
     let shutdown = state.shutdown.clone();
     let app = birdtest::app(state);
 
+    // The bound address: `BIND_ADDR` with port 0 is given one here.
+    let addr = listener.local_addr().unwrap_or(addr);
     tracing::info!(%addr, "birdtest listening");
 
     // `ConnectInfo` is the peer address `clientip` falls back to.

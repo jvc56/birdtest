@@ -329,7 +329,8 @@ def _submission(assignment: dict, mode: str, rng: random.Random,
     """
     if mode == "abandon":
         # Claim and never submit, so the heartbeat timeout has to reclaim the
-        # task. Pair with a short HEARTBEAT_TIMEOUT_SECONDS.
+        # task. Pair with a short HEARTBEAT_TIMEOUT_SECONDS (180, the least the
+        # server accepts).
         return None
     token = assignment["claim_token"]
     result = _result_for(assignment["task_request"], rng, p1_win_probability)

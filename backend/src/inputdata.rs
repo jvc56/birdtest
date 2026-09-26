@@ -253,6 +253,11 @@ async fn resolve_branch_or_tag(state: &AppState, git_ref: &str) -> AppResult<Str
         })?;
         (sha, kind) = ref_object(&tag, git_ref)?;
     }
+    if kind == "tag" {
+        return Err(AppError::bad_request(format!(
+            "{git_ref:?} is a tag of a tag more than four deep; name the commit's own tag"
+        )));
+    }
     if kind != "commit" {
         return Err(AppError::bad_request(format!(
             "{git_ref:?} names a {kind}, not a commit"
@@ -1377,6 +1382,15 @@ mod tests {
         let files =
             walk_archive(&tarball_with_links(&[("data/layouts/real.txt", &layout)], &few), None).unwrap();
         assert_eq!(files.len(), 4);
+
+        // A lexicon's aliases are links on the worker and no copy on the
+        // server, so sixty of the same noise cost nothing against the caps.
+        let lex_names: Vec<String> = (0..60).map(|i| format!("data/lexica/ALIAS{i}.kwg")).collect();
+        let lex_links: Vec<(&str, &str)> = lex_names.iter().map(|n| (n.as_str(), "REAL.kwg")).collect();
+        let files =
+            walk_archive(&tarball_with_links(&[("data/lexica/REAL.kwg", &layout)], &lex_links), None)
+                .unwrap();
+        assert_eq!(files.len(), 61);
     }
 
     /// A symlink at a pinned path that leaves the archive, dangles, loops, or

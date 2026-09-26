@@ -186,9 +186,10 @@ resource "aws_cloudwatch_metric_alarm" "no_healthy_targets" {
   tags               = local.tags
 }
 
-# Plain HTTP only redirects. The backend runs with SECURE_COOKIES=true, and a
-# browser discards a Secure cookie set over http, so serving the app on port 80
-# would make signing in silently impossible -- and would send session cookies
+# Plain HTTP redirects pages (and refuses the API, below). The backend runs
+# with SECURE_COOKIES=true, and a browser discards a Secure cookie set over
+# http, so serving the app on port 80 would make signing in silently
+# impossible -- and would send session cookies
 # and API keys in the clear if it did not.
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
@@ -201,6 +202,33 @@ resource "aws_lb_listener" "http" {
       port        = "443"
       protocol    = "HTTPS"
       status_code = "HTTP_301"
+    }
+  }
+}
+
+# Except the API: a worker configured with `server http://...` was redirected,
+# and MAGPIE followed -- sending its API key or anonymous UUID in the clear on
+# every request, with nothing to show for it (an anonymous worker simply
+# worked; a keyed one lost its key header at the scheme change and its work
+# with it). Refused here instead, so the first request fails and says why.
+# The app never calls the API over http -- its page is redirected -- though
+# someone opening a copied http://.../api/... link now reads the 426's text.
+resource "aws_lb_listener_rule" "http_api_refused" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 1
+
+  condition {
+    path_pattern {
+      values = ["/api/*"]
+    }
+  }
+
+  action {
+    type = "fixed-response"
+    fixed_response {
+      content_type = "text/plain"
+      status_code  = "426"
+      message_body = "birdtest's API is served over https only: set server to https://, and treat any API key sent over http as disclosed (revoke it on the site)."
     }
   }
 }

@@ -1398,7 +1398,7 @@ start. The process has no SSM code path of its own.
 | `MAIL_OUTBOX_DIR` | unset | The `file` backend's directory. |
 | `MAIL_FROM` | `no-reply@birdtest.local` | |
 | `PUBLIC_URL` | `http://localhost:5173` | The base for links in emails. |
-| `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. 180 to 86,400; anything else fails startup. MAGPIE heartbeats every thirty seconds, one attempt each under its 120 s request timeout, so a live claim can go 180 s between recorded heartbeats; below MAGPIE's cadence a live worker's claim lapses and is handed to the next claimant. |
+| `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. 180 to 86,400; anything else fails startup: below MAGPIE's thirty-second cadence a live worker's claim lapses and is handed to the next claimant. 180 is six heartbeats and no more: one heartbeat stalled until MAGPIE gives up on it (about 127 s) leaves some 187 s between recorded ones, and one that crawls lapses its claim at any setting (KL-83). |
 | `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. Built one at a time per job; dropped by every admin action on the job, by its completion and by a leave generation closing, so the admin page reloading after an action reads the change. `0` builds it on every request (the tests). |
 | `S3_BUCKET` | `birdtest-artifacts` | |
 | `S3_ENDPOINT` | unset | Set to MinIO's address locally; the AWS SDK works against it unmodified. |
@@ -1706,8 +1706,10 @@ is the first thing that breaks.
    untrusted container format, so every entry is checked against an explicit
    allowlist before it is trusted enough to hash: **regular files**, and symlinks
    at pinned paths that resolve inside the archive to a pinned file of the same
-   role (MAGPIE-DATA ships aliases so), each pinned with its target's bytes and
-   counted as those bytes against the caps; the
+   role (MAGPIE-DATA ships aliases so), each pinned with its target's bytes —
+   an alias of a letter distribution or layout counted as those bytes against
+   the caps, since its row keeps a copy; a lexicon's, KLV's or win table's is a
+   link on the worker and costs nothing; the
    path must be relative, carry no `..` segment, and match the expected
    `data/<dir>/<basename>` shape. **Never construct a filesystem path from an
    archive name** — the import hashes bytes and has no reason to form one.
@@ -1768,7 +1770,8 @@ this replaced three patches; and the 30-minute limit was not enforced at all:
 the client's timeouts are per read.) The archive URL is built from `MAGPIE_DATA_REPO` and never
 from user input, and the ref an admin gives is resolved only among that repository's own
 branches and tags (`/git/ref/heads/…`, then `/git/ref/tags/…`, or only one of
-them for a `heads/`, `tags/`, `refs/heads/` or `refs/tags/` prefix; an annotated
+them for a `heads/`, `tags/`, `refs/heads/` or `refs/tags/` prefix, so a branch
+whose own name begins `tags/` is named `heads/tags/…`; an annotated
 tag peeled to its commit through up to four tag objects) — `/commits/{ref}`, which it used, also resolves a
 sha, five characters of one, a pull request's ref or a `git describe` name
 from any fork, and GitHub serves a fork's files under the upstream's name
@@ -4228,14 +4231,20 @@ client may contribute with, and where to get it. Not a self-update.
 
 #### Rate limiting
 
-Worker endpoints are limited to roughly one request per second per identity with
-a small burst. A `429` carries `Retry-After` in seconds. A task costs at least two
+Worker endpoints are limited to one request a second per credential for claims
+and another for work in hand (heartbeats, declines, results, artifacts), each
+with a burst of five. A `429` carries `Retry-After` in seconds. A task costs at least two
 requests, so this is reached under normal operation and must be handled as
 backoff, not as an error.
 
 ### Client security
 
 - TLS certificate verification on by default, with no way to disable it.
+- Nothing requires TLS: a `server http://…` is accepted. The deployment refuses
+  `http://…/api/*` at the load balancer (`426`, saying why) rather than
+  redirecting it — a followed redirect sent the credential in the clear on every
+  request, silently — so a misconfigured worker fails on its first request, the
+  one that has already disclosed its credential (KL-84).
 - The API key is never accepted on the command line, never written to
   `settings.txt`, and never appears in status output, logs or errors.
 - The worker UUID is minted by the server, never trusted from the client, so a
@@ -4609,7 +4618,8 @@ In-memory token buckets, per process, reset on restart.
 | The "that address already has an account" notice registration mails | 5 / hour | The address (`reg-em:`, on the reset limiter): past it the registration answers as usual and sends nothing, so it cannot bury an account holder in notices |
 | `POST /api/auth/login` | 10 / minute, and 100 / minute | Client IP; and, separately, the account the name matched (or, for a name that matches none, the name) from anywhere — ten times the address's, so that one address cannot lock an account out |
 | `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
-| `POST /api/worker/{task,result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Worker identity: the API key (`k:<key-id>`) or the anonymous UUID (`a:<uuid>`). Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
+| `POST /api/worker/task` | 1 / second, **burst 5** | Per credential: the API key (`k:<the key's SHA-256>`) or the anonymous UUID (`a:<uuid>`). Claims only. |
+| `POST /api/worker/{result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Per credential again, in a second bucket (`…#work`): work in hand never waits behind claims — idle machines sharing a key or a copied `uuid` took every token, and a busy one's heartbeats, sent once and never retried, were refused until its claim lapsed (thirty-first audit). So one credential makes up to two requests a second, five and five in a burst. Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
 | `POST /api/me/api-keys` | 10 / hour, **burst 100** | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered churn was unmetered new capacity. The burst is the cap, so a contributor setting up a machine per key is not held back (at ten an hour from the start, fifty machines took five hours); what refills slowly is revoke-and-recreate |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
 | Any worker request with an API key or `X-Worker-UUID` that has not resolved in the last ten minutes | 5 / second, **burst 100**, charged **before the lookup**, match or not | Client IP. The identity lookup is a main-pool query; a credential that resolved recently skips this, so a bad neighbour behind a shared address does not lock out working machines (`ratelimit::CredentialGate`). The worker's own bucket (above) is charged before the lookup too, on the credential as presented |
@@ -7893,9 +7903,12 @@ says so in its implemented option, rather than being removed.
 - **Context:** The site at phone width (E-10), after the thirty-first audit
   wrapped the header and put wide tables in scrolling boxes.
 - **Problem:** Header links are 20 px tall, 24 px apart when they wrap at
-  280 px, which is borderline for WCAG 2.5.8; and E-10's seeded contributors are
-  all anonymous, so a long registered name — which widened the job page until
-  this audit — is not in the journey's data. And the rating charts keep fixed
+  280 px, which is borderline for WCAG 2.5.8. (E-10 now answers the job page and
+  both rankings with a 32-character name of wide letters, pass 12, but measures
+  at 393 px only: at 320 px its twelve-digit count puts the job page's
+  contributor table 2 px past its box, which a realistic count does not.) A
+  pool's ratings table at 320 px scrolls in its box, the rating column partly
+  off screen. And the rating charts keep fixed
   margins for names and labels (204 px around the dot plot, 184 px around the
   history), so at 320 px the dot plot's scale is 34 px wide and its tick labels
   run together, and at 280 px four configs 600 Elo apart sit on one another; the
@@ -7903,12 +7916,12 @@ says so in its implemented option, rather than being removed.
   A clamped error bar (±400 Elo drawn) has no mark, so ±400, ±1,278 and ±∞
   look the same while the caption says the bars are one error; the prior's
   widened errors make clamped bars more common (thirty-second audit, pass 2).
-- **Options considered:** larger tap targets; a registered contributor with a
-  32-character name in E-10's seed; narrower chart margins below the `sm`
+- **Options considered:** larger tap targets; a 320 px run of E-10; narrower
+  chart margins below the `sm`
   breakpoint, or names stacked above the dots; an open end on a clamped bar.
 - **Option implemented:** None.
 - **Justification:** Checked by hand in the audit's sweep (744 page loads, none
-  wider than the screen); the seed change needs a tier-5 run to prove.
+  wider than the screen, and pass 13's 156, one spill fixed).
 
 **KL-77. Where the archive walk and GNU tar still part, failing safe.**
 - **Context:** `inputdata::walk_archive`, compared with `tar -xzf` over many
@@ -8100,6 +8113,9 @@ says so in its implemented option, rather than being removed.
     owner waits for the bucket too. Scoring a crafted password is close to a
     second, on two turns of its own; a flood of them makes registrations and
     resets answer `503`, never sign-ins.
+  - The CSRF cookie is not `__Host-`-prefixed, so a sibling subdomain able to
+    set cookies could plant one (cookie tossing); none exists, and the token
+    is compared in constant time since pass 13.
   - A username is compared by `lower`, not by a normal form: `émile` composed
     and decomposed are two accounts that look alike. Normalizing new names
     only would lock out an existing decomposed one at sign-in.
@@ -8137,8 +8153,9 @@ says so in its implemented option, rather than being removed.
     limit on the peer — in production the ALB — so the site shares one bucket,
     silently.
   - The derived-file builder does not check its MAGPIE against
-    `MIN_MAGPIE_VERSION` as the web task does; both images are the same
-    binary, which the Terraform requires.
+    `MIN_MAGPIE_VERSION` as the web task does. Both images are built from the
+    same Dockerfile and MAGPIE pin, by convention: the Terraform checks only
+    that `derived_builder_image` is set.
 - **Options considered:** a session-scoped advisory lock taken on a dedicated
   connection before the reapers, so a second process waits for the first to
   exit; `catch_unwind` around each tick; tracking the mail tasks for shutdown;
@@ -8151,7 +8168,59 @@ says so in its implemented option, rather than being removed.
 - **Justification:** The lock would make a new task wait, unhealthy, behind a
   draining one that ECS may already be waiting on; it is worth adding once the
   overlap is shown to happen. The rest are rare, bounded by a restart or a
-  retry, or moot while the two images share a binary.
+  retry, or moot while the two images are built from one pin.
+
+**KL-83. A heartbeat exchange is bounded by MAGPIE's hour, not by the heartbeat timeout.**
+- **Context:** `~/MAGPIE/src/impl/contribute.c` (heartbeat loop),
+  `src/compat/chttp.{h,c}`; `config.rs` (`HEARTBEAT_TIMEOUT_SECONDS`)
+  (thirty-second audit, pass 13).
+- **Problem:** MAGPIE sends one heartbeat attempt, waits for it to end, and
+  sleeps thirty seconds. Its 120 s timeouts bound a connect and a stall, not
+  the exchange, which may run an hour while it makes progress. The server
+  records a heartbeat when it arrives, so on a link slow enough that one
+  exchange takes longer than the timeout less thirty seconds, a live worker's
+  claim lapses, its task goes to someone else, and its result is answered
+  `accepted: false`. Shown with MAGPIE's own libcurl options against a server
+  that stalls 110 s twice mid-reply: every heartbeat succeeded, 250 s apart.
+  A connect of 120 s plus a stall of 120 s exceeds even the default 300 s.
+- **Options considered:** a whole-exchange bound on MAGPIE's heartbeat (a
+  minute, say) so "thirty seconds plus the bound" is the true worst case, and
+  the floor set from it; a floor of an hour, which would leave a dead
+  worker's task unclaimed for as long.
+- **Option implemented:** None. The floor (180 s) keeps a timeout above
+  MAGPIE's cadence and nothing more: one heartbeat stalled until libcurl gives
+  up (about 127 s, its speed averaged over a few seconds) leaves some 187 s
+  between recorded heartbeats, past the floor; the default, 300 s, covers it.
+- **Justification:** A link that needs minutes to move a heartbeat's fifty
+  bytes is, for scheduling, a worker that is gone. The MAGPIE bound is the
+  fix, with a release and a `MIN_MAGPIE_VERSION` bump; it is left for a
+  MAGPIE change of its own.
+
+**KL-84. A worker's first request over plain http discloses its credential.**
+- **Context:** `~/MAGPIE/src/ent/client_state.c` (`server` accepts any
+  scheme), `src/compat/chttp.c` (follows redirects); `infra/ecs.tf`
+  (`aws_lb_listener_rule.http_api_refused`) (thirty-second audit, pass 13).
+- **Problem:** A contributor who writes `server http://…` sends their API key
+  or anonymous UUID in the clear. The load balancer now answers `/api/*` on
+  port 80 with `426` and a message instead of redirecting, so MAGPIE stops
+  after that first request (shown against a stand-in: "claiming a task failed
+  with HTTP 426: birdtest's API is served over https only…") — but that
+  request has gone. Before, the redirect was followed on every request: an
+  anonymous worker worked, its UUID in the clear each time; a keyed one lost
+  the `Authorization` header at the scheme change, was treated as identity-less
+  and lost its results, still reporting "an authenticated worker".
+  Separately (not reproduced): if the ALB ever passed a client's own second
+  `X-Forwarded-For` header after the one it appends to, the rightmost entry
+  would be the client's choice; tested only against nginx, which rewrites the
+  header into one.
+- **Options considered:** MAGPIE refusing a non-`https` server other than a
+  loopback address, and `CURLOPT_REDIR_PROTOCOLS` limited to https so no
+  redirect can downgrade; the refusal at the load balancer.
+- **Option implemented:** The load balancer's refusal. The MAGPIE check is the
+  real fix and needs a MAGPIE release and a `MIN_MAGPIE_VERSION` bump (tier 6
+  talks to `http://localhost:8080`, which a loopback exception keeps working).
+- **Justification:** One request's disclosure, loudly reported, where every
+  request's was silent; the message says to revoke a key sent that way.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the

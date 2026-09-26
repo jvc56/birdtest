@@ -28,10 +28,15 @@ pub fn verify(method: &Method, headers: &HeaderMap, jar: &CookieJar) -> AppResul
         .get(CSRF_HEADER)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AppError::forbidden("missing CSRF header"))?;
-    if cookie != header {
+    if !same_token(cookie.as_bytes(), header.as_bytes()) {
         return Err(AppError::forbidden("CSRF token mismatch"));
     }
     Ok(())
+}
+
+/// Equal, in time that depends on the lengths and not on where they differ.
+fn same_token(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]

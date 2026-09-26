@@ -1074,5 +1074,12 @@ async fn a_ref_resolves_among_the_repositorys_own_branches_and_tags() {
     fixture.put("/repos/example/data/git/ref/tags/v3", ref_json(&sha(7), "tag"));
     fixture.put(&format!("/repos/example/data/git/tags/{}", sha(7)), ref_json(&sha(3), "tag"));
     assert_eq!(resolve("v3").await.unwrap(), sha(4));
+    // A tag that names itself is followed four hops and then refused, and
+    // says why.
+    fixture.put("/repos/example/data/git/ref/tags/loop", ref_json(&sha(8), "tag"));
+    fixture.put(&format!("/repos/example/data/git/tags/{}", sha(8)), ref_json(&sha(8), "tag"));
+    let err = resolve("loop").await.unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(err.message.contains("more than four deep"), "{}", err.message);
 }
 

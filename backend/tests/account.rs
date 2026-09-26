@@ -236,6 +236,41 @@ async fn deactivation_suspends_a_key_reactivation_restores_it_and_revocation_is_
     assert_eq!(claim_with(&app, raw).await.0, StatusCode::UNAUTHORIZED);
 }
 
+/// A-ACCOUNT-4b: the `Bearer` scheme is matched without regard to case (RFC
+/// 7235). `bearer <key>` was read as no credential: a deactivated key's claim
+/// minted an anonymous identity and was answered 204, and a live key's work
+/// was credited to nobody.
+#[tokio::test]
+async fn the_bearer_scheme_is_read_in_any_case() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let user = db.user("lowercase", false).await;
+    let headers = signed_in(&db, user);
+    let key = create_key(&app, &headers, "worker").await;
+    let raw = key["key"].as_str().unwrap();
+    let claim = |scheme: &'static str| {
+        let app = app.clone();
+        let bearer = format!("{scheme} {raw}");
+        async move {
+            send(&app, post_json("/api/worker/task", &[("authorization", &bearer)], claim_body("1.0.0", &[])))
+                .await
+        }
+    };
+
+    let (status, body) = set_active(&app, &headers, &key, false).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    for scheme in ["bearer", "BEARER"] {
+        let (status, body) = claim(scheme).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{scheme}: {body}");
+        assert_eq!(body["message"], "unknown or inactive API key", "{scheme}");
+    }
+    let minted: i64 = sqlx::query_scalar("SELECT count(*) FROM anonymous_workers")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(minted, 0, "a key in another case minted an anonymous identity");
+}
+
 /// A-ACCOUNT-5: one account cannot list, deactivate or revoke another's keys;
 /// each attempt answers as if the key did not exist, and the key is untouched.
 #[tokio::test]

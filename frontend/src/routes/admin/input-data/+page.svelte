@@ -159,7 +159,8 @@
 
 <div class="card mb-6 space-y-3">
   <h2 class="font-semibold">Import a tarball</h2>
-  <div class="grid grid-cols-3 gap-3">
+  <!-- One column on a phone: three were 74 px each at 320 px wide. -->
+  <div class="grid grid-cols-1 items-start gap-3 sm:grid-cols-3">
     <div>
       <label class="label" for="date">Version (YYYYMMDD)</label>
       <input id="date" class="input" bind:value={tarballDate} placeholder="20260101" />
@@ -171,7 +172,7 @@
         A branch or tag of the data repository, resolved to its commit at import time, so the record names a commit and never a branch.
       </p>
     </div>
-    <div class="flex items-end">
+    <div class="flex sm:pt-6">
       <button class="btn-primary" disabled={busy || !tarballDate} on:click={start}>
         {busy ? 'Working…' : 'Fetch and diff'}
       </button>

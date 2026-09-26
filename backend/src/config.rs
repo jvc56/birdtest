@@ -229,12 +229,14 @@ impl Config {
             mail_outbox_dir,
             mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
             public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
-            // At least 180 s: MAGPIE heartbeats every thirty seconds, one
-            // attempt each under its 120 s request timeout, so a live claim can
-            // go 30 + 120 + 30 s between recorded heartbeats. Below MAGPIE's
-            // cadence a live claim lapsed, and each claim request handed the
-            // fleet's running tasks to someone else (the audit's pass 12). At
-            // most a day, which the restart grace and SQL intervals can hold.
+            // At least 180 s. Below MAGPIE's thirty-second cadence a live claim
+            // lapsed, and each claim request handed the fleet's running tasks
+            // to someone else (the audit's pass 12). 180 is six heartbeats. It
+            // is not a promise for a bad link: one heartbeat stalled until
+            // MAGPIE gives up on it leaves about 187 s between recorded ones,
+            // which lapses a claim at the floor, and one that crawls lapses it
+            // at any setting (KL-83); the default is 300. At most a day, which
+            // the restart grace and SQL intervals can hold.
             heartbeat_timeout: seconds_in(lookup, "HEARTBEAT_TIMEOUT_SECONDS", 300, 180, 86_400)?,
             stats_cache: Duration::from_secs(parsed_u64("JOB_STATS_CACHE_SECONDS", 10)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),

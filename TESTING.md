@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 210 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1 Unit | 211 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 119 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 158 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 195 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 196 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 592 backend tests (the per-tier counts above are
+--run-ignored all` runs 594 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -2318,6 +2318,10 @@ below.
 - `A-ACCOUNT-4` Deactivating a key stops it authenticating; reactivating
   restores it; revoking is permanent. *(Covered:
   `account::deactivation_suspends_a_key_reactivation_restores_it_and_revocation_is_final`.)*
+- `A-ACCOUNT-4b` The `Bearer` scheme is read in any case (RFC 7235): `bearer
+  <key>` was no credential, so a deactivated key's claim minted an anonymous
+  identity. *(Covered: `account::the_bearer_scheme_is_read_in_any_case`.)*
+  (Thirty-second audit.)
 - `A-ACCOUNT-5` One user cannot see or modify another's keys. *(Covered:
   `account::one_user_cannot_see_or_change_anothers_keys`.)*
 - `A-ACCOUNT-6` An account's key creation is a burst of a hundred (the cap), then
@@ -2548,8 +2552,8 @@ admin in once and the admin journeys reuse its storage state.
   own column inside its box — a pseudonym's sixteen characters pushed it out,
   thirty-second audit. The contributors' list is measured with a row in it;
   the job page again with a 32-character creator and contributor, and both
-  lists with a 32-character username, a tombstone and a pseudonym, which the
-  seed does not register.)* The screen is the device's width:
+  lists with a 32-character username and a tombstone (and the contributors'
+  list a pseudonym), which the seed does not register.)* The screen is the device's width:
   compared with `innerWidth`, as it was, the check could not fail, because a
   phone's browser widens its layout viewport to fit what overflows — and the
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
@@ -2827,8 +2831,13 @@ the real check of the backups themselves.
 - `S-RUNBOOK-1` Every bash block in RUNBOOK.md parses: an operator pastes them
   during an incident, and one that does not leaves a continuation prompt that
   swallows what is pasted next — an apostrophe in a `${STAMP:?…}` message did
-  that to the restore's backup-settings command. *(Covered:
-  `scripts/runbook-check.sh`, `bash -n` per block, in CI's `scripts` job.)*
+  that to the restore's backup-settings command. Every fence is parsed: blocks
+  indented in a list are read too (the first cut read 16 of 25), a fence
+  labelled anything but exactly `bash` or `sql` (`Bash`, `sh`, `bash title=…`,
+  unlabelled, quoted) or never closed is refused, and a block that calls `aws`
+  must first `export AWS_PAGER=""` (the pager swallowed a pasted `wait`).
+  *(Covered: `scripts/runbook-check.sh`, `bash -n` per block, in CI's
+  `scripts` job.)*
   (Thirty-second audit.)
 - `S-SCRUB-1` A scrubbed dump holds no credential: every anonymous worker's
   UUID is replaced, with its claims, ban and audit rows following it and what
