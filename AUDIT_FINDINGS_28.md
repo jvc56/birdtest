@@ -76,6 +76,13 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   fixed and verified; the adversarial check found 2 medium (the decline skip
   forcing leave racks twice; an expired twin holding a name), fixed. KL-2,
   40, 57 and 78 updated. The loop continues.
+- **Pass 9 (follow-up: pass 8's diff, and admin operations):** 0 high and 3
+  medium from the reviewers — PLAN counting a `derived_mismatch` toward the
+  five-failure stop; KL-56 saying a ban stops an identity-less client; a
+  forced rebuild stopped part-way leaving no audit row — all fixed and
+  verified; the adversarial check found 2 medium (refused exports logged as
+  started; RUNBOOK counting identities on the wrong database), fixed. KL-40,
+  56 and 78 updated. The loop continues.
 
 ---
 
@@ -1393,5 +1400,130 @@ transient failure; a worker could skip outcomes it dislikes by declining
 - **Tier 5, natively: 11 of 11** on 9b28b9c (frontend reviewer).
 - Real MAGPIE against stubs: the poison-task stop and the post-restore `401`
   (task-lifecycle reviewer).
+- MAGPIE unchanged.
+
+
+---
+
+## Pass 9 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`9b28b9c..3f05fce`; MAGPIE
+unchanged), one reviewer per part it touches: backend; frontend (tier 5
+natively); docs and procedures; infra. Plus one area not examined in recent
+passes: **admin operations** — activating, deactivating, completing, purging
+and deleting jobs, allocation, player configs, bans, the fleet and workers
+pages, account deletion by an admin, the audit log, CSRF and admin
+authentication.
+
+**Findings: 0 high, 3 medium** from the five reviewers (backend none, 6 low, 1
+unconfirmed; frontend none, 4 low — tier 5 natively 11 of 11; docs and
+procedures 1 medium, 8 low; infra none, 2 low; admin operations 2 medium, 10
+low, 1 unconfirmed). All fixed and verified; the adversarial check (9.5)
+found 2 medium in the fixes, fixed.
+
+### 9.1 Medium — PLAN said a `derived_mismatch` decline counts toward MAGPIE's five-failure stop (docs reviewer)
+
+**Docs updated.** 8.6's rewrite of the decline paragraph said a KLV mismatch
+counts as a failure, five in a row ending the run; MAGPIE never counts it (a
+real MAGPIE against a stub declined `derived_mismatch` eight times, setting
+the job aside for 1, 2, …, 128 s, and never stopped). The paragraph now says
+which declines set a job aside, which count, and that leave generation
+reissues a declined task.
+
+### 9.2 Medium — KL-56 said a ban stops an identity-less client; none can (admin reviewer)
+
+**Docs updated.** A client that sends no identity mints a new one with every
+claim, so banning any of them changes nothing (reproduced: five of five
+claims after the ban got tasks), and a banned account's owner can claim with
+no key. KL-56, PLAN's ban list and the workers page now say so; the lever
+that would work, a cap on open claims per address, stays an option in KL-56.
+
+### 9.3 Medium — a forced artifact rebuild that stopped part-way left no audit row (admin reviewer)
+
+**Code updated.** The rebuild rewrites one generation at a time and logged
+only at the end, so one stopped by an S3 error, a failed build or the load
+balancer's timeout (KL-19) had replaced objects workers played with no record.
+An export also started before its row, and Retry reset a build before its
+row, breaking PLAN's same-transaction promise. **Fix:** a rebuild logs
+`job.artifacts_rebuild_started` (with `force`) before anything, and its
+counts row at the end; an export is logged in the transaction that records
+it (9.5); Retry's reset and row share a transaction; PLAN names the rebuild
+as the exception. **Verified:**
+`a_forced_rebuild_is_logged_before_it_rewrites_anything` (`A-ADMIN-11b`, tier
+6) fails without the early row and passes.
+
+### 9.4 Low findings
+
+**Fixed:**
+- Derived builds:
+  - the builder's delete of a damaged input and an import's or export's S3
+    failure store the SDK's whole cause again (they are read only by an
+    admin); only the object fetch a worker's request makes keeps the plain
+    message;
+  - an input whose key is not its content address is told the right remedy;
+  - Retry refuses (`404`) a row no builder of this version takes;
+  - the derived-data page's banners count only such rows, and a later
+    success clears an earlier error.
+- `Retry-After` is rounded up: a client that waited the seconds it was told
+  was refused again.
+- The registration twin check keeps its plan stable (its argument no longer
+  recomputed per row once Postgres switches to a generic plan).
+- Docs:
+  - PLAN's validation-placement text;
+  - the reset flow;
+  - the Retry row's 400/404;
+  - PLAN's 401/403 for admin routes and the input-data refusal's wording;
+  - README's Retry button;
+  - RUNBOOK's retry wait (about 20 minutes), when to count identities after
+    a restore, the census claim and §0's query;
+  - the account-deletion dialog (a ban discards nothing);
+  - `derived.tf`'s 90-day note.
+
+**Recorded:** KL-40 (the chillu look-alike and the Malayalam and Persian
+merges; the twin check's cost); KL-78 (the admin audit log's remaining gaps;
+old allocations shown beside inactive jobs). **Unconfirmed, left:** a decline
+loop generating tasks up to a job's cap (a hostile account); activating a job
+during a forced rebuild.
+
+### 9.5 Adversarial check of the pass's fixes
+
+**2 medium, fixed and verified.**
+
+- **Medium — refused exports were logged as started.** 9.3 moved the export's
+  audit row ahead of `exports::start`, which refuses routinely (the job not
+  completed, claims still out, one already running): each refusal left a
+  `job.export_started` row for an export that never existed (reproduced:
+  three refusals, three rows, no export). The export's start is one insert in
+  a transaction of its own. **Fix:** the row is written in that transaction.
+  **Verified:** `A-ADMIN-15b` (a refusal logs nothing, a begun export one row)
+  fails with the pre-start row and passes.
+- **Medium — RUNBOOK's advice on when to count identities counted the wrong
+  database.** It said to count "before step 5 repoints the service"; §1 has
+  no step 5, and the rename, which comes before the repoint, moves the
+  endpoint, so the service's `DATABASE_URL` then reaches the restored instance
+  — the one lacking exactly the identities counted. **Fix:** count before the
+  rename, with `scripts/prod-sql.sh`; the comment that cited step 5 is
+  reworded.
+
+**Lows fixed:** presigning keeps the plain message (a public download's
+failure reached an anonymous caller with the credential provider chain);
+PLAN's admin preamble (worker credentials without a session get `401`); the
+decline paragraph notes a task handed back on stopping counts as nothing.
+**Held:** the rebuild's started row follows every refusal; Retry's builder
+check agrees with `buildable`; `Retry-After`'s rounding never exceeds the
+period rounded up, and a client waiting exactly that long passes; the twin
+check's subquery holds its plan (about 210–250 ms at 200,000 users against
+370); RUNBOOK §0's query runs against the schema.
+
+### 9.6 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **588 of 588**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 118 of 118.
+- `terraform fmt -check -recursive` and `validate`: clean (infra reviewer).
+- **Tier 5, natively: 11 of 11** on 3f05fce (frontend reviewer).
+- The builder policy modelled in MinIO: `inputs/` deletable, `exports/`,
+  `leaves/` and `derived/` not (infra reviewer).
 - MAGPIE unchanged.
 

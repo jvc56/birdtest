@@ -213,6 +213,20 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
             err
         }
     })?;
+    // In the transaction that starts it: an export refused (the job not
+    // settled, one already running) writes no row, and one begun always has
+    // one. Written by the handler before this, every refusal was logged as a
+    // start (the adversarial check of the audit's pass 9).
+    crate::audit::log_detail(
+        &mut tx,
+        "job.export_started",
+        requested_by,
+        "job",
+        job.id.to_string(),
+        Some(job.id),
+        format!("export={id}"),
+    )
+    .await?;
     tx.commit().await?;
 
     let (state, job) = (state.clone(), job.clone());

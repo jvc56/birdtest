@@ -73,7 +73,9 @@
 
 <h1 class="mb-2 text-2xl font-semibold">Worker bans</h1>
 <p class="mb-6 text-sm text-muted-foreground">
-  Banned identities cannot claim or submit tasks. For anonymous workers the ban targets the UUID.
+  Banned identities cannot claim or submit tasks. For anonymous workers the ban targets the UUID —
+  a client that sends no identity gets a new one on every claim, and a banned account's owner can
+  still contribute without a key, so a ban stops neither.
 </p>
 
 <form class="card mb-6 max-w-2xl space-y-3" on:submit|preventDefault={ban}>

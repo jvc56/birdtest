@@ -2499,19 +2499,8 @@ async fn start_export(
     refuse_while_purging(&state, id)?;
 
     let job = crate::jobstats::load_job(&state.pool, id).await?;
+    // Logged by `exports::start`, in the transaction that records the export.
     let export_id = crate::exports::start(&state, &job, admin.0.id).await?;
-
-    let mut conn = state.pool.acquire().await?;
-    audit::log(
-        &mut conn,
-        "job.export_started",
-        Some(admin.0.id),
-        None,
-        Some("job"),
-        Some(id.to_string()),
-        Some(id),
-    )
-    .await?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -2697,11 +2686,17 @@ async fn retry_derived_data(
             "name the build by role, name, builder, kwg_id, klv_id and letterdist_id, as the list gives them",
         ));
     };
+    // The reset and its audit row in one transaction: written after, a failed
+    // insert left a build reset with no record of who reset it.
+    let mut tx = state.pool.begin().await?;
     let reset = sqlx::query(
         "UPDATE derived_data
          SET state = 'pending', attempts = 0, error = NULL, leased_until = NULL
          WHERE role = $1 AND name = $2 AND state = 'failed' AND builder = $3
-           AND kwg_id = $4 AND klv_id IS NOT DISTINCT FROM $5 AND letterdist_id = $6",
+           AND kwg_id = $4 AND klv_id IS NOT DISTINCT FROM $5 AND letterdist_id = $6
+           -- A builder this version has: retried, any other row sat pending
+           -- for good.
+           AND builder = CASE role WHEN 'wmp' THEN $7 ELSE $8 END",
     )
     .bind(&body.role)
     .bind(&body.name)
@@ -2709,15 +2704,18 @@ async fn retry_derived_data(
     .bind(kwg_id)
     .bind(body.klv_id)
     .bind(letterdist_id)
-    .execute(&state.pool)
+    .bind(state.builders.wmp())
+    .bind(state.builders.rit())
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if reset == 0 {
-        return Err(AppError::not_found("no failed build for that role and name"));
+        return Err(AppError::not_found(
+            "no failed build of that row that a builder of this version takes",
+        ));
     }
-    let mut conn = state.pool.acquire().await?;
     audit::log(
-        &mut conn,
+        &mut tx,
         "derived_data.retried",
         Some(admin.0.id),
         None,
@@ -2731,6 +2729,7 @@ async fn retry_derived_data(
         None,
     )
     .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2810,6 +2809,21 @@ async fn rebuild_artifacts(
         ));
     }
     let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
+    // Logged before the first object is rewritten: a rebuild writes one
+    // generation at a time, and one that stopped part-way -- an S3 error, a
+    // failed build, the load balancer's timeout past about twenty generations
+    // (KL-19) -- had replaced objects workers played and written no row at
+    // all, the one below being reached only at the end.
+    audit::log_detail(
+        &mut conn,
+        "job.artifacts_rebuild_started",
+        admin.0.id,
+        "job",
+        job.id.to_string(),
+        Some(job.id),
+        format!("force={}", query.force),
+    )
+    .await?;
     drop(conn);
 
     let report = crate::jobs::leave_gen::rebuild_artifacts(

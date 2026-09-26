@@ -391,6 +391,8 @@ async fn the_results_stream_is_admin_only_and_the_paginated_one_is_not() {
 
 /// Only a completed job can be exported: an export of a job still taking
 /// results would be stale before anyone downloaded it, and nothing would say so.
+/// A-ADMIN-15b: the audit row is written with the export's own row, so a
+/// refused one logs nothing (logged before it, every refusal read as a start).
 #[tokio::test]
 async fn only_a_completed_job_can_be_exported() {
     let db = TestDb::new().await;
@@ -414,6 +416,17 @@ async fn only_a_completed_job_can_be_exported() {
     let (status, body) = send(&app, start(headers.clone())).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert!(body["message"].as_str().unwrap().contains("completed"), "{body}");
+    let logged = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM audit_log WHERE job_id = $1 AND action = 'job.export_started'",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    // A refused export is not logged as started (A-ADMIN-15b).
+    assert_eq!(logged().await, 0);
 
     sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
         .bind(job)
@@ -435,6 +448,7 @@ async fn only_a_completed_job_can_be_exported() {
         .await
         .unwrap();
     assert_eq!(recorded, 1);
+    assert_eq!(logged().await, 1, "one begun export, one row");
 }
 
 /// An opening-rack job whose static player records only the best move cannot
@@ -2147,5 +2161,14 @@ async fn a_retry_resets_only_the_build_it_names() {
             .await
             .unwrap();
     assert_eq!(states, vec![("wmp-0".into(), "failed".into()), ("wmp-1".into(), "pending".into())]);
+
+    // A row for a builder this version lacks is not retried: nothing would
+    // ever take it.
+    let old = list.as_array().unwrap().iter().find(|r| r["builder"] == "wmp-0").unwrap().clone();
+    let (status, body) = send(&app, post_json("/api/admin/derived-data/retry", &headers, json!({
+        "role": old["role"], "name": old["name"], "builder": old["builder"],
+        "kwg_id": old["kwg_id"], "klv_id": old["klv_id"], "letterdist_id": old["letterdist_id"],
+    }))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 

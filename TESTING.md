@@ -74,12 +74,12 @@ at tier 5 names a symptom.
 | 3 API | 195 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
+| 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 587 backend tests (the per-tier counts above are
+--run-ignored all` runs 588 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -2074,6 +2074,11 @@ below.
   `admin_routes::only_a_leave_jobs_artifacts_can_be_rebuilt`; the rebuild,
   which runs MAGPIE, by the opt-in
   `magpie_routes::rebuilding_artifacts_restores_what_is_missing_and_is_idempotent`.)*
+- `A-ADMIN-11b` A forced artifact rebuild is in the audit log before it
+  rewrites anything: one that stopped part-way had replaced objects and
+  written no row, the only one coming at the end. *(Covered, tier 6 opt-in:
+  `magpie_routes::a_forced_rebuild_is_logged_before_it_rewrites_anything`.)*
+  (Thirty-second audit.)
 - `A-ADMIN-12` Ban and unban by user id and by anon UUID; a banned worker's next
   claim is refused; unban restores it. *(Covered:
   `admin_routes::a_ban_by_either_identity_refuses_the_next_claim_and_unban_restores_it`,
@@ -2087,6 +2092,10 @@ below.
   stored verdict, and it can be activated again. *(Covered:
   `admin_api::purging_a_completed_job_returns_it_to_inactive`.)* (Eleventh
   audit's fix, twelfth audit's test.)
+- `A-ADMIN-15b` An export's `job.export_started` row is written in the
+  transaction that records the export: a refused one (the job not completed,
+  one already running) writes none, and a begun one exactly one. *(Covered:
+  `admin_api::only_a_completed_job_can_be_exported`.)* (Thirty-second audit.)
 - `A-ADMIN-16` While a purge or delete holds a job's claims, a submission for
   one is answered `503` at once; and a hold that ends without committing spares
   the job's claims from reclamation, so the submission lands afterwards.

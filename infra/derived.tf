@@ -126,7 +126,8 @@ resource "aws_iam_role" "derived_builder_task" {
 # and does so only for one whose bytes are not the ones imported under its
 # content address, so that a re-import uploads it again (an import skips an
 # object that exists); inputs are re-importable and the bucket versioned, so
-# a delete leaves the bytes as a noncurrent version. Worth stating rather
+# a delete leaves the bytes as a noncurrent version for 90 days
+# (`expire-noncurrent-versions`, s3.tf). Worth stating rather
 # than reusing the web task's role, which can also write.
 data "aws_iam_policy_document" "derived_builder_task" {
   statement {

@@ -26,13 +26,19 @@ with the scratch database a Postgres started inside that shell the way
 psql "$DATABASE_URL" -c "
   SELECT created_at, action, target_id, reason
   FROM audit_log
-  WHERE action LIKE '%.census' OR action IN ('job.deleted','job.purged','user.deleted')
+  WHERE action LIKE '%.census'
+     OR action IN ('job.deleted','job.purged','user.deleted','input_data.deleted',
+                   'player_config.deleted','worker.unbanned','job.artifacts_rebuild_started')
   ORDER BY created_at DESC LIMIT 20"
 ```
 
-Every destructive admin endpoint writes a `*.census` row *before* it destroys
-anything, so `reason` holds the row counts that were about to be lost. That is
-the scope of the restore.
+Purging or deleting a job and deleting an account write a `*.census` row
+*before* they destroy anything, so `reason` holds the row counts that were
+about to be lost: that is the scope of the restore. Other destructive actions
+write their own row but no census — deleting input data (and the derived rows
+it takes) or a player config, an unban, a forced artifact rebuild — so for
+those the query above shows what was done, not how much; a purge's census
+does not count the data gaps and exports it also removes.
 
 ```bash
 # What is restorable, and how old it is.
@@ -65,8 +71,9 @@ STAMP=$(date -u +%Y%m%d%H%M)
 # the default group and loses the WAL settings leave-generation merges need.
 PARAMETER_GROUP=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
   --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' --output text)
-# And its class: the restore serves production from step 5, before the final
-# `terraform apply` puts anything else back.
+# And its class: the restore serves production once the names are swapped
+# and the application repointed (below), before the final `terraform apply`
+# puts anything else back.
 INSTANCE_CLASS=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
   --query 'DBInstances[0].DBInstanceClass' --output text)
 # And a storage ceiling, which a point-in-time restore is not promised to
@@ -203,10 +210,14 @@ again by itself. Say so where contributors will read it, with the remedy: an
 anonymous contributor deletes the `uuid` line from `contribute.txt` and starts
 again (a new UUID is issued); an account created in the window registers
 again; a key made in the window is made again on the account page. How many:
-the identities the damaged instance has that the restored one lacks — on the
-old instance, before it is deleted, `SELECT count(*) FROM anonymous_workers
-WHERE first_seen_at > '<restore time>'`, and the same over `api_keys` and
-`users` by `created_at`.
+the identities the damaged instance has that the restored one lacks. Count them
+**before the rename**, while `birdtest` is still the damaged instance (any time
+after the restore is started): `scripts/prod-sql.sh "SELECT count(*) FROM
+anonymous_workers WHERE first_seen_at > '<restore time>'"`, and the same over
+`api_keys` and `users` by `created_at`. The rename moves the endpoint with it,
+so after it `DATABASE_URL` reaches the restored instance, which lacks exactly
+these rows; the damaged one is then reachable only at
+`birdtest-damaged-$STAMP`'s endpoint.
 
 ---
 
@@ -764,7 +775,8 @@ leaderboard visible.
   failed three times, press **Retry** on it at `/admin/derived-data`: it stays
   failed until someone does, and its job hands out nothing meanwhile. A row
   still `pending` between attempts has no Retry and needs none: it is tried
-  again on its own within 15 minutes. (A
+  again on its own within about 20 minutes (a 15-minute wait, then the next
+  scheduled builder run). (A
   build that fails is tried again after 5 and then 15 minutes on its own, so
   a passing S3 outage heals without anyone.)
 

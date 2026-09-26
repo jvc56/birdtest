@@ -56,7 +56,7 @@ scheduled task ([infra/derived.tf](infra/derived.tf)). Run it once, after
 creating such a job, and it builds what is queued — up to eight files a run —
 and exits. A build that failed waits 5 minutes (then 15) before it is tried
 again, so a run straight after a failure builds nothing; `/admin/derived-data`
-shows the error and the Retry button:
+shows the error, and the Retry button once a build has failed three times:
 
 ```bash
 docker compose run --rm derived-builder

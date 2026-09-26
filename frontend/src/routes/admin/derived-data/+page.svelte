@@ -10,6 +10,7 @@
   async function load() {
     try {
       rows = await api.derivedData();
+      error = '';
     } catch (e) {
       error = e instanceof Error ? e.message : 'could not load derived data';
     }
@@ -39,8 +40,11 @@
 
   const kind = (role: string) => (role === 'wmp' ? 'Wordmap' : 'Rack info table');
 
-  $: waiting = rows.filter((r) => r.state === 'pending' || r.state === 'building');
-  $: failed = rows.filter((r) => r.state === 'failed');
+  // Rows a builder of this version takes: one queued for another is never
+  // built here, so it neither waits nor can be retried, and counted in these
+  // it held the banners up for good.
+  $: waiting = rows.filter((r) => r.buildable && (r.state === 'pending' || r.state === 'building'));
+  $: failed = rows.filter((r) => r.buildable && r.state === 'failed');
 </script>
 
 <h1 class="mb-2 text-2xl font-semibold">Derived data</h1>

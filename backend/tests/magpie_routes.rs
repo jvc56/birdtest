@@ -118,6 +118,45 @@ async fn a_leave_job_is_created_inactive_with_its_generation_zero_leaves_stored(
     assert_eq!((tasks, universe), (0, 0));
 }
 
+/// A-ADMIN-11b: a forced rebuild is in the audit log before it rewrites a
+/// thing. It writes one generation at a time, and one that stopped part-way
+/// -- here generation 1 cannot be rebuilt -- had replaced generation 0's
+/// object and written no row: the only one came at the end.
+#[tokio::test]
+#[ignore]
+async fn a_forced_rebuild_is_logged_before_it_rewrites_anything() {
+    let stack = Stack::new().await;
+    let created = stack.leave_job().await;
+    let id: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    // A generation 1 on record with no universe behind it: its rebuild fails.
+    sqlx::query(
+        "INSERT INTO leave_generation_artifacts (job_id, generation, artifact_key, sha256, builder)
+         VALUES ($1, 1, $2, repeat('0', 64), $3)",
+    )
+    .bind(id)
+    .bind(artifact_key(id, 1))
+    .bind(stack.state.builders.klv())
+    .execute(&stack.db.pool)
+    .await
+    .unwrap();
+
+    let (status, body) =
+        stack.post(&format!("/api/admin/jobs/{id}/rebuild-artifacts?force=true"), json!({})).await;
+    assert!(status.is_server_error(), "{status} {body}");
+    let logged: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT action, reason FROM audit_log WHERE job_id = $1 AND action LIKE 'job.artifacts_rebuil%'",
+    )
+    .bind(id)
+    .fetch_all(&stack.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        logged.iter().map(|(a, _)| a.as_str()).collect::<Vec<_>>(),
+        vec!["job.artifacts_rebuild_started"],
+        "{logged:?}"
+    );
+}
+
 /// A-ADMIN-11: `rebuild-artifacts` recomputes every generation's KLV and says,
 /// per generation, what it found and whether it wrote: an object that is
 /// present is left alone, a lost one is restored from the database, and asking

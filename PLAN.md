@@ -98,7 +98,7 @@ Workers are the clients that perform tasks and submit results. Two types are sup
 #### Worker Integrity and Anomaly Detection
 
 - **Plausibility checks at submission time** — every submission is checked against what is *possible*, not against what is usual: a negative standard deviation, a play scoring negative points, a rack with eight tiles (counted as tiles: a multi-character letter such as Catalan's `[L·L]` is written bracketed and is one), a negative count of moves generated, a per-ply bingo percentage outside [0, 100] or plies out of order, a pentanomial whose pairs need more draws than the games report, a batch reporting a different number of games than the task dispatched. Implemented in [`backend/src/jobs/plausibility.rs`](backend/src/jobs/plausibility.rs). This is the only active integrity mechanism at submission time, and the rest of this section explains why it is the only one that can be.
-- **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID. Applied by an admin; nothing bans automatically. **One row per identity**, enforced by a partial unique index: enforcement is an `EXISTS`, so a second row's reason is never read, while unban deletes by row id — so a duplicate would leave an identity banned after an admin had lifted the ban, with nothing to say why. Banning again with a different reason is unban-then-ban, which the audit log records as both halves.
+- **Worker ban list** — a persistent table of banned worker identities; banned workers cannot claim or submit tasks. Meaningful for authenticated workers; for anonymous workers, banning targets the UUID. Applied by an admin; nothing bans automatically. A ban binds an identity, not a person: a client that sends none mints a new one on every claim, so it cannot be banned, and a banned account's owner can go on contributing without a key (KL-56). **One row per identity**, enforced by a partial unique index: enforcement is an `EXISTS`, so a second row's reason is never read, while unban deletes by row id — so a duplicate would leave an identity banned after an admin had lifted the ban, with nothing to say why. Banning again with a different reason is unban-then-ban, which the audit log records as both halves.
 - **Redundant task execution** — each job specifies a redundancy value X; X independent workers must each complete the task. All X results are stored independently. No consensus or agreement check is performed at submission time — reconciliation is a downstream analysis question deferred past v1. Every aggregate that treats results as observations — SPRT, progress counts, the job list, rating evidence and a leave generation's occurrence totals — reads **one result per task**, the first accepted: games are seeded and deterministic (a leave-generation task carries its seed too), so the other copies replay the same games, and counting them would multiply the evidence by the redundancy. "First" is the task's `accepted_count` read as zero under the task's row lock, which every submission takes before storing anything. A later result for a leave task is credited to its worker (`leave_records`) and not folded into `leave_rack_progress` — a guard rather than a path, since a
 leave-generation job is created at redundancy 1 only.
 
@@ -790,7 +790,7 @@ Email is confirmed before the first login. Logging in without a confirmed email 
    caller's latency; a send that fails is logged and nothing else, since the
    caller was told the same thing either way.
 4. The user clicks the link, landing on `/reset-password/confirm?token=<raw-token>`. The page shows a new-password form.
-5. On submit, `POST /api/auth/reset-password/confirm` reads the token (hash match, not expired, not already used, its account not deleted) without a lock, so a wrong link costs nothing more; takes one of scoring's own turns (two, on the blocking pool — never sign-in's), then charges the link's own bucket (five scorings an hour, whoever sends them: a link refused a weak password still works), and scores the new password against the account and hashes it on the password threads, both outside any transaction, so neither wait holds a lock; then locks the account, spends the token (checked again), stores the new hash, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
+5. On submit, `POST /api/auth/reset-password/confirm` reads the token (hash match, not expired, not already used, its account not deleted) without a lock, so a wrong link costs nothing more; takes one of scoring's own turns (two, on the blocking pool — never sign-in's), then charges the link's own bucket (five scorings an hour, whoever sends them: a link refused a weak password still works), and scores the new password against the account and then hashes it on the password threads, both outside any transaction, so neither wait holds a lock; then locks the account, spends the token (checked again), stores the new hash, and **spends every other outstanding reset token for that account** so an earlier link cannot be replayed. It clears the caller's session cookie.
 
    The reset also **revokes every existing session**. Each session token carries the account's `session_generation`, and `CurrentUser` compares it with the `users` row it already reads on every request; the reset increments it, so every token minted before it — an attacker's included — stops working. `POST /api/auth/sign-out-everywhere` (the "Sign out everywhere" button on the account page) and account deletion increment it the same way.
 6. The user is redirected to `/login` (with no message; signing in with the new password is the confirmation).
@@ -2474,8 +2474,10 @@ detection](#why-impossibility-and-not-per-worker-anomaly-detection) for the
 reasoning and the full table.
 
 Three of them cannot run in the pure validation step, because they need the
-request. They run in `decode_result` (the batch size, from the job's template)
-and `store_result` (what needs the task's own row), and they are
+request. They run in `decode_result` (from the job's template: the batch size,
+a leave result's occurrence total, positions only when the job captures them)
+and `store_result` (what needs the task's own row: an opening-rack batch's
+racks), and they are
 the only submission-time checks that catch a worker reporting work it did not
 do:
 
@@ -4145,9 +4147,14 @@ The server derives the task and job from the token, releases the claim immediate
 rather than waiting out the heartbeat timeout, and records the gap so an admin can
 see what the fleet is missing. Declining is an ordinary outcome, not an error:
 for `missing_data`, `magpie_version` and `unknown_job_type` the worker adds the
-job to its unsupported set and claims again; `task_failed` (and a KLV that does
-not match, `derived_mismatch`) counts as a failure, five in a row ending its
-run. The server does not offer a worker a task it declined within the hour.
+job to its unsupported set and claims again; `derived_mismatch` does not count
+as a failure either — a file built here that does not match sets the job aside
+for the run, the server's KLV for a while, doubling (above); `task_failed`, for
+a task that failed or a result refused, counts as one, five in a row ending
+its run (a task handed back because the worker is stopping is sent as
+`task_failed` too, and counts as nothing). Outside leave generation, the server does not offer a worker a task
+it declined within the hour (counted from the claim's last heartbeat); a
+declined leave task is reissued as it stands.
 
 #### `POST /api/worker/heartbeat`
 
@@ -4667,7 +4674,12 @@ until the heartbeat timeout, so the retry is answered `accepted: false`.
 #### Audit actions
 
 Every significant action writes an `audit_log` row inside the same transaction
-as the action itself, so an audit failure rolls back what it describes. Claims
+as the action itself, so an audit failure rolls back what it describes. The
+exception is an artifact rebuild, which runs over many transactions and writes
+its row *before* it rewrites anything (and a second, with counts, when it
+ends), so that one that stops part-way is still on record. An export is
+logged in the transaction that records it, before its work runs on a task of
+its own; a refused one writes nothing. Claims
 and submissions are the deliberate exception: `task_claims` already records who
 claimed and completed which task and when, so a row per claim and per submission
 duplicated it, cost a write each on the path a worker waits on, and made up most
@@ -4681,7 +4693,8 @@ of the log's growth.
 | `job.purged` / `job.purged.census` | Purge |
 | `job.deleted` / `job.deleted.census` | Delete |
 | `user.deleted` / `user.deleted.census` | Account deletion |
-| `job.artifacts_rebuilt` | Artifact rebuild, with counts |
+| `job.artifacts_rebuild_started` | An artifact rebuild, before it rewrites anything, with `force` |
+| `job.artifacts_rebuilt` | Artifact rebuild, with counts, when it ends |
 | `job.export_started` | An admin starting a results export |
 | `input_data.import_staged` / `input_data.import_confirmed` | Tarball import |
 | `worker.banned` | Ban, with the free-text reason |
@@ -4740,7 +4753,7 @@ The full request and response shapes are in [The Worker API Contract](#the-worke
 
 ### Admin API
 
-All Admin API endpoints require the requesting user to have `is_admin = TRUE`. Requests from non-admin authenticated users or anonymous workers are rejected with `403 Forbidden`.
+All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A non-admin session is rejected with `403 Forbidden`; a request with no session — worker credentials or not — gets `401`.
 
 | Method | Path | Description |
 |---|---|---|
@@ -4760,7 +4773,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `DELETE` | `/api/admin/workers/ban/:id` | Remove a ban, and with it the identity's only ban. |
 | `GET` | `/api/admin/audit-log` | Query the audit log with filtering and pagination. |
 | `GET` | `/api/admin/input-data` | List known input data rows — path, role, name, digest, tarball date. |
-| `DELETE` | `/api/admin/input-data/:id` | Delete an input data row. A row referenced by a job, player config or rating pool cannot be deleted; the foreign key is the safety mechanism and the error is rendered as "used by N jobs". |
+| `DELETE` | `/api/admin/input-data/:id` | Delete an input data row. A row referenced by a job, player config or rating pool cannot be deleted; the foreign key is the safety mechanism and the error reads "this file is pinned by N jobs, player configs or rating pools". |
 | `POST` | `/api/admin/input-data/imports` | Start a tarball import. Returns `202` and an import id immediately; the fetch and diff run as a background task. |
 | `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged, or the failure reason. |
 | `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged **new** rows, in one transaction. |
@@ -4770,7 +4783,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. R
 | `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready — and, for a games or game-pairs job that captured positions, a `positions_download_url` for the second object holding them. |
 | `GET` | `/api/admin/workers` | The contributor list with anonymous workers' real UUIDs, which banning one needs; the public list carries pseudonyms only. |
 | `GET` | `/api/admin/derived-data` | Every wordmap and rack info table the server has been asked to build: state, builder, hash, attempts and the last error. A job whose files are not `built` is not dispatched, and this is where that wait — or the failure behind it — is visible. |
-| `POST` | `/api/admin/derived-data/retry` | Put one `failed` build back in the queue: `{ role, name, builder, kwg_id, klv_id, letterdist_id }`, as `GET /api/admin/derived-data` lists them (`klv_id` null for a wordmap); anything less is a `400`, since rows can share a role and name. Explicit rather than automatic: a failed attempt is tried again after 5 and then 15 minutes, which a passing outage survives, so a build that has failed three times failed for a reason a fourth attempt does not change — a missing or damaged input, a broken binary. |
+| `POST` | `/api/admin/derived-data/retry` | Put one `failed` build back in the queue: `{ role, name, builder, kwg_id, klv_id, letterdist_id }`, as `GET /api/admin/derived-data` lists them (`klv_id` null for a wordmap); without the builder, `kwg_id` or `letterdist_id` it is a `400`, since rows can share a role and name, and a row that matches no failed build of this version's builders — a rack info table sent without its `klv_id` among them — is a `404`. Explicit rather than automatic: a failed attempt is tried again after 5 and then 15 minutes, which a passing outage survives, so a build that has failed three times failed for a reason a fourth attempt does not change — a missing or damaged input, a broken binary. |
 | `GET` | `/api/admin/fleet` | What the field is running, from `task_claims.magpie_version`. |
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name, scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
@@ -7240,7 +7253,12 @@ says so in its implemented option, rather than being removed.
   address.
 - **Option implemented:** None.
 - **Justification:** It is outside the stated threat model (a broken client,
-  not a hostile one), and a ban stops it. Revisit if it is seen.
+  not a hostile one). A ban does **not** stop it: such a client sends no
+  identity, so each claim mints a new one, and banning any of them changes
+  nothing (the thirty-second audit, pass 9, reproduced it: five of five
+  claims after the ban got tasks). Nor does banning an account stop its owner
+  claiming with no key. There is no ban by address; a cap on open claims per
+  address, above, is the lever that would. Revisit if it is seen.
 
 **KL-57. A job waiting on a derived build asks about it on every claim.**
 - **Context:** `derived::status_for_job` runs for a waiting job on every claim
@@ -7584,10 +7602,14 @@ says so in its implemented option, rather than being removed.
   where scripts and emoji place them, and a name that differs from a taken one
   only in those is taken (and an expired, unconfirmed one gives it up) — even
   where a non-joiner is visible, as in Persian, which merges `می‌خواهم` with
-  `میخواهم`. That check scans every name (about a quarter of a second at
-  200,000 accounts, under the registration limit) and is check-then-insert:
-  two twins registering at the same instant both succeed. A unique index on
-  the stripped name would close both, once existing twins are cleared. Look-alikes are left alone: another script's `а` for
+  `میخواهم`, and Malayalam's older chillu (`ന്‍`, allowed as a trailing
+  joiner after a virama) with a bare virama, while it does not merge that
+  chillu with its atomic form (`ൻ`), which looks the same. That check scans
+  every name (about a quarter of a second at 200,000 accounts, under the
+  registration limit) and is check-then-insert: two twins registering at the
+  same instant both succeed. An expression index on the stripped name would
+  make it a lookup, and a unique one close the race once existing twins are
+  cleared. Look-alikes are left alone: another script's `а` for
   `a`, composed and decomposed accents.
 - **Problem:** Variants of a name can sit side by side on the public lists. One
   such variant, a username of 16 hex characters, merges under `?worker=` with
@@ -7888,6 +7910,14 @@ says so in its implemented option, rather than being removed.
   - `GET /api/workers` answers a page past the end without its query now, but
     a page just short of the end still reads `offset + limit` rows of each
     arm's index: about 0.3 s at 300,000 contributing anonymous identities.
+  - The admin audit log has gaps the thirty-second audit left: `job.activated`
+    does not record the allocation, so an allocation change logs no values;
+    `job.deleted` and its census have `job_id` null, so a job's history
+    filtered by job misses its deletion; completing a completed job (or
+    deactivating an inactive one) succeeds and logs a no-op transition;
+    rating-pool membership rows do not name the pool; activating a completed
+    job queues its derived builds before it answers `409`. The job pages show
+    an inactive or completed job's old allocation beside its status.
   - SPRT on a run with no variance — every pair the same outcome — computes an
     LLR of 0 whatever the mean, so a thousand straight wins runs to
     `max_units` and is stored as stopped at its cap, where 999 wins and a draw

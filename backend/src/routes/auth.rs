@@ -376,7 +376,7 @@ async fn register(
         "SELECT EXISTS (SELECT 1 FROM users
                         WHERE lower(username) = lower($1)
                            OR regexp_replace(lower(username), $3, '', 'g')
-                              = regexp_replace(lower($1), $3, '', 'g')),
+                              = (SELECT regexp_replace(lower($1), $3, '', 'g'))),
                 EXISTS (SELECT 1 FROM users WHERE email = $2),
                 EXISTS (SELECT 1 FROM users WHERE email = $2 AND email_confirmed_at IS NOT NULL)",
     )

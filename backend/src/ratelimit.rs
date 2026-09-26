@@ -242,11 +242,14 @@ pub fn check(limiter: &Keyed, key: &str) -> Result<(), AppError> {
         Ok(()) => Ok(()),
         // `governor` tells us exactly how long the caller has to wait; rounding up
         // to the next whole second is what `Retry-After` can express.
-        Err(negative) => Err(AppError::rate_limited(
-            negative.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()))
-                .as_secs()
-                .max(1),
-        )),
+        Err(negative) => {
+            let wait = negative.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()));
+            // Up, not down: a client that waited the whole seconds it was told
+            // was refused again.
+            Err(AppError::rate_limited(
+                (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1),
+            ))
+        }
     }
 }
 

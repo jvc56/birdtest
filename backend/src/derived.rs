@@ -585,10 +585,18 @@ async fn input_bytes(
                 "{path}: the object at {key} hashed to {actual}, not the {expected} imported, \
                  and has been deleted; import its tarball again, then retry this build"
             ),
-            Err(why) => format!(
+            Err(why) if key == format!("inputs/{expected}") => format!(
                 "{path}: the object at {key} hashes to {actual}, not the {expected} imported, \
                  and could not be deleted ({why}); delete that object (RUNBOOK §2.4), import \
                  its tarball again, then retry this build"
+            ),
+            // A key that is not the row's content address was written by hand:
+            // deleting what is there could remove another row's object, and a
+            // re-import uploads to `inputs/{expected}`, not here.
+            Err(_) => format!(
+                "{path}: the object at {key} hashes to {actual}, not the {expected} imported, \
+                 and {key} is not this file's content address, so the row was written by hand; \
+                 delete the row and what pins it, and import its tarball again"
             ),
         }));
     }

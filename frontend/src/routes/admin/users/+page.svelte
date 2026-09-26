@@ -23,7 +23,7 @@
     error = '';
     if (
       !confirm(
-        `Delete ${user.username}? The account is anonymized and signed out everywhere, and its API keys stop working. Its results stay, under the tombstone name; to discard them, ban the worker or purge the jobs.`
+        `Delete ${user.username}? The account is anonymized and signed out everywhere, and its API keys stop working. Its results stay, under the tombstone name, and count as before; only purging a job discards them.`
       )
     )
       return;
