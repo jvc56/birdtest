@@ -257,6 +257,16 @@ async fn the_bearer_scheme_is_read_in_any_case() {
         }
     };
 
+    // A live key in lower case is the key: looked up, and its use recorded.
+    let (status, body) = claim("bearer").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let used: bool = sqlx::query_scalar("SELECT last_used_at IS NOT NULL FROM api_keys WHERE user_id = $1")
+        .bind(user)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(used, "a key sent as `bearer` was not looked up");
+
     let (status, body) = set_active(&app, &headers, &key, false).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     for scheme in ["bearer", "BEARER"] {

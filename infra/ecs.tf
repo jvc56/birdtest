@@ -189,8 +189,8 @@ resource "aws_cloudwatch_metric_alarm" "no_healthy_targets" {
 # Plain HTTP redirects pages (and refuses the API, below). The backend runs
 # with SECURE_COOKIES=true, and a browser discards a Secure cookie set over
 # http, so serving the app on port 80 would make signing in silently
-# impossible -- and would send session cookies
-# and API keys in the clear if it did not.
+# impossible -- and would send session cookies and API keys in the clear if it
+# did not.
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = 80

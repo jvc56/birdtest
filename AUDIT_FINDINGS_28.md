@@ -114,9 +114,19 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   PLAN's alias rule; the AWS CLI pager swallowing a pasted `wait` — all fixed
   or, where MAGPIE must change, bounded and recorded; the adversarial check
   found 4 medium (fence variants the check skipped — it now parses fences;
-  §6's drill broken by §5's new line; eleven more blocks without the pager
+  §6's drill broken by §5's new line; thirteen more blocks without the pager
   off, now enforced; the floor's reason again), all fixed. KL-76, 81 and 82
   updated; KL-83 and KL-84 added. The loop continues.
+- **Pass 14 (follow-up: pass 13's diff, and MAGPIE's contribute client):** 0
+  high and 5 medium from the reviewers — a server-assigned UUID written into
+  `contribute.txt` as it came (a newline added settings every later run
+  obeyed); PLAN promising size bounds the worker does not keep; a settings
+  file MAGPIE could not write losing the identity silently; README's password
+  block with the pager on; the pager check not checking "first" — all fixed,
+  the MAGPIE ones in `5753e212` on `birdtest-contribute`, now pinned; the
+  adversarial check found 2 medium (fences on nested list lines; README's ACM
+  block hiding its CNAME), both fixed. KL-68 and KL-84 updated; KL-85 added.
+  The loop continues.
 
 ---
 
@@ -2022,7 +2032,8 @@ is refused; the count read must equal the fences. §5's placeholders are
 `DR_REGION=''  # …` (and `DR_ACCOUNT`), which its `if` already refuses empty.
 **Verified:** 25 blocks parse; HEAD's RUNBOOK fails at line 975, an indented
 block with an apostrophe'd `${…:?}` fails at 1042, an unclosed fence and a
-`shell` fence fail.
+`shell` fence fail. (13.8 replaced this fix — the fence patterns and the
+count, and the `DR_ACCOUNT` placeholder.)
 
 ### 13.2 Medium — the heartbeat floor's reason was wrong: MAGPIE's 120 s bounds a stall, not a request (backend reviewer)
 
@@ -2127,7 +2138,7 @@ overshoot — covered by KL-83's statement that the floor promises nothing more.
   `DR_ACCOUNT`), the refusal names it, and §6 says to fill it in. **Shown:**
   step 1 replayed with stubs reads the drill's bucket when filled and refuses
   when empty.
-- **"Rotating the database password" and eleven other blocks had no
+- **"Rotating the database password" and thirteen other blocks had no
   `AWS_PAGER`** (13.6 covered §1, §5, §6): a pasted rotation set the new
   password in RDS and never reached SSM. **Fix:** every block that calls `aws`
   begins with `export AWS_PAGER=""` (fourteen added), and `runbook-check.sh`
@@ -2169,3 +2180,152 @@ state of the rename block; 594 tests listed.
   up after 90 tries); §5's step 1 empty and filled.
 - MAGPIE against a stand-in answering `426` (one request, the message shown).
 - MAGPIE unchanged (read only).
+
+## Pass 14 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`7c88905..d511393`; MAGPIE
+unchanged), one reviewer per part it touches: backend; frontend (tier 5
+natively); docs, procedures and scripts; infra. Plus one area not examined in
+this run: **MAGPIE's contribute client** — the claim, heartbeat and submission
+loop, the settings file, the HTTP client, and what a server's answers become on
+the contributor's machine.
+
+**Findings: 0 high, 5 medium** from the five reviewers (backend none, 3 low;
+frontend none, 2 low — tier 5 natively 11 of 11; docs and procedures 2
+medium, 6 low; infra none, 3 low, 2 unconfirmed; MAGPIE's client 3 medium, 9
+low, 2 unconfirmed). All fixed, the MAGPIE ones on `birdtest-contribute`.
+
+### 14.1 Medium — a server-assigned `worker_uuid` was written into `contribute.txt` as it came (MAGPIE reviewer)
+
+MAGPIE checked only that the UUID was present, then appended `uuid <value>` to
+the settings file and sent the value as `X-Worker-UUID`. A value with newlines
+added settings of the server's choosing, which every later run obeyed (the
+last `server` line wins), and its CRLF reached the wire as header injection.
+**Shown** with the committed binary against a stand-in:
+`contribute.txt` gained `server http://127.0.0.1:1/elsewhere` and `threads 1`.
+**Fix:** only a canonical UUID (8-4-4-4-12 hex digits) is adopted; anything
+else is ignored with a line saying so, and the next claim asks again.
+**Verified:** the same stand-in against the fixed binary leaves the file as it
+was and prints "the server sent a worker identity that is not a UUID";
+`contribute_test.c` checks the form against ten values, a newline and a CR
+among them.
+
+### 14.2 Medium — PLAN promised the worker bounds what the server asks for; nothing does (MAGPIE reviewer)
+
+Response bodies, `num_games`, `num_plays` and the recorded-play counts are
+checked only for being positive: under `ulimit -v`, a 2 GiB artifact, two
+billion plays and a 10^15-game task each ended in a failed allocation and an
+abort. AUDIT_FINDINGS_19 had weighed this and left it — the worker trusts its
+server's sizes — but PLAN still said the opposite. **Fix:** PLAN's "Client
+security" states the trust model; KL-85 records the gap and the bounds that
+would close it.
+
+### 14.3 Medium — a settings file MAGPIE could not write lost the worker's identity silently (MAGPIE reviewer)
+
+With `contribute.txt` read-only, the issued UUID lasted one run and each
+restart was a new anonymous worker, with nothing printed — the case PLAN's
+design exists to prevent. **Fix:** the failed write is reported, with the line
+to add by hand. **Verified:** read-only, the run prints "could not save this
+worker's identity to contribute.txt; add the line uuid 6f3d7198-…"; writable,
+the line is appended as before; a test writes to a path that cannot exist.
+
+### 14.4 Medium — README's password block had the pager problem RUNBOOK's had (docs reviewer)
+
+README's first-deploy password block (which rotation reuses) called
+`modify-db-instance` with the pager on: without bracketed paste, `less` ate
+the `wait` and the endpoint lookup, and `put-parameter` wrote
+`postgres://birdtest:…@:5432/birdtest` to SSM. **Fix:** README's three `aws`
+blocks turn the pager off, its example `contribute.txt` is labelled `text`, its
+ACM block parses (the ARN captured, not `<arn>`), and CI runs the check over
+README too.
+
+### 14.5 Medium — the pager check did not check "first" (docs reviewer)
+
+`runbook-check.sh` asked only that `export AWS_PAGER=""` appear somewhere in a
+block, and its `aws` pattern missed a tab, backticks, a line continuation and
+a quoted name: a block paging before its export passed, and replayed, the
+`wait` never ran. **Fix:** a block that mentions `aws` anywhere but a comment
+line must have the export as its first line of code; the pattern is widened;
+no pipes (one closed early under `pipefail` passed a large block). A fence on a
+list item's own line is refused, and a label's CR is shown. **Verified:** of
+the reviewer's 34 cases, every one that should fail fails (`aws` before the
+export, tab, backtick, continuation, `sudo`, `command`, `xargs`, a heredoc or
+`if false` export, `"aws"`, `'aws'`); the exceptions are an `AWS_PAGER=''`
+export, which is accepted, and an indented code block or `<pre>`, which are
+not fenced; RUNBOOK (25 blocks) and README (18) pass; HEAD's README fails.
+
+### 14.6 Low findings
+
+**Fixed:**
+- Backend: the bearer test also shows a live key sent as `bearer` is looked up
+  and its use recorded; an empty CSRF cookie and header no longer match.
+- MAGPIE (`5753e212`, which `docker/Dockerfile` now pins; `MAGPIE_VERSION`
+  stays 0.1.1, since nothing computed changes): a negative `maxtasks` is
+  refused; `bonus_square_from_char` indexes as unsigned (a byte above 0x7f
+  was a negative index) — both from KL-68, which said they would go with the
+  next MAGPIE change.
+- Docs: PLAN's HTTP requirements say `timeout_seconds` bounds a stall, not the
+  exchange; the eight `dlopen`ed symbols listed; where `impl_contribute`
+  lives and what `contribute.c` holds; "known values" for lexicon names is now
+  the character set the code checks; README's HTTPS sentence keeps its reason
+  with it; `ecs.tf`'s comment; KL-84 notes the `426` has no `Upgrade` header.
+
+**Recorded:** KL-68 (cross-host redirects, a leave task with no lexicon, the
+unchecked double-to-int cast, terminal escapes, the per-task mutex, exit 0
+after errors, a non-JSON `200` counted as accepted, a decline's answer unread,
+`maxtasks` truncation); KL-85. **Left:** the import form's button 2 px off
+its inputs; the staged-files table scrolling in its box on a phone.
+
+### 14.7 Adversarial check of the pass's fixes
+
+**2 medium, both fixed.**
+
+- **A fence on a nested or quoted list item's line was still skipped** —
+  `- - ```bash`, `1. - ```bash`, `> 1. ```bash`: none matched the list-marker
+  rule or the opener, and unclosed (a list's end closes it) the block rendered
+  as bash and was never read (`ok`, rc 0; rendered with micromark). **Fix:**
+  outside a block, any fence run after anything but blanks is refused —
+  quote marks, list markers, nesting and prose alike; neither RUNBOOK nor
+  README has one. **Verified:** the three cases fail; of the 55 case files
+  from this pass and the last, those accepted are only an `AWS_PAGER=''`
+  export, an export with leading blanks or a trailing comment, a call by full
+  path after the export, and three the header names as out of reach (an
+  indented code block, `<pre>`, a block that unsets the pager after turning
+  it off).
+- **README's ACM block, made to paste whole, hid the CNAME and blocked.**
+  `describe-certificate` ran before ACM had a record (`null`), then `wait`
+  sat for up to forty minutes on a certificate that could not validate, the
+  ARN shown only after. **Fix:** two blocks — the request prints the ARN and
+  polls (up to five minutes) until the CNAME exists, printing it; the second,
+  run once the CNAME is in DNS, waits and prints the `prod.tfvars` line. Each
+  refuses its empty placeholder. **Shown** with a stub that answers `None`
+  twice: the ARN, then the CNAME, then the wait; with nothing filled in, both
+  blocks refuse and nothing is called.
+
+**Lows fixed:** the `aws` pattern catches a call by path or through `${AWS:-aws}`;
+the first line may carry leading blanks. **Held:** MAGPIE's canonical-UUID
+check (a truncated value must still pass all 36 positions); a rejected UUID
+followed by a task ends in five failures and an exit, nothing spins; valgrind
+clean on the rejected and read-only paths; no documented use of a negative
+`maxtasks`; nothing else names the old pin; the CSRF cookie is always 48 hex
+characters, so no real request carries an empty token; mawk and busybox awk
+agree with the checker's results.
+
+### 14.8 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included,
+  `MAGPIE_BIN` the `portable_release` build of `5753e212`: **594 of 594**.
+- **MAGPIE's suite** (`no_pgo_release`, each default test alone): **70 of 70**;
+  `format.py` and `find_circ_deps.py` (on a clean copy) pass.
+- **Tier 6, natively, every case** (M-1 to M-7, M-9 to M-11) with `5753e212`:
+  passed.
+- MAGPIE against stand-ins: the injected UUID (committed binary writes the
+  `server` line; fixed binary ignores it), a read-only settings file (the
+  warning), a writable one (the line appended).
+- `npm run check`: 0 errors, 0 warnings (the frontend is unchanged this
+  pass); tier 5 was run by the frontend reviewer on `d511393`: 11 of 11.
+- `terraform fmt -check` and `validate`: pass.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks; the case
+  files as above; README's password and alert blocks replayed with the paging
+  stub (no call paged), and its ACM blocks with a stub.

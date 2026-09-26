@@ -3306,8 +3306,8 @@ void chttp_response_destroy(ChttpResponse *response);
 | Windows | **WinHTTP** (`winhttp.dll`) | Ships with the OS, no redistributable, Schannel trust store already configured. |
 | wasm | Stub | Pushes `ERROR_STATUS_HTTP_UNAVAILABLE`. |
 
-**`dlopen` rather than link-time binding.** Only seven symbols are needed
-(`curl_easy_init`, `_setopt`, `_perform`, `_getinfo`, `_cleanup`,
+**`dlopen` rather than link-time binding.** Only eight symbols are needed
+(`curl_easy_init`, `_setopt`, `_perform`, `_getinfo`, `_cleanup`, `_strerror`,
 `curl_slist_append`, `curl_slist_free_all`). Resolving them at first use means a
 machine without libcurl still runs every offline MAGPIE command, and `contribute`
 fails with "libcurl not found; install libcurl4" rather than MAGPIE refusing to
@@ -3315,7 +3315,8 @@ start at all. Try `libcurl.so.4`, then `libcurl.so`, then `libcurl.4.dylib`.
 
 Requirements that hold on every backend: **TLS certificate verification is on and
 cannot be disabled** — no flag, no environment variable; redirects followed,
-bounded at 5; `timeout_seconds` covers the whole exchange; the response body is
+bounded at 5; `timeout_seconds` bounds a connect and a stall, not the exchange
+(`CHTTP_MAX_EXCHANGE_SECONDS`, an hour, does that — KL-83); the response body is
 length-delimited rather than NUL-delimited, since artifacts are binary; and no
 global process state at exit, because `contribute` may run many requests.
 
@@ -3421,6 +3422,10 @@ yet sends no identity at all on its first request; the server responds with a
 UUID in the body of the first successful `/api/worker/task` claim — once there is
 actually a task to hand out — and the client persists it and sends it as
 `X-Worker-UUID` from then on, for the rest of this run and every run to come.
+Only a UUID in canonical form is taken (a newline in one wrote settings every
+later run obeyed); a settings file that cannot be written is said so, with the
+line to add by hand, since otherwise every run would be a new worker
+(thirty-second audit, pass 14).
 
 This is a deliberate reversal from letting the client generate its own UUID: a
 client-generated identity trusts a value the server never gets to validate.
@@ -3452,8 +3457,10 @@ magpie> contribute                      # reads ./contribute.txt
 magpie> contribute /path/to/other.txt   # a path is not a secret
 ```
 
-Implemented as `impl_contribute(Config *config, ErrorStack *error_stack)` in
-`src/impl/contribute.c`, following the other `impl_*` entry points.
+Implemented as `impl_contribute(Config *config, const char *settings_path,
+ErrorStack *error_stack)` in `src/impl/config.c`, following the other `impl_*`
+entry points, which owns the loop; `src/impl/contribute.c` holds the protocol
+it drives — claiming, heartbeating, submitting, the anonymous-UUID handshake.
 
 **Threads** default to `num_cores - 1`, minimum 1, overridable by the `threads`
 key. Contributing should leave the machine usable — this will eventually be a
@@ -4250,12 +4257,16 @@ backoff, not as an error.
 - The worker UUID is minted by the server, never trusted from the client, so a
   client cannot pick or collide an identity on its own.
 - **Every field of a task request is untrusted input.** It becomes file paths
-  (`previous_artifact_key`) and numeric parameters. Validate lexicon and variant
-  against known values before they reach `data_filepaths`, and reject artifact
-  keys containing `..` or a leading `/`.
-- Bound everything the server can ask for — batch sizes, rack-subset sizes,
-  iteration counts. A compromised or buggy server must not be able to make a
-  contributor's machine allocate without limit.
+  (`previous_artifact_key`) and numeric parameters. Lexicon and variant names
+  are held to a safe character set before they reach `data_filepaths`, so they
+  stay inside the data directory, and artifact keys containing `..` or a
+  leading `/` are refused. The worker UUID the server assigns is taken only in
+  canonical form: it becomes a header and a settings line, and a newline in it
+  wrote settings every later run obeyed (thirty-second audit, pass 14).
+- **Sizes are the server's to choose.** Batch sizes, play counts, rack counts
+  and response bodies are checked for sense (positive, present), not bounded:
+  the worker trusts its server's sizes, as AUDIT_FINDINGS_19 decided, and a
+  server that asks for too much ends the worker's run (KL-85).
 
 ### GUI integration surface
 
@@ -8220,7 +8231,34 @@ says so in its implemented option, rather than being removed.
   real fix and needs a MAGPIE release and a `MIN_MAGPIE_VERSION` bump (tier 6
   talks to `http://localhost:8080`, which a loopback exception keeps working).
 - **Justification:** One request's disclosure, loudly reported, where every
-  request's was silent; the message says to revoke a key sent that way.
+  request's was silent; the message says to revoke a key sent that way. (The
+  `426` goes without the `Upgrade` header RFC 9110 asks of it — a fixed
+  response cannot set headers; libcurl and browsers show the body regardless.)
+
+**KL-85. The worker trusts its server's sizes.**
+- **Context:** MAGPIE's `chttp.c` (`write_callback`), the games,
+  opening-rack and leave-generation executors in `config.c`
+  (thirty-second audit, pass 14; AUDIT_FINDINGS_19 §4 weighed it first).
+- **Problem:** Nothing on the worker caps what the server asks for: a response
+  body grows without limit, and `num_games`, `num_plays` and the recorded-play
+  counts are checked only for being positive. A compromised or buggy server
+  ends its workers' runs — shown under `ulimit -v`: a 2 GiB artifact, a
+  `num_plays` of two billion, and a games task of 10^15 with positions
+  captured each end in a failed allocation and an abort, with no decline, so
+  the claim lapses and the next worker dies the same way. Distinct
+  `previous_artifact_sha256` values and pinned rack tables also grow the data
+  directory without limit.
+- **Options considered:** a cap on response bodies in `chttp`
+  (`CURLOPT_MAXFILESIZE_LARGE` and a limit in the write callback); upper bounds
+  in `config_contribute_*` matching the server's own (plays, recorded plays,
+  plies, a games and racks ceiling), refused as a server error so the task is
+  declined.
+- **Option implemented:** None: the server validates every size it hands out
+  (pass 3.2 of this audit), and a server that does not is already in a
+  position to waste its workers' time.
+- **Justification:** The trust model is the one AUDIT_FINDINGS_19 chose;
+  PLAN had said otherwise until pass 14. Worth doing with the next MAGPIE
+  release that touches the executors.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
@@ -8492,8 +8530,6 @@ says so in its implemented option, rather than being removed.
 - **Context:** `birdtest-contribute`'s `contribute.c`, `client_state.c`.
 - **Problem:**
   - The raw autoplay summary line is printed on every games and leave task.
-  - A negative `maxtasks` in `contribute.txt` is accepted and stops the run
-    after one task.
   - A heartbeat's single attempt can block for about 120 seconds against an
     unreachable server, and the submission waits for it.
   - An `expected_data` entry with a role MAGPIE does not know is skipped
@@ -8515,13 +8551,30 @@ says so in its implemented option, rather than being removed.
   - Replacing a stale wordmap, rack info table or fetched KLV renames over the
     old file, which `rename()` does not do on Windows; the Windows build is
     written but has never been compiled or run.
-  - `bonus_square_from_char` indexes its table with a `char`, so a layout byte
-    above 0x7f is a negative index — an out-of-bounds read that accepted `é`
-    as a square. birdtest refuses such a layout at job creation (thirty-second
-    audit); the cast belongs with the next MAGPIE change.
+  - A redirect is followed to any host or port with the request's body and
+    `X-Worker-UUID` (KL-84 has the scheme half).
+  - A leave task with no `lexicon` names a file `(null)_birdtest_….klv2`
+    before failing to load it (a server bug is needed to send one).
+  - `json_get_int_or` casts a double to `int` unchecked, which is undefined
+    past `int`'s range (used for `num_plays` and display caps).
+  - A shutdown's message, `expected_data` paths and error bodies are printed
+    raw, so a server can send terminal escapes.
+  - `heartbeat_start` initialises its mutex on every task and never destroys
+    it.
+  - `magpie contribute` exits 0 after every error (five failures, a `401`, no
+    server), so a supervisor restarting on failure never restarts it.
+  - A captive portal answering a result with a `200` that is not JSON is
+    counted as an accepted task (reasoned, not run).
+  - A decline's answer is not read: a `401` passes silently and the run claims
+    again at once.
+  - `maxtasks` goes through `string_to_int`, which truncates a long:
+    `4294967296` reads as 0, no limit.
 - **Options considered:** each fix as named, on `birdtest-contribute`; bump
   to 0.1.2 before the branch is first pushed if anything between is ever built.
-- **Option implemented:** None.
+- **Option implemented:** Pass 14 fixed a negative `maxtasks` (now refused),
+  the `bonus_square_from_char` sign (a byte above 0x7f was a negative index),
+  and — with reasons of their own — the server-assigned UUID's form and a
+  settings file that cannot be written. The rest: none.
 - **Justification:** None changes a result. They go with the next MAGPIE change
   that has a reason of its own.
 

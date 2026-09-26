@@ -205,7 +205,7 @@ A contributor needs only MAGPIE — no Python, no Docker, nothing else to
 install. Put a `contribute.txt` in the directory you run it from, the one
 holding its `data/` (MAGPIE reads both from its working directory):
 
-```
+```text
 server   http://localhost:5173
 threads  7
 maxtasks 0
@@ -304,13 +304,38 @@ A first deployment, in order (each step is described below):
 3. Request an ACM certificate for the site's hostname in the stack's region,
    add its validation CNAME, and wait for it: the first apply creates the HTTPS
    listener, which refuses a certificate still pending validation and leaves
-   the apply half done.
+   the apply half done. First the request, which prints the certificate's ARN
+   and, once ACM has made it (a few seconds), the CNAME to add:
    ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
    REGION=us-east-1   # the stack's region, as in prod.tfvars
-   aws acm request-certificate --region "$REGION" --domain-name <hostname> --validation-method DNS
-   aws acm describe-certificate --region "$REGION" --certificate-arn <arn> \
-     --query 'Certificate.DomainValidationOptions[0].ResourceRecord'   # the CNAME to add (null for a few seconds: ask again)
-   aws acm wait certificate-validated --region "$REGION" --certificate-arn <arn>
+   SITE_HOSTNAME=''   # the site's hostname, e.g. birdtest.example.org
+   if [ -z "$SITE_HOSTNAME" ]; then
+     echo "set SITE_HOSTNAME first" >&2
+   elif ARN=$(aws acm request-certificate --region "$REGION" --domain-name "$SITE_HOSTNAME" \
+       --validation-method DNS --query CertificateArn --output text); then
+     echo "ARN=$ARN   # for the next block, and acm_certificate_arn in prod.tfvars"
+     for _ in $(seq 60); do   # up to five minutes
+       CNAME=$(aws acm describe-certificate --region "$REGION" --certificate-arn "$ARN" \
+         --query 'Certificate.DomainValidationOptions[0].ResourceRecord.[Name,Value]' \
+         --output text) && [ -n "$CNAME" ] && [ "$CNAME" != None ] && break
+       CNAME=''
+       sleep 5
+     done
+     if [ -n "$CNAME" ]; then echo "add this CNAME: $CNAME"
+     else echo "no CNAME yet: ask describe-certificate for it by hand" >&2; fi
+   fi
+   ```
+   Then, with the CNAME in DNS, wait for it (a few minutes; the wait gives up
+   after about forty):
+   ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+   if [ -z "${ARN:-}" ]; then
+     echo "no ARN: run the block above first (or set ARN from its output)" >&2
+   else
+     aws acm wait certificate-validated --region "$REGION" --certificate-arn "$ARN" \
+       && echo "acm_certificate_arn = \"$ARN\""   # for prod.tfvars, step 4
+   fi
    ```
 4. Write `infra/prod.tfvars` with the eight variables that have no default --
    `backend_image`, `derived_builder_image`, `frontend_image`, `alert_email`,
@@ -367,6 +392,7 @@ would break the fixed `DATABASE_URL`). Terraform creates the instance with a
 placeholder; replace it, then write the URL:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 DB_INSTANCE=birdtest   # the RDS identifier Terraform created
 # The stack's region on every command: with the CLI's default elsewhere,
 # put-parameter quietly creates the parameters in the wrong region, the real
@@ -393,10 +419,10 @@ To rotate the password later, run the same `modify-db-instance` and
 (RUNBOOK.md, "Rotating the database password").
 
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
-redirects pages and refuses `/api/*` with a `426`, so a worker set to
-`http://` fails at once rather than sending its credential in the clear on
-every request — because the backend sets `Secure` cookies, which a browser will not
-keep over plain HTTP. `public_url`, `ses_domain` and `mail_from_address` have
+redirects — because the backend sets `Secure` cookies, which a browser will not
+keep over plain HTTP. The API is not redirected but refused (`426`), so a
+worker set to `http://` fails at once rather than sending its credential in
+the clear on every request. `public_url`, `ses_domain` and `mail_from_address` have
 none: they are what every confirmation and reset mail links to and is sent
 from, and a placeholder left in is refused. `min_magpie_version` defaults to
 `0.1.1`, the `birdtest-contribute` version the backend image pins; raise it
@@ -431,6 +457,7 @@ subscription is confirmed), and after any change to the alerts topic: nothing
 else will say an alert was dropped. With `REGION` set as above:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 # A function, not a variable holding the command: zsh does not split one. Not
 # named `tf`: that is a common alias for terraform, and in bash an alias is
 # expanded in a function definition -- `tf() {...}` then redefined

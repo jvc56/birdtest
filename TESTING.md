@@ -2831,13 +2831,16 @@ the real check of the backups themselves.
 - `S-RUNBOOK-1` Every bash block in RUNBOOK.md parses: an operator pastes them
   during an incident, and one that does not leaves a continuation prompt that
   swallows what is pasted next — an apostrophe in a `${STAMP:?…}` message did
-  that to the restore's backup-settings command. Every fence is parsed: blocks
-  indented in a list are read too (the first cut read 16 of 25), a fence
-  labelled anything but exactly `bash` or `sql` (`Bash`, `sh`, `bash title=…`,
-  unlabelled, quoted) or never closed is refused, and a block that calls `aws`
-  must first `export AWS_PAGER=""` (the pager swallowed a pasted `wait`).
-  *(Covered: `scripts/runbook-check.sh`, `bash -n` per block, in CI's
-  `scripts` job.)*
+  that to the restore's backup-settings command. README.md's blocks too. Every
+  fence is parsed: blocks indented in a list are read too (the first cut read
+  16 of 25), a fence labelled anything but exactly `bash`, `sql` or `text`
+  (`Bash`, `sh`, `bash title=…`, unlabelled), a fence run after any other text
+  on its line (a quote mark, a list marker, a nested list) or a fence never
+  closed is refused, and a block that mentions `aws` must turn the
+  pager off in its first line of code (the pager swallowed a pasted `wait`; an
+  export after the first call was too late).
+  *(Covered: `scripts/runbook-check.sh RUNBOOK.md README.md`, `bash -n` per
+  block, in CI's `scripts` job.)*
   (Thirty-second audit.)
 - `S-SCRUB-1` A scrubbed dump holds no credential: every anonymous worker's
   UUID is replaced, with its claims, ban and audit rows following it and what
