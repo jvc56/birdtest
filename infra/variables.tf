@@ -237,6 +237,11 @@ variable "backup_ephemeral_storage_gib" {
   EOT
   type        = number
   default     = 100
+
+  validation {
+    condition     = var.backup_ephemeral_storage_gib >= 21 && var.backup_ephemeral_storage_gib <= 200
+    error_message = "Fargate ephemeral storage is 21 to 200 GiB."
+  }
 }
 
 variable "restore_ephemeral_storage_gib" {

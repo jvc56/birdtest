@@ -728,8 +728,9 @@ Test the pure functions; do not snapshot the SVG.
 - `F-CHART-2` It clamps a runaway error bar rather than letting one
   barely-measured config flatten the scale, and still reports the true number in
   the table. The anchor has no bar at all, whatever error the fit stored for it
-  (with no games, `f64::MAX`, which was drawn at the cap). *(Covered:
-  `charts/ratingDotPlot.test.ts`.)*
+  (with no games, `f64::MAX`, which was drawn at the cap). An error the fit
+  could not measure (`f64::MAX`) reads `±∞` in the table and tooltip, not
+  `±1.8e308`. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-3` A config with `connected_to_anchor: false` is listed as unrated
   and **not** drawn at a position. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-4` `RatingHistoryChart` caps at six series, picks them by latest
@@ -1327,13 +1328,16 @@ permanent.
   (`ratings.rs`'s `assert_only_the_control_counted`), and
   `ratings::a_head_to_head_counts_pairs_and_scores_half_points_over_four`.)*
 - `I-RATE-2` Excluded: wrong `variant`, wrong `letterdist_id`, wrong `layout_id`,
-  a job whose player is not a pool member, and a plain `games` job. One test per
-  exclusion, because each is a separate clause. *(Covered:
+  a job whose player is not a pool member, a plain `games` job, and a self-play
+  job (both seats one config), which is also left out of the run's
+  `pairs_used` and `jobs_used`. One test per exclusion, because each is a
+  separate clause. *(Covered:
   `ratings::a_pairs_job_in_another_variant_is_not_evidence`,
   `ratings::a_pairs_job_on_another_letter_distribution_is_not_evidence`,
   `ratings::a_pairs_job_on_another_board_layout_is_not_evidence`,
   `ratings::a_pairs_job_against_a_non_member_is_not_evidence`,
-  `ratings::a_plain_games_job_is_not_evidence`.)*
+  `ratings::a_plain_games_job_is_not_evidence`,
+  `ratings::a_self_play_job_is_not_counted_as_evidence` (thirty-second audit).)*
 - `I-RATE-3` The pair is the unit: a head-to-head's `games` equals pairs, not
   games, and its score is the half-point total over four. Under redundancy 2 a
   task is evidence once, through its first accepted copy. *(Covered:

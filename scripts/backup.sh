@@ -2,7 +2,9 @@
 #
 # Nightly logical backup of the birdtest database. Runs as a one-shot Fargate
 # task on the official Postgres image (see infra/backup.tf, which passes this
-# file as the container command), and can be run by hand against any database:
+# file as the container command), and can be run by hand against any database
+# whose schema the backend applied (it reads `_sqlx_migrations`; a schema
+# applied with psql alone needs that table -- see backup-drill-check.sh):
 #
 #   DATABASE_URL=postgres://... BACKUP_BUCKET=my-bucket ./scripts/backup.sh
 #

@@ -52,6 +52,14 @@ const MAX_MOVE_SCORE: i32 = 100_000;
 /// magnitude as a score plus a leave adjustment.
 const MAX_ABS_EQUITY: f64 = 200_000.0;
 
+/// A leave-generation rack's mean is the mean equity of the best play made from
+/// that full rack — score plus leave — so a 21x21 board raises it too. It keeps
+/// the bound move equities had before they were widened for that board: the
+/// shipped lexicons stop at 15 letters, which caps a play at ×36 (a quadruple
+/// and two triples), low thousands at most, and a mean over games sits far
+/// below its best play; only a 21-letter edge word reaches ×144.
+const MAX_ABS_RACK_MEAN: f64 = 5_000.0;
+
 fn finite(value: f64, field: &str) -> AppResult<()> {
     if !value.is_finite() {
         return Err(AppError::bad_request(format!(
@@ -265,7 +273,7 @@ pub fn check_rack_occurrences(racks: &[RackOccurrence]) -> AppResult<()> {
             )));
         }
         finite(occurrence.mean, &format!("leave result: mean equity of {:?}", occurrence.rack))?;
-        if occurrence.mean.abs() > MAX_ABS_EQUITY {
+        if occurrence.mean.abs() > MAX_ABS_RACK_MEAN {
             return Err(AppError::bad_request(format!(
                 "leave result: rack {:?} has an implausible mean equity {}",
                 occurrence.rack, occurrence.mean

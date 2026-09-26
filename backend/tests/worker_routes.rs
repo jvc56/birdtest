@@ -784,7 +784,7 @@ async fn every_implausible_leave_result_is_a_400_that_says_why() {
             "more than a rack holds"),
         ("a rack that never occurred", |a| edit(rack_occurrences(a), |v| v["racks"][1]["count"] = json!(0)),
             "a rack that did not occur should not be reported"),
-        ("an implausible mean", |a| edit(rack_occurrences(a), |v| v["racks"][0]["mean"] = json!(200_001.0)),
+        ("an implausible mean", |a| edit(rack_occurrences(a), |v| v["racks"][0]["mean"] = json!(6000.0)),
             "implausible mean equity"),
         ("a rack listed twice", |a| edit(rack_occurrences(a), |v| v["racks"][1]["rack"] = v["racks"][0]["rack"].clone()),
             "appears more than once"),

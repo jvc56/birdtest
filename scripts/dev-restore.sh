@@ -5,9 +5,12 @@
 #   ./scripts/dev-restore.sh .dev-backups/20260907-120000
 #   ./scripts/dev-restore.sh path/to/pg/2026-09-07T03-00-00Z/dump   # a production dump
 #
-# A production dump is scrubbed on the way in unless SCRUB=0 is set: it carries
-# real email addresses and password hashes, and the whole point of restoring it
-# locally is the shape of the data, not those (PLAN.md, "Local development").
+# Every restore is scrubbed on the way in unless SCRUB=0 is set -- a snapshot
+# of your own stack too, whose passwords, API keys and anonymous identities it
+# then resets. A production dump needs it: it carries real email addresses and
+# password hashes, and the whole point of restoring it locally is the shape of
+# the data, not those (PLAN.md, "Local development"). Set SCRUB=0 to restore
+# your own snapshot as it was.
 
 set -Eeuo pipefail
 

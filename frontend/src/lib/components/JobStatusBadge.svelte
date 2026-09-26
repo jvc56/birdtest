@@ -10,6 +10,8 @@
     running: 'bg-warning/15 text-warning border-warning/30',
     terminated_at_max: 'bg-muted text-muted-foreground border-border'
   };
+  // A games or pairs job's cap is not always games.
+  const labels: Record<string, string> = { terminated_at_max: 'at its cap' };
 </script>
 
 <span
@@ -17,5 +19,5 @@
     status
   ] ?? styles.inactive}"
 >
-  {status.replace(/_/g, ' ')}
+  {labels[status] ?? status.replace(/_/g, ' ')}
 </span>

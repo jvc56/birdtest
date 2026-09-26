@@ -182,8 +182,11 @@ resource "aws_iam_role" "derived_builder_scheduler" {
 data "aws_iam_policy_document" "derived_builder_scheduler" {
   statement {
     actions = ["ecs:RunTask"]
-    # Both forms: the schedule names the family without a revision, and
-    # which of the two IAM evaluates for that is not documented.
+    # The schedule names the family without a revision; RunTask's resource is
+    # always a revisioned task-definition ARN (the service authorization
+    # reference), which `:*` matches. The bare family is listed as well, since
+    # no AWS page says outright which one a revisionless schedule is checked
+    # against, and it widens nothing.
     resources = [
       aws_ecs_task_definition.derived_builder.arn_without_revision,
       "${aws_ecs_task_definition.derived_builder.arn_without_revision}:*",

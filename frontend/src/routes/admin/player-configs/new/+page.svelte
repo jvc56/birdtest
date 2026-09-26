@@ -61,7 +61,7 @@
     try {
       files = await api.inputData();
     } catch (e) {
-      error = `Could not load input data: ${e instanceof Error ? e.message : String(e)}`;
+      error = `Could not load input data: ${errorText(e)}`;
       return;
     }
     // Filtered from `files` here rather than read off the `$:` arrays above:

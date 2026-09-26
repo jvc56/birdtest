@@ -25,6 +25,11 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   fit over ten rounds — all fixed within the pass. KL-74 closed; KL-78 and
   KL-79 added; KL-17, 44, 54, 60, 63, 68, 75, 76 updated. The loop continues
   (pass 1 found medium).
+- **Pass 2 (follow-up: pass 1's diff, and the backup pipeline and restore
+  drill):** 0 high and 2 medium from the reviewers (E-8 could not pass; PLAN
+  said the drill writes a result row), both fixed and verified; the
+  adversarial check found no high or medium. Lows mostly fixed; KL-80 added,
+  KL-65, 75, 76 updated. The loop continues (pass 2 found medium).
 
 ---
 
@@ -215,8 +220,9 @@ re-weighted once it reached its third correction.
     error a few percent wider at most. The rest is KL-79, with the check's
     figures.
 
-**Verified:** 30 unit tests (`U-STATS-5`, each adversarial case among them)
-fail against the version they broke and pass; the analytic `U-STATS-4` errors
+**Verified:** the 18 `U-STATS-5` tests (each adversarial case among them) fail
+against the version they broke and pass, as do the 12 fit tests that predate
+the run; the analytic `U-STATS-4` errors
 still hold; the ratings and public API integration tests pass.
 
 ### 1.6 Adversarial checks of the pass's fixes
@@ -265,3 +271,124 @@ inside a refill (it failed at load average 13): both corrected.
   Postgres, in the adversarial check.
 - MAGPIE did not change, so its test table and tier 6's native run were not
   required.
+
+---
+
+## Pass 2 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`a229895..3fdbc27`; MAGPIE
+unchanged), reviewed against every objective, one reviewer per part it
+touches: backend (the rating fit above all, and the idle finish check);
+frontend; docs and procedures (PLAN, TESTING, README, `scripts/`); infra.
+Plus one area not examined in recent passes: **the backup pipeline and the
+restore drill** — `scripts/backup.sh` and `restore-drill.sh`, their manifests
+and the `backups` row, `infra/backup.tf` (schedules, IAM, the drill's disk and
+alarms), `routes/admin.rs`'s backups view, RUNBOOK §§ on restore, and the
+nightly CI jobs that exercise them.
+
+**Findings: 0 high, 2 medium** from the five reviewers (backend none, 4 low;
+frontend 1 medium, 5 low; docs and procedures none, 7 low, 2 unconfirmed;
+infra none, 2 low; backups 1 medium, 11 low, 2 unconfirmed). Both fixed and
+verified; the adversarial check is 2.4.
+
+### 2.1 Medium — E-8 could not pass (frontend reviewer)
+
+**Test updated.** E-8 looked for the SPRT line `… — LLR …` on the settled
+seeded game-pairs job, but a job the finish check completes has stored its
+verdict since the eleventh audit, and the page then shows `Completed: …`
+instead — so the locator timed out on every run. Pass 1's label change
+("stopped at its cap") added a second mismatch to its regex. TESTING lists E-8
+as covered; tier 5 has not run in any audit since AUDIT_FINDINGS_14 (image
+builds), which is how it went unseen. **Fix:** E-8 asserts the `Completed:`
+paragraph. **Verified** against a build of the pages with the API mocked,
+using E-8's exact locator and regex: the old spec matched none of the settled
+cases, the new one matches a job decided `passed` and one `terminated_at_max`.
+Tier 5 itself was not run (image builds). With it: the decided sentence reads
+"Completed: <verdict>, LLR x after N pairs" (it read "… at its cap at LLR"),
+the admin line likewise, and the SPRT badge shows "at its cap" rather than the
+raw `terminated at max`.
+
+### 2.2 Medium — PLAN said the monthly restore drill writes a result row; it writes nothing (backups reviewer)
+
+**PLAN updated.** The drill task has no database credentials by design and
+leaves only its exit status (mailed by `restore-drill-failed`), an unalarmed
+`DrillSuccess` metric and its logs: reproduced with `backup-drill-check.sh`,
+no row anywhere. PLAN's "Verifying a restore" also listed a check ("no
+completed task with insufficient accepted claims") that neither the drill nor
+RUNBOOK §4 runs. **Fix:** PLAN's Drills paragraph says what the drill records,
+and that nothing shows when it last passed (added to KL-65, with the unalarmed
+metric); the verification list names the counter check the drill does run.
+
+### 2.3 Low findings
+
+**Fixed:**
+- `scripts/restore-roundtrip.sh` seeded any table that was empty, so on a
+  developer's database with jobs but no tasks it added a completed task, a
+  claim, a result and an `ok` backups row to every job: reproduced on an
+  isolated stack (jobs|tasks|claims|results|backups 3|0|0|0|0 → 3|3|3|3|1).
+  It now seeds only a database with no jobs and round-trips any other as it
+  is: re-run twice, counts unchanged; an empty database is still seeded;
+  `backup-drill-check.sh` passes.
+- The rating fit runs on a blocking thread (`spawn_blocking`), not the
+  runtime's (0.23 s at 400 members, 4 s for a 400-rung ladder of sweeps, on a
+  one-vCPU service); leave rack means keep their own plausibility cap (5,000),
+  which pass 1's 21×21 widening had loosened for no reason; the worker page's
+  query re-indented; a stale test comment.
+- The drill's "not enough disk" message pointed at a RUNBOOK procedure that
+  does not exist and at server mode, whose `DATABASE_URL` is production's in
+  the ops task — it now names KL-46 and warns; its header's "7.6" reference.
+- `backup_ephemeral_storage_gib` gains the 21–200 validation its sibling has.
+- Headers: `backup.sh` needs `_sqlx_migrations`; `dev-restore.sh` scrubs every
+  restore; `dev.py`'s "settings.txt" claim; the IAM comment cites the service
+  authorization reference; README's image-build paragraph after its block, and
+  a line on emulating amd64 on arm64 Linux; the second contributor's file
+  without the first one's `uuid` line; PLAN's "the row is exactly the
+  manifest"; KL-74's summary (errors widened, figures in KL-79); KL-79's
+  mature-tier figures as ranges by layout; KL-17's justification (cold cache
+  unmeasured); TESTING names the self-play and ±∞ tests.
+
+**Tried and not kept:** a `TERM` trap in `backup.sh` and `restore-drill.sh`
+so an ECS StopTask would run the EXIT trap — measured in `postgres:16`, bash
+defers the trap while a foreground child (`pg_dump`) runs and the SIGKILL
+comes first (exit 137, trap not run), so it would claim a fix it does not
+make. Recorded in KL-80.
+
+**Recorded:** KL-65 (the drill's record), new KL-80 (backup timing excludes
+the upload, the StopTask case above, the check's leftover bucket, two
+unreproduced suspicions), and the frontend's remaining lows in KL-75 and
+KL-76 below.
+
+### 2.4 Adversarial check of the pass's fixes
+
+**No high or medium.** **Held:** E-8 against every way the seeded job can
+settle (a completed games or pairs job always stores its verdict; only a
+force-complete, which no spec calls, does not; the fake workers' 60% win rate
+ends it `passed` or at its cap), and no other spec or unit test depended on
+the old wording; the blocking fit (no deadlock, a panic is a 500 and a
+rollback); the rack-mean cap in practice; the worker page's re-indentation
+(whitespace only); `restore-roundtrip.sh` seeded on CI's fresh schema and
+unchanged on a re-run; `backup-drill-check.sh`; the storage validation's
+bounds through `terraform console`; the docs. **Lows fixed:**
+`restore-roundtrip.sh` still seeded a database holding users or input data but
+no jobs (reproduced: an active job and an admin appeared) — it now seeds only
+an empty one, and its two content comparisons get unique tiebreakers; the
+script, README and RUNBOOK say it seeds only a fresh schema and wants an idle
+stack; the rack-mean comment (the mean is a best play's equity, not a leave
+value; the bound still holds with 15-letter lexicons); PLAN's drill runs the
+*SQL* referential checks. **Recorded (KL-80):** the round trip's counts are
+read outside the dump's snapshot; a dropped refit request leaves its fit
+running on the blocking pool.
+
+### 2.5 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **560 of 560**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 117 of 117.
+- `terraform fmt -check -recursive` and `validate`: clean.
+- `scripts/restore-roundtrip.sh` (changed) on an isolated stack through its
+  failure (the committed script seeding a database with jobs) and its cases
+  (users only, empty, re-run); `scripts/backup-drill-check.sh`: passed.
+- E-8's new assertion against a build of the pages with the API mocked. Tier 5
+  itself not run (image builds).
+- MAGPIE unchanged.

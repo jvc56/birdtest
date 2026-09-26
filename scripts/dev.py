@@ -17,11 +17,11 @@ The cost is that this needs a built MAGPIE and a real MAGPIE-DATA install, so
 bringing up birdtest is no longer a Docker-only operation. It fails naming both
 when either is missing rather than starting something that cannot work.
 
-Each contributor gets its own directory, because `magpie contribute` reads and
-writes `settings.txt` and `contribute.txt` in its working directory: sharing
-one would race on both files and collapse every worker onto a single identity.
-The MAGPIE data directory is symlinked rather than copied, so N workers cost
-nothing but their own settings files.
+Each contributor gets its own directory, because `magpie contribute` writes the
+identity it is issued into the `contribute.txt` in its working directory:
+sharing one would collapse every worker onto a single identity. The MAGPIE data
+directory is symlinked rather than copied (MAGPIE loads its board from `./data`
+before anything else), so N workers cost nothing but their own settings files.
 """
 
 import argparse

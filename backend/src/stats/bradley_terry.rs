@@ -74,9 +74,9 @@ const PRIOR_SCALE: f64 = 2.0;
 /// off at a constant each, however far a config is from the centre — added up
 /// across any group far from the centre and joined to it thinly: twelve strong
 /// configs at +1,000 over one 300-pair link, 345 Elo low, nearly four errors
-/// (the audit's adversarial check). Faded at 200, that group is some 100 low,
-/// about half an error, and a newcomer's first few pairs are shrunk almost as
-/// before. It depends only on the game counts, so the objective stays concave.
+/// (the audit's adversarial check). Faded at 200, that group is some 70 to 100
+/// low, about half an error, and a newcomer's first few pairs are shrunk almost
+/// as before. It depends only on the game counts, so the objective stays concave.
 const PRIOR_FADE_GAMES: f64 = 200.0;
 
 /// The fewest virtual games a config keeps, however much it has played. The
@@ -714,7 +714,7 @@ mod tests {
         assert!(fit.ratings[1].rating > ANCHOR);
     }
 
-    /// A player with no games at all is pulled to the anchor by the prior and
+    /// A player with no games at all is pulled to the pool's centre and
     /// reported with infinite uncertainty, rather than being an unsolvable
     /// singularity in the fit.
     #[test]

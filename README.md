@@ -209,8 +209,9 @@ maxtasks 0
 ```
 
 then run `./bin/magpie contribute` there. A second process in the same
-directory needs a file of its own — a copy of the one above, named on the
-command line (`./bin/magpie contribute second.txt`): MAGPIE appends the identity it is issued
+directory needs a file of its own — a copy of the one above, without the
+`uuid` line MAGPIE appends on a first run, named on the command line
+(`./bin/magpie contribute second.txt`): MAGPIE appends the identity it is issued
 to that file. (A directory of its own does not work unless it also holds
 MAGPIE's `data/`, or a link to it: MAGPIE loads its default board from
 `./data` before it reads anything else.) Settings never
@@ -403,16 +404,19 @@ recorded beside every hash comes from the binary that produced it.
 The three images are built from this repository and pushed to a registry of
 your choice (Terraform creates none), at one tag per release:
 
-Build for `linux/amd64`, which is what the Fargate task definitions run, even on
-an arm64 machine: the backend's MAGPIE build targets `-march=nehalem`, and an
-arm64 frontend image fails on Fargate with "exec format error".
-
 ```bash
 docker build --platform linux/amd64 -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
 docker build --platform linux/amd64 -f docker/Dockerfile --target derived-builder -t $REGISTRY/birdtest-derived-builder:$TAG .
 docker build --platform linux/amd64 frontend -t $REGISTRY/birdtest-frontend:$TAG
 docker push ...   # all three, then apply with backend_image, derived_builder_image, frontend_image
 ```
+
+Build for `linux/amd64`, which is what the Fargate task definitions run, even on
+an arm64 machine: the backend's MAGPIE build targets `-march=nehalem`, and an
+arm64 frontend image fails on Fargate with "exec format error". Docker Desktop
+emulates amd64 as it is; on an arm64 Linux host, register the emulator first
+(`docker run --privileged --rm tonistiigi/binfmt --install amd64`), and expect
+the emulated release builds to be slow.
 
 The backend image fetches MAGPIE at `docker/Dockerfile`'s `MAGPIE_COMMIT`
 from GitHub, so that commit must be pushed to `birdtest-contribute` first.
@@ -529,6 +533,8 @@ docker compose up -d postgres backend
 ./scripts/restore-roundtrip.sh
 ```
 
-It seeds a row in each of seven core tables, dumps, restores into a fresh
-database, and checks row counts, referential integrity, the denormalized task
+On an empty database (a fresh schema) it first seeds a row in each of seven
+core tables; any other it round-trips as it is, which proves only as much as
+its own rows do, and it wants the stack idle while it runs. It dumps, restores
+into a fresh database, and checks row counts, referential integrity, the denormalized task
 counters, and that `BYTEA` and `DOUBLE PRECISION` columns survived intact.

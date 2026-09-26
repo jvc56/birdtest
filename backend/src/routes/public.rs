@@ -1133,36 +1133,35 @@ async fn worker_page(
         Vec::new()
     } else {
         sqlx::query(
-        "SELECT c.user_id, c.anon_uuid,
-                CASE WHEN c.anon_uuid IS NOT NULL
-                     THEN left(encode(sha256(convert_to(c.anon_uuid::text, 'UTF8')), 'hex'), 16)
-                END AS anon_id,
-                c.username, c.tasks_completed, c.last_seen_at
-         FROM (
-             SELECT * FROM (
-                 (SELECT u.id AS user_id, NULL::uuid AS anon_uuid,
-                         u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
-                  FROM users u WHERE u.tasks_completed > 0
-                  ORDER BY u.tasks_completed DESC, u.id
-                  LIMIT $3)
-                 UNION ALL
-                 (SELECT NULL::uuid, w.uuid, NULL::text, w.tasks_completed, w.last_completed_at
-                  FROM anonymous_workers w WHERE w.tasks_completed > 0
-                  ORDER BY w.tasks_completed DESC, w.uuid
-                  LIMIT $3)
-             ) contributors
-             ORDER BY tasks_completed DESC, user_id, anon_uuid
-             LIMIT $1 OFFSET $2
-         ) c
-         ORDER BY c.tasks_completed DESC, c.user_id, c.anon_uuid",
-    )
-    .bind(limit)
-    .bind(offset)
-    .bind(offset.saturating_add(limit))
-    .fetch_all(&state.read_pool)
-    .await?
+            "SELECT c.user_id, c.anon_uuid,
+                    CASE WHEN c.anon_uuid IS NOT NULL
+                         THEN left(encode(sha256(convert_to(c.anon_uuid::text, 'UTF8')), 'hex'), 16)
+                    END AS anon_id,
+                    c.username, c.tasks_completed, c.last_seen_at
+             FROM (
+                 SELECT * FROM (
+                     (SELECT u.id AS user_id, NULL::uuid AS anon_uuid,
+                             u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
+                      FROM users u WHERE u.tasks_completed > 0
+                      ORDER BY u.tasks_completed DESC, u.id
+                      LIMIT $3)
+                     UNION ALL
+                     (SELECT NULL::uuid, w.uuid, NULL::text, w.tasks_completed, w.last_completed_at
+                      FROM anonymous_workers w WHERE w.tasks_completed > 0
+                      ORDER BY w.tasks_completed DESC, w.uuid
+                      LIMIT $3)
+                 ) contributors
+                 ORDER BY tasks_completed DESC, user_id, anon_uuid
+                 LIMIT $1 OFFSET $2
+             ) c
+             ORDER BY c.tasks_completed DESC, c.user_id, c.anon_uuid",
+        )
+        .bind(limit)
+        .bind(offset)
+        .bind(offset.saturating_add(limit))
+        .fetch_all(&state.read_pool)
+        .await?
     };
-
 
     Ok(Json(super::Page {
         items: rows

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Automated restore drill (PLAN.md, "Drills"). Restores the most recent
-# nightly dump into a throwaway database, runs the verification queries from
-# 7.6 against it, and drops it again. Scheduled monthly by infra/backup.tf;
+# nightly dump into a throwaway database, runs the SQL verification queries
+# from PLAN.md's "Verifying a restore" against it, and drops it again. Scheduled monthly by infra/backup.tf;
 # runnable by hand the same way as scripts/backup.sh.
 #
 # This is the only check that catches a dump which has been silently producing
@@ -173,7 +173,7 @@ if [[ "${DRILL_TARGET}" == local ]]; then
     "${WORKDIR}/manifest.json")"
   free="$(df --output=avail -B1 "${WORKDIR}" | tail -1 | tr -d ' ')"
   if (( free < need )); then
-    log "NOT ENOUGH DISK: the restore needs about $(( need / 2**30 )) GiB and ${WORKDIR} has $(( free / 2**30 )) GiB free. Raise restore_ephemeral_storage_gib if it is below Fargate's 200; past that, run this drill by hand with DRILL_TARGET=server against a scratch RDS instance restored from a snapshot (RUNBOOK.md, 6)"
+    log "NOT ENOUGH DISK: the restore needs about $(( need / 2**30 )) GiB and ${WORKDIR} has $(( free / 2**30 )) GiB free. Raise restore_ephemeral_storage_gib if it is below Fargate's 200; past that the drill cannot run on Fargate (PLAN.md, KL-46). DRILL_TARGET=server restores into the server DATABASE_URL names: never point it at production"
     exit 1
   fi
   log "starting the drill's own server"

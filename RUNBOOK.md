@@ -1070,7 +1070,8 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
 
 - `./scripts/restore-roundtrip.sh` — proves a dump of the current schema
   restores byte-identically into an empty database. Run it after any schema
-  change; nightly CI runs it too.
+  change, on a fresh schema (it seeds only an empty database) with nothing
+  writing; nightly CI runs it that way.
 - `./scripts/restore-job-check.sh` — runs §2.2's `restore-job.sh` against three
   databases of its own through its refusals, a stopped run and its resume, a
   deleted job, and a re-run; `PG_EXEC="docker exec -i <container>"` points it

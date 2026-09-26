@@ -341,7 +341,17 @@ async fn fit_and_store(
         .position(|id| *id == pool.anchor_player_config_id)
         .ok_or_else(|| AppError::bad_request("the pool's anchor is not a member of the pool"))?;
 
-    let fit = bradley_terry::fit(&matrix, anchor_index, pool.anchor_rating);
+    // On a blocking thread, not the runtime's: a fit is a Cholesky factorisation
+    // a step, a quarter of a second at 400 members and more on a long ladder,
+    // and the service has one vCPU, so run inline it stalled every request that
+    // thread was serving. The pool's lock and this transaction are held
+    // meanwhile, as before.
+    let anchor_rating = pool.anchor_rating;
+    let (fit, matrix) = tokio::task::spawn_blocking(move || {
+        (bradley_terry::fit(&matrix, anchor_index, anchor_rating), matrix)
+    })
+    .await
+    .map_err(|err| AppError::internal(format!("the rating fit did not finish: {err}")))?;
 
     let run_id: Uuid = sqlx::query_scalar(
         // `computed_at` is the moment of the insert, under the pool's lock,

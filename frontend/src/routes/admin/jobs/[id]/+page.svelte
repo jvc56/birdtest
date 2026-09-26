@@ -356,7 +356,7 @@
         />
         <p class="text-sm text-muted-foreground">
           {#if stats.games.decided}
-            SPRT {sprtLabel(stats.games.decided.status)} at LLR
+            SPRT {sprtLabel(stats.games.decided.status)}, LLR
             {stats.games.decided.llr.toFixed(3)} (now {stats.games.sprt.llr.toFixed(3)})
           {:else}
             SPRT {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}

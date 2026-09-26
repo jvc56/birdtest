@@ -7208,7 +7208,10 @@ says so in its implemented option, rather than being removed.
 - **Options considered:** larger tasks.
 - **Option implemented:** `num_iterations` is the tuning knob: larger tasks mean
   fewer claims and fewer, larger submissions.
-- **Justification:** The ceiling is high.
+- **Justification:** The ceiling is high while the generation is in cache.
+  Worth measuring on the production instance class late in a lap with a cold
+  cache, where the reads are random and the lock's other claimants give up
+  after two seconds.
 
 **KL-18. `leave_rack_progress` keeps every generation's rows for the life of the job.**
 - **Context:** About 430 MB a generation for English, never read again once that
@@ -7620,15 +7623,17 @@ says so in its implemented option, rather than being removed.
   - a prior spread over each config's actual opponents;
   - standard errors from the inverse of the full information matrix.
 - **Option implemented:** All three parts, in the thirty-second audit (pass 1),
-  the prior after seven versions that each failed an adversarial check. The fit
+  the prior and its errors after nine versions that each failed an adversarial
+  check (AUDIT_FINDINGS_28, 1.K). The fit
   is Newton's method with a backtracking line search on a strictly concave
   objective, each step bounded at 8 natural-log units (about 1,400 Elo), a step
   under 0.5 taken whole, convergence judged on the full step, and damping if
   the curvature fails to factor. The prior is virtual drawn games against the
   pool's centre, the plain mean of every rating, on a logistic twice as wide as
   real games', two for a config with no games and `2 / (1 + g/200)`, at least
-  0.2, for one with `g`. Errors are the diagonal of the inverse of the full information over
-  the anchor's component, the prior left out, as before. `U-STATS-5` pins the
+  0.2, for one with `g`. Errors are the diagonal of the inverse of the full
+  information over the anchor's component, widened by one and a half times the
+  prior's one-step pull on each config. `U-STATS-5` pins the
   shapes above and the ones the adversarial checks found; runs record
   `method = 'bradley_terry_newton'`.
 - **Justification:** Each version tried in the audit pulled some shape of pool:
@@ -7650,19 +7655,24 @@ says so in its implemented option, rather than being removed.
     answer was stored as not converged;
   - against the mean rating, floored at a twentieth: a block that swept, or was
     swept by, everything outside it floated thousands of Elo on unrelated
-    configs' pulls, every error infinite.
+    configs' pulls, every error infinite;
+  - floored at a fifth, with errors from the games alone: tiers of lightly
+    played configs 400 to 800 Elo apart, joined by one small job, 1 to 3 errors
+    low, their 95% intervals covering the truth 30 to 65% of the time.
 
   The pool-centre prior was compared with the old one in a Monte Carlo of every
   shape found (gauntlet, a hub with twenty leaves, twenty shared swept
   baselines, young round-robins and stars centred and 400 away, newcomers,
-  a config between far-apart opponents, two ladders, two tiers): faded at 200
-  games, its worst bias is some 40 Elo (a ladder's top, a third of its error;
-  a thinly joined strong tier some 30), against the old prior's 390 and 540.
+  a config between far-apart opponents, two ladders, two tiers): it biases
+  every shape less than the old prior did (a 12-rung ladder's top some 40 low
+  against 390; two thin tiers 600 apart some 260 against 510), but no weighting
+  removes the pull that adds up across a thinly joined group, so the errors
+  carry it instead, and the intervals cover the truth again. KL-79 has the
+  figures.
   Concavity is what makes it one answer, continuous and monotone; a centre at
   the mean of the ratings keeps a far field in place and does not move with a
-  pool's maturity; the wider scale and the
-  fade keep pulls that add up inside the errors, at the price of more swing
-  for a barely played config between far-apart opponents (KL-79).
+  pool's maturity; the wider scale and the fade keep the pulls small, at the
+  price of more swing for a barely played config (KL-79).
 
 **KL-75. Small things in rating pools.**
 - **Context:** `ratings.rs`, `routes/ratings.rs` (thirty-first audit, pass 4).
@@ -7679,9 +7689,12 @@ says so in its implemented option, rather than being removed.
     configs since removed and members now unrated included, so they can take
     the six drawn slots from current members, and its "the table below lists
     every one" note is then wrong (thirty-second audit).
+  - A pool's first fit by the thirty-second audit's method moves every rating
+    (a different prior), and the history draws the jump with no mark; the API
+    does not expose a run's `method`.
 - **Options considered:** thin by time buckets; add the two settings to the
   pool's scope; answer a no-op membership change without a write; draw only
-  current, rated members.
+  current, rated members; expose `method` on history points and mark a change.
 - **Option implemented:** None.
 - **Justification:** None changes a rating today; the defaults have not moved.
 
@@ -7696,9 +7709,12 @@ says so in its implemented option, rather than being removed.
   history), so at 320 px the dot plot's scale is 34 px wide and its tick labels
   run together, and at 280 px four configs 600 Elo apart sit on one another; the
   page does not scroll sideways, so E-10 passes (thirty-second audit).
+  A clamped error bar (±400 Elo drawn) has no mark, so ±400, ±1,278 and ±∞
+  look the same while the caption says the bars are one error; the prior's
+  widened errors make clamped bars more common (thirty-second audit, pass 2).
 - **Options considered:** larger tap targets; a registered contributor with a
   32-character name in E-10's seed; narrower chart margins below the `sm`
-  breakpoint, or names stacked above the dots.
+  breakpoint, or names stacked above the dots; an open end on a clamped bar.
 - **Option implemented:** None.
 - **Justification:** Checked by hand in the audit's sweep (744 page loads, none
   wider than the screen); the seed change needs a tier-5 run to prove.
@@ -7772,9 +7788,10 @@ says so in its implemented option, rather than being removed.
   - Ladders, the top: 12 rungs of 100 Elo over 100 pairs, some 35 low (a third
     of its error); 12 of 200, some 70 (half); 20 of 100, some 130 (nine
     tenths); 20 of 50 over 300, 15.
-  - Mature tiers joined by one 300-pair job: at +600, 10; at +800, 64 (0.6
-    error); at +1,000, some 100 (0.6); 20 at +1,200, some 290 (1.6). Young
-    tiers at +1,000: 1.6 to 2.6 errors.
+  - Mature tiers joined by one 300-pair job, by the lower tier's size and
+    layout: at +600, 5 to 10; at +800, 20 to 65 (0.2 to 0.6 error); at +1,000,
+    70 to 100 (about half); 20 at +1,200, 200 to 290 (1.2 to 1.6). Young tiers
+    at +1,000: 1.6 to 2.6 errors. (All from the games' errors alone.)
   - A block that swept, or was swept by, everything outside it has its level
     set by the prior, with an error of hundreds of Elo; other young configs'
     pulls move it by a fraction of that.
@@ -7803,6 +7820,40 @@ says so in its implemented option, rather than being removed.
   bar, and the widening brings those intervals back to 95%. Worth revisiting — with
   a flag on configs the prior holds, or pools built with more than one job
   between tiers — if tiers like these appear.
+
+**KL-80. Small things in the backup pipeline, and a detached refit.**
+- **Context:** `scripts/backup.sh`, `backup-drill-check.sh`,
+  `restore-roundtrip.sh`, `infra/backup.tf`, and the rating refit's blocking
+  thread (thirty-second audit, pass 2).
+- **Problem:**
+  - `backups.finished_at`, the admin page's "Took" and the `DurationSeconds`
+    metric are taken before the upload, so they leave its time out.
+  - Run as the container's PID 1 (`bash -c`), the scripts ignore SIGTERM, so an
+    ECS StopTask ends them by SIGKILL without their EXIT trap: a stopped backup
+    writes no `ok = false` row (the failure rule still fires). A `TERM` trap
+    alone does not help while `pg_dump` or `pg_restore` runs in the
+    foreground — bash defers it until the child exits, and the kill comes
+    first (measured in `postgres:16`, exit 137, trap not run); the long steps
+    would have to run in the background under `wait`.
+  - `restore-roundtrip.sh` reads its row counts before and after the dump,
+    not inside its snapshot, so a writer on a live stack fails it (it wants an
+    idle one, and says so); `backup.sh` takes them inside the snapshot.
+  - A rating refit whose admin request is dropped releases its transaction
+    and lock while the fit it started runs on to the end on the blocking pool,
+    so a retry can run a second beside it (seconds each, only for a long
+    ladder of sweeps).
+  - A failure in `backup-drill-check.sh`'s step 2b leaves its
+    `birdtest-backups-empty-*` MinIO bucket and host log files behind.
+  - Two reasoned about and not reproduced: if CloudWatch aligns the staleness
+    alarm's 12-hour periods to fixed boundaries, "36 hours" can be up to about
+    45; and a snapshot session lost without a `FATAL` line is read as a value,
+    though a later step then fails the backup.
+- **Options considered:** a second timestamp after the upload for the row and
+  the metric (the manifest keeps the first); the long steps backgrounded under
+  `wait` with a `TERM` trap; the empty bucket in the check's cleanup; a
+  staleness alarm on 1-hour periods.
+- **Option implemented:** None.
+- **Justification:** None loses a backup or passes a bad one.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
@@ -7942,8 +7993,11 @@ says so in its implemented option, rather than being removed.
 - **Problem:** A task that never starts its container (an image pull or secret
   failure) raises nothing: a backup's is caught only by the 36-hour staleness
   alarm, and a drill's not at all. The derived builder has no failure alarm.
+  And a drill leaves no record anyone reads: its `DrillSuccess` metric has no
+  alarm and no page, and it writes no row, so when it last passed is visible
+  only in its logs (thirty-second audit; PLAN said it wrote a result row).
 - **Options considered:** match `stopCode`/`stoppedReason` too; an alarm on the
-  builder's failures.
+  builder's failures; an alarm on `DrillSuccess` missing for some 32 days.
 - **Option implemented:** None.
 - **Justification:** Staleness catches the first within a day and a half, and
   a failed build shows on `/admin/derived-data`.
@@ -8497,7 +8551,8 @@ Layer 3 had a design choice of its own. Having the backend list the backup bucke
 directly would require giving the task role `ListBucket` / `GetObject` on it,
 weakening the isolation the separate bucket exists to create. Instead **the backup
 task writes a `backups` row into Postgres when it finishes**: the backend reads its
-own database and needs no new S3 permission, and the row is exactly the manifest. A
+own database and needs no new S3 permission, and the row carries the manifest's
+figures (bytes, sha256, row counts, times). A
 restored database also restores the backup history, which is confusing but harmless
 if `restored_at` context is displayed. Failed runs insert a row with `ok = false` so
 the admin page shows the failure rather than a gap. The table is insert-only and
@@ -8595,7 +8650,7 @@ than the last schema edit restorable only with archaeology.
   from `input_data`; no `input_data` row with `role IN ('letterdist','layout')` and
   `content IS NULL`.
 - Counter sanity: `tasks.accepted_count` and `active_claim_count` agree with
-  `task_claims`; no `tasks.state = 'completed'` with insufficient accepted claims.
+  `task_claims`.
 - Functional smoke: run one real task against the restored stack with `magpie
   contribute` (`maxtasks 1`) and see it accepted. This exercises dispatch, data
   verification, the artifact fetch and the result write. **Not
@@ -8610,8 +8665,13 @@ against a claim the restored database has never heard of are rejected exactly as
 stale claim is — a path `fake_worker.py --mode stale` already covers.
 
 **Drills.** A restore procedure that has never been executed is a hypothesis.
-*Automated, monthly*: a scheduled task restores the latest dump, runs the row-count
-and referential checks, writes a result row, and tears the database down. This is
+*Automated, monthly*: a scheduled task restores the latest dump into a Postgres of
+its own, runs the row-count check and the SQL referential and counter checks,
+and tears it down.
+Its result is its exit status, which the `restore-drill-failed` rule mails, and
+a `DrillSuccess` metric nothing reads; it writes no row anywhere (it has no
+connection to the production database, by design), so nothing shows when it last
+passed, and a drill that stops being scheduled raises nothing (KL-65). This is
 the only thing that catches a dump that has been silently producing empty output for
 three weeks. *Manual, twice yearly*: a full region-loss drill — `terraform apply`
 into the DR region from scratch, restore, and check off every manual step (the two
