@@ -3,7 +3,7 @@
 # The commit this image's hashes are produced by, declared once for every
 # stage (each takes it with a bare `ARG MAGPIE_COMMIT`). CI reads it from this
 # line. MIN_MAGPIE_VERSION must never exceed the version this commit reports.
-ARG MAGPIE_COMMIT=5753e212a3ae0065701bb2b91eef09a36ed219d5
+ARG MAGPIE_COMMIT=8ba24b7b630a1af02a65489f6d9ff9ec5ebdfd51
 #
 # The backend, the derived-data builder, and the end-to-end suite's fake
 # worker.
@@ -48,10 +48,13 @@ RUN apt-get update \
 WORKDIR /src
 # A shallow fetch of the one commit, rather than a clone of the history: the
 # repository is large and none of it is wanted except this tree.
+# The pin is a full commit: a branch name here built a moving target and wrote
+# the name into the image's label.
 RUN git init -q . \
  && git remote add origin "$MAGPIE_REPO" \
  && git fetch -q --depth 1 origin "$MAGPIE_COMMIT" \
- && git checkout -q FETCH_HEAD
+ && git checkout -q FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "$MAGPIE_COMMIT"
 
 # MAGPIE loads a default board layout before it parses any argument, and its
 # `data/` is gitignored, so without this even `magpie builders` fails. The
@@ -69,7 +72,10 @@ COPY backend/src/magpie_standard15.txt /src/data/layouts/standard15.txt
 # whatever happens. The server parses this exact output to record which builder
 # produced every hash it publishes, so an image whose MAGPIE cannot print it is
 # an image that cannot dispatch a job needing a wordmap.
-RUN make magpie BUILD=portable_release -j"$(nproc)" \
+# MAKE_JOBS caps the LTO compiles as CARGO_BUILD_JOBS caps cargo: BuildKit
+# builds this stage beside the backend's.
+ARG MAKE_JOBS
+RUN make magpie BUILD=portable_release -j"${MAKE_JOBS:-$(nproc)}" \
  && ./bin/magpie builders | tee /dev/stderr | grep -q '"wmp_builder_version"'
 
 # ---------------------------------------------------------------------------
@@ -84,7 +90,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY backend/Cargo.toml backend/Cargo.lock ./
+COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
 COPY backend/src ./src
 COPY backend/migrations ./migrations
 
@@ -96,9 +102,17 @@ ARG CARGO_BUILD_JOBS
 # Cache mounts keep the registry and target directory across rebuilds. The
 # binary is copied out inside the same RUN because a cache mount is not part of
 # the resulting layer.
+#
+# The target cache is shared by every build on the machine, whichever checkout
+# it comes from, and COPY keeps each file's mtime: a checkout whose files were
+# older than the last build's was Fresh to cargo, and its image shipped the
+# other checkout's binary (thirty-second audit, pass 15). Touching this
+# crate's own files first makes it always rebuild; its dependencies stay
+# cached.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked \
+    find src migrations build.rs Cargo.toml -type f -exec touch {} + \
+ && cargo build --release --locked \
  && cp target/release/birdtest /usr/local/bin/birdtest \
  && cp target/release/build-derived /usr/local/bin/build-derived
 

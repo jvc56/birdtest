@@ -2835,10 +2835,12 @@ the real check of the backups themselves.
   fence is parsed: blocks indented in a list are read too (the first cut read
   16 of 25), a fence labelled anything but exactly `bash`, `sql` or `text`
   (`Bash`, `sh`, `bash title=…`, unlabelled), a fence run after any other text
-  on its line (a quote mark, a list marker, a nested list) or a fence never
-  closed is refused, and a block that mentions `aws` must turn the
-  pager off in its first line of code (the pager swallowed a pasted `wait`; an
-  export after the first call was too late).
+  on its line (a quote mark, a list marker, a nested list), a fence never
+  closed, or a line less indented than its block's fence is refused; a block
+  must parse with nothing said (`bash -n` only warns of a heredoc never
+  terminated) and must not end in a backslash; and a block that mentions
+  `aws` must turn the pager off in its first line of code (the pager
+  swallowed a pasted `wait`; an export after the first call was too late).
   *(Covered: `scripts/runbook-check.sh RUNBOOK.md README.md`, `bash -n` per
   block, in CI's `scripts` job.)*
   (Thirty-second audit.)
@@ -3114,7 +3116,9 @@ GitHub Actions.
    (no AWS credentials).
 6. **scripts** — `scripts/dev-restore-check.sh`: `dev-restore.sh`'s `SCRUB`
    rule against a stub `COMPOSE`, with no Docker; `scripts/runbook-check.sh`:
-   every bash block in RUNBOOK.md parses (five minutes at most).
+   every bash block in RUNBOOK.md and README.md parses, fences labelled and
+   placed so none goes unread, and each `aws` block turns the pager off first
+   (five minutes at most).
 7. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
    commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
    `test/birdtest_contract/`, and run `magpie_test contribute`; then

@@ -65,7 +65,8 @@ if [ "$build" = 1 ]; then
   # of the AWS SDK at full parallelism takes several GB.
   log "building images"
   docker build -f "$REPO_ROOT/docker/Dockerfile" --target backend \
-    --build-arg CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" -t birdtest-e2e-backend "$REPO_ROOT"
+    --build-arg CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}" --build-arg MAKE_JOBS="${MAKE_JOBS:-3}" \
+    -t birdtest-e2e-backend "$REPO_ROOT"
   docker build -f "$REPO_ROOT/docker/Dockerfile" --target fake-worker \
     -t birdtest-e2e-fake-worker "$REPO_ROOT"
   docker build -t birdtest-e2e-frontend "$REPO_ROOT/frontend"
@@ -136,4 +137,5 @@ if [ ! -d node_modules ]; then
 fi
 npx playwright install --only-shell chromium >/dev/null
 log "running Playwright"
-npx playwright test "${playwright_args[@]}"
+# The `+` form: an empty array under `set -u` is an error before bash 4.4.
+npx playwright test ${playwright_args[@]+"${playwright_args[@]}"}

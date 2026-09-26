@@ -20,7 +20,10 @@
 # a fence never closed is refused. A placeholder must parse: `X=''  # what goes
 # here`. A block that mentions `aws` must turn the pager off in its first line
 # of code. What it cannot see: an indented (unfenced) code block or `<pre>`, a
-# shell block labelled `text`, and a block that turns the pager back on.
+# shell block labelled `text`, a block that turns the pager back on, and a `!`
+# inside double quotes, which an interactive shell expands as history and
+# `bash -n` does not. A fence indented four columns or more is read as one,
+# though a renderer outside a list shows it as indented code.
 
 set -Eeuo pipefail
 
@@ -32,7 +35,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
 check() {
-  local file="$1" name blocks=0 failed=0 block start first
+  local file="$1" name blocks=0 failed=0 block start first bad
   name="$(basename "${file}")"
   rm -f "${WORK}"/block*.sh
   if ! awk -v dir="${WORK}" -v name="${name}" '
@@ -64,6 +67,16 @@ check() {
     inside {
       t = $0; sub(/^[ \t]*/, "", t)
       m = run(t, fence)
+      lead = $0; sub(/[^ \t].*$/, "", lead)
+      # A line of an indented block less indented than its fence -- the
+      # closing fence too -- ends the list item it sits in, and a renderer
+      # closes the block there: read on, this check swallowed what came next,
+      # and taken as a closer, a stray fence opened an unlabelled block over
+      # the next one (pass 15).
+      if (indent > 0 && t != "" && length(lead) < indent) {
+        refuse("a line less indented than its block'"'"'s fence (line " start - 1 "); indent the block'"'"'s every line, its closing fence too")
+        inside = 0; if (file != "") close(file); next
+      }
       if (m >= flen && substr(t, m + 1) ~ /^[ \t]*$/) { inside = 0; if (file != "") close(file); next }
       if (file != "") {
         line = $0; k = 0
@@ -84,7 +97,18 @@ check() {
     blocks=$((blocks + 1))
     start="${block##*-line}"
     start="${start%.sh}"
-    if ! bash -n "${block}" 2> "${WORK}/err"; then
+    # `bash -n` passes two shapes a paste never finishes: a heredoc whose
+    # terminator never matches (an indented `EOF` -- the twenty-fourth audit's)
+    # only warns, and a backslash ending the last line says nothing. Any
+    # output from it, or that backslash, fails the block.
+    bad=''
+    if awk 'NF { last = $0 } END { exit !(last ~ /\\$/) }' "${block}"; then
+      echo "its last line ends in a backslash, which waits for another line" > "${WORK}/err"
+      bad=yes
+    elif ! bash -n "${block}" 2> "${WORK}/err" || [ -s "${WORK}/err" ]; then
+      bad=yes
+    fi
+    if [ -n "${bad}" ]; then
       failed=$((failed + 1))
       echo "${name}: the bash block starting at line ${start} does not parse:" >&2
       sed 's/^/  /' "${WORK}/err" >&2

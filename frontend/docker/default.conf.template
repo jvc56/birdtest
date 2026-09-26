@@ -2,6 +2,11 @@ server {
     listen 80;
     server_name _;
     root /usr/share/nginx/html;
+    # A directory's trailing-slash redirect names no host, port or scheme:
+    # absolute, it sent `http://localhost/...` from behind the ALB's https and
+    # from any mapped port. And no version in the Server header.
+    absolute_redirect off;
+    server_tokens off;
 
     # In production the ALB splits /api off to the backend target group. There
     # is no ALB in compose, so Nginx does the same routing itself — which also

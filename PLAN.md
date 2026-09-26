@@ -3422,10 +3422,13 @@ yet sends no identity at all on its first request; the server responds with a
 UUID in the body of the first successful `/api/worker/task` claim — once there is
 actually a task to hand out — and the client persists it and sends it as
 `X-Worker-UUID` from then on, for the rest of this run and every run to come.
-Only a UUID in canonical form is taken (a newline in one wrote settings every
-later run obeyed); a settings file that cannot be written is said so, with the
-line to add by hand, since otherwise every run would be a new worker
-(thirty-second audit, pass 14).
+Only a UUID in canonical form (8-4-4-4-12 hex digits, either case) is taken
+(a newline in one wrote settings every later run obeyed); a settings file that
+cannot be written is said so, with the line to add by hand, since otherwise
+every run would be a new worker; and a `uuid` line that is not a UUID — the
+start of one, left by a save a full disk cut short — fails startup naming the
+line to correct or delete, rather than being sent; an empty one still means
+none (thirty-second audit, passes 14 and 15).
 
 This is a deliberate reversal from letting the client generate its own UUID: a
 client-generated identity trusts a value the server never gets to validate.
@@ -4263,8 +4266,9 @@ backoff, not as an error.
   leading `/` are refused. The worker UUID the server assigns is taken only in
   canonical form: it becomes a header and a settings line, and a newline in it
   wrote settings every later run obeyed (thirty-second audit, pass 14).
-- **Sizes are the server's to choose.** Batch sizes, play counts, rack counts
-  and response bodies are checked for sense (positive, present), not bounded:
+- **Sizes are the server's to choose.** Batch sizes, play counts and rack
+  counts are checked for sense (positive, present), and response bodies not at
+  all; none is bounded:
   the worker trusts its server's sizes, as AUDIT_FINDINGS_19 decided, and a
   server that asks for too much ends the worker's run (KL-85).
 
@@ -5130,7 +5134,8 @@ birdtest/
 │       ├── ci.yml                  # per pull request: clippy + backend tests (with Postgres),
 │       │                           # frontend check/build, the three images, tier 5's
 │       │                           # journeys, terraform validate, dev-restore's SCRUB
-│       │                           # rule, and MAGPIE's half of the message contract
+│       │                           # rule, runbook-check over RUNBOOK and README, and
+│       │                           # MAGPIE's half of the message contract
 │       └── nightly.yml             # tier 6: a real MAGPIE runs one task of every job type
 ├── docker-compose.yml               # the whole local stack: Postgres, MinIO (S3 stub), backend,
 │                                    # frontend, plus a `dev` profile — see Development
@@ -5150,7 +5155,8 @@ birdtest/
 │   ├── dev-dump.sh                 # snapshot the local Postgres + MinIO state
 │   ├── dev-restore.sh              # put it back
 │   ├── dev-restore-check.sh        # its SCRUB rule against a stub compose (CI)
-│   ├── runbook-check.sh            # every bash block in RUNBOOK.md parses (CI)
+│   ├── runbook-check.sh            # every bash block in RUNBOOK.md and README.md parses,
+│   │                               # and turns the AWS CLI's pager off (CI)
 │   ├── restore-job.sh              # copy one purged or deleted job back from a scratch restore
 │   │                               # (RUNBOOK §2.2; also embedded in the ops task, infra/ops.tf)
 │   ├── restore-job-check.sh        # restore-job.sh through its failure and re-run cases (nightly)
@@ -8405,9 +8411,22 @@ says so in its implemented option, rather than being removed.
   - The alerts SNS topic is unencrypted.
   - `ses:SendEmail` is allowed on `*` rather than the domain identity.
   - The pages' CSP has no `script-src` or `default-src`.
-  - Third-party CI actions are pinned by tag, not commit.
+  - Third-party CI actions are pinned by tag, not commit; base images
+    (`rust:1-slim-bookworm`, `debian:bookworm-slim`, `node:22-alpine`,
+    `nginx:1.30-alpine`, `python:3.11-slim`, `postgres:16`, Chainguard's
+    MinIO at `latest`) and `# syntax=docker/dockerfile:1.7` by floating tag,
+    not digest; the fake worker's `pip install requests` by no version; and
+    `rust:1` with the stable toolchain takes new clippy lints on its own.
+  - README's release build (`--pull` since pass 15) builds from the working
+    tree, so nothing ties a pushed image to a commit CI passed.
   - The dev compose file publishes Postgres, MinIO and the backend on every
     interface, with committed credentials.
+  - The pages are served uncompressed (nginx's gzip is off; the bundle is
+    about 524 KB).
+  - The nightly's backup drill starts once `minio-init` is running, not
+    finished; and MAGPIE's `convert_lexica.sh`, which CI caches the output of,
+    has no `set -e` and exits 0 after a partial conversion (thirty-second
+    audit, pass 15).
 - **Options considered:** each fix as named.
 - **Option implemented:** None.
 - **Justification:** No failure shown. Worth a pass of its own before release.

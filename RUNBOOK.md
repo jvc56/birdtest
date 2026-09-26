@@ -7,6 +7,10 @@ explains why; this one is what to type at 2am. Read the whole procedure before s
 Placeholders throughout: `$REGION` (default `us-east-1`), `$CLUSTER`
 (`birdtest`), `$BUCKET` (the `backups_bucket` Terraform output).
 
+**In bash.** Every block here is bash: in zsh, run `bash` first — stock zsh
+treats a `#` as a word, so a commented line fails, and an apostrophe in a
+comment opens a quote that swallows the rest of the paste.
+
 **No pager.** AWS CLI v2 sends output longer than a screen through `less`,
 which reads the rest of a pasted block as keystrokes: a restore's `wait` never
 ran. Every block here that calls `aws` begins with `export AWS_PAGER=""`

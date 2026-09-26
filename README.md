@@ -294,7 +294,10 @@ minio minio-init` gives you one without the rest of the stack.
 
 ## Deploying
 
-A first deployment, in order (each step is described below):
+A first deployment, in order (each step is described below). The blocks
+here and in RUNBOOK.md are bash: in zsh, run `bash` first — stock zsh treats a
+`#` as a word, so a commented line fails, and an apostrophe in a comment opens
+a quote that swallows the rest of the paste.
 
 1. Tools: Terraform 1.9, the AWS CLI with the Session Manager plugin, `jq`,
    `openssl`, and `python3` for RUNBOOK.md's procedures.
@@ -308,8 +311,10 @@ A first deployment, in order (each step is described below):
    and, once ACM has made it (a few seconds), the CNAME to add:
    ```bash
    export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
-   REGION=us-east-1   # the stack's region, as in prod.tfvars
+   REGION=us-east-1   # the stack's region, as prod.tfvars will say (step 4)
    SITE_HOSTNAME=''   # the site's hostname, e.g. birdtest.example.org
+   # Pasted again, this requests a second certificate: to see the first one's
+   # CNAME, run describe-certificate with its ARN instead.
    if [ -z "$SITE_HOSTNAME" ]; then
      echo "set SITE_HOSTNAME first" >&2
    elif ARN=$(aws acm request-certificate --region "$REGION" --domain-name "$SITE_HOSTNAME" \
@@ -326,15 +331,28 @@ A first deployment, in order (each step is described below):
      else echo "no CNAME yet: ask describe-certificate for it by hand" >&2; fi
    fi
    ```
-   Then, with the CNAME in DNS, wait for it (a few minutes; the wait gives up
-   after about forty):
+   Then, with the CNAME in DNS, wait for it. DNS validation can take half an
+   hour, and the CLI's own wait gives up after about five minutes (older CLIs
+   waited forty), so it is asked again, up to eight times:
    ```bash
    export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
-   if [ -z "${ARN:-}" ]; then
-     echo "no ARN: run the block above first (or set ARN from its output)" >&2
+   if [ -z "${ARN:-}" ] || [ -z "${REGION:-}" ]; then
+     echo "no ARN or REGION: run the block above first (or set both from it)" >&2
    else
-     aws acm wait certificate-validated --region "$REGION" --certificate-arn "$ARN" \
-       && echo "acm_certificate_arn = \"$ARN\""   # for prod.tfvars, step 4
+     validated=''
+     for _ in $(seq 8); do
+       if out=$(aws acm wait certificate-validated --region "$REGION" --certificate-arn "$ARN" 2>&1); then
+         validated=yes
+         break
+       fi
+       echo "$out" >&2
+       # A certificate that failed validation, or one this region does not
+       # have, will not pass however long this waits.
+       case "$out" in *"terminal failure"*|*ResourceNotFound*) break ;; esac
+       echo "not validated yet; waiting again" >&2
+     done
+     if [ -n "$validated" ]; then echo "acm_certificate_arn = \"$ARN\""   # for prod.tfvars, step 4
+     else echo "not validated: check the CNAME and REGION; a failed certificate needs a new request" >&2; fi
    fi
    ```
 4. Write `infra/prod.tfvars` with the eight variables that have no default --
@@ -436,9 +454,9 @@ The three images are built from this repository and pushed to a registry of
 your choice (Terraform creates none), at one tag per release:
 
 ```bash
-docker build --platform linux/amd64 -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
-docker build --platform linux/amd64 -f docker/Dockerfile --target derived-builder -t $REGISTRY/birdtest-derived-builder:$TAG .
-docker build --platform linux/amd64 frontend -t $REGISTRY/birdtest-frontend:$TAG
+docker build --pull --platform linux/amd64 -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
+docker build --pull --platform linux/amd64 -f docker/Dockerfile --target derived-builder -t $REGISTRY/birdtest-derived-builder:$TAG .
+docker build --pull --platform linux/amd64 frontend -t $REGISTRY/birdtest-frontend:$TAG
 docker push ...   # all three, then apply with backend_image, derived_builder_image, frontend_image
 ```
 

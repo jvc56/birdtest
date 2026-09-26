@@ -114,7 +114,8 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   PLAN's alias rule; the AWS CLI pager swallowing a pasted `wait` — all fixed
   or, where MAGPIE must change, bounded and recorded; the adversarial check
   found 4 medium (fence variants the check skipped — it now parses fences;
-  §6's drill broken by §5's new line; thirteen more blocks without the pager
+  §6's drill broken by §5's new line; the rest of the blocks that call `aws`
+  without the pager
   off, now enforced; the floor's reason again), all fixed. KL-76, 81 and 82
   updated; KL-83 and KL-84 added. The loop continues.
 - **Pass 14 (follow-up: pass 13's diff, and MAGPIE's contribute client):** 0
@@ -127,6 +128,15 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   adversarial check found 2 medium (fences on nested list lines; README's ACM
   block hiding its CNAME), both fixed. KL-68 and KL-84 updated; KL-85 added.
   The loop continues.
+- **Pass 15 (follow-up: pass 14's diff, and the build and CI):** 0 high and 5
+  medium from the reviewers — a UUID save cut short by a full disk locking the
+  worker out; README's ACM wait giving up after five minutes; the RUNBOOK
+  check passing an unterminated heredoc and a trailing backslash; a new
+  migration alone not rebuilding the backend; the image's shared cargo cache
+  able to ship another checkout's binary — all fixed (MAGPIE `8ba24b7b`,
+  pinned; `backend/build.rs`); the adversarial check found 2 medium (a
+  closing fence less indented than its opener; zsh without
+  `interactive_comments`), both fixed. KL-64 updated. The loop continues.
 
 ---
 
@@ -2234,8 +2244,8 @@ the line is appended as before; a test writes to a path that cannot exist.
 README's first-deploy password block (which rotation reuses) called
 `modify-db-instance` with the pager on: without bracketed paste, `less` ate
 the `wait` and the endpoint lookup, and `put-parameter` wrote
-`postgres://birdtest:…@:5432/birdtest` to SSM. **Fix:** README's three `aws`
-blocks turn the pager off, its example `contribute.txt` is labelled `text`, its
+`postgres://birdtest:…@:5432/birdtest` to SSM. **Fix:** README's `aws` blocks
+(three then, four once 14.7 split one) turn the pager off, its example `contribute.txt` is labelled `text`, its
 ACM block parses (the ARN captured, not `<arn>`), and CI runs the check over
 README too.
 
@@ -2294,8 +2304,8 @@ its inputs; the staged-files table scrolling in its box on a phone.
   it off).
 - **README's ACM block, made to paste whole, hid the CNAME and blocked.**
   `describe-certificate` ran before ACM had a record (`null`), then `wait`
-  sat for up to forty minutes on a certificate that could not validate, the
-  ARN shown only after. **Fix:** two blocks — the request prints the ARN and
+  sat — five minutes with the current CLI, forty with older ones (15.2) — on
+  a certificate that could not validate, the ARN shown only after. **Fix:** two blocks — the request prints the ARN and
   polls (up to five minutes) until the CNAME exists, printing it; the second,
   run once the CNAME is in DNS, waits and prints the `prod.tfvars` line. Each
   refuses its empty placeholder. **Shown** with a stub that answers `None`
@@ -2329,3 +2339,153 @@ agree with the checker's results.
 - `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks; the case
   files as above; README's password and alert blocks replayed with the paging
   stub (no call paged), and its ACM blocks with a stub.
+
+## Pass 15 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`d511393..97fd887`), and
+MAGPIE's `7400184f..5753e212`, one reviewer per part it touches: MAGPIE;
+backend and scripts; docs and procedures. Plus one area not examined in this
+run: **the build and CI** — `docker/Dockerfile` and the frontend's, the
+compose files, `.github/workflows/`, `e2e/run.sh`'s build.
+
+**Findings: 0 high, 5 medium** from the four reviewers (MAGPIE 1 medium, 4
+low; backend and scripts 1 medium, 3 low; docs and procedures 1 medium, 6 low;
+build and CI 2 medium, 14 low, 2 unconfirmed). All fixed.
+
+### 15.1 Medium — a UUID save cut short by a full disk left a line every later run sent (MAGPIE reviewer)
+
+On a full filesystem the append of `uuid <36>` could land partly: the warning
+printed (14.3), but `uuid 6f3d7198-1` stayed at the end of the file, and every
+later run sent it, was refused `400` by the server, and ended — after the disk
+was freed too. Shown in a user-namespace tmpfs of 8 KiB. **Fix** (MAGPIE
+`4c09e1a3`, and `8ba24b7b` after 15.7, now pinned): a `uuid` line that is not a
+UUID fails startup naming the line to correct or delete; the warning says to replace any part left at the end; the
+anonymous-assignment contract fixture's `worker_uuid` is checked against
+`client_state_is_worker_uuid`, tying the server's format to the client's
+check. **Verified:** the new load test fails with the check removed
+(`Assertion '!client_state_load(path, error_stack)' failed`) and passes with
+it; MAGPIE's `contribute` and `layout` tests pass; formatting passes.
+
+### 15.2 Medium — README's ACM wait gives up after five minutes, not forty (docs reviewer)
+
+The real AWS CLI 2.37.4's `CertificateValidated` waiter polls 60 s × 5 (shown
+against a fake ACM endpoint: `Max attempts exceeded`, rc 255, 241 s); README
+said about forty, and DNS validation can take thirty. **Fix:** the block asks
+again, up to eight times, and prints the `prod.tfvars` line only once
+validated, or says to check the CNAME; it refuses an unset `REGION` as well as
+`ARN`. **Shown** with a stub: failing twice then validating, it waits three
+times and prints the line; never validating, eight tries and the message.
+
+### 15.3 Medium — `runbook-check.sh` passed a heredoc never terminated and a trailing backslash (backend and scripts reviewer)
+
+`bash -n` only warns of a heredoc whose terminator never matches (an indented
+`EOF`, the twenty-fourth audit's own incident) and says nothing of a
+backslash ending a block's last line; both leave a paste at a continuation
+prompt. **Fix:** any output from `bash -n` fails the block, as does a last
+line ending in a backslash; and a line of an indented block less indented
+than its fence is refused (a renderer ends the list item there; the check read
+on and swallowed a four-backtick block after it). **Verified:** the reviewer's
+four new cases fail; RUNBOOK (25 blocks) and README (19) pass; of the 55
+earlier cases, the same eight are accepted as before.
+
+### 15.4 Medium — a new migration alone did not rebuild the backend (build and CI reviewer)
+
+`sqlx::migrate!` makes cargo watch only the migration files it embedded; a new
+one with no Rust changed left the crate Fresh, and the binary — which applies
+its embedded migrations at startup — without it. CI builds from scratch; a
+warm target (an operator's Docker builder, a native build) did not. **Shown**
+in this repo: a throwaway `0002_audit_probe.sql` left `Fresh birdtest`.
+**Fix:** `backend/build.rs` (`cargo:rerun-if-changed=migrations`), copied
+into the image. **Verified:** with it, the crate recompiles and the new
+migration's text is in the binary; removed, it is gone again.
+
+### 15.5 Medium — the backend image's cargo cache could ship another checkout's binary (build and CI reviewer)
+
+The target cache mount is shared by every build on the machine, and `COPY`
+keeps files' mtimes: a checkout whose sources were older than the last
+build's was Fresh to cargo and got the other checkout's binary (shown with
+cargo and `cp -p` into one build directory). **Fix:** the build touches the
+crate's own files first, so it always rebuilds; dependencies stay cached. Not
+built as an image (images are built only with the user's say-so).
+
+### 15.6 Low findings
+
+**Fixed:**
+- Build and CI: the fetched MAGPIE must be exactly the pinned commit (a branch
+  name is refused — checked against a local fetch); `MAKE_JOBS` caps MAGPIE's
+  LTO build, which `e2e/run.sh` passes as 3; CI's MinIO wait gives up after a
+  minute; CI's image probe also requires `"build_target":"nehalem"` (tiers 5
+  and 6 never run the image's own MAGPIE); the contract job clears MAGPIE's
+  fixture directory before copying (a removed fixture stayed); nginx's
+  directory redirects are relative and its version is not sent (`nginx -t`
+  passes; `/sub` answers `Location: /sub/`); `e2e/run.sh` expands an empty
+  argument list on bash before 4.4; README's release builds `--pull`;
+  `.env.example` names the import and builder variables compose reads.
+- Docs: TESTING's CI list and PLAN's tree name what `runbook-check.sh` covers;
+  README's `REGION` says where it will be written, and pasting the request
+  block again is said to request another certificate; PLAN's "response bodies
+  checked for sense" corrected; 14.4, 14.7 and pass 13's summary counts.
+- MAGPIE: `maxtasks`' refusal quotes what was written; "canonical" says either
+  case.
+
+**Recorded (KL-64):** base images, the Dockerfile syntax and the fake
+worker's `requests` unpinned; releases built from the working tree; pages
+served uncompressed; the nightly drill starting before `minio-init` ends;
+`convert_lexica.sh` exiting 0 on a partial conversion. **Unconfirmed, left:**
+an unset `ARG CARGO_BUILD_JOBS` exported empty (BuildKit leaves it out); CI
+job timeouts on GitHub's runners. **Left:** `bash -n` does not see history
+expansion (no block has a `!` in double quotes; the script's header says so);
+a fence indented four columns read as a fence.
+
+### 15.7 Adversarial check of the pass's fixes
+
+**2 medium, both fixed.**
+
+- **A closing fence less indented than its opener still passed.** The closer
+  test ran before 15.3's indentation rule, so a list-item block closed at
+  column 0 was taken as closed, while a renderer ended the list item there and
+  opened an unlabelled block over the prose and the next bash block (shown
+  with micromark; the check said `ok: 2`). **Fix:** the indentation rule
+  applies to every line of an indented block, its closing fence first.
+  **Verified:** the four closer cases fail; RUNBOOK and README pass; the
+  earlier cases are unchanged.
+- **In stock zsh, every commented block failed when pasted.** Without
+  `interactive_comments`, `#` is a word: with bracketed paste the first line's
+  `export AWS_PAGER=""   # …` failed and zsh dropped the paste; without it, an
+  apostrophe in a comment opened a quote that swallowed the rest (shown in
+  zsh 5.9; bash correct in both modes). **Fix:** README's deployment preamble
+  and RUNBOOK's header say the blocks are bash, and to run `bash` first in
+  zsh.
+
+**Lows fixed:** README's ACM wait stops at once on a terminal failure (a
+certificate that failed validation, or one the region does not have) and says
+a failed certificate needs a new request (shown: one try, not eight); the
+trailing-backslash refusal says why; MAGPIE `8ba24b7b` accepts an empty `uuid`
+value again (it always meant none — 4c09e1a3 refused it) and tells a
+contributor with a hand-edited UUID to correct the line, not only delete it
+(the server only ever mints lowercase hyphenated v4s). **Held:** `build.rs`
+(adding, editing, adding a second and removing a migration each rebuild, a
+source edit still rebuilds, an unchanged tree stays Fresh; with every mtime
+set to 2020 the build stayed Fresh until the Dockerfile's touch); the touch
+under dash in `debian:bookworm-slim`; no caller passes a branch as
+`MAGPIE_COMMIT`; the probe and the MinIO wait's quoting; the contract
+directory holds the same 16 fixtures and a README; the ACM loop under `set -e`
+and `set -u`. **Left:** a comment ending in a backslash is refused as a
+continuation; a tab counted as one column of indentation.
+
+### 15.8 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **594 of 594** (with `build.rs`).
+- **MAGPIE's suite** at `4c09e1a3`: **70 of 70**; at `8ba24b7b`, `contribute`,
+  `layout` and `config` pass; `format.py` passes.
+- **Tier 6, natively, every case**: passed at `4c09e1a3` and at `8ba24b7b`.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks; every
+  case file from passes 13–15 as above.
+- The Dockerfile's commit check against a local fetch (the pin passes, a
+  branch fails); `MAKE_JOBS` under dash; the nginx template under `nginx -t`
+  and a relative `Location` from the running container.
+- README's ACM blocks replayed with stubs (retry, terminal failure, empty
+  placeholders).
+- The frontend is unchanged this pass; Terraform unchanged.
