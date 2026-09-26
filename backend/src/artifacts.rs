@@ -13,10 +13,9 @@ fn chain(error: &dyn std::error::Error) -> String {
 /// (`AccessDenied: Access Denied`) rather than with the raw response it came
 /// in, whose headers and body made a stored error of two kilobytes (pass 10);
 /// a transport failure with everything, since that is where its cause is.
-fn sdk<E, R>(error: &aws_sdk_s3::error::SdkError<E, R>) -> String
+fn sdk<E>(error: &aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>) -> String
 where
     E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
-    R: std::fmt::Debug,
 {
     match error {
         aws_sdk_s3::error::SdkError::ServiceError(service) => {
@@ -24,7 +23,17 @@ where
             match (err.code(), err.message()) {
                 (Some(code), Some(message)) => format!("{code}: {message}"),
                 (Some(code), None) => code.to_string(),
-                _ => chain(err),
+                // No code: not S3 answering -- a proxy's HTML, an empty 403 --
+                // whose status and the start of whose body are the cause.
+                _ => {
+                    let raw = service.raw();
+                    let body = raw
+                        .body()
+                        .bytes()
+                        .map(|b| String::from_utf8_lossy(&b[..b.len().min(200)]).into_owned())
+                        .unwrap_or_default();
+                    format!("HTTP {}: {}", raw.status().as_u16(), body.trim())
+                }
             }
         }
         other => chain(other),
@@ -84,9 +93,9 @@ impl ArtifactStore {
             .await
         {
             Ok(_) => Ok(true),
-            Err(e) => match e.into_service_error() {
-                aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_) => Ok(false),
-                other => Err(AppError::internal(format!("S3 head {key} failed: {}", chain(&other)))),
+            Err(e) => match e.as_service_error() {
+                Some(aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_)) => Ok(false),
+                _ => Err(AppError::internal(format!("S3 head {key} failed: {}", sdk(&e)))),
             },
         }
     }
@@ -169,7 +178,7 @@ impl ArtifactStore {
     /// with the SDK's whole cause, where a response carries only the first
     /// line ("dispatch failure" told the admin nothing -- the audit's pass 7).
     pub async fn get_for_build(&self, key: &str) -> AppResult<Vec<u8>> {
-        Ok(self.get_bytes_as(key, chain).await?.to_vec())
+        Ok(self.get_bytes_as(key, true).await?.to_vec())
     }
 
     /// The object's bytes as S3 handed them over, without a copy.
@@ -179,14 +188,12 @@ impl ArtifactStore {
     /// generation's KLV does not exist does not retry: every leave worker's
     /// run ended on a transient S3 error. They are 503 with a `Retry-After`.
     pub async fn get_bytes(&self, key: &str) -> AppResult<axum::body::Bytes> {
-        self.get_bytes_as(key, cause).await
+        self.get_bytes_as(key, false).await
     }
 
-    async fn get_bytes_as(
-        &self,
-        key: &str,
-        described: fn(&dyn std::error::Error) -> String,
-    ) -> AppResult<axum::body::Bytes> {
+    /// `for_admin`: the error as [`sdk`] gives it, for a stored or admin-read
+    /// error; otherwise plain, for a worker's response.
+    async fn get_bytes_as(&self, key: &str, for_admin: bool) -> AppResult<axum::body::Bytes> {
         use aws_sdk_s3::operation::get_object::GetObjectError;
         let object = self
             .client
@@ -195,16 +202,22 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| match e.into_service_error() {
-                GetObjectError::NoSuchKey(_) => AppError::not_found(format!("no artifact at {key}")),
-                other => unavailable(format!("S3 get {key} failed: {}", described(&other))),
+            .map_err(|e| {
+                if let Some(GetObjectError::NoSuchKey(_)) = e.as_service_error() {
+                    return AppError::not_found(format!("no artifact at {key}"));
+                }
+                let why = if for_admin { sdk(&e) } else { cause(&e.into_service_error()) };
+                unavailable(format!("S3 get {key} failed: {why}"))
             })?;
 
         let bytes = object
             .body
             .collect()
             .await
-            .map_err(|e| unavailable(format!("S3 read {key} failed: {}", described(&e))))?;
+            .map_err(|e| {
+                let why = if for_admin { chain(&e) } else { cause(&e) };
+                unavailable(format!("S3 read {key} failed: {why}"))
+            })?;
         Ok(bytes.into_bytes())
     }
 }

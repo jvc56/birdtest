@@ -88,6 +88,11 @@ struct Fixture {
     requests: Mutex<Vec<String>>,
 }
 
+/// A `/git/ref/…` or `/git/tags/…` answer naming `sha` of `kind`.
+fn ref_json(sha: &str, kind: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "object": { "sha": sha, "type": kind } })).unwrap()
+}
+
 impl Fixture {
     fn new() -> Arc<Self> {
         let fixture = Arc::new(Fixture {
@@ -96,8 +101,12 @@ impl Fixture {
             gate: tokio::sync::Semaphore::new(0),
             requests: Mutex::new(Vec::new()),
         });
-        fixture.put("/repos/example/data/commits/main", COMMIT.as_bytes().to_vec());
+        fixture.put("/repos/example/data/git/ref/heads/main", ref_json(COMMIT, "commit"));
         fixture
+    }
+
+    fn requested(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 
     fn put(&self, path: &str, bytes: Vec<u8>) {
@@ -637,13 +646,29 @@ async fn an_import_is_started_polled_while_running_and_confirmed_over_http() {
     assert_eq!(body["message"], "tarball_date must be YYYYMMDD");
     let (status, body) = start(json!({ "tarball_date": DATE, "git_ref": "no-such-branch" })).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["message"], "no such ref \"no-such-branch\" in example/data");
+    assert_eq!(body["message"], "no branch or tag \"no-such-branch\" in example/data");
     // A ref is a ref name: `..` segments walked GitHub's API elsewhere with the
     // server's token.
     for bad in ["../../../user", "main?per_page=100", "a//b", ""] {
         let (status, body) = start(json!({ "tarball_date": DATE, "git_ref": bad })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
     }
+    // And a branch or a tag of the repository, found among its own refs:
+    // `/commits/{ref}` resolved a sha (a whole one or five characters of
+    // one), a pull request's ref or a `git describe` name from any fork, and
+    // GitHub serves a fork's files under the upstream's name.
+    for fork in [
+        "pull/1/head", "refs/pull/7/merge", COMMIT, "0123456", "01234", "x-0-g0123456789ab",
+        "v1-1-g0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let (status, body) = start(json!({ "tarball_date": DATE, "git_ref": fork })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{fork}: {body}");
+    }
+    assert!(
+        !fixture.requested().iter().any(|r| r.contains("/commits/")),
+        "resolved through /commits/: {:?}",
+        fixture.requested()
+    );
 
     let (status, started) = start(json!({ "tarball_date": DATE })).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{started}");
@@ -1009,5 +1034,34 @@ async fn a_damaged_lexicon_object_is_replaced_by_the_next_import() {
     let again = run_import(&db, &state).await;
     assert_eq!(import_state_row(&db, again).await.0, "staged");
     assert_eq!(state.artifacts.get(&key).await.unwrap(), fixture_file(&path), "uploaded again, whole");
+}
+
+/// A-ADMIN-5b: a ref resolves among the repository's own branches, then its
+/// tags, by name: a branch named like a sha (the real `20260101`, which shape
+/// checks refused), a lightweight tag, and an annotated tag peeled to its
+/// commit. A tag that names a tree is not a commit.
+#[tokio::test]
+async fn a_ref_resolves_among_the_repositorys_own_branches_and_tags() {
+    let db = TestDb::new().await;
+    let fixture = Fixture::new();
+    let sha = |n: u8| format!("{:040x}", n);
+    fixture.put("/repos/example/data/git/ref/heads/20260101", ref_json(&sha(1), "commit"));
+    fixture.put("/repos/example/data/git/ref/tags/v1", ref_json(&sha(2), "commit"));
+    fixture.put("/repos/example/data/git/ref/tags/v2", ref_json(&sha(3), "tag"));
+    fixture.put(&format!("/repos/example/data/git/tags/{}", sha(3)), ref_json(&sha(4), "commit"));
+    fixture.put("/repos/example/data/git/ref/tags/tree", ref_json(&sha(5), "tree"));
+    let base = fake_github(fixture.clone()).await;
+    let (state, _bucket) = import_state(&db, &base).await;
+
+    let resolve = |r: &'static str| {
+        let state = state.clone();
+        async move { birdtest::inputdata::resolve_ref(&state, r).await }
+    };
+    assert_eq!(resolve("main").await.unwrap(), COMMIT);
+    assert_eq!(resolve("20260101").await.unwrap(), sha(1));
+    assert_eq!(resolve("v1").await.unwrap(), sha(2));
+    assert_eq!(resolve("v2").await.unwrap(), sha(4), "an annotated tag, peeled");
+    assert_eq!(resolve("tree").await.unwrap_err().status, StatusCode::BAD_REQUEST);
+    assert_eq!(resolve("nope").await.unwrap_err().status, StatusCode::NOT_FOUND);
 }
 

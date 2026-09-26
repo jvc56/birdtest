@@ -63,6 +63,7 @@ directories its workers used.
 import argparse
 import hashlib
 import io
+import json
 import re
 import shutil
 import signal
@@ -143,7 +144,7 @@ def small_tarball(magpie_root: Path) -> bytes:
 class GitHubStandIn(ThreadingHTTPServer):
     """Answers the two GitHub calls an input-data import makes.
 
-    `SMALL_REF` resolves to `SMALL_SHA`, whose tarball is served from memory.
+    `SMALL_REF`, a branch, resolves to `SMALL_SHA`, whose tarball is served from memory.
     Everything else is GitHub's: a ref resolution is forwarded (with the
     backend's token, if it sent one) and a tarball download redirected, so the
     real MAGPIE-DATA import the other cases rely on is still the real one.
@@ -174,8 +175,10 @@ class _GitHubHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.startswith("/api/"):
             rest = self.path[len("/api"):]
-            if re.fullmatch(r"/repos/[^/]+/[^/]+/commits/" + SMALL_REF, rest):
-                return self._send(200, SMALL_SHA.encode())
+            if re.fullmatch(r"/repos/[^/]+/[^/]+/git/ref/heads/" + SMALL_REF, rest):
+                return self._send(200, json.dumps(
+                    {"ref": "refs/heads/" + SMALL_REF,
+                     "object": {"sha": SMALL_SHA, "type": "commit"}}).encode())
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() in ("accept", "authorization", "user-agent")}
             request = urllib.request.Request("https://api.github.com" + rest, headers=headers)

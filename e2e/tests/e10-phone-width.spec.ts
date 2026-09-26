@@ -59,4 +59,17 @@ test('E-10: a visitor on a phone reads the job list and a job page', async ({ pa
     const link = page.getByRole('banner').getByRole('link', { name, exact: true });
     await expect(link).toBeInViewport();
   }
+
+  // The contributors' ranking fits its box, the column it is ranked by on
+  // screen: a pseudonym's sixteen characters pushed it out (thirty-second audit).
+  await page.getByRole('banner').getByRole('link', { name: 'Contributors', exact: true }).tap();
+  await expect(page.getByRole('columnheader', { name: 'Tasks completed' })).toBeVisible();
+  await expectNoSidewaysScroll(page);
+  const table = page.locator('.card', { has: page.locator('table') }).first();
+  const { scrollWidth, clientWidth } = await table.evaluate((el) => ({
+    scrollWidth: el.scrollWidth,
+    clientWidth: el.clientWidth
+  }));
+  expect(scrollWidth, 'the ranking is wider than its box').toBeLessThanOrEqual(clientWidth);
+  await expect(page.getByRole('columnheader', { name: 'Tasks completed' })).toBeInViewport();
 });

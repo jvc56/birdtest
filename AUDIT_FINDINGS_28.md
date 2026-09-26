@@ -89,6 +89,14 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   is lost — both fixed and verified; the adversarial check found 1 medium
   (PLAN's backup section still calling account deletion destructive), fixed.
   The loop continues.
+- **Pass 11 (follow-up: pass 10's diff, and input-data import):** 1 high and 5
+  medium from the reviewers — symlink aliases copying their targets past every
+  archive cap; any fork's commit importable under the upstream's name; viewers
+  queued on a failed stats build waiting in turn; RUNBOOK's guard closing the
+  operator's shell; two PLAN passages wrong — all fixed and verified; the
+  adversarial check found 1 medium (the ref check still passing fork commits),
+  fixed by resolving refs only among the repository's own branches and tags.
+  KL-70 updated. The loop continues.
 
 ---
 
@@ -1663,4 +1671,155 @@ fails its acquire each try again in turn.
 - `terraform fmt -check -recursive` and `validate`: clean (infra reviewer).
 - RUNBOOK §1's count, run against a migrated schema with a stub `prod-sql.sh`.
 - MAGPIE unchanged.
+
+
+---
+
+## Pass 11 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`b2d9962..40380f9`; MAGPIE
+and infra unchanged), one reviewer per part it touches: backend; frontend
+(tier 5 natively); docs and procedures. Plus one area not examined in this
+run: **input-data import** — fetching a MAGPIE-DATA release, walking and
+staging it, confirming, uploading lexicon bytes, deleting an input row, the
+import page.
+
+**Findings: 1 high, 5 medium** from the four reviewers (backend 1 medium, 4
+low; frontend none, 1 low — tier 5 natively 11 of 11; docs and procedures 3
+medium, 6 low; input-data import 1 high, 2 medium, 6 low, 2 unconfirmed). One
+medium was found by two reviewers. All fixed and verified; the adversarial
+check (11.8) found 1 medium in the fixes, fixed by redesign.
+
+### 11.1 High — a symlink alias copied its target's bytes, and no archive cap counted the copies (import reviewer)
+
+**Code updated.** An alias at a pinned path is resolved to a file in the
+archive and its row carries its own copy of the target's bytes; each alias was
+a zero-byte entry, so the total, the ratio and the per-entry cap saw the target
+once, and nothing bounded a distribution or layout below the 128 MiB entry cap.
+150 aliases of a 4 MiB layout held 604 MiB from a 263 KiB gzip; 100 of a
+2 MiB one staged and inserted 202 MiB of rows. **Fix:** an alias counts as its
+target's bytes against the total and the ratio, and a file kept in its row
+(a letter distribution, a layout) is at most 64 KiB. **Verified:**
+`aliases_count_as_their_targets_bytes_and_kept_files_are_small`
+(`U-ARCHIVE-5b`) fails without the caps (a 100 KiB layout accepted) and passes;
+a handful of aliases, as MAGPIE-DATA ships, still imports.
+
+### 11.2 Medium — any GitHub user's commit could be imported under the upstream's name (import reviewer)
+
+**Code updated.** `resolve_ref` accepted a commit sha and `pull/N/head`, which
+GitHub resolves from any fork and whose files it serves under the upstream's
+raw URLs (shown on a public repository): anyone who can open a pull request
+could author the tarball an admin imports — with 11.1, a hostile archive for
+one pasted ref, not a compromised upstream as PLAN's threat model says.
+**Fix (final, 11.8):** a ref is resolved only among the repository's own
+branches and tags, through GitHub's refs endpoints, never `/commits/`; PLAN's
+threat model says so. Resolving is bounded as a whole (20 s) and each answer
+read to 64 KiB.
+
+### 11.3 Medium — viewers queued on a failed stats build each waited out the timeout in turn (backend and docs reviewers)
+
+**Code updated.** Pass 10 left it unconfirmed; both reviewers reproduced it:
+a failed build keeps nothing, so each viewer waiting on the job's build lock
+built again, the k-th answering after k acquire (or statement) timeouts — 5,
+10, 15, 20 s on the display pool; 15 to 60 s behind a slow read. **Fix:** a
+build that failed after a waiter asked answers it, as busy (`503`).
+**Verified:** `viewers_waiting_on_a_failed_build_are_answered_together`
+(`I-STATS-10b`): six viewers on a held one-connection pool took 6.0 s on the
+old code and about one second now.
+
+### 11.4 Medium — RUNBOOK's `RESTORE_TIME` guard closed the operator's shell (docs reviewer)
+
+**Docs updated.** The guard's `return 1 2>/dev/null || exit 1` exits an
+interactive shell, and the block pasted as written (the time not yet chosen)
+always tripped it; in a nested shell the rest of the paste ran in the outer
+one. The first block now ends at the `LatestRestorableTime` query, the next
+sets `RESTORE_TIME`, and each use is `${RESTORE_TIME:?…}`, which refuses only
+that command.
+
+### 11.5 Medium — PLAN said the contributor list reads by `task_claims.job_id`; it joins `tasks` (docs reviewer)
+
+**Docs updated.** 10.3 replaced one wrong sentence with another (no index on
+`task_claims` leads with the job; KL-58 said so). Reworded to match.
+
+### 11.6 Medium — PLAN's import section did not describe the walk and confirm the code does (import reviewer)
+
+**Docs updated.** PLAN said "regular files only" (aliases are accepted and
+pinned — the path 11.1 used) and that confirming inserts only new rows
+(collisions are inserted too). Both now match, with the new limits in PLAN's
+table.
+
+### 11.7 Low findings
+
+**Fixed:**
+- Object store errors:
+  - a service error with no code (a proxy's HTML, an empty `403`) keeps its
+    HTTP status and the start of its body;
+  - the builder's fetch and the existence check store the short form too;
+  - the hand-edited-key remedy is scoped to the one version.
+- Stats cache: the freshness test cannot overflow `Instant` (a huge
+  configured age would have panicked under the cache's lock).
+- `/workers` drops "Last result" on a phone, where a sixteen-character
+  pseudonym pushed the ranking column out of its box; E-10 now visits it.
+- Docs:
+  - RUNBOOK's post-rename fallback (`--output text`, `--region`, a literal
+    time) and "loop" wording;
+  - PLAN's account row (public credit, admin flag, sessions) and census
+    wording.
+
+**Recorded (KL-70):** a `known` row deleted between staging and confirm; "or
+later" dates across releases; an input row's object kept after its delete;
+case-only duplicate paths. **Unconfirmed, left:** a directory symlink written
+through at extraction; a status change with no later submission leaving an
+open job page stale until reload.
+
+### 11.8 Adversarial check of the pass's fixes
+
+**1 medium, fixed by redesign.**
+
+- **Medium — the ref check still let a fork's commit through.** 11.2 refused
+  refs shaped like a sha (7 to 40 hex characters) or a pull request's; GitHub's
+  `/commits/{ref}` also resolves five- and six-character abbreviations and
+  `git describe` names (`x-0-g7044a8a…`) from any fork. Shown against GitHub
+  and end to end through the patched backend (a fork's commit pinned, its
+  tarball fetched from the upstream's raw URL); and a real upstream branch,
+  `20260101`, was refused for looking like hex. Refusing by shape was the
+  second patch to this check, so it is replaced rather than patched again.
+  **Fix:** `resolve_ref` asks only the endpoints that list the repository's own
+  refs — `/git/ref/heads/{ref}`, then `/git/ref/tags/{ref}`, an annotated tag
+  peeled through `/git/tags/{sha}` — and anything else is "no branch or tag";
+  the whole resolution runs under one 20-second deadline, each answer read to
+  64 KiB (the "256 bytes" of 11.2 had buffered the whole body first). The
+  fixture (`fixtures/github`, `build.sh`, `nginx.conf`) and tier 6's stand-in
+  answer the refs endpoint. **Verified:** `A-ADMIN-5` now sends the forms the
+  check found (a whole and a five-character sha, pull refs, two describe names)
+  and asserts each is not found and `/commits/` never asked; `A-ADMIN-5b`
+  resolves a hex-named branch, a lightweight and an annotated tag and refuses a
+  tag naming a tree — both fail on the committed resolver and pass; tier 6's
+  M-10 imports through the stand-in.
+
+**Lows fixed:** a thirty-two-character username or a tombstone no longer
+pushes `/workers`' ranking out of its box (the contributor cell breaks);
+PLAN's account row says the Contributors ranking keeps the tombstone's count;
+the walk-limits test asserts the 64 KiB cap; RUNBOOK's identity count is a
+block of its own before the renames, so a refused count stops before them.
+**Held:** alias chains, aliases of aliases and aliases read before their
+targets each count; hard links are refused; the real current release (195 MB,
+23 symlinks) walks; the largest shipped distribution is 496 bytes; a request
+arriving after a failed build is not answered busy; the worker path of the
+object fetch is unchanged. **Left:** a waiter on a build that failed for a
+non-transient reason (the job deleted mid-build) is told busy rather than the
+builder's error; its retry gets the true answer.
+
+### 11.9 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **592 of 592**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 119 of 119.
+- **Tier 5, natively: 11 of 11** on the final working tree — the seed and E-3
+  importing through `git/ref/heads/main`, never `/commits/`; E-10 visiting
+  `/workers`.
+- Tier 6's M-10 natively, importing through the stand-in's refs endpoint.
+- RUNBOOK §1's blocks parse; its count checked against a migrated schema.
+- MAGPIE and infra unchanged.
 

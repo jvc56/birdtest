@@ -726,3 +726,38 @@ async fn a_stats_build_takes_one_connection() {
     assert_eq!(acquired.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
+/// I-STATS-10b: viewers waiting on one job's build that fails are all told
+/// busy when it does, not each after a failed build of its own: in turn, on a
+/// saturated pool each waited out the acquire timeout after the one before.
+#[tokio::test]
+async fn viewers_waiting_on_a_failed_build_are_answered_together() {
+    let db = TestDb::new().await;
+    let job_id = db.games_job(1, 2).await;
+    let job = birdtest::jobstats::load_job(&db.pool, job_id).await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(1))
+        .connect(&db.url)
+        .await
+        .unwrap();
+    // The pool's one connection, held: every build waits out the timeout.
+    let held = pool.acquire().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let viewers: Vec<_> = (0..6)
+        .map(|_| {
+            let (pool, job) = (pool.clone(), job.clone());
+            tokio::spawn(async move {
+                birdtest::jobstats::payload(&pool, &job, std::time::Duration::from_secs(10)).await
+            })
+        })
+        .collect();
+    for viewer in viewers {
+        let answer = viewer.await.unwrap();
+        assert_eq!(answer.unwrap_err().status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let took = started.elapsed();
+    drop(held);
+    assert!(took < std::time::Duration::from_millis(2500), "six viewers took {took:?}");
+}
+

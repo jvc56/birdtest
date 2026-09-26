@@ -40,15 +40,15 @@ VERSIONS=(
   "20260201 400"
 )
 
-api="github/api/repos/$REPO/commits"
+api="github/api/repos/$REPO/git/ref/heads"
 raw="github/raw/$REPO/$SHA/versioned-tarballs"
 
 rm -rf github data-*.tgz data-*.tgz.??
 mkdir -p "$api" "$raw"
-# `GET /repos/<repo>/commits/<ref>` with `Accept: application/vnd.github.sha`
-# answers the bare sha. Only `main` exists; any other ref is a 404, as it is
-# on GitHub.
-echo "$SHA" > "$api/main"
+# `GET /repos/<repo>/git/ref/heads/<branch>` answers the ref as JSON, naming
+# its commit. Only `main` exists; any other branch or tag is a 404, as it is on
+# GitHub.
+printf '{"ref":"refs/heads/main","object":{"sha":"%s","type":"commit"}}\n' "$SHA" > "$api/main"
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT

@@ -1702,7 +1702,10 @@ is the first thing that breaks.
 3. Stream the concatenated chunks through SHA-256 (recording the tarball's own
    digest), then gunzip, then tar. This is the one place birdtest parses an
    untrusted container format, so every entry is checked against an explicit
-   allowlist before it is trusted enough to hash: **regular files only**; the
+   allowlist before it is trusted enough to hash: **regular files**, and symlinks
+   at pinned paths that resolve inside the archive to a pinned file of the same
+   role (MAGPIE-DATA ships aliases so), each pinned with its target's bytes and
+   counted as those bytes against the caps; the
    path must be relative, carry no `..` segment, and match the expected
    `data/<dir>/<basename>` shape. **Never construct a filesystem path from an
    archive name** — the import hashes bytes and has no reason to form one.
@@ -1731,8 +1734,9 @@ is the first thing that breaks.
 (the majority, and the reason the diff exists), and **path collisions** — a path
 already known under a different `sha256`. That last group deserves a second look,
 because it is either a legitimate data update or a tarball re-cut under a name
-that was already used. Confirmation inserts only the new rows, in one
-transaction, with `tarball_date` set to this import's date.
+that was already used. Confirmation inserts the new rows and the changed ones
+(collisions), in one transaction, with `tarball_date` set to this import's
+date; the known rows are already there.
 
 **Limits, all enforced during the walk:**
 
@@ -1740,9 +1744,10 @@ transaction, with `tarball_date` set to this import's date.
 |---|---|
 | Compressed bytes downloaded | 512 MiB |
 | Chunks walked (`aa`, `ab`, …) | 64 |
-| Total uncompressed bytes | 1 GiB |
-| Uncompressed : compressed ratio | 20× |
+| Total uncompressed bytes (an alias counted as its target's) | 1 GiB |
+| Uncompressed : compressed ratio (the same total) | 20× |
 | Single entry | 128 MiB |
+| A letter distribution or layout (kept in its row) | 64 KiB |
 | Entry count | 5,000 |
 | Whole task | 30 min, 30 s connect, 120 s idle read |
 
@@ -1759,8 +1764,13 @@ extensions, held what no cap reached three different ways — a PAX `size` that
 passed every cap, a PAX header read whole, GNU sparse blocks expanded — before
 this replaced three patches; and the 30-minute limit was not enforced at all:
 the client's timeouts are per read.) The archive URL is built from `MAGPIE_DATA_REPO` and never
-from user input, so the residual exposure is a compromised upstream; that is the
-threat model these checks are written against.
+from user input, and the ref an admin gives is resolved only among that repository's own
+branches and tags (`/git/ref/heads/…`, then `/git/ref/tags/…`, an annotated
+tag peeled to its commit) — `/commits/{ref}`, which it used, also resolves a
+sha, five characters of one, a pull request's ref or a `git describe` name
+from any fork, and GitHub serves a fork's files under the upstream's name
+(thirty-second audit) — so the residual exposure is a compromised upstream; that is the threat model these checks are written
+against.
 
 Staging rather than recomputing on confirm means the download happens once and
 the admin confirms exactly what they were shown. An import left staged for 24
@@ -4713,7 +4723,8 @@ transaction. After the delete commits, that row is the only surviving
 description of what the job held, and it is what a selective restore is scoped
 against. `delete_user` anonymizes rather than deletes, so its census says
 which counts go (API keys, confirmation codes, reset tokens — and, uncounted,
-the name, address and password) and which stay (claims, results). `audit_log` deliberately has no foreign keys: one to `jobs` or
+the name, address and password) and which stay (claims, and of them the
+completed ones). `audit_log` deliberately has no foreign keys: one to `jobs` or
 `users` would either block those deletions outright — every job has a
 `job.created` row, every user a `user.registered` one — or rewrite the history the
 log exists to keep.
@@ -4780,7 +4791,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `DELETE` | `/api/admin/input-data/:id` | Delete an input data row. A row referenced by a job, player config or rating pool cannot be deleted; the foreign key is the safety mechanism and the error reads "this file is pinned by N jobs, player configs or rating pools". |
 | `POST` | `/api/admin/input-data/imports` | Start a tarball import. Returns `202` and an import id immediately; the fetch and diff run as a background task. |
 | `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged, or the failure reason. |
-| `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged **new** rows, in one transaction. |
+| `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged new and changed (collision) rows, in one transaction. |
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
 | `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. `?positions=true` (games and game-pairs jobs) streams the positions the job captured instead of its result rows. At most two run at once; a completed job with a ready export gets a `303` to it instead. |
 | `POST` | `/api/admin/jobs/:id/export` | Build a **completed** job's results into one gzipped NDJSON object in the artifact store. `202` with an id; the work runs on a background task. `409` for a job that is not completed, or whose last claims are still in flight. |
@@ -7694,6 +7705,18 @@ says so in its implemented option, rather than being removed.
   - The audit log's `input_data.import_staged` is written when the request
     starts, failed imports included, and names no date, ref or commit;
     `input_data.deleted` names only the id of a row that no longer exists.
+  - A `known` row an admin deletes between staging and confirming is not
+    inserted again, though the diff showed it as present (thirty-second
+    audit).
+  - "From data-X or later" is wrong for a file shared with an older release
+    imported after a newer one; and a job declined for a player's `.kwg` or
+    `.klv2` from a newer release than its distribution tells the worker the
+    distribution's date (MAGPIE says "or later", so weakly).
+  - Deleting an input row leaves its `inputs/{sha}` object in the bucket, as a
+    cancelled import does: content-addressed, reused by a re-import.
+  - Two pinned paths differing only in case (`NWL23.kwg`, `nwl23.kwg`) are two
+    rows; a worker on a case-insensitive filesystem keeps one and declines the
+    other (reasoned, not reproduced).
   - Two imports staged at the same time each label a path `new` that becomes a
     collision once the other confirms, so the second admin misses the second
     look; a staged import's expiry counts from the request, not from staging.
@@ -8450,7 +8473,7 @@ says so in its implemented option, rather than being removed.
   every task of the job to the day's completions (hundreds of milliseconds at a
   million tasks, growing with history, on every list view); the submission that
   stores a result now keeps the time, at most once a minute.
-- **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least `JOB_STATS_CACHE_SECONDS` (10) apart — by a cool-down after every build since the thirty-second audit, before which it held only under steady load — the page and new subscribers reading the last push's payload. What remains is the payload's cost itself: its contributor list groups every completed claim of the job (by `task_claims.job_id`, one range of the job's claims), and its game statistics read every result — hundreds of milliseconds at a few hundred thousand tasks, growing with history. *Open (fifteenth audit):* a per-job contributor running total (`job_contributors`, upserted in the submit transaction like `users.tasks_completed`, given back by purge and delete, recounted by RUNBOOK §2.3b) would make the list an index read; it is a schema change and one more write per submission, left for a decision.
+- **Debounced live stats** — done: the finish condition is checked on every eighth submission (plus whenever nothing is left in flight), and the SSE push is coalesced per job and spaced at least `JOB_STATS_CACHE_SECONDS` (10) apart — by a cool-down after every build since the thirty-second audit, before which it held only under steady load — the page and new subscribers reading the last push's payload. What remains is the payload's cost itself: its contributor list groups every completed claim of the job (joined through `tasks` by `tasks.job_id`; no index on `task_claims` leads with the job — KL-58), and its game statistics read every result — hundreds of milliseconds at a few hundred thousand tasks, growing with history. *Open (fifteenth audit):* a per-job contributor running total (`job_contributors`, upserted in the submit transaction like `users.tasks_completed`, given back by purge and delete, recounted by RUNBOOK §2.3b) would make the list an index read; it is a schema change and one more write per submission, left for a decision.
 
 ---
 
@@ -8545,7 +8568,7 @@ The scenarios worth designing against, in descending order of likelihood:
    result, rating and progress row for a job in one transaction, and `delete_job`
    is similarly total. (`delete_user` is not: it anonymizes the account and keeps
    its claims and results, destroying only its keys, outstanding codes, name,
-   address and password.) There is no confirmation dialogue in the API
+   address, password, admin flag and sessions.) There is no confirmation dialogue in the API
    layer and no undo. This is the most likely way birdtest loses contributor work,
    and it is the scenario that most demands *selective* restore: the rest of the
    database has moved on and must not be rolled back.
@@ -8820,7 +8843,7 @@ log says what was lost.
 | Instance/AZ failure | RDS PITR restore to new instance, repoint `DATABASE_URL` | ≤ 5 min |
 | Bad migration / dropped schema | RDS PITR to just before the statement | ≤ 5 min |
 | Mistaken purge/delete of one job | Restore latest dump into a **scratch** instance, extract, re-insert (RUNBOOK §2) | Whatever arrived after the last dump, for those rows only |
-| Mistaken deletion of an account | None documented: its work is kept; the owner registers again and makes new keys (the old name is free once deleted) | The account's name, address, password and keys |
+| Mistaken deletion of an account | None documented: its work is kept; the owner registers again and makes new keys (the old name is free once deleted) | The account's name, address, password, admin flag, sessions and keys, and its credit on the account list: the work stays under the tombstone, which `/api/users` omits (the Contributors ranking, `/api/workers`, lists the tombstone with its count), so the new account starts at zero |
 | Corrupted or overwritten artifact | S3 object version restore, or rebuild from `leave_rack_progress` | None |
 | Region loss | Terraform apply in DR region, restore cross-region snapshot or replicated dump | ≤ 24 h |
 | Local dev database wedged | `docker compose down -v` and re-seed, or restore a scrubbed dump | N/A |

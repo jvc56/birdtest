@@ -68,9 +68,9 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 209 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1 Unit | 210 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 119 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 156 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (16), `input_data.rs` (13), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 2 Integration | 158 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 195 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 589 backend tests (the per-tier counts above are
+--run-ignored all` runs 592 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -575,6 +575,13 @@ path, nothing recognisable, and a bomb by compression ratio.)
   and refusing them refused the whole release. *(Covered:
   `inputdata::tests::a_symlink_alias_is_pinned_with_its_targets_bytes`,
   `inputdata::tests::a_symlink_that_is_not_an_alias_inside_the_archive_is_refused`.)*
+- `U-ARCHIVE-5b` An alias counts as its target's bytes against the archive's
+  total and ratio, and a letter distribution or layout — kept in its row — is
+  at most 64 KiB. As a zero-byte entry, a few hundred aliases of one large
+  layout were held, staged and inserted a few hundred times over (150 of a
+  4 MiB one: 600 MiB from a 263 KiB gzip). *(Covered:
+  `inputdata::tests::aliases_count_as_their_targets_bytes_and_kept_files_are_small`.)*
+  (Thirty-second audit.)
 - `U-ARCHIVE-6` The limits are PLAN.md's table; changing one is a design change.
   *(Covered: `inputdata::tests::the_walk_limits_are_the_ones_the_design_states`.)*
 - `U-ARCHIVE-7` A file whose name MAGPIE would refuse as a path — a `.`, a
@@ -1525,6 +1532,12 @@ permanent.
   one wait (two, with the job page's own read of the job) makes it a quick
   `503`. *(Covered:
   `stats::a_stats_build_takes_one_connection`.)* (Thirty-second audit.)
+- `I-STATS-10b` Viewers waiting on one job's build that fails are all told
+  busy when it does: each retried it in turn, and on a saturated pool the k-th
+  waited k acquire timeouts (six took six seconds at a one-second timeout; now
+  about one). *(Covered:
+  `stats::viewers_waiting_on_a_failed_build_are_answered_together`.)*
+  (Thirty-second audit.)
 - `I-STATS-11` The stats payload cache serves a payload until it expires or is
   forgotten (every admin action), and a build reads the job's row itself, so a
   copy read before an admin action is not cached as newer than it. *(Covered:
@@ -2064,8 +2077,17 @@ below.
   `admin_routes::each_lifecycle_action_answers_its_shape_and_a_read_agrees`; the
   allocation cap by `A-BOUND-7`.)*
 - `A-ADMIN-5` Import start → poll → confirm over HTTP, including that polling
-  reports progress while running. *(Covered:
+  reports progress while running. The ref is resolved only among the
+  repository's own branches and tags: a sha (whole or five characters), a
+  pull request's ref or a `git describe` name — which `/commits/{ref}`
+  resolved from any fork, served under the upstream's name — is not found,
+  and `/commits/` is never asked (thirty-second audit). *(Covered:
   `input_data::an_import_is_started_polled_while_running_and_confirmed_over_http`.)*
+- `A-ADMIN-5b` A branch named like a sha (`20260101`, a real one), a
+  lightweight tag and an annotated tag (peeled to its commit) all resolve; a
+  tag naming a tree is refused. *(Covered:
+  `input_data::a_ref_resolves_among_the_repositorys_own_branches_and_tags`.)*
+  (Thirty-second audit.)
 - `A-ADMIN-6` Confirming an import that is not `staged` is rejected. *(Covered:
   `input_data::only_a_staged_import_can_be_confirmed`.)*
 - `A-ADMIN-7` `input-data` list and delete, including the in-use refusal.
@@ -2516,8 +2538,10 @@ admin in once and the admin journeys reuse its storage state.
 - `E-9` The password reset flow end to end. *(Covered:
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
 - `E-10` A page renders correctly at phone width — one journey, not all of them.
-  *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list and a
-  job page, nothing wider than the screen.)* The screen is the device's width:
+  *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list, a
+  job page and the contributors' ranking, nothing wider than the screen and the
+  ranking's own column inside its box — a pseudonym's sixteen characters
+  pushed it out, thirty-second audit.)* The screen is the device's width:
   compared with `innerWidth`, as it was, the check could not fail, because a
   phone's browser widens its layout viewport to fit what overflows — and the
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
@@ -2942,8 +2966,8 @@ Serving it offline takes two settings and a static tree.
 `GITHUB_API_URL` and fetches tarballs from `GITHUB_RAW_URL`, both defaulting to
 the real hosts (`MAGPIE_DATA_REPO` substitutes only the `owner/repo` segment).
 `fixtures/build.sh` also writes `fixtures/github/`, the two answers an import
-asks GitHub for — `api/repos/birdtest/fixtures/commits/main` resolving to a
-fixed sha, and `raw/birdtest/fixtures/<sha>/versioned-tarballs/` holding the
+asks GitHub for — `api/repos/birdtest/fixtures/git/ref/heads/main`, the branch
+as JSON naming a fixed sha, and `raw/birdtest/fixtures/<sha>/versioned-tarballs/` holding the
 tarballs — which the e2e stack's `fixtures` service (Nginx,
 `fixtures/nginx.conf`) serves with the backend's two URLs pointed at it. Tier 2
 points the same two settings at an in-process stand-in that serves a tarball

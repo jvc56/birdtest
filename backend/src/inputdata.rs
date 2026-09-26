@@ -39,6 +39,11 @@ mod limits {
     pub const ENTRIES: usize = 5_000;
     /// A PAX extension header or GNU long name is a few hundred bytes.
     pub const EXTENSION_BYTES: u64 = 64 * 1024;
+    /// A letter distribution or a layout, kept in its row and read by the
+    /// server: the real ones are hundreds of bytes. Up to the per-entry cap, a
+    /// 128 MiB one was stored, parsed at job creation and copied once per
+    /// alias (the audit's pass 11).
+    pub const CONTENT_BYTES: u64 = 64 * 1024;
 }
 
 /// The decompressed stream, counted: every byte the tar reader takes, entry
@@ -165,8 +170,31 @@ pub fn input_object_key(sha256: &str) -> String {
     format!("inputs/{sha256}")
 }
 
-/// Resolves a git ref to a commit sha, so `main` is pinned at import time and
-/// the record names a commit rather than a branch.
+/// How long resolving a ref may take, all of it.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The most of one GitHub answer read while resolving: a ref's JSON is a few
+/// hundred bytes.
+const RESOLVE_BODY_BYTES: usize = 64 * 1024;
+
+fn resolve_timed_out() -> AppError {
+    AppError::bad_request(format!(
+        "GitHub did not answer within {} seconds; try again",
+        RESOLVE_TIMEOUT.as_secs()
+    ))
+}
+
+/// Resolves a branch or a tag of `MAGPIE_DATA_REPO`, by name, to a commit sha,
+/// so `main` is pinned at import time and the record names a commit rather
+/// than a branch.
+///
+/// Only through the endpoints that list the repository's own refs
+/// (`/git/ref/heads/…`, then `/git/ref/tags/…`). `/commits/{ref}` resolved a
+/// commit sha, a pull request's ref, an abbreviated sha of five characters or
+/// a `git describe` name from any fork, and GitHub serves a fork's files under
+/// the upstream's raw URLs: anyone who can open a pull request could author
+/// the tarball an admin imported. Refusing refs by their shape missed forms
+/// and refused a real branch named `20260101` (the audit's pass 11).
 pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
     // A ref is a git ref name. Put into the URL as given, `..` segments
     // resolved -- `../../../user` asked GitHub's API for another endpoint,
@@ -181,20 +209,66 @@ pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
         return Err(AppError::bad_request("that is not a git ref name")
             .with_field("git_ref", "letters, digits, '-', '_', '.' and '/' only"));
     }
-    let url = format!(
-        "{}/repos/{}/commits/{}",
-        state.cfg.github_api_url, state.cfg.magpie_data_repo, git_ref
-    );
+    tokio::time::timeout(RESOLVE_TIMEOUT, resolve_branch_or_tag(state, git_ref))
+        .await
+        .map_err(|_| resolve_timed_out())?
+}
+
+async fn resolve_branch_or_tag(state: &AppState, git_ref: &str) -> AppResult<String> {
+    let found = match github_json(state, &format!("git/ref/heads/{git_ref}")).await? {
+        Some(found) => found,
+        None => match github_json(state, &format!("git/ref/tags/{git_ref}")).await? {
+            Some(found) => found,
+            None => {
+                return Err(AppError::not_found(format!(
+                    "no branch or tag {git_ref:?} in {}",
+                    state.cfg.magpie_data_repo
+                )))
+            }
+        },
+    };
+    let (mut sha, mut kind) = ref_object(&found, git_ref)?;
+    // An annotated tag names a tag object, which names the commit.
+    if kind == "tag" {
+        let tag = github_json(state, &format!("git/tags/{sha}")).await?.ok_or_else(|| {
+            AppError::bad_request(format!("GitHub has no tag object {sha} for {git_ref:?}"))
+        })?;
+        (sha, kind) = ref_object(&tag, git_ref)?;
+    }
+    if kind != "commit" {
+        return Err(AppError::bad_request(format!(
+            "{git_ref:?} names a {kind}, not a commit"
+        )));
+    }
+    Ok(sha)
+}
+
+/// `object.sha` and `object.type` of a ref or tag object, checked.
+fn ref_object(value: &serde_json::Value, git_ref: &str) -> AppResult<(String, String)> {
+    let sha = value["object"]["sha"].as_str().unwrap_or_default().to_string();
+    let kind = value["object"]["type"].as_str().unwrap_or_default().to_string();
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(format!(
+            "GitHub's answer for {git_ref:?} names no commit sha"
+        )));
+    }
+    Ok((sha, kind))
+}
+
+/// One GitHub API answer for `/repos/{MAGPIE_DATA_REPO}/{path}`, as JSON:
+/// `None` for a 404, read to at most `RESOLVE_BODY_BYTES`.
+async fn github_json(state: &AppState, path: &str) -> AppResult<Option<serde_json::Value>> {
+    let url = format!("{}/repos/{}/{}", state.cfg.github_api_url, state.cfg.magpie_data_repo, path);
     let mut request = state
         .http
         .get(&url)
         .header("User-Agent", "birdtest")
-        .header("Accept", "application/vnd.github.sha");
+        .header("Accept", "application/vnd.github+json");
     if let Some(token) = &state.cfg.github_token {
         request = request.bearer_auth(token);
     }
 
-    let response = request.send().await.map_err(github_error)?;
+    let mut response = request.send().await.map_err(github_error)?;
     let status = response.status();
     if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
     {
@@ -219,25 +293,24 @@ pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
         )));
     }
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(AppError::not_found(format!(
-            "no such ref {git_ref:?} in {}",
-            state.cfg.magpie_data_repo
-        )));
+        return Ok(None);
     }
     if !status.is_success() {
-        return Err(AppError::bad_request(format!(
-            "GitHub returned {status} resolving {git_ref:?}"
-        )));
+        return Err(AppError::bad_request(format!("GitHub returned {status} for {path}")));
     }
 
-    let sha = response.text().await.map_err(github_error)?.trim().to_string();
-    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(AppError::bad_request(format!(
-            "GitHub returned something that is not a commit sha: {:?}",
-            sha.chars().take(80).collect::<String>()
-        )));
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(github_error)? {
+        body.extend_from_slice(&chunk);
+        if body.len() > RESOLVE_BODY_BYTES {
+            return Err(AppError::bad_request(format!(
+                "GitHub's answer for {path} is larger than a ref's"
+            )));
+        }
     }
-    Ok(sha)
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| AppError::bad_request(format!("GitHub's answer for {path} is not JSON: {e}")))
 }
 
 fn header(response: &reqwest::Response, name: &str) -> Option<String> {
@@ -647,6 +720,12 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         if !seen.insert(mapped_path.clone()) {
             return Err(twice(&path));
         }
+        if keeps_content(&role) && size > limits::CONTENT_BYTES {
+            return Err(AppError::bad_request(format!(
+                "{path} is larger than the {} KiB a {role} file may be",
+                limits::CONTENT_BYTES / 1024
+            )));
+        }
 
         let mut bytes = Vec::with_capacity(size as usize);
         (&mut entry)
@@ -699,6 +778,12 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         let Some(file) = resolved else {
             return Err(unresolvable_link(&format!("data/{mapped_path}"), written));
         };
+        // An alias is its target's bytes again, for a worker extracting it and
+        // for its row: counted against the caps as they are. As a zero-byte
+        // entry, a few hundred aliases of one large file held and stored it a
+        // few hundred times (the audit's pass 11).
+        total_uncompressed += file.bytes as u64;
+        check_expansion(total_uncompressed, compressed.len() as u64)?;
         let alias = ImportedFile {
             path: mapped_path.clone(),
             role: role.clone(),
@@ -1232,6 +1317,46 @@ mod tests {
         assert_eq!(files.iter().filter(|f| f.stored.is_some()).count(), 1);
     }
 
+    /// U-ARCHIVE-5b: an alias counts as its target's bytes against the caps,
+    /// and a file the server keeps in its row (a distribution, a layout) is at
+    /// most 64 KiB. As a zero-byte entry, a few hundred aliases of one large
+    /// layout were held, staged and inserted a few hundred times over: 150 of a
+    /// 4 MiB one took 600 MiB from a 263 KiB gzip.
+    #[test]
+    fn aliases_count_as_their_targets_bytes_and_kept_files_are_small() {
+        let noise = |n: usize| -> Vec<u8> {
+            let mut x: u32 = 0x9e37_79b9;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect()
+        };
+        // Too large to keep in a row, whatever its aliases.
+        let big = noise(100 * 1024);
+        let refused = walk_archive(&tarball(&[("data/layouts/big.txt", &big)]), None).unwrap_err();
+        assert!(refused.message.contains("KiB a layout file may be"), "{}", refused.message);
+
+        // Sixty aliases of 60 KiB of noise: sixty times the bytes, past the
+        // expansion ratio.
+        let layout = noise(60 * 1024);
+        let names: Vec<String> = (0..60).map(|i| format!("data/layouts/alias{i}.txt")).collect();
+        let links: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "real.txt")).collect();
+        let refused =
+            walk_archive(&tarball_with_links(&[("data/layouts/real.txt", &layout)], &links), None)
+                .unwrap_err();
+        assert!(refused.message.contains("expan") || refused.message.contains("ratio"), "{}", refused.message);
+
+        // A handful, as MAGPIE-DATA ships, is fine.
+        let few: Vec<(&str, &str)> = names.iter().take(3).map(|n| (n.as_str(), "real.txt")).collect();
+        let files =
+            walk_archive(&tarball_with_links(&[("data/layouts/real.txt", &layout)], &few), None).unwrap();
+        assert_eq!(files.len(), 4);
+    }
+
     /// A symlink at a pinned path that leaves the archive, dangles, loops, or
     /// names a file of another kind is refused rather than skipped: it is
     /// exactly what a hostile archive would use to look ordinary.
@@ -1446,6 +1571,7 @@ mod tests {
         assert_eq!(limits::EXPANSION_RATIO, 20);
         assert_eq!(limits::ENTRY_BYTES, 128 * 1024 * 1024);
         assert_eq!(limits::ENTRIES, 5_000);
+        assert_eq!(limits::CONTENT_BYTES, 64 * 1024);
     }
 
     /// A gzipped tar of one pinned entry whose ustar header says 0 bytes while

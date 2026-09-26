@@ -223,13 +223,48 @@ pub async fn payload(
     // merely started before the request asked -- the one it waited on --
     // was refused, so on a slow database each burst of viewers built twice
     // (the audit's pass 10).
+    // And a build that *failed* after this request asked answers it too, as
+    // busy: tried again by each waiter in turn, on a saturated pool each
+    // waited out the acquire timeout after the one before, and the tenth
+    // viewer had its `503` after fifty seconds (the audit's pass 11).
     let result = match cached_payload(job.id, max_age, Some(asked)) {
         Some(cached) => Ok(cached),
-        None => build_payload(pool, job.id, max_age).await.map(|(json, _)| json),
+        None if failed_since(job.id, asked) => Err(busy()),
+        None => {
+            let built = build_payload(pool, job.id, max_age).await.map(|(json, _)| json);
+            if built.is_err() {
+                FAILED.lock().expect("stats cache poisoned").insert(job.id, std::time::Instant::now());
+            }
+            built
+        }
     };
     drop(turn);
     release_build_lock(job.id, lock);
     result
+}
+
+/// When each job's last build failed, for the requests waiting on it.
+static FAILED: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Whether the job's last build failed after `since`; old entries go.
+fn failed_since(job_id: Uuid, since: std::time::Instant) -> bool {
+    let mut failed = FAILED.lock().expect("stats cache poisoned");
+    failed.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(60));
+    failed.get(&job_id).is_some_and(|at| *at >= since)
+}
+
+/// What a request waiting on a failed build is told: what a pool timeout
+/// tells it, since that is what failed builds on a busy server are.
+fn busy() -> crate::error::AppError {
+    crate::error::AppError {
+        retry_after: Some(5),
+        ..crate::error::AppError::new(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "the server is busy; try again shortly",
+        )
+    }
 }
 
 /// Builds the job's stats as JSON and keeps them for [`payload`] -- `None`
@@ -351,7 +386,11 @@ fn cached_payload(
         .get(&job_id)
         .filter(|entry| {
             entry.started.elapsed() < max_age
-                || since.is_some_and(|since| entry.started + max_age >= since)
+                || since.is_some_and(|since| {
+                    // Checked: a configured age past `Instant`'s range would
+                    // panic here, under the payloads' lock, and poison it.
+                    entry.started.checked_add(max_age).is_none_or(|fresh_until| fresh_until >= since)
+                })
         })
         .map(|entry| entry.json.clone())
 }
