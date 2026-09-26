@@ -42,6 +42,14 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   SPRT settings; `dev-restore.sh` skipping the scrub on `SCRUB=yes`), all fixed
   and verified; the adversarial check found no high or medium. KL-2, KL-10,
   KL-60 and KL-78 updated. The loop continues.
+- **Pass 5 (follow-up: pass 4's diff, and the account lifecycle):** 1 high
+  (Argon2 had no concurrency bound: a flood of sign-ins took the process to
+  2.6 GB; now four turns on four threads, 129 MB) and 3 medium from the
+  reviewers (no way to recover a forgotten username; PLAN's password-score
+  claim; `game_pair_stats`'s cost understated), all fixed and verified; the
+  adversarial check found 2 medium (aborted requests escaped the Argon2
+  bound; the confirmation mail carried the registrant's text), both fixed.
+  KL-34, KL-60 and KL-81 updated. The loop continues.
 
 ---
 
@@ -613,7 +621,7 @@ board no job can use is refused; the layout test's comment; KL-2 (checks run
 at creation only); Fargate CPU sizes validated, the memory message gives the
 whole table, and `db_allocated_storage` stops at 59,578 GiB (past it RDS's
 ceiling is under a tenth above the allocation) — a mock `terraform test` of
-11 runs passes; RUNBOOK §5's ceiling wording; a push after a delete ends
+11 runs passes; RUNBOOK §1's ceiling wording; a push after a delete ends
 quietly; `sse.rs`'s and PLAN's "an idle server holds no per-job state"; the job
 page's "live, on every accepted result"; TESTING's `A-ADMIN-21` claims now
 tested (β, the 0.000001 boundary, the inference margin); PLAN's schema seed
@@ -646,9 +654,9 @@ cool-down for an identical push (spent after the rebuild); two more joins let
 a panic's text reach an admin (the purge/delete operation, an export's stored
 error); the refit's failure log names its pool again; an edit cleared a
 failure to load the form's choices as well as a submit's error (only the
-submit's now); "live, at most every few seconds"; the remaining "on every
+submit's now); "live, at most every few seconds" (now plain "live"); the remaining "on every
 accepted result" and "one a second" in PLAN, `public.rs` and `sse.ts`; a stray
-comma in RUNBOOK §5. **Unconfirmed, recorded under KL-78:** a page view in the
+comma in RUNBOOK §1. **Unconfirmed, recorded under KL-78:** a page view in the
 gap between the cache's expiry and the next push can cost a second build per
 interval.
 
@@ -665,3 +673,148 @@ interval.
 - **Tier 5, natively: 11 of 11** — on the committed pass-3 tree by the frontend
   reviewer, and on the working tree by the adversarial check.
 - MAGPIE unchanged.
+
+---
+
+## Pass 5 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`7e75361..dd8ae36`; MAGPIE
+unchanged), one reviewer per part it touches: backend (the live-push loop
+above all); frontend; docs and procedures; infra. Plus one area not examined
+in recent passes: **the account lifecycle** — registration, email
+confirmation, password reset, sign-in and sessions, account deletion and its
+tombstone, API keys (creation, use, revocation), and the account page.
+
+**Findings: 1 high, 3 medium** from the five reviewers (backend none, 3 low;
+frontend none, 4 low — tier 5 natively 11 of 11; docs and procedures 1 medium,
+9 low; infra none, 3 low; the account lifecycle 1 high, 2 medium, 5 low, 1
+unconfirmed). All fixed and verified; the adversarial check (5.6) found 2
+medium, both fixed.
+
+### 5.1 High — Argon2 had no concurrency bound: a flood of sign-ins took the process past its memory (account reviewer)
+
+**Code updated.** Every password hash and verify (19 MiB each, the crate's
+defaults) ran on the blocking pool with no limit, and the rate limits are per
+address: seven addresses' worth of wrong-password logins and registrations —
+within every limit, needing no account, the target usernames public — held
+140 runs at once. Reproduced on a native backend: RSS to 2.6 GB and held there
+(glibc keeps the memory), past the single 2 GiB task, which is OOM-killed with
+every claim and stream and the rate limiters' state. **Fix:** Argon2 runs on
+four threads of its own, admitted by a semaphore of four; a request that waits
+ten seconds for a turn is `503` with `Retry-After`; a taken username is
+answered before the hash (it bought nothing there). The first version — the
+semaphore alone, on the blocking pool — still peaked at 694 MB: glibc raises
+its mmap threshold to the last large block freed, after which each 19 MiB
+buffer came from a per-thread arena and stayed (eleven arenas, 600 MB, seen in
+`smaps`), and dedicated threads alone still left 420 MB. So the allocator's
+mmap threshold is pinned at 1 MiB at startup, and every such buffer is given
+back. **Verified:** the same flood, 2.6 GB before; 129 MB peak and 52 MB after
+now (logins alone 129 MB); `argon2_runs_wait_for_a_turn` (`U-AUTH-9`).
+
+### 5.2 Medium — someone who had forgotten their username had no way back (account reviewer)
+
+**Code updated.** Sign-in asks for a username, and neither the reset mail nor
+the notice sent when someone registers a taken address named it; PLAN promises
+that "a real person who has forgotten they signed up still finds out". Both
+now name the account (both go only to the address's owner; the notice's lookup
+runs in its own task, so the request's timing does not change), and so does the
+confirmation mail, so an owner can see an account someone else registered on
+their address (KL-34). **Verified:** `the_owner_of_a_taken_address_is_told_their_username`
+(`A-AUTH-4e`) and the reset test's new assertion.
+
+### 5.3 Medium — PLAN said the registration form shows the server's password score; it does not (account reviewer)
+
+**Docs and page updated.** The form's meter is length and character classes,
+not zxcvbn, and disagrees with the server both ways (`Qwerty123456789!` shown
+strong and refused; a long passphrase shown good and taken). PLAN and the page
+now call it a rough guide that the server's check overrides.
+
+### 5.4 Medium — PLAN's cost for `game_pair_stats` had the same sevenfold understatement (docs reviewer)
+
+**PLAN updated.** Pass 4 corrected the games row only; the pairs row said 54 ms
+where 400,000 one-pair rows (the form's default batch) measured 430–520 ms.
+Both rows now carry the measured figure and say when they run (every eighth
+submission, an idle job's check, every live build), and KL-10 says games or
+pairs.
+
+### 5.5 Low findings
+
+**Fixed:** a reset and an admin's delete of one account deadlocked (reproduced
+in psql; the delete now removes the account's rows first, as a reset takes
+them — rerun, both finish); an admin change made during a third superseded
+build waited out the cool-down (the wake-up is now drained before each build,
+not after the publish); a pool on a letter distribution no job can use is
+refused; a test that submissions during a cool-down are pushed when it ends;
+RUNBOOK's PITR and DR ceilings capped at RDS's bounds and §1's wording;
+`scripts/dev-restore-check.sh` (the SCRUB rule against a stub, in a new CI
+`scripts` job; fails against the committed script); the check-email page's
+developer hint only in development; form errors announced (`role="alert"`);
+stopping % bounded in the form; "acted on from the first pair" when the
+minimum is 0; PLAN's heading "An event per round", the deletion rationale, the
+scrub list, the schema's seed comment (the migration's copy left for its
+checksum); TESTING's `A-ADMIN-21` boundaries now all tested, `A-RATE-3b`,
+`S-BACKUP-6`; the findings file's RUNBOOK section names. **Recorded:** KL-60
+(α/β arrow keys), KL-81 (a reset holds its transaction while it waits for a
+turn; no SES timeout; a known address's reset writes a row), KL-34.
+
+### 5.6 Adversarial check of the pass's fixes
+
+**2 medium, both fixed and verified.**
+
+- **Medium — a client that hung up escaped the Argon2 bound.** The request
+  held the turn, so an aborted request gave its turn back while its run stayed
+  queued on the four threads: 2,000 abandoned logins left a fresh one waiting
+  46 s, and no request was ever told `503`. **Fix:** the turn goes with the
+  run and is given back when the run ends, and a run whose requester has gone
+  is skipped (`api_key::on_an_argon2_thread`). **Verified:** the new
+  `abandoned_argon2_runs_do_not_queue_past_the_turns` (a thousand aborted
+  requests, then a fresh hash) fails on the old code, 8.4 s and timed out, and
+  passes, under a second.
+- **Medium — the confirmation mail carried the registrant's text to any
+  address.** Naming the account (5.2's companion change for KL-34) let anyone
+  put 32 characters of their own, newlines included, in a mail from
+  birdtest's sender to an address they typed. **Fix:** the confirmation mail
+  does not name the account; the taken-address notice and the reset mail
+  still do, since they go to the account's own address. **Verified:**
+  `A-AUTH-1` now asserts no line but `To:` carries the username; KL-34
+  rewritten.
+
+**Lows fixed:**
+- **The reset/delete deadlock came back with two reset links.** 5.5's fix
+  held for one link only: a reset spends link B while the delete removes link
+  A, then waits for B, and the reset's spend of the account's other links
+  waits for A. Reproduced in psql with the adversary's script (the delete was
+  the victim). Both now lock the account's row first: the delete
+  `FOR UPDATE`, the reset `FOR NO KEY UPDATE`, which the account's own
+  submissions do not wait on. Rerun in both start orders: both commit, and a
+  reset that starts second finds its link gone.
+- **The reset hashes before its transaction.** The new lock is held for a few
+  statements; hashed inside, it would have held the account's row through a
+  wait of up to ten seconds for an Argon2 turn, against the account's own
+  submissions, which count its tasks on that row. KL-81's first item is
+  resolved this way.
+- The pool test gained its letter-distribution case (fails with the check
+  removed).
+- `main.rs`'s allocator pin is `cfg(all(target_os = "linux", target_env =
+  "gnu"))`.
+- PLAN records the pin's cost, 12–18% of Argon2's throughput.
+- The player-config form's stopping % takes the server's range, 0 to 100,
+  instead of a stricter one.
+- With a minimum of 0 the job page now says "SPRT can stop the job as soon as
+  a bound is crossed".
+
+**Held:** tier 5 natively on the working tree, 11 of 11; the full suite, 568
+of 568; a flood that hangs up does not stall sign-in once the fix is in
+(0 turns held after 2,000 dropped requests; a fresh hash in 36 ms).
+
+### 5.7 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **569 of 569**.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 117 of 117.
+- `scripts/dev-restore-check.sh`: passes, and fails against the committed
+  script.
+- The reset/delete race replayed in psql, old order and both new orders.
+- **Tier 5, natively: 11 of 11** (reviewer and adversarial check).
+- Terraform and MAGPIE unchanged since pass 4.

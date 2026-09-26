@@ -225,6 +225,13 @@ async fn register_confirm_and_login_gives_a_working_session() {
     // The address is stored trimmed and lowercased, and mailed there.
     let mail = outbox.wait_for("newcomer@example.invalid", 1).await;
     assert!(mail[0].contains("Subject: Confirm your birdtest account"), "{}", mail[0]);
+    // The username is the registrant's own text and the address is any
+    // address they typed: the mail does not carry the one to the other.
+    assert!(
+        mail[0].lines().filter(|line| !line.starts_with("To:")).all(|line| !line.contains("newcomer")),
+        "{}",
+        mail[0]
+    );
     let code = link_param(&mail[0], "code");
 
     let response = post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await;
@@ -326,6 +333,23 @@ async fn registering_a_taken_address_answers_exactly_like_a_new_registration() {
         .find(|m| m.contains("Subject: Someone tried to register with your email address"))
         .unwrap_or_else(|| panic!("no notice to the owner: {mail:?}"));
     assert!(!notice.contains("code="), "the notice carries no confirmation code: {notice}");
+}
+
+/// A-AUTH-4e: the notice to a confirmed address's owner names their account,
+/// so someone who has forgotten they signed up can sign in -- sign-in asks for
+/// the username, which nothing else would tell them.
+#[tokio::test]
+async fn the_owner_of_a_taken_address_is_told_their_username() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+    confirmed_user(&db, "forgetful", PASSWORD).await;
+
+    let taken = register(&app, "newcomer", "forgetful@example.invalid", PASSWORD, "").await;
+    assert_eq!(taken.status, StatusCode::CREATED, "{taken:?}");
+    let mail = outbox.wait_for("forgetful@example.invalid", 1).await;
+    assert!(mail[0].contains("it already has one: forgetful."), "{}", mail[0]);
+    assert!(mail[0].contains("/login as forgetful"), "{}", mail[0]);
 }
 
 /// A-AUTH-4b: an account that never confirmed its address holds the address
@@ -552,6 +576,9 @@ async fn a_reset_request_answers_the_same_for_known_and_unknown_addresses() {
 
     let mail = outbox.wait_for("forgetful@example.invalid", 1).await;
     assert!(mail[0].contains("/reset-password/confirm?token="), "{}", mail[0]);
+    // Signing in asks for the username, which someone resetting may also have
+    // forgotten; the mail goes only to the address's owner.
+    assert!(mail[0].contains("Your birdtest username is forgetful."), "{}", mail[0]);
     // The unknown address's request came first; by the time the known one's
     // mail has landed, anything it had sent would have too.
     assert!(outbox.messages_to("nobody@example.invalid").is_empty());

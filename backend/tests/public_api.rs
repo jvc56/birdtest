@@ -965,3 +965,51 @@ async fn live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not(
     .expect("the deactivation reaches the page without waiting out the interval");
     assert_eq!(event["job"]["status"], "inactive");
 }
+
+/// A-PUBLIC-6d, the other half: submissions that arrive during a cool-down
+/// are pushed when it ends, with nothing urgent to wake it -- together, in
+/// one push that counts them all.
+#[tokio::test]
+async fn submissions_during_a_cool_down_are_pushed_when_it_ends() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let mut cfg = db.config();
+    cfg.stats_cache = std::time::Duration::from_secs(2);
+    let app = birdtest::app(db.state_with(cfg).await);
+    let response = app
+        .clone()
+        .oneshot(get_request(&format!("/api/jobs/{job}/stream"), &[]))
+        .await
+        .unwrap();
+    let mut body = response.into_body().into_data_stream();
+    let mut buffer = String::new();
+    next_stats_event(&mut body, &mut buffer).await;
+
+    let (mut assignment, uuid) = first_claim(&app).await;
+    for i in 0..3 {
+        submit(&app, &assignment, &uuid, games_result(2, 1)).await;
+        if i < 2 {
+            let (status, next) = send(
+                &app,
+                post_json("/api/worker/task", &[("x-worker-uuid", &uuid)], claim_body("1.0.0", &[])),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{next}");
+            assignment = next;
+        }
+    }
+    // The first submission's push, then the cool-down's: within one
+    // interval and a build, the page has all six games.
+    let everything = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+        loop {
+            let event = next_stats_event(&mut body, &mut buffer).await;
+            let parsed: serde_json::Value = serde_json::from_str(&event).unwrap();
+            if parsed["games"]["units_completed"] == 6 {
+                return parsed;
+            }
+        }
+    })
+    .await
+    .expect("the submissions made during the cool-down are pushed when it ends");
+    assert_eq!(everything["games"]["units_completed"], 6);
+}

@@ -185,6 +185,14 @@ jobs:
       - run: terraform init -backend=false -input=false
       - run: terraform validate
 
+  # Scripts checked without Docker or AWS.
+  scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dev-restore.sh scrubs unless told 0, and refuses anything else
+        run: ./scripts/dev-restore-check.sh
+
   # MAGPIE's half of the contract. Each repository
   # tests against its own copy of the fixtures, so a fixture changed here and
   # not copied to MAGPIE would pass both suites while breaking the protocol.

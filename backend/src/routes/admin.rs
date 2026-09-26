@@ -2793,6 +2793,20 @@ async fn delete_user(
     )
     .await?;
 
+    // The account is locked first, then its own rows go, then the account is
+    // anonymized: a password reset locks the account before its token too.
+    // Taken the other way round, a reset and a delete of one account
+    // deadlocked, and the delete lost.
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    for table in ["api_keys", "email_confirmations", "password_reset_tokens"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let anonymized = sqlx::query(
         "UPDATE users SET
              username = 'deleted-' || id::text,
@@ -2812,12 +2826,6 @@ async fn delete_user(
     .await?;
     if anonymized.rows_affected() == 0 {
         return Err(AppError::not_found("no such user"));
-    }
-    for table in ["api_keys", "email_confirmations", "password_reset_tokens"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
     }
 
     audit::log(

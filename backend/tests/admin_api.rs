@@ -1148,6 +1148,12 @@ async fn a_config_or_job_no_worker_can_run_is_refused() {
         "movegen_margin": 2_147_483.645, "num_plays": 63_585, "num_plays_recorded": 32_767,
     })).await;
     assert_eq!(status, StatusCode::CREATED, "{at_ceilings}");
+    let (status, at_ceilings) = player_config(&app, &headers, json!({
+        "name": "ceilings-simmer", "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+        "winpct_id": db.input_data("winpct", "winpct").await, "num_plies": 2,
+        "max_iterations": 100, "time_limit_secs": 0, "inference_margin": 2_147_483.645, "num_plays": 200_000, "num_plays_recorded": 1,
+    })).await;
+    assert_eq!(status, StatusCode::CREATED, "{at_ceilings}");
     let (status, player) = player_config(&app, &headers, json!({
         "name": "ok", "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
         "num_plays_recorded": 1,

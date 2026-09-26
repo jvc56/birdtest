@@ -1030,6 +1030,21 @@ async fn a_pool_that_could_rate_no_one_is_refused() {
             b["layout_id"] = json!(super21);
             b
         }),
+        ("a letter distribution no job can be created on", {
+            let garbled = b"this is not a letter distribution\n".to_vec();
+            let garbled_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+                 VALUES ('letterdists/garbled.csv', 'letterdist', 'garbled', repeat('3', 64), $1,
+                         '20260101', $2)
+                 RETURNING id",
+            )
+            .bind(garbled.len() as i64)
+            .bind(&garbled)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            body("classic", garbled_id, 2000.0)
+        }),
     ] {
         let (status, response) = send(
             &app,

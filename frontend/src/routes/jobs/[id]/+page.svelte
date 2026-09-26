@@ -155,8 +155,12 @@
           <p class="text-sm text-muted-foreground">
             {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)} within
             [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
-            SPRT is not acted on until {stats.games.min_units.toLocaleString()}
-            {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
+            {#if stats.games.min_units > 0}
+              SPRT is not acted on until {stats.games.min_units.toLocaleString()}
+              {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
+            {:else}
+              SPRT can stop the job as soon as a bound is crossed, with no minimum number of {stats.games.unit}s.
+            {/if}
           </p>
         {/if}
         <OutcomeChart

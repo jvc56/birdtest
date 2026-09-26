@@ -209,7 +209,7 @@
       <div><label class="label" for="num_plies">Plies (-pl)</label><input id="num_plies" type="number" class="input" bind:value={numPlies} /></div>
       <div><label class="label" for="np">Plays to simulate (-np)</label><input id="np" type="number" class="input" bind:value={numPlays} /></div>
       <div><label class="label" for="npr">Plies to report (shplies)</label><input id="npr" type="number" class="input" bind:value={numPliesRecorded} /></div>
-      <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="any" class="input" bind:value={stoppingPct} /></div>
+      <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="any" min="0" max="100" class="input" bind:value={stoppingPct} /></div>
       <p class="text-sm">No time limit: a simulation stops at its iteration budget, so what it finds does not depend on the contributor's hardware.</p>
       <label class="flex items-end gap-2 text-sm">
         <input type="checkbox" bind:checked={useInference} />
@@ -294,6 +294,8 @@
     </div>
   {/if}
 
-  {#if error}<p class="field-error">{error}</p>{/if}
+  <!-- Announced: an error that appears after a submit is otherwise silent to a
+       screen reader. -->
+  {#if error}<p class="field-error" role="alert">{error}</p>{/if}
   <button class="btn-primary" disabled={busy}>{busy ? 'Creating…' : 'Create'}</button>
 </form>

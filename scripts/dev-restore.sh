@@ -6,8 +6,8 @@
 #   ./scripts/dev-restore.sh path/to/pg/2026-09-07T03-00-00Z/dump   # a production dump
 #
 # Every restore is scrubbed on the way in unless SCRUB=0 is set -- a snapshot
-# of your own stack too, whose passwords, API keys and anonymous identities it
-# then resets. A production dump needs it: it carries real email addresses and
+# of your own stack too, whose addresses, passwords, API keys, anonymous
+# identities and backup history it then resets (scripts/scrub.sql). A production dump needs it: it carries real email addresses and
 # password hashes, and the whole point of restoring it locally is the shape of
 # the data, not those (PLAN.md, "Local development"). Set SCRUB=0 to restore
 # your own snapshot as it was; any value but 0 or 1 is refused.

@@ -368,8 +368,17 @@ async fn create_pool(
     if !err.fields.is_empty() {
         return Err(err);
     }
-    super::admin::require_role(&state.pool, body.letterdist_id, "letterdist").await?;
+    let letterdist_name = super::admin::require_role(&state.pool, body.letterdist_id, "letterdist").await?;
     super::admin::require_role(&state.pool, body.layout_id, "layout").await?;
+    // Nor a distribution no job can be created on (`create_job` parses it).
+    let letterdist: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(body.letterdist_id)
+        .fetch_one(&state.pool)
+        .await?;
+    crate::jobs::racks::LetterDistribution::parse(&letterdist, &letterdist_name).map_err(|e| {
+        AppError::bad_request("no job can be created on that letter distribution")
+            .with_field("letterdist_id", e.message)
+    })?;
     // A board no job can be created on is a pool no job will ever match: it
     // would rate no one, silently.
     let layout: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")

@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 204 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
+| 1 Unit | 206 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (29), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (4), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `exports`, `jobs`, `jobs::game`, `jobs::game_pair`, `routes`, `routes::auth` (1 each) |
 | 1F Frontend unit | 117 | Vitest, `frontend/src/lib/`: `format.test.ts` (19), `api.test.ts` (16), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 150 | `backend/tests/`: `leave_gen.rs` (30), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (15), `input_data.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 183 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (33), `auth_routes.rs` (17), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (13), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 185 | `backend/tests/`: `worker_api.rs` (44), `admin_api.rs` (33), `auth_routes.rs` (18), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (7), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 14 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 14 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (2) |
@@ -79,8 +79,8 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 539 backend tests (the per-tier counts above are
-from `cargo nextest list --run-ignored all` and `vitest`, thirty-first audit;
+--run-ignored all` runs 569 backend tests (the per-tier counts above are
+from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
 Tier 2 was the largest gap and the highest value, and is now the largest tier.
@@ -340,6 +340,19 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
   `csrf::tests::tokens_are_unpredictable`.)*
 - `U-AUTH-8` A confirmation code is stored only as its hash. *(Covered:
   `api_key::tests::a_confirmation_code_is_stored_only_as_its_hash`.)*
+- `U-AUTH-9` Argon2 runs wait for one of four turns: with every turn taken, a
+  hash does not start, and it runs once one is given back. Unbounded, a flood
+  of sign-ins and registrations from seven addresses took the process to
+  2.6 GB; bounded, and with the allocator's mmap threshold pinned, the same
+  flood peaked at 129 MB and fell back to 52 MB (measured on a native backend;
+  the memory half is not a unit test). *(Covered:
+  `api_key::tests::argon2_runs_wait_for_a_turn`.)* (Thirty-second audit.)
+- `U-AUTH-9b` A request that goes away does not leave its Argon2 run queued
+  past the four turns: the turn goes with the run, and a run whose requester
+  has gone is skipped. A thousand aborted requests leave a fresh hash under a
+  second (8 s, timed out, when the request held the turn). *(Covered:
+  `api_key::tests::abandoned_argon2_runs_do_not_queue_past_the_turns`.)*
+  (Thirty-second audit.)
 
 ### `U-CFG-*` — configuration (`config.rs`)
 
@@ -1723,6 +1736,8 @@ below.
 ### `A-AUTH-*` — `routes/auth.rs`
 
 - `A-AUTH-1` Register → confirm → login succeeds and sets a session cookie.
+  The confirmation mail does not carry the username, the registrant's own
+  text, to the address they typed (thirty-second audit).
   *(Covered: `auth_routes::register_confirm_and_login_gives_a_working_session`.)*
 - `A-AUTH-2` An unconfirmed login is 403 with a message naming the fix.
   *(Covered: `auth_routes::an_unconfirmed_login_is_refused_with_the_fix_named`.)*
@@ -1747,6 +1762,13 @@ below.
   `auth_routes::an_oversized_auth_body_is_refused`,
   `ratelimit::key_tests::a_long_key_is_one_bucket_kept_small`.)* (Nineteenth
   audit.)
+- `A-AUTH-4e` The notice to a confirmed address's owner names their account,
+  and so does the reset mail: sign-in asks for a username, which someone who
+  has forgotten they signed up, or their password, may have forgotten too.
+  *(Covered: `auth_routes::the_owner_of_a_taken_address_is_told_their_username`,
+  and the reset mail's in
+  `auth_routes::a_reset_request_answers_the_same_for_known_and_unknown_addresses`.)*
+  (Thirty-second audit.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
   scored the new password without the account's context. *(Covered:
@@ -2022,8 +2044,9 @@ below.
 - `A-RATE-3` Creating a pool adds the anchor as a member automatically.
   *(Covered: `ratings::creating_a_pool_makes_its_anchor_a_member`.)*
 - `A-RATE-3b` A pool is validated like a job: a variant no job has, a
-  distribution id that is a layout row, and an anchor rating whose scale would
-  overflow are each a 400, and nothing is created. *(Covered:
+  distribution id that is a layout row, an anchor rating whose scale would
+  overflow, and a board or a letter distribution no job can be created on
+  (thirty-second audit) are each a 400, and nothing is created. *(Covered:
   `ratings::a_pool_that_could_rate_no_one_is_refused`.)* (Eleventh audit.)
 - `A-RATE-4` Adding and removing a member each trigger a refit and return a new
   `run_id`. *(Covered: `ratings::adding_and_removing_a_member_each_refit_the_pool`.)*
@@ -2107,7 +2130,9 @@ below.
   under a ten-second interval push at most once — while an admin's change is
   pushed at once, mid-interval. *(Covered:
   `public_api::live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not`,
-  `sse::tests::an_urgent_push_cuts_the_cool_down_short`.)* (Thirty-second audit:
+  `sse::tests::an_urgent_push_cuts_the_cool_down_short`,
+  `public_api::submissions_during_a_cool_down_are_pushed_when_it_ends`, which
+  checks that what arrived during a cool-down is pushed when it ends.)* (Thirty-second audit:
   a job whose submissions came slower than one build was rebuilt and pushed for
   each.)
 - `A-PUBLIC-6a` The SSE stream ends when the process is told to stop: it has no
@@ -2631,6 +2656,11 @@ database — which is also the migration replay the nightly list asks for. The
 monthly production drill (`restore-drill.sh` on the newest real dump) remains
 the real check of the backups themselves.
 
+- `S-BACKUP-6` `dev-restore.sh` scrubs a restore unless `SCRUB=0`, and refuses
+  any other value (`yes`, `true`, `2`, padded spaces) before a single compose
+  call — `SCRUB=yes` used to skip the scrub, restoring a production dump's real
+  addresses and password hashes. *(Covered: `scripts/dev-restore-check.sh`,
+  a stub compose, in CI's `scripts` job.)* (Thirty-second audit.)
 - `S-SCRUB-1` A scrubbed dump holds no credential: every anonymous worker's
   UUID is replaced, with its claims, ban and audit rows following it and what
   it did kept, and an open claim's token is replaced; twice over, as the script

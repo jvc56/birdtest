@@ -175,19 +175,20 @@ async fn register(
     .await?;
     let (username_taken, email_taken, email_confirmed) = taken;
 
-    // Hashed before the collision branch, not after, so both paths pay the same
-    // Argon2 cost. Returning an identical body for a taken address and then
-    // answering in tens of milliseconds less would give the answer back through
-    // timing, which is exactly the flaw this branch exists to avoid.
-    let password_hash = api_key::hash_password_off_the_executor(body.password.clone()).await?;
-
     // A taken username is reported plainly: the user has to choose another one
     // to get anywhere, and `GET /api/users` publishes the whole list anyway, so
-    // there is nothing here to protect.
+    // there is nothing here to protect -- and it is answered before the hash,
+    // which bought nothing here but a free Argon2 run per request.
     if username_taken {
         return Err(AppError::conflict("registration details are invalid")
             .with_field("username", "that username is taken"));
     }
+
+    // Hashed before the email branch, not after, so both paths pay the same
+    // Argon2 cost. Returning an identical body for a taken address and then
+    // answering in tens of milliseconds less would give the answer back through
+    // timing, which is exactly the flaw this branch exists to avoid.
+    let password_hash = api_key::hash_password_off_the_executor(body.password.clone()).await?;
 
     // A taken *email* is not reported. Answering "that address is already
     // registered" turns this endpoint into an oracle for whether a given person
@@ -201,12 +202,14 @@ async fn register(
         // from enough IPs, and a refusal here -- and only here -- would answer
         // the question this branch hides.
         let notice = if email_confirmed {
+            // `{username}` is filled in off the request, below: looking it up
+            // here would be a query only this branch makes.
             format!(
                 "Someone tried to create a birdtest account with this \
-                 address, but it already has one.\n\n\
-                 If that was you, sign in at {url}/login, or reset your \
-                 password at {url}/reset-password if you have forgotten \
-                 it.\n\n\
+                 address, but it already has one: {{username}}.\n\n\
+                 If that was you, sign in at {url}/login as {{username}}, or \
+                 reset your password at {url}/reset-password if you have \
+                 forgotten it.\n\n\
                  If it was not you, no account was created and nothing \
                  has changed.\n",
                 url = state.cfg.public_url
@@ -224,12 +227,22 @@ async fn register(
             )
         };
         if ratelimit::check(&state.limits.reset, &format!("reg-em:{email}")).is_ok() {
-            send_in_background(
-                &state,
-                email.clone(),
-                "Someone tried to register with your email address",
-                notice,
-            );
+            let (pool, mailer, to) = (state.pool.clone(), state.mailer.clone(), email.clone());
+            tokio::spawn(async move {
+                let owner: Option<String> =
+                    sqlx::query_scalar("SELECT username FROM users WHERE email = $1")
+                        .bind(&to)
+                        .fetch_optional(&pool)
+                        .await
+                        .ok()
+                        .flatten();
+                let body = notice.replace("{username}", owner.as_deref().unwrap_or("your account"));
+                if let Err(err) =
+                    mailer.send(&to, "Someone tried to register with your email address", &body).await
+                {
+                    tracing::error!(error = %err.message, "registration email failed to send");
+                }
+            });
         }
         return Ok((
             StatusCode::CREATED,
@@ -293,7 +306,13 @@ async fn register(
         &state,
         email,
         "Confirm your birdtest account",
-        format!("Welcome to birdtest.\n\nConfirm your account:\n{link}\n"),
+        // Not named: the username is the registrant's own text, and this mail
+        // goes to any address they type, so naming it made birdtest carry
+        // their words to strangers (the audit's adversarial check).
+        format!(
+            "Welcome to birdtest.\n\nConfirm your account:\n{link}\n\n\
+             If you did not register, ignore this mail.\n"
+        ),
     );
 
     // No session is created yet — email is confirmed before the first login.
@@ -374,7 +393,7 @@ async fn login(
     let Some((id, username, password_hash, is_admin, confirmed_at, generation)) = row else {
         return Err(invalid());
     };
-    if !api_key::verify_password_off_the_executor(body.password.clone(), password_hash.clone()).await {
+    if !api_key::verify_password_off_the_executor(body.password.clone(), password_hash.clone()).await? {
         return Err(invalid());
     }
     if confirmed_at.is_none() {
@@ -506,15 +525,15 @@ async fn request_password_reset(
     // one address being buried in reset mail from many sources.
     ratelimit::check(&state.limits.reset, &format!("ip:{ip}"))?;
     ratelimit::check(&state.limits.reset, &format!("em:{email}"))?;
-    let user = sqlx::query_as::<_, (Uuid,)>(
-        "SELECT id FROM users
+    let user = sqlx::query_as::<_, (Uuid, String)>(
+        "SELECT id, username FROM users
          WHERE email = $1 AND email_confirmed_at IS NOT NULL AND deleted_at IS NULL",
     )
     .bind(&email)
     .fetch_optional(&state.pool)
     .await?;
 
-    if let Some((user_id,)) = user {
+    if let Some((user_id, username)) = user {
         let raw_token = api_key::generate_code();
         sqlx::query(
             "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at)
@@ -543,8 +562,12 @@ async fn request_password_reset(
                 .send(
                     &email,
                     "Reset your birdtest password",
+                    // The username too: signing in asks for it, and someone who
+                    // has forgotten their password may have forgotten that as
+                    // well. The mail goes only to the address's owner.
                     &format!(
-                        "Reset your password (valid for {RESET_TTL_MINUTES} minutes):\n{link}\n"
+                        "Your birdtest username is {username}.\n\n\
+                         Reset your password (valid for {RESET_TTL_MINUTES} minutes):\n{link}\n"
                     ),
                 )
                 .await
@@ -585,7 +608,23 @@ async fn confirm_password_reset(
         return Err(weak());
     }
 
+    // Hashed before the transaction: the wait for an Argon2 turn can be ten
+    // seconds under a flood, and inside the transaction it held the account's
+    // row locked all that while — against the account's own submissions,
+    // which count its tasks on that row.
+    let password_hash = api_key::hash_password_off_the_executor(body.password.clone()).await?;
+
     let mut tx = state.pool.begin().await?;
+    // The account first, then its token: the order an admin's delete takes
+    // them in. Token first, a reset and a delete deadlocked whenever the
+    // account had two reset links out (the delete took the other first).
+    sqlx::query(
+        "SELECT u.id FROM users u JOIN password_reset_tokens t ON t.user_id = u.id
+         WHERE t.token_hash = $1 FOR NO KEY UPDATE OF u",
+    )
+    .bind(api_key::hash_code(body.token.trim()))
+    .fetch_optional(&mut *tx)
+    .await?;
     let user_id = sqlx::query_scalar::<_, Uuid>(
         "UPDATE password_reset_tokens SET used_at = now()
          WHERE token_hash = $1 AND used_at IS NULL AND expires_at > now()
@@ -615,7 +654,7 @@ async fn confirm_password_reset(
         "UPDATE users SET password_hash = $1, session_generation = session_generation + 1
          WHERE id = $2 AND deleted_at IS NULL",
     )
-        .bind(api_key::hash_password_off_the_executor(body.password.clone()).await?)
+        .bind(&password_hash)
         .bind(user_id)
         .execute(&mut *tx)
         .await?;

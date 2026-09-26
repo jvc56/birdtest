@@ -719,7 +719,10 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
      mail, the same inbox under another string.
    - Password scores at least **3** on zxcvbn, with the username and email passed
      in as context so a password derived from either is rejected. Scored
-     server-side; the client shows the same feedback but is not trusted.
+     server-side only. The form shows a rough guide from length and character
+     classes, which is not zxcvbn and can disagree with it either way (a
+     keyboard walk it calls strong is refused; a long passphrase it calls good
+     is taken); the server's refusal says why.
 
    A **taken username** returns `409` naming it. The user has to choose another
    one to get anywhere, and `GET /api/users` publishes the whole list anyway, so
@@ -969,7 +972,7 @@ is a `503`; the page tries again after 5 s, doubling to a minute while it is
 refused, jittered so refused pages do not return together. A push is shared among its subscribers (`Arc<str>`),
 not copied to each.
 
-**An event per result, not one per result.** Building a payload is several
+**An event per round, not one per result.** Building a payload is several
 aggregates over the job's history, so it happens off the submitting request and
 one at a time per job: a submission that finds a build already running marks it
 to repeat rather than starting a second. A burst of submissions therefore
@@ -1047,7 +1050,16 @@ read as text Postgres has already serialized, gathered a mebibyte at a time,
 and compressed and hashed through `spawn_blocking`; the same export finishes in
 34 s with `/health` at 2 ms median and 8 ms at worst throughout. The rule is
 general, and the other computations of that size follow it: an import's
-gunzip-untar-hash of a whole tarball; every Argon2 hash and verify; each
+gunzip-untar-hash of a whole tarball; every Argon2 hash and verify (on four
+threads of their own, at most four at a time — each holds 19 MiB, and a flood
+of sign-ins and registrations from seven addresses, within every per-address
+limit, took the process past its 2 GiB task until the thirty-second audit; a
+request that waits ten seconds for a turn is told `503` to come back; the
+turn goes with the run, so a client that hangs up does not leave a run queued
+past the four; and the allocator's mmap threshold is pinned at 1 MiB so each
+run's buffer is given back, not kept by the thread that ran it — at 12–18% of
+Argon2's throughput, paid for a peak of 129 MB where 2.6 GB was measured);
+each
 50,000-rack chunk of a universe's `COPY` (`/health` reached 1.3 s while one was
 seeded, 3.6 ms after); the parse of a request body of 256 KiB or more; and the
 decoding and validation of every submission, which for a full batch is tens to
@@ -1139,8 +1151,8 @@ leave-generation job's 3,199,724 progress rows. Warm times, best of two:
 
 | Query | Runs | Time |
 |---|---|---|
-| `game_pair_stats` over 400,000 pairs | every paired submission and SSE push | 54 ms |
-| `game_stats` over 400,000 games | every game submission and SSE push | 50 ms (the thirty-second audit measured 340–620 ms at 400,000 *result rows*, a batch of one game each, the form's default; the sort spills at the default `work_mem`) |
+| `game_pair_stats` over 400,000 pairs | every eighth paired submission (and an idle job's check), and every SSE build | 54 ms (the thirty-second audit measured 430–520 ms at 400,000 *result rows*, a batch of one pair each, the form's default; the sort spills at the default `work_mem`) |
+| `game_stats` over 400,000 games | every eighth game submission (and an idle job's check), and every SSE build | 50 ms (the thirty-second audit measured 340–620 ms at 400,000 *result rows*, a batch of one game each, the form's default; the sort spills at the default `work_mem`) |
 | `list_jobs`, 42 game jobs — **as it was**, re-deriving per-task game totals | every job-list page view | **2,188 ms** |
 | `list_jobs` task counts — **as they were**, two `COUNT(*)`s over `tasks` per job | every job-list page view | linear in every listed job's task history |
 | Contributor lists — **as they were**, grouping every completed claim in the database | every `/api/users` and `/api/workers` page view | 93 ms at 44,000 claims, linear from there |
@@ -1424,7 +1436,7 @@ what the workers are checked against.
 | Two finish conditions for SPRT jobs | `min_games`/`min_pairs` prevents early false-positive termination; `max_games`/`max_pairs` bounds compute cost |
 | Jobs created inactive | Allocation is set at activation time, not creation, so the admin reviews the full active job set and assigns percentages as a single deliberate act |
 | API keys active/inactive toggle | Lets contributors rotate or temporarily suspend a key without losing it; only active keys accepted for auth |
-| Account deletion is app-layer, not CASCADE | Task counters must be decremented and tasks may revert state; a DB-level cascade cannot update denormalized counters |
+| Account deletion is app-layer, not CASCADE | The account is anonymized in place, its contributions kept, and its keys, codes and tokens deleted; a cascade would delete what the account did, and the census row it writes first must outlive it |
 | SPRT evaluated inline on the submission path, debounced | No background sweep needed; a debounced check is late, never wrong (see Statistical Result Evaluation) |
 | Two containers per ECS task | Axum backend + Nginx for SvelteKit static files; cleaner than co-mingling in one process |
 
@@ -5057,6 +5069,7 @@ birdtest/
 │   ├── prod-shell.sh               # an interactive psql-capable shell there, over ECS Exec (--attach to return)
 │   ├── dev-dump.sh                 # snapshot the local Postgres + MinIO state
 │   ├── dev-restore.sh              # put it back
+│   ├── dev-restore-check.sh        # its SCRUB rule against a stub compose (CI)
 │   ├── restore-job.sh              # copy one purged or deleted job back from a scratch restore
 │   │                               # (RUNBOOK §2.2; also embedded in the ops task, infra/ops.tf)
 │   ├── restore-job-check.sh        # restore-job.sh through its failure and re-run cases (nightly)
@@ -5981,7 +5994,8 @@ CREATE TABLE tasks (
     -- The seed the task's games are played from. Every job type plays games,
     -- so every task has one, stated on its request: games and game pairs seed
     -- their batch from it (MAGPIE draws each game's seed from a stream seeded
-    -- with it); an opening-rack task's is
+    -- with it; the applied migration's copy of this comment still says "step
+    -- by one per game", left so its checksum holds); an opening-rack task's is
     -- the index of its first rack in the job's rack space, and rack i of the
     -- batch is analysed from seed + i; a leave-generation task's is drawn
     -- when the task is created. Stored as signed int64; interpreted as uint64
@@ -7047,8 +7061,9 @@ says so in its implemented option, rather than being removed.
   dispatching.
 - **Problem:** One submission in eight pays an aggregate over the job's results;
   the rest pay an `EXISTS`. The worker waits for it, holding a main-pool
-  connection. It is a sort of every result row: some 0.4 s (340–620 ms) at
-  400,000 rows, a job of 400,000 games at the form's default batch of one,
+  connection. It is a sort of every result row: some 0.4 s (340–620 ms for
+  games, 430–520 for pairs) at 400,000 rows, a job of 400,000 games or pairs at
+  the form's default batch of one,
   where this entry said tens of milliseconds (thirty-second audit); half of
   every live stats build is the same read.
 - **Options considered:** move it off the worker's wait (eleventh audit);
@@ -7414,6 +7429,8 @@ says so in its implemented option, rather than being removed.
 - **Problem:** 0.8 s for a job with 600,000 completed claims, about 8% of a
   database core per busy dashboard. It still joins `tasks`, though
   `task_claims.job_id` exists.
+  A watched job that is also visited can cost two builds an interval, and a
+  push overtaken by a page build more (KL-78).
 - **Options considered:** read `task_claims` by `job_id` alone; keep running
   totals per contributor.
 - **Option implemented:** None.
@@ -7435,7 +7452,14 @@ says so in its implemented option, rather than being removed.
 
 **KL-34. Confirming an address happens when the link is opened.**
 - **Context:** The confirmation page confirms on load.
-- **Problem:** A mail scanner that runs the page's script confirms the address.
+- **Problem:** A mail scanner that runs the page's script confirms the address
+  — and with it an account someone else registered on that address, under a
+  name they chose; the owner can take it over by a reset, but inherits the
+  name, and the registrant's API keys go on working (KL-33). The confirmation
+  mail does not name the account: it was named for a pass of the
+  thirty-second audit, which carried a registrant's own 32 characters —
+  newlines included — to any address under birdtest's sender. A reset mail
+  names the account, so an owner who resets sees whose it is.
 - **Options considered:** a button to press.
 - **Option implemented:** Confirm on open. *(Sixteenth audit.)*
 - **Justification:** A button would cost every registrant a click.
@@ -7908,6 +7932,27 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** None.
 - **Justification:** None loses a backup or passes a bad one.
 
+**KL-81. Small things in the account lifecycle.**
+- **Context:** `routes/auth.rs`, `email.rs` (thirty-second audit, pass 5).
+- **Problem:**
+  - A password reset hashes the new password before it looks at the token, so
+    a wrong or spent link costs an Argon2 run (within the per-caller redeem
+    limit). Hashed inside the transaction, it held the account's row — which
+    the reset now locks first, in the order a delete does — for the whole wait
+    for a turn, up to ten seconds under a flood, against the account's own
+    submissions.
+  - The SES client has no operation timeout, so if SES hangs, background sends
+    accumulate (bounded by the rate limits on what sends them).
+  - Resetting for a known address writes a token row that an unknown address
+    does not: a statistical timing difference of a millisecond or so, beside
+    KL-37's deterministic one (not measured).
+- **Options considered:** hash inside the transaction; a timeout on the SES
+  client; a dummy write for an unknown address.
+- **Option implemented:** The hash before the transaction (pass 5's
+  adversarial check); the other two, none.
+- **Justification:** Resets are limited per address and per caller; the rest is
+  bounded or moot while KL-37 stands.
+
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
   layout's sign-out has no error path (`F-AUTH-2` pins the store's side).
@@ -7942,6 +7987,8 @@ says so in its implemented option, rather than being removed.
     foot of the form, by API field name (`layout_id`, `sprt_alpha`), not at the
     input under its label; and job creation checks the layout only once the
     other settings pass, so an admin can fix one error and meet a second.
+  - The job form's α and β take any value the server does (`step="any"`), so
+    their arrow keys step by one and are of no use; they are typed.
   - A leave job whose generation-0 KLV fails to build after the job row
     commits is answered `500`, but exists; the form stays, and a second click
     makes a second job.
@@ -8765,7 +8812,7 @@ development rather than recovery:
   password hashes. `scripts/scrub.sql`, applied immediately after a local restore,
   rewrites `users.email` to `user-<id>@example.invalid`, replaces every
   `password_hash` with a known throwaway argon2 hash, truncates `api_keys`,
-  `email_confirmations` and `password_reset_tokens`, and replaces every
+  `email_confirmations`, `password_reset_tokens` and `backups`, and replaces every
   anonymous worker's UUID, which `X-Worker-UUID` alone authenticates, with its
   claims, ban and audit rows following it, and every open claim's token
   (thirty-first audit; until then a scrubbed dump could submit as any anonymous

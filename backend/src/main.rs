@@ -27,6 +27,18 @@ const RATING_RUN_THIN_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Large allocations always from `mmap`, and so given back when freed. By
+    // default glibc raises this threshold to the size of the last large block
+    // freed, after which Argon2's 19 MiB buffers came from per-thread arenas
+    // and stayed there: after a burst of sign-ins and registrations, eleven
+    // arenas held 600 MB between them, where only four runs are ever allowed
+    // at once (thirty-second audit). Fixing the threshold turns the dynamic
+    // behaviour off.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only sets allocator parameters; 1 MiB is a valid value.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+    }
     // Local development reads `.env`; in ECS the same variables arrive from the
     // task definition, so a missing file is not an error.
     let _ = dotenvy::dotenv();

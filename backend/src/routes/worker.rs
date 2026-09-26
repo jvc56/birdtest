@@ -1009,17 +1009,22 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // an admin action (or a newer build) superseded while it ran is not
         // sent: it would put the pre-action status back on every open page;
         // it is built again instead, a bounded number of times.
-        let mut superseded = false;
         for _ in 0..3 {
+            // An urgent ask made before this build starts is reflected by it
+            // (every ask forgets the cached payload first), so its wake-up is
+            // spent here. One left after the build belongs to a change the
+            // published payload may lack, and skips the cool-down, as it
+            // should. Drained after the publish instead, a third superseded
+            // build's change waited out the whole interval.
+            if let Some(urgent) = state.sse.urgent(job_id) {
+                let _ = futures::FutureExt::now_or_never(urgent.notified());
+            }
             match jobstats::refresh_payload(&state.read_pool, job_id, state.cfg.stats_cache).await {
                 Ok(Some(payload)) => {
                     state.sse.publish(job_id, payload);
                     break;
                 }
-                Ok(None) => {
-                    superseded = true;
-                    continue;
-                }
+                Ok(None) => continue,
                 // Deleted since the push was asked for: nothing to send, and
                 // nothing wrong -- and nothing more to push, ever.
                 Err(err) if err.status == axum::http::StatusCode::NOT_FOUND => {
@@ -1043,12 +1048,6 @@ async fn push_stats_until_idle(state: &AppState, job_id: Uuid) {
         // short: its pages should not show the job active for ten seconds more.
         let interval = MIN_STATS_PUSH_INTERVAL.max(state.cfg.stats_cache);
         if let Some(urgent) = state.sse.urgent(job_id) {
-            // A build superseded by an admin's change was built again, after
-            // the change: the wake-up that change left is spent, and would
-            // otherwise skip this cool-down for an identical push.
-            if superseded {
-                let _ = futures::FutureExt::now_or_never(urgent.notified());
-            }
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
                 _ = urgent.notified() => {}

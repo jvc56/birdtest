@@ -80,6 +80,8 @@ read -r ALLOCATED MAX_STORAGE < <(aws rds describe-db-instances --region "$REGIO
 [[ "$MAX_STORAGE" =~ ^[0-9]+$ ]] || MAX_STORAGE=0
 # 130%: RDS warns once allocation passes 80% of the ceiling.
 MIN_CEILING=$(( (ALLOCATED * 130 + 99) / 100 ))
+# Never past RDS's largest volume, 65,536 GiB.
+(( MIN_CEILING <= 65536 )) || MIN_CEILING=65536
 (( MAX_STORAGE >= MIN_CEILING )) || MAX_STORAGE=$MIN_CEILING
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
@@ -163,11 +165,11 @@ aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type Se
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
 ```
 
-(If the ceiling had to be raised above the stack's `db_allocated_storage * 5`
-— never past RDS's 65,536 GiB — raise `db_allocated_storage` in `prod.tfvars`
-before the closing apply below: it sets the ceiling back to five times that, and RDS refuses one less than a
-tenth above the current allocation. The allocation itself Terraform leaves
-alone — autoscaling owns it.)
+(If the ceiling had to be raised above the stack's `db_allocated_storage * 5`,
+raise `db_allocated_storage` in `prod.tfvars` before the closing apply below:
+it sets the ceiling back to five times that, capped at RDS's 65,536 GiB, and
+RDS refuses one less than a tenth above the current allocation. The allocation
+itself Terraform leaves alone — autoscaling owns it.)
 
 Then run §4 (verification), **Check artifacts** on every leave-generation job
 (§3: the database now describes the objects as they were at the restore point,
@@ -895,8 +897,10 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    # manifest: database_bytes is the database's own size when it was dumped
    # (the dump compresses four times or more, so a multiple of the dump
    # undershoots), plus 30% and room for WAL (db_max_wal_size_mb/1024; 4 by
-   # default); never under RDS's minimum of 20. Raise it by hand to
-   # production's own allocation if that is larger and known.
+   # default); never under RDS's minimum of 20, nor over 59,578 (past it the
+   # copy's autoscaling ceiling, capped at RDS's 65,536, could not be a tenth
+   # above it, and the plan refuses it). Raise it by hand to production's own
+   # allocation if that is larger and known, within the same bound.
    # The replica bucket is in the lost stack's dr_region, which need not be
    # $DR_REGION; with no --region the CLI asks the lost region first.
    DR_REGION=<the region the copy is built in>
@@ -905,7 +909,7 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
    # <account>: this account's id, the lost stack's (a drill: §6).
    REPLICA=s3://birdtest-backups-dr-<account>/pg
    MANIFEST=$(aws s3 ls --region $REPLICA_REGION "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
-   DR_STORAGE_GB=$(aws s3 cp --region $REPLICA_REGION "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4))')
+   DR_STORAGE_GB=$(aws s3 cp --region $REPLICA_REGION "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(min(59578, max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4)))')
    echo "restoring ${MANIFEST%.manifest.json}: $DR_STORAGE_GB GiB"
    # Everything below needs these; an unset one wrote region = "" (the CLI's
    # default region, likely the lost one) into dr.tfvars. One `if`, not a
@@ -1072,6 +1076,9 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   restores intact into an empty database. Run it after any schema
   change, on a fresh schema (it seeds only an empty database) with nothing
   writing; nightly CI runs it that way.
+- `./scripts/dev-restore-check.sh` — runs `dev-restore.sh` against a stub
+  compose and checks it scrubs unless `SCRUB=0` and refuses any other value;
+  CI runs it.
 - `./scripts/restore-job-check.sh` — runs §2.2's `restore-job.sh` against three
   databases of its own through its refusals, a stopped run and its resume, a
   deleted job, and a re-run; `PG_EXEC="docker exec -i <container>"` points it

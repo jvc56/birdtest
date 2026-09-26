@@ -326,6 +326,8 @@
     </label>
   {/if}
 
-  {#if error}<p class="field-error">{error}</p>{/if}
+  <!-- Announced: an error that appears after a submit is otherwise silent to a
+       screen reader. -->
+  {#if error}<p class="field-error" role="alert">{error}</p>{/if}
   <button class="btn-primary" disabled={busy}>{busy ? 'Creating…' : 'Create job'}</button>
 </form>
