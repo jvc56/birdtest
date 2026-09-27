@@ -130,8 +130,16 @@ def explain_failed_start() -> None:
             "goes; `scripts/dev-dump.sh` snapshots it first), with --rebuild too if the images "
             "predate the change")
     else:
-        log("the stack did not start; the backend's last lines:")
-        print(logs.rstrip() or "(no output)")
+        # Any service can fail the start -- a host port another project
+        # holds, most often -- so compose's own error, printed above, is the
+        # reason; the backend's log only when the backend is what is down.
+        log("the stack did not start: docker compose's error is above")
+        running = subprocess.run(["docker", "compose", "ps", "-q", "--status", "running", "backend"],
+                                 cwd=REPO_ROOT, capture_output=True, text=True).stdout.strip()
+        if not running:
+            log("the backend is not running; its last lines:")
+            print(logs.rstrip() or "(no output)")
+        log("a host port in use? --web-port and --backend-port move the stack's")
 
 
 def wait_for_health(url: str, timeout: int) -> None:
