@@ -5,7 +5,7 @@ One command: start the stack, wait for it, seed it, launch N `magpie
 contribute` processes -- in the background, or with --worker-windows each in
 its own terminal window, so one can be stopped and restarted by hand -- and
 open the site. It is tier 6's setup with the
-assertions and the teardown removed, and it calls the same `scripts/seed.py`,
+assertions removed, and it calls the same `scripts/seed.py`,
 so the development environment cannot drift from what the tests exercise.
 
 **Contributors are always real MAGPIE.** There is no fake-worker mode here.
@@ -639,8 +639,10 @@ def build_parser() -> argparse.ArgumentParser:
                             "jobs among three players, which a rating pool can rate once they are "
                             "done -- and two contributor accounts whose keys workers 3 and 4 run "
                             "under")
-    stack.add_argument("--down", action="store_true",
-                       help="stop the stack on exit instead of leaving it up")
+    stack.add_argument("--keep-up", action="store_true",
+                       help="leave the stack running on exit instead of stopping it (a stack "
+                            "attached to with --no-up is always left running). The database "
+                            "and MinIO volumes are kept either way")
     stack.add_argument("--health-timeout", type=int, default=180,
                        help="seconds to wait for the backend (default: %(default)s)")
     stack.add_argument("--min-magpie-version", default=os.environ.get("MIN_MAGPIE_VERSION"),
@@ -765,7 +767,8 @@ def main() -> int:
         log(f"signed in as {user}: {open_url}")
     if not args.no_browser:
         webbrowser.open(open_url)
-    log(f"birdtest is at {site_url} — Ctrl-C to stop the contributors")
+    log(f"birdtest is at {site_url} — Ctrl-C to stop the contributors"
+        + ("" if args.keep_up or args.no_up else " and the stack"))
 
     stopping = False
 
@@ -804,11 +807,13 @@ def main() -> int:
     finally:
         stop_contributors(processes)
         log("contributors stopped")
-        if args.down:
-            log("stopping the stack")
-            compose(["down"], check=False)
-        else:
+        # `down` without -v: the database and MinIO volumes stay, so the next
+        # run picks up where this one left off.
+        if args.keep_up or args.no_up:
             log(f"the stack is still up ({site_url}); `docker compose down` when you are done")
+        else:
+            log("stopping the stack (its data is kept; --keep-up leaves it running)")
+            compose(["down"], check=False)
     return 0
 
 

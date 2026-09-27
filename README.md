@@ -139,7 +139,7 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker (the keyed workers lose their keys until the next `--reset-db`) |
 | `--rebuild` | off | Rebuild images before starting |
 | `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with six jobs (three of them game pairs among three players) and the two contributor accounts: see below |
-| `--down` | off | Stop the stack on exit instead of leaving it up |
+| `--keep-up` | off | Leave the stack running on exit instead of stopping it |
 | `--no-seed` | off | Skip seeding (the stack already has an active job) |
 | `--no-up` | off | Assume the stack is already running |
 | `--login-as` | the seeded admin (`--username`) | Open the site signed in as this account |
@@ -162,8 +162,10 @@ the local stack enables (`DEV_LOGIN` in `docker-compose.yml`) and the backend
 refuses anywhere cookies are secure. A stack built before it needs
 `--rebuild` once.
 
-Ctrl-C stops the contributors and leaves the stack up, so the site stays
-browsable; `--down` tears it down instead.
+Ctrl-C stops the contributors and then the stack (`docker compose down`,
+without `-v`: the database and MinIO volumes are kept, so the next run starts
+where this one stopped). `--keep-up` leaves the stack running so the site stays
+browsable, and a stack attached to with `--no-up` is always left running.
 
 ### Seeding on its own
 
