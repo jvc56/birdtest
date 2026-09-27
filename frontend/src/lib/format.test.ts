@@ -8,6 +8,7 @@ import {
   sprtLabel,
   sprtState,
   completionText,
+  jobTitle,
   workerLabel
 } from './format';
 
@@ -210,5 +211,13 @@ describe('F-FMT-12 completionText', () => {
         completion: { forced: false, reason: 'last generation built' }
       })
     ).toBe('its last generation was built');
+  });
+});
+
+describe('F-FMT-13 jobTitle', () => {
+  it("is the job's name, or its type for one given none", () => {
+    expect(jobTitle({ name: 'equity vs static', job_type: 'game_pairs' })).toBe('equity vs static');
+    expect(jobTitle({ name: '', job_type: 'game_pairs' })).toBe('Game pairs');
+    expect(jobTitle({ name: '   ', job_type: 'games' })).toBe(jobTitle({ name: '', job_type: 'games' }));
   });
 });

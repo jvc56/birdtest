@@ -976,6 +976,10 @@ pub(crate) async fn require_role(
 
 #[derive(Deserialize)]
 struct CreateJobBody {
+    /// What to call the job: shown first wherever jobs are listed. Optional
+    /// here, for scripts; the creation form asks for it.
+    #[serde(default)]
+    name: Option<String>,
     job_type: JobType,
     #[serde(default = "one")]
     redundancy: i32,
@@ -1150,8 +1154,8 @@ async fn create_job(
         "INSERT INTO jobs
              (job_type, redundancy, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
-              sim_cutoff, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
+              sim_cutoff, created_by, name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *",
     )
     .bind(body.job_type)
     .bind(body.redundancy)
@@ -1167,6 +1171,7 @@ async fn create_job(
     .bind(crate::magpie_defaults::BINGO_BONUS)
     .bind(crate::magpie_defaults::SIM_CUTOFF)
     .bind(admin.0.id)
+    .bind(job_name(&body))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1251,8 +1256,24 @@ fn games_batch_field(mut err: AppError, unit: &str, games_per_unit: i32, batch: 
 /// LLR's sign, so SPRT confidently accepts the wrong hypothesis; an `alpha` of
 /// 0 or 1 puts a logarithm of zero or infinity in the bounds. Every problem is
 /// reported at once, like registration does.
+/// The longest job name, in characters (the column's check).
+const MAX_JOB_NAME_CHARS: usize = 100;
+
+/// The job's name as stored: trimmed, empty when none was given.
+fn job_name(body: &CreateJobBody) -> String {
+    body.name.as_deref().unwrap_or("").trim().to_string()
+}
+
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let mut err = AppError::bad_request("job settings are invalid");
+    let name = job_name(body);
+    // Shown in every job list and as the job page's title: a line, not a
+    // document, and nothing that breaks or hides in one.
+    if name.chars().count() > MAX_JOB_NAME_CHARS {
+        err = err.with_field("name", format!("at most {MAX_JOB_NAME_CHARS} characters"));
+    } else if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+        err = err.with_field("name", "one line, with no control characters");
+    }
     if body.redundancy < 1 {
         err = err.with_field("redundancy", "must be at least 1");
     }

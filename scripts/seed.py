@@ -355,6 +355,7 @@ def create_job(client: Client, args, data: dict, players: list) -> str:
             return already
 
     body = {
+        "name": args.job_name,
         "job_type": args.job_type,
         "variant": args.variant,
         "letterdist_id": data["letterdist"],
@@ -455,6 +456,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--new-job", action="store_true",
                         help="always create a job, even if an active one of this type exists")
     parser.add_argument("--redundancy", type=int, default=1)
+    parser.add_argument("--job-name", default="",
+                        help="what to call the seeded job (shown first in the jobs list); "
+                             "unnamed by default, so it is titled by its type")
     parser.add_argument("--allocation", type=int, default=100)
     return parser
 

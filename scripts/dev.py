@@ -313,6 +313,7 @@ def run_seed(args, api_url: str, magpie_root: Path, floor: str) -> None:
         sys.executable, str(REPO_ROOT / "scripts" / "seed.py"),
         "--api", api_url,
         "--job-type", args.job_type,
+        "--job-name", f"dev {args.job_type.replace('_', ' ')}",
         "--magpie-root", str(magpie_root),
         "--username", args.username,
         "--password", args.password,

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type JobListItem, type Page } from '$lib/api';
-  import { jobTypeLabel } from '$lib/format';
+  import { jobTitle, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import Pagination from '$lib/components/Pagination.svelte';
 
@@ -53,7 +53,7 @@
     <table class="table">
       <thead>
         <tr>
-          <th>Type</th><th>Status</th><th>Allocation</th>
+          <th>Name</th><th>Type</th><th>Status</th><th>Allocation</th>
           <th>Redundancy</th><th class="text-right">Progress</th>
         </tr>
       </thead>
@@ -61,7 +61,8 @@
         {#each result.items as job}
           {@const p = progress(job)}
           <tr>
-            <td><a href="/jobs/{job.id}">{jobTypeLabel(job.job_type)}</a></td>
+            <td><a href="/jobs/{job.id}">{jobTitle(job)}</a></td>
+            <td>{jobTypeLabel(job.job_type)}</td>
             <td>
               <JobStatusBadge status={job.status} />
               {#if job.stalled}

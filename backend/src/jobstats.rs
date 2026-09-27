@@ -77,6 +77,8 @@ pub struct Completion {
 #[derive(Debug, Serialize)]
 pub struct JobSummary {
     pub id: Uuid,
+    /// What the admin called it; empty for a job created without one.
+    pub name: String,
     pub job_type: JobType,
     pub status: String,
     pub allocation: Option<i32>,
@@ -494,6 +496,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
     Ok(JobStats {
         job: JobSummary {
             id: job.id,
+            name: job.name.clone(),
             job_type: job.job_type,
             status: status_label(job).to_string(),
             allocation: job.allocation,

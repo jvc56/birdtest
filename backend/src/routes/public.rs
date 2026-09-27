@@ -50,6 +50,7 @@ struct JobListQuery {
 #[derive(Serialize)]
 struct JobListItem {
     id: Uuid,
+    name: String,
     job_type: JobType,
     status: String,
     allocation: Option<i32>,
@@ -78,7 +79,7 @@ async fn list_jobs(
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
     let rows = sqlx::query(
-        "SELECT j.id, j.job_type, j.status::text AS status, j.allocation,
+        "SELECT j.id, j.name, j.job_type, j.status::text AS status, j.allocation,
                 j.redundancy, j.created_at,
                 -- Running totals, like games_completed below. Counted, these
                 -- were two scans of a job's whole task history for every job on
@@ -156,6 +157,7 @@ async fn list_jobs(
             };
             JobListItem {
                 id: row.get("id"),
+                name: row.get("name"),
                 job_type,
                 status: row.get("status"),
                 allocation: row.get("allocation"),

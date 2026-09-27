@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type JobListItem } from '$lib/api';
-  import { jobTypeLabel } from '$lib/format';
+  import { jobTitle, jobTypeLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
 
   let active: JobListItem[] = [];
@@ -64,11 +64,11 @@ maxtasks 0</code
         {#each active as job}
           <a href="/jobs/{job.id}" class="card no-underline hover:border-primary/50 hover:no-underline">
             <div class="flex items-center justify-between">
-              <span class="font-medium text-foreground">{jobTypeLabel(job.job_type)}</span>
+              <span class="font-medium text-foreground">{jobTitle(job)}</span>
               <JobStatusBadge status={job.status} />
             </div>
             <p class="mt-1 text-sm text-muted-foreground">
-              {job.allocation ?? 0}% allocation
+              {#if job.name}{jobTypeLabel(job.job_type)} · {/if}{job.allocation ?? 0}% allocation
             </p>
           </a>
         {/each}

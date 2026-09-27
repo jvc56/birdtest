@@ -147,3 +147,9 @@ export function completionText(stats: {
   if (stats.job.job_type === 'opening_rack' && completion) return 'every rack was analysed';
   return 'it was completed';
 }
+
+/** A job's title: the name it was given, or its type for one given none. */
+export function jobTitle(job: { name?: string | null; job_type: string }): string {
+  const name = job.name?.trim();
+  return name ? name : jobTypeLabel(job.job_type);
+}

@@ -350,6 +350,9 @@ CREATE TYPE job_status AS ENUM (
 
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- What the admin called it, shown first wherever jobs are listed. '' for
+    -- a job created without one (through the API; the form asks for it).
+    name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
     job_type   job_type NOT NULL,
     -- NULL until the job is first activated; set by the admin at activation
     -- time. Every active job's share of the fleet: the scheduler hands each

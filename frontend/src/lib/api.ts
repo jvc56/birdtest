@@ -124,6 +124,8 @@ export interface CursorPage<T> {
 
 export interface JobListItem {
   id: string;
+  /** What the admin called it; empty for a job created without one. */
+  name: string;
   job_type: JobType;
   status: JobStatus;
   /** The job's share of claims while active (not of worker time: PLAN's KL-88); null until first activated. 0% means what inactive means. */
@@ -144,6 +146,7 @@ export interface JobListItem {
  */
 export interface JobRow {
   id: string;
+  name: string;
   job_type: JobType;
   status: JobStatus;
   allocation: number | null;
@@ -207,6 +210,8 @@ export interface Completion {
 export interface JobStats {
   job: {
     id: string;
+    /** What the admin called it; empty for a job created without one. */
+    name: string;
     job_type: JobType;
     status: JobStatus;
     allocation: number | null;

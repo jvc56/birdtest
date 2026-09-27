@@ -13,6 +13,8 @@
   let busy = false;
 
   let jobType: JobType = 'game_pairs';
+  // Shown first wherever jobs are listed, and as the job page's title.
+  let name = '';
   let redundancy = 1;
   // Pre-filled from the server-wide floor rather than left blank: a default
   // nobody sees is how every new job quietly inherits a floor that is too low.
@@ -99,6 +101,7 @@
 
   function body(): Record<string, unknown> {
     const common = {
+      name: name.trim(),
       job_type: jobType,
       // Leave generation runs at redundancy 1 only: the server refuses more.
       redundancy: jobType === 'leave_generation' ? 1 : redundancy,
@@ -175,6 +178,17 @@
 <!-- Any edit clears the last server error: a submit the browser blocks never
      reaches submit(), which is where it was cleared, so it lingered. -->
 <form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
+  <div>
+    <label class="label" for="name">Job name</label>
+    <input
+      id="name"
+      class="input"
+      bind:value={name}
+      required
+      maxlength="100"
+      placeholder="e.g. simmer 4-ply vs static, NWL23"
+    />
+  </div>
   <div>
     <label class="label" for="type">Job type</label>
     <select

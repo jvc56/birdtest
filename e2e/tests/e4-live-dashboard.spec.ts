@@ -41,6 +41,8 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await createStaticConfig(page, p2, 'score');
 
   await page.goto('/admin/jobs/new');
+  const jobName = `e2e pairs ${suffix}`;
+  await page.getByLabel('Job name').fill(jobName);
   await page.getByLabel('Job type').selectOption({ label: 'Game pairs' });
   const letterdist = page.getByLabel('Letter distribution');
   const fixtureBag = letterdist.locator('option', { hasText: `english_fixture (${SEEDED_DATA},` });
@@ -54,7 +56,9 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await expect(page).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
   const jobId = page.url().split('/').pop()!;
   const header = page.locator('main header');
-  await expect(header.getByRole('heading', { name: 'Game pairs' })).toBeVisible();
+  // Titled by the name it was given, its type beside it.
+  await expect(header.getByRole('heading', { name: jobName })).toBeVisible();
+  await expect(header.getByText('Game pairs', { exact: true })).toBeVisible();
   await expect(header.getByText('inactive', { exact: true })).toBeVisible();
 
   // Activating refetches the job once, after the action; wait that out.
