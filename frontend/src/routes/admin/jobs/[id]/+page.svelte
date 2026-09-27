@@ -307,7 +307,16 @@
       )
     )
       return;
-    run(() => api.purgeJob(jobId), 'Results purged; the job starts over from its first task.');
+    // Only an active job goes on running: a completed one returns to inactive
+    // and an inactive one stays so. Said as "starts over", an admin who had
+    // purged a completed job watched it do nothing.
+    const running = stats?.job.status === 'active';
+    run(
+      () => api.purgeJob(jobId),
+      running
+        ? 'Results purged; the job starts over from its first task.'
+        : 'Results purged. The job is inactive: activate it to start over from its first task.'
+    );
   }
 
   function forceComplete() {
