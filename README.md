@@ -75,8 +75,8 @@ either is missing:
 
 | | Default | Override |
 |---|---|---|
-| A built MAGPIE binary | `../MAGPIE/bin/magpie` | `--magpie`, or `$MAGPIE_BIN` |
-| A real MAGPIE-DATA install | `../MAGPIE/data` | `--magpie-data`, or `$MAGPIE_DATA_PATH` |
+| A built MAGPIE binary | `~/MAGPIE/bin/magpie` | `--magpie`, or `$MAGPIE_BIN` |
+| A real MAGPIE-DATA install | the `data/` of that binary's checkout | `--magpie-data`, or `$MAGPIE_DATA_PATH` |
 
 ### Choosing how it runs
 

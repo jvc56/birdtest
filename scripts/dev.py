@@ -95,7 +95,10 @@ def resolve_magpie(args) -> tuple:
             "      Contributors here are always real MAGPIE; there is no fake-worker mode."
         )
 
-    data = Path(args.magpie_data).expanduser()
+    # The data of the checkout the binary is in, unless named: pointed at
+    # another MAGPIE, the data went on being the default one's.
+    data = (Path(args.magpie_data).expanduser() if args.magpie_data
+            else binary.resolve().parent.parent / "data")
     if not data.is_dir():
         fail(
             f"no MAGPIE data directory at {data}.\n"
@@ -397,12 +400,12 @@ def build_parser() -> argparse.ArgumentParser:
                                    "(default: %(default)s)")
     contributors.add_argument("--api-key", default=os.environ.get("BIRDTEST_API_KEY"),
                               help="contribute under an account instead of anonymously")
-    contributors.add_argument("--magpie", default=os.environ.get("MAGPIE_BIN", "../MAGPIE/bin/magpie"),
-                              help="MAGPIE binary (default: %(default)s, or $MAGPIE_BIN)")
-    contributors.add_argument("--magpie-data",
-                              default=os.environ.get("MAGPIE_DATA_PATH", "../MAGPIE/data"),
-                              help="MAGPIE data directory (default: %(default)s, "
-                                   "or $MAGPIE_DATA_PATH)")
+    contributors.add_argument("--magpie", default=os.environ.get("MAGPIE_BIN", "~/MAGPIE/bin/magpie"),
+                              help="MAGPIE binary, in the checkout the backend runs too "
+                                   "(default: $MAGPIE_BIN, or %(default)s)")
+    contributors.add_argument("--magpie-data", default=os.environ.get("MAGPIE_DATA_PATH"),
+                              help="MAGPIE data directory (default: $MAGPIE_DATA_PATH, or the "
+                                   "data/ of the --magpie checkout)")
     # Under the repo root whatever the working directory: `.gitignore` covers
     # only the root's `.dev-workers/`, and a contribute.txt holding an API key
     # written under frontend/ was not ignored (the audit's pass 23).
