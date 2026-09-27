@@ -698,10 +698,12 @@ async fn create_player_config(
     .bind(stopping_pct)
     .bind(use_inference)
     .bind(body.time_limit_secs)
-    .bind(body.use_wordmap.unwrap_or(false))
-    // Absent means no, for both: a rack info table is a large, slow thing to
-    // provision, and a config that did not ask for one must not get one
-    // because a default said so.
+    // On unless the config says otherwise, as the form has it: a wordmap is a
+    // large speedup in move generation, and workers build one on demand.
+    .bind(body.use_wordmap.unwrap_or(true))
+    // Absent means no: a rack info table is a large, slow thing to provision,
+    // and a config that did not ask for one must not get one because a
+    // default said so.
     .bind(body.use_rit.unwrap_or(false))
     .bind(min_play_iterations)
     .bind(&threshold)

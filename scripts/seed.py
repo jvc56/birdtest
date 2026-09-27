@@ -343,7 +343,7 @@ def input_data_ids(client: Client, args) -> dict:
 
 def player_config(
     client: Client, name: str, sort_strategy: str, data: dict, recorder: str = "best",
-    sim: Optional[dict] = None,
+    sim: Optional[dict] = None, wordmap: bool = True,
 ) -> str:
     """A static player: no simulation parameters, and so no win% model either.
 
@@ -369,6 +369,7 @@ def player_config(
                 "kwg_id": data["kwg"],
                 "klv_id": data["klv"],
                 "num_plays_recorded": 10,
+                "use_wordmap": wordmap,
                 **(sim or {}),
             },
         ),
@@ -395,7 +396,7 @@ def job_config(job_type: str, players: list, args) -> dict:
         # still takes MAGPIE a couple of minutes; the rack universe is built by
         # the first claim, not at creation.
         return {"kwg_id": args.leave_kwg, "num_iterations": 20, "generation_count": 1,
-                "target_rack_count": 1, "racks_per_task": 50}
+                "target_rack_count": 1, "racks_per_task": 50, "use_wordmap": args.wordmap}
     raise SeedError(f"unknown job type {job_type!r}")
 
 
@@ -529,6 +530,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="what to call the seeded job (shown first in the jobs list); "
                              "unnamed by default, so it is titled by its type")
     parser.add_argument("--allocation", type=int, default=100)
+    parser.add_argument("--no-wordmap", dest="wordmap", action="store_false",
+                        help="players (and the leave-generation bot) play without a wordmap, "
+                             "so no job waits on the derived-file builder; a player config "
+                             "that already exists by name is reused as it is")
     parser.add_argument("--all-job-types", action="store_true",
                         help="create a job of every type -- games, opening racks, leave "
                              "generation, and three game-pairs jobs among two static players "
@@ -560,12 +565,13 @@ def seed(args) -> None:
 
     def players_for(job_type: str) -> list:
         if job_type == "opening_rack":
-            return [player_config(client, "static-equity-all", "equity", data, recorder="all")]
+            return [player_config(client, "static-equity-all", "equity", data, recorder="all",
+                                  wordmap=args.wordmap)]
         if job_type == "leave_generation":
             return []
         return [
-            player_config(client, "static-equity", "equity", data),
-            player_config(client, "static-score", "score", data),
+            player_config(client, "static-equity", "equity", data, wordmap=args.wordmap),
+            player_config(client, "static-score", "score", data, wordmap=args.wordmap),
         ]
 
     if args.all_job_types:
@@ -580,7 +586,7 @@ def seed(args) -> None:
         sim = player_config(client, "sim-1ply", "equity", data, sim={
             "winpct_id": data["winpct"], "num_plies": 1, "max_iterations": 100,
             "time_limit_secs": 0, "num_plays": 10, "use_inference": False,
-        })
+        }, wordmap=args.wordmap)
         create_job(client, args, data, [equity, score], "games", "dev games")
         for (p1, n1), (p2, n2) in (((equity, "static equity"), (score, "static score")),
                                    ((equity, "static equity"), (sim, "1-ply sim")),

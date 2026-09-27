@@ -1089,7 +1089,7 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
         ("num_plays", json!(100)),
         ("num_plies_recorded", json!(2)),
         ("movegen_margin", json!(5.0)),
-        ("use_wordmap", json!(false)),
+        ("use_wordmap", json!(true)),
         ("use_rit", json!(false)),
         ("max_iterations", json!(null)),
         ("threshold", json!(null)),

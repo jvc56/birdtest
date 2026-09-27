@@ -121,12 +121,15 @@ wait_for "$E2E_BASE_URL/health" 60
 # job-page journeys see a finished pentanomial and the ratings journey has
 # fixed evidence.
 log "seeding"
+# --no-wordmap: the fake workers build nothing, and the fixture lexicon has no
+# wordmap for the server to hash, so a job asking for one would never run.
 python3 "$REPO_ROOT/scripts/seed.py" \
   --api "$E2E_API_URL" \
   --mail-outbox "$E2E_OUTBOX_DIR" \
   --username "$E2E_ADMIN_USER" --email "$E2E_ADMIN_EMAIL" --password "$E2E_ADMIN_PASSWORD" \
   --tarball-date 20260101 --letterdist english_fixture \
-  --job-type game_pairs --batch 10 --min-units 100 --max-units 400 --allocation 30
+  --job-type game_pairs --batch 10 --min-units 100 --max-units 400 --allocation 30 \
+  --no-wordmap
 
 log "starting the fake workers"
 compose --profile fake-worker up -d --no-build fake-worker

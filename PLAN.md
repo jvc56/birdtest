@@ -3848,8 +3848,9 @@ pentanomial and the divergent counts kept only as a diagnostic.
 Whether either file is used is the **job's** decision, not the client's: both
 are player settings like any other, sent as `use_wordmap` and `use_rit` on each
 player object (and, for `leave_generation`, which has one bot rather than a
-player pair, `use_wordmap` on the request itself). A job that omits them runs
-without them. Games run dramatically faster with a wordmap, so most jobs will
+player pair, `use_wordmap` on the request itself). The config decides; a
+config created without saying gets a wordmap and no rack info table (see
+"Creating a player config"). Games run dramatically faster with a wordmap, so most jobs will
 ask for it — but the client neither assumes it nor builds one it was not asked
 for, and a file already sitting in `./data` from an earlier job is not switched
 on by its mere presence.
@@ -4958,7 +4959,9 @@ Whatever the body leaves out is filled from MAGPIE's defaults
 (`backend/src/magpie_defaults.rs`) before the row is written, so the stored config
 is exactly what every request built from it states: `sort_strategy` (`equity`),
 `num_plies` (0, static), `num_plays` (100), `num_plies_recorded` (2),
-`movegen_margin` (5), `use_wordmap` (false), and for a simmer every simulation
+`movegen_margin` (5), `use_wordmap` (true -- the one default that is
+birdtest's rather than MAGPIE's: a wordmap is a large speedup and workers build
+one on demand; the admin form has it checked too), and for a simmer every simulation
 setting. A static player may not set a simulation setting at all — nothing would
 read it — and a CHECK on the table holds the two sets apart. `num_plays` is not a
 simulation setting: an opening-rack analysis sizes its move list from it,

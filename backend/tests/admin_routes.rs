@@ -78,6 +78,9 @@ fn static_config(name: &str, files: &Files) -> Value {
     json!({
         "name": name, "recorder_type": "all", "sort_strategy": "equity",
         "kwg_id": files.kwg, "klv_id": files.klv, "num_plays_recorded": 3,
+        // The test lexicons are not real KWGs, so no reference wordmap exists
+        // for a worker to be asked to reproduce.
+        "use_wordmap": false,
     })
 }
 

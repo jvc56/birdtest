@@ -473,9 +473,11 @@ def run_job(ctx: Context, data: dict, body: dict, check, needs_build: bool = Fal
 def static_players(ctx: Context) -> dict:
     data = ctx.data
     return {
-        "player1_config_id": create_player(ctx, data, "e2e-static-equity", {}),
+        # No wordmap: these jobs are dispatched at once, without the builder.
+        "player1_config_id": create_player(ctx, data, "e2e-static-equity",
+                                           {"use_wordmap": False}),
         "player2_config_id": create_player(ctx, data, "e2e-static-score",
-                                           {"sort_strategy": "score"}),
+                                           {"sort_strategy": "score", "use_wordmap": False}),
     }
 
 
@@ -497,7 +499,7 @@ def simming_player(ctx: Context) -> str:
     return create_player(ctx, ctx.data, "e2e-simming", {
         "recorder_type": "all",
         "winpct_id": ctx.winpct, "num_plies": 2, "num_plays": 5, "num_plies_recorded": 2,
-        "max_iterations": 60, "stopping_pct": 99, "time_limit_secs": 0,
+        "max_iterations": 60, "stopping_pct": 99, "time_limit_secs": 0, "use_wordmap": False,
     })
 
 
