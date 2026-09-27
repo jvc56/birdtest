@@ -3397,8 +3397,13 @@ GitHub Actions.
    builder image, and the frontend image.
 4. **e2e** — tier 5: MAGPIE at the commit `docker/Dockerfile` pins, built `portable_release`
    inside `debian:bookworm-slim` (the backend image's glibc), Playwright's
-   Chromium, then `e2e/run.sh`; the Playwright report and traces are uploaded
-   on failure.
+   Chromium, the three images from the Dockerfile with buildx, then
+   `e2e/run.sh --no-build`; the Playwright report and traces are uploaded on
+   failure. The image builds are cached between runs: buildx's layer cache,
+   and the Dockerfile's cargo cache mounts carried in the Actions cache keyed
+   on `Cargo.lock`, so a run whose lockfile is unchanged compiles only the
+   backend crate. Built from scratch, the backend's release build was nearly
+   six of the job's nine minutes.
 5. **terraform** — `terraform fmt -check -recursive` and `terraform validate`
    (no AWS credentials).
 6. **scripts** — `scripts/dev-restore-check.sh`: `dev-restore.sh`'s `SCRUB`

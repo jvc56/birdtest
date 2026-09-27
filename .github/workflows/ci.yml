@@ -219,11 +219,70 @@ jobs:
         run: |
           pip install requests
           cd e2e && npm ci && npx playwright install --with-deps --only-shell chromium
+      # The images, built here rather than by run.sh so that the build is
+      # cached between runs. Built from scratch, the backend's Rust release
+      # build was nearly six of the job's nine minutes; the journeys take
+      # under one. Two caches: buildx's layer cache (the toolchain and apt
+      # layers, the MAGPIE stage), and the Dockerfile's cargo cache mounts --
+      # the registry and the target directory, so only the backend crate
+      # itself is compiled again -- carried in the Actions cache, keyed on
+      # the lockfile, since BuildKit's own cache mounts start empty on every
+      # runner.
+      - uses: docker/setup-buildx-action@v3
+      - name: Restore the backend's cargo cache
+        id: cargo-cache
+        uses: actions/cache@v4
+        with:
+          # Outside the checkout: in it, every image build would send it to
+          # BuildKit as part of the context.
+          path: ${{ runner.temp }}/cargo-cache
+          key: e2e-cargo-${{ runner.os }}-${{ hashFiles('backend/Cargo.lock', 'docker/Dockerfile', 'rust-toolchain.toml') }}
+          restore-keys: e2e-cargo-${{ runner.os }}-
+      - name: Put the cargo cache into BuildKit's cache mounts
+        uses: reproducible-containers/buildkit-cache-dance@v3
+        with:
+          cache-map: |
+            {
+              "${{ runner.temp }}/cargo-cache/registry": "/usr/local/cargo/registry",
+              "${{ runner.temp }}/cargo-cache/target": "/src/target"
+            }
+          # Saved back only when the lockfile changed: on a hit the cache
+          # already holds every dependency.
+          skip-extraction: ${{ steps.cargo-cache.outputs.cache-hit }}
+      - name: Backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: backend
+          tags: birdtest-e2e-backend
+          load: true
+          build-args: |
+            CARGO_BUILD_JOBS=4
+          cache-from: type=gha,scope=e2e-backend
+          cache-to: type=gha,scope=e2e-backend,mode=max
+      - name: Fake-worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: fake-worker
+          tags: birdtest-e2e-fake-worker
+          load: true
+          cache-from: type=gha,scope=e2e-fake-worker
+          cache-to: type=gha,scope=e2e-fake-worker,mode=max
+      - name: Frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: frontend
+          tags: birdtest-e2e-frontend
+          load: true
+          cache-from: type=gha,scope=e2e-frontend
+          cache-to: type=gha,scope=e2e-frontend,mode=max
       - name: End-to-end journeys
-        run: e2e/run.sh
+        run: e2e/run.sh --no-build
         env:
           MAGPIE_ROOT: ${{ github.workspace }}/magpie
-          CARGO_BUILD_JOBS: "4"
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
