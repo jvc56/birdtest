@@ -200,7 +200,10 @@
 
     <div class="card space-y-3">
       <h2 class="text-lg font-medium">Rating history</h2>
-      <RatingHistoryChart {history} />
+      <RatingHistoryChart
+        {history}
+        rated={pool.ratings.filter((r) => r.connected_to_anchor).length}
+      />
     </div>
 
     <div class="card space-y-3">

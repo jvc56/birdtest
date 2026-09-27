@@ -72,6 +72,12 @@ pub struct Config {
     /// peer; 1 is right behind the ALB and behind the local Nginx. See
     /// `clientip`.
     pub trusted_proxy_hops: usize,
+    /// The most account mails sent a second under `ses`: the account's
+    /// sending rate (1 in SES's sandbox, 14 by default after). Sends past it
+    /// wait their turn; sent at once, a burst of registrations exceeded the
+    /// rate and SES refused them -- lost mail, and the mail-failed alarm, at
+    /// any visitor's call (the audit's pass 25).
+    pub mail_max_per_second: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,6 +289,11 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             trusted_proxy_hops: parsed(lookup, "TRUSTED_PROXY_HOPS", 0usize)?,
+            mail_max_per_second: match parsed(lookup, "MAIL_MAX_PER_SECOND", 1u32)? {
+                // Past a billion the pacer's period is 0, and startup panicked.
+                n @ 1..=1000 => n,
+                n => anyhow::bail!("MAIL_MAX_PER_SECOND must be 1 to 1000, got {n}"),
+            },
         })
     }
 }
@@ -345,6 +356,7 @@ mod tests {
                 c.github_token.clone().unwrap_or_else(|| "None".into())
             }),
             ("TRUSTED_PROXY_HOPS", "0", "2", |c| c.trusted_proxy_hops.to_string()),
+            ("MAIL_MAX_PER_SECOND", "1", "14", |c| c.mail_max_per_second.to_string()),
             ("GITHUB_API_URL", "https://api.github.com", "http://fixtures:80", |c| {
                 c.github_api_url.clone()
             }),
@@ -405,6 +417,8 @@ mod tests {
             ("BIND_ADDR", "localhost:8080"),
             ("MAGPIE_THREADS", "two"),
             ("TRUSTED_PROXY_HOPS", "one"),
+            ("MAIL_MAX_PER_SECOND", "0"),
+            ("MAIL_MAX_PER_SECOND", "2000000000"),
             ("SECURE_COOKIES", "yes"),
             ("MAIL_BACKEND", "smtp"),
             // The file backend with nowhere to write.

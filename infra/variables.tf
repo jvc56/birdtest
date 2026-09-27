@@ -468,3 +468,20 @@ variable "public_url" {
     error_message = "public_url must be the site's https:// origin (no path or trailing slash), and not the birdtest.example placeholder."
   }
 }
+
+variable "mail_max_per_second" {
+  description = <<-EOT
+    The most account mails the backend sends a second (MAIL_MAX_PER_SECOND):
+    the SES account's maximum send rate, which the SES console shows. 1 while
+    the account is in the sandbox; raise it (to 14, SES's usual first rate)
+    once production access is granted. Sends past it wait their turn: sent at
+    once, a burst of registrations exceeded the rate and SES refused them.
+  EOT
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.mail_max_per_second >= 1 && var.mail_max_per_second <= 1000 && floor(var.mail_max_per_second) == var.mail_max_per_second
+    error_message = "mail_max_per_second must be a whole number from 1 to 1000."
+  }
+}

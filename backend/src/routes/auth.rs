@@ -802,7 +802,7 @@ async fn request_password_reset(
         let mailer = state.mailer.clone();
         tokio::spawn(async move {
             if let Err(err) = mailer
-                .send(
+                .send_within(
                     &email,
                     "Reset your birdtest password",
                     // The username too: signing in asks for it, and someone who
@@ -813,6 +813,8 @@ async fn request_password_reset(
                          Reset your password (valid for {RESET_TTL_MINUTES} minutes):\n{link}\n",
                         as_mailed(&username)
                     ),
+                    // Not sent once the link it carries has expired.
+                    Some(std::time::Duration::from_secs(RESET_TTL_MINUTES as u64 * 60)),
                 )
                 .await
             {

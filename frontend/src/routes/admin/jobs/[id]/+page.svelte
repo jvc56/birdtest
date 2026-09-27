@@ -410,16 +410,17 @@
             {/if}
           </p>
         </div>
+        <!-- A completed job is final: the server refuses all three (409). -->
         <button
           class="btn-primary"
-          disabled={busy || gone}
+          disabled={busy || gone || stats.job.status === 'completed'}
           on:click={activate}
         >
           Activate
         </button>
         <button
           class="btn-secondary"
-          disabled={busy || gone}
+          disabled={busy || gone || stats.job.status === 'completed'}
           on:click={() => run(() => api.deactivateJob(jobId), 'Job deactivated.')}
         >
           Deactivate

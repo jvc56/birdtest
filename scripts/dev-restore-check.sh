@@ -17,10 +17,12 @@ trap 'rm -rf "${WORK}"' EXIT
 
 mkdir -p "${WORK}/dump"
 : > "${WORK}/dump/db.dump"
+# Each call's arguments and, after them, what it was given on stdin (the SQL of
+# the scrub and the swap), in order.
 cat > "${WORK}/compose" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "${STUBLOG}"
-cat > /dev/null
+cat >> "${STUBLOG}"
 STUB
 chmod +x "${WORK}/compose"
 
@@ -33,7 +35,8 @@ check() {
   env "$@" STUBLOG="${log}" COMPOSE="${WORK}/compose" \
     bash "${HERE}/dev-restore.sh" "${WORK}/dump" < /dev/null > /dev/null 2>&1 || status=$?
   local scrubs calls got
-  scrubs=$(grep -c "dev_copy=1" "${log}" || true)
+  # The calls, not the SQL logged after them, which mentions the variable too.
+  scrubs=$(grep -c "^exec .*-v dev_copy=1" "${log}" || true)
   calls=$(wc -l < "${log}")
   if (( status == 2 && calls == 0 )); then
     got=refused
@@ -42,12 +45,20 @@ check() {
     # swapped an unscrubbed dump in.
     local copy
     copy=$(grep -o "CREATE DATABASE birdtest_restore_[0-9_]*" "${log}" | awk '{print $3}')
-    if [[ -n "${copy}" ]] && grep -q -- "-d ${copy} .*dev_copy=1" "${log}"; then
+    local scrubbed_at swapped_at
+    scrubbed_at=$(grep -n -m1 "^exec .*-d ${copy:-none} .*-v dev_copy=1" "${log}" | cut -d: -f1)
+    swapped_at=$(grep -n -m1 "RENAME TO birdtest;" "${log}" | cut -d: -f1)
+    # Fed scrub.sql itself, and the swap one transaction renaming this copy.
+    if [[ -n "${copy}" && -n "${scrubbed_at}" && -n "${swapped_at}" ]] && (( scrubbed_at < swapped_at )) \
+      && [[ "$(sed -n "$((scrubbed_at + 1))p" "${log}")" == "$(head -n 1 "${HERE}/scrub.sql")" ]] \
+      && grep -q "^ALTER DATABASE ${copy} RENAME TO birdtest;" "${log}" \
+      && [[ "$(grep -B1 -m1 "^SELECT pg_advisory_xact_lock" "${log}" | head -n 1)" == "BEGIN;" ]] \
+      && sed -n "${swapped_at},\$p" "${log}" | awk '/^exec /{exit} /^COMMIT;/{found=1} END{exit !found}'; then
       got=scrubbed
     else
-      got="scrubbed, but not the copy (${copy:-none created})"
+      got="scrubbed, but not the copy before the swap (${copy:-no copy created})"
     fi
-  elif (( status == 0 && scrubs == 0 )); then
+  elif (( status == 0 && scrubs == 0 )) && grep -q "RENAME TO birdtest;" "${log}"; then
     got=kept
   else
     got="exit ${status}, ${calls} calls, ${scrubs} scrubs"

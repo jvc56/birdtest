@@ -263,7 +263,9 @@ ran; the ops shell has none of their variables). The export and the review
 live in the ops task's `/tmp`: if the shell drops (ECS Exec ends after twenty
 idle minutes), return to the same task with `scripts/prod-shell.sh --attach
 <task-arn>`, which it prints — a new task starts with an empty `/tmp`, and the
-apply then refuses. If the master password was rotated after the restore point,
+apply then refuses. The task stops itself after `SHELL_HOURS` (4 by default),
+taking the review with it: for a long review, start it with
+`SHELL_HOURS=12 scripts/prod-shell.sh`. If the master password was rotated after the restore point,
 set it on the restored instance first (see "Rotating the database password"):
 both blocks connect to it. First export the actions and review them:
 
@@ -275,6 +277,11 @@ set -eo pipefail
 # First: a refused paste must not leave an earlier export for the apply.
 rm -f /tmp/after.done
 DAMAGED_URL=$(sed "s#@[^:/]*:#@${DAMAGED_HOST:?set DAMAGED_HOST to the damaged instance endpoint}:#" <<<"$DATABASE_URL")
+# Every time read and written as ISO in UTC, whatever the shell's settings:
+# read in another zone or style, the window below moved, silently. (PGTZ and
+# PGDATESTYLE would win over PGOPTIONS.)
+unset PGTZ PGDATESTYLE
+export PGOPTIONS='-c datestyle=ISO -c timezone=UTC'
 q() { psql "$1" -v ON_ERROR_STOP=1 -Atqc "$2"; }
 where="SELECT coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()"
 restored_at=$(q "$DATABASE_URL" "$where")
@@ -286,7 +293,7 @@ fi
 # point, so newer rows on the DATABASE_URL side mean the two are swapped.
 if [ "$(q "$DATABASE_URL" "SELECT coalesce(max(id), 0) FROM audit_log")" -gt \
      "$(q "$DAMAGED_URL" "SELECT coalesce(max(id), 0) FROM audit_log")" ]; then
-  echo "DATABASE_URL reaches the instance with the newer audit rows: not the restored one. Wait for DNS and paste again." >&2
+  echo "DATABASE_URL reaches the instance with the newer audit rows: not the restored one. Wait for DNS and paste again -- unless the application already runs on the restored instance, whose ids are then its own: do not paste this again, and apply what is missing by hand." >&2
   exit 1
 fi
 # From an hour before the restored instance's newest row: a row's time is its
@@ -306,7 +313,8 @@ q "$DAMAGED_URL" "COPY (
    ORDER BY a.id) TO STDOUT CSV" > /tmp/after-raw.tmp
 q "$DAMAGED_URL" "COPY (
   SELECT id, password_hash FROM users
-   WHERE id::text IN (SELECT target_id FROM audit_log WHERE action = 'user.password_reset'
+   WHERE deleted_at IS NULL
+     AND id::text IN (SELECT target_id FROM audit_log WHERE action = 'user.password_reset'
                        AND created_at > timestamptz '$since')
   ) TO STDOUT CSV" > /tmp/after-passwords.tmp
 q "$DAMAGED_URL" "COPY (SELECT id FROM users WHERE is_admin) TO STDOUT CSV" > /tmp/after-admins.tmp
@@ -324,10 +332,28 @@ else
 fi
 rm -f /tmp/after-restored-admins.tmp
 # Only the actions the restored instance lacks, and what they add up to.
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -v restored_at="$restored_at" <<'SQL'
+-- The server the checks above reached, still: each psql connects afresh, and
+-- DNS may have moved between them.
+SELECT (coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()) = :'restored_at' AS same_server \gset
+\if :same_server
+\else
+DO $$ BEGIN RAISE EXCEPTION 'DATABASE_URL now reaches another server than a moment ago: paste again'; END $$;
+\endif
 CREATE TEMP TABLE raw (id bigint, action text, target_id text, actor uuid, at timestamptz, reason_b64 text, actor_name text);
 \copy raw FROM '/tmp/after-raw.tmp' CSV
 ANALYZE raw;
+-- An id is the same row on both instances only while neither has written or
+-- renumbered its log: after the repoint the restored instance reuses ids the
+-- damaged one had, and a migration that rebuilt the log shifts them. Either
+-- way matching by id would drop actions, silently (the audit's pass 25).
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM raw r JOIN audit_log a ON a.id = r.id
+              WHERE (a.action, a.target_id, a.actor_user_id, a.created_at)
+                    IS DISTINCT FROM (r.action, r.target_id, r.actor, r.at)) THEN
+    RAISE EXCEPTION 'the two audit logs use one id for different rows -- renumbered, or written here since the restore (after the repoint): nothing was exported; apply what is missing by hand';
+  END IF;
+END $$;
 CREATE TEMP TABLE fresh AS SELECT * FROM raw r WHERE NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.id = r.id);
 \copy (SELECT * FROM fresh ORDER BY id) TO '/tmp/after-actions.tmp' CSV
 \echo security actions since the restore point, by who and what (the 40 largest):
@@ -340,6 +366,7 @@ mv /tmp/after-actions.tmp /tmp/after-actions.csv
 mv /tmp/after-passwords.tmp /tmp/after-passwords.csv
 mv /tmp/after-admins.tmp /tmp/after-admins.csv
 echo "$restored_at" > /tmp/after-restored-at
+q "$DATABASE_URL" "SELECT coalesce(max(id), 0) FROM audit_log" > /tmp/after-restored-last
 echo "each one is a line of /tmp/after-actions.csv: id, action, target, actor, time, reason, actor's name"
 # The demotions under review are the operator's once written: a second export
 # proposes again beside them, and says if the two differ.
@@ -370,6 +397,8 @@ in one transaction:
 ```bash
 (
 set -eo pipefail
+unset PGTZ PGDATESTYLE
+export PGOPTIONS='-c datestyle=ISO -c timezone=UTC'
 if [ ! -e /tmp/after.done ]; then
   echo "the export above has not finished: paste it again" >&2
   exit 1
@@ -384,6 +413,14 @@ if [ "$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "$where")" != "$(cat /tmp/
   echo "DATABASE_URL reaches another server than the export took as the restored one: paste the export again" >&2
   exit 1
 fi
+# And the export is still of what the restored instance lacks: once the
+# application runs on it, it writes rows of its own, under ids the damaged
+# instance had used.
+if [ "$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "SELECT coalesce(max(id), 0) FROM audit_log")" != \
+     "$(cat /tmp/after-restored-last)" ]; then
+  echo "the restored instance has written audit rows since the export was taken (it is serving): the step is not pasted again after the repoint; apply what is missing by hand" >&2
+  exit 1
+fi
 # The first word of each line, which must be an id; lower case, as Postgres
 # writes a uuid.
 tr -d '\r' < /tmp/after-exclude | { grep -v '^[[:space:]]*\(#.*\)\{0,1\}$' || true; } \
@@ -395,8 +432,15 @@ if grep -qvE "$id" /tmp/after-exclude.ids; then
   exit 1
 fi
 echo "leaving out: $(tr '\n' ' ' < /tmp/after-exclude.ids)"
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -v restored_at="$(cat /tmp/after-restored-at)" <<'SQL'
 BEGIN;
+-- The server the checks above reached, still: each psql connects afresh, and
+-- DNS may have moved between them.
+SELECT (coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()) = :'restored_at' AS same_server \gset
+\if :same_server
+\else
+DO $$ BEGIN RAISE EXCEPTION 'DATABASE_URL now reaches another server than a moment ago: paste again'; END $$;
+\endif
 -- No reset link sent before the restore point works: one spent since cannot
 -- be told from one that was not. (Sessions end with the signing key, below.)
 UPDATE password_reset_tokens SET used_at = now() WHERE used_at IS NULL;
@@ -408,19 +452,25 @@ CREATE TEMP TABLE all_actions (id bigint, action text, target_id text, actor uui
 ANALYZE all_actions;
 CREATE TEMP TABLE after_exclude (v text);
 \copy after_exclude FROM '/tmp/after-exclude.ids' CSV
+ANALYZE after_exclude;
 -- A left-out id that matches nothing was meant for something: nothing is
--- applied until it is corrected.
+-- applied until it is corrected. By id and by actor apart: `IN (id, actor)`
+-- can use no hash, and compared every action with every line -- five
+-- minutes for two thousand lines.
+CREATE TEMP TABLE unmatched AS
+  SELECT v FROM after_exclude e
+   WHERE NOT EXISTS (SELECT 1 FROM all_actions a WHERE a.id::text = e.v)
+     AND NOT EXISTS (SELECT 1 FROM all_actions a WHERE a.actor::text = e.v);
 DO $$ BEGIN
-  IF EXISTS (SELECT 1 FROM after_exclude e
-              WHERE NOT EXISTS (SELECT 1 FROM all_actions a WHERE e.v IN (a.id::text, a.actor::text))) THEN
+  IF EXISTS (SELECT 1 FROM unmatched) THEN
     RAISE EXCEPTION 'these exclusions match no action or actor, so nothing was applied: %',
-      (SELECT string_agg(v, ', ') FROM after_exclude e
-        WHERE NOT EXISTS (SELECT 1 FROM all_actions a WHERE e.v IN (a.id::text, a.actor::text)));
+      (SELECT string_agg(v, ', ') FROM unmatched);
   END IF;
 END $$;
 CREATE TEMP TABLE after_actions AS
   SELECT * FROM all_actions a
-   WHERE NOT EXISTS (SELECT 1 FROM after_exclude e WHERE e.v IN (a.id::text, a.actor::text));
+   WHERE NOT EXISTS (SELECT 1 FROM after_exclude e WHERE e.v = a.id::text)
+     AND NOT EXISTS (SELECT 1 FROM after_exclude e WHERE e.v = a.actor::text);
 ANALYZE after_actions;
 CREATE TEMP TABLE after_passwords (id uuid, password_hash text);
 \copy after_passwords FROM '/tmp/after-passwords.csv' CSV
@@ -449,9 +499,12 @@ UPDATE users u SET password_hash = p.password_hash FROM after_passwords p, last_
  WHERE p.id = u.id AND r.target_id = u.id::text
    AND EXISTS (SELECT 1 FROM after_actions x WHERE x.id = r.id)
 RETURNING u.username;
-\echo accounts whose last password reset was left out, so their password is the restored one: have each reset it
+\echo accounts reset since whose password is the restored one -- the last reset left out, or the account deleted there (a deletion left out): have each reset it
 SELECT u.id, u.username FROM last_reset r JOIN users u ON u.id::text = r.target_id
- WHERE NOT EXISTS (SELECT 1 FROM after_actions x WHERE x.id = r.id);
+ WHERE (NOT EXISTS (SELECT 1 FROM after_actions x WHERE x.id = r.id)
+        OR NOT EXISTS (SELECT 1 FROM after_passwords p WHERE p.id = u.id))
+   -- Not one deleted again below.
+   AND NOT EXISTS (SELECT 1 FROM after_actions d WHERE d.action = 'user.deleted' AND d.target_id = r.target_id);
 -- Bans: each identity's last ban or unban, for the identities this instance has.
 CREATE TEMP TABLE last_ban AS
   SELECT DISTINCT ON (target_id) target_id, action, actor, at,
@@ -495,9 +548,11 @@ SQL
 )
 ```
 
-Both blocks can be pasted again: the first rewrites its export and keeps the
-review (the exclusions and the demotions as edited), and the second sets state
-from them. `scripts/reapply-check.sh` runs both against two databases, through
+Both blocks can be pasted again until the application is repointed: the first
+rewrites its export and keeps the review (the exclusions and the demotions as
+edited), and the second sets state from them. After it, not: the restored
+instance writes audit rows of its own, under ids the damaged one had used, and
+both blocks refuse; apply a missed action by hand. `scripts/reapply-check.sh` runs both against two databases, through
 these cases (§6).
 
 If the damaged instance cannot be read at all — the instance failed, the schema
@@ -528,14 +583,15 @@ p = u.urlsplit(sys.argv[1])
 print(p._replace(netloc=p.netloc.rsplit("@", 1)[0] + "@" + sys.argv[2] + ":5432").geturl())' \
   "$OLD_URL" "$ENDPOINT")
 
+# Chained: the service starts only once both are written. Started on the old
+# key, it would honour again the sessions the new one ends.
 aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
-  --value "$NEW_URL"
+  --value "$NEW_URL" &&
 # A new signing key ends every session: one ended on the damaged instance
 # after the restore point matches the restored instance's session generation
 # again, and only the key tells it from one that was not.
 aws ssm put-parameter --region "$REGION" --name /birdtest/SESSION_SIGNING_KEY --type SecureString --overwrite \
-  --value "$(openssl rand -hex 32)"
-
+  --value "$(openssl rand -hex 32)" &&
 # Tasks read SSM at start, so this is the whole deploy.
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
 ```
@@ -1288,8 +1344,10 @@ SELECT
 
    **Never use `worker/fake_worker.py` for this.** It submits invented
    results, the server records them as real contributions to real jobs, and
-   they skew SPRT verdicts and rating fits until someone finds and deletes
-   them. It is test tooling for disposable stacks only.
+   they skew SPRT verdicts and rating fits until the jobs they went to are
+   purged (§2.0) — no route deletes a single result, and one deleted by hand
+   leaves the job's counters, and so its pools' fits, as they were. It is test
+   tooling for disposable stacks only.
 
 In-flight claims need no action. Claims open at the restore point are reclaimed
 by the heartbeat timeout, and a worker submitting against a claim the restored

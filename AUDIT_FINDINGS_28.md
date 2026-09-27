@@ -231,6 +231,17 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   (anyone could raise the mail alarm; `ON_ERROR_ROLLBACK`; a quadratic apply;
   a stop after the swap; a lost snapshot; empty artifact snapshots), fixed.
   KL-91 and KL-92 added; KL-2, KL-35, KL-90 updated. The loop continues.
+- **Pass 25 (follow-up: pass 24's diff, and rating pools and ratings):** 0
+  high and 8 medium from the reviewers: the public rating history sent every
+  point of every member; rating chart labels were clipped and overlapped; a
+  burst of registrations exceeded SES's send rate, and a send SES never
+  answered hung silently; a Ctrl-C left the dev restore's mirror running; the
+  re-apply step matched the two logs by id alone, was quadratic in its
+  exclusions, and its check still missed faults — all fixed and verified. The
+  adversarial checks found 2 medium (the mail pacer starved the oldest mail;
+  labels shortened one at a time still collided), fixed: mail now goes
+  through one bounded queue in order. KL-75, KL-76, KL-91, KL-92 updated. The
+  loop continues.
 
 ---
 
@@ -4044,4 +4055,173 @@ succeeds).
   README.md`: 28 and 19 blocks; the dev restore, dump and scrub replayed as in
   24.6, 24.7 and 24.10 against throwaway compose stacks; the re-apply timed
   at 500,000 actions.
+- MAGPIE unchanged this pass.
+
+## Pass 25 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`7175565..fcf7492`), one
+reviewer per part: the dev and ops scripts (replayed against a real compose
+project with the real MinIO and mc images); RUNBOOK §1's re-apply step in its
+fourth form (replayed, and through the real backend); the backend, frontend,
+infra and docs (tier 5 natively). MAGPIE is unchanged. Plus one area not
+examined in this run: **rating pools and ratings** — the fit's inputs, the
+sweep, history, the admin and public routes, and the charts.
+
+### 25.1 Medium — the public rating history cost what the chart never drew (ratings reviewer)
+
+`GET /api/rating-pools/:id/history` sent every member's point for every kept
+run, each with its name, sorted by name; the chart draws six configs. The plan
+the planner chose also crossed the JIT thresholds. **Shown:** 9.5 MB and a
+second for a 100-member pool; forty views at once answered `503` to 22 of
+them, and the pool list took 4.2 s meanwhile. **Fix:** three keyed queries —
+the kept runs, the six current members rated highest in the newest run, their
+points by primary key — so a removed config also takes none of the six (KL-75's
+bullet, closed). **Verified:** `A-RATE-6b` (fails against the old route: ten
+configs, the removed one among them); the adversary's 4.5 million rating rows:
+66–77 ms a view, no JIT, forty at once all `200`, worst 0.6 s.
+
+### 25.2 Medium — rating chart labels were clipped and drawn on one another (ratings reviewer)
+
+Names were drawn whole in fixed margins: the history's end labels lost their
+tails past the SVG's edge — the part that tells two configs apart — and two
+lines ending close together had their labels on top of each other; the dot
+plot lost the start of any name over about 26 characters. **Shown** in
+Chromium at 1280 and 393 px. **Fix:** labels are shortened together, the
+segments a family of configs shares dropped and the rest shortened in the
+middle, with labels still alike widened where they differ (the adversary found
+the first form, one name at a time, still read `2ply…off` and `4ply…off` the
+same); end labels are moved apart; each carries the full name as its title;
+the chart counts what it does not draw from the pool's rated members.
+**Verified:** in Chromium, no label past its SVG and none overlapping; the
+family's seven names give seven labels.
+
+### 25.3 Medium — a burst of registrations could exceed SES's send rate (backend reviewer)
+
+Each send was its own task and went out at once; SES caps an account's rate
+(1 a second in the sandbox, 14 after), and ten client addresses registering at
+once exceeded it. **Shown:** against a stand-in allowing 14 a second, 66 of
+100 confirmation mails failed, each raising the mail alarm, while every caller
+was told to check their mail. **Fix** (its second form, after the adversary):
+one queue per process, drained in order by one sender at `MAIL_MAX_PER_SECOND`
+(new, 1 to 1,000; `mail_max_per_second` in Terraform, to raise with production
+access), each send then on its own; the queue holds an hour of mail at the
+rate, 20,000 at most, and refuses past that with the alarm; a reset that would
+go out after its link expired is dropped, with the alarm; a throttled attempt
+is retried a second later at the soonest. The first form had each send wait
+on the limiter by itself, and a limiter is not a queue: under a sustained
+flood the newest waiter won every turn and the oldest mail was never sent, with
+no bound and no alarm (shown by the adversary: 1 of 60 queued first sent in
+eight seconds, the reset never). **Verified:** `a_burst_of_sends_is_paced_in_order`,
+`a_full_mail_queue_refuses_rather_than_growing`,
+`a_mail_that_waited_past_its_link_is_not_sent`.
+
+### 25.4 Medium — an SES endpoint that never answered held a send for good (backend reviewer)
+
+The SDK sets only a connect timeout. **Shown:** a listener that accepted and
+never replied: no log line in eight minutes, the connection open. **Fix:** an
+attempt timeout of 10 s and an operation timeout of 30 s. **Verified:**
+`a_send_nobody_answers_times_out` (fails with the timeouts taken out); the
+adversary saw the production client fail at 30.0 s, logged.
+
+### 25.5 Medium — a Ctrl-C during the dev restore's mirror left it running (scripts reviewer)
+
+A Ctrl-C reaches the whole process group; the compose CLI caught it and
+exited, the script reported a failed mirror, and the container — its first
+process a shell that ignores SIGINT — went on mirroring with `--remove`.
+**Shown:** the orphan finished 23 s later; a restore run at once then ended
+with 50,061 objects where its snapshot held 2. **Fix:** `exec mc`, so a signal
+reaches mc; the container removed whatever the exit; a stop reported as one;
+the snapshot mounted read-only. **Replayed** against the real images: the
+group Ctrl-C mid-mirror, no container left, the next restore's bucket exactly
+its snapshot's.
+
+### 25.6 Medium — the re-apply step matched the two logs by id alone (RUNBOOK reviewer)
+
+An id names the same row on both instances only until one writes or renumbers
+its log. **Shown (a):** after the repoint the restored instance reused the
+damaged one's ids; pasted again, as the RUNBOOK allowed, the step dropped the
+actions whose ids were reused and copied an old password over a newer reset.
+**(b):** a migration that rebuilt the damaged log shifted its ids, and nothing
+was exported, with nothing said. **Fix:** block 1 refuses when an id both logs
+have names different rows (action, target, actor, time); block 2 refuses when
+the restored instance has written since the export; both pin the server inside
+their psql session; the RUNBOOK says the step is not pasted again after the
+repoint. **Verified:** both cases in `reapply-check.sh`.
+
+### 25.7 Medium — leaving out many actions by id was quadratic (RUNBOOK reviewer)
+
+`e.v IN (a.id::text, a.actor::text)` can use no hash. **Shown:** 2,000
+exclusions against 500,000 actions: 310 s, silent. **Fix:** by id and by actor
+in separate anti-joins, the table analyzed. **Verified:** 4.9 s.
+
+### 25.8 Medium — `reapply-check.sh` passed faults its record said it caught (RUNBOOK reviewer)
+
+Of 22 faults, ten passed: the apply reading the proposed demotions, not the
+edited ones; the rogue's key revocations, suspensions and confirmations
+applied; the window hung on the damaged instance or the clock; the copied-hash
+list removed; and five minor ones. **Fix:** cases for each — the rogue's other
+actions, a demotion edit on an admin who stays one, an action an hour after the
+restored instance's newest row, an anonymous identity unbanned since, a
+deletion left out after its account's own reset (which copied `!` as the
+password; now no hash is copied from an account deleted there), the copied-hash
+list, a confirmation of an address confirmed long before, the deletion's date,
+an account already deleted, the proposal shown beside an edit. **Verified:** of
+26 faults (the reviewer's 22 and four for this pass's fixes), each fails the
+check but one — the completion mark written before the demotion file, which
+would take a failure between the two lines to show.
+
+### 25.9 Low findings
+
+**Fixed:**
+- Mail: an SES error with a message and no code keeps the message; the admin
+  job page disables Activate and Deactivate on a completed job too; KL-2's
+  history reads "since the first audit".
+- Ratings: the pool's newest run picked with the fit's tie-break; RUNBOOK no
+  longer says fake results are found and deleted (no route deletes one); KL-75
+  corrected.
+- Scripts: the restore's `compose stop` waited out before `start`; no
+  `birdtest` database is a refusal naming the replaced ones; the dump's object
+  count leaves out folder markers; the scrub's closing line is said only when
+  it ran; the stub check logs each call's stdin and asserts the scrub is the
+  copy's, fed `scrub.sql`, before a swap in one transaction.
+- RUNBOOK §1: the repoint chained so the service starts only on the new key;
+  `SHELL_HOURS` for a long review; the swapped check's message.
+
+**Unconfirmed:** a block-1 DNS flip between connections (now pinned); ECS
+Exec's idle limit during a long silent apply; SDK retries of a throttled send
+(now backed off a second).
+
+### 25.10 Adversarial checks of the pass's fixes
+
+Two. **2 medium, fixed** (in 25.2 and 25.3: labels shortened one at a time
+still collided; the pacer starved the oldest mail) — the other found none,
+its replays of every signal at every phase of the dev restore, the `\if` pin
+under psql 16 and CSV timestamps all holding. **Lows fixed:** a client's
+`PGTZ`/`PGDATESTYLE` moved the export's window silently (both blocks now unset
+them and read ISO in UTC; the check runs its main case under
+`PGDATESTYLE=Postgres PGTZ=Asia/Kolkata`); an account reset then deleted by a
+kept action was listed for a reset; the reset list's check grepped the whole
+output; the restore's messages after a stop, its listing of unfinished copies
+and a signal held while the mirror's paths were worked out;
+`MAIL_MAX_PER_SECOND` above a billion panicked (capped at 1,000). **Recorded:**
+chart labels are sized by character count, so wide capitals can still run past
+(KL-76); single-column faults in the id-content check and the server pin are
+not exercised by the check; a second Ctrl-C during the restart can leave the
+backend stopped (the script says so).
+
+### 25.11 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **636 of 636** (new: five email tests, `A-RATE-6b`; more asserted in
+  `U-CFG-1`/`-4`).
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 126 of 126 (label tests).
+- **Tier 5, natively: 14 of 14**; **tier 6, natively, every case**.
+- `terraform fmt -check` and `validate`: clean.
+- `scripts/reapply-check.sh`: passes; 26 faults as above;
+  `scripts/dev-restore-check.sh`: passes, and fails with the scrub fed
+  nothing, a swap without its transaction, or one renaming another database;
+  `scripts/runbook-check.sh RUNBOOK.md README.md`: 28 and 19 blocks; the dev
+  restore's mirror, dump markers and missing-database refusal replayed against
+  the real images; the apply timed with 2,000 exclusions.
 - MAGPIE unchanged this pass.

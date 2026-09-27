@@ -1283,6 +1283,66 @@ async fn history_is_in_time_order_and_leaves_out_unrated_configs() {
     assert_eq!(points, expected);
 }
 
+/// A-RATE-6b: history carries only what the chart draws -- the six current
+/// members rated highest in the newest run -- where it sent every member's
+/// every point on each view of a public page; and a config removed from the
+/// pool takes none of the six, however high it was rated.
+#[tokio::test]
+async fn history_carries_the_six_highest_current_members() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let admin = db.user("root", true).await;
+    let scope = scope(&db).await;
+    let anchor = db.static_player("anchor", admin).await;
+    let mut others = Vec::new();
+    for i in 0..8 {
+        others.push(db.static_player(&format!("m{i}"), admin).await);
+    }
+    let removed = db.static_player("removed", admin).await;
+    let pool = pool(&db, "pool", "classic", scope, anchor, &others, 2000.0).await;
+
+    // Two runs; member i rated 1900 + 10 i, the removed config above them all.
+    for at in ["2026-03-01", "2026-03-02"] {
+        let run: Uuid = sqlx::query_scalar(
+            "INSERT INTO rating_runs (pool_id, computed_at, trigger, iterations, converged,
+                                      pairs_used, jobs_used)
+             VALUES ($1, $2::timestamptz, 'evidence', 1, true, 1, 1) RETURNING id",
+        )
+        .bind(pool)
+        .bind(at)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let mut rows = vec![(anchor, 2000.0), (removed, 2500.0)];
+        rows.extend(others.iter().enumerate().map(|(i, c)| (*c, 1900.0 + 10.0 * i as f64)));
+        for (config, rating) in rows {
+            sqlx::query(
+                "INSERT INTO player_config_ratings
+                     (run_id, player_config_id, rating, stderr, pairs_played,
+                      connected_to_anchor, is_anchor)
+                 VALUES ($1, $2, $3, 10, 1, true, $4)",
+            )
+            .bind(run)
+            .bind(config)
+            .bind(rating)
+            .bind(config == anchor)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    let (status, body) =
+        send(&app, get_request(&format!("/api/rating-pools/{pool}/history"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut names: Vec<String> =
+        body.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names.len(), 12, "six configs at two runs: {names:?}");
+    names.sort();
+    names.dedup();
+    assert_eq!(names, ["anchor", "m3", "m4", "m5", "m6", "m7"]);
+}
+
 /// A-RATE-7: recompute is an admin action -- refused without a session and
 /// with a non-admin one, before anything is fit -- and an admin's stores a
 /// new manual run and returns it.

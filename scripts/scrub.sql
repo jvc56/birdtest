@@ -93,4 +93,7 @@ UPDATE audit_log SET reason = '[scrubbed]'
 
 COMMIT;
 
+-- Said only when it was asked for: after a refusal it would be untrue.
+\if :dev_copy
 \echo 'Scrubbed. Every account now has the password birdtest-local.'
+\endif

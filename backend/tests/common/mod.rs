@@ -219,6 +219,7 @@ impl TestDb {
             github_api_url: "http://127.0.0.1:9".into(),
             github_raw_url: "http://127.0.0.1:9".into(),
             trusted_proxy_hops: 0,
+            mail_max_per_second: 1,
         }
     }
 

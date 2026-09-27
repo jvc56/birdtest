@@ -11,7 +11,9 @@ import {
   ratingCell,
   ROW_HEIGHT,
   stderrCell,
-  visibleError
+  visibleError,
+  NAME_CHARS,
+  rowLabels
 } from './ratingDotPlot';
 
 function row(
@@ -194,5 +196,23 @@ describe('F-CHART-3 configs not connected to the anchor', () => {
     expect(layout.rated).toEqual([]);
     expect(layout.unrated).toEqual([island]);
     expect(layout.bounds).toEqual({ lo: 0, hi: 1 });
+  });
+});
+
+describe('row labels', () => {
+  it('fit the margin, keep the anchor mark, and tell a family apart', () => {
+    const rows = [
+      row('a', 1500, 0, { name: 'static-CSW24-equity-baseline', is_anchor: true }),
+      row('b', 1500, 10, { name: 'simmer-CSW24-2ply-inference-on' }),
+      row('c', 1500, 10, { name: 'simmer-CSW24-2ply-inference-off' }),
+      row('d', 1500, 10, { name: 'simmer-CSW24-4ply-inference-on' }),
+      row('e', 1500, 10, { name: 'simmer-CSW24-4ply-inference-off' }),
+      row('f', 1500, 10, { name: 'short' })
+    ];
+    const labels = rowLabels(rows);
+    for (const label of labels) expect(label.length).toBeLessThanOrEqual(NAME_CHARS);
+    expect(labels[0].endsWith(' (anchor)')).toBe(true);
+    expect(new Set(labels).size).toBe(rows.length);
+    expect(labels[5]).toBe('short');
   });
 });

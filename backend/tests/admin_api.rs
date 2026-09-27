@@ -747,6 +747,13 @@ async fn a_long_rating_history_is_thinned_but_keeps_its_ends() {
     .fetch_one(&db.pool)
     .await
     .unwrap();
+    // A member, as a pool's anchor always is: history carries members only.
+    sqlx::query("INSERT INTO rating_pool_members (pool_id, player_config_id) VALUES ($1, $2)")
+        .bind(pool)
+        .bind(anchor)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     // Twelve hundred runs, two minutes apart: under two days of one active job.
     sqlx::query(
         "WITH runs AS (

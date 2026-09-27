@@ -480,8 +480,17 @@ Ratings are **displayed on the ratings pages and nowhere else**:
   with no path of games to the anchor is listed as unrated rather than drawn.
   Admin membership controls appear inline here for admins.
 - The **history chart** on the same page (`GET /api/rating-pools/:id/history`)
-  — one line per rated member across the stored runs, thinned to at most 500
-  evenly spaced points with the first and newest always kept.
+  — one line for each of the six current members rated highest in the newest
+  run, across the stored runs, thinned to at most 500 evenly spaced points
+  with the first and newest always kept. Only those six are sent: every
+  member's every point went out on each view of this public page, and a
+  burst of views at a hundred members answered other readers `503` (the
+  audit's pass 25). Each line is labelled at its end, the labels moved apart
+  where lines end close together, and long names are shortened together —
+  the segments a family of configs shares dropped, the rest shortened in the
+  middle, and labels still alike widened where they differ — so no two drawn
+  labels read the same (the full name is each one's title); the dot plot's
+  names likewise.
 
 A job's own pages (`/jobs/[id]`) show its SPRT verdict, win rate and
 pentanomial, and **no rating**: a rating belongs to a pool, not to a job, and a
@@ -1411,6 +1420,7 @@ start. The process has no SSM code path of its own.
 | `MAIL_BACKEND` | `console` | `console`, `ses`, or `file` — the end-to-end suite's, never production: each mail written to `MAIL_OUTBOX_DIR`, which it requires. Anything else fails startup. |
 | `MAIL_OUTBOX_DIR` | unset | The `file` backend's directory. |
 | `MAIL_FROM` | `no-reply@birdtest.local` | Required under `ses`: the default is only for local use, and SES refuses it. |
+| `MAIL_MAX_PER_SECOND` | `1` | Under `ses`, the most mails sent a second: the account's sending rate (1 in the sandbox). Sends past it wait their turn rather than being refused by SES. |
 | `PUBLIC_URL` | `http://localhost:5173` | The base for links in emails; a trailing slash is dropped. Required under `ses`, whose links must reach the real site. |
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. 180 to 86,400; anything else fails startup: below MAGPIE's thirty-second cadence a live worker's claim lapses and is handed to the next claimant. 180 is six heartbeats and no more: one heartbeat stalled until MAGPIE gives up on it (about 127 s) leaves some 187 s between recorded ones, and one that crawls lapses its claim at any setting (KL-83). |
 | `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. Built one at a time per job; dropped by every admin action on the job, by its completion and by a leave generation closing, so the admin page reloading after an action reads the change. `0` builds it on every request (the tests). |
@@ -5100,7 +5110,7 @@ do not exist.
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated), paginated. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
 | `GET` | `/api/rating-pools/:id` | Latest fit for one pool: run provenance, every member's rating with uncertainty, and the residuals. |
-| `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history — the history chart's series. |
+| `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run — the history chart's series. |
 
 **Rack lookup** canonicalizes the query before matching: uppercased, whitespace
 trimmed, letters sorted. A rack is a multiset of tiles, so `AEINRST` and
@@ -7111,7 +7121,7 @@ says so in its implemented option, rather than being removed.
   either, except `racks_per_task` (10,000 since the thirty-second audit: every
   claim and every `leave_requests` row carries a task's forced racks); a typo
   makes tasks that outlast their lease rather than fail. Batch sizes have one:
-  `racks_per_batch` 10,000 (since before the first audit), and since the thirty-second audit's
+  `racks_per_batch` 10,000 (since the first audit), and since the thirty-second audit's
   pass 21 `games_per_batch`
   10,000 games (1,000 when capturing; `pairs_per_batch` half that) — past
   32,768 captured games a result could not name its games at all. The
@@ -8003,18 +8013,14 @@ says so in its implemented option, rather than being removed.
   - A pool's scope is its variant, distribution and layout, not the job-level
     `bingo_bonus` and `sim_cutoff`: a change to `magpie_defaults` would mix
     rule sets in one pool.
-  - Adding a member already in the pool, or removing one that is not, writes an
-    audit row and refits.
-  - The history chart ranks every config it has points for by its last rating,
-    configs since removed and members now unrated included, so they can take
-    the six drawn slots from current members, and its "the table below lists
-    every one" note is then wrong (thirty-second audit).
+  - Adding a member already in the pool writes an audit row and refits
+    (removing one that is not is a `404`, since the thirty-second audit).
   - A pool's first fit by the thirty-second audit's method moves every rating
     (a different prior), and the history draws the jump with no mark; the API
     does not expose a run's `method`.
 - **Options considered:** thin by time buckets; add the two settings to the
-  pool's scope; answer a no-op membership change without a write; draw only
-  current, rated members; expose `method` on history points and mark a change.
+  pool's scope; answer a no-op membership change without a write; expose
+  `method` on history points and mark a change.
 - **Option implemented:** None.
 - **Justification:** None changes a rating today; the defaults have not moved.
 
@@ -8035,6 +8041,9 @@ says so in its implemented option, rather than being removed.
   A clamped error bar (±400 Elo drawn) has no mark, so ±400, ±1,278 and ±∞
   look the same while the caption says the bars are one error; the prior's
   widened errors make clamped bars more common (thirty-second audit, pass 2).
+  The charts' name labels are shortened by character count, not measured: a
+  name in wide capitals (`NWL23-WMWM-4PLY-…`) still runs past its margin
+  (pass 25).
 - **Options considered:** larger tap targets; a 320 px run of E-10; narrower
   chart margins below the `sm`
   breakpoint, or names stacked above the dots; an open end on a clamped bar.
@@ -8538,7 +8547,14 @@ says so in its implemented option, rather than being removed.
   feedback: which addresses bounced is in SES's suppression list, not in
   birdtest. And the outbox file name that the end-to-end suite reads mail by
   maps `a.b@x` and `a-b@x` to one suffix (tests only; their addresses are
-  unique).
+  unique). Sends are paced to the account's rate, in one queue in the order
+  they came, so a burst from many client addresses no longer fails, but it
+  queues: past the rate, everyone's mail — a real registrant's, a reset —
+  waits behind it. The queue holds an hour of mail at the rate (20,000 at
+  most); past that a mail is refused, and a reset that would go out after its
+  link expired is dropped, each with the mail-failed alarm. So a flood from
+  enough client addresses delays mail, and past an hour's worth loses it,
+  loudly.
 - **Options considered:** a daily cap per address as well as the hourly one; a
   site-wide cap on confirmation mail; refusing reserved domains (`.invalid`,
   `.test`) at registration; a configuration set with bounce and complaint
@@ -8560,7 +8576,11 @@ says so in its implemented option, rather than being removed.
   action that writes none (KL-90) — is not re-applied; admin flags, which are
   not audited, are compared instead. It takes the damaged rows from an hour
   before the restored instance's newest one, so an action in a transaction
-  that ran for more than an hour across the restore point is missed. The
+  that ran for more than an hour across the restore point is missed. It
+  matches the two logs by id, and refuses — rather than reading nothing new —
+  when an id names different rows on the two: a damaged log a migration
+  renumbered, or the restored instance writing once repointed (so the step is
+  not pasted again after that; a missed action is applied by hand). The
   review lives in the ops task's `/tmp` and is lost with the task. A password
   reset since the restore point is applied by copying the damaged instance's
   current hash, which a later change with no audit row (a migration) would
@@ -9348,10 +9368,17 @@ SDK has retried by then; a JSON field, because the frontend's access lines in
 the same log group carry whatever a visitor puts in a header), and two alarms
 watch SES's own bounce and complaint rates at 4% and 0.08%, below the 5% and
 0.1% at which SES reviews an account (it may pause one at 10% and 0.5%).
-Addresses that hard-bounced or complained are suppressed account-wide, and an
+Addresses that hard-bounced or complained are suppressed account-wide; an
 address is refused at registration unless SES would parse it (a dot-atom and
-host-name labels), so a visitor cannot make a send fail. What a visitor can
-still do to the rates is KL-91.
+host-name labels); sends are spaced to the account's sending rate
+(`MAIL_MAX_PER_SECOND`), one queue drained in order by one sender, so a burst
+of registrations waits its turn rather than being refused (the audit's pass
+25 — first as each send waiting on the limiter by itself, which let the newest
+win every turn and starved the oldest; the queue is bounded, and a mail it
+refuses or a reset that waited past its link alarms); and a send SES never answers fails after 30
+seconds, logged and alarmed, where it hung silently. In SES's sandbox every
+send to an unverified address still fails, and alarms (README). What a visitor
+can still do to the rates, and to the mail queue, is KL-91.
 
 Layer 3 had a design choice of its own. Having the backend list the backup bucket
 directly would require giving the task role `ListBucket` / `GetObject` on it,

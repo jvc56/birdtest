@@ -51,9 +51,13 @@ ${COMPOSE} run --rm --no-deps -T --name "${MIRROR}" --user "$(id -u):$(id -g)" \
   -v "$(cd "${PARTIAL}" && pwd)/artifacts:/out" --entrypoint /bin/sh minio-init -c '
     set -e
     mc mirror --overwrite local/birdtest-artifacts /out
-    want=$(mc ls -r local/birdtest-artifacts | wc -l)
+    # A key ending in "/" is a folder marker, mirrored as a directory.
+    want=$(mc ls -r local/birdtest-artifacts | grep -vc "/$" || true)
     got=$(find /out -type f | wc -l)
-    [ "$want" = "$got" ] || { echo "mirrored $got of $want objects" >&2; exit 1; }
+    [ "$want" = "$got" ] || {
+      echo "mirrored $got of $want objects (the backend writes while this runs: stop it, or run this again)" >&2
+      exit 1
+    }
   '
 
 # Moved aside before the new one goes in, and removed after: a stop while an

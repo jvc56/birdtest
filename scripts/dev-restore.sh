@@ -75,7 +75,10 @@ phase=copy
 stopped=0
 restart() {
   if (( stopped )); then
-    echo "starting the backend"
+    echo "starting the backend" >&2
+    # A stop the daemon is still carrying out would end after the start,
+    # leaving it stopped: `stop` waits for it first.
+    ${COMPOSE} stop backend >/dev/null 2>&1 || true
     ${COMPOSE} start backend >/dev/null 2>&1 || echo "the backend did not start: docker compose start backend" >&2
   fi
 }
@@ -115,6 +118,15 @@ trap 'stop; exit 130' INT TERM HUP
 # What earlier runs left: their copies (killed outright, or one running now,
 # which then fails harmlessly) and a replaced database whose drop was cut
 # short -- only while `birdtest` exists, so never the last copy there is.
+# The stack's database must be there to be replaced. A swap by an earlier
+# version of this script could leave it renamed away.
+if [[ "$(sql postgres -At -c "SELECT count(*) FROM pg_database WHERE datname = 'birdtest'" || true)" == 0 ]]; then
+  echo "there is no database named birdtest; nothing was changed. Replaced ones:" >&2
+  sql postgres -At -c "SELECT datname FROM pg_database WHERE datname LIKE 'birdtest\_replaced%'" >&2 || true
+  echo "rename the one to keep back (ALTER DATABASE ... RENAME TO birdtest), or create an empty one, and run this again" >&2
+  trap - ERR INT TERM HUP
+  exit 1
+fi
 sql postgres <<'SQL'
 SELECT format('DROP DATABASE %I WITH (FORCE)', datname) FROM pg_database
  WHERE datname LIKE 'birdtest\_restore%'
@@ -170,7 +182,7 @@ phase=done
 after() {
   trap '' INT TERM HUP
   docker rm -f "${MIRROR}" >/dev/null 2>&1 || true
-  echo "stopped after the swap: the database is restored from ${SRC}, the artifact bucket perhaps not" >&2
+  echo "stopped after the swap: the database is restored from ${SRC}, the artifact bucket perhaps not; run the restore again" >&2
   restart
 }
 trap - ERR
@@ -184,17 +196,33 @@ if [[ -d "${SRC}/artifacts" && -z "$(find "${SRC}/artifacts" -type f -print -qui
   # the audit's pass 24 every snapshot's was empty on Linux (dev-dump.sh).
   echo "the snapshot holds no artifact objects: the bucket is left as it is" >&2
 elif [[ -d "${SRC}/artifacts" ]]; then
+  # Worked out before the mirror starts, so that a signal is not held while
+  # they are.
+  user="$(id -u):$(id -g)"
+  artifacts="$(cd "${SRC}/artifacts" && pwd)"
   echo "restoring the artifact bucket"
-  ${COMPOSE} run --rm --no-deps -T --name "${MIRROR}" --user "$(id -u):$(id -g)" \
+  # `exec`, so that mc, not a shell that ignores it, gets a signal. The
+  # container is removed whatever the exit: stopped any way the trap above
+  # does not see -- its own `docker stop` -- it went on mirroring, with
+  # --remove, after this had said it had stopped (pass 25).
+  mirrored=0
+  ${COMPOSE} run --rm --no-deps -T --name "${MIRROR}" --user "${user}" \
     -e MC_CONFIG_DIR=/tmp/.mc -e MC_HOST_local=http://birdtest:birdtestbirdtest@minio:9000 \
-    -v "$(cd "${SRC}/artifacts" && pwd):/in" --entrypoint /bin/sh minio-init -c '
+    -v "${artifacts}:/in:ro" --entrypoint /bin/sh minio-init -c '
       set -e
       mc mb --ignore-existing local/birdtest-artifacts >/dev/null
-      mc mirror --overwrite --remove /in local/birdtest-artifacts
-    ' || {
-    echo "the artifact bucket was not restored (the database was): once MinIO is up, run the restore again" >&2
-    status=1
-  }
+      exec mc mirror --overwrite --remove /in local/birdtest-artifacts
+    ' || mirrored=$?
+  docker rm -f "${MIRROR}" >/dev/null 2>&1 || true
+  case "${mirrored}" in
+    0) ;;
+    129 | 130 | 143)
+      echo "the artifact mirror was stopped: the database is restored, the bucket only partly; run the restore again" >&2
+      status=1 ;;
+    *)
+      echo "the artifact bucket was not restored (the database was): see mc's message above, and run the restore again" >&2
+      status=1 ;;
+  esac
 fi
 
 restart

@@ -4,6 +4,7 @@
  * wrong, draws a plausible picture rather than failing.
  */
 import type { RatingRow } from '$lib/api';
+import { fitLabel, fitLabels } from './ratingHistory';
 
 export const ROW_HEIGHT = 28;
 export const PAD = { top: 8, right: 24, bottom: 28, left: 180 };
@@ -142,4 +143,25 @@ export function ratingCell(row: RatingRow): string {
 export function stderrCell(row: RatingRow): string {
   if (row.is_anchor) return 'fixed';
   return row.connected_to_anchor ? `±${errorText(row.stderr)}` : 'unrated';
+}
+
+/**
+ * The most characters a row's name shows, its " (anchor)" included: the left
+ * margin is fixed, and a longer name lost its start past the SVG's edge (the
+ * audit's pass 25). 20 characters at 12px fit it in lower case and ordinary
+ * mixed case; wide capitals can still run past (KL-76).
+ */
+export const NAME_CHARS = 20;
+
+const ANCHOR = ' (anchor)';
+
+/**
+ * Each row's label, told apart from the others drawn (see `fitLabels`), the
+ * anchor marked.
+ */
+export function rowLabels(rows: RatingRow[]): string[] {
+  const labels = fitLabels(rows.map((r) => r.name), NAME_CHARS);
+  return labels.map((label, i) =>
+    rows[i].is_anchor ? fitLabel(label, NAME_CHARS - ANCHOR.length) + ANCHOR : label
+  );
 }

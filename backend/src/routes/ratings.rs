@@ -152,7 +152,7 @@ async fn pool_detail(
 
     let run = sqlx::query(
         "SELECT id, computed_at, trigger, iterations, converged, pairs_used, jobs_used
-         FROM rating_runs WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
+         FROM rating_runs WHERE pool_id = $1 ORDER BY computed_at DESC, id DESC LIMIT 1",
     )
     .bind(id)
     .fetch_optional(&state.read_pool)
@@ -253,62 +253,88 @@ struct HistoryPoint {
 /// chart a few hundred pixels wide.
 const MAX_HISTORY_RUNS: i64 = 500;
 
+/// How many configs the history carries: the chart draws this many
+/// (`SERIES_CAP` in `frontend/src/lib/charts/ratingHistory.ts`).
+const HISTORY_CONFIGS: i64 = 6;
+
 /// The pool's rating history, oldest first: the chart's time axis. Snapshots per
 /// run rather than a mutated current value are what make this possible at all.
 ///
 /// Thinned to at most [`MAX_HISTORY_RUNS`] runs, evenly spaced over the pool's
 /// whole history, with the first and the newest always kept -- so the chart
 /// still starts where the pool started and ends at the rating the page shows.
+///
+/// Only the [`HISTORY_CONFIGS`] current members rated highest in the newest
+/// run: the chart draws no more. Every member's points went out on every view
+/// of this public page -- 9.5 MB at 100 members, a second of the display
+/// pool's time, and forty at once answered `503` to other readers (the audit's
+/// pass 25) -- and a removed config could take one of the six places.
 async fn pool_history(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<HistoryPoint>>> {
-    let rows = sqlx::query(
+    // The kept runs, by themselves: a plain query on the pool's runs.
+    let runs: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "WITH runs AS (
              SELECT id, computed_at,
-                    row_number() OVER (ORDER BY computed_at) AS n,
+                    row_number() OVER (ORDER BY computed_at, id) AS n,
                     count(*) OVER () AS total
              FROM rating_runs WHERE pool_id = $1
-         ),
-         kept AS (
-             SELECT id, computed_at FROM runs
-             WHERE total <= $2
-                OR (n - 1) % ((total + $2 - 1) / $2) = 0
-                OR n = total
          )
-         -- Each kept run's ratings by its key, not a join the planner may
-         -- answer by scanning every pool's ratings: it guessed thousands of
-         -- kept runs where there are at most 501, and on a month of 2-minute
-         -- runs in 11 pools (4.75 million rows) read them all, about half a
-         -- second an anonymous request and growing with every pool (thirty-first
-         -- audit). `OFFSET 0` keeps the subquery from being flattened back.
-         SELECT kept.computed_at, r.player_config_id, c.name, r.rating, r.stderr
-         FROM kept
-         CROSS JOIN LATERAL (
-             SELECT x.player_config_id, x.rating, x.stderr
-             FROM player_config_ratings x
-             WHERE x.run_id = kept.id AND x.connected_to_anchor
-             OFFSET 0
-         ) r
-         JOIN player_configs c ON c.id = r.player_config_id
-         ORDER BY kept.computed_at ASC, c.name ASC",
+         SELECT id, computed_at FROM runs
+         WHERE total <= $2
+            OR (n - 1) % ((total + $2 - 1) / $2) = 0
+            OR n = total
+         ORDER BY n",
     )
     .bind(id)
     .bind(MAX_HISTORY_RUNS)
     .fetch_all(&state.read_pool)
     .await?;
+    let Some(&(newest, _)) = runs.last() else {
+        return Ok(Json(Vec::new()));
+    };
+    let shown: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT r.player_config_id, c.name
+         FROM player_config_ratings r
+         JOIN player_configs c ON c.id = r.player_config_id
+         JOIN rating_pool_members m ON m.pool_id = $2 AND m.player_config_id = r.player_config_id
+         WHERE r.run_id = $1 AND r.connected_to_anchor
+         ORDER BY r.rating DESC, r.player_config_id
+         LIMIT $3",
+    )
+    .bind(newest)
+    .bind(id)
+    .bind(HISTORY_CONFIGS)
+    .fetch_all(&state.read_pool)
+    .await?;
+    // Each (run, config) by the ratings' primary key: at most 501 × 6 rows.
+    let run_ids: Vec<Uuid> = runs.iter().map(|(run, _)| *run).collect();
+    let config_ids: Vec<Uuid> = shown.iter().map(|(config, _)| *config).collect();
+    let rows: Vec<(Uuid, Uuid, f64, f64)> = sqlx::query_as(
+        "SELECT run_id, player_config_id, rating, stderr
+         FROM player_config_ratings
+         WHERE run_id = ANY($1) AND player_config_id = ANY($2) AND connected_to_anchor",
+    )
+    .bind(&run_ids)
+    .bind(&config_ids)
+    .fetch_all(&state.read_pool)
+    .await?;
 
-    Ok(Json(
-        rows.iter()
-            .map(|row| HistoryPoint {
-                computed_at: row.get("computed_at"),
-                player_config_id: row.get("player_config_id"),
-                name: row.get("name"),
-                rating: row.get("rating"),
-                stderr: row.get("stderr"),
-            })
-            .collect(),
-    ))
+    let at: std::collections::HashMap<Uuid, chrono::DateTime<chrono::Utc>> = runs.into_iter().collect();
+    let names: std::collections::HashMap<Uuid, String> = shown.into_iter().collect();
+    let mut points: Vec<HistoryPoint> = rows
+        .into_iter()
+        .map(|(run, config, rating, stderr)| HistoryPoint {
+            computed_at: at[&run],
+            player_config_id: config,
+            name: names[&config].clone(),
+            rating,
+            stderr,
+        })
+        .collect();
+    points.sort_by(|a, b| a.computed_at.cmp(&b.computed_at).then_with(|| a.name.cmp(&b.name)));
+    Ok(Json(points))
 }
 
 // ---------------------------------------------------------------------------

@@ -526,6 +526,11 @@ Request it, and add the `ses_dkim_records` output's CNAME records (each
 DMARC record, the `ses_dmarc_record` output's TXT record, before opening
 registration.
 
+**Raise `mail_max_per_second`** in `prod.tfvars` to the account's maximum send
+rate once production access is granted (the SES console shows it; 14 is usual):
+the backend spaces its sends to it, and at the default of 1 a burst of
+registrations waits in line.
+
 **Mail has three alarms** (`infra/ses.tf`), to the same topic as the rest:
 `-mail-failed` on any account mail that failed to send (the backend's log says
 why, with SES's own code; search it for `mail_failed`), and `-ses-bounce-rate`
@@ -609,8 +614,10 @@ every anonymous worker's UUID -- its whole credential -- is replaced, and ban
 reasons are blanked). Restoring production data locally without that is a
 disclosure risk, not a shortcut. A restore goes into a copy, is scrubbed
 there, and replaces the stack's database in one transaction only when both
-have succeeded, so one that fails or is stopped leaves the stack as it was (a
-stop during the swap waits for it and says which way it went). A process
+have succeeded, so one that fails or is stopped before then leaves the stack as
+it was (a stop during the swap waits for it and says which way it went); one
+that fails or is stopped after it — in the artifact mirror — leaves the
+database restored and the bucket not, says so, and exits 1. A process
 killed outright (`kill -9`) leaves its copy, unscrubbed if the scrub had not
 run, in the dev Postgres until the next restore drops it. `dev-dump.sh` refuses
 a name that exists unless `FORCE=1`, and leaves nothing behind when it fails.

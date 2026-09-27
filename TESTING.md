@@ -68,9 +68,9 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 218 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (4), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 122 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 161 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (27), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 126 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `ratingHistory.test.ts` (17), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 223 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (26), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 631 backend tests (the per-tier counts above are
+--run-ignored all` runs 636 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -2402,6 +2402,13 @@ below.
 - `A-RATE-6` History returns points in time order and excludes unrated configs.
   *(Covered: `ratings::history_is_in_time_order_and_leaves_out_unrated_configs`,
   `admin_api::a_long_rating_history_is_thinned_but_keeps_its_ends`.)*
+- `A-RATE-6b` History carries only the configs the chart draws: the six current
+  members rated highest in the newest run. Every member's every point went out
+  on each view of this public page — 9.5 MB at 100 members, and forty views at
+  once answered `503` to other readers — and a removed config could take one
+  of the six. *(Covered:
+  `ratings::history_carries_the_six_highest_current_members`.)* (Thirty-second
+  audit, pass 25.)
 - `A-RATE-7` Recompute is admin-only and returns a new run. *(Covered:
   `ratings::only_an_admin_can_recompute_and_it_stores_a_new_run`.)*
 
@@ -3052,12 +3059,22 @@ the real check of the backups themselves.
   bans and lifts, deletions — each target's last, an admin deleted, one whose
   transaction began before the restore point), and not a bad migration's
   unaudited changes nor an action from before the point; it leaves out an
-  actor or one action by id, keeps the restored password when the last reset
-  is left out, demotes only from the reviewed list and keeps an edit to it;
-  pasted again, it changes nothing; and it asks only for actions the backend
-  writes. Nineteen faults put into the step, one at a time, each fail it.
+  actor — its key revocations, suspensions and confirmations too — or one
+  action by id, keeps the restored password when the last reset is left out
+  or the account was deleted there by a left-out action (and lists the
+  passwords it copies), demotes only from the reviewed list and keeps an edit
+  to it (showing the proposal beside it); an action an hour after the
+  restored instance's newest row and hours before the damaged one's is
+  applied; it refuses ids the two logs use for different rows (the restored
+  instance writing after the repoint, a renumbered damaged log); pasted
+  again, it changes nothing; and it asks only for actions the backend writes.
+  Of 26 faults put into the step one at a time (the pass 25 reviewer's 22 and
+  four more), each fails it but one: the completion mark set before the
+  demotion file is written, which would take a failure between the two lines
+  to show.
   *(Covered: `scripts/reapply-check.sh`, nightly in `restore-roundtrip`.)*
-  (Thirty-second audit, pass 23; the fourth form, pass 24.)
+  (Thirty-second audit, pass 23; the fourth form, pass 24; the ids and the
+  cases above, pass 25.)
 - `S-RUNBOOK-1` Every bash block in RUNBOOK.md parses: an operator pastes them
   during an incident, and one that does not leaves a continuation prompt that
   swallows what is pasted next — an apostrophe in a `${STAMP:?…}` message did
@@ -3095,8 +3112,10 @@ the real check of the backups themselves.
   SIGTERM and SIGHUP part-way, a copy that cannot be renamed, SIGINT during a
   held swap (which it waits out and reports), two restores at once, a failed
   artifact mirror (exit 1), TERM, HUP and INT at half-second steps through a
-  whole run (36 runs) each leave a `birdtest`, a message that says which,
-  the backend running and no mirror container — and `dev-dump.sh`'s writing
+  whole run (36 runs), and a Ctrl-C to the whole process group during the
+  mirror (pass 25: the compose CLI caught it, and the container went on
+  mirroring with `--remove` after the script exited), each leave a `birdtest`,
+  a message that says which, the backend running and no mirror container — and `dev-dump.sh`'s writing
   aside, leaving nothing when it fails or is stopped and the old snapshot
   when stopped replacing it, and its artifact mirror, by hand against the real
   mc image: the audit's passes 23 and 24 replayed each against a throwaway
@@ -3130,7 +3149,13 @@ what they share — composing the message, sending off the request path
 (`A-AUTH-8`) — runs under both. The real SDK is run against a local endpoint
 (`email::tests::a_refused_send_keeps_what_ses_said`: a refusal is logged
 as SES's `code: message`, where it read `service error`, and a send with no
-answer as its causes), and
+answer as its causes; `a_send_nobody_answers_times_out`: a send an endpoint
+takes and never answers fails after its time, where it hung silently;
+`a_burst_of_sends_is_paced_in_order`: eight sends at four a second reach SES
+spread over two seconds and in the order they were queued, where a burst past
+the account's rate was refused, and then the newest waiter won each turn;
+`a_full_mail_queue_refuses_rather_than_growing`;
+`a_mail_that_waited_past_its_link_is_not_sent` — pass 25), and
 `email::tests::every_failed_send_is_logged_as_the_alarm_expects` ties each
 failure line's `alarm = "mail_failed"` field to the alarm's JSON filter in
 `infra/ses.tf`. What SES itself accepts,

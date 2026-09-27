@@ -383,6 +383,7 @@ resource "aws_ecs_task_definition" "main" {
         { name = "SECURE_COOKIES", value = "true" },
         { name = "MAIL_BACKEND", value = "ses" },
         { name = "MAIL_FROM", value = var.mail_from_address },
+        { name = "MAIL_MAX_PER_SECOND", value = tostring(var.mail_max_per_second) },
         { name = "PUBLIC_URL", value = var.public_url },
         { name = "S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
         { name = "AWS_REGION", value = var.region },
