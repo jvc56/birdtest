@@ -2,7 +2,8 @@
 """Bring up birdtest locally with real MAGPIE contributors, and open a browser.
 
 One command: start the stack, wait for it, seed it, launch N `magpie
-contribute` processes, and open the site. It is tier 6's setup with the
+contribute` processes -- each in its own terminal window when there is a
+display, so one can be stopped and restarted by hand -- and open the site. It is tier 6's setup with the
 assertions and the teardown removed, and it calls the same `scripts/seed.py`,
 so the development environment cannot drift from what the tests exercise.
 
@@ -28,6 +29,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -305,7 +307,132 @@ def write_contribute_settings(directory: Path, args, api_url: str, uuid: Optiona
     return settings
 
 
-def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[subprocess.Popen]:
+# The terminals a worker's window can be opened in, tried in order, and how
+# each is told a window title and a command. `x-terminal-emulator` is Debian's
+# alternatives link to whichever is installed, and takes xterm's flags.
+TERMINALS = (
+    ("gnome-terminal", lambda title, command: ["--title", title, "--", *command]),
+    ("konsole", lambda title, command: ["-p", f"tabtitle={title}", "-e", *command]),
+    ("xfce4-terminal", lambda title, command: ["--title", title, "-x", *command]),
+    ("kitty", lambda title, command: ["--title", title, *command]),
+    ("alacritty", lambda title, command: ["--title", title, "-e", *command]),
+    ("x-terminal-emulator", lambda title, command: ["-T", title, "-e", *command]),
+    ("xterm", lambda title, command: ["-T", title, "-e", *command]),
+)
+
+# Run in each worker's window. It loops so a stopped worker can be started
+# again from the same window, keeping its identity: Ctrl-C stops MAGPIE (the
+# trap keeps the script alive for the prompt), Enter restarts it, and a second
+# Ctrl-C or closing the window leaves it stopped -- the prompt has its own trap,
+# since bash resumes a `read` a trap interrupted. The pid it records is how
+# dev.py follows, and stops, a window whose terminal launcher returned at once.
+WORKER_SCRIPT = """#!/usr/bin/env bash
+cd "$(dirname "$0")"
+echo $$ > window.pid
+trap 'rm -f window.pid' EXIT
+trap 'echo' INT
+title={title}
+printf '\\033]0;%s\\007' "$title"
+while true; do
+    echo "--- started $(date '+%Y-%m-%d %H:%M:%S') ---" >> contribute.log
+    echo "$title: Ctrl-C stops it"
+    {binary} contribute contribute.txt 2>&1 | tee -a contribute.log
+    status=${{PIPESTATUS[0]}}
+    echo
+    trap 'exit 0' INT
+    read -r -p "MAGPIE exited ($status). Enter restarts it; Ctrl-C closes this window. " || break
+    trap 'echo' INT
+done
+"""
+
+
+def find_terminal() -> Optional[tuple]:
+    """The first terminal emulator on PATH, or None -- including when there is
+    no display to open a window on (an SSH session)."""
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return None
+    for name, flags in TERMINALS:
+        path = shutil.which(name)
+        if path:
+            return path, flags
+    return None
+
+
+class WorkerWindow:
+    """A worker in its own terminal window, standing in for the Popen a
+    background worker has: poll, terminate, kill and wait, by the pid the
+    window's script records."""
+
+    def __init__(self, pid_file: Path):
+        self.pid_file = pid_file
+        self.pid: Optional[int] = None
+        self.returncode: Optional[int] = None
+
+    def started(self, timeout: float) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                self.pid = int(self.pid_file.read_text().strip())
+                return True
+            except (OSError, ValueError):
+                time.sleep(0.2)
+        return False
+
+    def poll(self) -> Optional[int]:
+        if self.returncode is None and self.pid is not None:
+            try:
+                os.kill(self.pid, 0)
+            except ProcessLookupError:
+                self.returncode = 0
+            except PermissionError:
+                pass
+        return self.returncode
+
+    def _signal(self, sig: int) -> None:
+        if self.poll() is not None:
+            return
+        try:
+            # The window's whole process group -- the script, MAGPIE and tee --
+            # unless the terminal left it in ours, which would signal this
+            # script too.
+            group = os.getpgid(self.pid)
+            if group == os.getpgrp():
+                os.kill(self.pid, sig)
+            else:
+                os.killpg(group, sig)
+        except ProcessLookupError:
+            pass
+
+    def terminate(self) -> None:
+        self._signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self._signal(signal.SIGKILL)
+
+    def wait(self, timeout: float) -> int:
+        deadline = time.time() + timeout
+        while self.poll() is None:
+            if time.time() >= deadline:
+                raise subprocess.TimeoutExpired(str(self.pid_file), timeout)
+            time.sleep(0.2)
+        return self.returncode
+
+
+def open_worker_window(terminal: tuple, directory: Path, binary: Path, title: str) -> WorkerWindow:
+    script = directory / "run.sh"
+    script.write_text(WORKER_SCRIPT.format(title=shlex.quote(title),
+                                           binary=shlex.quote(str(binary))))
+    script.chmod(0o755)
+    pid_file = directory / "window.pid"
+    pid_file.unlink(missing_ok=True)
+    path, flags = terminal
+    subprocess.Popen([path, *flags(title, ["bash", str(script)])], cwd=directory,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    return WorkerWindow(pid_file)
+
+
+def start_contributors(args, binary: Path, data: Path, api_url: str) -> list:
     workdir = Path(args.workdir).expanduser().resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
@@ -315,6 +442,11 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[sub
     directories = [workdir / f"worker-{index:02d}" for index in range(1, args.workers + 1)]
     issued = {d: issued_uuid(d / "contribute.txt") for d in directories}
     known = uuids_the_database_knows([u for u in issued.values() if u])
+
+    terminal = None if args.no_worker_windows else find_terminal()
+    if not args.no_worker_windows and terminal is None:
+        log("no display or terminal emulator found: workers run in the background "
+            "(their output goes to each contribute.log)")
 
     processes = []
     for index, directory in enumerate(directories, start=1):
@@ -334,7 +466,17 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[sub
 
         key = worker_key(directory / "contribute.txt")
         settings = write_contribute_settings(directory, args, api_url, uuid, key)
+        kind = "under an API key" if (args.api_key or key) else "anonymous"
         log_path = directory / "contribute.log"
+        if terminal:
+            window = open_worker_window(terminal, directory, binary,
+                                        f"birdtest worker {index} ({kind})")
+            if not window.started(timeout=15):
+                fail(f"worker {index}'s window did not start ({terminal[0]}); "
+                     "re-run with --no-worker-windows")
+            processes.append(window)
+            log(f"worker {index} ({kind}): its own window, in {directory}")
+            continue
         handle = log_path.open("a", buffering=1)
         handle.write(f"\n--- started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
 
@@ -346,13 +488,12 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[sub
                 stderr=subprocess.STDOUT,
             )
         )
-        kind = "under an API key" if (args.api_key or key) else "anonymous"
         log(f"worker {index} ({kind}): {directory} (log: {log_path})")
 
     return processes
 
 
-def stop_contributors(processes: List[subprocess.Popen]) -> None:
+def stop_contributors(processes: list) -> None:
     for process in processes:
         if process.poll() is None:
             process.terminate()
@@ -425,6 +566,11 @@ def build_parser() -> argparse.ArgumentParser:
                                    "Workers 1 and 2 are anonymous; 3 and 4 run as the contributor "
                                    "accounts --reset-db makes, under their API keys (anonymous "
                                    "until a reset has made them)")
+    contributors.add_argument("--no-worker-windows", action="store_true",
+                              help="run the workers in the background, logging to their "
+                                   "contribute.log, instead of each in its own terminal window "
+                                   "(where Ctrl-C stops one and Enter restarts it); the "
+                                   "default when there is no display")
     contributors.add_argument("--threads", type=int, default=2,
                               help="threads per contributor (default: %(default)s)")
     contributors.add_argument("--max-tasks", type=int, default=0,
@@ -609,8 +755,11 @@ def main() -> int:
             for index, process in list(labelled.items()):
                 code = process.poll()
                 if code is not None:
-                    # MAGPIE exits 0 on errors too: its last line says why.
-                    log(f"worker {index} exited with status {code}: {last_line(index)}")
+                    if isinstance(process, WorkerWindow):
+                        log(f"worker {index}'s window closed")
+                    else:
+                        # MAGPIE exits 0 on errors too: its last line says why.
+                        log(f"worker {index} exited with status {code}: {last_line(index)}")
                     del labelled[index]
                     processes.remove(process)
             if not processes:

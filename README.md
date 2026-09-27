@@ -44,8 +44,16 @@ opens the site:
 
 That is the whole setup. It waits for the backend, imports the MAGPIE-DATA
 tarball your own checkout installed, creates two player configs and an active
-game-pairs job, launches two `magpie contribute` processes, and opens
-**http://localhost:5173**.
+game-pairs job, launches four `magpie contribute` workers, and opens
+**http://localhost:5173** signed in as the seeded admin.
+
+Each worker runs in its own terminal window (gnome-terminal, konsole,
+xfce4-terminal, kitty, alacritty or xterm, whichever is found first). Ctrl-C in
+a window stops that worker and Enter starts it again under the same identity;
+a second Ctrl-C, or closing the window, leaves it stopped. Ctrl-C in dev.py
+stops every worker. With no display (an SSH session), or with
+`--no-worker-windows`, they run in the background and write to
+`.dev-workers/worker-NN/contribute.log`.
 
 **Contributors are always real MAGPIE.** There is no fake-worker mode here.
 `worker/fake_worker.py` belongs to the end-to-end suite, where a browser
@@ -84,7 +92,7 @@ either is missing:
 Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 
 ```bash
-./scripts/dev.py --workers 6                  # six contributors instead of two
+./scripts/dev.py --workers 6                  # six contributors instead of four
 ./scripts/dev.py --workers 1 --threads 12     # one contributor, more threads each
 ./scripts/dev.py --job-type games             # seed a plain games job
 ./scripts/dev.py --no-browser                 # SSH sessions and CI (prints the sign-in link)
