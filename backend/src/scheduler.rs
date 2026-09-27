@@ -111,9 +111,11 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
 }
 
 /// Put `job_id` level with the jobs already **being served**: set its
-/// `claims_baseline` so that its deficit ratio equals the lowest ratio among
+/// `claims_baseline` so that its deficit ratio equals the highest ratio among
 /// the other active jobs above 0% that issued a claim within `served_within`
-/// -- or, when none has, among all of them; or zero when there are none.
+/// -- or, when none has, among all of them; or zero when there are none. With
+/// every job's lag bounded ([`LAG_WINDOW_FLEET_CLAIMS`]), joining at the
+/// leader costs a newcomer at most that window.
 ///
 /// The deficit the scheduler orders on is a ratio of claims issued to share.
 /// Measured over a job's whole life, that made every change to the set of jobs
@@ -152,13 +154,20 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
 /// that recently -- a quiet server, the first activation in a while -- every
 /// job on offer counts, as before.
 ///
-/// What this does not cover, deliberately: a job only a *minority* of the
-/// fleet can run is served, recently, and still lags, so a newcomer joining
-/// level with it is ahead of the rest for the majority. No single ratio
-/// describes a fleet that is really two queues; PLAN.md records it as a limit.
+/// Level with the *leader* -- the highest ratio among them -- not the lowest.
+/// "Served" is not "keeping pace": a job at its cap whose one lapsed task was
+/// just reissued is served and stands still, and so does a job only a
+/// minority of the fleet can run; a newcomer put level with the lowest took
+/// every claim until it caught the leader (500 in a row, the audit's pass 19).
+/// Joined at the leader, a newcomer is never ahead of anyone being served; a
+/// job that lags keeps its own debt -- up to [`LAG_WINDOW_FLEET_CLAIMS`], past
+/// which each claim forgives it ([`bound_lag`]): without that bound, joining at
+/// the leader starved a newcomer behind every lagging job for as long as the
+/// fleet had been split. The same in the quiet fallback, where the lowest was
+/// often a job nobody could run.
 ///
 /// The baseline may go negative (a job with no claims joining a busy fleet is
-/// credited the claims that put it level); ratios never do, since the minimum
+/// credited the claims that put it level); ratios never do, since the ratio
 /// it copies is itself a ratio of a count that only grows.
 pub async fn join_at_parity(
     conn: &mut sqlx::PgConnection,
@@ -174,8 +183,8 @@ pub async fn join_at_parity(
          )
          UPDATE jobs j
          SET claims_baseline = j.claims_issued - floor(
-                 COALESCE((SELECT MIN(ratio) FROM others WHERE served),
-                          (SELECT MIN(ratio) FROM others), 0)
+                 COALESCE((SELECT MAX(ratio) FROM others WHERE served),
+                          (SELECT MAX(ratio) FROM others), 0)
                  * COALESCE(j.allocation, 0)
              )::bigint
          WHERE j.id = $1",
@@ -919,14 +928,74 @@ async fn issue_claim(
     .rows_affected()
         > 0;
 
+    if still_active {
+        bound_lag(tx, job.id).await?;
+    }
+
     Ok(still_active.then_some(claim_token))
+}
+
+/// How far, in claims, a job may fall behind the job being claimed from.
+///
+/// A job that stays on offer but is not served -- no worker can run it, its
+/// data is building -- or is served by only part of the fleet falls behind
+/// the others without limit, and a job's deficit is what the scheduler orders
+/// on. Unbounded, that debt decided every join: a newcomer put level with the
+/// lowest served ratio took every claim until it had caught the leader, and
+/// one put level with the highest starved behind every job that lagged, each
+/// for as long as the fleet had been split (the audit's pass 19, both shown).
+/// So no job's debt is kept past this much of the fleet's time: a job still
+/// owed work it could not take is favoured until it has had its share of
+/// this many claims of the whole fleet, and then it runs level.
+///
+/// In ratio units -- claims per percent of allocation -- and the same for
+/// every job. A window in each job's own claims pinned lagging jobs at
+/// different distances behind the leader, and the one with the smallest
+/// allocation, pinned lowest, then took every claim (shown in testing).
+pub const LAG_WINDOW_FLEET_CLAIMS: f64 = 400.0;
+
+/// Lift every active job lagging the one just claimed from by more than
+/// [`LAG_WINDOW_FLEET_CLAIMS`] to that window. In the claim's transaction,
+/// after its job row is updated; a row somebody else holds is skipped (the
+/// next claim lifts it), so a claim never waits on another job's lock.
+async fn bound_lag(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: Uuid,
+) -> AppResult<()> {
+    sqlx::query(
+        "WITH chosen AS (
+             SELECT (claims_issued - claims_baseline)::float8 / allocation AS ratio
+             FROM jobs WHERE id = $1 AND allocation > 0
+         ),
+         lagging AS (
+             SELECT o.id FROM jobs o, chosen c
+             WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1
+               AND (o.claims_issued - o.claims_baseline)::float8 / o.allocation
+                   < c.ratio - $2
+             FOR UPDATE OF o SKIP LOCKED
+         )
+         UPDATE jobs k
+         SET claims_baseline = k.claims_issued
+                 - floor(((SELECT ratio FROM chosen) - $2) * k.allocation)::bigint
+         FROM lagging l
+         WHERE k.id = l.id",
+    )
+    .bind(job_id)
+    // Allocations are percentages: a whole-fleet claim is a hundredth of a
+    // ratio unit.
+    .bind(LAG_WINDOW_FLEET_CLAIMS / 100.0)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Release a claim that ended in something other than a submission.
 ///
 /// Decline and expiry are the same operation -- mark the claim terminal, drop
 /// the job's live claim count, recompute the task against `redundancy` -- and
-/// writing it twice is how the counter drifts. A drifting counter makes the
+/// writing it twice is how the counter drifts. (Expiry does write it twice:
+/// `reclaim_expired_for` releases many claims in one statement with the same
+/// formula. Keep the two in step.) A drifting counter makes the
 /// scheduler believe a job is saturated and dispatch quietly stops, days later
 /// and nowhere near the cause.
 ///

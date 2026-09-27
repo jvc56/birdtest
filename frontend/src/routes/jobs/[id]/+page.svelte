@@ -158,6 +158,10 @@
             {#if stats.games.min_units > 0 && stats.games.units_completed < stats.games.min_units}
               SPRT is not acted on until {stats.games.min_units.toLocaleString()}
               {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
+            {:else if stats.games.min_units > 0}
+              The minimum of {stats.games.min_units.toLocaleString()}
+              {stats.games.unit}{stats.games.min_units === 1 ? '' : 's'} is reached; SPRT is checked as
+              {stats.games.unit}s arrive.
             {:else}
               SPRT is checked as {stats.games.unit}s arrive, with no minimum number of them.
             {/if}

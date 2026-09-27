@@ -1466,8 +1466,8 @@ async fn claims_by_job(app: &axum::Router, n: usize) -> std::collections::HashMa
 /// whole life, so a job activated beside one with a long history had a ratio
 /// of zero and took *every* claim until it had issued as many -- the older job,
 /// at the same 50%, got nothing for as long as that took. A job now joins level
-/// with the job furthest behind (`scheduler::join_at_parity`) and takes its
-/// share from then on.
+/// with the leader among the jobs being served (`scheduler::join_at_parity`)
+/// and takes its share from then on.
 #[tokio::test]
 async fn a_newly_activated_job_joins_at_parity_instead_of_taking_everything() {
     let db = TestDb::new().await;
@@ -2184,3 +2184,207 @@ async fn a_retry_resets_only_the_build_it_names() {
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
+/// I-SCHED-3c: a newcomer joins level with the *leader* among jobs being
+/// served, not the laggard. A job "served" -- it issued a claim within the
+/// heartbeat timeout -- may have no work to give (a games job at its cap
+/// whose last task was reissued a minute ago), its ratio standing still; a
+/// newcomer put level with it took the next 500 claims in a row, the veteran
+/// none (thirty-second audit, pass 19).
+#[tokio::test]
+async fn a_newcomer_joins_level_with_the_leader_not_a_job_that_has_stopped() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let veteran = db.games_job(1, 2).await;
+    let capped = db.games_job(1, 2).await;
+    // The capped job: its whole space handed out (max 2 games, one task), and
+    // that task in flight -- claimed for real, so its last_claimed_at is fresh.
+    sqlx::query("UPDATE job_game_config SET max_games = 2, min_games = 2 WHERE job_id = $1")
+        .bind(capped)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let state = db.state().await;
+    let steer = birdtest::scheduler::WorkerCapabilities {
+        magpie_version: birdtest::version::Version::parse_or_zero("1.0.0"),
+        unsupported_jobs: vec![veteran],
+    };
+    let w = birdtest::auth::WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip: std::net::IpAddr::from([127, 0, 0, 1]) };
+    match birdtest::scheduler::claim(&state, &w, &steer).await.unwrap() {
+        birdtest::scheduler::ClaimOutcome::Task(t) => assert_eq!(t.job_id, capped),
+        _ => panic!("expected the capped job's one task"),
+    }
+    // The two ran level at 40% each until the capped one ran out of new
+    // work; since then the veteran has issued 1,000 more claims.
+    sqlx::query("UPDATE jobs SET allocation = 40, claims_issued = 10000, last_claimed_at = now() WHERE id = $1")
+        .bind(veteran).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE jobs SET allocation = 40, claims_issued = 9000, last_claimed_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(capped).execute(&db.pool).await.unwrap();
+    let newcomer = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
+        .bind(newcomer).execute(&db.pool).await.unwrap();
+    let app = birdtest::app(state.clone());
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{newcomer}/activate"), &borrowed, json!({ "allocation": 20 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let any = birdtest::scheduler::WorkerCapabilities {
+        magpie_version: birdtest::version::Version::parse_or_zero("1.0.0"),
+        unsupported_jobs: vec![],
+    };
+    let mut by_job: std::collections::HashMap<Uuid, usize> = Default::default();
+    let mut first_veteran = None;
+    for i in 0..900 {
+        let w = birdtest::auth::WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip: std::net::IpAddr::from([127, 0, 0, 1]) };
+        match birdtest::scheduler::claim(&state, &w, &any).await.unwrap() {
+            birdtest::scheduler::ClaimOutcome::Task(t) => {
+                *by_job.entry(t.job_id).or_default() += 1;
+                if t.job_id == veteran && first_veteran.is_none() {
+                    first_veteran = Some(i);
+                }
+            }
+            _ => panic!("expected a task"),
+        }
+    }
+    // Fair: veteran 40 : newcomer 20 over the next 900 claims = 600 : 300.
+    assert!(first_veteran.is_some_and(|i| i < 12), "the veteran starved: first claim at {first_veteran:?}");
+    let veteran_share = by_job.get(&veteran).copied().unwrap_or(0);
+    assert!((550..=650).contains(&veteran_share), "veteran {veteran_share} of 900, not about 600");
+}
+
+/// I-SCHED-3d: the same veteran and unservable job as
+/// `a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity`, but
+/// the fleet has been quiet for ten minutes (a deployment gap, a quiet night)
+/// when the newcomer is activated: it still joins level with the leader, not
+/// the job nobody can run -- it took twelve claims of twelve (pass 19).
+#[tokio::test]
+async fn after_a_quiet_spell_a_newcomer_still_joins_level_with_the_leader() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let veteran = db.games_job(1, 2).await;
+    sqlx::query(
+        "UPDATE jobs SET claims_issued = 100000, allocation = 40,
+                         last_claimed_at = now() - interval '10 minutes'
+         WHERE id = $1",
+    )
+    .bind(veteran).execute(&db.pool).await.unwrap();
+    let lagging = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET allocation = 20, min_magpie_major = 9 WHERE id = $1")
+        .bind(lagging).execute(&db.pool).await.unwrap();
+    let newcomer = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
+        .bind(newcomer).execute(&db.pool).await.unwrap();
+    let app = birdtest::app(db.state().await);
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{newcomer}/activate"), &borrowed, json!({ "allocation": 40 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let shares = claims_by_job(&app, 12).await;
+    assert_eq!(shares.get(&veteran.to_string()), Some(&6), "{shares:?}");
+}
+
+fn split_caps(v: &str) -> birdtest::scheduler::WorkerCapabilities {
+    birdtest::scheduler::WorkerCapabilities {
+        magpie_version: birdtest::version::Version::parse_or_zero(v),
+        unsupported_jobs: vec![],
+    }
+}
+
+async fn split_run(
+    state: &birdtest::state::AppState,
+    n: usize,
+    old_per_10: usize,
+) -> (std::collections::HashMap<Uuid, usize>, Option<usize>) {
+    let mut by_job: std::collections::HashMap<Uuid, usize> = Default::default();
+    let old = split_caps("1.0.0");
+    let new = split_caps("3.0.0");
+    let mut seq = Vec::new();
+    for i in 0..n {
+        let c = if i % 10 < old_per_10 { &old } else { &new };
+        let w = birdtest::auth::WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip: std::net::IpAddr::from([127, 0, 0, 1]) };
+        match birdtest::scheduler::claim(state, &w, c).await.unwrap() {
+            birdtest::scheduler::ClaimOutcome::Task(t) => {
+                *by_job.entry(t.job_id).or_default() += 1;
+                seq.push(t.job_id);
+            }
+            _ => panic!("expected a task at {i}"),
+        }
+    }
+    (by_job, None)
+}
+
+async fn split_activate(db: &TestDb, state: &birdtest::state::AppState, admin: Uuid, job: Uuid, alloc: i32) {
+    let cfg = db.config();
+    let app = birdtest::app(state.clone());
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{job}/activate"), &borrowed, json!({ "allocation": alloc })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// I-SCHED-3e: in a split fleet a newcomer still gets its share. A job some
+/// workers can only run (an old MAGPIE floor while a release rolls out)
+/// climbs past its share and leads; the job the rest run lags it without
+/// limit. Joined at the leader, a newcomer got none of the next 1,000 claims;
+/// with each job's lag bounded (`LAG_WINDOW_CLAIMS`) it shares (the audit's
+/// pass 19).
+#[tokio::test]
+async fn in_a_split_fleet_a_newcomer_is_not_starved_behind_a_lagging_job() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let t = db.games_job(1, 2).await; // runnable by everyone (floor 0.1.0)
+    let a = db.games_job(1, 2).await; // needs MAGPIE 2
+    sqlx::query("UPDATE jobs SET allocation = 10 WHERE id = $1").bind(t).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE jobs SET allocation = 50, min_magpie_major = 2 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
+    let state = db.state().await;
+    // 30% of claims from workers still on MAGPIE 1.
+    split_run(&state, 1000, 3).await;
+    let n = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL, min_magpie_major = 2 WHERE id = $1")
+        .bind(n).execute(&db.pool).await.unwrap();
+    split_activate(&db, &state, admin, n, 40).await;
+    let (p2, _) = split_run(&state, 1000, 3).await;
+    // Fair among the 700 claims from MAGPIE-2 workers is A:N = 50:40, N about
+    // 311, less the debt A is still owed (at most the lag window's worth).
+    let got = p2.get(&n).copied().unwrap_or(0);
+    assert!((200..=350).contains(&got), "newcomer at 40% got {got} of the next 1000 claims");
+}
+
+/// I-SCHED-3f: a job only a minority can run lags while served; a newcomer the
+/// same minority can run is not starved behind it (it got none of 1,000
+/// claims with the lag unbounded).
+#[tokio::test]
+async fn a_minority_newcomer_is_not_starved_behind_a_lagging_minority_job() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let a = db.games_job(1, 2).await; // everyone
+    let b = db.games_job(1, 2).await; // MAGPIE 2 only
+    sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE jobs SET allocation = 30, min_magpie_major = 2 WHERE id = $1").bind(b).execute(&db.pool).await.unwrap();
+    let state = db.state().await;
+    // 80% of claims from MAGPIE-1 workers.
+    split_run(&state, 1000, 8).await;
+    let n = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL, min_magpie_major = 2 WHERE id = $1")
+        .bind(n).execute(&db.pool).await.unwrap();
+    split_activate(&db, &state, admin, n, 30).await;
+    let (p2, _) = split_run(&state, 1000, 8).await;
+    // Fair among the 200 MAGPIE-2 claims is B:N = 30:30, N about 100, less the
+    // debt B is still owed (at most the lag window's worth).
+    let got = p2.get(&n).copied().unwrap_or(0);
+    assert!((50..=120).contains(&got), "newcomer at 30% got {got} of the next 1000 claims");
+}

@@ -163,6 +163,14 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   actions (`E-11c`) — all fixed; the adversarial check found 1 medium
   (MAGPIE's test not compiling in the dev build CI uses; MAGPIE `8f2f5d75`,
   pinned), fixed. KL-86 updated; KL-87 added. The loop continues.
+- **Pass 19 (follow-up: pass 18's diff, and task dispatch and allocation):** 0
+  high and 2 medium from the reviewers — a newcomer joining level with a job
+  that had stopped moving and taking every claim; allocation being a share of
+  claims where PLAN said the fleet (stated, KL-88) — both addressed; the
+  adversarial check found 1 medium (joining at the leader starved a newcomer
+  in a split fleet), fixed by redesign: every claim bounds every job's lag to
+  a window, so neither join point can take over or starve (`I-SCHED-3c` to
+  `3f`). KL-87 and KL-88 updated. The loop continues.
 
 ---
 
@@ -2840,8 +2848,9 @@ though PLAN says `#` lines are ignored; and it missed a key appended to a
 comment ending in a blank, a tab, a bare `#` or a banner, which then ran
 anonymous. The rule's third fault, so the approach changed. **Fix** (MAGPIE
 `65ad3348`, pinned): no comment is refused; one holding `apikey`, blanks and
-`bt_` is recorded, and a run with no `apikey` prints that line's number beside
-"contributing to … as a new anonymous worker", never the key. PLAN's settings
+`bt_` is recorded, and a run with no `apikey` prints that line's number after
+its "contributing to …" line (as a new or a returning anonymous worker), never
+the key. PLAN's settings
 section states it and the rules the parser keeps (lowercase names, the range,
 a key's shape, the BOM). **Shown:** with `f3fc1927` the doc comment is refused
 and the banner case silent; with `65ad3348` both load and name their line.
@@ -2885,7 +2894,7 @@ test for `onRefused` passes.
 
 **Recorded:** KL-87 (games jobs made with an odd batch; the normal
 approximation's LLR in near-zero-variance samples; type I error with no
-minimum and wide bounds); KL-86 (two export pollers while a read fails).
+minimum and wide bounds); KL-86's deleted-job wording.
 **Left:** the checker's refusal of a closer indented 1–3 columns and of
 non-ASCII data in a heredoc (both fail safe); ARNs in `ecs.tf` and `backup.tf`
 hard-coding the `aws` partition.
@@ -2915,8 +2924,9 @@ explanation; the checker's header names the quoted `\ #` it refuses.
 redundancy, and a short task cannot count (a games result must carry exactly
 `games_per_batch` games) — measured with MAGPIE, identical players: batch 1
 0.561 (+42 Elo), batch 2 0.496, batch 4 0.503; rating pools read only
-game-pairs jobs, so odd-batch games jobs never reached a rating; no caller
-makes an odd games batch; switching the form's type to games bumps an odd
+game-pairs jobs, so odd-batch games jobs never reached a rating; no API caller
+makes an odd games batch (some scheduling-only test fixtures insert one
+directly, which the schema's default allows, KL-87); switching the form's type to games bumps an odd
 batch; no fixture or test has |Elo| past 1000; E-11, E-11b and E-11c passed
 six times each; a job deleted with no click is shown gone within seconds; the
 commented-key warning prints once, never the key, and not when a key is set.
@@ -2937,3 +2947,120 @@ commented-key warning prints once, never the key, and not when a key is set.
 - `npm run check`: 0 errors, 0 warnings; `npm test`: **120 of 120** (the sse
   `onRefused` test new).
 - `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks.
+
+## Pass 19 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`ec43aef..b569b6d`), and
+MAGPIE's `f3fc1927..8f2f5d75`, one reviewer per part: backend and frontend
+(tier 5 natively); MAGPIE (both build flavours, and birdtest's CI contract job
+replicated); docs, scripts and infra. Plus one area not examined in this run:
+**task dispatch and allocation** — how a claim picks a job and a task.
+
+**Findings: 0 high, 2 medium** from the four reviewers (backend and frontend
+none, 5 low, 1 unconfirmed; MAGPIE none, 4 low, 1 unconfirmed; docs, scripts
+and infra none, 6 low; dispatch 2 medium, 5 low, 1 unconfirmed). Both fixed or,
+where the fix is a design of its own, stated and recorded.
+
+### 19.1 Medium — a newcomer joined level with a job that had stopped moving, and took every claim (dispatch reviewer)
+
+`join_at_parity` put a newly activated job level with the *lowest* ratio among
+jobs being served. "Served" — a claim within the heartbeat timeout — is not
+"keeping pace": a games job at its cap reissuing one lapsed task is served and
+stands still, and after a quiet spell the fallback took the lowest of every job
+on offer, often one nobody could run. **Shown** with the real
+`scheduler::claim`: beside a veteran at 40% and such a capped job, a newcomer at
+20% took the first 500 of 900 claims in a row (a fair split is 600 : 300); after
+ten quiet minutes, 12 of 12. **Fix:** the newcomer joins level with the
+*leader* — the highest ratio among jobs served, and among all in the quiet
+fallback — so it is never ahead of anyone being served; and every job's lag is
+bounded (19.4, where the first form of this fix was found to starve a
+newcomer). **Verified:** both cases added as tests (`I-SCHED-3c`,
+`I-SCHED-3d`) fail on the committed code and pass; the three earlier parity
+tests still pass. PLAN's workflow text says so.
+
+### 19.2 Medium — allocation is a share of claims, and PLAN called it a share of the fleet (dispatch reviewer)
+
+Every claim counts one, whatever its task costs, and task sizes differ by
+orders of magnitude across job types at the form's defaults. **Shown** with the
+real `scheduler::claim` in simulated time: two jobs at 50/50 with tasks of 30
+and 1 time units split claims 750/750 and worker time 96.8% / 3.2%. Weighting
+the counter by an estimated task cost is start-time fair queuing with packet
+lengths, a design of its own. **Fix:** stated — PLAN's schema comment and design
+table say a share of *claims*, the admin page's field reads "Allocation % of
+claims" and explains, and KL-88 records the gap and the options.
+
+### 19.3 Low findings
+
+**Fixed:**
+- Dispatch: an `unsupported_jobs` list past 200 keeps the newest entries
+  (MAGPIE appends and never prunes; keeping the first dropped the live ones —
+  `A-WORKER-3` rewritten, failing on the committed code); PLAN and the code
+  say expiry repeats `release_claim`'s formula rather than calling it.
+- Admin job page: an action's 404 is confirmed with a read before the job is
+  called gone; a reload older than an export start no longer puts "Export
+  results" back; the export poll stops once the job is gone; the public job
+  page says when the SPRT minimum is reached.
+- `runbook-check.sh`: its grep and sed run in the C locale (an invalid byte in
+  a comment after `\ ` passed under UTF-8); the header names every `\ #` it
+  refuses.
+- Docs: PLAN's example key is an obvious placeholder; `sprt.rs` no longer
+  credits fishtest with the approximation; KL-78's quote; KL-87 notes the
+  schema's column default; 18.2, 18.4 and 18.5 wording.
+
+**Recorded:** KL-88 (allocation by claims; the generation-0 build with no
+backoff; the decline skip covering MAGPIE's `stop`; a transient template error
+parking a job). **Left:** MAGPIE's refusal message saying "letters and digits"
+where it takes underscores too (to go with the next MAGPIE change); the dev
+build's `-Wshadow` is not in this audit's release-only MAGPIE runs before pass
+18 (it is now).
+
+### 19.4 Adversarial check of the pass's fixes
+
+**1 medium, fixed by redesign.**
+
+- **Joining at the leader starved a newcomer in a split fleet.** With some
+  workers able to run only one job (an older MAGPIE floor while a release rolls
+  out), that job climbs past its share and leads, while the job the rest run
+  lags it without limit; a newcomer joined at the leader got none of the next
+  1,000 claims, for about 1.14 times as long as the split had lasted, and a
+  newcomer only a minority can run fared the same (shown with the real
+  `scheduler::claim` and the activation route). The committed rule (join at the
+  lowest) was fair there and unfair in 19.1's case; neither join point is
+  right while a job's lag is unbounded. `join_at_parity`'s third correction,
+  so the scheduler changed instead: **every claim lifts any active job lagging
+  the one it is from by more than a window — 400 claims of the whole fleet, in
+  ratio units the same for every job — to that window** (`scheduler::bound_lag`,
+  in the claim's transaction after the job row's update, skipping a row
+  somebody holds, so a claim never waits on another job). With lags bounded,
+  joining at the leader costs a newcomer at most the window. A first cut
+  counted the window in each job's own claims; in testing it pinned lagging
+  jobs at different distances behind the leader and the smallest allocation
+  took every claim, so the window is in ratio units. **Verified:** the
+  adversary's two cases added as tests (`I-SCHED-3e`, `I-SCHED-3f`: in the
+  split fleet the newcomer at 40% gets 262 of the majority's 700 claims, fair
+  being 311 less the lagging job's window; the minority newcomer 81 of 200).
+  `I-SCHED-3c` and `3d` fail on the committed code (join at the lowest), `3e`
+  and `3f` failed on join-at-the-leader alone (the adversary's run), and all
+  four pass with both; the 145 scheduler, admin, worker and boundary tests
+  pass; tier 6 passes. PLAN's workflow text, the schema comment and KL-88 say
+  it.
+
+**Lows fixed:** the `join_at_parity` doc, PLAN's activation and
+`claims_baseline` text and a test's doc no longer say "lowest"; `worker.rs`
+and PLAN say the newest 200 unsupported entries are kept; an export poll that
+finds the export gone asks whether the job is; an older read's export error no
+longer lands after an export start; the allocation note is visible text, not
+only a tooltip. **Recorded (KL-88):** MAGPIE keeping a re-declined job's first
+place in its list.
+
+### 19.5 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **600 of 600** (four new scheduling tests; `A-WORKER-3` rewritten).
+- **Tier 5, natively: 14 of 14**; **tier 6, natively, every case** (the lag
+  bound runs in every claim of both).
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 120 of 120.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks.
+- MAGPIE unchanged this pass (8f2f5d75 checked by its reviewer in both build
+  flavours, with birdtest's CI contract job replicated).

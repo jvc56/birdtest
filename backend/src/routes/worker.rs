@@ -32,7 +32,7 @@ pub const MAX_RESULT_BYTES: usize = 64 * 1024 * 1024;
 /// jobs the worker cannot run: MAGPIE keeps that list for the life of its run
 /// and does not cap it, at some 40 bytes a job, and a claim refused for its
 /// size ends the run -- so this leaves room for some 26,000 (the server reads
-/// the first `MAX_UNSUPPORTED_JOBS`). What bounds the memory all bodies take
+/// the last `MAX_UNSUPPORTED_JOBS`). What bounds the memory all bodies take
 /// together is `extract::read_body`'s tiers; this is the bound on one.
 pub const WORKER_BODY_BYTES: usize = 1024 * 1024;
 
@@ -319,8 +319,13 @@ async fn claim_task(
         )
     })?;
 
+    // The newest are kept: MAGPIE appends and never prunes, so a long run's
+    // list starts with jobs long gone, and keeping the first 200 dropped the
+    // live ones -- each then offered and declined again.
     let mut unsupported_jobs = body.unsupported_jobs;
-    unsupported_jobs.truncate(MAX_UNSUPPORTED_JOBS);
+    if unsupported_jobs.len() > MAX_UNSUPPORTED_JOBS {
+        unsupported_jobs.drain(..unsupported_jobs.len() - MAX_UNSUPPORTED_JOBS);
+    }
     let caps = scheduler::WorkerCapabilities {
         magpie_version: crate::version::Version::parse_or_zero(&body.magpie_version),
         unsupported_jobs,

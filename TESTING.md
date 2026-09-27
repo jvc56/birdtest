@@ -71,7 +71,7 @@ at tier 5 names a symptom.
 | 1 Unit | 213 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (10), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 120 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 158 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 196 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 200 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (40), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 596 backend tests (the per-tier counts above are
+--run-ignored all` runs 600 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -975,6 +975,29 @@ The single most important group. Every entry is about a decision made in SQL.
   taking all twelve; and issuing a claim stamps `jobs.last_claimed_at`, which
   is what "served" reads. *(Covered:
   `admin_api::a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity`.)*
+- `I-SCHED-3c` **Parity is with the leader.** A newcomer joins level with the
+  highest ratio among the jobs being served, not the lowest: beside a veteran
+  and a games job at its cap that reissued a task a minute ago (served, and
+  standing still), it splits the next 900 claims 2:1 with the veteran rather
+  than taking the first 500 in a row. *(Covered:
+  `admin_api::a_newcomer_joins_level_with_the_leader_not_a_job_that_has_stopped`.)*
+  (Thirty-second audit, pass 19.)
+- `I-SCHED-3d` After a quiet spell (no job has claimed within the heartbeat
+  timeout), a newcomer still joins level with the leader, not a job nobody can
+  run: 6/6 with the veteran, where it took 12 of 12. *(Covered:
+  `admin_api::after_a_quiet_spell_a_newcomer_still_joins_level_with_the_leader`.)*
+- `I-SCHED-3e` **No job's lag grows without limit.** In a split fleet — 30%
+  of claims from workers that can run only an old-floor job at 10%, which then
+  leads — a newcomer at 40% beside the majority's lagging job gets its share
+  of the next 1,000 claims (200 to 350; with lags unbounded and joins at the
+  leader it got none). *(Covered:
+  `admin_api::in_a_split_fleet_a_newcomer_is_not_starved_behind_a_lagging_job`.)*
+- `I-SCHED-3f` A job only a minority can run lags while served; a newcomer the
+  same minority can run gets its share (50 to 120 of that minority's 200
+  claims; it got none). *(Covered:
+  `admin_api::a_minority_newcomer_is_not_starved_behind_a_lagging_minority_job`.)*
+  (Thirty-second audit, pass 19: the join at the leader and the lag window
+  together — each alone failed one of I-SCHED-3c to 3f.)
 - `I-SCHED-4` Abandoned claims count toward a job's share. Abandon many claims
   on one job and confirm its share does **not** grow — excluding them would let
   a job with flaky workers accumulate more than its share. The counter is
@@ -1948,7 +1971,9 @@ below.
   the field. *(Covered:
   `worker_routes::a_malformed_magpie_version_is_refused_rather_than_assumed`.)*
 - `A-WORKER-3` An `unsupported_jobs` list over 200 is **truncated, not
-  rejected** — a truncated list costs at most a wasted claim. *(Covered:
+  rejected** — a truncated list costs at most a wasted claim — and the newest
+  200 are kept: MAGPIE appends and never prunes, so keeping the first dropped
+  the live entries (thirty-second audit, pass 19). *(Covered:
   `worker_routes::an_oversized_unsupported_list_is_truncated_not_rejected`.)*
 - `A-WORKER-4` A first claim with no identity mints an anon UUID and returns it
   in the body; the client reusing it is recognised. An idle poll mints nothing,

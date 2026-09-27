@@ -22,8 +22,9 @@
 # of code. What it cannot see: an indented (unfenced) code block, `<pre>` or
 # an HTML comment (and a fence inside one throws off how the fences after it
 # pair, so a later block can go unread), a shell block labelled `text`, code
-# after a ` #` inside quotes (read as a comment by the ASCII rule; and a
-# quoted `\ #` is refused as a continuation it is not), a block that turns the pager back on, and a `!`
+# after a ` #` inside quotes (read as a comment by the ASCII rule); and a
+# `\ #` anywhere -- in quotes, a word, a heredoc or a comment -- is refused
+# as a continuation it is not (fails safe), a block that turns the pager back on, and a `!`
 # inside double quotes, which an interactive shell expands as history and
 # `bash -n` does not. A fence indented four columns or more is read as one,
 # though a renderer outside a list shows it as indented code. And bash 3.2
@@ -133,10 +134,10 @@ check() {
         END { exit !bad }
       ' "${block}" > "${WORK}/err"; then
       bad=yes
-    elif grep -nE '(^|[^\\])(\\\\)*\\[[:blank:]]+(#.*)?$' "${block}" > "${WORK}/err"; then
+    elif LC_ALL=C grep -nE '(^|[^\\])(\\\\)*\\[[:blank:]]+(#.*)?$' "${block}" > "${WORK}/err"; then
       # A backslash then blanks -- and perhaps a comment -- escapes a blank,
       # not the newline: the line after it ran as a command of its own.
-      sed 's/^\([0-9]*\):.*/line \1: a backslash followed by blanks, not a continuation/' \
+      LC_ALL=C sed 's/^\([0-9]*\):.*/line \1: a backslash followed by blanks, not a continuation/' \
         "${WORK}/err" > "${WORK}/err2" && mv "${WORK}/err2" "${WORK}/err"
       bad=yes
     elif LC_ALL=C awk '

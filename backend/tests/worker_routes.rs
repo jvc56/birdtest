@@ -181,9 +181,11 @@ async fn a_malformed_magpie_version_is_refused_rather_than_assumed() {
 }
 
 /// A-WORKER-3: an `unsupported_jobs` list past 200 entries is truncated, not
-/// rejected. The only active job listed at position 221 is dropped with the
-/// overflow, so the worker is still handed it; listed at position 1 of the same
-/// oversized list it is honoured.
+/// rejected, and the newest 200 are kept: MAGPIE appends and never prunes, so
+/// a long run's first entries are jobs long gone. The only active job listed
+/// first is dropped with the overflow, so the worker is still handed it; listed
+/// at position 221 (among the newest) it is honoured. (Keeping the first 200,
+/// as it did, dropped the live entries; thirty-second audit, pass 19.)
 #[tokio::test]
 async fn an_oversized_unsupported_list_is_truncated_not_rejected() {
     let db = TestDb::new().await;
@@ -191,10 +193,10 @@ async fn an_oversized_unsupported_list_is_truncated_not_rejected() {
     let app = birdtest::app(db.state().await);
 
     let mut listed: Vec<Uuid> = (0..250).map(|_| Uuid::new_v4()).collect();
-    listed[220] = job;
+    listed[0] = job;
     let (status, body) = claim(&app, &[], claim_body("1.0.0", &listed)).await;
     assert_eq!(status, StatusCode::OK, "an oversized list must not be refused: {body}");
-    assert_eq!(body["job_id"], json!(job.to_string()), "the entry past the cap was not dropped: {body}");
+    assert_eq!(body["job_id"], json!(job.to_string()), "the oldest entry was not dropped: {body}");
 
     listed.swap(0, 220);
     let (status, body) = claim(&app, &[], claim_body("1.0.0", &listed)).await;

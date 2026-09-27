@@ -58,6 +58,9 @@
   // An export started here that no read has shown yet: the button stays off
   // (its read failing left "Export results" up, and a second click a 409).
   let exportStarted = false;
+  // Bumped by an export start: a reload's export read that began before it
+  // is older than the start, and would put "Export results" back.
+  let exportGen = 0;
   let exportPoll: number | undefined;
   // Set when the page goes, so a request in flight then schedules nothing.
   let destroyed = false;
@@ -68,6 +71,15 @@
   function goneIf(e: unknown): boolean {
     if (e instanceof ApiError && e.status === 404) markGone();
     return gone;
+  }
+
+  // An action's 404 is asked about first: one could come from something the
+  // action touched (an object the rebuild reads), not the job, and "gone"
+  // disables every action until a reload.
+  function goneIfConfirmed(e: unknown): boolean {
+    if (!(e instanceof ApiError && e.status === 404)) return false;
+    api.job(jobId).catch((read) => goneIf(read));
+    return false;
   }
 
   function markGone() {
@@ -88,6 +100,7 @@
 
   async function reload() {
     const gen = ++reloadGen;
+    const exportGenAtStart = exportGen;
     const payloadsAtStart = streamPayloads;
     reloading = true;
     window.clearTimeout(retry);
@@ -105,8 +118,9 @@
     } else if (!goneIf(job.reason)) failures.push((job.reason as Error).message);
     if (gapsRead.status === 'fulfilled') gaps = gapsRead.value;
     else if (!gone) failures.push((gapsRead.reason as Error).message);
-    if (exportRead.status === 'fulfilled') applyExport(exportRead.value);
-    else if (!gone) exportError = `Could not check the export: ${(exportRead.reason as Error).message}`;
+    if (exportRead.status === 'fulfilled') {
+      if (exportGen === exportGenAtStart) applyExport(exportRead.value);
+    } else if (!gone && exportGen === exportGenAtStart) exportError = `Could not check the export: ${(exportRead.reason as Error).message}`;
     if (gone) return;
     loadError = failures.length ? `Could not load all of this job: ${[...new Set(failures)].join('; ')}` : '';
     // And again in a few seconds: an inactive job sends no live payload.
@@ -138,11 +152,16 @@
   // "Building…" up after the export was ready).
   function pollExport() {
     window.clearTimeout(exportPoll);
-    if (destroyed) return;
+    if (destroyed || gone) return;
     exportPoll = window.setTimeout(async () => {
       try {
-        applyExport(await fetchExport());
+        const value = await fetchExport();
+        // An export being polled cannot vanish unless its job did: a 404 here
+        // reads as "never exported" to fetchExport, so ask the job.
+        if (value === null && jobExport !== null) api.job(jobId).catch((read) => goneIf(read));
+        applyExport(value);
       } catch (e) {
+        if (goneIf(e)) return;
         exportError = `Could not check the export: ${(e as Error).message}`;
         pollExport();
       }
@@ -156,9 +175,10 @@
     notice = '';
     try {
       await api.startExport(jobId);
+      exportGen += 1;
       exportStarted = true;
     } catch (e) {
-      if (!goneIf(e)) error = (e as Error).message;
+      if (!goneIfConfirmed(e)) error = (e as Error).message;
       busy = false;
       return;
     }
@@ -220,7 +240,7 @@
       notice = message;
       await reload();
     } catch (e) {
-      if (!goneIf(e)) error = (e as Error).message;
+      if (!goneIfConfirmed(e)) error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -270,7 +290,7 @@
           ? `; ${foreign} holding bytes nothing here accounts for, which workers refuse — restore the right object version or force a rebuild.`
           : '.');
     } catch (e) {
-      if (!goneIf(e)) error = (e as Error).message;
+      if (!goneIfConfirmed(e)) error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -315,7 +335,7 @@
         `Merged ${merged.folds_merged.toLocaleString()} staged results into ` +
         `${merged.racks_updated.toLocaleString()} racks.`;
     } catch (e) {
-      if (!goneIf(e)) error = (e as Error).message;
+      if (!goneIfConfirmed(e)) error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -332,7 +352,7 @@
       await api.deleteJob(jobId);
       goto('/jobs');
     } catch (e) {
-      if (!goneIf(e)) error = (e as Error).message;
+      if (!goneIfConfirmed(e)) error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -356,9 +376,19 @@
 
     <div class="card space-y-4">
       <h2 class="text-lg font-medium">Controls</h2>
+      <p class="text-xs text-muted-foreground">
+        An allocation is a share of claims, not of worker time: a job whose tasks take longer holds
+        more of the fleet than its share.
+      </p>
       <div class="flex flex-wrap items-end gap-3">
         <div>
-          <label class="label" for="alloc">Allocation %</label>
+          <label
+            class="label"
+            for="alloc"
+            title="A share of claims, not of worker time: a job whose tasks take longer holds more of the fleet than its share (PLAN KL-88)."
+          >
+            Allocation % of claims
+          </label>
           <input
             id="alloc"
             type="number"
