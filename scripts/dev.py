@@ -181,21 +181,51 @@ def wait_for_health(url: str, timeout: int) -> None:
 # --- contributors -----------------------------------------------------------
 
 
-def write_contribute_settings(directory: Path, args, api_url: str) -> Path:
-    """One `contribute.txt` per worker.
+UUID_LINE = re.compile(r"^uuid\s+(\S+)\s*$", re.MULTILINE)
+
+
+def issued_uuid(settings: Path) -> Optional[str]:
+    """The identity the server issued this worker, which MAGPIE appends to its
+    settings file on first contact."""
+    if not settings.is_file():
+        return None
+    match = UUID_LINE.search(settings.read_text())
+    return match.group(1) if match else None
+
+
+def uuids_the_database_knows(uuids: List[str]) -> Optional[set]:
+    """Which of `uuids` the stack's database has, or None when it cannot be
+    asked (a stack not run by this compose file)."""
+    if not uuids:
+        return set()
+    listed = ",".join(f"'{u}'" for u in uuids if re.fullmatch(r"[0-9a-fA-F-]{36}", u))
+    if not listed:
+        return set()
+    result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "birdtest", "-d", "birdtest",
+         "-Atq", "-c", f"SELECT uuid FROM anonymous_workers WHERE uuid IN ({listed})"],
+        cwd=REPO_ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def write_contribute_settings(directory: Path, args, api_url: str, uuid: Optional[str]) -> Path:
+    """One `contribute.txt` per worker, written from this run's flags.
 
     Settings live in a file rather than on the command line so an API key stays
     out of shell history and `ps` output. MAGPIE appends the server-minted
     `uuid` to this file on first contact, which is why each worker needs its
-    own: they would otherwise overwrite each other's identity.
+    own: they would otherwise overwrite each other's identity. That identity
+    is the one thing carried over from an earlier run (`uuid`, when given);
+    the rest is rewritten every time -- written once and kept, the file
+    ignored every later --threads, --max-tasks, --idle-wait and --api-key.
     """
     settings = directory / "contribute.txt"
-    if settings.exists() and not args.reset_workers:
-        return settings
-
     lines = [
-        "# Written by scripts/dev.py. Delete this file (or pass --reset-workers)",
-        "# to make this worker forget the identity the server assigned it.",
+        "# Written by scripts/dev.py on every run; only the uuid MAGPIE appends",
+        "# is kept. Delete this file (or pass --reset-workers) to make this worker",
+        "# forget the identity the server assigned it.",
         f"server   {api_url}",
         f"threads  {args.threads}",
         f"maxtasks {args.max_tasks}",
@@ -203,6 +233,8 @@ def write_contribute_settings(directory: Path, args, api_url: str) -> Path:
     ]
     if args.api_key:
         lines.append(f"apikey   {args.api_key}")
+    if uuid:
+        lines.append(f"uuid {uuid}")
     # It may hold an API key: readable by its owner only, from the start --
     # written first and chmod'd after, it was world-readable in between.
     settings.unlink(missing_ok=True)
@@ -218,10 +250,21 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[sub
         shutil.rmtree(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
+    # Each worker's issued identity, kept only while the database still knows
+    # it: after --reset-db, or a restore, the server answers an identity it
+    # never issued with 401, and MAGPIE gives up at once -- with status 0.
+    directories = [workdir / f"worker-{index:02d}" for index in range(1, args.workers + 1)]
+    issued = {d: issued_uuid(d / "contribute.txt") for d in directories}
+    known = uuids_the_database_knows([u for u in issued.values() if u])
+
     processes = []
-    for index in range(1, args.workers + 1):
-        directory = workdir / f"worker-{index:02d}"
+    for index, directory in enumerate(directories, start=1):
         directory.mkdir(exist_ok=True)
+        uuid = issued[directory]
+        if uuid and known is not None and uuid not in known:
+            log(f"worker {index}: its identity {uuid} is not in this database (reset or "
+                f"restored since); it will be issued a new one")
+            uuid = None
 
         # Symlinked, not copied: the data directory is gigabytes and every
         # worker reads the same bytes.
@@ -230,7 +273,7 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[sub
             link.unlink()
         link.symlink_to(data)
 
-        settings = write_contribute_settings(directory, args, api_url)
+        settings = write_contribute_settings(directory, args, api_url, uuid)
         log_path = directory / "contribute.log"
         handle = log_path.open("a", buffering=1)
         handle.write(f"\n--- started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -416,6 +459,14 @@ def main() -> int:
     # Keyed by the worker number shown at startup, so an exit report names the
     # directory whose log to read rather than a shifting position in a list.
     labelled = {index: process for index, process in enumerate(processes, start=1)}
+
+    def last_line(index: int) -> str:
+        log_path = Path(args.workdir).expanduser().resolve() / f"worker-{index:02d}" / "contribute.log"
+        try:
+            lines = [line for line in log_path.read_text().splitlines() if line.strip()]
+        except OSError:
+            return "(no log)"
+        return lines[-1] if lines else "(no output)"
     log(f"{args.workers} MAGPIE contributor(s) running against {api_url}")
 
     if not args.no_browser:
@@ -439,7 +490,8 @@ def main() -> int:
             for index, process in list(labelled.items()):
                 code = process.poll()
                 if code is not None:
-                    log(f"worker {index} exited with status {code}")
+                    # MAGPIE exits 0 on errors too: its last line says why.
+                    log(f"worker {index} exited with status {code}: {last_line(index)}")
                     del labelled[index]
                     processes.remove(process)
             if not processes:

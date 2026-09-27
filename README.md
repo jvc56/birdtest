@@ -124,7 +124,11 @@ Each contributor gets its own directory under `--workdir`, holding its
 (MAGPIE loads its board from `./data` before anything else). Each needs a
 `contribute.txt` of its own because MAGPIE writes the identity it is issued
 into that file — sharing one would collapse every worker onto a single
-identity. Watch one with `tail -f .dev-workers/worker-01/contribute.log`.
+identity. The file is rewritten from the flags on every run, keeping only
+that identity, and only while the database still has it: after `--reset-db`
+or a restore a worker is issued a new one instead of being refused. Watch one
+with `tail -f .dev-workers/worker-01/contribute.log`; when one exits, `dev.py`
+prints the last line of its log (MAGPIE exits 0 on errors too).
 
 Ctrl-C stops the contributors and leaves the stack up, so the site stays
 browsable; `--down` tears it down instead.
