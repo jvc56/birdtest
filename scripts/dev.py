@@ -41,6 +41,29 @@ import requests
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+def load_env_file() -> None:
+    """The repository's `.env`, as docker compose reads it, into the
+    environment: the defaults below (WEB_PORT, BACKEND_PORT, ...) come from
+    it. Set there, a port applied to compose but not to this script, which
+    passed compose its own default and so overrode the file. A variable
+    already in the environment wins, as it does for compose."""
+    path = REPO_ROOT / ".env"
+    if not path.is_file():
+        return
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        os.environ.setdefault(key, value)
+
+
 def log(message: str) -> None:
     print(f"[dev] {message}", flush=True)
 
@@ -139,7 +162,8 @@ def explain_failed_start() -> None:
         if not running:
             log("the backend is not running; its last lines:")
             print(logs.rstrip() or "(no output)")
-        log("a host port in use? --web-port and --backend-port move the stack's")
+        log("a host port in use? --web-port and --backend-port move the stack's ports, "
+            "or set WEB_PORT and BACKEND_PORT in .env")
 
 
 def wait_for_health(url: str, timeout: int) -> None:
@@ -339,6 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    load_env_file()
     args = build_parser().parse_args()
     binary, data = resolve_magpie(args)
     magpie_root = binary.parent.parent
