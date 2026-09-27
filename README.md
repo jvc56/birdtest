@@ -89,7 +89,15 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 ./scripts/dev.py --no-browser                 # SSH sessions and CI
 ./scripts/dev.py --hot-reload                 # add the Vite dev server on :5174
 ./scripts/dev.py --no-up --no-seed            # attach contributors to a stack already running
+./scripts/dev.py --rebuild --reset-db         # after a schema change: new images, fresh database
 ```
+
+After a schema change the backend refuses a database made by the migration's
+older edit ("migration 1 was previously applied but has been modified": the one
+migration changes in place until release), and `dev.py` says so. `--reset-db`
+drops the schema so the backend rebuilds it; the database's data goes, the
+MinIO bucket stays, and `scripts/dev-dump.sh` snapshots both first if you want
+them. Add `--rebuild` when the images predate the change.
 
 | Flag | Default | What it changes |
 |---|---|---|
@@ -106,6 +114,7 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 | `--workdir` | `.dev-workers` | Where per-worker directories live |
 | `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker |
 | `--rebuild` | off | Rebuild images before starting |
+| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change) |
 | `--down` | off | Stop the stack on exit instead of leaving it up |
 | `--no-seed` | off | Skip seeding (the stack already has an active job) |
 | `--no-up` | off | Assume the stack is already running |

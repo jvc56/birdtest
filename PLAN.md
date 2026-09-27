@@ -9743,7 +9743,9 @@ docker compose exec postgres \
 docker compose restart backend
 ```
 
-`docker compose down -v` also works but discards the MinIO bucket with it.
+`./scripts/dev.py --reset-db` does the same before starting the stack (and says
+so when a start fails this way). `docker compose down -v` also works but
+discards the MinIO bucket with it.
 
 ### 3. Configuration
 
