@@ -26,6 +26,7 @@ before anything else), so N workers cost nothing but their own settings files.
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
@@ -236,6 +237,9 @@ def uuids_the_database_knows(uuids: List[str]) -> Optional[set]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+# In the worker directory; see lock_workdir.
+LOCK_FILE = ".dev.lock"
+
 # How often a running dev.py looks for queued derived files.
 DERIVED_CHECK_SECS = 15
 
@@ -344,6 +348,26 @@ while true; do
     trap 'echo' INT
 done
 """
+
+
+def lock_workdir(workdir: Path):
+    """Held for the whole run: a second dev.py on the same worker directories
+    ran a second MAGPIE in each, under the same identities, beside the first's.
+    The lock goes with the process, however it ends."""
+    workdir.mkdir(parents=True, exist_ok=True)
+    handle = (workdir / LOCK_FILE).open("a+")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.seek(0)
+        holder = handle.read().strip() or "unknown"
+        fail(f"another dev.py (pid {holder}) is running workers in {workdir}; stop it first, "
+             "or give this one its own --workdir")
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"{os.getpid()}\n")
+    handle.flush()
+    return handle
 
 
 def find_terminal() -> Optional[tuple]:
@@ -679,12 +703,23 @@ def main() -> int:
     log(f"version floor {floor} (your MAGPIE build reports "
         f"{magpie_version(magpie_root) or 'an unknown version'})")
 
+    # Before anything touches the stack: a second run's --reset-db would drop
+    # the database under the first one's workers too.
+    workdir = Path(args.workdir).expanduser().resolve()
+    lock = lock_workdir(workdir)  # noqa: F841 -- held until exit
+
     if args.reset_db:
         reset_database()
-    # Before seeding, which may give workers keys to keep.
-    workdir = Path(args.workdir).expanduser().resolve()
-    if args.reset_workers and workdir.exists():
-        shutil.rmtree(workdir)
+    # Before seeding, which may give workers keys to keep. Everything but the
+    # lock, which this run holds.
+    if args.reset_workers:
+        for entry in workdir.iterdir():
+            if entry.name == LOCK_FILE:
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
     if not args.no_up:
         # --remove-orphans: containers of services the compose file no longer
         # has (a `worker` service, once) are removed rather than warned about.
