@@ -100,11 +100,18 @@ drops the schema so the backend rebuilds it; the database's data goes, the
 MinIO bucket stays, and `scripts/dev-dump.sh` snapshots both first if you want
 them. Add `--rebuild` when the images predate the change.
 
-The fresh database is seeded with a full set: the `dev` admin; a job of every
-type (games, game pairs, opening racks, and a small leave generation) at 25%
-allocation each; and two contributor accounts, `dev-contributor-1` and `-2`,
-each with a new API key that workers 3 and 4 run under and keep in their
-`contribute.txt` for later runs. Workers 1 and 2 contribute anonymously.
+The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
+
+- the `dev` admin;
+- six jobs at equal allocation: games, opening racks, a small leave
+  generation, and three game-pairs jobs among three players — `static-equity`,
+  `static-score` and `sim-1ply` (a 1-ply sim, 100 iterations) — one for each
+  pair of them. Games and pairs jobs stop at 2,000, if their test has not
+  decided first, so all three pairs jobs finish, and an admin can then make a
+  rating pool of the three players;
+- two contributor accounts, `dev-contributor-1` and `-2`, each with a new API
+  key that workers 3 and 4 run under and keep in their `contribute.txt` for
+  later runs. Workers 1 and 2 contribute anonymously.
 
 | Flag | Default | What it changes |
 |---|---|---|
@@ -121,7 +128,7 @@ each with a new API key that workers 3 and 4 run under and keep in their
 | `--workdir` | `.dev-workers` | Where per-worker directories live |
 | `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker (the keyed workers lose their keys until the next `--reset-db`) |
 | `--rebuild` | off | Rebuild images before starting |
-| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with a job of every type at 25% each and the two contributor accounts |
+| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with six jobs (three of them game pairs among three players) and the two contributor accounts: see below |
 | `--down` | off | Stop the stack on exit instead of leaving it up |
 | `--no-seed` | off | Skip seeding (the stack already has an active job) |
 | `--no-up` | off | Assume the stack is already running |

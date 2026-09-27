@@ -327,11 +327,14 @@ def input_data_ids(client: Client, args) -> dict:
         available = sorted({f"{r['role']}/{r['name']}" for r in rows})
         raise SeedError(f"no {role} named {name!r} was imported. Available: {available}")
 
+    # A simulating player's win% model, where the data has one.
+    winpct = next((row["id"] for row in rows if row["role"] == "winpct" and row["name"] == "winpct"), None)
     return {
         "kwg": find("kwg", args.lexicon),
         "klv": find("klv", args.lexicon),
         "letterdist": find("letterdist", args.letterdist),
         "layout": find("layout", args.layout),
+        "winpct": winpct,
     }
 
 
@@ -339,7 +342,8 @@ def input_data_ids(client: Client, args) -> dict:
 
 
 def player_config(
-    client: Client, name: str, sort_strategy: str, data: dict, recorder: str = "best"
+    client: Client, name: str, sort_strategy: str, data: dict, recorder: str = "best",
+    sim: Optional[dict] = None,
 ) -> str:
     """A static player: no simulation parameters, and so no win% model either.
 
@@ -365,6 +369,7 @@ def player_config(
                 "kwg_id": data["kwg"],
                 "klv_id": data["klv"],
                 "num_plays_recorded": 10,
+                **(sim or {}),
             },
         ),
         f"create player config {name}",
@@ -525,8 +530,10 @@ def build_parser() -> argparse.ArgumentParser:
                              "unnamed by default, so it is titled by its type")
     parser.add_argument("--allocation", type=int, default=100)
     parser.add_argument("--all-job-types", action="store_true",
-                        help="create one job of every type (games, game pairs, opening racks, "
-                             "leave generation), each at --allocation, instead of --job-type")
+                        help="create a job of every type -- games, opening racks, leave "
+                             "generation, and three game-pairs jobs among two static players "
+                             "and a 1-ply simming one, so a rating pool can rate all three -- "
+                             "each at --allocation, instead of --job-type")
     parser.add_argument("--contributors", type=int, default=0,
                         help="contributor accounts to make (dev-contributor-1, ...), each with a "
                              "new API key written to --keys-out")
@@ -562,10 +569,26 @@ def seed(args) -> None:
         ]
 
     if args.all_job_types:
-        for job_type in ("games", "game_pairs", "opening_rack", "leave_generation"):
-            create_job(client, args, data, players_for(job_type), job_type,
-                       f"dev {job_type.replace('_', ' ')}")
-        log(f"seeded — a job of every type, each at {args.allocation}%")
+        # Every job is made, whatever is active already: three are game pairs.
+        args.new_job = True
+        equity, score = players_for("game_pairs")
+        if not data["winpct"]:
+            raise SeedError("--all-job-types needs a win% model in the data, for its simming player")
+        # A third player, stronger than either static one, on the same files:
+        # three players every pair of whom has a pairs job is a set a rating
+        # pool can rate, once the jobs are done.
+        sim = player_config(client, "sim-1ply", "equity", data, sim={
+            "winpct_id": data["winpct"], "num_plies": 1, "max_iterations": 100,
+            "time_limit_secs": 0, "num_plays": 10, "use_inference": False,
+        })
+        create_job(client, args, data, [equity, score], "games", "dev games")
+        for (p1, n1), (p2, n2) in (((equity, "static equity"), (score, "static score")),
+                                   ((equity, "static equity"), (sim, "1-ply sim")),
+                                   ((score, "static score"), (sim, "1-ply sim"))):
+            create_job(client, args, data, [p1, p2], "game_pairs", f"dev game pairs: {n1} vs {n2}")
+        create_job(client, args, data, players_for("opening_rack"), "opening_rack", "dev opening racks")
+        create_job(client, args, data, [], "leave_generation", "dev leave generation")
+        log(f"seeded — six jobs, each at {args.allocation}%")
     else:
         create_job(client, args, data, players_for(args.job_type))
         log("seeded — the job is active and workers can claim")

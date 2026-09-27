@@ -353,7 +353,9 @@ def run_seed(args, api_url: str, magpie_root: Path, floor: str) -> None:
     # shares, and contributor accounts whose keys the keyed workers run under.
     keys_file = Path(args.workdir).expanduser().resolve() / ".contributor-keys.json"
     if args.reset_db:
-        command += ["--all-job-types", "--allocation", str(100 // 4),
+        # Six jobs at equal shares; a cap every pairs job reaches in a dev
+        # session, so all three finish and their players can be rated.
+        command += ["--all-job-types", "--allocation", str(100 // 6), "--max-units", "2000",
                     "--contributors", str(len(KEYED_WORKERS)), "--keys-out", str(keys_file)]
     if subprocess.run(command, cwd=REPO_ROOT).returncode != 0:
         fail("seeding failed; the stack is still up, so fix and re-run with --no-up")
@@ -424,8 +426,11 @@ def build_parser() -> argparse.ArgumentParser:
                        help="drop the database's schema first, and let the backend rebuild it: "
                             "needed after a schema change, since the one migration is edited "
                             "in place until release (its data goes; the MinIO bucket is kept). "
-                            "The fresh database is seeded with a job of every type at 25%% each, "
-                            "and two contributor accounts whose keys workers 3 and 4 run under")
+                            "The fresh database is seeded, on --lexicon, with six jobs at equal "
+                            "shares -- games, opening racks, leave generation and three game-pairs "
+                            "jobs among three players, which a rating pool can rate once they are "
+                            "done -- and two contributor accounts whose keys workers 3 and 4 run "
+                            "under")
     stack.add_argument("--down", action="store_true",
                        help="stop the stack on exit instead of leaving it up")
     stack.add_argument("--health-timeout", type=int, default=180,
@@ -440,7 +445,8 @@ def build_parser() -> argparse.ArgumentParser:
     seeding.add_argument("--job-type", default="game_pairs",
                          choices=["game_pairs", "games", "opening_rack"],
                          help="job to create and activate (default: %(default)s)")
-    seeding.add_argument("--lexicon", default=None, help="lexicon for the seeded job")
+    seeding.add_argument("--lexicon", default="CSW24",
+                         help="lexicon for the seeded jobs and their players (default: %(default)s)")
     seeding.add_argument("--variant", default=None, choices=["classic", "wordsmog"])
     seeding.add_argument("--tarball-date", default=None,
                          help="MAGPIE-DATA tarball YYYYMMDD (default: the DATA_VERSION your "
