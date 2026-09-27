@@ -55,6 +55,8 @@ export function jobTypeLabel(type: string): string {
 
 const SPRT_LABELS: Record<string, string> = {
   running: 'running',
+  paused: 'paused while the job is inactive',
+  undecided: 'not decided: the job was completed before the test was',
   passed: 'passed (H1 accepted)',
   failed: 'failed (H0 accepted)',
   terminated_at_max: 'stopped at its cap'
@@ -62,6 +64,24 @@ const SPRT_LABELS: Record<string, string> = {
 
 export function sprtLabel(status: string): string {
   return lookup(SPRT_LABELS, status);
+}
+
+/**
+ * Where a games or pairs job's test stands, for its badge and label. The test
+ * itself says `running` whenever it has not crossed a bound, which read as
+ * work going on while the job was inactive and nothing was being played:
+ * the job's status comes first. A completed job shows the decision it was
+ * completed on, or `undecided` when it was completed without one (an admin's
+ * force-complete).
+ */
+export function sprtState(
+  jobStatus: string,
+  games: { sprt: { status: string }; decided?: { status: string } }
+): string {
+  if (games.decided) return games.decided.status;
+  if (jobStatus === 'inactive') return 'paused';
+  if (jobStatus === 'completed') return 'undecided';
+  return games.sprt.status;
 }
 
 /**

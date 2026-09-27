@@ -11,7 +11,7 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { jobTypeLabel, sprtLabel, duration } from '$lib/format';
+  import { jobTypeLabel, sprtLabel, sprtState, duration } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
@@ -588,7 +588,7 @@
             SPRT {sprtLabel(stats.games.decided.status)}, LLR
             {stats.games.decided.llr.toFixed(3)} (now {stats.games.sprt.llr.toFixed(3)})
           {:else}
-            SPRT {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}
+            SPRT {sprtLabel(sprtState(stats.job.status, stats.games))} — LLR {stats.games.sprt.llr.toFixed(3)}
           {/if}
         </p>
       {:else if stats.opening_racks}

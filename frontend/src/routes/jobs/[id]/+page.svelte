@@ -4,7 +4,7 @@
   import { api, type JobStats } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { duration, datetime, jobTypeLabel, sprtLabel } from '$lib/format';
+  import { duration, datetime, jobTypeLabel, sprtLabel, sprtState } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
@@ -141,7 +141,7 @@
       <div class="card space-y-4">
         <div class="flex items-center justify-between">
           <h2 class="text-lg font-medium">SPRT</h2>
-          <JobStatusBadge status={stats.games.decided?.status ?? stats.games.sprt.status} />
+          <JobStatusBadge status={sprtState(stats.job.status, stats.games)} />
         </div>
         {#if stats.games.decided}
           <p class="text-sm text-muted-foreground">
@@ -150,6 +150,15 @@
             {stats.games.unit}{stats.games.decided.units === 1 ? '' : 's'}. With the {stats.games.unit}s that were in flight then, LLR
             {stats.games.sprt.llr.toFixed(3)}, bounds [{stats.games.sprt.lower_bound.toFixed(2)},
             {stats.games.sprt.upper_bound.toFixed(2)}].
+          </p>
+        {:else if stats.job.status !== 'active'}
+          <!-- Nothing is being played: the test is where it stopped, and said
+               "running" as if it were not. -->
+          <p class="text-sm text-muted-foreground">
+            {sprtLabel(sprtState(stats.job.status, stats.games))}{stats.job.status === 'inactive'
+              ? `: no ${stats.games.unit}s are being played, so the test is not moving`
+              : ''}. LLR {stats.games.sprt.llr.toFixed(3)}, bounds
+            [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
           </p>
         {:else}
           <p class="text-sm text-muted-foreground">

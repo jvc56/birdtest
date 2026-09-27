@@ -8,10 +8,15 @@
     passed: 'bg-success/15 text-success border-success/30',
     failed: 'bg-destructive/15 text-destructive border-destructive/30',
     running: 'bg-warning/15 text-warning border-warning/30',
+    paused: 'bg-muted text-muted-foreground border-border',
+    undecided: 'bg-muted text-muted-foreground border-border',
     terminated_at_max: 'bg-muted text-muted-foreground border-border'
   };
   // A games or pairs job's cap is not always games.
-  const labels: Record<string, string> = { terminated_at_max: 'at its cap' };
+  const labels: Record<string, string> = {
+    terminated_at_max: 'at its cap',
+    undecided: 'not decided'
+  };
   // Own keys only: a plain lookup of `constructor` would find a function.
   // (`Object.hasOwn` is newer than the build's browser targets.)
   const own = (map: Record<string, string>, key: string) =>

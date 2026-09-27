@@ -6,6 +6,7 @@ import {
   jobTypeLabel,
   optionalNumber,
   sprtLabel,
+  sprtState,
   workerLabel
 } from './format';
 
@@ -116,6 +117,26 @@ describe('F-FMT-4 jobTypeLabel', () => {
   });
 });
 
+describe('F-FMT-5b sprtState', () => {
+  const running = { sprt: { status: 'running' } };
+  it("says paused, not running, while the job is inactive", () => {
+    expect(sprtState('inactive', running)).toBe('paused');
+    expect(sprtLabel(sprtState('inactive', running))).toBe('paused while the job is inactive');
+  });
+  it('is the test while the job is active', () => {
+    expect(sprtState('active', running)).toBe('running');
+    expect(sprtState('active', { sprt: { status: 'passed' } })).toBe('passed');
+  });
+  it('is the decision a completed job stopped on, or undecided without one', () => {
+    expect(sprtState('completed', { ...running, decided: { status: 'terminated_at_max' } })).toBe(
+      'terminated_at_max'
+    );
+    expect(sprtState('completed', running)).toBe('undecided');
+    // A purged job that had a decision keeps none: the purge clears it.
+    expect(sprtState('inactive', { sprt: { status: 'failed' } })).toBe('paused');
+  });
+});
+
 describe('F-FMT-5 sprtLabel', () => {
   it('covers all four statuses', () => {
     expect(sprtLabel('running')).toBe('running');
@@ -126,7 +147,7 @@ describe('F-FMT-5 sprtLabel', () => {
   });
 
   it('falls back to the raw status for an unknown one', () => {
-    expect(sprtLabel('paused')).toBe('paused');
+    expect(sprtLabel('abandoned')).toBe('abandoned');
     expect(sprtLabel('constructor')).toBe('constructor');
   });
 });
