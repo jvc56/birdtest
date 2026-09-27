@@ -1365,7 +1365,8 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   Then what `destroy` leaves: the instance's final snapshot (rds.tf keeps
   one, and it exists only once the instance is gone), the staging bucket, the
   two SSM parameters (Terraform only names them — and the session key may be
-  production's), the workspace and `dr.tfvars`. The snapshot is a full copy
+  production's; a `GITHUB_TOKEN` parameter the drill created in `$DR_REGION`
+  goes by hand too), the workspace and `dr.tfvars`. The snapshot is a full copy
   of production's database, and one left behind also stops the next drill's
   `destroy`, which makes one of the same name:
 

@@ -350,8 +350,20 @@ never: it would sit `active` holding its allocation.
 
 #### How the LLR is computed
 
+**A games job's batch is even.** MAGPIE gives player 1 the first move in a run's
+first game and alternates from there, and every task is a run of its own. At a
+batch of 1 — the default until the thirty-second audit's pass 18 — player 1
+moved first in every game of the job, and SPRT passed two identical players on
+the first move alone (+42 Elo measured, an H1 of +10 accepted after 358
+games); any odd batch leans the same way, by less. An even batch gives each
+player the first move in half of every task's games. Game pairs are balanced
+already: each pair gives each side the first move once. (The schema's column
+default is still 1; the API always sets it. A `games` job made before then
+with an odd batch is biased, KL-87.)
+
 The hypotheses are stated in Elo: H0 says the difference is `elo_low`, H1 says
-it is `elo_high`. The test uses the normal approximation fishtest uses — treat
+it is `elo_high`, each within ±1000. The test uses a normal approximation of
+the kind fishtest has used — treat
 the sample as draws from a distribution with unknown mean and compare the
 likelihood of the observed mean under the two hypothesised means:
 
@@ -3384,7 +3396,13 @@ history and in `ps` output, and contribution settings have no business mixed int
 `settings.txt` alongside board layouts and simulation parameters.
 
 `contribute.txt` sits in the current working directory, one setting per line as
-`key value`. Blank lines and lines beginning with `#` are ignored.
+`key value`. Blank lines and lines beginning with `#` are ignored — but a run
+with no `apikey` set names a comment that holds `apikey` then a key, since
+appending the setting to a last comment line with no newline puts it there
+(thirty-second audit, pass 18). Setting names are lowercase (one in the wrong
+case is refused, saying so); whole numbers run to 2147483647; an `apikey` is
+`bt_` then letters, digits and underscores (an empty one means none); a UTF-8 byte-order mark is
+skipped; and no refusal quotes a value.
 
 ```
 # birdtest contribution settings
@@ -4901,7 +4919,8 @@ the body omits them:
 |---|---|
 | `redundancy` | 1 |
 | `min_magpie_version` | the server-wide floor |
-| `games_per_batch` / `pairs_per_batch` | 1 |
+| `games_per_batch` | 2 — and it must be even (see "How the LLR is computed") |
+| `pairs_per_batch` | 1 |
 | `racks_per_batch` | 500 |
 | `rack_size` | 7 |
 | `sprt_alpha` / `sprt_beta` | 0.05 |
@@ -5345,7 +5364,7 @@ birdtest/
     ├── backup.tf                   # backup bucket (KMS, Object Lock, CRR), the nightly dump task,
     │                               # its schedule, the alarms, and the monthly restore drill
     ├── ses.tf                      # SES domain and sending identity
-    └── ssm.tf                      # SSM Parameter Store entries (names only; values set manually)
+    └── ssm.tf                      # the two SSM parameters' names and ARNs (never managed or read)
 ```
 
 ---
@@ -8295,13 +8314,40 @@ says so in its implemented option, rather than being removed.
   settle apart and retry, and pass 17 redesigned how it keeps state: a REST
   read is applied only if it is the newest and no live payload came while it
   was out, the allocation box is filled once and then only the admin's (the
-  job's current value shown beside it), and a deleted job stops the retries
-  and disables its actions;
-  every action on it takes one click, trimmed a ban's target, confirmed an unban,
+  job's current value shown beside it), and a deleted job — found by a read,
+  an action or the stream, pass 18 — stops the retries and disables its
+  actions. Passes 16 and 17 also made every action on it take
+  one click, trimmed a ban's target, confirmed an unban,
   required the job form's players, and named an input row's digest and its
   derived files in the delete confirmation.
 - **Justification:** Admin-only, each visible and recoverable by a reload or
   a second action.
+
+**KL-87. What the SPRT still gets wrong at the edges.**
+- **Context:** `stats/sprt.rs`, `routes/admin.rs::validate_job_body`
+  (thirty-second audit, pass 18).
+- **Problem:**
+  - A `games` job created before pass 18 with an odd `games_per_batch` gave
+    player 1 the first move in more than half its games — every one at a
+    batch of 1 — so its verdict favours player 1 (about +42 Elo at a batch
+    of 1, +14 at 3, +8 at 5). Nothing marks such a job.
+  - The normal approximation overstates |LLR| when almost every pair is a
+    split: `[0,0,10000,1,0]` at ±10 reads 1151 where the exact GSPRT gives
+    about 1.1, so one decisive pair among a few dozen splits can decide a job
+    with no minimum. Simulated type I error stayed near α at the hypotheses,
+    so this misleads the displayed LLR more than the verdict.
+  - With `min_units = 0` and wide Elo bounds the type I error roughly doubles
+    (about 10–12% against α = 5% at [0, 200]); a minimum of 50 brings it
+    back to 1–2.5%.
+- **Options considered:** refusing to activate a games job with an odd batch;
+  fishtest-style pseudo-count regularization, or the exact MLE GSPRT; a floor
+  on `min_units`.
+- **Option implemented:** None of these (pass 18 made new games jobs' batch
+  even and bounded the Elo hypotheses to ±1000).
+- **Justification:** Such jobs are found with `SELECT job_id FROM
+  job_game_config WHERE games_per_batch % 2 = 1`; their verdicts should be
+  read as biased and the jobs re-run. The approximation keeps α at the
+  hypotheses, and the minimum is the admin's to set.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the

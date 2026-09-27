@@ -154,6 +154,15 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   value (MAGPIE `e98a5244`) — all fixed; the adversarial check found 1 medium
   (a commented-out key refused; MAGPIE `f3fc1927`, pinned), fixed. KL-64,
   KL-65, KL-68 and KL-86 updated. The loop continues.
+- **Pass 18 (follow-up: pass 17's diff, and the job statistics):** 1 high and 3
+  medium from the reviewers — a `games` job at the default batch of 1 gave
+  player 1 every first move, so SPRT passed identical players (a games batch
+  is now even, default 2); MAGPIE's comment rule refusing ordinary comments
+  and missing the key it was for (redesigned: warn, never refuse; MAGPIE
+  `65ad3348`); a job deleted while its admin page was open keeping its
+  actions (`E-11c`) — all fixed; the adversarial check found 1 medium
+  (MAGPIE's test not compiling in the dev build CI uses; MAGPIE `8f2f5d75`,
+  pinned), fixed. KL-86 updated; KL-87 added. The loop continues.
 
 ---
 
@@ -2712,7 +2721,8 @@ With it: whole-number settings are refused past an `int`'s range rather than
 truncated (`maxtasks 4294967296` read as 0, "no limit"); a UTF-8 byte-order
 mark is skipped (it made `server` an unknown setting); a comment holding
 `apikey bt_` is refused (a key appended to a last comment line was swallowed
-and the run went anonymous); an `apikey` holding a space is refused; a
+and the run went anonymous — narrowed in 17.7, and replaced by a warning in
+pass 18); an `apikey` holding a space is refused; a
 setting's name in the wrong case is shown, saying settings are lowercase; the
 fixture README says which files birdtest's CI replaces. **Verified:**
 `test_client_state` fails on the committed parser and passes; MAGPIE's
@@ -2791,4 +2801,139 @@ takes `+5`, `007` and `2147483647` and refuses `0x10`, `1e3` and
 - `terraform fmt -check`, `validate`, and each new validation refusing its
   bad value while the defaults pass; the state migration replayed against a
   local SSM emulator.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks.
+
+## Pass 18 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`20a27fd..ec43aef`), and
+MAGPIE's `3565279b..f3fc1927`, one reviewer per part: frontend (tier 5
+natively); MAGPIE; infrastructure, docs and scripts. Plus one area not examined
+in this run: **the job statistics** — the SPRT, the pentanomial, how results
+become counts, the finish check, and what the job page shows.
+
+**Findings: 1 high, 3 medium** from the four reviewers (frontend 1 medium, 6
+low; MAGPIE 2 medium, 6 low; infrastructure, docs and scripts none, 11 low, 1
+unconfirmed; statistics 1 high, 6 low, 1 unconfirmed). All fixed; MAGPIE's
+comment rule, patched in 17.5 and 17.7, is redesigned rather than patched a
+third time.
+
+### 18.1 High — a `games` job at the default batch gave player 1 every first move, and SPRT passed identical players (statistics reviewer)
+
+MAGPIE gives player 1 the first move in a run's first game and alternates, and
+every task is a run of its own. At the default `games_per_batch` of 1 player 1
+moved first in every game of the job. **Shown** with MAGPIE's own executor
+path on the seeds birdtest dispatches, two identical players: 3,000 one-game
+tasks scored 0.560 for player 1 (+41.9 Elo), where two-game tasks scored 0.490;
+walked through birdtest's LLR at ±10, the job passed H1 after 358 games. Any
+odd batch leans the same way, by less (+13.9 at 3, +8.3 at 5). Game pairs were
+unaffected. **Fix:** a `games` job's batch must be even, and defaults to 2;
+the form steps by two and says why; PLAN explains it, and KL-87 gives the query
+that finds jobs made before with an odd batch, whose verdicts are biased.
+**Verified:** `a_games_batch_must_be_even` fails on the committed validation
+and passes; E-5 and tier 6's cases now use even batches.
+
+### 18.2 Medium — MAGPIE's comment rule refused ordinary comments and missed the key it was for (MAGPIE reviewer)
+
+17.7's rule refused a comment holding `apikey` glued to other text before
+`bt_` — `# paste yours as "apikey bt_..." below`, `# old key:apikey bt_x` —
+though PLAN says `#` lines are ignored; and it missed a key appended to a
+comment ending in a blank, a tab, a bare `#` or a banner, which then ran
+anonymous. The rule's third fault, so the approach changed. **Fix** (MAGPIE
+`65ad3348`, pinned): no comment is refused; one holding `apikey`, blanks and
+`bt_` is recorded, and a run with no `apikey` prints that line's number beside
+"contributing to … as a new anonymous worker", never the key. PLAN's settings
+section states it and the rules the parser keeps (lowercase names, the range,
+a key's shape, the BOM). **Shown:** with `f3fc1927` the doc comment is refused
+and the banner case silent; with `65ad3348` both load and name their line.
+
+### 18.3 Medium — a job deleted while its admin page was open kept its actions (frontend reviewer)
+
+Only a failed read set the page's "gone"; a job deleted by another admin went
+on offering every action, each answering "no such job", though KL-86 said a
+deleted job disabled them. **Fix:** a 404 from any read, action or the stream
+(`subscribeToJob` gained an `onRefused` callback) marks the job gone: the page
+says so, stops its retries and polls, and disables its actions. **Verified:**
+a new `E-11c` deletes the job through the API while its page is open, then
+clicks Deactivate: it fails on the committed page and passes; the sse unit
+test for `onRefused` passes.
+
+### 18.4 Low findings
+
+**Fixed:**
+- Statistics: Elo hypotheses are bounded to ±1000 (past it both are an
+  expected score of 1 and the job runs to its cap); the job page says "LLR x,
+  bounds [lo, hi]" rather than "within" when x is outside, and stops saying
+  "not acted on until N" once N are in; PLAN no longer credits fishtest with
+  the exact approximation.
+- MAGPIE: an `apikey` is `bt_` then letters, digits and underscores (a
+  no-break space made a key the server refused); the range refusal names the
+  range; a negative `maxtasks` is tested as refused without its value; the
+  fixture README rewrapped.
+- Admin job page: after starting an export, a failed read is the export's to
+  retry, not the action's error; a job that never existed shows no
+  "Loading…"; an inactive job's allocation reads "Set: 7% (offered to nobody
+  while inactive)"; E-11b asserts its held read carried the old status, with a
+  wider margin.
+- `runbook-check.sh`: a backslash before blanks and a comment is refused; the
+  header's HTML-block and quoted-`#` limits are stated plainly.
+- Docs: README says a missing parameter's backup fails before starting (only
+  the staleness alarm reports it), that `removed` works on an apply (a
+  `destroy` first deletes), and to rotate after the migrating apply; RUNBOOK
+  §6 names a drill's `GITHUB_TOKEN` parameter; PLAN's tree and KL-86 wording;
+  the `name_suffix` message names `-backup` alone; 17.5 notes it was
+  superseded.
+
+**Recorded:** KL-87 (games jobs made with an odd batch; the normal
+approximation's LLR in near-zero-variance samples; type I error with no
+minimum and wide bounds); KL-86 (two export pollers while a read fails).
+**Left:** the checker's refusal of a closer indented 1–3 columns and of
+non-ASCII data in a heredoc (both fail safe); ARNs in `ecs.tf` and `backup.tf`
+hard-coding the `aws` partition.
+
+### 18.5 Adversarial check of the pass's fixes
+
+**1 medium, fixed.**
+
+- **MAGPIE's test did not compile in the dev build.** `65ad3348`'s new loop
+  declared a second `contents` inside `test_client_state`; the dev build's
+  `-Wshadow -Werror` refused it, so `make magpie_test` — what birdtest's
+  contract job and MAGPIE's CI build — failed at the pinned commit. This
+  audit's MAGPIE runs had built `no_pgo_release`, which lacks the flags.
+  **Fix** (MAGPIE `8f2f5d75`, pinned): the variable renamed. **Verified:**
+  `make magpie_test BUILD=dev` builds, and `magpie_test contribute` passes
+  under its sanitizers; the dev build is now part of every MAGPIE check here.
+
+**Lows fixed:** after starting an export the button stays off until a read
+shows it (a failed read left it on, and a second click got a 409); a job found
+gone clears the last action's notice and the export error; a completed job's
+allocation reads "Was: 4% (completed)"; the job form's Elo inputs carry the
+±1000 limits; the ±1000 comment gives the right reason (saturation begins near
+6,400 Elo; the bound is policy); TESTING's `I-JOB-1b` says the bound covers
+game pairs too; PLAN names an empty `apikey` and points at the even-batch
+explanation; the checker's header names the quoted `\ #` it refuses.
+**Held:** an even batch is balanced whatever the threads, capture or
+redundancy, and a short task cannot count (a games result must carry exactly
+`games_per_batch` games) — measured with MAGPIE, identical players: batch 1
+0.561 (+42 Elo), batch 2 0.496, batch 4 0.503; rating pools read only
+game-pairs jobs, so odd-batch games jobs never reached a rating; no caller
+makes an odd games batch; switching the form's type to games bumps an odd
+batch; no fixture or test has |Elo| past 1000; E-11, E-11b and E-11c passed
+six times each; a job deleted with no click is shown gone within seconds; the
+commented-key warning prints once, never the key, and not when a key is set.
+
+### 18.6 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **596 of 596** (two new: `a_games_batch_must_be_even` and
+  `elo_hypotheses_past_a_thousand_are_refused`, each failing on the committed
+  validation).
+- **MAGPIE's suite** at `65ad3348` (release): **70 of 70**; at `8f2f5d75`, the
+  dev build and its `contribute` pass; `format.py` passes.
+- **Tier 6, natively, every case** at `65ad3348` (the binary `8f2f5d75`
+  builds is the same): passed.
+- **Tier 5, natively: 14 of 14** (`E-11c` new; `E-8`'s pattern follows the
+  job page's "bounds" wording); `E-11c` fails on the committed page.
+- `npm run check`: 0 errors, 0 warnings; `npm test`: **120 of 120** (the sse
+  `onRefused` test new).
 - `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks.

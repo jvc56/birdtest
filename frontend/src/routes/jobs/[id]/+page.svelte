@@ -148,14 +148,14 @@
             Completed: {sprtLabel(stats.games.decided.status)}, LLR
             {stats.games.decided.llr.toFixed(3)} after {stats.games.decided.units.toLocaleString()}
             {stats.games.unit}{stats.games.decided.units === 1 ? '' : 's'}. With the {stats.games.unit}s that were in flight then, LLR
-            {stats.games.sprt.llr.toFixed(3)} within [{stats.games.sprt.lower_bound.toFixed(2)},
+            {stats.games.sprt.llr.toFixed(3)}, bounds [{stats.games.sprt.lower_bound.toFixed(2)},
             {stats.games.sprt.upper_bound.toFixed(2)}].
           </p>
         {:else}
           <p class="text-sm text-muted-foreground">
-            {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)} within
+            {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}, bounds
             [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
-            {#if stats.games.min_units > 0}
+            {#if stats.games.min_units > 0 && stats.games.units_completed < stats.games.min_units}
               SPRT is not acted on until {stats.games.min_units.toLocaleString()}
               {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
             {:else}

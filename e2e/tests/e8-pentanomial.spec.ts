@@ -23,7 +23,7 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and SPRT ver
   const verdict = sprt.locator('p', { hasText: 'Completed:' });
   await expect(verdict).toBeVisible();
   expect((await verdict.innerText()).replace(/\s+/g, ' ').trim()).toMatch(
-    /^Completed: (passed \(H1 accepted\)|stopped at its cap), LLR -?\d+\.\d{3} after [\d,]+ pairs\. With the pairs that were in flight then, LLR -?\d+\.\d{3} within \[-?\d+\.\d{2}, -?\d+\.\d{2}\]\.$/
+    /^Completed: (passed \(H1 accepted\)|stopped at its cap), LLR -?\d+\.\d{3} after [\d,]+ pairs\. With the pairs that were in flight then, LLR -?\d+\.\d{3}, bounds \[-?\d+\.\d{2}, -?\d+\.\d{2}\]\.$/
   );
 
   const table = sprt.locator('table');

@@ -68,18 +68,18 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 211 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (8), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 119 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (11), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1 Unit | 213 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (10), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 120 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 158 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 196 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (36), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 12 | Playwright journeys `E-1`..`E-11` (`E-11` in two tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 594 backend tests (the per-tier counts above are
+--run-ignored all` runs 596 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -1090,6 +1090,12 @@ job creation touches needs one caller here.
   every column populated, and reads back identical. *(Covered:
   `jobs::each_job_type_stores_every_setting_it_was_created_with`,
   `jobs::a_leave_generation_job_stores_every_setting_it_was_created_with`.)*
+- `I-JOB-1b` A `games` job's batch is even (default 2), and a games or
+  game-pairs job's Elo hypotheses lie within ±1000: MAGPIE gives player 1 the first move in each
+  task's first game, so at a batch of 1 player 1 moved first in every game and
+  SPRT passed two identical players (thirty-second audit, pass 18). *(Covered:
+  `routes::admin::tests::a_games_batch_must_be_even`,
+  `routes::admin::tests::elo_hypotheses_past_a_thousand_are_refused`.)*
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
   accepted; two with different `movegen_margin` are rejected. The regression
@@ -2568,10 +2574,13 @@ admin in once and the admin journeys reuse its storage state.
   sending it — through an action's read too, since only Activate sends it
   (the job's own allocation is shown beside the box). And `E-11b`: a read
   started before a live payload does not land over it — a slow retry put back
-  the status the stream had moved past, on a job that sends nothing more.
-  *(Covered: `e11-admin-job-first-read.spec.ts`, two tests: the first
+  the status the stream had moved past, on a job that sends nothing more. And
+  `E-11c`: a job deleted while its page is open (by another admin) is said to
+  be gone and its actions disabled — only a failed read noticed before.
+  *(Covered: `e11-admin-job-first-read.spec.ts`, three tests: the first
   `GET /api/jobs/:id` and the first two gap reads answered `503`; and the
-  stream mocked to say `completed` while a retry's read is held.)* The reads ran one after another: the page said
+  stream mocked to say `completed` while a retry's read is held, asserting
+  the held read carried the old status; and a delete through the API.)* The reads ran one after another: the page said
   "No worker has declined this job", showed 100, and Activate sent it
   (thirty-second audit, pass 16).
 

@@ -177,7 +177,15 @@
 <form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
     <label class="label" for="type">Job type</label>
-    <select id="type" class="input" bind:value={jobType}>
+    <select
+      id="type"
+      class="input"
+      bind:value={jobType}
+      on:change={() => {
+        // A games batch is even (see the field below).
+        if (jobType === 'games' && batchSize % 2 !== 0) batchSize += 1;
+      }}
+    >
       {#each types as type}<option value={type}>{jobTypeLabel(type)}</option>{/each}
     </select>
   </div>
@@ -271,7 +279,20 @@
         <label class="label" for="batch">
           {jobType === 'games' ? 'Games' : 'Pairs'} per batch
         </label>
-        <input id="batch" type="number" min="1" class="input" bind:value={batchSize} />
+        <input
+          id="batch"
+          type="number"
+          min={jobType === 'games' ? 2 : 1}
+          step={jobType === 'games' ? 2 : 1}
+          class="input"
+          bind:value={batchSize}
+        />
+        {#if jobType === 'games'}
+          <p class="mt-1 text-xs text-muted-foreground">
+            Even: MAGPIE gives player 1 the first move in a task's first game and alternates, so
+            an odd batch hands player 1 the first move more often.
+          </p>
+        {/if}
       </div>
       <div>
         <label class="label" for="min">Min before SPRT</label>
@@ -285,8 +306,8 @@
     <div class="grid grid-cols-4 gap-3">
       <div><label class="label" for="alpha">α</label><input id="alpha" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtAlpha} /></div>
       <div><label class="label" for="beta">β</label><input id="beta" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtBeta} /></div>
-      <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" step="any" class="input" bind:value={eloLow} /></div>
-      <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" step="any" class="input" bind:value={eloHigh} /></div>
+      <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloLow} /></div>
+      <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloHigh} /></div>
     </div>
   {:else}
     <div>

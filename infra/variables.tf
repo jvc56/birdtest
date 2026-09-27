@@ -25,7 +25,7 @@ variable "name_suffix" {
   # apply fails half-way (checked against every name the stack builds).
   validation {
     condition     = var.name_suffix != "-backup"
-    error_message = "name_suffix must not be a suffix production's own resource names already use, such as \"-backup\"; use one such as \"-dr\"."
+    error_message = "name_suffix must not be \"-backup\": the copy's task role would be production's birdtest-backup-task. Use one such as \"-dr\"."
   }
 }
 

@@ -998,6 +998,12 @@ fn one() -> i32 {
     1
 }
 
+/// A games job's default batch: even, so each task gives each player the
+/// first move equally (see [`validate_job_body`]).
+fn two() -> i32 {
+    2
+}
+
 /// Per-job-type configuration, expanded into typed columns rather than stored
 /// as JSON.
 #[derive(Deserialize)]
@@ -1013,7 +1019,7 @@ enum JobTypeConfig {
     Game {
         player1_config_id: Uuid,
         player2_config_id: Uuid,
-        #[serde(default = "one")]
+        #[serde(default = "two")]
         games_per_batch: i32,
         min_games: i32,
         max_games: i32,
@@ -1280,6 +1286,15 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         if !(elo_low.is_finite() && elo_high.is_finite() && elo_low < elo_high) {
             err = err.with_field("elo_high", "must be a finite number greater than elo_low");
         }
+        // A bound on what a hypothesis may say: far enough out, both are an
+        // expected score of 1 to the last bit (from about 6,400 Elo), the LLR
+        // is always 0 and the job runs to its cap. Past a thousand no job
+        // between two word-game players means anything.
+        for (field, value) in [("elo_low", elo_low), ("elo_high", elo_high)] {
+            if value.is_finite() && value.abs() > 1000.0 {
+                err = err.with_field(field, "must be between -1000 and 1000");
+            }
+        }
         err
     };
 
@@ -1298,10 +1313,25 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         }
         JobTypeConfig::Game {
             games_per_batch, min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high, ..
-        } => sprt(
-            err, "game", *games_per_batch, *min_games, *max_games, *sprt_alpha, *sprt_beta,
-            *elo_low, *elo_high,
-        ),
+        } => {
+            let mut err = sprt(
+                err, "game", *games_per_batch, *min_games, *max_games, *sprt_alpha, *sprt_beta,
+                *elo_low, *elo_high,
+            );
+            // MAGPIE alternates the first mover within one run, from player 1,
+            // and every task is a run of its own: at a batch of 1 player 1
+            // moved first in every game of the job, and SPRT passed two
+            // identical players on the first move alone (+42 Elo; the audit's
+            // pass 18). An even batch gives each player the first move equally
+            // in every task. Game pairs swap it within each pair already.
+            if *games_per_batch >= 1 && games_per_batch % 2 != 0 {
+                err = err.with_field(
+                    "games_per_batch",
+                    "must be even, so each player moves first in half of every task's games",
+                );
+            }
+            err
+        }
         JobTypeConfig::GamePair {
             pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high, ..
         } => sprt(
@@ -3258,6 +3288,48 @@ mod tests {
             fields(validate_job_body(&game_pairs(serde_json::json!({ "pairs_per_batch": 0 })))),
             ["pairs_per_batch"]
         );
+    }
+
+    /// An odd games batch gives player 1 the first move more often in every
+    /// task; at the old default of 1, in every game. An even one is balanced.
+    #[test]
+    fn a_games_batch_must_be_even() {
+        let games = |batch: serde_json::Value| {
+            let mut config = serde_json::json!({
+                "job_type": "games",
+                "player1_config_id": Uuid::nil(),
+                "player2_config_id": Uuid::nil(),
+                "min_games": 100,
+                "max_games": 1000,
+            });
+            if !batch.is_null() {
+                config["games_per_batch"] = batch;
+            }
+            body(config)
+        };
+        for odd in [1, 3, 7] {
+            assert_eq!(fields(validate_job_body(&games(serde_json::json!(odd)))), ["games_per_batch"]);
+        }
+        assert!(validate_job_body(&games(serde_json::json!(2))).is_ok());
+        assert!(validate_job_body(&games(serde_json::json!(10))).is_ok());
+        // The default is even.
+        assert!(validate_job_body(&games(serde_json::Value::Null)).is_ok());
+    }
+
+    /// Past a thousand Elo both hypotheses are an expected score of 1: the
+    /// LLR is always 0 and the job runs to its cap without a verdict.
+    #[test]
+    fn elo_hypotheses_past_a_thousand_are_refused() {
+        assert_eq!(
+            fields(validate_job_body(&game_pairs(
+                serde_json::json!({ "elo_low": 7000.0, "elo_high": 8000.0 })
+            ))),
+            ["elo_low", "elo_high"]
+        );
+        assert!(validate_job_body(&game_pairs(
+            serde_json::json!({ "elo_low": -1000.0, "elo_high": 1000.0 })
+        ))
+        .is_ok());
     }
 
     /// Inverted hypotheses flip the LLR's sign: SPRT would accept the wrong one.

@@ -32,7 +32,13 @@ export function resubscribeDelay(failures: number, random: () => number = Math.r
  * this as its cleanup — registering `onDestroy` in here instead would run
  * outside component initialization and throw.
  */
-export function subscribeToJob<T>(jobId: string, onUpdate: (stats: T) => void): () => void {
+export function subscribeToJob<T>(
+  jobId: string,
+  onUpdate: (stats: T) => void,
+  // Told the status when the stream stops for good, so a page can say its job
+  // is gone rather than go on offering it.
+  onRefused?: (status: number) => void
+): () => void {
   let source: EventSource | null = null;
   let retry: ReturnType<typeof setTimeout> | null = null;
   let unsubscribed = false;
@@ -55,6 +61,7 @@ export function subscribeToJob<T>(jobId: string, onUpdate: (stats: T) => void): 
       // the API answered those as 404 too).
       if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
         console.debug(`job stream refused (${status}); not subscribing again`);
+        onRefused?.(status);
         return;
       }
     }

@@ -87,7 +87,7 @@ test('E-11: an admin job page whose first read fails shows only what the server 
   await page.getByRole('button', { name: 'Deactivate', exact: true }).click();
   await expect(page.getByText('Job deactivated.')).toBeVisible();
   await expect(page.locator('#alloc')).toHaveValue('55');
-  await expect(page.getByText('Now: 7%')).toBeVisible();
+  await expect(page.getByText(/Set: 7% \(offered to nobody while inactive\)/)).toBeVisible();
   await api.dispose();
 });
 
@@ -124,16 +124,20 @@ test('E-11b: a slow read does not undo what the stream has since said', async ({
   await page.route(`**/api/jobs/${id}/stream`, (route) => {
     streams += 1;
     if (streams >= 2) current = as('completed');
-    const body = `retry: ${streams === 1 ? 6000 : 600000}\nevent: stats\ndata: ${JSON.stringify(current)}\n\n`;
+    const body = `retry: ${streams === 1 ? 9000 : 600000}\nevent: stats\ndata: ${JSON.stringify(current)}\n\n`;
     const fulfilled = route.fulfill({ headers: { 'content-type': 'text/event-stream' }, body });
     if (streams >= 2) fulfilled.then(() => setTimeout(saidCompleted, 500));
     return fulfilled.catch(() => {});
   });
   let jobReads = 0;
+  let heldStatus = '';
   await page.route(`**/api/jobs/${id}`, async (route) => {
     jobReads += 1;
     const snapshot = JSON.stringify(current);
-    if (jobReads === 2) await completedSaid;
+    if (jobReads === 2) {
+      heldStatus = current.job.status as string;
+      await completedSaid;
+    }
     return route.fulfill({ contentType: 'application/json', body: snapshot }).catch(() => {});
   });
   // The first gap read fails, so the page retries (after five seconds).
@@ -146,10 +150,45 @@ test('E-11b: a slow read does not undo what the stream has since said', async ({
   await expect(page.getByText(/Could not load all of this job/)).toBeVisible();
   await expect.poll(() => jobReads, { timeout: 20_000 }).toBeGreaterThanOrEqual(2);
   await completedSaid;
+  // The held read did carry the old status, or this proves nothing.
+  expect(heldStatus).toBe('active');
   await expect(page.getByText(/Could not load all of this job/)).toBeHidden({ timeout: 10_000 });
   const jobHeader = page.locator('header', { has: page.getByRole('heading', { level: 1 }) });
   await expect(jobHeader.getByText('completed', { exact: true })).toBeVisible();
   await page.waitForTimeout(1000);
   await expect(jobHeader.getByText('completed', { exact: true })).toBeVisible();
+  await api.dispose();
+});
+
+/**
+ * E-11c: a job deleted while its page is open -- by another admin, say -- is
+ * said to be gone and offered no more. Only a failed read noticed before, so
+ * every action stayed, each answering "no such job" (thirty-second audit,
+ * pass 18).
+ */
+test('E-11c: a job deleted while its page is open offers nothing more', async ({ page }) => {
+  const api = await AdminApi.open();
+  const a = await api.createStaticConfig(`e11c-a-${Date.now()}`, 'equity');
+  const b = await api.createStaticConfig(`e11c-b-${Date.now()}`, 'score');
+  const id = await api.activeJob(
+    {
+      job_type: 'game_pairs',
+      player1_config_id: a,
+      player2_config_id: b,
+      pairs_per_batch: 1,
+      min_pairs: 100000,
+      max_pairs: 200000
+    },
+    3
+  );
+  await api.post(`/api/admin/jobs/${id}/deactivate`);
+  await page.goto(`/admin/jobs/${id}`);
+  await expect(page.getByRole('heading', { name: 'Controls' })).toBeVisible();
+
+  await api.delete(`/api/admin/jobs/${id}`);
+  await page.getByRole('button', { name: 'Deactivate', exact: true }).click();
+  await expect(page.getByText('This job no longer exists.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Activate', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Delete job', exact: true })).toBeDisabled();
   await api.dispose();
 });

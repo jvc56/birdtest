@@ -790,7 +790,7 @@ def case_positions(ctx: Context) -> None:
     """M-7: every position `capture_positions` stores is a CGP MAGPIE loads."""
     deactivate_everything(ctx)
     job_id = create_and_activate(ctx, ctx.data,
-                                 games_body(static_players(ctx), 1, capture_positions=True))
+                                 games_body(static_players(ctx), 2, capture_positions=True))
     worker = Worker(ctx, "m7")
     try:
         worker.run(tasks=1)
@@ -994,7 +994,7 @@ def case_capture(ctx: Context) -> None:
     try:
         # First, from a worker with no identity yet: the assignment that mints
         # one. A games job capturing positions, so its result carries them.
-        one(games_body(static_players(ctx), 1, capture_positions=True), ctx.data)
+        one(games_body(static_players(ctx), 2, capture_positions=True), ctx.data)
         expect(worker.uuid() is not None, "the first assignment minted no worker UUID")
         # Players with a wordmap, so the assignment pins a derived file.
         one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,

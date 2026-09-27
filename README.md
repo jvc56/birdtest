@@ -397,8 +397,8 @@ writes them, so their values stay out of its state — so make the first apply
 with `-var desired_count=0 -var scheduled_tasks_enabled=false`, create them as
 below, and apply again with the service at one task and the schedules on:
 started before they exist, the service's tasks cannot start, the
-derived-data builder fails every five minutes, and a 03:00 backup fails and
-alarms.
+derived-data builder fails every five minutes, and a 03:00 backup fails
+without starting, which only the 36-hour staleness alarm reports.
 
 **Terraform's state is local** — `infra/terraform.tfstate`, ignored by git, on
 the machine that applied. RUNBOOK.md's recovery steps and both ops scripts read
@@ -411,9 +411,10 @@ records no input variables, and every later apply and the region-loss rebuild
 read them. Neither holds a secret. (A stack applied before the thirty-second
 audit's pass 17 managed the two SSM parameters as resources, and every refresh
 wrote their decrypted values into the state: its next apply drops them from
-the state without deleting them, but older copies of the state —
+the state without deleting them (an apply does; a `destroy` run first would
+delete them), but older copies of the state —
 `infra/terraform.tfstate.backup` among them — and a versioned backend's
-history still hold them — rotate both, as below and in
+history still hold them — so after that apply, rotate both, as below and in
 RUNBOOK.md, "Rotating the database password".)
 
 The database master password is set by hand, not managed by RDS (RDS rotation

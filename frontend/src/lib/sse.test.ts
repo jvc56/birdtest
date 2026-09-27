@@ -138,6 +138,15 @@ describe('F-SSE-3 unsubscribe', () => {
     expect(FakeEventSource.instances).toHaveLength(1);
   });
 
+  it('a job that is gone is said so to the page', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ status: 404 })));
+    const refused = vi.fn();
+    subscribeToJob('gone', vi.fn(), refused);
+    FakeEventSource.instances[0].giveUp();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(refused).toHaveBeenCalledWith(404);
+  });
+
   it('a transient error (still reconnecting) does not open a second stream', () => {
     subscribeToJob('j', vi.fn());
     FakeEventSource.instances[0].readyState = FakeEventSource.CONNECTING;

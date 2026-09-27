@@ -55,9 +55,30 @@
   let notice = '';
   let rebuild: ArtifactRebuild[] | null = null;
   let jobExport: JobExport | null = null;
+  // An export started here that no read has shown yet: the button stays off
+  // (its read failing left "Export results" up, and a second click a 409).
+  let exportStarted = false;
   let exportPoll: number | undefined;
   // Set when the page goes, so a request in flight then schedules nothing.
   let destroyed = false;
+
+  // A 404 from anything -- a read, an action, the stream -- means the job was
+  // deleted, here or elsewhere: say so, and offer nothing more. (Only a read
+  // noticed before, so a job deleted by another admin kept every action.)
+  function goneIf(e: unknown): boolean {
+    if (e instanceof ApiError && e.status === 404) markGone();
+    return gone;
+  }
+
+  function markGone() {
+    gone = true;
+    loadError = 'This job no longer exists.';
+    notice = '';
+    error = '';
+    exportError = '';
+    window.clearTimeout(retry);
+    window.clearTimeout(exportPoll);
+  }
 
   function fillAllocation(value: JobStats) {
     if (allocationFilled) return;
@@ -81,18 +102,13 @@
     if (job.status === 'fulfilled') {
       if (streamPayloads === payloadsAtStart) stats = job.value;
       fillAllocation(job.value);
-    } else if (job.reason instanceof ApiError && job.reason.status === 404) {
-      gone = true;
-    } else failures.push((job.reason as Error).message);
+    } else if (!goneIf(job.reason)) failures.push((job.reason as Error).message);
     if (gapsRead.status === 'fulfilled') gaps = gapsRead.value;
     else if (!gone) failures.push((gapsRead.reason as Error).message);
     if (exportRead.status === 'fulfilled') applyExport(exportRead.value);
     else if (!gone) exportError = `Could not check the export: ${(exportRead.reason as Error).message}`;
-    loadError = gone
-      ? 'This job no longer exists.'
-      : failures.length
-        ? `Could not load all of this job: ${[...new Set(failures)].join('; ')}`
-        : '';
+    if (gone) return;
+    loadError = failures.length ? `Could not load all of this job: ${[...new Set(failures)].join('; ')}` : '';
     // And again in a few seconds: an inactive job sends no live payload.
     if (!gone && (failures.length || exportRead.status === 'rejected')) {
       retry = window.setTimeout(() => !reloading && reload(), 5000);
@@ -113,6 +129,7 @@
 
   function applyExport(value: JobExport | null) {
     jobExport = value;
+    exportStarted = false;
     exportError = '';
     if (value?.state === 'running') pollExport();
   }
@@ -139,9 +156,19 @@
     notice = '';
     try {
       await api.startExport(jobId);
+      exportStarted = true;
+    } catch (e) {
+      if (!goneIf(e)) error = (e as Error).message;
+      busy = false;
+      return;
+    }
+    // Started: a read that fails now is the export's to retry, not the
+    // action's error (it left "Export results" up, and a second click a 409).
+    try {
       applyExport(await fetchExport());
     } catch (e) {
-      error = (e as Error).message;
+      exportError = `Could not check the export: ${(e as Error).message}`;
+      pollExport();
     } finally {
       busy = false;
     }
@@ -153,12 +180,16 @@
 
   onMount(() => {
     reload();
-    const unsubscribe = subscribeToJob<JobStats>(jobId, (value) => {
-      streamPayloads += 1;
-      stats = value;
-      fillAllocation(value);
-      if ((loadError || exportError) && !reloading && !gone) reload();
-    });
+    const unsubscribe = subscribeToJob<JobStats>(
+      jobId,
+      (value) => {
+        streamPayloads += 1;
+        stats = value;
+        fillAllocation(value);
+        if ((loadError || exportError) && !reloading && !gone) reload();
+      },
+      (status) => status === 404 && markGone()
+    );
     return () => {
       destroyed = true;
       window.clearTimeout(exportPoll);
@@ -189,7 +220,7 @@
       notice = message;
       await reload();
     } catch (e) {
-      error = (e as Error).message;
+      if (!goneIf(e)) error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -239,7 +270,7 @@
           ? `; ${foreign} holding bytes nothing here accounts for, which workers refuse — restore the right object version or force a rebuild.`
           : '.');
     } catch (e) {
-      error = (e as Error).message;
+      if (!goneIf(e)) error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -284,7 +315,7 @@
         `Merged ${merged.folds_merged.toLocaleString()} staged results into ` +
         `${merged.racks_updated.toLocaleString()} racks.`;
     } catch (e) {
-      error = (e as Error).message;
+      if (!goneIf(e)) error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -301,7 +332,7 @@
       await api.deleteJob(jobId);
       goto('/jobs');
     } catch (e) {
-      error = (e as Error).message;
+      if (!goneIf(e)) error = (e as Error).message;
     } finally {
       busy = false;
     }
@@ -314,7 +345,7 @@
 {#if notice}<p class="mb-4 text-success">{notice}</p>{/if}
 
 {#if !stats}
-  <p class="text-muted-foreground">Loading…</p>
+  {#if !gone}<p class="text-muted-foreground">Loading…</p>{/if}
 {:else}
   <div class="space-y-6">
     <header class="flex flex-wrap items-center gap-3">
@@ -338,7 +369,15 @@
             on:input={() => (allocationFilled = true)}
           />
           <p class="mt-1 text-xs text-muted-foreground">
-            Now: {stats.job.allocation === null ? 'none' : `${stats.job.allocation}%`}
+            {#if stats.job.allocation === null}
+              Set: none
+            {:else if stats.job.status === 'active'}
+              Now: {stats.job.allocation}%
+            {:else if stats.job.status === 'completed'}
+              Was: {stats.job.allocation}% (completed)
+            {:else}
+              Set: {stats.job.allocation}% (offered to nobody while {stats.job.status})
+            {/if}
           </p>
         </div>
         <button
@@ -449,7 +488,7 @@
           <button
             class="btn-secondary"
             on:click={startExport}
-            disabled={busy || gone || jobExport?.state === 'running'}
+            disabled={busy || gone || exportStarted || jobExport?.state === 'running'}
           >
             {jobExport ? 'Export again' : 'Export results'}
           </button>
