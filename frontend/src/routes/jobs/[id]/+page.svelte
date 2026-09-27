@@ -6,6 +6,7 @@
   import { session } from '$lib/auth';
   import { duration, datetime, jobTypeLabel, sprtLabel, sprtState } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
+  import CompletionNote from '$lib/components/CompletionNote.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import OutcomeChart from '$lib/components/OutcomeChart.svelte';
@@ -74,6 +75,7 @@
         <a href="/admin/jobs/{stats.job.id}" class="btn-secondary ml-auto no-underline">Manage</a>
       {/if}
     </header>
+    <CompletionNote {stats} />
 
     <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <div class="card">

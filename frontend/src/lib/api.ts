@@ -192,6 +192,18 @@ export interface GameStats {
   decided?: { status: SprtResult['status']; llr: number; units: number };
 }
 
+/**
+ * How a job was completed. `forced` is an admin's force-complete; otherwise
+ * `reason` is the server's: the SPRT verdict (`passed`, `failed`,
+ * `terminated_at_max`), `last generation built`, or none for an opening-rack
+ * job whose racks were all analysed.
+ */
+export interface Completion {
+  at: string;
+  forced: boolean;
+  reason: string | null;
+}
+
 export interface JobStats {
   job: {
     id: string;
@@ -243,6 +255,8 @@ export interface JobStats {
   /** Contributors beyond the ones listed; the list is capped. */
   other_workers: number;
   eta_seconds: number | null;
+  /** How a completed job came to be completed; absent while it is not. */
+  completion?: Completion;
 }
 
 export interface PlayerConfig {

@@ -7,6 +7,7 @@ import {
   optionalNumber,
   sprtLabel,
   sprtState,
+  completionText,
   workerLabel
 } from './format';
 
@@ -167,5 +168,47 @@ describe('F-FMT-6 form numbers', () => {
   it('names the fields a request would send blank', () => {
     expect(blankFields({ a: 1, b: null, c: Number.NaN, d: 'x', e: 0 })).toEqual(['b', 'c']);
     expect(blankFields({ a: 1 })).toEqual([]);
+  });
+});
+
+describe('F-FMT-12 completionText', () => {
+  const games = (decided?: { status: string; llr: number; units: number }) => ({
+    unit: 'pair',
+    max_units: 5000,
+    sprt: { lower_bound: -2.94, upper_bound: 2.94 },
+    decided
+  });
+  const pairs = { job_type: 'game_pairs' };
+  it('tells a test that decided from a cap that was reached', () => {
+    expect(
+      completionText({
+        job: pairs,
+        completion: { forced: false, reason: 'passed' },
+        games: games({ status: 'passed', llr: 2.95, units: 1200 })
+      })
+    ).toBe('the SPRT passed (H1 accepted) after 1,200 pairs: LLR 2.950 reached the upper bound 2.94');
+    expect(
+      completionText({
+        job: pairs,
+        completion: { forced: false, reason: 'terminated_at_max' },
+        games: games({ status: 'terminated_at_max', llr: 0.5, units: 5000 })
+      })
+    ).toBe('it reached its cap of 5,000 pairs before the SPRT decided (LLR 0.500, bounds [-2.94, 2.94])');
+  });
+  it('says when an admin forced it', () => {
+    expect(completionText({ job: pairs, completion: { forced: true, reason: null }, games: games() })).toBe(
+      'an admin force-completed it before its test decided'
+    );
+  });
+  it('names the other job types\' own ends', () => {
+    expect(
+      completionText({ job: { job_type: 'opening_rack' }, completion: { forced: false, reason: null } })
+    ).toBe('every rack was analysed');
+    expect(
+      completionText({
+        job: { job_type: 'leave_generation' },
+        completion: { forced: false, reason: 'last generation built' }
+      })
+    ).toBe('its last generation was built');
   });
 });

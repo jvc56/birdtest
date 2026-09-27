@@ -106,3 +106,44 @@ export function blankFields(body: Record<string, unknown>): string[] {
     .filter(([, value]) => value === null || (typeof value === 'number' && Number.isNaN(value)))
     .map(([field]) => field);
 }
+
+/**
+ * Why a completed job finished, as a sentence: the job page said only
+ * "completed", and a pairs job its test stopped read like one stopped at its
+ * cap. From the completion record and, for a games or pairs job, the decision
+ * and the test's bounds.
+ */
+export function completionText(stats: {
+  job: { job_type: string };
+  completion?: { forced: boolean; reason: string | null };
+  games?: {
+    unit: string;
+    max_units: number;
+    sprt: { lower_bound: number; upper_bound: number };
+    decided?: { status: string; llr: number; units: number };
+  };
+}): string {
+  const completion = stats.completion;
+  const games = stats.games;
+  const units = (n: number, unit: string) => `${n.toLocaleString()} ${unit}${n === 1 ? '' : 's'}`;
+  if (completion?.forced) {
+    return games && !games.decided
+      ? 'an admin force-completed it before its test decided'
+      : 'an admin force-completed it';
+  }
+  const decided = games?.decided;
+  if (games && decided) {
+    const llr = decided.llr.toFixed(3);
+    switch (decided.status) {
+      case 'passed':
+        return `the SPRT passed (H1 accepted) after ${units(decided.units, games.unit)}: LLR ${llr} reached the upper bound ${games.sprt.upper_bound.toFixed(2)}`;
+      case 'failed':
+        return `the SPRT failed (H0 accepted) after ${units(decided.units, games.unit)}: LLR ${llr} reached the lower bound ${games.sprt.lower_bound.toFixed(2)}`;
+      case 'terminated_at_max':
+        return `it reached its cap of ${units(games.max_units, games.unit)} before the SPRT decided (LLR ${llr}, bounds [${games.sprt.lower_bound.toFixed(2)}, ${games.sprt.upper_bound.toFixed(2)}])`;
+    }
+  }
+  if (completion?.reason === 'last generation built') return 'its last generation was built';
+  if (stats.job.job_type === 'opening_rack' && completion) return 'every rack was analysed';
+  return 'it was completed';
+}

@@ -69,9 +69,9 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 129 | Vitest, `frontend/src/lib/`: `format.test.ts` (23), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `ratingHistory.test.ts` (17), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1F Frontend unit | 132 | Vitest, `frontend/src/lib/`: `format.test.ts` (26), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `ratingHistory.test.ts` (17), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 224 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 225 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (6), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 637 backend tests (the per-tier counts above are
+--run-ignored all` runs 638 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -1635,6 +1635,15 @@ permanent.
   `stats::a_job_driven_to_h0_completes_with_its_sprt_failed`,
   `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`.)*
   (Eleventh audit; the in-flight half, twelfth.)
+- `I-STATS-9f` A completed job's stats say how it was completed (`completion`:
+  when, whether an admin forced it, and the server's reason — the SPRT verdict,
+  `last generation built`, or none when an opening-rack job's racks ran out),
+  from its `job.completed` audit row; a job not completed has none. The job
+  pages turn it into "Finished …: …" under the title. *(Covered:
+  `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`,
+  `finish::an_opening_rack_job_completes_once_its_racks_are_handed_out_and_all_accepted`,
+  `finish::a_forced_completion_is_reported_as_forced`; the sentences,
+  `format.test.ts` `F-FMT-12`.)*
 - `I-STATS-9a` **Debounced under load.** With a claim held open the whole time,
   so the job is never idle, the check runs on the `SPRT_CHECK_EVERY`th
   submission and not before, and the open claim's result is still accepted

@@ -13,6 +13,7 @@
   import { subscribeToJob } from '$lib/sse';
   import { jobTypeLabel, sprtLabel, sprtState, duration } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
+  import CompletionNote from '$lib/components/CompletionNote.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
 
@@ -382,6 +383,7 @@
       <JobStatusBadge status={stats.job.status} />
       <a href="/jobs/{jobId}" class="text-sm">public view</a>
     </header>
+    <CompletionNote {stats} />
 
     <div class="card space-y-4">
       <h2 class="text-lg font-medium">Controls</h2>

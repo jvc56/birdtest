@@ -55,6 +55,23 @@ pub struct JobStats {
     /// Estimated seconds to completion from recent throughput, or `None` when
     /// there is not enough recent activity to extrapolate.
     pub eta_seconds: Option<f64>,
+    /// How a completed job came to be completed; absent while it is not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion: Option<Completion>,
+}
+
+/// How a job was completed, from its `job.completed` audit row: a job page
+/// said only "completed", and a pairs job stopped by its test and one stopped
+/// at its cap read the same.
+#[derive(Debug, Serialize)]
+pub struct Completion {
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// Completed by an admin (force-complete) rather than by its own rule.
+    pub forced: bool,
+    /// The server's reason, when it completed the job: the SPRT verdict
+    /// (`passed`, `failed`, `terminated_at_max`) or `last generation built`.
+    /// None for an opening-rack job whose racks were all analysed.
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -461,6 +478,19 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
     let eta_seconds = estimate_eta(&mut *conn, job, &games, tasks_total, tasks_completed).await?;
     let (workers, other_workers) = worker_contributions_on(&mut *conn, job.id).await?;
 
+    let completion = if job.status == crate::models::job::JobStatus::Completed {
+        sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, bool, Option<String>)>(
+            "SELECT created_at, actor_user_id IS NOT NULL, reason FROM audit_log
+             WHERE job_id = $1 AND action = 'job.completed' ORDER BY id DESC LIMIT 1",
+        )
+        .bind(job.id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .map(|(at, forced, reason)| Completion { at, forced, reason })
+    } else {
+        None
+    };
+
     Ok(JobStats {
         job: JobSummary {
             id: job.id,
@@ -485,6 +515,7 @@ async fn compute_inner(conn: &mut PgConnection, job: &Job) -> AppResult<JobStats
         workers,
         other_workers,
         eta_seconds,
+        completion,
     })
 }
 
