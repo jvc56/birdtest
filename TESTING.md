@@ -3377,14 +3377,19 @@ for `leave_generation` deliberately.
 
 GitHub Actions.
 
-**Per pull request** (`.github/workflows/ci.yml`), seven jobs in parallel:
+**Per pull request** (`.github/workflows/ci.yml`), in parallel:
 
-1. **backend** — a Postgres 16 service and a MinIO container, with
-   `TEST_DATABASE_URL` and `TEST_S3_ENDPOINT` pointing at them; `cargo clippy
-   --locked --all-targets -- -D warnings`, then `cargo nextest run --locked
-   --no-fail-fast` (tiers 1, 2, 3 and 4; `backend/.config/nextest.toml` kills a
-   test at ten minutes) and `cargo test --locked --doc`. The `#[ignore]`d
-   tier-6 tests are not run here; the nightly runs them.
+1. **backend** — three kinds of job. **backend-lint**: `cargo clippy --locked
+   --all-targets -- -D warnings` and `cargo test --locked --doc`.
+   **backend-build**: the test binaries, built once and archived (`cargo
+   nextest archive`). **backend-test**, four jobs once the archive is built,
+   each with a Postgres 16 service and a MinIO container
+   (`TEST_DATABASE_URL`, `TEST_S3_ENDPOINT`): a quarter of the tests each,
+   dealt out in turn (`--partition count:N/4`), tiers 1, 2, 3 and 4
+   (`backend/.config/nextest.toml` kills a test at ten minutes). One job
+   running them all took some seven minutes; a quarter takes about the time
+   of its longest test. The `#[ignore]`d tier-6 tests are not run here; the
+   nightly runs them.
 2. **frontend** — `npm ci`, `npm run check`, `npm test` (tier 1F), `npm run
    build`.
 3. **images** — the backend image (which builds the pinned MAGPIE too), a probe
