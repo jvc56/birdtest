@@ -106,6 +106,34 @@ def compose(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", "compose", *args], cwd=REPO_ROOT, check=check)
 
 
+# What the backend says when the database holds an older edit of the one
+# migration (PLAN.md, "Resetting the database after a schema change").
+SCHEMA_CHANGED = "was previously applied but has been modified"
+
+
+def reset_database() -> None:
+    """Drop the schema and let the backend rebuild it on its next start."""
+    log("resetting the database (--reset-db)")
+    compose(["up", "-d", "--wait", "postgres"])
+    compose(["exec", "-T", "postgres", "psql", "-U", "birdtest", "-d", "birdtest", "-q",
+             "-v", "ON_ERROR_STOP=1", "-c", "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"])
+
+
+def explain_failed_start() -> None:
+    """Why the stack did not come up, from the backend's own last words."""
+    logs = subprocess.run(["docker", "compose", "logs", "--no-color", "--tail", "40", "backend"],
+                          cwd=REPO_ROOT, capture_output=True, text=True).stdout
+    if SCHEMA_CHANGED in logs:
+        log("the backend refused the database: it was made by an older edit of the schema's "
+            "one migration, which changes in place until release")
+        log("run again with --reset-db to drop the schema and rebuild it (the database's data "
+            "goes; `scripts/dev-dump.sh` snapshots it first), with --rebuild too if the images "
+            "predate the change")
+    else:
+        log("the stack did not start; the backend's last lines:")
+        print(logs.rstrip() or "(no output)")
+
+
 def wait_for_health(url: str, timeout: int) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -268,6 +296,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="rebuild images before starting")
     stack.add_argument("--hot-reload", action="store_true",
                        help="also run the Vite dev server (compose profile 'dev')")
+    stack.add_argument("--reset-db", action="store_true",
+                       help="drop the database's schema first, and let the backend rebuild it: "
+                            "needed after a schema change, since the one migration is edited "
+                            "in place until release (its data goes; the MinIO bucket is kept)")
     stack.add_argument("--down", action="store_true",
                        help="stop the stack on exit instead of leaving it up")
     stack.add_argument("--health-timeout", type=int, default=180,
@@ -324,14 +356,20 @@ def main() -> int:
     log(f"version floor {floor} (your MAGPIE build reports "
         f"{magpie_version(magpie_root) or 'an unknown version'})")
 
+    if args.reset_db:
+        reset_database()
     if not args.no_up:
-        up = ["up", "-d"]
+        # --remove-orphans: containers of services the compose file no longer
+        # has (a `worker` service, once) are removed rather than warned about.
+        up = ["up", "-d", "--remove-orphans"]
         if args.hot_reload:
             up = ["--profile", "dev", *up]
         if args.rebuild:
             up.append("--build")
         log("starting the stack")
-        compose(up)
+        if compose(up, check=False).returncode != 0:
+            explain_failed_start()
+            return 1
 
     log(f"waiting for {api_url}/health")
     wait_for_health(f"{api_url}/health", args.health_timeout)
