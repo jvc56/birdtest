@@ -146,6 +146,11 @@ async fn build_matrix(
         let (Some(&i), Some(&j)) = (index.get(&p1), index.get(&p2)) else {
             continue;
         };
+        // A config against itself says nothing about its rating (the matrix
+        // ignores it), so it is not counted as evidence the fit used either.
+        if i == j {
+            continue;
+        }
         let mut pairs = 0.0;
         let mut score_p1 = 0.0;
         for bucket in 0..5 {
@@ -192,12 +197,41 @@ async fn lock_pool_fit(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<()> 
     Ok(())
 }
 
+/// Marks every pool's newest fit for a refit (`evidence_games = NULL`), for a
+/// purge or delete of a job whose results may have been in it: the sweep's
+/// cheap check compares a sum of `games_completed`, which a purge and a re-run
+/// to the same count leave where it was. Under every pool's fit lock, in pool
+/// order: a fit that read the pools before the purge committed would
+/// otherwise write its pre-purge sum back over the mark, or become the newest
+/// run itself, and the purged results stay in the ratings.
+pub async fn mark_every_pool_for_refit(conn: &mut PgConnection) -> AppResult<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext(id::text)) FROM rating_pools ORDER BY id")
+        .bind(RATING_LOCK_NAMESPACE)
+        .execute(&mut *conn)
+        .await?;
+    // Each pool's newest run, found by a seek into the pool's index --
+    // walking every run to find them was most of a second, inside the purge's
+    // locks, at a month's runs for a few dozen pools.
+    sqlx::query(
+        "UPDATE rating_runs r SET evidence_games = NULL
+           FROM rating_pools p
+           CROSS JOIN LATERAL (SELECT x.id FROM rating_runs x WHERE x.pool_id = p.id
+                               ORDER BY x.computed_at DESC, x.id DESC LIMIT 1) newest
+          WHERE r.id = newest.id AND r.evidence_games IS NOT NULL",
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Refits a pool from scratch and stores the result as a new run.
 ///
 /// Always a full refit, never a patch: adding or removing a config changes what
 /// counts as evidence for *everyone*, and a batch fit has no per-player history
-/// to unwind. Cheap enough to do this way — the MM iteration is microseconds
-/// for a pool of any plausible size, and the query above is one grouped scan.
+/// to unwind. Cheap enough to do this way — the Newton fit is milliseconds for
+/// a hundred-member pool (seconds only for hundreds of members or a long ladder
+/// of sweeps, on a blocking thread: see `fit_and_store`), and the query above is
+/// one grouped scan.
 pub async fn recompute(db: &PgPool, pool_id: Uuid, trigger: Trigger) -> AppResult<Uuid> {
     fit_and_store(db, pool_id, trigger, false)
         .await?
@@ -220,19 +254,87 @@ async fn fit_and_store(
     let mut tx = db.begin().await?;
     lock_pool_fit(&mut tx, pool_id).await?;
     let pool = load_pool(&mut tx, pool_id).await?;
-    let (members, matrix, pairs_used, jobs_used) = build_matrix(&mut tx, pool_id).await?;
 
+    // The cheap question first: have the pool's jobs completed any games, or
+    // its members changed, since the last run? `games_completed` is each
+    // job's first-result-per-task running total, kept by the submission that
+    // stores the result, so an unchanged sum is unchanged evidence. Read
+    // before the matrix: a result committed in between makes the stored sum
+    // short of the fit, and the next sweep refits, which is the safe side.
+    let evidence_games: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(j.games_completed), 0)::bigint
+         FROM jobs j
+         JOIN job_game_pair_config c ON c.job_id = j.id
+         JOIN rating_pools pool      ON pool.id = $1
+         WHERE j.job_type = 'game_pairs'
+           AND j.variant = pool.variant
+           AND j.letterdist_id = pool.letterdist_id
+           AND j.layout_id = pool.layout_id
+           AND c.player1_config_id IN
+               (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)
+           AND c.player2_config_id IN
+               (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)",
+    )
+    .bind(pool_id)
+    .fetch_one(&mut *tx)
+    .await?;
     if only_if_evidence_changed {
-        let last: Option<i64> = sqlx::query_scalar(
-            "SELECT pairs_used FROM rating_runs
-             WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
+        let last: Option<(Option<i64>, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT r.evidence_games,
+                    ARRAY(SELECT p.player_config_id FROM player_config_ratings p
+                           WHERE p.run_id = r.id ORDER BY p.player_config_id)
+             FROM rating_runs r
+             WHERE r.pool_id = $1 ORDER BY r.computed_at DESC, r.id DESC LIMIT 1",
         )
         .bind(pool_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if last == Some(pairs_used as i64) {
+        let members: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1
+             ORDER BY player_config_id",
+        )
+        .bind(pool_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        if last == Some((Some(evidence_games), members)) {
             tx.rollback().await?;
             return Ok(None);
+        }
+    }
+
+    let (members, matrix, pairs_used, jobs_used) = build_matrix(&mut tx, pool_id).await?;
+
+    if only_if_evidence_changed {
+        // The evidence is the pairs *and* who is in the pool. Compared on the
+        // pairs alone, a membership change whose own refit never ran -- the
+        // request dropped, or the fit failing after the membership committed
+        // -- was never repaired when the config added or removed had no pairs
+        // in the pool, since the count did not move.
+        let last: Option<(Uuid, i64, Vec<Uuid>)> = sqlx::query_as(
+            "SELECT r.id, r.pairs_used,
+                    ARRAY(SELECT p.player_config_id FROM player_config_ratings p
+                           WHERE p.run_id = r.id ORDER BY p.player_config_id)
+             FROM rating_runs r
+             WHERE r.pool_id = $1 ORDER BY r.computed_at DESC, r.id DESC LIMIT 1",
+        )
+        .bind(pool_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let mut current = members.clone();
+        current.sort();
+        if let Some((run_id, pairs, last_members)) = last {
+            if pairs == pairs_used as i64 && last_members == current {
+                // The same evidence under a sum that moved (a run from before
+                // the sum was recorded, a hand-repaired counter): recorded, so
+                // the next sweep's cheap check answers instead of this build.
+                sqlx::query("UPDATE rating_runs SET evidence_games = $2 WHERE id = $1")
+                    .bind(run_id)
+                    .bind(evidence_games)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                return Ok(None);
+            }
         }
     }
 
@@ -241,12 +343,31 @@ async fn fit_and_store(
         .position(|id| *id == pool.anchor_player_config_id)
         .ok_or_else(|| AppError::bad_request("the pool's anchor is not a member of the pool"))?;
 
-    let fit = bradley_terry::fit(&matrix, anchor_index, pool.anchor_rating);
+    // On a blocking thread, not the runtime's: a fit is a Cholesky factorisation
+    // a step, a quarter of a second at 400 members and more on a long ladder,
+    // and the service has one vCPU, so run inline it stalled every request that
+    // thread was serving. The pool's lock and this transaction are held
+    // meanwhile, as before.
+    let anchor_rating = pool.anchor_rating;
+    let (fit, matrix) = tokio::task::spawn_blocking(move || {
+        (bradley_terry::fit(&matrix, anchor_index, anchor_rating), matrix)
+    })
+    .await
+    .map_err(|err| {
+        tracing::error!(%pool_id, "the rating fit for this pool did not finish");
+        AppError::task_failed("the rating fit", err)
+    })?;
 
     let run_id: Uuid = sqlx::query_scalar(
+        // `computed_at` is the moment of the insert, under the pool's lock,
+        // rather than the column's `now()` default -- the transaction's start,
+        // taken before the lock. A fit that began first and got the lock
+        // second would otherwise be stamped older than the run it superseded,
+        // and the page, which reads the newest, would show the older one.
         "INSERT INTO rating_runs
-             (pool_id, trigger, method, iterations, converged, pairs_used, jobs_used)
-         VALUES ($1, $2, 'bradley_terry_mm', $3, $4, $5, $6)
+             (pool_id, trigger, method, iterations, converged, pairs_used, jobs_used,
+              evidence_games, computed_at)
+         VALUES ($1, $2, 'bradley_terry_newton', $3, $4, $5, $6, $7, clock_timestamp())
          RETURNING id",
     )
     .bind(pool_id)
@@ -255,6 +376,7 @@ async fn fit_and_store(
     .bind(fit.converged)
     .bind(pairs_used as i64)
     .bind(jobs_used)
+    .bind(evidence_games)
     .fetch_one(&mut *tx)
     .await?;
 

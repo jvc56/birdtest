@@ -10,9 +10,9 @@
   let busy = false;
 
   /**
-   * Client-side strength feedback only. The server scores the password again on
-   * submit and is the one that decides — this is here so the user finds out
-   * before they press the button.
+   * A rough guide from length and character classes, not zxcvbn: the server
+   * scores the password with zxcvbn on submit and is the one that decides, and
+   * the two can disagree either way, so the page says so.
    */
   $: strength = (() => {
     let score = 0;
@@ -56,12 +56,12 @@
     <div>
       <label class="label" for="username">Username</label>
       <input id="username" class="input" bind:value={username} autocomplete="username" required />
-      {#if fields.username}<p class="field-error">{fields.username}</p>{/if}
+      {#if fields.username}<p class="field-error" role="alert">{fields.username}</p>{/if}
     </div>
     <div>
       <label class="label" for="email">Email</label>
       <input id="email" type="email" class="input" bind:value={email} autocomplete="email" required />
-      {#if fields.email}<p class="field-error">{fields.email}</p>{/if}
+      {#if fields.email}<p class="field-error" role="alert">{fields.email}</p>{/if}
     </div>
     <div>
       <label class="label" for="password">Password</label>
@@ -74,11 +74,11 @@
         required
       />
       {#if password}
-        <p class="mt-1 text-xs text-muted-foreground">Strength: {labels[strength]}</p>
+        <p class="mt-1 text-xs text-muted-foreground">Rough strength: {labels[strength]} — the server checks it properly when you register.</p>
       {/if}
-      {#if fields.password}<p class="field-error">{fields.password}</p>{/if}
+      {#if fields.password}<p class="field-error" role="alert">{fields.password}</p>{/if}
     </div>
-    {#if error}<p class="field-error">{error}</p>{/if}
+    {#if error}<p class="field-error" role="alert">{error}</p>{/if}
     <button class="btn-primary w-full" disabled={busy}>{busy ? 'Creating…' : 'Register'}</button>
     <p class="text-center text-sm text-muted-foreground">
       Already registered? <a href="/login">Sign in</a>

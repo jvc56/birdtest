@@ -11,7 +11,9 @@ import {
   ratingCell,
   ROW_HEIGHT,
   stderrCell,
-  visibleError
+  visibleError,
+  NAME_CHARS,
+  rowLabels
 } from './ratingDotPlot';
 
 function row(
@@ -147,9 +149,24 @@ describe('F-CHART-2 runaway error bars', () => {
     expect(ratingCell(barely)).toBe('1520.0');
   });
 
+  it('shows an error the fit could not measure as infinite, not as 1.8e308', () => {
+    const unmeasured = row('e', 1600, Number.MAX_VALUE, { pairs_played: 4 });
+    expect(stderrCell(unmeasured)).toBe('±∞');
+    expect(dotTitle(unmeasured)).toBe('E: 1600.0 ± ∞ over 4 pairs');
+  });
+
   it('labels the anchor as fixed rather than with a standard error', () => {
     expect(stderrCell(anchor)).toBe('fixed');
     expect(stderrCell(other)).toBe('±50.0');
+  });
+
+  it("draws no bar for the anchor, whatever error the fit stored for it", () => {
+    // With no games the server stores f64::MAX; drawn at the cap, it was a
+    // ±400 bar on the one rating that is fixed, and stretched the scale.
+    const unplayed = row('a', 1500, Number.MAX_VALUE, { is_anchor: true, pairs_played: 0 });
+    expect(visibleError(unplayed)).toBe(0);
+    expect(dotPlotBounds([unplayed])).toEqual({ lo: 1490, hi: 1510 });
+    expect(dotTitle(unplayed)).toBe('A: 1500.0 (fixed) over 0 pairs');
   });
 });
 
@@ -179,5 +196,23 @@ describe('F-CHART-3 configs not connected to the anchor', () => {
     expect(layout.rated).toEqual([]);
     expect(layout.unrated).toEqual([island]);
     expect(layout.bounds).toEqual({ lo: 0, hi: 1 });
+  });
+});
+
+describe('row labels', () => {
+  it('fit the margin, keep the anchor mark, and tell a family apart', () => {
+    const rows = [
+      row('a', 1500, 0, { name: 'static-CSW24-equity-baseline', is_anchor: true }),
+      row('b', 1500, 10, { name: 'simmer-CSW24-2ply-inference-on' }),
+      row('c', 1500, 10, { name: 'simmer-CSW24-2ply-inference-off' }),
+      row('d', 1500, 10, { name: 'simmer-CSW24-4ply-inference-on' }),
+      row('e', 1500, 10, { name: 'simmer-CSW24-4ply-inference-off' }),
+      row('f', 1500, 10, { name: 'short' })
+    ];
+    const labels = rowLabels(rows);
+    for (const label of labels) expect(label.length).toBeLessThanOrEqual(NAME_CHARS);
+    expect(labels[0].endsWith(' (anchor)')).toBe(true);
+    expect(new Set(labels).size).toBe(rows.length);
+    expect(labels[5]).toBe('short');
   });
 });

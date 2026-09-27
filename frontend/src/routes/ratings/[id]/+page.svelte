@@ -17,6 +17,7 @@
   let history: RatingHistoryPoint[] = [];
   let configs: PlayerConfig[] = [];
   let error = '';
+  let loadError = '';
   let busy = false;
   let addConfigId = '';
 
@@ -26,19 +27,37 @@
     (c) => !pool?.ratings.some((r) => r.player_config_id === c.id)
   );
 
+  // Both before either is shown: assigned one at a time, a failed history
+  // left the pool on screen with an empty chart and the error nowhere.
   async function load() {
-    pool = await api.ratingPool(poolId);
-    history = await api.ratingHistory(poolId);
-    if (isAdmin) {
-      try {
-        configs = await api.playerConfigs();
-      } catch {
-        configs = [];
-      }
-    }
+    const [loadedPool, loadedHistory] = await Promise.all([
+      api.ratingPool(poolId),
+      api.ratingHistory(poolId)
+    ]);
+    pool = loadedPool;
+    history = loadedHistory;
   }
 
-  onMount(load);
+  onMount(async () => {
+    try {
+      await load();
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
+  });
+
+  // Reactive on the session rather than read once in `load`: the layout asks
+  // who is signed in at the same time this page loads, and on a hard refresh
+  // its answer can arrive after the pool's -- when an admin was shown the
+  // membership controls with nothing to add.
+  let configsLoaded = false;
+  $: if (isAdmin && !configsLoaded) {
+    configsLoaded = true;
+    api
+      .playerConfigs()
+      .then((list) => (configs = list))
+      .catch(() => (configs = []));
+  }
 
   /** Membership changes refit the whole pool, so the page reloads everything
    *  rather than patching one row: every other rating has moved too. */
@@ -47,9 +66,14 @@
     error = '';
     try {
       await action();
-      await load();
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
+    }
+    // Reloaded either way: a change whose refit failed has still committed.
+    try {
+      await load();
+    } catch (e) {
+      error ||= e instanceof Error ? e.message : String(e);
     } finally {
       busy = false;
     }
@@ -93,6 +117,7 @@
 
     <div class="card space-y-3">
       <h2 class="text-lg font-medium">All configs</h2>
+      <div class="overflow-x-auto">
       <table class="table">
         <thead>
           <tr>
@@ -133,6 +158,7 @@
           {/each}
         </tbody>
       </table>
+      </div>
 
       {#if isAdmin}
         <div class="flex flex-wrap items-end gap-2 border-t border-border pt-3">
@@ -174,7 +200,10 @@
 
     <div class="card space-y-3">
       <h2 class="text-lg font-medium">Rating history</h2>
-      <RatingHistoryChart {history} />
+      <RatingHistoryChart
+        {history}
+        rated={pool.ratings.filter((r) => r.connected_to_anchor).length}
+      />
     </div>
 
     <div class="card space-y-3">
@@ -186,6 +215,8 @@
       <ResidualMatrix residuals={pool.residuals} ratings={pool.ratings} />
     </div>
   </section>
+{:else if loadError}
+  <p class="text-sm text-destructive">Could not load this rating pool: {loadError}</p>
 {:else}
   <p class="text-sm text-muted-foreground">Loading…</p>
 {/if}

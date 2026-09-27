@@ -97,10 +97,21 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
     }
     assert_eq!(job_status(&db, job).await, "completed");
     assert_eq!(claim_state(&db, &held).await, "claimed", "the held claim is still open");
+    let decided = jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(decided.sprt_decided_status.as_deref(), Some("passed"));
+    assert_eq!(decided.sprt_decided_units, Some(100 * SPRT_CHECK_EVERY as i64));
+    let decided_llr = decided.sprt_decided_llr.unwrap();
 
-    submit(&app, &held_uuid, &held, games_result(100, 90)).await;
+    // I-STATS-9e: the result in flight at completion lands and moves the live
+    // figures -- a losing batch -- and the verdict the job stopped on stays.
+    submit(&app, &held_uuid, &held, games_result(100, 10)).await;
     assert_eq!(claim_state(&db, &held).await, "completed");
     assert_eq!(job_status(&db, job).await, "completed");
+    let row = jobstats::load_job(&db.pool, job).await.unwrap();
+    let games = jobstats::game_stats(&db.pool, &row).await.unwrap().unwrap();
+    assert!(games.sprt.llr < decided_llr, "the live LLR moved: {} vs {decided_llr}", games.sprt.llr);
+    let stored = games.decided.expect("the stored verdict is reported");
+    assert_eq!((stored.status.as_str(), stored.llr), ("passed", decided_llr));
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +185,17 @@ async fn an_opening_rack_job_completes_once_its_racks_are_handed_out_and_all_acc
     assert_eq!(job_status(&db, job).await, "completed");
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
     assert_eq!(row.racks_analyzed, 6);
+    // The server completed it, and says so: only an admin's completion was on
+    // record, and `jobs` keeps no completion time (the audit's pass 22).
+    let logged: Vec<(Option<uuid::Uuid>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT actor_user_id, old_status, new_status FROM audit_log
+         WHERE action = 'job.completed' AND job_id = $1",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logged, vec![(None, Some("active".to_string()), Some("completed".to_string()))]);
 }
 
 /// I-STATS-9 (opening racks): a declined task goes back to `available`, and a
@@ -212,4 +234,89 @@ async fn a_declined_opening_rack_task_keeps_its_job_active_until_it_is_done() {
     assert_eq!(c["task_request"]["seed"], b["task_request"]["seed"], "the declined task, again");
     submit(&app, &uuid_c, &c, analysis(&c)).await;
     assert_eq!(job_status(&db, job).await, "completed");
+}
+
+// ---------------------------------------------------------------------------
+// A job whose last results landed with nobody to check them
+// ---------------------------------------------------------------------------
+
+async fn admin_post(app: &axum::Router, headers: &[(String, String)], path: &str) -> Value {
+    let refs: Vec<(&str, &str)> = headers.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+    let body = if path.ends_with("/activate") { json!({ "allocation": 50 }) } else { json!({}) };
+    let (status, body) = send(app, post_json(path, &refs, body)).await;
+    assert_eq!(status, StatusCode::OK, "{path}: {body}");
+    body
+}
+
+/// The idle check runs off the claim request, so its result is waited for.
+async fn eventually_completed(db: &TestDb, job: Uuid) -> String {
+    for _ in 0..100 {
+        let status = job_status(db, job).await;
+        if status == "completed" {
+            return status;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    job_status(db, job).await
+}
+
+/// I-STATS-9f: an opening-rack job deactivated while its last two tasks are
+/// out. Their results land while it is inactive and are accepted, with no
+/// finish check; reactivated, it has nothing to hand out and nothing will
+/// submit again. It used to stay `active` at its allocation for good; the
+/// first claim to find it empty now completes it.
+#[tokio::test]
+async fn a_job_whose_last_results_landed_while_inactive_completes_once_reactivated() {
+    let db = TestDb::new().await;
+    let job = opening_rack_job(&db, 3, 6).await;
+    let boss = db.user("boss", true).await;
+    let state = db.state().await;
+    let headers = admin_headers(&state.cfg, boss);
+    let app = birdtest::app(state);
+
+    let (a, uuid_a) = first_claim(&app).await;
+    let (b, uuid_b) = first_claim(&app).await;
+    admin_post(&app, &headers, &format!("/api/admin/jobs/{job}/deactivate")).await;
+    submit(&app, &uuid_a, &a, analysis(&a)).await;
+    submit(&app, &uuid_b, &b, analysis(&b)).await;
+    assert_eq!(job_status(&db, job).await, "inactive");
+
+    admin_post(&app, &headers, &format!("/api/admin/jobs/{job}/activate")).await;
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(eventually_completed(&db, job).await, "completed");
+}
+
+/// I-STATS-9f (games): the same for a games job at its `max_games` cap.
+#[tokio::test]
+async fn a_games_job_at_its_cap_whose_results_landed_while_inactive_completes() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 100).await;
+    sqlx::query("UPDATE job_game_config SET min_games = 100, max_games = 200 WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let boss = db.user("boss", true).await;
+    let state = db.state().await;
+    let headers = admin_headers(&state.cfg, boss);
+    let app = birdtest::app(state);
+
+    let (a, uuid_a) = first_claim(&app).await;
+    let (b, uuid_b) = first_claim(&app).await;
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "the cap is handed out");
+    // That claim found nothing with two in flight: no completion, and the
+    // pacing must not stop the check after reactivation from running.
+    assert_eq!(job_status(&db, job).await, "active");
+
+    admin_post(&app, &headers, &format!("/api/admin/jobs/{job}/deactivate")).await;
+    submit(&app, &uuid_a, &a, games_result(100, 50)).await;
+    submit(&app, &uuid_b, &b, games_result(100, 50)).await;
+    admin_post(&app, &headers, &format!("/api/admin/jobs/{job}/activate")).await;
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(eventually_completed(&db, job).await, "completed");
+    let row = jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(row.sprt_decided_status.as_deref(), Some("terminated_at_max"));
 }

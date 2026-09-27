@@ -32,11 +32,22 @@ use uuid::Uuid;
 
 /// How long a builder holds a row before another builder may take it over.
 ///
-/// Longer than the longest build (about three minutes for a rack info table on
-/// one core) with room for a slow fetch of the inputs, and short enough that a
-/// builder killed mid-build does not strand the job that is waiting on it for
-/// an afternoon.
-const LEASE: chrono::Duration = chrono::Duration::minutes(45);
+/// Longer than the longest a build is allowed ([`BUILD_DEADLINE`]), so a
+/// build still running is never taken over, and short enough that a builder
+/// killed mid-build does not strand the job that is waiting on it for an
+/// afternoon. A rack info table is two converts of up to thirty minutes each
+/// (`magpie::CONVERT_TIMEOUT`), and it used to be 45 minutes.
+const LEASE: chrono::Duration = chrono::Duration::minutes(75);
+
+/// How long one build may take, input fetches and converts together, before
+/// it is recorded as failed (and its MAGPIE killed). Without it a stalled S3
+/// read held the builder task, and the row, for good (the audit's pass 7).
+const BUILD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(70 * 60);
+
+/// How long one input's bytes may take to arrive from the object store. The
+/// client sets a connect timeout only; a connection that stalls after it
+/// never ended.
+const INPUT_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// How many times a row is retried before it is left failed for an admin.
 ///
@@ -220,6 +231,10 @@ pub struct DerivedStatus {
     /// Gave up. A job with any of these is not dispatched either, and an admin
     /// has something to look at.
     pub failed: Vec<String>,
+    /// How many of `pending` nothing has requested under this binary's
+    /// builder: no row at all, as after a deployment whose MAGPIE bumped a
+    /// builder version.
+    pub unrequested: usize,
 }
 
 impl DerivedStatus {
@@ -245,7 +260,8 @@ pub async fn status_for_job(
             .bind(job_id)
             .fetch_optional(&mut *conn)
             .await?;
-    let mut status = DerivedStatus { ready: Vec::new(), pending: Vec::new(), failed: Vec::new() };
+    let mut status =
+        DerivedStatus { ready: Vec::new(), pending: Vec::new(), failed: Vec::new(), unrequested: 0 };
     let Some(letterdist_id) = letterdist_id else {
         return Ok(status);
     };
@@ -275,15 +291,23 @@ pub async fn status_for_job(
         let label = format!("{role} {name}");
         // NULL state is a LEFT JOIN miss: nothing has requested this file
         // under this builder yet, which from a worker's point of view is the
-        // same wait as a queued one. The caller requests it; this reports.
-        match row.get::<Option<String>, _>("state").as_deref() {
+        // same wait as a queued one. `ready_for_job` requests it; this reports.
+        let state = row.get::<Option<String>, _>("state");
+        if state.is_none() {
+            status.unrequested += 1;
+        }
+        match state.as_deref() {
             Some("built") => status.ready.push(ExpectedDerived {
                 builder: builders.for_role(&role)?,
                 role,
                 name,
                 sha256: row.get("sha256"),
                 bytes: row.get("bytes"),
-                build_target: builders.build_target.clone(),
+                // What built this hash, as the row records it: the builder
+                // task's target, which this process's need not be.
+                build_target: row
+                    .get::<Option<String>, _>("build_target")
+                    .unwrap_or_else(|| builders.build_target.clone()),
             }),
             Some("failed") => status.failed.push(label),
             _ => status.pending.push(label),
@@ -360,6 +384,18 @@ pub async fn ready_for_job(
         return Ok(Some(ready));
     }
     let status = status_for_job(conn, job_id, builders).await?;
+    if status.unrequested > 0 {
+        // Creating and activating a job request its files, but a deployment
+        // whose MAGPIE bumped a builder version finds every running job's
+        // files built under the old one only. Requested here, by the first
+        // claim that considers the job, or nothing ever would be: the builder
+        // task builds only what is queued (thirty-first audit). Once queued, a
+        // file is no longer a miss, so this runs once per file.
+        let requested = request_for_job(conn, job_id, builders).await?;
+        if requested > 0 {
+            tracing::info!(%job_id, requested, "queued derived files under this binary's builder");
+        }
+    }
     if !status.dispatchable() {
         // Logged at debug: a table takes minutes to build, and every worker
         // asking during those minutes would otherwise produce a line each.
@@ -381,6 +417,9 @@ struct Lease {
     klv_id: Option<Uuid>,
     letterdist_id: Uuid,
     builder: String,
+    /// The lease this build holds, as stored: the token its outcome is
+    /// recorded against.
+    leased_until: chrono::DateTime<chrono::Utc>,
 }
 
 /// Takes the oldest row that needs building, or `None` if the queue is empty.
@@ -398,11 +437,25 @@ struct Lease {
 /// after a MAGPIE upgrade, every row the new builder was asked for -- waited
 /// behind a build this binary will never do.
 async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease>> {
+    // A build that died on its last attempt -- the builder task killed, out
+    // of memory on a 2.4 GB table -- recorded nothing, and its row sat in
+    // `building` for good: past the attempt cap nothing retakes it, and the
+    // admin's retry reopens only `failed` rows. Failed here, with the reason
+    // it can only guess at, so the retry can reopen it.
+    sqlx::query(
+        "UPDATE derived_data
+         SET state = 'failed', leased_until = NULL,
+             error = 'the builder stopped without recording an outcome (killed, or out of memory?)'
+         WHERE state = 'building' AND leased_until < now() AND attempts >= $1",
+    )
+    .bind(MAX_ATTEMPTS)
+    .execute(pool)
+    .await?;
     let mut tx = pool.begin().await?;
     let row = sqlx::query(
         "SELECT role, name, builder, kwg_id, klv_id, letterdist_id
          FROM derived_data
-         WHERE (state = 'pending'
+         WHERE ((state = 'pending' AND (leased_until IS NULL OR leased_until < now()))
                 OR (state = 'building' AND leased_until < now()))
            AND attempts < $1
            AND builder = CASE role WHEN 'wmp' THEN $2 WHEN 'rit' THEN $3 END
@@ -439,34 +492,35 @@ async fn take_next(pool: &PgPool, builders: &Builders) -> AppResult<Option<Lease
         }
         return Ok(None);
     };
-    let lease = Lease {
-        role: row.get("role"),
-        name: row.get("name"),
-        kwg_id: row.get("kwg_id"),
-        klv_id: row.get("klv_id"),
-        letterdist_id: row.get("letterdist_id"),
-        builder: row.get("builder"),
-    };
+    let (role, name, builder): (String, String, String) =
+        (row.get("role"), row.get("name"), row.get("builder"));
+    let (kwg_id, klv_id, letterdist_id): (Uuid, Option<Uuid>, Uuid) =
+        (row.get("kwg_id"), row.get("klv_id"), row.get("letterdist_id"));
 
-    sqlx::query(
+    // The lease as the database stores it (to the microsecond), so the
+    // outcome's `leased_until = $n` matches exactly -- and on the database's
+    // clock, which is the one lapses are judged by.
+    let leased_until: chrono::DateTime<chrono::Utc> = sqlx::query_scalar(
         "UPDATE derived_data
-         SET state = 'building', leased_until = $1, attempts = attempts + 1,
+         SET state = 'building', leased_until = now() + make_interval(secs => $1),
+             attempts = attempts + 1,
              error = NULL
          WHERE role = $2 AND name = $3 AND builder = $4
            AND kwg_id = $5 AND klv_id IS NOT DISTINCT FROM $6
-           AND letterdist_id = $7",
+           AND letterdist_id = $7
+         RETURNING leased_until",
     )
-    .bind(chrono::Utc::now() + LEASE)
-    .bind(&lease.role)
-    .bind(&lease.name)
-    .bind(&lease.builder)
-    .bind(lease.kwg_id)
-    .bind(lease.klv_id)
-    .bind(lease.letterdist_id)
-    .execute(&mut *tx)
+    .bind(LEASE.num_seconds() as f64)
+    .bind(&role)
+    .bind(&name)
+    .bind(&builder)
+    .bind(kwg_id)
+    .bind(klv_id)
+    .bind(letterdist_id)
+    .fetch_one(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(Some(lease))
+    Ok(Some(Lease { role, name, kwg_id, klv_id, letterdist_id, builder, leased_until }))
 }
 
 /// The bytes of an `input_data` row, from the object store.
@@ -475,7 +529,9 @@ async fn input_bytes(
     artifacts: &ArtifactStore,
     id: Uuid,
 ) -> AppResult<(String, Vec<u8>)> {
-    let row = sqlx::query("SELECT name, role, path, content, object_key FROM input_data WHERE id = $1")
+    let row = sqlx::query(
+        "SELECT name, role, path, sha256, content, object_key FROM input_data WHERE id = $1",
+    )
         .bind(id)
         .fetch_one(pool)
         .await?;
@@ -488,12 +544,65 @@ async fn input_bytes(
     let Some(key) = row.get::<Option<String>, _>("object_key") else {
         let path: String = row.get("path");
         return Err(AppError::internal(format!(
-            "{path} was imported before the server stored lexicon bytes, so it cannot be built \
-             from. Re-import that tarball -- the import adds no rows for files whose bytes have \
-             not changed, and will fill in the missing ones."
+            "{path} has neither stored bytes nor an object key, so it cannot be built from, \
+             and no import writes such a row: it was put in by hand. Delete it, and what \
+             pins it, and import its tarball again (an import adds no row for a file already \
+             known, so re-importing leaves this one as it is)."
         )));
     };
-    Ok((name, artifacts.get(&key).await?))
+    let bytes = tokio::time::timeout(INPUT_FETCH_TIMEOUT, artifacts.get_for_build(&key))
+        .await
+        .map_err(|_| {
+            AppError::internal(format!(
+                "fetching {key} from the object store took longer than {} minutes",
+                INPUT_FETCH_TIMEOUT.as_secs() / 60
+            ))
+        })??;
+    // The bytes the row names, or none: a replaced or damaged object built
+    // into a file whose hash every worker then declined as a mismatch.
+    let expected: String = row.get("sha256");
+    let actual = hex::encode(sha2::Sha256::digest(&bytes));
+    if actual != expected {
+        let path: String = row.get("path");
+        // Deleted, so that re-importing uploads it again: an import skips an
+        // object that exists, and the remedy the message gives did not work
+        // while the damaged one stayed (the audit's pass 7). Only an object
+        // under its own content address: that key can hold nothing but the
+        // imported bytes, so what is there is wrong for everyone who reads it.
+        let removed = if key == format!("inputs/{expected}") {
+            match artifacts.delete(&key).await {
+                Ok(()) => Ok(()),
+                Err(err) => {
+                    tracing::warn!(%key, error = %err.message, "could not delete a damaged input object");
+                    Err(err.message)
+                }
+            }
+        } else {
+            Err("it is not under its own content address".to_string())
+        };
+        return Err(AppError::internal(match removed {
+            Ok(()) => format!(
+                "{path}: the object at {key} hashed to {actual}, not the {expected} imported, \
+                 and has been deleted; import its tarball again, then retry this build"
+            ),
+            Err(why) if key == format!("inputs/{expected}") => format!(
+                "{path}: the object at {key} hashes to {actual}, not the {expected} imported, \
+                 and could not be deleted ({why}); delete that object (RUNBOOK §2.4), import \
+                 its tarball again, then retry this build"
+            ),
+            // A key that is not the row's content address was written by hand:
+            // deleting what is there could remove another row's object, and a
+            // re-import uploads to `inputs/{expected}`, not here.
+            Err(_) => format!(
+                "{path}: the object at {key} hashes to {actual}, not the {expected} imported, \
+                 and {key} is not this file's content address, so the key was written by hand; \
+                 set it back (UPDATE input_data SET object_key = 'inputs/' || sha256 WHERE \
+                 path = '{path}' AND sha256 = '{expected}'), import its tarball again, then retry \
+                 this build"
+            ),
+        }));
+    }
+    Ok((name, bytes))
 }
 
 /// Builds one derived file and records its hash. `Ok(true)` means a row was
@@ -510,15 +619,23 @@ pub async fn build_next(
     tracing::info!(role = %lease.role, name = %lease.name, "building a derived file");
     let started = std::time::Instant::now();
 
-    match build(pool, artifacts, magpie, &lease).await {
+    let outcome = match tokio::time::timeout(BUILD_DEADLINE, build(pool, artifacts, magpie, &lease)).await {
+        Ok(outcome) => outcome,
+        Err(_) => Err(AppError::internal(format!(
+            "the build took longer than {} minutes and was stopped",
+            BUILD_DEADLINE.as_secs() / 60
+        ))),
+    };
+    match outcome {
         Ok((sha256, bytes)) => {
-            sqlx::query(
+            let recorded = sqlx::query(
                 "UPDATE derived_data
                  SET state = 'built', sha256 = $1, bytes = $2, build_target = $3,
                      built_at = now(), leased_until = NULL, error = NULL
                  WHERE role = $4 AND name = $5 AND builder = $6
                    AND kwg_id = $7 AND klv_id IS NOT DISTINCT FROM $8
-                   AND letterdist_id = $9",
+                   AND letterdist_id = $9
+                   AND state = 'building' AND leased_until = $10",
             )
             .bind(&sha256)
             .bind(bytes)
@@ -529,8 +646,10 @@ pub async fn build_next(
             .bind(lease.kwg_id)
             .bind(lease.klv_id)
             .bind(lease.letterdist_id)
+            .bind(lease.leased_until)
             .execute(pool)
             .await?;
+            lease_outcome(&lease, recorded.rows_affected());
             tracing::info!(
                 role = %lease.role, name = %lease.name, %sha256, bytes,
                 seconds = started.elapsed().as_secs(),
@@ -538,17 +657,23 @@ pub async fn build_next(
             );
         }
         Err(err) => {
-            // Left 'building' with a lapsed lease would be retried by the next
-            // run; 'pending' says the same thing and reads correctly in the
-            // admin view. The attempt counter, not the state, is what stops it
-            // eventually.
-            sqlx::query(
+            // Back to 'pending', not to be taken again until a wait has
+            // passed -- 5, then 15 minutes -- which `leased_until` holds while
+            // the row is pending. Taken again at once, it was still the
+            // oldest row, so one run spent all three attempts in seconds and
+            // an S3 blip failed a build for good (the audit's pass 7). The
+            // attempt counter, not the state, is what stops it eventually.
+            let recorded = sqlx::query(
                 "UPDATE derived_data
                  SET state = CASE WHEN attempts >= $1 THEN 'failed' ELSE 'pending' END,
-                     leased_until = NULL, error = $2
+                     leased_until = CASE WHEN attempts >= $1 THEN NULL
+                                         ELSE now() + make_interval(mins => 5 * (3 ^ (attempts - 1))::int)
+                                    END,
+                     error = $2
                  WHERE role = $3 AND name = $4 AND builder = $5
                    AND kwg_id = $6 AND klv_id IS NOT DISTINCT FROM $7
-                   AND letterdist_id = $8",
+                   AND letterdist_id = $8
+                   AND state = 'building' AND leased_until = $9",
             )
             .bind(MAX_ATTEMPTS)
             .bind(&err.message)
@@ -558,8 +683,10 @@ pub async fn build_next(
             .bind(lease.kwg_id)
             .bind(lease.klv_id)
             .bind(lease.letterdist_id)
+            .bind(lease.leased_until)
             .execute(pool)
             .await?;
+            lease_outcome(&lease, recorded.rows_affected());
             tracing::error!(
                 role = %lease.role, name = %lease.name, error = %err.message,
                 "could not build a derived file"
@@ -567,6 +694,19 @@ pub async fn build_next(
         }
     }
     Ok(true)
+}
+
+/// Every outcome is recorded against the lease it was built under: a build
+/// that outlived its lease (a slow convert, a hung input read) found another
+/// builder had taken the row over and recorded `built`, and then set it back
+/// to `pending` -- or `failed`, for good, once the attempts ran out.
+fn lease_outcome(lease: &Lease, rows: u64) {
+    if rows == 0 {
+        tracing::warn!(
+            role = %lease.role, name = %lease.name,
+            "a build outlived its lease; another builder has the row, and this outcome is dropped"
+        );
+    }
 }
 
 /// Writes the inputs into a scratch directory, runs MAGPIE, and hashes what it
@@ -673,17 +813,19 @@ mod tests {
             builder: "wmp-1".into(),
             build_target: "nehalem".into(),
         };
-        assert!(DerivedStatus { ready: vec![], pending: vec![], failed: vec![] }.dispatchable());
+        assert!(DerivedStatus { ready: vec![], pending: vec![], failed: vec![], unrequested: 0 }.dispatchable());
         assert!(DerivedStatus {
             ready: vec![ready.clone()],
             pending: vec![],
-            failed: vec![]
+            failed: vec![],
+            unrequested: 0,
         }
         .dispatchable());
         assert!(!DerivedStatus {
             ready: vec![ready.clone()],
             pending: vec!["rit NWL23.CSW21".into()],
-            failed: vec![]
+            failed: vec![],
+            unrequested: 0,
         }
         .dispatchable());
         // A failed build is not "dispatch without it": the worker would fall
@@ -691,7 +833,8 @@ mod tests {
         assert!(!DerivedStatus {
             ready: vec![ready],
             pending: vec![],
-            failed: vec!["rit NWL23.CSW21".into()]
+            failed: vec!["rit NWL23.CSW21".into()],
+            unrequested: 0,
         }
         .dispatchable());
     }

@@ -22,11 +22,13 @@
 
 <div class="flex min-h-screen flex-col">
   <header class="border-b border-border bg-card/50">
-    <nav class="mx-auto flex max-w-6xl items-center gap-6 px-6 py-3">
+    <!-- Wraps on a phone: in one row the links ran past the screen, and a
+         phone's browser widened the page to fit them rather than clip. -->
+    <nav class="mx-auto flex max-w-6xl flex-wrap items-center gap-x-6 gap-y-2 px-4 py-3 sm:px-6">
       <a href="/" class="text-lg font-semibold text-foreground no-underline hover:no-underline">
         birdtest
       </a>
-      <div class="flex flex-1 gap-4 text-sm">
+      <div class="flex flex-1 basis-full flex-wrap gap-x-4 gap-y-1 text-sm sm:basis-auto">
         {#each links as link}
           <a
             href={link.href}
@@ -46,7 +48,10 @@
       </div>
       <div class="flex items-center gap-3 text-sm">
         {#if $session}
-          <a href="/account" class="no-underline text-muted-foreground hover:text-foreground">
+          <a
+            href="/account"
+            class="min-w-0 max-w-[40vw] truncate no-underline text-muted-foreground hover:text-foreground"
+          >
             {$session.username}
           </a>
           <button class="btn-secondary" on:click={handleSignOut}>Sign out</button>
@@ -60,7 +65,7 @@
     </nav>
   </header>
 
-  <main class="mx-auto w-full max-w-6xl flex-1 px-6 py-8">
+  <main class="mx-auto w-full max-w-6xl flex-1 px-4 py-8 sm:px-6">
     <slot />
   </main>
 

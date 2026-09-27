@@ -2,8 +2,11 @@ use crate::error::AppError;
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 type Keyed = RateLimiter<String, DefaultKeyedStateStore<String>, DefaultClock>;
 
@@ -24,8 +27,10 @@ pub struct RateLimiters {
     /// issued a UUID. It exists at all because without it, omitting the
     /// identity header would be a way around the per-identity limit.
     pub unregistered_worker: Arc<Keyed>,
-    /// 5 password-reset requests per hour, checked twice: once against the
-    /// caller's IP and once against the address they asked for.
+    /// 5 an hour. Reset requests are checked twice, once against the caller's
+    /// IP and once against the address they asked for; the same limiter also
+    /// bounds the "already has an account" notices per address (`reg-em:`)
+    /// and the scorings one reset link buys (`tok:`).
     ///
     /// The per-address half is the one that matters. Without it this is an
     /// unauthenticated endpoint that sends mail to any address it is given, so
@@ -33,11 +38,134 @@ pub struct RateLimiters {
     /// bury a known contributor in reset emails at the operator's expense.
     /// Limiting by IP alone stops neither, since IPs are cheap.
     pub reset: Arc<Keyed>,
-    /// 10 login attempts per minute, checked against the caller's IP and,
-    /// separately, the username tried. Each attempt costs an Argon2 verify, so
+    /// 10 login attempts per minute from one IP. Each attempt costs an Argon2 verify, so
     /// an unlimited login endpoint is both an online password-guessing oracle
     /// and a cheap way to pin the server's CPU.
     pub login: Arc<Keyed>,
+    /// 100 login attempts per minute against one username from anywhere: the
+    /// bound on a guesser spread over many addresses. Ten times `login`, so
+    /// that one address cannot lock an account out.
+    pub login_account: Arc<Keyed>,
+    /// API keys created per account: a burst of 100 (the key cap), then 10
+    /// an hour. `worker` is per key, and revoking a key and making another
+    /// would be a fresh bucket each time; this bounds that churn without
+    /// holding back a contributor setting up many machines at once (at ten
+    /// an hour from the start, fifty machines took five hours). (An account-wide worker bucket was tried and
+    /// was too tight for the hundred keys an account may hold: fifty idle
+    /// machines filled it, and heartbeats, which are not retried, lapsed.)
+    pub key_creation: Arc<Keyed>,
+    /// Resuming an account's keys: a burst of 100 (every key at once), then 60
+    /// an hour. Each change writes an audit row, and unlimited, one account
+    /// toggling a key back and forth wrote 4,000 in ten seconds (the audit's
+    /// pass 23); a back-and-forth needs a resume, so this bounds it, while
+    /// suspending and revoking stay free for an owner after a takeover.
+    pub key_changes: Arc<Keyed>,
+    /// Worker credentials, before their lookup: see [`CredentialGate`].
+    pub worker_credentials: Arc<CredentialGate>,
+    /// Confirmation and reset links redeemed, per client address: 20 a
+    /// minute. The codes are too long to guess, so this is about cost, not
+    /// guessing -- both routes are unauthenticated and write on the main pool.
+    pub redeem: Arc<Keyed>,
+}
+
+/// Which of a credential's two buckets a worker request is charged to.
+///
+/// Machines sharing a key, or a copied `uuid` line, share its buckets. An idle
+/// machine claims every few seconds and retries a `429` without limit, and a
+/// heartbeat is sent once and never retried: on one bucket, a few idle
+/// machines took every token and a busy one's heartbeats were refused until
+/// its claim lapsed and its finished task was thrown away (thirty-first
+/// audit). Asking for work and reporting on work in hand are charged apart,
+/// so the first can only hold back the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkerBucket {
+    /// `POST /api/worker/task`.
+    Claims,
+    /// Heartbeats, declines, results and artifact fetches: work a machine
+    /// already holds.
+    WorkInHand,
+}
+
+/// Worker credentials looked up in the database, and how many of them one
+/// address may try.
+///
+/// Resolving a worker identity is a main-pool query, on the pool claims and
+/// submissions need (`db.rs`). Every presented credential is charged its own
+/// bucket (`worker`, 1 a second, burst 5) before that query -- the key's hash
+/// or the UUID already names the bucket -- so a real identity costs at most
+/// that many lookups. A credential that has not resolved in the last ten
+/// minutes also pays a cell of its address's bucket (5 a second, burst 100)
+/// before its lookup, match or not: made-up keys and UUIDs, each a fresh
+/// bucket of its own, are bounded per address, and so are the lookups a
+/// burst of them sends at once. Credentials that resolved recently skip the
+/// address's bucket, so a misbehaving machine -- or a fleet still running a
+/// revoked key -- behind a shared address does not lock out the workers that
+/// are fine. The burst admits a hundred machines behind one address at once
+/// after a restart, when nothing is known yet.
+pub struct CredentialGate {
+    unknown_per_address: Keyed,
+    known: Mutex<HashMap<String, Instant>>,
+}
+
+/// How long a credential that resolved counts as known.
+const KNOWN_FOR: Duration = Duration::from_secs(600);
+/// At most this many known credentials are remembered (about 7 MB); past it a
+/// credential is simply treated as unknown, which costs its address a cell.
+const MAX_KNOWN: usize = 50_000;
+
+impl CredentialGate {
+    fn new() -> Self {
+        Self {
+            unknown_per_address: RateLimiter::keyed(
+                Quota::per_second(NonZeroU32::new(5).unwrap())
+                    .allow_burst(NonZeroU32::new(100).unwrap()),
+            ),
+            known: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn is_known(&self, presented: &str) -> bool {
+        let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        known.get(presented).is_some_and(|at| at.elapsed() < KNOWN_FOR)
+    }
+
+    /// Before the lookup: unless the credential resolved recently, a cell of
+    /// its address's bucket; then its own. The address first: each made-up
+    /// credential is a new key in the `worker` limiter, kept until the sweep,
+    /// so charged first, a refused flood from one address still grew memory
+    /// by an entry a request (150 MB a million) with no database work to slow
+    /// it down.
+    pub fn admit(
+        &self,
+        worker: &Keyed,
+        presented: &str,
+        bucket: WorkerBucket,
+        address: IpAddr,
+    ) -> Result<(), AppError> {
+        if !self.is_known(presented) {
+            check(&self.unknown_per_address, &format!("ip:{address}"))?;
+        }
+        match bucket {
+            WorkerBucket::Claims => check(worker, presented),
+            WorkerBucket::WorkInHand => check(worker, &format!("{presented}#work")),
+        }
+    }
+
+    /// After a lookup that resolved.
+    pub fn remember(&self, presented: &str) {
+        let mut known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        if known.len() < MAX_KNOWN || known.contains_key(presented) {
+            known.insert(presented.to_owned(), Instant::now());
+        }
+    }
+
+    fn retain_recent(&self) {
+        self.unknown_per_address.retain_recent();
+        self.known
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, at| at.elapsed() < KNOWN_FOR);
+    }
 }
 
 impl RateLimiters {
@@ -49,12 +177,25 @@ impl RateLimiters {
             .allow_burst(NonZeroU32::new(30).unwrap());
         let resets_per_hour = Quota::per_hour(NonZeroU32::new(5).unwrap());
         let logins_per_minute = Quota::per_minute(NonZeroU32::new(10).unwrap());
+        let account_logins_per_minute = Quota::per_minute(NonZeroU32::new(100).unwrap());
+        // The burst is the key cap: setting up a machine per key at once is
+        // not held back. What refills slowly is churn -- revoking a key and
+        // making another, a fresh bucket each time.
+        let keys_per_hour = Quota::per_hour(NonZeroU32::new(10).unwrap())
+            .allow_burst(NonZeroU32::new(100).unwrap());
         Self {
             register: Arc::new(RateLimiter::keyed(per_hour)),
             worker: Arc::new(RateLimiter::keyed(per_second)),
             unregistered_worker: Arc::new(RateLimiter::keyed(unregistered)),
             reset: Arc::new(RateLimiter::keyed(resets_per_hour)),
             login: Arc::new(RateLimiter::keyed(logins_per_minute)),
+            login_account: Arc::new(RateLimiter::keyed(account_logins_per_minute)),
+            key_creation: Arc::new(RateLimiter::keyed(keys_per_hour)),
+            key_changes: Arc::new(RateLimiter::keyed(
+                Quota::per_hour(NonZeroU32::new(60).unwrap()).allow_burst(NonZeroU32::new(100).unwrap()),
+            )),
+            worker_credentials: Arc::new(CredentialGate::new()),
+            redeem: Arc::new(RateLimiter::keyed(Quota::per_minute(NonZeroU32::new(20).unwrap()))),
         }
     }
 
@@ -76,9 +217,14 @@ impl RateLimiters {
             &self.unregistered_worker,
             &self.reset,
             &self.login,
+            &self.login_account,
+            &self.key_creation,
+            &self.key_changes,
+            &self.redeem,
         ] {
             limiter.retain_recent();
         }
+        self.worker_credentials.retain_recent();
     }
 }
 
@@ -89,15 +235,94 @@ impl Default for RateLimiters {
 }
 
 /// Returns 429 with a `Retry-After` header when the bucket is empty.
+/// Keys longer than this are kept as a digest; see [`check`].
+const MAX_KEY_BYTES: usize = 128;
+
 pub fn check(limiter: &Keyed, key: &str) -> Result<(), AppError> {
-    match limiter.check_key(&key.to_string()) {
+    // Bounded: a key is kept until the next sweep, and some are built from
+    // what a caller sends -- a username tried, an address asked for -- which
+    // could be megabytes each. A long key is kept as its digest.
+    let key = if key.len() > MAX_KEY_BYTES {
+        use sha2::Digest;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(key.as_bytes())))
+    } else {
+        key.to_string()
+    };
+    match limiter.check_key(&key) {
         Ok(()) => Ok(()),
         // `governor` tells us exactly how long the caller has to wait; rounding up
         // to the next whole second is what `Retry-After` can express.
-        Err(negative) => Err(AppError::rate_limited(
-            negative.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()))
-                .as_secs()
-                .max(1),
-        )),
+        Err(negative) => {
+            let wait = negative.wait_time_from(governor::clock::Clock::now(&DefaultClock::default()));
+            // Up, not down: a client that waited the whole seconds it was told
+            // was refused again.
+            Err(AppError::rate_limited(
+                (wait.as_secs() + u64::from(wait.subsec_nanos() > 0)).max(1),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_tests {
+    use super::*;
+
+    /// A-WORKER-16 (the gate): a credential's own bucket is charged before
+    /// its lookup; unknown credentials also pay their address's, and once
+    /// that is spent they are refused, while a credential that resolved is
+    /// not -- whatever its address's neighbours did.
+    #[test]
+    fn unknown_credentials_pay_their_address_and_known_ones_do_not() {
+        let gate = CredentialGate::new();
+        let worker: Keyed = RateLimiter::keyed(
+            Quota::per_second(NonZeroU32::new(1).unwrap()).allow_burst(NonZeroU32::new(5).unwrap()),
+        );
+        let shared: IpAddr = "192.0.2.50".parse().unwrap();
+
+        assert!(gate.admit(&worker, "a:real", WorkerBucket::Claims, shared).is_ok());
+        gate.remember("a:real");
+
+        let mut refused = None;
+        for i in 0..200 {
+            if let Err(e) = gate.admit(&worker, &format!("k:made-up-{i}"), WorkerBucket::Claims, shared) {
+                refused = Some(i);
+                assert_eq!(e.status, axum::http::StatusCode::TOO_MANY_REQUESTS);
+                break;
+            }
+        }
+        assert!(refused.is_some_and(|i| (99..=101).contains(&i)), "{refused:?}");
+        assert!(gate.admit(&worker, "a:real", WorkerBucket::Claims, shared).is_ok(), "the known worker is not refused");
+        assert!(
+            gate.admit(&worker, "k:fresh", WorkerBucket::Claims, "192.0.2.51".parse().unwrap()).is_ok(),
+            "another address"
+        );
+
+        // A refused flood leaves nothing behind per credential: the address
+        // refused it before its own bucket was made.
+        let before = worker.len();
+        for i in 0..1000 {
+            assert!(gate.admit(&worker, &format!("k:flood-{i}"), WorkerBucket::Claims, shared).is_err());
+        }
+        assert_eq!(worker.len(), before, "refused credentials were given buckets");
+
+        // The credential's own bucket holds whether or not it is known.
+        let mut own = 0;
+        while gate.admit(&worker, "a:real", WorkerBucket::Claims, shared).is_ok() {
+            own += 1;
+            assert!(own < 10);
+        }
+    }
+
+    /// A caller-supplied key is kept as a digest past `MAX_KEY_BYTES`: a
+    /// megabyte "username" held a megabyte in the limiter until its sweep.
+    /// The same long key still lands in the same bucket.
+    #[test]
+    fn a_long_key_is_one_bucket_kept_small() {
+        let limiter: Keyed = RateLimiter::keyed(Quota::per_hour(NonZeroU32::new(1).unwrap()));
+        let long = format!("user:{}", "x".repeat(1 << 20));
+        assert!(check(&limiter, &long).is_ok());
+        assert!(check(&limiter, &long).is_err(), "the same key, the same bucket");
+        assert!(check(&limiter, &format!("{long}y")).is_ok(), "another key, another");
+        assert!(limiter.len() == 2);
     }
 }

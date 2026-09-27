@@ -13,8 +13,10 @@
 # 1. A backup taken while another session keeps writing (audit_log rows, as
 #    claims and admin actions do in production) succeeds and records an ok=true
 #    `backups` row whose sha256 and row counts are the manifest's.
-# 2. The restore drill of that backup passes: the restored row counts equal
-#    the manifest's even though the database moved on while it was dumped.
+# 2. The restore drill of that backup passes, in both modes (its own server,
+#    as production runs it, and a second database on the stack's server): the
+#    restored row counts equal the manifest's even though the database moved
+#    on while it was dumped.
 #    The counts were once taken after pg_dump finished, outside its snapshot,
 #    so any write during the dump failed every drill.
 # 3. A backup that cannot upload exits non-zero and leaves an ok=false row.
@@ -182,11 +184,44 @@ print(f"backups row matches the manifest: sha256 {sha}, audit_log {counts['audit
 PY
 
 # --- 2. The drill of that backup -------------------------------------------
+# As production runs it: into a Postgres of its own, inside the container.
 log "restore-drill.sh"
 run_script restore-drill.sh "BACKUP_PREFIX=${PREFIX}" "DRILL_DB=${DRILL_DB}" \
   || fail "restore-drill.sh exited $?"
+# Live processes only: this container's PID 1 is `sleep`, which never reaps
+# the drill's exited server, so its zombies stay listed.
+tools "${TOOLS}" bash -c '! cat /proc/[0-9]*/stat 2>/dev/null | awk "\$2 == \"(postgres)\" && \$3 != \"Z\"" | grep -q . && [[ ! -e /tmp/birdtest-drill ]]' \
+  || fail "the drill left its own server or its work directory behind"
 [[ "$(sql "SELECT count(*) FROM pg_database WHERE datname = '${DRILL_DB}'")" == 0 ]] \
-  || fail "the drill left ${DRILL_DB} behind"
+  || fail "the local drill created ${DRILL_DB} on the stack's server"
+
+# And the hand-run mode RUNBOOK keeps, into a second database on the server
+# DATABASE_URL names, which it must drop again.
+log "restore-drill.sh, DRILL_TARGET=server"
+run_script restore-drill.sh "BACKUP_PREFIX=${PREFIX}" "DRILL_DB=${DRILL_DB}" "DRILL_TARGET=server" \
+  || fail "restore-drill.sh (server) exited $?"
+[[ "$(sql "SELECT count(*) FROM pg_database WHERE datname = '${DRILL_DB}'")" == 0 ]] \
+  || fail "the server drill left ${DRILL_DB} behind"
+
+# --- 2b. A drill with nothing to drill -----------------------------------------
+# An empty bucket -- a new stack before its first backup -- passes, saying so.
+# A prefix with no backups in a bucket that has some fails: passing it would
+# pass every drill of a misplaced prefix from then on.
+empty_bucket="${BUCKET}-empty-${RANDOM}"
+tools "${TOOLS}" ${S3} s3 mb "s3://${empty_bucket}" >/dev/null
+log "restore-drill.sh on an empty bucket (expected to pass)"
+empty_log="$(mktemp)"
+run_script restore-drill.sh "BACKUP_BUCKET=${empty_bucket}" "BACKUP_PREFIX=pg" "DRILL_DB=${DRILL_DB}" \
+  2>"${empty_log}" || { cat "${empty_log}" >&2; fail "the drill failed on an empty bucket"; }
+grep -q "nothing to drill" "${empty_log}" || { cat "${empty_log}" >&2; fail "the empty-bucket drill did not say so"; }
+tools "${TOOLS}" ${S3} s3 rb "s3://${empty_bucket}" >/dev/null
+log "restore-drill.sh on a prefix with no backups in a bucket with some (expected to fail)"
+status=0
+run_script restore-drill.sh "BACKUP_PREFIX=${PREFIX}-nothing-here" "DRILL_DB=${DRILL_DB}" \
+  2>"${empty_log}" || status=$?
+grep -q "but the bucket is not empty" "${empty_log}" || { cat "${empty_log}" >&2; fail "no message for an empty prefix"; }
+rm -f "${empty_log}"
+(( status == 1 )) || fail "the drill of an empty prefix exited ${status}, not 1"
 
 # --- 3. A backup that cannot upload ------------------------------------------
 log "backup.sh to a bucket that does not exist (expected to fail)"

@@ -16,6 +16,8 @@ __pycache__/
 .terraform/
 *.tfstate
 *.tfstate.*
+# The stack's variables (README.md, "Deploying"): account-specific.
+*.tfvars
 
 # Local snapshots taken by scripts/dev-dump.sh
 .dev-backups/
@@ -25,3 +27,6 @@ __pycache__/
 # settings.txt MAGPIE writes, a log, and a symlink to the data directory.
 /.dev-workers/
 /.e2e-worker/
+
+# A contribute.txt left at the root by a local `magpie contribute` run.
+/contribute.txt

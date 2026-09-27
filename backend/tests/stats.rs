@@ -63,8 +63,8 @@ async fn claim(
     };
     let claim: Uuid = sqlx::query_scalar(
         "INSERT INTO task_claims
-             (task_id, claim_token, state, claimed_by_user_id, claimed_by_anon_uuid, completed_at)
-         VALUES ($1, gen_random_uuid(), $2::claim_state, $3, $4,
+             (task_id, job_id, claim_token, state, claimed_by_user_id, claimed_by_anon_uuid, completed_at)
+         VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), gen_random_uuid(), $2::claim_state, $3, $4,
                  CASE WHEN $2 = 'completed'
                       THEN now() - make_interval(mins => $5) END)
          RETURNING id",
@@ -424,11 +424,11 @@ async fn contributions_are_attributed_to_each_identity_across_both_kinds() {
          tasks AS (
              INSERT INTO tasks (job_id, seed, state, accepted_count)
              SELECT $1, 1000 + n, 'completed'::task_state, 1 FROM numbered
-             RETURNING id, seed
+             RETURNING id, job_id, seed
          )
          INSERT INTO task_claims
-             (task_id, claim_token, state, claimed_by_anon_uuid, completed_at)
-         SELECT t.id, gen_random_uuid(), 'completed'::claim_state, w.uuid, now()
+             (task_id, job_id, claim_token, state, claimed_by_anon_uuid, completed_at)
+         SELECT t.id, t.job_id, gen_random_uuid(), 'completed'::claim_state, w.uuid, now()
          FROM tasks t JOIN numbered w ON t.seed = 1000 + w.n",
     )
     .bind(job)
@@ -464,6 +464,80 @@ async fn the_eta_is_none_without_recent_throughput() {
         .await
         .unwrap();
     assert_eq!(stats(&db, job).await.eta_seconds, None, "an inactive job has no ETA");
+}
+
+/// I-STATS-8b: a games job's ETA is the units left at the rate units have
+/// been finishing -- claims an hour times the batch, over the redundancy,
+/// since a task's redundant copies add no units. Counted per completed task,
+/// as it was, it read half the time left at redundancy 2.
+#[tokio::test]
+async fn the_games_eta_divides_by_redundancy() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2, 10).await;
+    let worker = Owner::Anon(anon(&db).await);
+    claim(&db, job, worker, "completed", 10).await;
+    claim(&db, job, worker, "completed", 10).await;
+    let stats = stats(&db, job).await;
+    let games = stats.games.as_ref().expect("a games job");
+    let left = games.max_units as f64 - games.units_completed as f64;
+    // Two claims in the last hour, ten games a batch, each task played twice.
+    let expected = left / (2.0 / 3600.0 * 10.0 / 2.0);
+    let eta = stats.eta_seconds.expect("recent throughput");
+    assert!((eta - expected).abs() < 1e-6 * expected, "{eta} vs {expected}");
+}
+
+/// I-STATS-8c: a job activated less than an hour ago is measured since its
+/// activation, not over a whole hour: ten minutes in, the hour's average read
+/// six times the real time left.
+#[tokio::test]
+async fn a_new_jobs_eta_is_measured_since_it_was_activated() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 10).await;
+    sqlx::query("UPDATE jobs SET activated_at = now() - interval '10 minutes' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let worker = Owner::Anon(anon(&db).await);
+    claim(&db, job, worker, "completed", 5).await;
+    claim(&db, job, worker, "completed", 5).await;
+    let stats = stats(&db, job).await;
+    let games = stats.games.as_ref().expect("a games job");
+    let left = games.max_units as f64 - games.units_completed as f64;
+    // Two claims in ten minutes, ten games a batch.
+    let expected = left / (2.0 / 600.0 * 10.0);
+    let eta = stats.eta_seconds.expect("recent throughput");
+    assert!((eta - expected).abs() < 0.01 * expected, "{eta} vs {expected}");
+}
+
+/// I-STATS-11: the stats payload cache. A payload is served from the cache
+/// until it expires; `forget` (every admin action) makes the next read build
+/// again; and a build reads the job's row itself, so a caller's copy read
+/// before an admin action cannot be cached as newer than it.
+#[tokio::test]
+async fn the_stats_cache_follows_admin_changes() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 10).await;
+    let before = jobstats::load_job(&db.pool, job).await.unwrap();
+    let ttl = std::time::Duration::from_secs(600);
+    let allocation = |json: &str| -> serde_json::Value {
+        serde_json::from_str::<serde_json::Value>(json).unwrap()["job"]["allocation"].clone()
+    };
+
+    let first = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    assert_eq!(allocation(&first), json!(50));
+    sqlx::query("UPDATE jobs SET allocation = 30 WHERE id = $1").bind(job).execute(&db.pool).await.unwrap();
+    let cached = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    assert_eq!(allocation(&cached), json!(50), "served from the cache until it is forgotten");
+
+    jobstats::forget(job);
+    // `before` still says 50: the build reads the row, not the caller's copy.
+    let fresh = jobstats::payload(&db.pool, &before, ttl).await.unwrap();
+    assert_eq!(allocation(&fresh), json!(30));
+    // A build that starts after a forget is kept, and so is what a live push
+    // sends.
+    jobstats::forget(job);
+    assert!(jobstats::refresh_payload(&db.pool, job, ttl).await.unwrap().is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -578,6 +652,14 @@ async fn a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before() {
     close(games.sprt.llr, 3.069_265_955_413_046_7);
     assert_eq!(games.sprt.status, SprtStatus::Passed);
     assert_eq!(job_status(&db, job).await, "completed");
+
+    // I-STATS-9b: the verdict it completed on is stored with the completion,
+    // beside the live figures that results still in flight can go on moving.
+    let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
+    let decided = &body["games"]["decided"];
+    assert_eq!(decided["status"], json!("passed"), "{body}");
+    assert_eq!(decided["units"], json!(200), "{body}");
+    close(decided["llr"].as_f64().unwrap(), 3.069_265_955_413_046_7);
 }
 
 /// I-STATS-9 (H0): a job whose player 1 is losing completes too, with its
@@ -598,4 +680,84 @@ async fn a_job_driven_to_h0_completes_with_its_sprt_failed() {
 
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}"), &[])).await;
     assert_eq!(body["games"]["sprt"]["status"], json!("failed"), "{body}");
+    assert_eq!(body["games"]["decided"]["status"], json!("failed"), "{body}");
 }
+
+/// I-STATS-10: a stats build takes one connection from its pool, not one per
+/// statement. Taken per statement, a build on a saturated display pool waited
+/// out the acquire timeout once for each of its eight or so reads and answered
+/// in tens of seconds, where the pool's short timeout was meant to make it a
+/// quick `503`.
+#[tokio::test]
+async fn a_stats_build_takes_one_connection() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let acquired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = acquired.clone();
+    let connects = acquired.clone();
+    // One connection, so every acquire after the first reuses it and passes
+    // the hook; a new one passes `after_connect` instead.
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(move |_, _| {
+            let connects = connects.clone();
+            Box::pin(async move {
+                connects.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        })
+        .before_acquire(move |_, _| {
+            let counter = counter.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(true)
+            })
+        })
+        .connect(&db.url)
+        .await
+        .unwrap();
+    // The connection opened and returned first, so the build's acquires are
+    // all reuses of it.
+    drop(pool.acquire().await.unwrap());
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    acquired.store(0, std::sync::atomic::Ordering::SeqCst);
+
+    birdtest::jobstats::refresh_payload(&pool, job, std::time::Duration::ZERO).await.unwrap();
+    assert_eq!(acquired.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// I-STATS-10b: viewers waiting on one job's build that fails are all told
+/// busy when it does, not each after a failed build of its own: in turn, on a
+/// saturated pool each waited out the acquire timeout after the one before.
+#[tokio::test]
+async fn viewers_waiting_on_a_failed_build_are_answered_together() {
+    let db = TestDb::new().await;
+    let job_id = db.games_job(1, 2).await;
+    let job = birdtest::jobstats::load_job(&db.pool, job_id).await.unwrap();
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(1))
+        .connect(&db.url)
+        .await
+        .unwrap();
+    // The pool's one connection, held: every build waits out the timeout.
+    let held = pool.acquire().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let viewers: Vec<_> = (0..6)
+        .map(|_| {
+            let (pool, job) = (pool.clone(), job.clone());
+            tokio::spawn(async move {
+                birdtest::jobstats::payload(&pool, &job, std::time::Duration::from_secs(10)).await
+            })
+        })
+        .collect();
+    for viewer in viewers {
+        let answer = viewer.await.unwrap();
+        assert_eq!(answer.unwrap_err().status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+    let took = started.elapsed();
+    drop(held);
+    assert!(took < std::time::Duration::from_millis(2500), "six viewers took {took:?}");
+}
+

@@ -32,6 +32,57 @@ pub async fn log(
     Ok(())
 }
 
+/// An account's own action on its credentials: an API key issued, suspended,
+/// resumed or revoked, a password reset, an address confirmed. The account is
+/// both actor and, for the password and address, target. A key's label is not
+/// recorded: it is the owner's free text, and the log is append-only, so it
+/// would outlive the account's deletion.
+///
+/// These are what a takeover leaves behind -- keys minted, then revoked by the
+/// owner; a password reset -- and a revoked key's row is deleted, so this row is
+/// the only record it existed. They are also what a restore to an earlier point
+/// silently undoes, and what RUNBOOK §1 re-applies from (the audit's pass 22).
+pub async fn log_account(
+    conn: &mut PgConnection,
+    action: &str,
+    user_id: Uuid,
+    target_type: &str,
+    target_id: String,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO audit_log (action, actor_user_id, target_type, target_id)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(action)
+    .bind(user_id)
+    .bind(target_type)
+    .bind(target_id)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// A job the server completed itself -- its stopping rule, SPRT, its last
+/// generation -- with the verdict in `reason` when there is one. Only the admin
+/// path logged `job.completed`, and `jobs` keeps no completion time, so nothing
+/// said when such a job finished (the audit's pass 22). No actor: the server.
+pub async fn log_server_completion(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    reason: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO audit_log (action, target_type, target_id, job_id, old_status, new_status, reason)
+         VALUES ('job.completed', 'job', $1, $2, 'active', 'completed', $3)",
+    )
+    .bind(job_id.to_string())
+    .bind(job_id)
+    .bind(reason)
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
 /// Status transitions carry the old and new value so the log reads as a history.
 pub async fn log_status_change(
     conn: &mut PgConnection,

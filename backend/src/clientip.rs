@@ -26,13 +26,15 @@ pub fn resolve(headers: &HeaderMap, peer: Option<IpAddr>, trusted_hops: usize) -
     if trusted_hops == 0 {
         return peer;
     }
-    // Repeated headers are one list, in order.
-    let entries: Vec<&str> = headers
+    // Repeated headers are one list, in order. Read as bytes: a value with one
+    // byte that is not visible ASCII was dropped whole, and the request keyed
+    // on the peer -- behind the ALB, a node's address, a fresh bucket for
+    // every per-IP limit. Only the entry the trusted hop wrote need parse.
+    let entries: Vec<&[u8]> = headers
         .get_all("x-forwarded-for")
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
+        .flat_map(|value| value.as_bytes().split(|&b| b == b','))
+        .map(<[u8]>::trim_ascii)
         .filter(|entry| !entry.is_empty())
         .collect();
     if entries.len() < trusted_hops {
@@ -40,7 +42,10 @@ pub fn resolve(headers: &HeaderMap, peer: Option<IpAddr>, trusted_hops: usize) -
         // proxies at all, so the header says nothing trustworthy.
         return peer;
     }
-    entries[entries.len() - trusted_hops].parse().ok().or(peer)
+    std::str::from_utf8(entries[entries.len() - trusted_hops])
+        .ok()
+        .and_then(|entry| entry.parse().ok())
+        .or(peer)
 }
 
 /// The resolved client address. Never rejects: a request with no connection
@@ -98,6 +103,17 @@ mod tests {
     fn two_trusted_hops_skip_the_inner_proxy() {
         let forwarded = headers(&["6.6.6.6, 203.0.113.7", "10.0.1.5"]);
         assert_eq!(resolve(&forwarded, Some(ip("10.0.0.9")), 2), Some(ip("203.0.113.7")));
+    }
+
+    #[test]
+    fn a_byte_that_is_not_ascii_does_not_drop_the_header() {
+        // Keyed on the peer instead, each ALB node was a fresh bucket.
+        let mut forwarded = HeaderMap::new();
+        forwarded.append(
+            "x-forwarded-for",
+            axum::http::HeaderValue::from_bytes(b"caf\xe9, 203.0.113.9").unwrap(),
+        );
+        assert_eq!(resolve(&forwarded, Some(ip("10.0.0.9")), 1), Some(ip("203.0.113.9")));
     }
 
     #[test]

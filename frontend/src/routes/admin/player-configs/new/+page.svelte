@@ -1,7 +1,8 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { api, type InputData } from '$lib/api';
+  import { optionalNumber } from '$lib/format';
+  import { api, errorText, type InputData } from '$lib/api';
 
   let name = '';
   let recorderType = 'best';
@@ -16,6 +17,9 @@
   let maxIterations = 1000;
   let numPlies = 2;
   let numPlays = 10;
+  // MAGPIE's default. A static player's list is sized by it too: an opening-rack
+  // job cannot report more plays per rack than this.
+  let staticNumPlays = 100;
   let numPlaysRecorded = 10;
   let numPliesRecorded = 2;
   let stoppingPct = 99;
@@ -26,6 +30,8 @@
   // workers.
   let useWordmap = true;
   let useRit = false;
+  // Blank means "MAGPIE's default" (see optionalNumber).
+  const optional = optionalNumber;
   let minPlayIterations: number | '' = '';
   let threshold = '';
   let samplingRule = '';
@@ -35,6 +41,9 @@
   let utilitySpreadScale: number | '' = '';
   let movegenMargin: number | '' = '';
   let error = '';
+  // Whether `error` is the last submit's: only that is cleared by an edit, not
+  // a failure to load the form's choices.
+  let fromSubmit = false;
   let busy = false;
 
   $: lexica = files.filter((f) => f.role === 'kwg');
@@ -52,7 +61,12 @@
   }
 
   onMount(async () => {
-    files = await api.inputData();
+    try {
+      files = await api.inputData();
+    } catch (e) {
+      error = `Could not load input data: ${errorText(e)}`;
+      return;
+    }
     // Filtered from `files` here rather than read off the `$:` arrays above:
     // those are recomputed on the update cycle, not on assignment, so they
     // would still be empty on the next line and every default would be ''.
@@ -74,7 +88,7 @@
         winpct_id: simming ? winpctId || null : null,
         max_iterations: simming ? maxIterations : null,
         num_plies: simming ? numPlies : null,
-        num_plays: simming ? numPlays : null,
+        num_plays: simming ? numPlays : staticNumPlays,
         num_plays_recorded: numPlaysRecorded,
         num_plies_recorded: simming ? numPliesRecorded : null,
         stopping_pct: simming ? stoppingPct : null,
@@ -87,21 +101,20 @@
         // Left blank, the server writes MAGPIE's default into the config. These
         // are simulation settings, which a static player states none of: the
         // server refuses one that does.
-        min_play_iterations:
-          !simming || minPlayIterations === '' ? null : Number(minPlayIterations),
+        min_play_iterations: simming ? optional(minPlayIterations) : null,
         threshold: (simming && threshold) || null,
         sampling_rule: (simming && samplingRule) || null,
-        inference_margin: !simming || inferenceMargin === '' ? null : Number(inferenceMargin),
-        utility_w_winpct: !simming || utilityWWinpct === '' ? null : Number(utilityWWinpct),
-        utility_w_spread: !simming || utilityWSpread === '' ? null : Number(utilityWSpread),
-        utility_spread_scale:
-          !simming || utilitySpreadScale === '' ? null : Number(utilitySpreadScale),
-        movegen_margin: movegenMargin === '' ? null : Number(movegenMargin)
+        inference_margin: simming ? optional(inferenceMargin) : null,
+        utility_w_winpct: simming ? optional(utilityWWinpct) : null,
+        utility_w_spread: simming ? optional(utilityWSpread) : null,
+        utility_spread_scale: simming ? optional(utilitySpreadScale) : null,
+        movegen_margin: optional(movegenMargin)
       });
       goto('/admin/player-configs');
       return created;
     } catch (e) {
-      error = (e as Error).message;
+      error = errorText(e);
+      fromSubmit = true;
     } finally {
       busy = false;
     }
@@ -110,7 +123,7 @@
 
 <h1 class="mb-6 text-2xl font-semibold">New player config</h1>
 
-<form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit}>
+<form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
     <label class="label" for="name">Name</label>
     <input id="name" class="input" bind:value={name} placeholder="simmer-NWL23-4ply" required />
@@ -126,11 +139,12 @@
       </select>
       <p class="mt-1 text-xs text-muted-foreground">
         This decides what move generation <em>keeps</em>, not which move is played.
-        <strong>best</strong> throws away every candidate but the winner, so a config using it
-        can only ever report one move per position — and a simmer using it has nothing to choose
-        between, which makes plies and plays do nothing. Right for games jobs, where only the
-        move played matters. An opening-rack job wants a ranking, so it needs
-        <strong>all</strong> or <strong>equity</strong> unless it records exactly one play.
+        <strong>best</strong> throws away every candidate but the winner, so a static config
+        using it can only ever report one move per position. A simmer is unaffected: it ranks
+        every play up to its number of plays, whatever the recorder. Right for games jobs, where
+        only the move played matters. A static opening-rack player wants a ranking, so it needs
+        <strong>all</strong> unless it records exactly one play. (<strong>equity</strong> keeps only
+        the moves within the equity margin of the best, which can be fewer than it reports.)
       </p>
     </div>
     <div>
@@ -168,9 +182,21 @@
     <input id="npres" type="number" min="1" required class="input" bind:value={numPlaysRecorded} />
     <p class="mt-1 text-xs text-muted-foreground">
       How many ranked plays birdtest stores per analysed position. Separate from
-      how many are generated or simulated.
+      how many are generated or simulated, and never more than that: an
+      opening-rack job refuses a config that reports more plays than it generates.
     </p>
   </div>
+
+  {#if !simming}
+    <div>
+      <label class="label" for="nps">Plays to generate (-np)</label>
+      <input id="nps" type="number" min="1" required class="input" bind:value={staticNumPlays} />
+      <p class="mt-1 text-xs text-muted-foreground">
+        How many plays move generation keeps. An opening-rack analysis ranks these, so
+        it must be at least the plays to report.
+      </p>
+    </div>
+  {/if}
 
   <label class="flex items-center gap-2 text-sm">
     <input type="checkbox" bind:checked={simming} />
@@ -183,7 +209,7 @@
       <div><label class="label" for="num_plies">Plies (-pl)</label><input id="num_plies" type="number" class="input" bind:value={numPlies} /></div>
       <div><label class="label" for="np">Plays to simulate (-np)</label><input id="np" type="number" class="input" bind:value={numPlays} /></div>
       <div><label class="label" for="npr">Plies to report (shplies)</label><input id="npr" type="number" class="input" bind:value={numPliesRecorded} /></div>
-      <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="0.1" class="input" bind:value={stoppingPct} /></div>
+      <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="any" min="0" max="100" class="input" bind:value={stoppingPct} /></div>
       <p class="text-sm">No time limit: a simulation stops at its iteration budget, so what it finds does not depend on the contributor's hardware.</p>
       <label class="flex items-end gap-2 text-sm">
         <input type="checkbox" bind:checked={useInference} />
@@ -195,7 +221,7 @@
       <label class="label" for="sort">Sort strategy (-s)</label>
       <select id="sort" class="input" bind:value={sortStrategy}>
         <option value="equity">equity — score plus leave value (standard static player)</option>
-        <option value="score">score — raw score only</option>
+        <option value="score">score — raw score only (static players; a simmer ranks by equity)</option>
       </select>
     </div>
   {/if}
@@ -244,23 +270,23 @@
       </div>
       <div>
         <label class="label" for="im">Inference margin (-im)</label>
-        <input id="im" type="number" step="0.1" class="input" bind:value={inferenceMargin} />
+        <input id="im" type="number" step="any" class="input" bind:value={inferenceMargin} />
       </div>
       <div>
         <label class="label" for="uwin">Utility weight: win% (-uwin)</label>
-        <input id="uwin" type="number" step="0.1" class="input" bind:value={utilityWWinpct} />
+        <input id="uwin" type="number" step="any" class="input" bind:value={utilityWWinpct} />
       </div>
       <div>
         <label class="label" for="uspread">Utility weight: spread (-uspread)</label>
-        <input id="uspread" type="number" step="0.1" class="input" bind:value={utilityWSpread} />
+        <input id="uspread" type="number" step="any" class="input" bind:value={utilityWSpread} />
       </div>
       <div>
         <label class="label" for="uspreadscale">Utility spread scale (-uspreadscale)</label>
-        <input id="uspreadscale" type="number" step="0.1" class="input" bind:value={utilitySpreadScale} />
+        <input id="uspreadscale" type="number" step="any" class="input" bind:value={utilitySpreadScale} />
       </div>
       <div>
         <label class="label" for="mmargin">Move-gen equity margin (-mmargin)</label>
-        <input id="mmargin" type="number" step="0.1" class="input" bind:value={movegenMargin} />
+        <input id="mmargin" type="number" step="any" class="input" bind:value={movegenMargin} />
         <p class="mt-1 text-xs text-muted-foreground">
           Shared across both players in a job, same as win% model.
         </p>
@@ -268,6 +294,8 @@
     </div>
   {/if}
 
-  {#if error}<p class="field-error">{error}</p>{/if}
+  <!-- Announced: an error that appears after a submit is otherwise silent to a
+       screen reader. -->
+  {#if error}<p class="field-error" role="alert">{error}</p>{/if}
   <button class="btn-primary" disabled={busy}>{busy ? 'Creating…' : 'Create'}</button>
 </form>

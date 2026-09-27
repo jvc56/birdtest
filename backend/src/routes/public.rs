@@ -1,8 +1,10 @@
+use crate::clientip::ClientIp;
 use crate::error::{AppError, AppResult};
-use crate::jobstats::{self, JobStats};
+use crate::jobstats;
 use crate::models::job::{Job, JobType};
 use crate::state::AppState;
-use axum::extract::{Path, Query, State};
+use crate::extract::{ApiPath as Path, ApiQuery as Query};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::IntoResponse;
@@ -11,7 +13,9 @@ use axum::{Json, Router};
 use futures::stream::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -32,6 +36,17 @@ pub struct PageQuery {
     pub per_page: Option<i64>,
 }
 
+/// The job list's query: a page, and optionally only jobs of one status --
+/// the home page's "active jobs" filtered the newest page in the browser,
+/// and lost every active job older than it.
+#[derive(Deserialize)]
+struct JobListQuery {
+    #[serde(default)]
+    page: i64,
+    per_page: Option<i64>,
+    status: Option<crate::models::job::JobStatus>,
+}
+
 #[derive(Serialize)]
 struct JobListItem {
     id: Uuid,
@@ -45,7 +60,7 @@ struct JobListItem {
     /// For on-demand SPRT jobs the meaningful denominator is `max_games` /
     /// `max_pairs`, not a task count that grows as work is handed out.
     units_completed: Option<i64>,
-    max_units: Option<i32>,
+    max_units: Option<i64>,
     /// Workers are declining this job and none is completing it.
     ///
     /// A job pinned to data nobody has does not announce itself: the workers
@@ -58,7 +73,7 @@ struct JobListItem {
 
 async fn list_jobs(
     State(state): State<AppState>,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<JobListQuery>,
 ) -> AppResult<Json<super::Page<JobListItem>>> {
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
@@ -77,6 +92,13 @@ async fn list_jobs(
                 -- from the rows.
                 j.games_completed AS game_rows,
                 gc.max_games, pc.max_pairs,
+                -- Tasks are made on demand, so for opening racks and leave
+                -- generation a task count is no denominator: it is only what
+                -- has been handed out so far. Their own units instead: racks
+                -- analysed of the rack space, generations closed of the count.
+                j.racks_analyzed, rc.total_racks, lc.generation_count,
+                (SELECT COUNT(*) FROM leave_generation_artifacts a
+                  WHERE a.job_id = j.id AND a.generation >= 1) AS generations_closed,
                 -- Stalled: at least one decline and no submission in the last
                 -- 24 hours, with nothing currently claimed. Long enough not to
                 -- flap overnight, short enough that an admin sees it the next
@@ -85,11 +107,8 @@ async fn list_jobs(
                  AND EXISTS (SELECT 1 FROM worker_data_gaps g
                               WHERE g.job_id = j.id
                                 AND g.reported_at > now() - interval '24 hours')
-                 AND NOT EXISTS (SELECT 1 FROM task_claims c
-                                 JOIN tasks t ON t.id = c.task_id
-                                 WHERE t.job_id = j.id
-                                   AND c.state = 'completed'
-                                   AND c.completed_at > now() - interval '24 hours')
+                 AND (j.last_completed_at IS NULL
+                      OR j.last_completed_at < now() - interval '24 hours')
                  AND NOT EXISTS (SELECT 1 FROM task_claims c
                                  JOIN tasks t ON t.id = c.task_id
                                  WHERE t.job_id = j.id AND c.state = 'claimed')
@@ -97,17 +116,24 @@ async fn list_jobs(
          FROM jobs j
          LEFT JOIN job_game_config gc ON gc.job_id = j.id
          LEFT JOIN job_game_pair_config pc ON pc.job_id = j.id
+         LEFT JOIN job_opening_rack_config rc ON rc.job_id = j.id
+         LEFT JOIN job_leave_config lc ON lc.job_id = j.id
+         WHERE $3::job_status IS NULL OR j.status = $3
          ORDER BY j.created_at DESC, j.id DESC
          LIMIT $1 OFFSET $2",
     )
     .bind(limit)
     .bind(offset)
+    .bind(query.status)
     .fetch_all(&state.read_pool)
     .await?;
 
-    let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs")
-        .fetch_one(&state.read_pool)
-        .await?;
+    let total = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM jobs WHERE $1::job_status IS NULL OR status = $1",
+    )
+    .bind(query.status)
+    .fetch_one(&state.read_pool)
+    .await?;
 
     let items = rows
         .into_iter()
@@ -118,9 +144,15 @@ async fn list_jobs(
             let max_games: Option<i32> = row.get("max_games");
             let max_pairs: Option<i32> = row.get("max_pairs");
             let (units_completed, max_units) = match job_type {
-                JobType::Games => (Some(game_rows), max_games),
-                JobType::GamePairs => (Some(game_rows / 2), max_pairs),
-                _ => (None, None),
+                JobType::Games => (Some(game_rows), max_games.map(i64::from)),
+                JobType::GamePairs => (Some(game_rows / 2), max_pairs.map(i64::from)),
+                JobType::OpeningRack => {
+                    (Some(row.get::<i64, _>("racks_analyzed")), row.get::<Option<i64>, _>("total_racks"))
+                }
+                JobType::LeaveGeneration => (
+                    Some(row.get::<i64, _>("generations_closed")),
+                    row.get::<Option<i32>, _>("generation_count").map(i64::from),
+                ),
             };
             JobListItem {
                 id: row.get("id"),
@@ -149,9 +181,19 @@ async fn load_job(state: &AppState, id: Uuid) -> AppResult<Job> {
         .ok_or_else(|| AppError::not_found("no such job"))
 }
 
-async fn job_detail(State(state): State<AppState>, Path(id): Path<Uuid>) -> AppResult<Json<JobStats>> {
+/// A `JobStats`, as JSON; see `Config::stats_cache` for how fresh.
+async fn job_detail(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<axum::response::Response> {
+    use axum::response::IntoResponse;
     let job = load_job(&state, id).await?;
-    Ok(Json(jobstats::compute(&state.read_pool, &job).await?))
+    let payload = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache).await?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        payload.to_string(),
+    )
+        .into_response())
 }
 
 #[derive(Deserialize)]
@@ -202,6 +244,23 @@ async fn job_results(
     };
     let worker_predicate = worker_predicate(worker.as_ref());
 
+    // A named contributor's page is read through their own claims in this
+    // job, newest completion first: one backward range of
+    // `task_claims_user_idx` / `_anon_idx`, which are keyed by identity, job
+    // and completion time, joined to each claim's records until the page is
+    // full. It costs a page whoever the contributor is. Read the other way --
+    // the job's records newest first, keeping that contributor's -- the cost
+    // was the distance from the head of the feed to their fiftieth record: a
+    // contributor who never worked the job walked all of it (5.8 s cold over
+    // two million records) to return nothing, and one whose work was all early
+    // in a long job walked everything since, on a public route. A claim's
+    // records share its completion time (an opening-rack batch's
+    // `submitted_at` is the same transaction's `now()`; a games result's is
+    // taken moments later, in the same transaction), so this is the feed's
+    // own order; the cursor is the claim's time, so paging is exact either
+    // way. One range per identity the name is (`filtered_claims`).
+    let claims = worker.as_ref().map(filtered_claims);
+
     // Every branch below reads its rows through the job id the record tables
     // now carry, rather than by joining `tasks` to find out which rows belong
     // to the job — which put the filter on the far side of a join from the
@@ -216,22 +275,40 @@ async fn job_results(
             // to now(), which is transaction time, so every record of one batch
             // shares it exactly and it is not a key on its own.
             let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
-            let rows = sqlx::query(&format!(
-                "SELECT r.id, r.task_id, r.rack, m.move AS best_move, m.score AS best_score,
-                        m.equity AS best_equity, r.num_moves, r.submitted_at,
+            // The page is chosen first -- from the records alone, or from the
+            // contributor's claims and their records -- and only its rows are
+            // joined to their claim, best move and account. Joined first, a
+            // contributor with many records here had every one of them joined
+            // to its moves before the sort picked fifty. The LIMIT keeps the
+            // subquery from being flattened into the joins.
+            let page = match &claims {
+                None => "SELECT r.id, r.task_id, r.rack, r.num_moves, r.submitted_at,
+                                r.task_claim_id, r.submitted_at AS at
+                         FROM position_analysis_records r
+                         WHERE r.job_id = $1
+                           AND ($4::timestamptz IS NULL
+                                OR (r.submitted_at, r.id) < ($4, $5))
+                         ORDER BY r.submitted_at DESC, r.id DESC
+                         LIMIT $6"
+                    .to_string(),
+                Some(ranges) => {
+                    merged_pages(ranges.iter().map(|c| opening_rack_page(c)), "at DESC, id DESC")
+                }
+            };
+            let sql = format!(
+                "WITH page AS ({page})
+                 SELECT p.id, p.task_id, p.rack, m.move AS best_move, m.score AS best_score,
+                        m.equity AS best_equity, p.num_moves, p.submitted_at, p.at,
                         u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
-                 FROM position_analysis_records r
-                 JOIN task_claims c ON c.id = r.task_claim_id
+                 FROM page p
+                 JOIN task_claims c ON c.id = p.task_claim_id
                  LEFT JOIN position_analysis_moves m
-                     ON m.record_id = r.id AND m.rank = 1
+                     ON m.record_id = p.id AND m.rank = 1
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
-                 WHERE r.job_id = $1
-                   {worker_predicate}
-                   AND ($4::timestamptz IS NULL
-                        OR (r.submitted_at, r.id) < ($4, $5))
-                 ORDER BY r.submitted_at DESC, r.id DESC
-                 LIMIT $6",
-            ))
+                 WHERE TRUE {worker_predicate}
+                 ORDER BY p.at DESC, p.id DESC",
+            );
+            let rows = sqlx::query(&sql)
             // Planned for the values it is run with, not cached: see
             // `worker_predicate`.
             .persistent(worker.is_none())
@@ -247,7 +324,7 @@ async fn job_results(
             if rows.len() as i64 == limit {
                 if let Some(last) = rows.last() {
                     next_cursor = Some(super::encode_cursor(&[
-                        last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
+                        last.get::<chrono::DateTime<chrono::Utc>, _>("at")
                             .timestamp_micros()
                             .to_string(),
                         last.get::<i64, _>("id").to_string(),
@@ -278,23 +355,36 @@ async fn job_results(
             // rather than as the thing that decides which rows belong to the
             // job.
             let (after_time, after_claim) = game_result_cursor(cursor.as_deref());
-            let rows = sqlx::query(&format!(
-                "SELECT r.task_claim_id, r.task_id, r.games, r.wins, r.losses, r.ties,
+            let page = match &claims {
+                None => "SELECT r.task_claim_id, r.submitted_at AS at
+                         FROM game_results r
+                         WHERE r.job_id = $1
+                           AND ($4::timestamptz IS NULL
+                                OR (r.submitted_at, r.task_claim_id) < ($4, $5))
+                         ORDER BY r.submitted_at DESC, r.task_claim_id DESC
+                         LIMIT $6"
+                    .to_string(),
+                Some(ranges) => merged_pages(
+                    ranges.iter().map(|c| game_page(c)),
+                    "at DESC, task_claim_id DESC",
+                ),
+            };
+            let sql = format!(
+                "WITH page AS ({page})
+                 SELECT r.task_claim_id, r.task_id, r.games, r.wins, r.losses, r.ties,
                         r.p1_score_mean, r.p1_score_sd, r.p2_score_mean, r.p2_score_sd,
                         r.divergent_games, r.divergent_wins, r.divergent_losses,
-                        r.divergent_ties, r.submitted_at,
+                        r.divergent_ties, r.submitted_at, p.at,
                         t.seed, u.username, left(encode(sha256(convert_to(c.claimed_by_anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id
-                 FROM game_results r
+                 FROM page p
+                 JOIN game_results r ON r.task_claim_id = p.task_claim_id
                  JOIN tasks t ON t.id = r.task_id
                  JOIN task_claims c ON c.id = r.task_claim_id
                  LEFT JOIN users u ON u.id = c.claimed_by_user_id
-                 WHERE r.job_id = $1
-                   {worker_predicate}
-                   AND ($4::timestamptz IS NULL
-                        OR (r.submitted_at, r.task_claim_id) < ($4, $5))
-                 ORDER BY r.submitted_at DESC, r.task_claim_id DESC
-                 LIMIT $6",
-            ))
+                 WHERE TRUE {worker_predicate}
+                 ORDER BY p.at DESC, p.task_claim_id DESC",
+            );
+            let rows = sqlx::query(&sql)
             .persistent(worker.is_none())
             .bind(id)
             .bind(worker_user)
@@ -308,7 +398,7 @@ async fn job_results(
             if rows.len() as i64 == limit {
                 if let Some(last) = rows.last() {
                     next_cursor = Some(super::encode_cursor(&[
-                        last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
+                        last.get::<chrono::DateTime<chrono::Utc>, _>("at")
                             .timestamp_micros()
                             .to_string(),
                         last.get::<Uuid, _>("task_claim_id").to_string(),
@@ -388,8 +478,24 @@ async fn job_results(
                 .bind(remaining)
                 .fetch_all(&state.read_pool)
                 .await?;
+                let short = (page.len() as i64) < remaining;
                 rows.extend(page);
-                generation = Some(current - 1);
+                if !short {
+                    break;
+                }
+                // The next generation down that has rows, by one probe of the
+                // primary key -- not `current - 1`: the cursor is the client's,
+                // and a made-up generation of two billion stepped down one
+                // empty read at a time, holding a display-pool connection for
+                // as long as the client cared to wait.
+                generation = sqlx::query_scalar::<_, Option<i32>>(
+                    "SELECT MAX(generation) FROM leave_rack_progress
+                     WHERE job_id = $1 AND generation < $2",
+                )
+                .bind(id)
+                .bind(current)
+                .fetch_one(&state.read_pool)
+                .await?;
             }
 
             if rows.len() as i64 == limit {
@@ -446,7 +552,9 @@ struct WorkerFilter {
 async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<WorkerFilter>> {
     // Deleted accounts included: the contribution table still lists their
     // results, under the tombstone name, and that name filters like any other.
-    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE username = $1")
+    // Through the case-insensitive unique index, the only one on the name:
+    // names are unique whatever their case, so this is still one account.
+    let user_id = sqlx::query_scalar::<_, Uuid>("SELECT id FROM users WHERE lower(username) = lower($1)")
     .bind(name)
     .fetch_optional(&state.read_pool)
     .await?;
@@ -470,15 +578,99 @@ async fn resolve_worker(state: &AppState, name: &str) -> AppResult<Option<Worker
     Ok((user_id.is_some() || anon_uuid.is_some()).then_some(WorkerFilter { user_id, anon_uuid }))
 }
 
+/// A named contributor's completed claims in the job (`$1`), from the cursor's
+/// time (`$4`) back, as `(id, completed_at)`: one range per identity the name
+/// is -- an account, an anonymous pseudonym, or (rarely) both. Each is one
+/// backward range of that identity's index, `(identity, job_id,
+/// completed_at)`: only a completed claim has a `completed_at`, so the rest
+/// sit at the NULL end, outside it.
+///
+/// Past the cursor's time is the range's own bound, `completed_at <= $4`; the
+/// pages built on it break the tie at exactly `$4` as `NOT (completed_at = $4
+/// AND id >= $5)`, which is `(completed_at, id) < ($4, $5)` inside the range.
+/// Not written as that row comparison: Postgres estimates one from its first
+/// column, so it applied the time bound's selectivity twice, expected fewer
+/// rows than the page, and dropped the ordered scan that stops at the page --
+/// reading the contributor's whole range, or every position record in the
+/// fleet (0.5-2 s), for an old cursor anyone can send.
+///
+/// There is deliberately no `state = 'completed'`. It says nothing more, and
+/// it lets the planner prove the fleet-wide `task_claims_completed_idx` usable,
+/// which it then chose for a heavy contributor on a large job -- judging their
+/// share of the job from their share of all claims -- and walked every
+/// completion in the fleet: 6.2 s to return an empty page.
+fn filtered_claims(worker: &WorkerFilter) -> Vec<String> {
+    let range = |column: &str, param: &str| {
+        format!(
+            "SELECT c.id, c.completed_at FROM task_claims c
+             WHERE c.{column} = {param}::uuid AND c.job_id = $1
+               AND c.completed_at IS NOT NULL
+               AND ($4::timestamptz IS NULL OR c.completed_at <= $4)"
+        )
+    };
+    let mut ranges = Vec::new();
+    if worker.user_id.is_some() {
+        ranges.push(range("claimed_by_user_id", "$2"));
+    }
+    if worker.anon_uuid.is_some() {
+        ranges.push(range("claimed_by_anon_uuid", "$3"));
+    }
+    ranges
+}
+
+/// One identity's opening-rack page over its claim range (`filtered_claims`).
+fn opening_rack_page(claims: &str) -> String {
+    format!(
+        "SELECT r.id, r.task_id, r.rack, r.num_moves, r.submitted_at,
+                r.task_claim_id, cl.completed_at AS at
+         FROM ({claims}) cl
+         JOIN position_analysis_records r ON r.task_claim_id = cl.id
+         WHERE $4::timestamptz IS NULL
+               OR NOT (cl.completed_at = $4 AND r.id >= $5)
+         ORDER BY cl.completed_at DESC, r.id DESC
+         LIMIT $6"
+    )
+}
+
+/// One identity's games page over its claim range (`filtered_claims`).
+fn game_page(claims: &str) -> String {
+    format!(
+        "SELECT r.task_claim_id, cl.completed_at AS at
+         FROM ({claims}) cl
+         JOIN game_results r ON r.task_claim_id = cl.id
+         WHERE $4::timestamptz IS NULL
+               OR NOT (cl.completed_at = $4 AND cl.id >= $5)
+         ORDER BY cl.completed_at DESC, cl.id DESC
+         LIMIT $6"
+    )
+}
+
+/// One identity's page, or two merged. Each page is complete on its own --
+/// its range, its records, its order and its LIMIT -- so the merge is of at
+/// most two pages. Merged any earlier, as one `UNION ALL` of the two claim
+/// ranges under a single sort, Postgres did not merge the ranges in order: it
+/// read and sorted every claim of both identities in the job (1.3-2.5 s),
+/// for a name anyone can arrange to be both by registering a heavy anonymous
+/// worker's public pseudonym.
+fn merged_pages(pages: impl Iterator<Item = String>, order: &str) -> String {
+    let pages: Vec<String> = pages.map(|page| format!("({page})")).collect();
+    match pages.as_slice() {
+        [one] => one.clone(),
+        many => format!(
+            "SELECT * FROM ({}) merged ORDER BY {order} LIMIT $6",
+            many.join(" UNION ALL ")
+        ),
+    }
+}
+
 /// The feed queries' worker clause, over `$2` (an account) and `$3` (an
 /// anonymous worker). Every variant mentions both, typed, so the statement
 /// prepares whichever are NULL.
 ///
-/// A filtered feed is sent unprepared (`persistent(false)`), so Postgres plans
-/// it for the identity actually asked about. The right plan differs by two
-/// orders of magnitude with who that is -- a heavy contributor is found at the
-/// head of the job's feed index, a rare one through their own claims -- and a
-/// cached generic plan picks one for everybody.
+/// A filtered feed is sent unprepared (`persistent(false)`), so it is planned
+/// for the values it is run with: the claim range's bound, `completed_at <= $4`,
+/// is an index condition only once `$4 IS NULL` has been decided, which a
+/// cached generic plan cannot do.
 fn worker_predicate(worker: Option<&WorkerFilter>) -> &'static str {
     match worker {
         None => "AND $2::uuid IS NULL AND $3::uuid IS NULL",
@@ -575,17 +767,100 @@ async fn rack_lookup(
     Ok(super::CursorPage { items, total, per_page: total.max(1), next_cursor: None })
 }
 
-/// One SSE event per accepted result, carrying the same payload `GET
-/// /api/jobs/:id` would return.
+/// How many live job streams are open at once, across every job.
+const MAX_LIVE_STREAMS: usize = 2000;
+static LIVE_STREAMS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(MAX_LIVE_STREAMS);
+
+/// How many of them one client address may hold. The global cap alone let one
+/// host hold every place, idle, and every other page got a 503 for as long as
+/// it stayed connected. Generous for one household or office behind one
+/// address; nowhere near the global cap.
+const MAX_LIVE_STREAMS_PER_ADDRESS: usize = 32;
+
+/// Open streams per client address; an address leaves the map with its last.
+#[derive(Debug, Default)]
+struct StreamsByAddress(std::sync::Mutex<HashMap<IpAddr, usize>>);
+
+static STREAMS_BY_ADDRESS: std::sync::LazyLock<StreamsByAddress> =
+    std::sync::LazyLock::new(StreamsByAddress::default);
+
+/// One address's place among its streams, given back on drop.
+#[derive(Debug)]
+struct AddressStream<'a> {
+    table: &'a StreamsByAddress,
+    address: IpAddr,
+}
+
+impl StreamsByAddress {
+    fn take(&self, address: IpAddr, cap: usize) -> Option<AddressStream<'_>> {
+        let mut open = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let count = open.entry(address).or_insert(0);
+        if *count >= cap {
+            return None;
+        }
+        *count += 1;
+        Some(AddressStream { table: self, address })
+    }
+}
+
+impl Drop for AddressStream<'_> {
+    fn drop(&mut self) {
+        let mut open = self.table.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = open.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                open.remove(&self.address);
+            }
+        }
+    }
+}
+
+/// A place among the live streams -- this address's share first, then the
+/// global cap -- or the 503 that says there is none. Both are held for the
+/// life of the stream.
+fn stream_permit<'a>(
+    streams: &'a tokio::sync::Semaphore,
+    by_address: &'a StreamsByAddress,
+    address: IpAddr,
+    per_address: usize,
+) -> AppResult<(AddressStream<'a>, tokio::sync::SemaphorePermit<'a>)> {
+    let unavailable = |message: &str| AppError {
+        retry_after: Some(30),
+        ..AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
+    };
+    let mine = by_address
+        .take(address, per_address)
+        .ok_or_else(|| unavailable("too many live pages are open from this address"))?;
+    let global = streams
+        .try_acquire()
+        .map_err(|_| unavailable("too many live pages are open; this one will try again shortly"))?;
+    Ok((mine, global))
+}
+
+/// SSE events as results land -- coalesced, at most one per
+/// `JOB_STATS_CACHE_SECONDS` -- each carrying the payload `GET /api/jobs/:id`
+/// would return.
 async fn job_stream(
     State(state): State<AppState>,
+    ClientIp(address): ClientIp,
     Path(id): Path<Uuid>,
 ) -> AppResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    // A stream is a connection, a task and a receiver for as long as the page
+    // is open, on a public route: unbounded, one host could hold enough of
+    // them to run the task out of memory. Past the cap a 503, which the page
+    // answers by trying again later (`frontend/src/lib/sse.ts`).
+    let permit = stream_permit(
+        &LIVE_STREAMS,
+        &STREAMS_BY_ADDRESS,
+        address,
+        MAX_LIVE_STREAMS_PER_ADDRESS,
+    )?;
     let job = load_job(&state, id).await?;
-    let initial = jobstats::compute(&state.read_pool, &job).await?;
-    let initial = serde_json::to_string(&initial).unwrap_or_else(|_| "{}".into());
-
+    // Subscribed before the first payload is read: a push published between
+    // the two was lost, and on a quiet job nothing followed it.
     let receiver = state.sse.subscribe(id);
+    let initial = jobstats::payload(&state.read_pool, &job, state.cfg.stats_cache).await?;
+
     let updates = tokio_stream::wrappers::BroadcastStream::new(receiver)
         .filter_map(|msg| async move { msg.ok() });
 
@@ -596,7 +871,11 @@ async fn job_stream(
     let shutdown = state.shutdown.clone();
     let stream = futures::stream::once(async move { initial })
         .chain(updates)
-        .map(|payload| Ok(Event::default().event("stats").data(payload)))
+        .map(move |payload| {
+            // Held for the life of the stream.
+            let _ = &permit;
+            Ok(Event::default().event("stats").data(payload.as_ref()))
+        })
         .take_until(async move { shutdown.triggered().await });
 
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
@@ -665,14 +944,40 @@ pub(super) async fn job_results_stream(
         .result_streams
         .clone()
         .try_acquire_owned()
-        .map_err(|_| AppError::rate_limited(30))?;
+        .map_err(|_| AppError {
+            message: format!(
+                "{} result streams are already running, the most at once; try again when one ends",
+                crate::state::MAX_CONCURRENT_RESULT_STREAMS
+            ),
+            ..AppError::rate_limited(30)
+        })?;
 
     // The main pool, not the display one: this cursor is held for as long as
     // the caller keeps reading, which the display pool's statement timeout
     // exists to forbid. The permit above is what bounds it instead.
-    let pool = state.pool.clone();
+    //
+    // A stream is complete exactly when it ends without an error (PLAN.md,
+    // "Exports"), so everything that can fail before the first row is done
+    // before the response head goes out, where a failure is still a status:
+    // settled here, a completed leave job's unmerged results failed to merge
+    // and the stream went on without them; connected inside the body, a busy
+    // pool answered `200` and an empty download (the audit's pass 20).
+    //
+    // A completed leave job may still hold accepted results that no merge
+    // has folded into the rows about to be read (`exports::settle`); an
+    // active one is a moving target either way, and is left to its sweep.
+    if job.status == crate::models::job::JobStatus::Completed {
+        crate::exports::settle(&state.pool, &job).await?;
+    }
+    // Closed rather than returned when the stream ends: a pool connection
+    // dropped mid-result is drained first, so a caller that hung up after
+    // a line left the whole corpus building on a connection the permit no
+    // longer counted (thirty-first audit). Closing it ends the query.
+    let mut conn = state.pool.acquire().await?;
+    conn.close_on_drop();
     let stream = async_stream::stream! {
         let _permit = permit;
+        let mut conn = conn;
         // The export's own queries, so the stream of an active job and the
         // export of a completed one are the same corpus -- an opening-rack
         // record with its ranked moves nested in it, not the record alone.
@@ -681,17 +986,7 @@ pub(super) async fn job_results_stream(
         } else {
             crate::exports::export_query(job.job_type)
         };
-
-        // A completed leave job may still hold accepted results that no merge
-        // has folded into the rows about to be read (`exports::settle`); an
-        // active one is a moving target either way, and is left to its sweep.
-        if job.status == crate::models::job::JobStatus::Completed {
-            if let Err(err) = crate::exports::settle(&pool, &job).await {
-                tracing::error!(job_id = %id, error = %err.message, "settling a job before streaming it failed");
-            }
-        }
-
-        let mut rows = sqlx::query(query).bind(id).fetch(&pool);
+        let mut rows = sqlx::query(query).bind(id).fetch(&mut *conn);
         while let Some(row) = rows.next().await {
             match row {
                 Ok(row) => {
@@ -702,7 +997,12 @@ pub(super) async fn job_results_stream(
                     yield Ok::<_, std::io::Error>(line);
                 }
                 Err(err) => {
+                    // An error, not an end: the body is cut off without its
+                    // closing chunk, which a client reports as a failed
+                    // transfer. Ended quietly, the rows so far read as the
+                    // whole corpus (the audit's pass 20).
                     tracing::error!(error = %err, "result stream failed mid-flight");
+                    yield Err(std::io::Error::other("the results query failed part-way"));
                     break;
                 }
             }
@@ -736,21 +1036,27 @@ async fn list_users(
     // `task_claims`. The page orders by it, so counting meant computing every
     // user's whole claim history before the LIMIT could apply; the partial
     // index on (tasks_completed DESC, created_at ASC) now serves both.
-    let rows = sqlx::query(
-        "SELECT u.id, u.username, u.is_admin, u.created_at, u.tasks_completed
-         FROM users u
-         WHERE u.deleted_at IS NULL
-         ORDER BY u.tasks_completed DESC, u.created_at ASC, u.id ASC
-         LIMIT $1 OFFSET $2",
-    )
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.read_pool)
-    .await?;
-
+    // Counted first, so a page past the end is answered without its query,
+    // as `/api/workers` is: `?page=` is anyone's, and a huge one read every
+    // account to return nothing.
     let total = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE deleted_at IS NULL")
         .fetch_one(&state.read_pool)
         .await?;
+    let rows = if offset >= total {
+        Vec::new()
+    } else {
+        sqlx::query(
+            "SELECT u.id, u.username, u.is_admin, u.created_at, u.tasks_completed
+             FROM users u
+             WHERE u.deleted_at IS NULL
+             ORDER BY u.tasks_completed DESC, u.created_at ASC, u.id ASC
+             LIMIT $1 OFFSET $2",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.read_pool)
+        .await?
+    };
 
     Ok(Json(super::Page {
         items: rows
@@ -805,10 +1111,26 @@ async fn worker_page(
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
+    // Counted first, so a page past the end is answered without its query:
+    // each arm reads `offset + limit` rows of its index before the merge, and
+    // `?page=` is anyone's (a huge one read every contributor, 0.3 s at
+    // 300,000 of them).
+    let total = sqlx::query_scalar::<_, i64>(
+        "SELECT (SELECT COUNT(*) FROM users WHERE tasks_completed > 0)
+              + (SELECT COUNT(*) FROM anonymous_workers WHERE tasks_completed > 0)",
+    )
+    .fetch_one(&state.read_pool)
+    .await?;
+
     // Both kinds of contributor in one ranking, each from its own running
-    // total. This was a group-by over every completed claim in the database --
-    // twice, once for the page and once for the count. Each arm is now an
-    // ordered scan of a partial index, merged under the LIMIT.
+    // total. Each arm is an ordered scan of its own partial index, cut off at
+    // the end of the requested page, and the two are merged. The arms must be
+    // limited themselves: with the LIMIT only outside the UNION, Postgres
+    // sorted every contributor of both kinds on each view (the constant NULL
+    // column in each arm defeats a merge of the index orders). Within a count,
+    // the outer order puts accounts (by id) before anonymous identities (by
+    // UUID) -- a NULL sorts last -- which is what each arm's own order gives,
+    // so the first `offset + limit` of each arm hold the page.
     //
     // `last_seen_at` here is the last *task finished*, which is what this list
     // has always shown; it is deliberately not `anonymous_workers.last_seen_at`,
@@ -819,31 +1141,43 @@ async fn worker_page(
     // to order a tie differently for each LIMIT, so paging through the list
     // showed some contributors twice and others never. A row has exactly one of
     // the two ids, so together they are a total order.
-    let rows = sqlx::query(
-        "SELECT * FROM (
-             SELECT u.id AS user_id, NULL::uuid AS anon_uuid, NULL::text AS anon_id,
-                    u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
-             FROM users u WHERE u.tasks_completed > 0
-             UNION ALL
-             SELECT NULL::uuid, w.uuid,
-                    left(encode(sha256(convert_to(w.uuid::text, 'UTF8')), 'hex'), 16),
-                    NULL::text, w.tasks_completed, w.last_completed_at
-             FROM anonymous_workers w WHERE w.tasks_completed > 0
-         ) contributors
-         ORDER BY tasks_completed DESC, user_id, anon_uuid
-         LIMIT $1 OFFSET $2",
-    )
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.read_pool)
-    .await?;
-
-    let total = sqlx::query_scalar::<_, i64>(
-        "SELECT (SELECT COUNT(*) FROM users WHERE tasks_completed > 0)
-              + (SELECT COUNT(*) FROM anonymous_workers WHERE tasks_completed > 0)",
-    )
-    .fetch_one(&state.read_pool)
-    .await?;
+    //
+    // The pseudonym is hashed after the page is chosen, for its rows only:
+    // computed inside the anonymous arm, it was a SHA-256 of every contributing
+    // anonymous identity on every view of a public, unmetered page.
+    let rows = if offset >= total {
+        Vec::new()
+    } else {
+        sqlx::query(
+            "SELECT c.user_id, c.anon_uuid,
+                    CASE WHEN c.anon_uuid IS NOT NULL
+                         THEN left(encode(sha256(convert_to(c.anon_uuid::text, 'UTF8')), 'hex'), 16)
+                    END AS anon_id,
+                    c.username, c.tasks_completed, c.last_seen_at
+             FROM (
+                 SELECT * FROM (
+                     (SELECT u.id AS user_id, NULL::uuid AS anon_uuid,
+                             u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
+                      FROM users u WHERE u.tasks_completed > 0
+                      ORDER BY u.tasks_completed DESC, u.id
+                      LIMIT $3)
+                     UNION ALL
+                     (SELECT NULL::uuid, w.uuid, NULL::text, w.tasks_completed, w.last_completed_at
+                      FROM anonymous_workers w WHERE w.tasks_completed > 0
+                      ORDER BY w.tasks_completed DESC, w.uuid
+                      LIMIT $3)
+                 ) contributors
+                 ORDER BY tasks_completed DESC, user_id, anon_uuid
+                 LIMIT $1 OFFSET $2
+             ) c
+             ORDER BY c.tasks_completed DESC, c.user_id, c.anon_uuid",
+        )
+        .bind(limit)
+        .bind(offset)
+        .bind(offset.saturating_add(limit))
+        .fetch_all(&state.read_pool)
+        .await?
+    };
 
     Ok(Json(super::Page {
         items: rows
@@ -861,4 +1195,84 @@ async fn worker_page(
         page: query.page.max(0),
         per_page: limit,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip(text: &str) -> IpAddr {
+        text.parse().unwrap()
+    }
+
+    /// A-PUBLIC-3c: a contributor's claim range names nothing a partial index
+    /// on completed claims could be proven from -- given `state = 'completed'`,
+    /// the planner walked the fleet's completions for a heavy contributor
+    /// (6.2 s) -- and a name that is two identities is two pages, merged,
+    /// never one sort over both identities' claims.
+    #[test]
+    fn a_contributors_page_is_read_through_their_own_index() {
+        let both = WorkerFilter { user_id: Some(Uuid::nil()), anon_uuid: Some(Uuid::nil()) };
+        let ranges = filtered_claims(&both);
+        assert_eq!(ranges.len(), 2);
+        for range in &ranges {
+            assert!(!range.contains("state"), "{range}");
+            assert!(range.contains("c.job_id = $1") && range.contains("completed_at IS NOT NULL"));
+        }
+        let one = WorkerFilter { user_id: Some(Uuid::nil()), anon_uuid: None };
+        assert_eq!(filtered_claims(&one).len(), 1);
+
+        // The tie at the cursor's time is broken by a negation, not a row
+        // comparison the planner would estimate from its time column again.
+        for page in ranges.iter().flat_map(|c| [opening_rack_page(c), game_page(c)]) {
+            assert!(!page.contains(") < ($4"), "{page}");
+            assert!(page.contains("NOT (cl.completed_at = $4 AND"), "{page}");
+        }
+        let merged = merged_pages(ranges.into_iter(), "at DESC, id DESC");
+        assert_eq!(merged.matches("LIMIT $6").count(), 1, "the merge's own; each page brings one");
+        assert!(merged.contains(") UNION ALL ("), "{merged}");
+        assert_eq!(merged_pages(std::iter::once("SELECT 1".to_string()), "x"), "(SELECT 1)");
+    }
+
+    /// A-PUBLIC-6b: past the cap a stream is a 503 with `Retry-After`, and a
+    /// place comes back when a stream ends.
+    #[test]
+    fn a_stream_past_the_cap_is_told_to_come_back() {
+        let streams = tokio::sync::Semaphore::new(1);
+        let by_address = StreamsByAddress::default();
+        let held = stream_permit(&streams, &by_address, ip("192.0.2.1"), 8)
+            .expect("the first stream has a place");
+        let refused = stream_permit(&streams, &by_address, ip("192.0.2.2"), 8)
+            .expect_err("the second has none");
+        assert_eq!(refused.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.retry_after, Some(30));
+        drop(held);
+        assert!(
+            stream_permit(&streams, &by_address, ip("192.0.2.2"), 8).is_ok(),
+            "an ended stream gives its place back"
+        );
+    }
+
+    /// A-PUBLIC-6c: one address cannot take every place. Past its share it is
+    /// refused while another address still gets one, a refusal holds nothing,
+    /// and an address with no streams left is forgotten.
+    #[test]
+    fn one_address_cannot_hold_every_stream() {
+        let streams = tokio::sync::Semaphore::new(10);
+        let by_address = StreamsByAddress::default();
+        let greedy = ip("198.51.100.7");
+        let held: Vec<_> = (0..3)
+            .map(|_| stream_permit(&streams, &by_address, greedy, 3).expect("within its share"))
+            .collect();
+        let refused = stream_permit(&streams, &by_address, greedy, 3).expect_err("past its share");
+        assert_eq!(refused.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(streams.available_permits(), 7, "the refusal took no global place");
+        assert!(stream_permit(&streams, &by_address, ip("203.0.113.9"), 3).is_ok());
+
+        // A global refusal gives the address's place back as well.
+        let tight = tokio::sync::Semaphore::new(0);
+        assert!(stream_permit(&tight, &by_address, ip("203.0.113.10"), 3).is_err());
+        drop(held);
+        assert!(by_address.0.lock().unwrap().is_empty(), "{:?}", by_address.0.lock().unwrap());
+    }
 }

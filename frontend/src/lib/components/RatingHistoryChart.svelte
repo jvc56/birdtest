@@ -11,16 +11,21 @@
    */
   import type { RatingHistoryPoint } from '$lib/api';
   import {
+    fitLabels,
     groupHistory,
     HEIGHT,
     historyDomain,
     PAD,
     seriesPath,
+    spreadLabels,
     historyX as sx,
     historyY as sy
   } from '$lib/charts/ratingHistory';
 
   export let history: RatingHistoryPoint[] = [];
+  /** How many of the pool's members are rated: the server sends the history
+   *  of only those drawn, so what is not shown is counted from this. */
+  export let rated = 0;
 
   let width = 720;
 
@@ -29,6 +34,17 @@
   // view (see assignColors).
   $: grouped = groupHistory(history);
   $: domain = historyDomain(grouped.series);
+  $: hidden = Math.max(grouped.hidden, rated - grouped.series.length);
+  $: names = fitLabels(grouped.series.map((s) => s.name));
+  // End labels, moved apart where their lines end close together.
+  $: labelY = domain
+    ? spreadLabels(
+        grouped.series.map((s) => sy(s.points[s.points.length - 1].rating, domain!) + 4),
+        13,
+        PAD.top + 8,
+        HEIGHT - PAD.bottom
+      )
+    : [];
 </script>
 
 <div class="w-full" bind:clientWidth={width}>
@@ -51,7 +67,7 @@
         >
       {/each}
 
-      {#each grouped.series as series}
+      {#each grouped.series as series, i}
         <path
           d={seriesPath(series, domain, width)}
           fill="none"
@@ -68,17 +84,15 @@
             r="3.5"
             fill={series.color}
           />
-          <text
-            x={sx(last.t, domain, width) + 8}
-            y={sy(last.rating, domain) + 4}
-            class="fill-foreground text-[11px]">{series.name}</text
+          <text x={sx(last.t, domain, width) + 8} y={labelY[i]} class="fill-foreground text-[11px]"
+            ><title>{series.name}</title>{names[i]}</text
           >
         {/if}
       {/each}
     </svg>
-    {#if grouped.hidden}
+    {#if hidden}
       <p class="mt-1 text-xs text-muted-foreground">
-        {grouped.hidden} more config{grouped.hidden === 1 ? '' : 's'} not shown — the table below
+        {hidden} more config{hidden === 1 ? '' : 's'} not shown — the table below
         lists every one.
       </p>
     {/if}

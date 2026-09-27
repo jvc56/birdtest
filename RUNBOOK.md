@@ -7,6 +7,25 @@ explains why; this one is what to type at 2am. Read the whole procedure before s
 Placeholders throughout: `$REGION` (default `us-east-1`), `$CLUSTER`
 (`birdtest`), `$BUCKET` (the `backups_bucket` Terraform output).
 
+**In bash.** Every block here is bash: in zsh, run `bash` first — stock zsh
+treats a `#` as a word, so a commented line fails, and an apostrophe in a
+comment opens a quote that swallows the rest of the paste.
+
+**No pager.** AWS CLI v2 sends output longer than a screen through `less`,
+which reads the rest of a pasted block as keystrokes: a restore's `wait` never
+ran. Every block here that calls `aws` begins with `export AWS_PAGER=""`
+(`scripts/runbook-check.sh` refuses one that does not).
+
+**Where the SQL runs.** The database has no public address and admits only the
+service's security group, so no `psql` on an operator's machine can reach it.
+Every `psql "$DATABASE_URL" ...` below runs inside the VPC, in the ops task
+(`infra/ops.tf`: the postgres image, `DATABASE_URL` already set, read access to
+the backups bucket): `scripts/prod-sql.sh "<SQL>"` for one batch of statements,
+or `scripts/prod-shell.sh` for an interactive shell (it needs the AWS CLI's
+Session Manager plugin) — which is where §2's scratch restore and row copy run,
+with the scratch database a Postgres started inside that shell the way
+`scripts/restore-drill.sh` starts one.
+
 ---
 
 ## 0. Before anything: what is the damage?
@@ -16,15 +35,28 @@ Placeholders throughout: `$REGION` (default `us-east-1`), `$CLUSTER`
 psql "$DATABASE_URL" -c "
   SELECT created_at, action, target_id, reason
   FROM audit_log
-  WHERE action LIKE '%.census' OR action IN ('job.deleted','job.purged','user.deleted')
+  WHERE action LIKE '%.census'
+     OR action IN ('job.deleted','job.purged','user.deleted','input_data.deleted',
+                   'player_config.deleted','worker.unbanned','job.artifacts_rebuild_started')
   ORDER BY created_at DESC LIMIT 20"
 ```
 
-Every destructive admin endpoint writes a `*.census` row *before* it destroys
-anything, so `reason` holds the row counts that were about to be lost. That is
-the scope of the restore.
+Purging or deleting a job writes a `*.census` row *before* it destroys
+anything, so `reason` holds the row counts that were about to be lost: that is
+the scope of the restore. Deleting an account anonymizes it and keeps its
+claims and results; its census says which counts were destroyed (API keys,
+confirmation codes, reset tokens) and which were kept. No procedure here
+restores an account's name, address, password or keys: its owner registers
+again and makes new keys. Other
+destructive actions
+write their own row but no census — deleting input data (and the derived rows
+it takes) or a player config, an unban, a forced artifact rebuild — so for
+those the query above shows what was done, not how much; a purge's or a
+job deletion's census does not count the data gaps and exports it also
+removes.
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 # What is restorable, and how old it is.
 aws s3 ls "s3://$BUCKET/pg/" | grep manifest | tail -5
 psql "$DATABASE_URL" -c "SELECT finished_at, ok, dump_bytes, s3_key FROM backups ORDER BY finished_at DESC LIMIT 5"
@@ -39,37 +71,498 @@ The same information is on `/admin/backups` if the site is up.
 Loses at most ~5 minutes. Takes under an hour.
 
 ```bash
+# No pager: one would swallow the rest of a paste (above).
+export AWS_PAGER=""
+
 # 1. STOP WRITES. Workers submitting into a database about to be replaced have
-#    their results silently discarded.
+#    their results silently discarded. The -down alarms fire ten minutes
+#    later, and clear when the service is back: expected here.
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 0 --region "$REGION"
 
 # 2. Pick the restore point: the latest possible instant before the damage.
 aws rds describe-db-instances --db-instance-identifier birdtest --region "$REGION" \
   --query 'DBInstances[0].LatestRestorableTime'
+```
+
+Choose the instant, then go on. Each command that needs it refuses to run
+until it is set, rather than a check here that would close the shell it was
+pasted into:
+
+```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+RESTORE_TIME=''   # the instant chosen, e.g. '2026-09-07T02:55:00Z'; used again below
 
 # 3. Restore to a NEW instance. The original is left untouched until the
 #    restore is confirmed good.
 STAMP=$(date -u +%Y%m%d%H%M)
+# The source's parameter group (a generated name): a restore without one gets
+# the default group and loses the WAL settings leave-generation merges need.
+PARAMETER_GROUP=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
+  --query 'DBInstances[0].DBParameterGroups[0].DBParameterGroupName' --output text)
+# And its class: the restore serves production once the names are swapped
+# and the application repointed (below), before the final `terraform apply`
+# puts anything else back.
+INSTANCE_CLASS=$(aws rds describe-db-instances --region "$REGION" --db-instance-identifier birdtest \
+  --query 'DBInstances[0].DBInstanceClass' --output text)
+# And a storage ceiling, which a point-in-time restore is not promised to
+# carry over: without one the restored instance cannot grow at all. RDS
+# refuses a ceiling less than 10% above the allocation, which the source's own
+# is once autoscaling has taken it near the top (and it reads `None` if it was
+# ever switched off), so it is at least 30% above.
+read -r ALLOCATED MAX_STORAGE < <(aws rds describe-db-instances --region "$REGION" \
+  --db-instance-identifier birdtest \
+  --query 'DBInstances[0].[AllocatedStorage,MaxAllocatedStorage]' --output text)
+[[ "$MAX_STORAGE" =~ ^[0-9]+$ ]] || MAX_STORAGE=0
+# 130%: RDS warns once allocation passes 80% of the ceiling.
+MIN_CEILING=$(( (ALLOCATED * 130 + 99) / 100 ))
+# Never past RDS's largest volume, 65,536 GiB. Past 59,578 GiB allocated no
+# ceiling is a tenth above the allocation, so the restore goes without one.
+(( MIN_CEILING <= 65536 )) || MIN_CEILING=65536
+(( MAX_STORAGE >= MIN_CEILING )) || MAX_STORAGE=$MIN_CEILING
+CEILING=(--max-allocated-storage "$MAX_STORAGE")
+(( ALLOCATED * 11 <= 655360 )) || CEILING=()
 aws rds restore-db-instance-to-point-in-time --region "$REGION" \
   --source-db-instance-identifier birdtest \
   --target-db-instance-identifier "birdtest-restore-$STAMP" \
-  --restore-time '2026-09-07T02:55:00Z' \
+  --restore-time "${RESTORE_TIME:?set RESTORE_TIME to the instant chosen}" \
   --db-subnet-group-name birdtest-db \
-  --vpc-security-group-ids "$(terraform -chdir=infra output -raw db_security_group_id 2>/dev/null || echo sg-XXXX)" \
+  --vpc-security-group-ids "$(terraform -chdir=infra output -raw db_security_group_id)" \
+  --db-parameter-group-name "$PARAMETER_GROUP" \
   --no-publicly-accessible \
-  --db-instance-class db.t4g.micro
+  --db-instance-class "$INSTANCE_CLASS" \
+  "${CEILING[@]}"
 
 aws rds wait db-instance-available --region "$REGION" \
   --db-instance-identifier "birdtest-restore-$STAMP"
 ```
 
 A restored instance does **not** inherit the source's backup settings. Fix that
-before it becomes the production database:
+before it becomes the production database. (The blocks below use `STAMP` and
+`RESTORE_TIME` from the one above; in a fresh shell set both again — `STAMP` is
+the suffix of the `birdtest-restore-…` instance — or each block refuses.)
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 aws rds modify-db-instance --region "$REGION" \
-  --db-instance-identifier "birdtest-restore-$STAMP" \
+  --db-instance-identifier "birdtest-restore-${STAMP:?set STAMP to the suffix of the restore instance}" \
   --backup-retention-period 30 --deletion-protection --apply-immediately
+```
+
+Before the swap, while `birdtest` is still the damaged instance, count the
+contributors the restore will stop — in a block of its own, so that a refusal
+(`RESTORE_TIME` unset in a fresh shell) stops here rather than before a rename
+that makes the count impossible:
+
+```bash
+# Before the rename, while `birdtest` is still the damaged instance: the
+# contributors the restore will stop, whose identities are newer than the
+# restore point (see "Contributors whose identity is newer…", below). After the
+# rename these queries reach the restored instance and answer 0.
+# One ops task for the three counts.
+scripts/prod-sql.sh "
+  SELECT 'anonymous_workers', count(*) FROM anonymous_workers WHERE first_seen_at > '${RESTORE_TIME:?}'
+  UNION ALL SELECT 'api_keys', count(*) FROM api_keys WHERE created_at > '${RESTORE_TIME:?}'
+  UNION ALL SELECT 'users', count(*) FROM users WHERE created_at > '${RESTORE_TIME:?}'"
+```
+
+Swap the names, and hand the restored instance to Terraform. The rename moves
+the endpoint with it, which is why it comes before repointing. A rename returns
+before it takes effect, and `wait db-instance-available` on a name that does not
+exist yet fails at once rather than waiting, so each wait is preceded by a poll
+for the new name:
+
+```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+renamed() {  # wait until instance $1 exists under its new name, then until it is available
+  local tries=0
+  until aws rds describe-db-instances --region "$REGION" --db-instance-identifier "$1" \
+      >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    if [ "$tries" -ge 90 ]; then
+      echo "no instance named $1 after 15 minutes (or the credentials expired)" >&2
+      return 1
+    fi
+    sleep 10
+  done
+  aws rds wait db-instance-available --region "$REGION" --db-instance-identifier "$1"
+}
+# One command, so that nothing after a step that fails runs: an unset STAMP
+# refused the renames one line at a time, and the state surgery below them ran
+# on the damaged instance anyway.
+if [ -z "${STAMP:-}" ]; then
+  echo "STAMP is not set: the suffix of the birdtest-restore-... instance" >&2
+else
+  # The restored instance first: a mistyped STAMP renamed production and then
+  # found nothing to put in its place.
+  aws rds describe-db-instances --region "$REGION" \
+    --db-instance-identifier "birdtest-restore-$STAMP" >/dev/null &&
+  aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
+    --new-db-instance-identifier "birdtest-damaged-$STAMP" --apply-immediately &&
+  renamed "birdtest-damaged-$STAMP" &&
+  aws rds modify-db-instance --region "$REGION" --db-instance-identifier "birdtest-restore-$STAMP" \
+    --new-db-instance-identifier birdtest --apply-immediately &&
+  renamed birdtest &&
+  # Terraform's state holds the damaged instance by its resource id (db-...),
+  # not by name, so it would follow the damaged one under its new name. Point
+  # it at the restored one instead; import takes the identifier. With the
+  # stack's variables (README.md "Deploying" keeps them in infra/prod.tfvars):
+  # import evaluates the whole configuration, in the stack's region. The import
+  # must succeed before going on -- after the `state rm`, a failed import
+  # leaves nothing in state for the next apply.
+  terraform -chdir=infra state rm aws_db_instance.main &&
+  terraform -chdir=infra import -var-file=prod.tfvars aws_db_instance.main birdtest
+fi
+```
+
+Left under its restore name, or left out of the state, the next `terraform
+apply` would find `birdtest` missing once the damaged one was retired and
+create a new, empty database in its place.
+
+If the block stops part-way, it says where; nothing after the failed step ran.
+List the names (`aws rds describe-db-instances --region "$REGION" --query
+'DBInstances[].DBInstanceIdentifier'`) and run the remaining steps by hand, in
+order, from the first whose result is not there: `birdtest-damaged-$STAMP`
+and `birdtest-restore-$STAMP` present and no `birdtest` means the second
+rename is next.
+Pasting the block again stops at its first check or rename.
+
+**Before repointing, re-apply what the restore undid for security.** The
+restored instance holds every credential as it was at the restore point: an API
+key revoked or suspended since authenticates again, a password reset since is
+back to the old one, a session ended since — by a reset or "sign out
+everywhere" — is valid again for up to seven days, a ban added or lifted since
+is undone, an account deleted since is back with its name, address and keys,
+and an admin demoted since is an admin again. Sessions are ended by a new
+signing key when the application is repointed (below): a session minted on the
+damaged instance and ended there matches the restored instance's session
+generation again, and nothing in the database can tell it from one that was
+not (the audit's pass 24). The rest: the damaged instance is the only record of
+them, so this runs while it still exists, and before the application points at
+the restored one. It is driven by the damaged instance's audit rows rather than
+its tables, which hold the damage too — a bad migration writes no audit rows,
+but its changes to keys or bans would be copied back with everything else —
+and the rows are reviewed before anything is applied, since damage done through
+the application (an admin account acting for an attacker) is recorded like any
+other action. Admin flags are the exception: they are set by hand
+(`scripts/prod-sql.sh`) and not audited, so they are compared instead — a
+restored admin the damaged instance no longer has is demoted, and the reverse is
+listed for a person to decide.
+
+Which rows are "since the restore point" is read from the data, not typed: the
+damaged instance's rows from an hour before the restored instance's newest one,
+less every row the restored instance also has, by id. A restore time typed a
+little late used to skip what happened in between with no word, and one in local
+time was refused only if it lacked a `Z`.
+
+In an ops shell (`scripts/prod-shell.sh`), where `DATABASE_URL` now reaches
+the restored instance — the rename moved the endpoint — with the damaged
+instance's endpoint (`aws rds describe-db-instances --region "$REGION"
+--db-instance-identifier "birdtest-damaged-$STAMP" --query
+'DBInstances[0].Endpoint.Address' --output text`, from where the blocks above
+ran; the ops shell has none of their variables). The export and the review
+live in the ops task's `/tmp`: if the shell drops (ECS Exec ends after twenty
+idle minutes), return to the same task with `scripts/prod-shell.sh --attach
+<task-arn>`, which it prints — a new task starts with an empty `/tmp`, and the
+apply then refuses. The task stops itself after `SHELL_HOURS` (4 by default),
+taking the review with it: for a long review, start it with
+`SHELL_HOURS=12 scripts/prod-shell.sh`. If the master password was rotated after the restore point,
+set it on the restored instance first (see "Rotating the database password"):
+both blocks connect to it. First export the actions and review them:
+
+```bash
+DAMAGED_HOST=''   # the damaged instance's endpoint address
+# In a subshell: a failure stops the block without ending the ops shell.
+(
+set -eo pipefail
+# First: a refused paste must not leave an earlier export for the apply.
+rm -f /tmp/after.done
+DAMAGED_URL=$(sed "s#@[^:/]*:#@${DAMAGED_HOST:?set DAMAGED_HOST to the damaged instance endpoint}:#" <<<"$DATABASE_URL")
+# Every time read and written as ISO in UTC, whatever the shell's settings:
+# read in another zone or style, the window below moved, silently. (PGTZ and
+# PGDATESTYLE would win over PGOPTIONS.)
+unset PGTZ PGDATESTYLE
+export PGOPTIONS='-c datestyle=ISO -c timezone=UTC'
+q() { psql "$1" -v ON_ERROR_STOP=1 -Atqc "$2"; }
+where="SELECT coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()"
+restored_at=$(q "$DATABASE_URL" "$where")
+if [ "$restored_at" = "$(q "$DAMAGED_URL" "$where")" ]; then
+  echo "DATABASE_URL and the damaged endpoint reach the same server: check DAMAGED_HOST, or wait for DNS to follow the rename and paste again" >&2
+  exit 1
+fi
+# The restored instance's audit log is the damaged one's up to the restore
+# point, so newer rows on the DATABASE_URL side mean the two are swapped.
+if [ "$(q "$DATABASE_URL" "SELECT coalesce(max(id), 0) FROM audit_log")" -gt \
+     "$(q "$DAMAGED_URL" "SELECT coalesce(max(id), 0) FROM audit_log")" ]; then
+  echo "DATABASE_URL reaches the instance with the newer audit rows: not the restored one. Wait for DNS and paste again -- unless the application already runs on the restored instance, whose ids are then its own: do not paste this again, and apply what is missing by hand." >&2
+  exit 1
+fi
+# From an hour before the restored instance's newest row: a row's time is its
+# transaction's start, so one that committed after the restore point may be
+# stamped before it. The rows the restored instance has are dropped below.
+since=$(q "$DATABASE_URL" "SELECT coalesce(max(created_at), '-infinity') - interval '1 hour' FROM audit_log")
+actions="'api_key.revoked', 'api_key.deactivated', 'api_key.reactivated',
+         'user.password_reset', 'user.email_confirmed', 'user.deleted',
+         'worker.banned', 'worker.unbanned'"
+# The reason is base64, so no line in it can end the file early.
+q "$DAMAGED_URL" "COPY (
+  SELECT a.id, a.action, a.target_id, a.actor_user_id, a.created_at,
+         translate(encode(convert_to(coalesce(a.reason, ''), 'UTF8'), 'base64'), E'\n', ''),
+         u.username
+    FROM audit_log a LEFT JOIN users u ON u.id = a.actor_user_id
+   WHERE a.created_at > timestamptz '$since' AND a.action IN ($actions)
+   ORDER BY a.id) TO STDOUT CSV" > /tmp/after-raw.tmp
+q "$DAMAGED_URL" "COPY (
+  SELECT id, password_hash FROM users
+   WHERE deleted_at IS NULL
+     AND id::text IN (SELECT target_id FROM audit_log WHERE action = 'user.password_reset'
+                       AND created_at > timestamptz '$since')
+  ) TO STDOUT CSV" > /tmp/after-passwords.tmp
+q "$DAMAGED_URL" "COPY (SELECT id FROM users WHERE is_admin) TO STDOUT CSV" > /tmp/after-admins.tmp
+# Admin flags are set by hand and not audited, so they are compared: the
+# restored admins the damaged instance no longer has would be demoted. They
+# are a list to review like the actions -- a bad migration that cleared the
+# flags would otherwise demote everyone -- and none at all is proposed when
+# the damaged instance has no admins.
+q "$DATABASE_URL" "COPY (SELECT id, username FROM users WHERE is_admin) TO STDOUT CSV" > /tmp/after-restored-admins.tmp
+if [ -s /tmp/after-admins.tmp ]; then
+  grep -v -F -f <(cut -d, -f1 /tmp/after-admins.tmp) /tmp/after-restored-admins.tmp > /tmp/after-demote.proposed || true
+else
+  echo "the damaged instance has no admins at all: its flags look damaged, so no demotion is proposed" >&2
+  : > /tmp/after-demote.proposed
+fi
+rm -f /tmp/after-restored-admins.tmp
+# Only the actions the restored instance lacks, and what they add up to.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -v restored_at="$restored_at" <<'SQL'
+-- The server the checks above reached, still: each psql connects afresh, and
+-- DNS may have moved between them.
+SELECT (coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()) = :'restored_at' AS same_server \gset
+\if :same_server
+\else
+DO $$ BEGIN RAISE EXCEPTION 'DATABASE_URL now reaches another server than a moment ago: paste again'; END $$;
+\endif
+CREATE TEMP TABLE raw (id bigint, action text, target_id text, actor uuid, at timestamptz, reason_b64 text, actor_name text);
+\copy raw FROM '/tmp/after-raw.tmp' CSV
+ANALYZE raw;
+-- An id is the same row on both instances only while neither has written or
+-- renumbered its log: after the repoint the restored instance reuses ids the
+-- damaged one had, and a migration that rebuilt the log shifts them. Either
+-- way matching by id would drop actions, silently (the audit's pass 25).
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM raw r JOIN audit_log a ON a.id = r.id
+              WHERE (a.action, a.target_id, a.actor_user_id, a.created_at)
+                    IS DISTINCT FROM (r.action, r.target_id, r.actor, r.at)) THEN
+    RAISE EXCEPTION 'the two audit logs use one id for different rows -- renumbered, or written here since the restore (after the repoint): nothing was exported; apply what is missing by hand';
+  END IF;
+END $$;
+CREATE TEMP TABLE fresh AS SELECT * FROM raw r WHERE NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.id = r.id);
+\copy (SELECT * FROM fresh ORDER BY id) TO '/tmp/after-actions.tmp' CSV
+\echo security actions since the restore point, by who and what (the 40 largest):
+SELECT coalesce(actor_name, actor::text, 'the server') AS actor, actor AS actor_id, action, count(*)
+  FROM fresh GROUP BY 1, 2, 3 ORDER BY 4 DESC, 1 LIMIT 40;
+SELECT count(*) AS actions, count(DISTINCT (actor, action)) AS "actor and action pairs" FROM fresh;
+SQL
+rm -f /tmp/after-raw.tmp
+mv /tmp/after-actions.tmp /tmp/after-actions.csv
+mv /tmp/after-passwords.tmp /tmp/after-passwords.csv
+mv /tmp/after-admins.tmp /tmp/after-admins.csv
+echo "$restored_at" > /tmp/after-restored-at
+q "$DATABASE_URL" "SELECT coalesce(max(id), 0) FROM audit_log" > /tmp/after-restored-last
+echo "each one is a line of /tmp/after-actions.csv: id, action, target, actor, time, reason, actor's name"
+# The demotions under review are the operator's once written: a second export
+# proposes again beside them, and says if the two differ.
+if [ ! -e /tmp/after-demote.csv ]; then
+  cp /tmp/after-demote.proposed /tmp/after-demote.csv
+elif ! cmp -s /tmp/after-demote.proposed /tmp/after-demote.csv; then
+  echo "/tmp/after-demote.csv is kept as edited; this export proposes /tmp/after-demote.proposed:" >&2
+  diff /tmp/after-demote.csv /tmp/after-demote.proposed >&2 || true
+fi
+echo "admins here that the damaged instance no longer has, to be demoted (/tmp/after-demote.csv):"
+cat /tmp/after-demote.csv
+touch /tmp/after.done
+)
+```
+
+Read the summary and the demotions, then record the review in
+`/tmp/after-exclude`, which the apply refuses to run without: one id to leave
+out per line — an action's id, or an account's to leave out everything it did
+(the id beside the name in the summary; a name matches nothing) — with anything
+after it on the line a comment, `echo '<id> # why' >> /tmp/after-exclude`, and
+`touch /tmp/after-exclude` when nothing is left out. An action that is part of
+the damage — a run of unbans or deletions by an account acting for an attacker
+— is left out so. A demotion that is part of the damage is deleted from
+`/tmp/after-demote.csv` (`sed -i '/<account id>/d' /tmp/after-demote.csv`: the
+ops task has no editor); a second export keeps both files. Then apply the rest,
+in one transaction:
+
+```bash
+(
+set -eo pipefail
+unset PGTZ PGDATESTYLE
+export PGOPTIONS='-c datestyle=ISO -c timezone=UTC'
+if [ ! -e /tmp/after.done ]; then
+  echo "the export above has not finished: paste it again" >&2
+  exit 1
+fi
+if [ ! -e /tmp/after-exclude ]; then
+  echo "no /tmp/after-exclude: review the export, then list what to leave out in it (touch it if nothing)" >&2
+  exit 1
+fi
+# The same server the export took as the restored one: this writes to it.
+where="SELECT coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()"
+if [ "$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "$where")" != "$(cat /tmp/after-restored-at)" ]; then
+  echo "DATABASE_URL reaches another server than the export took as the restored one: paste the export again" >&2
+  exit 1
+fi
+# And the export is still of what the restored instance lacks: once the
+# application runs on it, it writes rows of its own, under ids the damaged
+# instance had used.
+if [ "$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "SELECT coalesce(max(id), 0) FROM audit_log")" != \
+     "$(cat /tmp/after-restored-last)" ]; then
+  echo "the restored instance has written audit rows since the export was taken (it is serving): the step is not pasted again after the repoint; apply what is missing by hand" >&2
+  exit 1
+fi
+# The first word of each line, which must be an id; lower case, as Postgres
+# writes a uuid.
+tr -d '\r' < /tmp/after-exclude | { grep -v '^[[:space:]]*\(#.*\)\{0,1\}$' || true; } \
+  | awk '{print tolower($1)}' > /tmp/after-exclude.ids
+id='^([0-9]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+if grep -qvE "$id" /tmp/after-exclude.ids; then
+  echo "these lines of /tmp/after-exclude do not start with an action's or an account's id:" >&2
+  grep -vE "$id" /tmp/after-exclude.ids >&2
+  exit 1
+fi
+echo "leaving out: $(tr '\n' ' ' < /tmp/after-exclude.ids)"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q -v restored_at="$(cat /tmp/after-restored-at)" <<'SQL'
+BEGIN;
+-- The server the checks above reached, still: each psql connects afresh, and
+-- DNS may have moved between them.
+SELECT (coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()) = :'restored_at' AS same_server \gset
+\if :same_server
+\else
+DO $$ BEGIN RAISE EXCEPTION 'DATABASE_URL now reaches another server than a moment ago: paste again'; END $$;
+\endif
+-- No reset link sent before the restore point works: one spent since cannot
+-- be told from one that was not. (Sessions end with the signing key, below.)
+UPDATE password_reset_tokens SET used_at = now() WHERE used_at IS NULL;
+CREATE TEMP TABLE all_actions (id bigint, action text, target_id text, actor uuid, at timestamptz, reason_b64 text, actor_name text);
+\copy all_actions FROM '/tmp/after-actions.csv' CSV
+-- Every temporary table is analyzed and every "not in" is an anti-join: with
+-- no statistics, a few hundred thousand actions -- one mass ban since the
+-- restore point -- turned a `NOT IN` into a scan per row, for hours.
+ANALYZE all_actions;
+CREATE TEMP TABLE after_exclude (v text);
+\copy after_exclude FROM '/tmp/after-exclude.ids' CSV
+ANALYZE after_exclude;
+-- A left-out id that matches nothing was meant for something: nothing is
+-- applied until it is corrected. By id and by actor apart: `IN (id, actor)`
+-- can use no hash, and compared every action with every line -- five
+-- minutes for two thousand lines.
+CREATE TEMP TABLE unmatched AS
+  SELECT v FROM after_exclude e
+   WHERE NOT EXISTS (SELECT 1 FROM all_actions a WHERE a.id::text = e.v)
+     AND NOT EXISTS (SELECT 1 FROM all_actions a WHERE a.actor::text = e.v);
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM unmatched) THEN
+    RAISE EXCEPTION 'these exclusions match no action or actor, so nothing was applied: %',
+      (SELECT string_agg(v, ', ') FROM unmatched);
+  END IF;
+END $$;
+CREATE TEMP TABLE after_actions AS
+  SELECT * FROM all_actions a
+   WHERE NOT EXISTS (SELECT 1 FROM after_exclude e WHERE e.v = a.id::text)
+     AND NOT EXISTS (SELECT 1 FROM after_exclude e WHERE e.v = a.actor::text);
+ANALYZE after_actions;
+CREATE TEMP TABLE after_passwords (id uuid, password_hash text);
+\copy after_passwords FROM '/tmp/after-passwords.csv' CSV
+CREATE TEMP TABLE after_admins (id uuid);
+\copy after_admins FROM '/tmp/after-admins.csv' CSV
+CREATE TEMP TABLE after_demote (id uuid, username text);
+\copy after_demote FROM '/tmp/after-demote.csv' CSV
+-- Keys: revoked ones go; a suspended or resumed one takes its last state.
+DELETE FROM api_keys k USING after_actions a WHERE a.action = 'api_key.revoked' AND k.id::text = a.target_id;
+UPDATE api_keys k SET is_active = (l.action = 'api_key.reactivated')
+  FROM (SELECT DISTINCT ON (target_id) target_id, action FROM after_actions
+         WHERE action IN ('api_key.deactivated', 'api_key.reactivated') ORDER BY target_id, id DESC) l
+ WHERE k.id::text = l.target_id;
+-- Addresses confirmed since: unconfirmed, the account could not sign in.
+UPDATE users u SET email_confirmed_at = a.at FROM after_actions a
+ WHERE a.action = 'user.email_confirmed' AND a.target_id = u.id::text AND u.email_confirmed_at IS NULL;
+-- Passwords reset since, as the damaged instance has them: its current hash,
+-- which is the last reset's unless something changed it without an audit row
+-- since, so it is taken only when that reset is not left out, and each one
+-- taken is listed.
+CREATE TEMP TABLE last_reset AS
+  SELECT DISTINCT ON (target_id) target_id, id FROM all_actions
+   WHERE action = 'user.password_reset' ORDER BY target_id, id DESC;
+\echo passwords taken from the damaged instance (a reset since the restore point): check none is part of the damage
+UPDATE users u SET password_hash = p.password_hash FROM after_passwords p, last_reset r
+ WHERE p.id = u.id AND r.target_id = u.id::text
+   AND EXISTS (SELECT 1 FROM after_actions x WHERE x.id = r.id)
+RETURNING u.username;
+\echo accounts reset since whose password is the restored one -- the last reset left out, or the account deleted there (a deletion left out): have each reset it
+SELECT u.id, u.username FROM last_reset r JOIN users u ON u.id::text = r.target_id
+ WHERE (NOT EXISTS (SELECT 1 FROM after_actions x WHERE x.id = r.id)
+        OR NOT EXISTS (SELECT 1 FROM after_passwords p WHERE p.id = u.id))
+   -- Not one deleted again below.
+   AND NOT EXISTS (SELECT 1 FROM after_actions d WHERE d.action = 'user.deleted' AND d.target_id = r.target_id);
+-- Bans: each identity's last ban or unban, for the identities this instance has.
+CREATE TEMP TABLE last_ban AS
+  SELECT DISTINCT ON (target_id) target_id, action, actor, at,
+         nullif(convert_from(decode(reason_b64, 'base64'), 'UTF8'), '') AS reason
+    FROM after_actions WHERE action IN ('worker.banned', 'worker.unbanned')
+   ORDER BY target_id, id DESC;
+DELETE FROM worker_bans b USING last_ban l WHERE b.user_id::text = l.target_id;
+DELETE FROM worker_bans b USING last_ban l WHERE b.anon_uuid::text = l.target_id;
+INSERT INTO worker_bans (user_id, reason, banned_by, created_at)
+SELECT u.id, l.reason, (SELECT id FROM users WHERE id = l.actor), l.at
+  FROM last_ban l JOIN users u ON u.id::text = l.target_id WHERE l.action = 'worker.banned';
+INSERT INTO worker_bans (anon_uuid, reason, banned_by, created_at)
+SELECT w.uuid, l.reason, (SELECT id FROM users WHERE id = l.actor), l.at
+  FROM last_ban l JOIN anonymous_workers w ON w.uuid::text = l.target_id WHERE l.action = 'worker.banned';
+-- Accounts deleted since: deleted again, as the admin route deletes them.
+CREATE TEMP TABLE deleted_since AS
+  SELECT target_id::uuid AS id, max(at) AS at FROM after_actions WHERE action = 'user.deleted' GROUP BY 1;
+DELETE FROM api_keys WHERE user_id IN (SELECT id FROM deleted_since);
+DELETE FROM email_confirmations WHERE user_id IN (SELECT id FROM deleted_since);
+DELETE FROM password_reset_tokens WHERE user_id IN (SELECT id FROM deleted_since);
+UPDATE users u SET username = 'deleted-' || u.id::text,
+                   email = gen_random_uuid()::text || '@deleted.invalid',
+                   password_hash = '!', email_confirmed_at = NULL, is_admin = false,
+                   deleted_at = d.at
+  FROM deleted_since d WHERE u.id = d.id AND u.deleted_at IS NULL;
+-- Admin flags, compared rather than audited: the reviewed demotions.
+\echo demoted:
+UPDATE users SET is_admin = false WHERE is_admin AND id IN (SELECT id FROM after_demote) RETURNING username;
+\echo admins on the damaged instance but not here: promote again by hand only if that was legitimate
+SELECT u.id, u.username FROM users u JOIN after_admins a ON a.id = u.id WHERE NOT u.is_admin;
+\echo accounts whose actions were left out, as they were at the restore point: demote or reset any that acted for an attacker
+SELECT DISTINCT u.id, u.username, u.is_admin FROM all_actions a JOIN users u ON u.id = a.actor
+ WHERE NOT EXISTS (SELECT 1 FROM after_actions x WHERE x.id = a.id);
+\echo identities banned on the damaged instance that are newer than the restore point: watch for them
+SELECT target_id FROM last_ban l
+ WHERE action = 'worker.banned'
+   AND NOT EXISTS (SELECT 1 FROM users WHERE id::text = l.target_id)
+   AND NOT EXISTS (SELECT 1 FROM anonymous_workers WHERE uuid::text = l.target_id);
+COMMIT;
+SQL
+)
+```
+
+Both blocks can be pasted again until the application is repointed: the first
+rewrites its export and keeps the review (the exclusions and the demotions as
+edited), and the second sets state from them. After it, not: the restored
+instance writes audit rows of its own, under ids the damaged one had used, and
+both blocks refuse; apply a missed action by hand. `scripts/reapply-check.sh` runs both against two databases, through
+these cases (§6).
+
+If the damaged instance cannot be read at all — the instance failed, the schema
+is gone — there is nothing to re-apply from: spend every reset link (sessions
+end with the signing key, below), and say in the incident notes that
+revocations, resets, bans, deletions and demotions since the restore point must
+be redone by hand from what people remember and report.
+
+```bash
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'UPDATE password_reset_tokens SET used_at = now() WHERE used_at IS NULL'
 ```
 
 Repoint the application. The master password is set by hand and lives only in
@@ -78,8 +571,9 @@ the password the source had at the restore point; if it was rotated after that
 point, set it on the new instance first (see "Rotating the database password"):
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 ENDPOINT=$(aws rds describe-db-instances --region "$REGION" \
-  --db-instance-identifier "birdtest-restore-$STAMP" \
+  --db-instance-identifier birdtest \
   --query 'DBInstances[0].Endpoint.Address' --output text)
 
 OLD_URL=$(aws ssm get-parameter --region "$REGION" --name /birdtest/DATABASE_URL \
@@ -89,15 +583,37 @@ p = u.urlsplit(sys.argv[1])
 print(p._replace(netloc=p.netloc.rsplit("@", 1)[0] + "@" + sys.argv[2] + ":5432").geturl())' \
   "$OLD_URL" "$ENDPOINT")
 
+# Chained: the service starts only once both are written. Started on the old
+# key, it would honour again the sessions the new one ends.
 aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
-  --value "$NEW_URL"
-
+  --value "$NEW_URL" &&
+# A new signing key ends every session: one ended on the damaged instance
+# after the restore point matches the restored instance's session generation
+# again, and only the key tells it from one that was not.
+aws ssm put-parameter --region "$REGION" --name /birdtest/SESSION_SIGNING_KEY --type SecureString --overwrite \
+  --value "$(openssl rand -hex 32)" &&
 # Tasks read SSM at start, so this is the whole deploy.
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
 ```
 
-Then run §4 (verification). Only once it passes, rename or retire the damaged
-instance — never before.
+(If the ceiling had to be raised above the stack's `db_allocated_storage * 5`,
+raise `db_allocated_storage` in `prod.tfvars` before the closing apply below:
+it sets the ceiling back to five times that, capped at RDS's 65,536 GiB, and
+RDS refuses one less than a tenth above the current allocation. The allocation
+itself Terraform leaves alone — autoscaling owns it.)
+
+Then run §4 (verification), **Check artifacts** on every leave-generation job
+(§3: the database now describes the objects as they were at the restore point,
+and the button makes what workers are sent match what the bucket holds), and
+`terraform apply -var-file=prod.tfvars`: the restore set none of
+Multi-AZ, the backup window or tag copying, and the apply puts them back. Only
+once §4 passes, retire `birdtest-damaged-$STAMP` — never before, and with a
+final snapshot (`aws rds delete-db-instance --region "$REGION"
+--db-instance-identifier "birdtest-damaged-$STAMP" --final-db-snapshot-identifier
+"birdtest-damaged-$STAMP-final"`, after `modify-db-instance
+--no-deletion-protection`): its audit rows since the restore point are the only
+record of what happened then, which the re-apply above applied but did not
+copy.
 
 **What the fleet does meanwhile.** Workers go on playing the tasks they hold.
 A worker asking for a task keeps asking, once a minute, for as long as the
@@ -113,55 +629,251 @@ results are accepted; the claims of those that gave up lapse after the grace
 and are handed out again. Claims issued after the restore point do not exist in
 the restored database, so results for them are answered `accepted: false`.
 
+**Contributors whose identity is newer than the restore point are stopped.**
+The restored database has no anonymous worker UUID, API key or account created
+after the restore point. Such a worker's result is refused and its next claim
+is answered `401`, which ends its `contribute` run: it does **not** pick up
+again by itself. Say so where contributors will read it, with the remedy: an
+anonymous contributor deletes the `uuid` line from `contribute.txt` and starts
+again (a new UUID is issued); an account created in the window registers
+again; a key made in the window is made again on the account page. How many:
+the identities the damaged instance has that the restored one lacks. Count them
+**before the rename**, while `birdtest` is still the damaged instance — the
+query just before the rename, above, does. The rename moves the endpoint with it, so
+after it `DATABASE_URL` reaches the restored instance, which lacks exactly
+these rows. Counting later means reaching the damaged instance at its new
+endpoint: `scripts/prod-shell.sh`, then inside it
+`psql "$(sed "s#@[^:/]*:#@<damaged endpoint>:#" <<<"$DATABASE_URL")" -c '…'`
+with the three counts written out and the restore time as a literal (the ops
+shell has none of this procedure's variables), and the endpoint from
+`aws rds describe-db-instances --region "$REGION" --db-instance-identifier
+"birdtest-damaged-$STAMP" --query 'DBInstances[0].Endpoint.Address' --output text`.
+
 ---
 
 ## 2. Selective restore (a mistaken purge or delete)
 
 The database must **not** be rolled back: everything else has moved on. The
-shape is always the same — restore a copy somewhere else, copy the missing rows
-across, repair the counters, recompute the derived state.
+shape is always the same — stop the job, restore a copy somewhere else, clear
+out what the job has done since, copy the missing rows across, repair the
+counters, recompute the derived state.
+
+### 2.0 Stop the job, and clear what it has done since
+
+A purge leaves the job's status alone, so an active job goes straight on
+dispatching: its seed cursor is back at zero, a leave job re-seeds generation
+1, and every new task takes a `(job_id, seed)` — and every new progress row a
+`(job_id, generation, rack)` — that the restored rows need. Copied over them
+with `ON CONFLICT DO NOTHING`, the restored rows lose silently, their claims and
+results then fail their foreign keys, and the restore reports success with the
+contributors' work still gone. So first, from the admin page or the API,
+**deactivate the job** (a purged completed job is already inactive). Then
+delete what it has generated since the purge — nothing of it predates the
+mistake — in one transaction, in the ops shell. The SQL here and in §2.3 reads
+the job's id as `:'job'`, so start psql with it set:
+
+```bash
+psql "$DATABASE_URL" -v job=00000000-0000-0000-0000-000000000000
+```
+
+```sql
+BEGIN;
+-- A purged job that completed again since -- a small job, or a force-complete --
+-- cannot be deactivated from the admin page, and its verdict is from the
+-- results about to be deleted: back to inactive, with no verdict.
+UPDATE jobs SET status = 'inactive', sprt_decided_status = NULL,
+                sprt_decided_llr = NULL, sprt_decided_units = NULL
+ WHERE id = :'job' AND status = 'completed';
+-- And an export of those results: once §2.3 completes the job again it would be
+-- served as the restored job's corpus. (A purge deletes exports for this
+-- reason; the objects go with the bucket's lifecycle rule.)
+DELETE FROM job_exports WHERE job_id = :'job';
+DELETE FROM task_claims c USING tasks t WHERE c.task_id = t.id AND t.job_id = :'job';
+DELETE FROM tasks WHERE job_id = :'job';
+DELETE FROM leave_rack_progress         WHERE job_id = :'job';
+DELETE FROM leave_rack_staging          WHERE job_id = :'job';
+DELETE FROM leave_generation_progress   WHERE job_id = :'job';
+DELETE FROM leave_selection_cursors     WHERE job_id = :'job';
+DELETE FROM leave_generation_artifacts  WHERE job_id = :'job';
+DELETE FROM leave_generation_transitions WHERE job_id = :'job';
+COMMIT;
+```
+
+(A deleted job has nothing to clear, and needs nothing re-inserted by hand:
+§2.2's script, finding no `jobs` row in production, restores it first.) After
+this, any conflict in §2.2 means this step was missed — not that the row is
+safe to skip.
 
 ### 2.1 Get a copy of the old data
 
 Either a PITR instance from just before the mistake (fresher, §1 steps 2–3 with
-a `-scratch-` identifier and no repointing), or the latest nightly dump:
+a `-scratch-` identifier and no repointing), or the latest nightly dump
+restored into a Postgres of the ops shell's own (`scripts/prod-shell.sh`), the
+way the monthly drill does it. The shell's task stops itself after
+`SHELL_HOURS` (default 4); a large dump on the task's one vCPU can take longer,
+so start it with `SHELL_HOURS=12 scripts/prod-shell.sh` for anything big:
+
+First fetch the dump and check it against its manifest, as the drill does
+(`scripts/restore-drill.sh`, `dump_digest`): a partial download, or a replica
+whose files were still arriving, restores part of a database and says nothing.
+This block can be run again as it is; do not go on to the next until it says
+`checksum matches`.
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+# Inside scripts/prod-shell.sh.
+apt-get update -qq && apt-get install -y -qq awscli >/dev/null
 STAMP=2026-09-07T03-00-00Z
-aws s3 cp "s3://$BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
-createdb -h "$SCRATCH_HOST" -U birdtest birdtest_scratch
-pg_restore -h "$SCRATCH_HOST" -U birdtest -d birdtest_scratch -j4 \
-  --no-owner --no-privileges --exit-on-error /tmp/dump
+BUCKET=${BUCKET:-$BACKUP_BUCKET}   # the stack's own: the ops role can read no other
+rm -rf /tmp/dump   # a re-fetch must not keep files from an earlier one
+aws s3 cp ${S3_REGION:+--region $S3_REGION} "s3://$BUCKET/pg/$STAMP/dump" /tmp/dump --recursive
+aws s3 cp ${S3_REGION:+--region $S3_REGION} "s3://$BUCKET/pg/$STAMP.manifest.json" /tmp/manifest.json
+want=$(grep -o '"sha256"[^,}]*' /tmp/manifest.json | sed 's/.*: *"//;s/"//')
+got=$( (cd /tmp/dump && find . -type f | LC_ALL=C sort | xargs -r sha256sum) | sha256sum | cut -d' ' -f1)
+[ -n "$want" ] && [ "$want" = "$got" ] && echo "checksum matches" \
+  || echo "CHECKSUM MISMATCH ($want vs $got): run this block again; do not restore"
 ```
 
-For a dump small enough, the scratch database can be the local docker compose
-stack: `./scripts/dev-restore.sh /tmp/dump` (which scrubs on the way in).
+Then restore it. If an earlier attempt got part of the way, start clean first:
+`gosu postgres pg_ctl -D /tmp/scratch stop; rm -rf /tmp/scratch`.
+
+```bash
+mkdir -p /tmp/scratch /tmp/sock && chown postgres /tmp/scratch /tmp/sock
+gosu postgres initdb -D /tmp/scratch -U postgres --auth=trust >/dev/null
+# As the drill starts its own (scripts/restore-drill.sh): no parallel query,
+# whose workers share memory through the task's small /dev/shm and fail a big
+# join part-way, and no durability, which a scratch copy does not need.
+gosu postgres pg_ctl -D /tmp/scratch -w -l /tmp/scratch.log start \
+  -o "-c listen_addresses='' -c unix_socket_directories=/tmp/sock \
+      -c max_parallel_workers_per_gather=0 -c fsync=off -c full_page_writes=off \
+      -c synchronous_commit=off"
+SCRATCH_URL="postgresql:///birdtest_scratch?host=/tmp/sock&user=postgres"
+# Kept in a file: an `--attach`ed shell, or the detached §2.2 script, does not
+# inherit this one's variables. `source /tmp/restore.env` in either.
+echo "export SCRATCH_URL='$SCRATCH_URL'" > /tmp/restore.env
+createdb -h /tmp/sock -U postgres birdtest_scratch
+# Detached, so the ECS Exec session ending (twenty idle minutes, a laptop
+# asleep) does not end the restore; `scripts/prod-shell.sh --attach <task>`
+# comes back to it.
+# pg_restore prints nothing when it succeeds, so the last line says it ended.
+setsid nohup sh -c 'pg_restore -d "$0" -j4 --no-owner --no-privileges \
+  --exit-on-error /tmp/dump; echo "pg_restore exit $?"' "$SCRATCH_URL" \
+  > /tmp/pg_restore.log 2>&1 &
+tail -f /tmp/pg_restore.log   # Ctrl-C leaves the restore running
+```
+
+Do not start §2.2 until the log's last line is `pg_restore exit 0`: with `-j4`
+each table commits on its own, so a copy-back taken mid-restore finds some of
+the job's tables loaded and others empty, and reports success.
+
+The §2.2 script is best run the same way, detached.
 
 ### 2.2 Copy the rows back, in dependency order
 
-Dump only the job's rows from the scratch copy and load them into production.
-`ON CONFLICT DO NOTHING` throughout, so a partial re-run is safe:
+`/tmp/restore-job.sh` does this; `scripts/prod-shell.sh` writes it there when
+the shell's task starts (it is `scripts/restore-job.sh` as of the last
+`terraform apply`, carried by the ops task definition; one from before that says
+so and exits). It dumps only the job's rows from the scratch copy, a file per
+table, and loads them into production (`$DATABASE_URL`, in the same shell) in
+dependency order — 16 MiB of rows at a time, each batch its own transaction,
+through a temporary table and `INSERT … ON CONFLICT DO NOTHING` — holding the
+job's merge lock while it loads, so the half-hourly merge cannot fold restored
+staged rows in mid-run. It refuses to start until `/tmp/pg_restore.log` ends in
+`pg_restore exit 0`, and refuses when `SCRATCH_URL` is production itself, when
+production has the job active or completed since the mistake (§2.0), when
+production holds an export of the job made since (§2.0 deletes it), when the
+scratch copy holds no such job
+(a mistyped id), and when the scratch copy already holds the audit row of the
+job's last purge or delete — a copy taken after the mistake, which may hold a
+job that went on running, or only the generation-0 artifact a leave job's purge
+writes back. Only the *last* purge or delete is checked: for a job purged by
+mistake and then purged or deleted again, a copy taken between the two is
+accepted, and holds the job as it ran on after the first. (Use a dump or a PITR
+point from *before* the mistake you mean: the latest nightly dump may be after
+it.)
+
+It stops, with nothing of that batch loaded, if production already holds a row
+under a restored row's key with other contents: that is a row the job wrote
+since the purge, and it means §2.0 was missed. A row already there exactly as
+dumped is an earlier run's, so running the script again after a stop — a
+failure, the session ending, §2.0 done late — carries on where it left off. (A
+leave job is the exception: if a merge folded its restored staged rows in
+between two runs, the next run reads them as other contents; do §2.0 and run
+it from the start.) It
+prints each table's rows, how many it loaded and how many were there already,
+and moves the three `BIGSERIAL` sequences forward if the restored ids are ahead
+of them. (One statement per table, as this section first had it, queued a
+foreign-key check per row in one backend: some 12 bytes a row, 780 MB for a
+20-generation leave job, more than a `db.t4g.micro` has. And its
+`ON CONFLICT DO NOTHING` dropped a conflicting row without a word.)
+
+For a large job, look at the space first. The copy-back adds the job's rows to
+every table, with their indexes, and stages each batch in an unindexed
+temporary table on the production volume first, plus the WAL the inserts
+write; autoscaling keeps only about a tenth of the volume free and grows it at
+most every six hours. Run it once with `COPYBACK_DUMP_ONLY=1`: it dumps the
+job's rows and prints their sizes, and stops before loading anything. Allow
+about twice the total (measured: the loaded rows and their indexes came to 1.5
+times the text), plus `db_max_wal_size_mb` (4 GiB by default) for the WAL the
+inserts write (3.2 times the text, measured). Compare with `FreeStorageSpace`,
+raise `db_allocated_storage` first if it is close, then run it again without.
+
+From a PITR scratch instance rather than a dump there is no restore to wait
+for; write what the script reads first:
 
 ```bash
-JOB=00000000-0000-0000-0000-000000000000
-
-psql "$SCRATCH_URL" -v job="$JOB" -At <<'SQL' > /tmp/restore.sql
-\set ON_ERROR_STOP on
--- Order matters: tasks, then claims, then everything hanging off a claim.
-COPY (SELECT * FROM tasks WHERE job_id = :'job') TO STDOUT;
-SQL
+# The production URL with the scratch instance's endpoint for its host: a PITR
+# restore keeps the source's master password, already encoded in the URL as
+# it must be. sed, not python: the ops image (postgres:16) has no python3.
+# The last '@' ends the password (one in it is encoded); the host runs to the
+# path or query. %q, so no character in the URL can break the file.
+ENDPOINT="<the scratch instance's endpoint>"
+ENDPOINT=${ENDPOINT%%:*}   # a pasted ":5432" would be doubled
+# The userinfo is everything up to the '@' before the first '/', '?' or '#'
+# after the scheme: an '@' in a query string is not it.
+SCRATCH_URL=$(printf '%s' "$DATABASE_URL" | sed -E "s#^([a-z]+://[^/?\#]*@)[^/?\#]+#\1$ENDPOINT:5432#")
+case "$SCRATCH_URL" in *"@$ENDPOINT:5432"*) ;; *) echo "could not build SCRATCH_URL: stop"; SCRATCH_URL= ;; esac
+[ -n "$SCRATCH_URL" ] && printf 'export SCRATCH_URL=%q\n' "$SCRATCH_URL" > /tmp/restore.env \
+  && echo 'pg_restore exit 0' > /tmp/pg_restore.log   # nothing to wait for
 ```
 
-In practice this is a table-by-table `COPY ... TO` / `COPY ... FROM` for:
+Then, with the job's id:
+
+```bash
+COPYBACK_DUMP_ONLY=1 bash /tmp/restore-job.sh 00000000-0000-0000-0000-000000000000
+# compare the sizes with FreeStorageSpace, then:
+setsid nohup bash /tmp/restore-job.sh 00000000-0000-0000-0000-000000000000 \
+  > /tmp/restore-job.log 2>&1 &
+tail -f /tmp/restore-job.log   # ends "restored; now repair the counters", or "stopped: …"
+```
+
+It removes `/tmp/dump` first (the dump is in the scratch database by then, and
+its files would share the task's disk with the job's rows); `FREE_DUMP_DIR=`
+keeps it. `scripts/restore-job-check.sh` runs the script against a real
+Postgres through each of these cases, nightly.
 
 | Order | Table | Filter |
 |---|---|---|
 | 1 | `tasks` | `job_id = :job` |
 | 2 | `opening_rack_requests` / `game_requests` / `leave_requests` | `task_id IN (...)` |
-| 3 | `task_claims` | `task_id IN (...)` |
+| 3 | `task_claims`, then `worker_data_gaps` | `task_id IN (...)` / `job_id = :job` |
 | 4 | `game_results`, `leave_records` | `job_id = :job` / `task_id IN (...)` |
 | 5 | `position_analysis_records` → `_moves` → `_plies` | `job_id = :job`, then by parent id |
 | 6 | `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_selection_cursors`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
+
+`worker_data_gaps` is what the admin page's data gaps and the job list's
+`stalled` flag read: left out, a job's declines are forgotten.
+
+A *deleted* job is restored whole by the same script: before the table above,
+and on every run (so one stopped part-way resumes), the scratch copy's `jobs`
+row (made `inactive`: §2.5 starts it) if production has none, its config row (`job_game_config`,
+`job_game_pair_config`, `job_opening_rack_config` or `job_leave_config`), and
+any `player_configs` row it names and `input_data` row those name that has
+been deleted since (nothing pinned them once the job was gone), each only if
+missing. A reference to an account deleted since is cleared. Its `job_exports`
+rows are not restored: export the job again. (An `input_data` row deleted and
+then imported again has a new id; the script stops on it, and the job must be
+recreated on the new row instead.)
 
 Ratings are not in this list: they belong to rating pools rather than jobs, and
 are recomputed from `game_results` (see §2.4).
@@ -192,15 +904,13 @@ The job's counters are repaired in §2.3, and the contributors' in §2.3b — th
 latter globally rather than per job, because an identity's total spans every job
 it has worked on.
 
-`position_analysis_records.id` and `_moves.id` are `BIGSERIAL`. Restoring them
-with their original ids preserves the parent-child links; afterwards the
-sequences must be moved past what was inserted, or the next insert collides:
-
-```sql
-SELECT setval('position_analysis_records_id_seq', (SELECT max(id) FROM position_analysis_records));
-SELECT setval('position_analysis_moves_id_seq',   (SELECT max(id) FROM position_analysis_moves));
-SELECT setval('position_analysis_plies_id_seq',   (SELECT max(id) FROM position_analysis_plies));
-```
+`position_analysis_records.id`, `_moves.id` and `leave_rack_staging.id` are
+`BIGSERIAL`, restored with their original ids so the parent-child links hold.
+Those ids came from these sequences, which a selective restore does not rewind,
+so nothing normally needs moving; the script moves a sequence only forward, and
+only when its table is ahead of it (a plain `setval(..., max(id))` could move it
+*back* below ids the running fleet had taken since, and the next insert
+collided).
 
 ### 2.3 Repair the counters
 
@@ -223,7 +933,10 @@ UPDATE tasks t
      WHERE t2.job_id = :'job'
      GROUP BY t2.id
   ) actual
- WHERE t.id = actual.id;
+ WHERE t.id = actual.id
+   -- Only rows that are wrong: every task of a large job rewritten was
+   -- seconds of writes and as many dead tuples, for rows already right.
+   AND (t.accepted_count, t.active_claim_count) IS DISTINCT FROM (actual.accepted, actual.active);
 
 -- State and completed_at follow from the counters and the job's redundancy,
 -- exactly as the submit path computes them.
@@ -236,7 +949,12 @@ UPDATE tasks t
        completed_at = CASE WHEN t.accepted_count >= j.redundancy
                            THEN COALESCE(t.completed_at, now()) ELSE NULL END
   FROM jobs j
- WHERE j.id = t.job_id AND t.job_id = :'job';
+ WHERE j.id = t.job_id AND t.job_id = :'job'
+   AND t.state IS DISTINCT FROM CASE
+         WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
+         WHEN t.accepted_count + t.active_claim_count >= j.redundancy THEN 'claimed'::task_state
+         ELSE 'available'::task_state
+       END;
 
 -- The job's own counters. claims_issued is the scheduler's deficit numerator,
 -- measured from claims_baseline; the statement after this one puts the
@@ -247,10 +965,11 @@ UPDATE tasks t
 -- copy leaves them describing the results the job had before. Each is
 -- recomputed here exactly as the read it replaced computed it: one result per
 -- task, because redundant claims replay the same work.
+-- The claims are read once, for both of their columns: a second subquery for
+-- last_completed_at was a second pass over them.
 UPDATE jobs j
-   SET claims_issued = (SELECT count(*) FROM task_claims c
-                          JOIN tasks t ON t.id = c.task_id
-                         WHERE t.job_id = j.id),
+   SET claims_issued = cl.issued,
+       last_completed_at = cl.last,
        tasks_total = (SELECT count(*) FROM tasks t WHERE t.job_id = j.id),
        tasks_completed = (SELECT count(*) FROM tasks t
                            WHERE t.job_id = j.id AND t.state = 'completed'),
@@ -262,22 +981,29 @@ UPDATE jobs j
                           ) g),
        racks_analyzed = (SELECT count(DISTINCT p.rack)
                            FROM position_analysis_records p
-                          WHERE p.job_id = j.id)
+                          WHERE p.job_id = j.id AND p.game_index IS NULL)
+  FROM (SELECT count(*) AS issued,
+               max(c.completed_at) FILTER (WHERE c.state = 'completed') AS last
+          FROM task_claims c JOIN tasks t ON t.id = c.task_id
+         WHERE t.job_id = :'job') cl
  WHERE j.id = :'job';
 
--- Level with the jobs being *served* -- those that issued a claim within the
--- heartbeat timeout (300 s unless HEARTBEAT_TIMEOUT_SECONDS says otherwise) --
--- or, when none has, with every job on offer: scheduler::join_at_parity's rule.
+-- Level with the lowest of the jobs being *served* -- those that issued a
+-- claim within the heartbeat timeout (300 s unless HEARTBEAT_TIMEOUT_SECONDS
+-- says otherwise) of the latest claim of any of them -- or, when none ever
+-- has, the highest on offer: scheduler::join_at_parity's rule.
 WITH others AS (
   SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
-         COALESCE(o.last_claimed_at > now() - interval '300 seconds', FALSE) AS served
+         o.last_claimed_at,
+         MAX(o.last_claimed_at) OVER () AS latest
     FROM jobs o
    WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> :'job'
 )
 UPDATE jobs j
    SET claims_baseline = j.claims_issued - floor(
-         COALESCE((SELECT MIN(ratio) FROM others WHERE served),
-                  (SELECT MIN(ratio) FROM others), 0)
+         COALESCE((SELECT MIN(ratio) FROM others
+                    WHERE last_claimed_at > latest - interval '300 seconds'),
+                  (SELECT MAX(ratio) FROM others), 0)
          * COALESCE(j.allocation, 0))::bigint
  WHERE j.id = :'job';
 
@@ -292,80 +1018,209 @@ Run `tasks_total`/`tasks_completed` before §2.4's state repair or after it, but
 not between the two `UPDATE tasks` statements above: `tasks_completed` counts
 tasks whose `state` is `completed`, which the second of those recomputes.
 
+**A purged job that had completed** comes back inactive with no verdict: a
+purge returns a completed job to inactive and clears the SPRT verdict it was
+completed on, and neither is a row the copy brings back. **A deleted job that
+had completed** comes back inactive too: §2.2 restores its `jobs` row with its
+verdict but made `inactive`. Put the status (and, for a purged job, the
+verdict) back from the scratch copy's `jobs` row:
+
+```sql
+-- Set each variable from the scratch copy's row
+--   SELECT status, sprt_decided_status, sprt_decided_llr, sprt_decided_units
+--   FROM jobs WHERE id = :'job';
+-- and to the empty string where it is NULL (a job an admin completed has no
+-- verdict): :'var' always quotes, so NULLIF is what turns empty back into NULL.
+UPDATE jobs SET status = :'old_status',
+               sprt_decided_status = NULLIF(:'old_verdict', ''),
+               sprt_decided_llr    = NULLIF(:'old_llr', '')::float8,
+               sprt_decided_units  = NULLIF(:'old_units', '')::bigint
+ WHERE id = :'job';
+```
+
+Activating it instead would dispatch more work on a job that had finished.
+
 ### 2.3b Repair the contributor counters
 
 The counters on `users` and `anonymous_workers` are not scoped to one job — they
 span every job an identity ever worked on — so a partial restore of one job
 cannot repair them in isolation the way §2.3 repairs the job's own. Recompute
-them globally, once, after every job has been restored:
+them globally, once, after every job has been restored — in the ops shell's
+psql (`scripts/prod-shell.sh`): the loops below commit as they go, which
+`scripts/prod-sql.sh`, running everything as one transaction, refuses.
+
+**Write it to a file and run it with `psql -f`**, not pasted: pasted into the
+interactive psql, an error stops only the statement it is in and the rest of
+the paste runs on, and pasting it again in the same session found the old
+snapshot's tables already there and applied that snapshot — zeroing everyone
+whose first result came after it. Run as a file, psql stops at the first error
+and exits, the temporary tables go with the session, and running the file
+again starts from a fresh count; rows already right are skipped, so a re-run
+costs little.
+
+Count first, into a temporary table, then apply in small batches. A single
+`UPDATE` over every account would hold each one's row lock until it finished,
+and every submission increments its worker's counter: submissions would wait,
+then be answered 503 after five seconds, for as long as the recount ran.
 
 ```sql
-BEGIN;
+-- /tmp/recount.sql -- written with  cat > /tmp/recount.sql <<'EOF' ... EOF
+-- (quoted: unquoted, the shell turns each $$ below into its process id) --
+-- and run as  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f /tmp/recount.sql
+-- Room for the temporary tables below in memory; they are read once per batch.
+-- (Set before any temporary table is touched, which a fresh session is.)
+SET temp_buffers = '64MB';
 
-UPDATE users u
-   SET tasks_completed = COALESCE(actual.n, 0),
-       last_completed_at = actual.last
-  FROM (SELECT c.claimed_by_user_id AS id, count(*) AS n, max(c.completed_at) AS last
-          FROM task_claims c
-         WHERE c.state = 'completed' AND c.claimed_by_user_id IS NOT NULL
-         GROUP BY 1) actual
- WHERE u.id = actual.id;
+-- 1. Count. Reads only; nothing waits on this. `recount` is kept whole for
+--    the rest of the procedure (step 2 reads it); step 3 works through a copy.
+CREATE TEMP TABLE recount AS
+SELECT 'u' AS kind, c.claimed_by_user_id AS id, count(*) AS n, max(c.completed_at) AS last
+  FROM task_claims c
+ WHERE c.state = 'completed' AND c.claimed_by_user_id IS NOT NULL
+ GROUP BY 2
+UNION ALL
+SELECT 'a', c.claimed_by_anon_uuid, count(*), max(c.completed_at)
+  FROM task_claims c
+ WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
+ GROUP BY 2;
+CREATE INDEX ON recount (kind, id);
+ANALYZE recount;
+CREATE TEMP TABLE pending AS SELECT * FROM recount;
 
-UPDATE anonymous_workers w
-   SET tasks_completed = COALESCE(actual.n, 0),
-       last_completed_at = actual.last
-  FROM (SELECT c.claimed_by_anon_uuid AS uuid, count(*) AS n, max(c.completed_at) AS last
-          FROM task_claims c
-         WHERE c.state = 'completed' AND c.claimed_by_anon_uuid IS NOT NULL
-         GROUP BY 1) actual
- WHERE w.uuid = actual.uuid;
+-- 2. Zero the identities with no completed claims left. Required after
+--    §2.0, which deletes the claims made after the purge: the counters those
+--    claims raised would otherwise stay, with nothing behind them. (An
+--    identity with no completed claims appears nowhere in step 1.)
+-- 3. Apply the counts, a thousand a transaction, only where they differ.
+--    Each batch is taken out of `pending` as it is applied, so no batch
+--    rereads the ones before it. A run stopped by a lock timeout -- it gives
+--    up rather than queue behind a submission -- is run again, the whole
+--    file, from a fresh count.
+SET lock_timeout = '2s';
 
-COMMIT;
+DO $$
+DECLARE zeroed int;
+BEGIN
+  LOOP
+    WITH z AS (
+      UPDATE users SET tasks_completed = 0, last_completed_at = NULL
+       WHERE id IN (SELECT u.id FROM users u
+                     WHERE u.tasks_completed > 0
+                       AND NOT EXISTS (SELECT 1 FROM recount r
+                                        WHERE r.kind = 'u' AND r.id = u.id)
+                     LIMIT 1000)
+      RETURNING 1),
+    za AS (
+      UPDATE anonymous_workers SET tasks_completed = 0, last_completed_at = NULL
+       WHERE uuid IN (SELECT w.uuid FROM anonymous_workers w
+                       WHERE w.tasks_completed > 0
+                         AND NOT EXISTS (SELECT 1 FROM recount r
+                                          WHERE r.kind = 'a' AND r.id = w.uuid)
+                       LIMIT 1000)
+      RETURNING 1)
+    SELECT (SELECT count(*) FROM z) + (SELECT count(*) FROM za) INTO zeroed;
+    EXIT WHEN zeroed = 0;
+    COMMIT;
+  END LOOP;
+END $$;
+
+DO $$
+DECLARE taken int;
+BEGIN
+  LOOP
+    WITH batch AS (
+      DELETE FROM pending
+       WHERE ctid IN (SELECT ctid FROM pending LIMIT 1000)
+      RETURNING kind, id, n, last),
+    u AS (
+      UPDATE users u SET tasks_completed = b.n, last_completed_at = b.last
+        FROM batch b
+       WHERE b.kind = 'u' AND u.id = b.id
+         AND (u.tasks_completed, u.last_completed_at) IS DISTINCT FROM (b.n, b.last)
+      RETURNING 1),
+    a AS (
+      UPDATE anonymous_workers w SET tasks_completed = b.n, last_completed_at = b.last
+        FROM batch b
+       WHERE b.kind = 'a' AND w.uuid = b.id
+         AND (w.tasks_completed, w.last_completed_at) IS DISTINCT FROM (b.n, b.last)
+      RETURNING 1)
+    SELECT count(*) INTO taken FROM batch;
+    EXIT WHEN taken = 0;
+    COMMIT;
+  END LOOP;
+END $$;
+
+-- Then §4's check 3b, which counts from the claims afresh: 0 when done.
 ```
+
+The counts are a snapshot: a submission accepted between step 1 and a row's
+update is overwritten by the older figure. Run this when the fleet is quiet, or
+run the file again afterwards; a second run changes only what moved. §4
+checks the result.
 
 This is the one recount a restore is most likely to need, and the one most
 likely to be forgotten: nothing about a single job's restore makes a wrong
-leaderboard visible. An identity with no completed claims at all keeps whatever
-it had — the joins above only touch identities that appear in `task_claims` — so
-if claims were *dropped* rather than restored, zero those rows first
-(`UPDATE users SET tasks_completed = 0, last_completed_at = NULL;` and the
-same for `anonymous_workers`) and let the statements above put back what the
-rows actually support.
+leaderboard visible.
 
 ### 2.4 Recompute derived state
 
-- **Job exports** (`job_exports`): derived data, and the one thing here that a
-  partial restore can make actively misleading — a row still saying `ready`
-  describes results the restore may not have brought back, and hands an admin a
-  stable-looking artifact of something else. Delete the job's rows
-  (`DELETE FROM job_exports WHERE job_id = :'job'`) and re-export if anyone
-  wants one; the objects behind them expire from the bucket on their own.
+- **Job exports** (`job_exports`): none comes back. A purge or delete removed
+  the job's own, §2.0 removed any made since, and §2.2 refuses to run beside
+  one. Export the job again once §2.3 has completed it, if anyone wants one;
+  the objects of the removed rows expire from the bucket on their own.
 
 - **Ratings** (`rating_runs` / `player_config_ratings`): a batch fit over
-  each pool's `game_results`, never applied per submission. Once the results
-  are back the two-minute sweep notices the pool's evidence changed and refits
-  it; `POST /api/admin/rating-pools/:id/recompute` does it immediately. Nothing
+  each pool's `game_results`, never applied per submission. §2.2's script ends
+  by marking every pool for a refit, and the two-minute sweep refits them on
+  the restored rows; `POST /api/admin/rating-pools/:id/recompute` does one
+  immediately. (Left to notice the change itself, a sweep that ran while the
+  rows were loading could record a deleted job's counter as seen and never
+  refit.) Nothing
   to copy. Runs older than a month are thinned to one a day in any case
   (PLAN.md, "Ratings"), so a restored history is at that resolution past the
   month whatever the backup's age.
 - **SPRT**: computed from `game_results` on read, so it corrects itself once
   the results are back.
-- **Leave-generation artifacts**: if any object is missing, use
-  `POST /api/admin/jobs/:id/rebuild-artifacts` (the "Check artifacts" button on
-  the admin job page) rather than restoring bytes — see §3.
+- **Leave-generation artifacts**: run `POST /api/admin/jobs/:id/rebuild-artifacts`
+  (the "Check artifacts" button on the admin job page) on every restored
+  leave-generation job, whether or not an object is missing: it rebuilds the
+  missing ones, and makes the hash workers are sent match the object each
+  generation's key now holds — restored rows describe the objects as they were,
+  and a worker refuses a KLV whose hash does not match. See §3.
 - **Derived data** (`derived_data`): the SHA-256 of each wordmap and rack info
   table the server built. Derived by definition, and **a job whose rows are
   missing does not dispatch** — which is the symptom a restore produces here:
-  active jobs handing out nothing. Activating each job again re-queues them
-  (`POST /api/admin/jobs/:id/activate`), and the builder task fills them in
-  within a few minutes; `/admin/derived-data` shows the queue. The files
-  themselves are not restored because none is kept: the server hashes and
-  discards them.
+  active jobs handing out nothing, for a few minutes. The first claim that
+  considers an active job queues whatever of its files has no row (so does
+  activating it), and the builder task fills them in; `/admin/derived-data`
+  shows the queue. The files themselves are not restored because none is kept:
+  the server hashes and discards them.
 
   A row whose `kwg_id` or `klv_id` points at an `input_data` row restored
-  without its object-store bytes will fail with that as its reason. Re-import
-  that tarball; the import is idempotent and adds no rows for files whose bytes
-  have not changed.
+  without its object-store bytes will fail with that as its reason; one whose
+  object holds other bytes than those imported fails saying so, and the build
+  deletes that object so the re-import below uploads it again. If its error
+  says the object could not be deleted, delete it by hand first —
+  `aws s3 rm "s3://$(terraform -chdir=infra output -raw artifacts_bucket)/inputs/<sha256>"`
+  (the bucket is versioned, so the damaged bytes stay as a noncurrent version
+  until they expire). Re-import
+  that tarball; the import is idempotent, adds no rows for files whose bytes
+  have not changed, and uploads their bytes again. Then, if the row has
+  failed three times, press **Retry** on it at `/admin/derived-data`: it stays
+  failed until someone does, and its job hands out nothing meanwhile. A row
+  still `pending` between attempts has no Retry and needs none: it is tried
+  again on its own within about 20 minutes (a 15-minute wait, then the next
+  scheduled builder run). (A
+  build that fails is tried again after 5 and then 15 minutes on its own, so
+  a passing S3 outage heals without anyone.)
+
+### 2.5 Start the job again
+
+§2.0 deactivated it, and nothing since has put it back. A job that was active
+before the mistake is activated again with the allocation it had: the
+**Activate** button on its admin page, or `POST /api/admin/jobs/:id/activate`
+with `{"allocation": N}` and the CSRF header (a different `N` changes the job's
+share). A job that was completed stays as §2.3 left it.
 
 ---
 
@@ -377,11 +1232,25 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   whose object is gone is rebuilt from the database and rewritten; every
   generation that is present is left alone.
 - **Object present but the hash differs** from what was recorded when the
-  generation closed. This is *not* automatically overwritten, and usually
-  should not be: the results have moved on since the generation closed, so a
-  rebuild legitimately produces different bytes, and rewriting would replace
-  the KLV that workers actually played with. Investigate before forcing
-  (`?force=true`).
+  generation closed, by the same builder. This is *not* automatically
+  overwritten, and should not be until you know why: a closed generation's
+  rows do not change (a late result is credited, never folded), so a
+  difference means the object or the rows were damaged or replaced — a
+  restore from another point in time, a hand edit, an object written over —
+  and rewriting would replace the KLV that workers actually played with.
+  Investigate before forcing
+  (**Force rebuild** on the admin job page; `?force=true` on the API), which
+  rewrites every generation and is refused while the job is active. A check
+  or a forced rebuild that started before a purge goes on writing objects
+  after it; if §2 then copies the old rows back, run **Check artifacts**
+  again, which puts the recorded builds back.
+- **Object nothing accounts for** (the **Served** column says so): the bytes
+  are neither the recorded build, nor the rebuild, nor what workers were being
+  sent — typically another run's KLV under the same key, after a purge, a
+  re-run and §2's copy-back of the old rows. When the rows reproduce the
+  recorded build exactly the check puts that build back itself; otherwise
+  workers refuse the object until you restore the version that matches the
+  recorded hash (below) or force a rebuild.
 - **Built by a different builder.** Read this column first. MAGPIE builds these
   KLVs, so a MAGPIE upgrade can legitimately change the bytes for the same
   leave values; the report says which builder wrote the artifact and which one
@@ -392,11 +1261,23 @@ KLVs are derivable from `leave_rack_progress`, so they need no backup:
   bucket back:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+# On your own machine, with the Terraform state in infra/: the ops task can
+# read only the backups bucket.
+ARTIFACTS_BUCKET=$(terraform -chdir=infra output -raw artifacts_bucket)
+export AWS_REGION=$(terraform -chdir=infra output -raw region)
+JOB=00000000-0000-0000-0000-000000000000
 aws s3api list-object-versions --bucket "$ARTIFACTS_BUCKET" --prefix "leaves/$JOB/"
+VERSION="<the VersionId of the known-good version, from the listing above>"
 aws s3api copy-object --bucket "$ARTIFACTS_BUCKET" \
   --copy-source "$ARTIFACTS_BUCKET/leaves/$JOB/generation-3.klv2?versionId=$VERSION" \
   --key "leaves/$JOB/generation-3.klv2"
 ```
+
+Then **Check artifacts** (without `force`). Workers verify the KLV they fetch
+against the hash they are sent, and that hash still describes the object the
+copy replaced: until the check records the restored object's hash, every task
+of the next generation is declined.
 
 Never restore the artifact bucket wholesale to an older point: the bucket is
 allowed to be newer than the database, never older (PLAN.md, "Artifacts: back up, or rebuild?").
@@ -408,7 +1289,10 @@ allowed to be newer than the database, never older (PLAN.md, "Artifacts: back up
 Do not declare it finished because the page loads.
 
 ```bash
-# 1. Row counts, against the manifest of the dump that was restored.
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+# 1. Row counts, against the manifest of the dump that was restored (after a
+#    dump restore, §2.1 or §5: STAMP is the dump's stamp. After §1's PITR there
+#    is no dump; skip this one).
 aws s3 cp "s3://$BUCKET/pg/$STAMP.manifest.json" - | python3 -m json.tool | head -40
 ```
 
@@ -421,15 +1305,35 @@ SELECT count(*) AS jobs_missing_data FROM jobs j
 SELECT count(*) AS inputs_missing_content FROM input_data
  WHERE role IN ('letterdist','layout') AND content IS NULL;
 
--- 3. Counter sanity. Must be zero.
+-- 3. Counter sanity. Must be zero. Serial: in parallel, each worker builds
+--    the whole grouped aggregate of the claims itself.
+SET max_parallel_workers_per_gather = 0;
 SELECT count(*) AS counter_disagreements
   FROM tasks t
-  JOIN LATERAL (
-    SELECT count(*) FILTER (WHERE c.state = 'completed') AS accepted,
+  LEFT JOIN (
+    -- One pass over the claims, grouped: a per-task probe (as a lateral
+    -- join) was a random index read per task, hours on the drill's disk
+    -- at tens of millions of tasks.
+    SELECT c.task_id,
+           count(*) FILTER (WHERE c.state = 'completed') AS accepted,
            count(*) FILTER (WHERE c.state = 'claimed')   AS active
-      FROM task_claims c WHERE c.task_id = t.id
-  ) actual ON true
- WHERE t.accepted_count <> actual.accepted OR t.active_claim_count <> actual.active;
+      FROM task_claims c GROUP BY c.task_id
+  ) actual ON actual.task_id = t.id
+ WHERE t.accepted_count <> COALESCE(actual.accepted, 0)
+    OR t.active_claim_count <> COALESCE(actual.active, 0);
+-- 3b. Contributor counters (§2.3b's result). Must be zero.
+SELECT
+  (SELECT count(*) FROM users u
+     LEFT JOIN (SELECT claimed_by_user_id AS id, count(*) AS n FROM task_claims
+                 WHERE state = 'completed' AND claimed_by_user_id IS NOT NULL
+                 GROUP BY 1) c ON c.id = u.id
+    WHERE u.tasks_completed <> COALESCE(c.n, 0))
++ (SELECT count(*) FROM anonymous_workers w
+     LEFT JOIN (SELECT claimed_by_anon_uuid AS id, count(*) AS n FROM task_claims
+                 WHERE state = 'completed' AND claimed_by_anon_uuid IS NOT NULL
+                 GROUP BY 1) c ON c.id = w.uuid
+    WHERE w.tasks_completed <> COALESCE(c.n, 0))
+  AS contributor_disagreements;
 ```
 
 4. **Functional smoke**: run one real task against the restored stack with
@@ -440,8 +1344,10 @@ SELECT count(*) AS counter_disagreements
 
    **Never use `worker/fake_worker.py` for this.** It submits invented
    results, the server records them as real contributions to real jobs, and
-   they skew SPRT verdicts and rating fits until someone finds and deletes
-   them. It is test tooling for disposable stacks only.
+   they skew SPRT verdicts and rating fits until the jobs they went to are
+   purged (§2.0) — no route deletes a single result, and one deleted by hand
+   leaves the job's counters, and so its pools' fits, as they were. It is test
+   tooling for disposable stacks only.
 
 In-flight claims need no action. Claims open at the restore point are reclaimed
 by the heartbeat timeout, and a worker submitting against a claim the restored
@@ -451,27 +1357,225 @@ database never issued is rejected the same way any stale claim is.
 
 ## 5. Region loss
 
-1. `terraform apply` in the DR region: `terraform apply -var region=$DR_REGION -var dr_region=$REGION`.
-2. Set the two SSM parameters by hand — Terraform manages their names, never
-   their values. `SESSION_SIGNING_KEY` may be a fresh `openssl rand -hex 32`;
-   every session cookie is invalidated, which costs a round of logins.
-3. Restore the database from the replicated dump in
-   `birdtest-backups-dr-<account>` (§2.1's `pg_restore`, into the new instance).
-4. Artifacts are already in `birdtest-artifacts-dr-<account>`; sync them into
-   the new region's artifact bucket, or point `S3_BUCKET` at the replica.
-5. Re-verify the SES domain identity and add the DKIM CNAMEs — account mail is
+A second copy of the stack, applied into the same account in another region.
+Every bucket name is global and every IAM role name account-wide, and the lost
+region's still hold theirs — as do the DR replicas the rebuild restores from —
+so the copy is named apart with `name_suffix`, and kept in state of its own.
+
+1. `terraform apply` the copy, in its own workspace so the lost region's state
+   is left as it was, and with the service at **zero tasks**: the backend
+   migrates its database before it binds, and a schema made in the empty new
+   instance would stop the restore in step 3 at its first object:
+
+   ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+   terraform -chdir=infra workspace select -or-create dr
+   # The stack's own settings first, the DR overrides after (a later -var
+   # wins): without prod.tfvars every other setting fell back to its default
+   # -- a micro instance, 20 GiB, and the fleet's MAGPIE floor back at 0.1.1.
+   # Storage sized for the restore in step 3 at creation: autoscaling cannot
+   # keep up with a bulk load (a step at most every six hours), and raising
+   # the variable later is no quicker. Sized from the replicated dump's
+   # manifest: database_bytes is the database's own size when it was dumped
+   # (the dump compresses four times or more, so a multiple of the dump
+   # undershoots), plus 30% and room for WAL (db_max_wal_size_mb/1024; 4 by
+   # default); never under RDS's minimum of 20, nor over 59,578 (past it the
+   # copy's autoscaling ceiling, capped at RDS's 65,536, could not be a tenth
+   # above it, and the plan refuses it). Raise it by hand to production's own
+   # allocation if that is larger and known, within the same bound.
+   # The replica bucket is in the lost stack's dr_region, which need not be
+   # $DR_REGION; with no --region the CLI asks the lost region first.
+   # Fill in the four quoted values (left empty, the `if` below refuses).
+   DR_REGION=''        # the region the copy is built in
+   THIRD_REGION=''     # a third region, up, for the copy's own replicas
+   REPLICA_REGION=''   # the lost stack's dr_region
+   REPLICA=''          # s3://birdtest-backups-dr-<account id>/pg, the lost stack's
+                       # (a drill: §6's staging bucket)
+   MANIFEST=$(aws s3 ls --region "$REPLICA_REGION" "$REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
+   DR_STORAGE_GB=$(aws s3 cp --region "$REPLICA_REGION" "$REPLICA/$MANIFEST" - | python3 -c 'import json, math, sys; print(min(59578, max(20, math.ceil(json.load(sys.stdin)["database_bytes"] * 1.3 / 2**30) + 4)))')
+   echo "restoring ${MANIFEST%.manifest.json}: $DR_STORAGE_GB GiB"
+   # Everything below needs these; an unset one wrote region = "" (the CLI's
+   # default region, likely the lost one) into dr.tfvars. One `if`, not a
+   # `: "${X:?}"` line: pasted into a terminal, a failed expansion abandons
+   # only its own line, and the lines after it ran anyway.
+   # An existing one for this region -- filled in, then this block pasted
+   # again -- is kept; one for another (a drill's, §6) is not reused.
+   if [ -e infra/dr.tfvars ] && grep -q "^region *= *\"$DR_REGION\"" infra/dr.tfvars \
+      && grep -q "^db_allocated_storage *= *$DR_STORAGE_GB\$" infra/dr.tfvars; then
+     echo "infra/dr.tfvars exists for $DR_REGION; kept"
+   elif [ -e infra/dr.tfvars ]; then
+     echo "infra/dr.tfvars is for another region or size (a drill's?): move it aside first"
+   elif [ -n "$DR_REGION" ] && [ -n "$THIRD_REGION" ] && [ -n "$REPLICA_REGION" ] \
+      && [ -n "$REPLICA" ] && [ -n "$MANIFEST" ] && [ -n "$DR_STORAGE_GB" ]; then
+     # The DR overrides, in a file of their own beside prod.tfvars, so every
+     # later DR command -- step 4's apply, the ones after it -- carries the same
+     # ones (a later -var-file wins). Every ARN prod.tfvars names in the lost
+     # region is overridden: a task whose secrets live there cannot start.
+     # GITHUB_TOKEN is optional; leave it empty, or create the parameter in
+     # $DR_REGION and put its ARN here. Fill in the <...> before applying.
+     # printf, not a heredoc: copied from this indented list, a heredoc's
+     # closing EOF keeps its indent and never ends it.
+     printf '%s\n' \
+       "region                     = \"$DR_REGION\"" \
+       "dr_region                  = \"$THIRD_REGION\"" \
+       'name_suffix                = "-dr"' \
+       "db_allocated_storage       = $DR_STORAGE_GB" \
+       'github_token_parameter_arn = ""' \
+       "acm_certificate_arn        = \"<a certificate issued in $DR_REGION>\"" \
+       "backend_image              = \"<pullable from $DR_REGION>\"" \
+       "derived_builder_image      = \"<pullable from $DR_REGION>\"" \
+       "frontend_image             = \"<pullable from $DR_REGION>\"" \
+       > infra/dr.tfvars
+   else echo "set DR_REGION, THIRD_REGION, REPLICA_REGION and REPLICA, and check MANIFEST and DR_STORAGE_GB, first"; fi
+   # Scheduled tasks off until step 4: the derived builder would fail rows
+   # whose inputs are not synced yet, and a 03:00 backup would dump the
+   # half-restored database as the newest.
+   ```
+
+   Fill in the `<...>` in `infra/dr.tfvars`, then apply. (`azs=null` undoes
+   `prod.tfvars`' pinned zones, which are the lost region's: the copy takes
+   `$DR_REGION`'s first two, and step 4 pins those in `dr.tfvars`.)
+
+   ```bash
+   if ! grep -q "^region *= *\"$DR_REGION\"" infra/dr.tfvars; then
+     echo "infra/dr.tfvars is not for $DR_REGION"
+   elif grep -n '<' infra/dr.tfvars; then echo "fill these in first"; else
+     terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars \
+       -var desired_count=0 -var scheduled_tasks_enabled=false -var 'azs=null'
+   fi
+   ```
+
+   ACM certificates are regional, so the lost region's cannot be used; request
+   one in `$DR_REGION` first. The three images must be pullable from
+   `$DR_REGION`: a registry in the lost region is lost with it, so push
+   releases to one that is not (ECR with cross-region replication, or a
+   registry outside AWS) — or rebuild them from this repository and the pinned
+   MAGPIE commit (README.md, "Deploying") first. And this needs Terraform's
+   state for the copy only — it is a new workspace — but step 9's return to the
+   default workspace needs the original's, which README.md says to keep off
+   the lost machine and region. `dr_region` must be a region that is up — the
+   copy replicates into it as the original did — not the one that was lost.
+   `$CLUSTER` below is then `birdtest-dr`.
+2. Set the new instance's master password and the two SSM parameters by hand,
+   as README.md "Deploying" does for a first deploy — but in `$DR_REGION`
+   (`--region $DR_REGION` on every command; the CLI's default is likely the
+   lost region) and with `DB_INSTANCE=birdtest-dr`. Terraform creates the
+   instance with a placeholder password; the parameters it only names, and
+   `put-parameter` creates them. `SESSION_SIGNING_KEY` may be a fresh
+   `openssl rand -hex 32`; every session cookie is invalidated, which costs a
+   round of logins.
+3. Restore the database from the replicated dump. The new stack's ops task
+   can read only the new stack's own backups bucket, so first copy the dump
+   step 1 sized for, and its manifest, across into it -- from the operator's
+   machine, whose credentials can read the replica:
+
+   ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+   # In step 1's shell, or with its variables set again: an empty REPLICA made
+   # the source the local root, and --recursive would copy this machine's
+   # files into the Object-Locked bucket, where they stay for 30 days. One
+   # `if`, so nothing runs unless every one is set (a `: "${X:?}"` line stops
+   # only itself when pasted into a terminal).
+   NEW=s3://$(terraform -chdir=infra output -raw backups_bucket)/pg
+   if [ -n "$REPLICA" ] && [ -n "$MANIFEST" ] && [ -n "$REPLICA_REGION" ] \
+      && [ -n "$DR_REGION" ] && [ "$NEW" != "s3:///pg" ]; then
+     STAMP=${MANIFEST%.manifest.json}
+     aws s3 cp --recursive --source-region $REPLICA_REGION --region $DR_REGION \
+       "$REPLICA/$STAMP/" "$NEW/$STAMP/"
+     aws s3 cp --source-region $REPLICA_REGION --region $DR_REGION \
+       "$REPLICA/$MANIFEST" "$NEW/$MANIFEST"
+     echo "$STAMP"   # for the ops shell, which has none of these variables
+   else echo "set REPLICA, MANIFEST, REPLICA_REGION and DR_REGION (step 1) first"; fi
+   ```
+
+   This needs `kms:Decrypt` on the lost stack's `backups-dr` key (in
+   `$REPLICA_REGION`) and `kms:GenerateDataKey` and `kms:Decrypt` on the new
+   stack's backups key; both keys leave that to IAM, so an administrator has
+   it and a narrower role needs it granted. The copies take the new bucket's
+   30-day Object Lock retention.
+
+   Then, in `scripts/prod-shell.sh` against the new stack, fetch and check it
+   with §2.1's first block with `STAMP=<the stamp printed above>` (and
+   `BUCKET`, `S3_REGION` unset: it is the stack's own bucket now).
+   Replication does not keep order, so just after a 03:00 backup the newest
+   manifest can arrive before all of its dump's files, and with the source
+   region gone the rest never will: if the block still says
+   `CHECKSUM MISMATCH` after one fresh copy, take the previous stamp --
+   `MANIFEST=$(aws s3 ls --region $REPLICA_REGION "$REPLICA/" | grep manifest | tail -2 | head -1 | awk '{print $4}')`,
+   a day older, which step 1's size still covers -- and copy that across
+   instead. Then the dump into the new instance, as in §2.1's second block but
+   with `pg_restore -d "$DATABASE_URL"` — run detached as §2.1 does, since it
+   takes longer than an ECS Exec session lasts, and not finished until its log
+   ends `pg_restore exit 0`: step 4's `desired_count=1` against a
+   half-restored database serves it.
+4. The leave-generation KLVs (`leaves/`) and the imported input data
+   (`inputs/`) are in `birdtest-artifacts-dr-<account>`; sync both prefixes
+   into the new stack's artifact bucket (`birdtest-dr-artifacts-<account>`)
+   with `aws s3 sync`. The service reads only its own bucket. (Input data
+   imported before the `input-data` replication rule existed was never
+   replicated: re-import those tarballs from the admin page instead —
+   importing is idempotent.) Then pin the copy's zones and apply with the
+   service up and the schedules on (their defaults):
+
+   ```bash
+   # Once, and on a line of its own: a second append redefines the attribute.
+   # Captured first: a failed output wrote a bare `azs = `, which the grep
+   # then took for done.
+   AZS=$(terraform -chdir=infra output -json azs) && ! grep -q '^azs' infra/dr.tfvars \
+     && printf '\nazs = %s\n' "$AZS" >> infra/dr.tfvars
+   # Only with the zones pinned: without them prod.tfvars' -- the lost
+   # region's -- apply, and the plan replaces the subnets. This apply creates
+   # the copy's -down alarms before its task is healthy: an ALARM mail for
+   # each, then an OK.
+   if grep -q '^azs' infra/dr.tfvars; then
+     terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars
+   else echo "no azs in infra/dr.tfvars: is this the dr workspace, with step 1's state?"; fi
+   ```
+
+   Every later command against the copy takes both files, in that order.
+5. Re-verify the SES domain identity and add the DKIM CNAMEs, and point the
+   MAIL FROM MX record at the DR region (the `ses_mail_from_records` output of
+   the `dr` workspace) — account mail is
    dead until this is done, which means no confirmations and no password
-   resets.
+   resets. SES production access is per region: request it again.
 6. Point DNS at the new ALB.
-7. Run §4.
+7. Confirm the new stack's alert subscription (SNS mails a confirmation) and
+   run README.md's alert-path checks with `SUFFIX=-dr` and
+   `REGION=$DR_REGION` (in the `dr` workspace, so the Terraform outputs are
+   the copy's): with `REGION` still the lost region, they test nothing that
+   exists.
+8. Run §4, and **Check artifacts** on every leave-generation job (§3): the
+   synced objects are the replicas' latest versions, which need not be the ones
+   the restored rows describe.
+9. `terraform -chdir=infra workspace select default` when done. The workspace
+   is remembered in `infra/.terraform`, and `scripts/prod-sql.sh`,
+   `scripts/prod-shell.sh` and §1's outputs would otherwise go on reading the
+   DR stack's state (both scripts print the workspace they are using).
 
 ---
 
 ## 6. Testing this runbook
 
 - `./scripts/restore-roundtrip.sh` — proves a dump of the current schema
-  restores byte-identically into an empty database. Run it after any schema
-  change; nightly CI runs it too.
+  restores intact into an empty database. Run it after any schema
+  change, on a fresh schema (it seeds only an empty database) with nothing
+  writing; nightly CI runs it that way.
+- `./scripts/dev-restore-check.sh` — runs `dev-restore.sh` against a stub
+  compose and checks it scrubs unless `SCRUB=0` and refuses any other value;
+  CI runs it.
+- `./scripts/restore-job-check.sh` — runs §2.2's `restore-job.sh` against three
+  databases of its own through its refusals, a stopped run and its resume, a
+  deleted job, and a re-run; `PG_EXEC="docker exec -i <container>"` points it
+  at any Postgres 16 container. Nightly CI runs it.
+- `./scripts/reapply-check.sh` — runs §1's two blocks that re-apply the
+  security actions a full restore undoes, as written here, against a
+  restored and a damaged database of its own: their refusals (the wrong
+  instance either way, an export unfinished or failed, no review, an
+  exclusion that matches nothing or is not an id), the actions applied — each
+  target's last, one begun before the restore point — and a bad migration's
+  damage not, an actor and an action left out, a later reset left out, a
+  demoted admin and an edited demotion list, and both blocks pasted again.
+  Nightly CI runs it.
 - `./scripts/backup-drill-check.sh` — runs `backup.sh` and `restore-drill.sh`
   exactly as their Fargate tasks do (the `postgres:16` image, the script as
   `bash -c`) against the local stack's Postgres and MinIO: a backup taken while
@@ -482,10 +1586,237 @@ database never issued is rejected the same way any stale claim is.
   stand-in object store, and `BACKUP_METRICS=false` (or `=true`) overrides that
   either way.
 - `scripts/restore-drill.sh` runs monthly in production and restores the newest
-  dump into a throwaway database. A failure means the backups are not
+  dump into a throwaway Postgres started inside its own task — never into the
+  production instance, whose credentials it does not hold. A failure means the backups are not
   restorable and is the loudest alarm in the system.
-- Twice a year, do §5 by hand into a scratch account or region. The manual
-  drill exists to find the steps that live only in someone's head.
+- Twice a year, do §5 by hand into a **scratch account** (not only another
+  region of this one). The manual drill exists to find the steps that live only
+  in someone's head. In this account the drill's copy would hold §5's names --
+  the `-dr` buckets are global, its IAM roles account-wide -- and a real region
+  loss would fail at step 1 on the first of them.
+
+  §5 reads production's replicas (`birdtest-backups-dr-<account>`,
+  `birdtest-artifacts-dr-<account>`, with production's account id), which the
+  scratch account cannot. Stage them first, through this machine, so neither
+  account is granted anything on the other's buckets. Two blocks, one per
+  account's credentials; each runs only with the account it names:
+
+  ```bash
+  export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+  # 1. With PRODUCTION's credentials. PROD_ACCOUNT is its id, PROD_REPLICA_REGION
+  # its dr_region.
+  PROD_REPLICA=s3://birdtest-backups-dr-$PROD_ACCOUNT/pg
+  if [ -z "$PROD_ACCOUNT" ] || [ -z "$PROD_REPLICA_REGION" ]; then
+    echo "set PROD_ACCOUNT and PROD_REPLICA_REGION first"
+  elif [ "$(aws sts get-caller-identity --query Account --output text)" != "$PROD_ACCOUNT" ]; then
+    echo "these are not production's credentials"
+  else
+    # Kept across a re-paste in this shell, so a retry leaves no second
+    # partial copy of production's data behind. .staged says it is whole.
+    [ -d "$STAGE" ] || STAGE=$(mktemp -d)
+    rm -f "$STAGE/.staged"
+    M=$(aws s3 ls --region $PROD_REPLICA_REGION "$PROD_REPLICA/" | grep manifest | tail -1 | awk '{print $4}')
+    if [ -z "$M" ]; then
+      echo "no manifest listed in $PROD_REPLICA/"
+    elif aws s3 cp --recursive --region $PROD_REPLICA_REGION \
+           "$PROD_REPLICA/${M%.manifest.json}/" "$STAGE/pg/${M%.manifest.json}/" \
+      && aws s3 cp --region $PROD_REPLICA_REGION "$PROD_REPLICA/$M" "$STAGE/pg/$M" \
+      && aws s3 sync --region $PROD_REPLICA_REGION "s3://birdtest-artifacts-dr-$PROD_ACCOUNT/leaves" "$STAGE/leaves" \
+      && aws s3 sync --region $PROD_REPLICA_REGION "s3://birdtest-artifacts-dr-$PROD_ACCOUNT/inputs" "$STAGE/inputs"; then
+      touch "$STAGE/.staged" && echo "staged $M in $STAGE"
+    else
+      echo "staging failed: fix what it printed and paste this block again"
+    fi
+  fi
+  ```
+
+  ```bash
+  export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+  # 2. With the SCRATCH account's credentials, in the same shell. SCRATCH_ACCOUNT
+  # is its id. One bucket stands for both replicas; it is created here, so a
+  # block pasted with production's credentials cannot create it in
+  # production's account (bucket names are global: the scratch account could
+  # then never have it).
+  if [ -z "$SCRATCH_ACCOUNT" ] || [ -z "$PROD_REPLICA_REGION" ] || [ ! -e "$STAGE/.staged" ]; then
+    echo "set SCRATCH_ACCOUNT, and run block 1 in this shell until it says staged"
+    echo "(after an upload, the local copy is gone and there is nothing to do)"
+  elif [ "$(aws sts get-caller-identity --query Account --output text)" != "$SCRATCH_ACCOUNT" ]; then
+    echo "these are not the scratch account's credentials"
+  else
+    STAGING=birdtest-drill-stage-$SCRATCH_ACCOUNT
+    # Made once: pasted again after a failed upload, the bucket is already there.
+    { aws s3api head-bucket --region $PROD_REPLICA_REGION --bucket $STAGING 2>/dev/null \
+        || aws s3 mb --region $PROD_REPLICA_REGION s3://$STAGING; } \
+      && aws s3 sync --region $PROD_REPLICA_REGION --exclude .staged "$STAGE" s3://$STAGING/ \
+      && rm -rf "$STAGE" \
+      && echo "uploaded; the local copy of production's data is removed"
+  fi
+  ```
+
+  Then run §5 in the scratch account, filling in step 1's `REPLICA_REGION` with
+  `$PROD_REPLICA_REGION`'s value and `REPLICA` with
+  `s3://birdtest-drill-stage-<the scratch account's id>/pg`. Step 4 syncs
+  `leaves/` and `inputs/` from the same bucket. Step 3's `kms:Decrypt` on the
+  replica's key does not apply: the staging bucket uses S3's own encryption.
+  Skip step 6: DNS stays on production. The copy holds production's data, so
+  tear it down the day the drill ends. Use the scratch account's credentials,
+  with `DR_REGION`, `THIRD_REGION` and `PROD_REPLICA_REGION` set again as the
+  drill had them. §5 step 9 left the `default` workspace selected, and this
+  block selects `dr`: an apply or destroy in `default` works on production's
+  state.
+
+  ```bash
+  export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+  empty() {  # bucket region [--bypass-governance-retention]
+    # Destroy refuses a bucket that is not empty, and versioning keeps every
+    # version, delete markers included. A listing page holds at most 1,000 --
+    # all delete-objects takes -- so one page at a time (--no-paginate; the
+    # CLI otherwise merges every page into one request that is refused),
+    # until the listing is empty. A failed listing or a version not deleted
+    # is a failure, not an empty bucket.
+    local listing errors
+    listing=$(mktemp) && errors=$(mktemp) || return 1
+    while :; do
+      aws s3api list-object-versions --bucket "$1" --region "$2" --no-paginate \
+        --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
+        --output json > "$listing" || { echo "$1: listing failed"; break; }
+      if ! grep -q '"Key"' "$listing"; then rm -f "$listing" "$errors"; return 0; fi
+      aws s3api delete-objects --bucket "$1" --region "$2" $3 \
+        --delete "file://$listing" --query Errors --output json > "$errors" \
+        || { echo "$1: delete failed"; break; }
+      if grep -q '"Key"' "$errors"; then echo "$1: not deleted:"; cat "$errors"; break; fi
+    done
+    rm -f "$listing" "$errors"
+    return 1
+  }
+  A=$(aws sts get-caller-identity --query Account --output text)
+  if [ -z "$DR_REGION" ] || [ -z "$THIRD_REGION" ] || [ -z "$PROD_REPLICA_REGION" ]; then
+    echo "set DR_REGION, THIRD_REGION and PROD_REPLICA_REGION first"
+  elif [ -z "$A" ] || [ "$A" != "$SCRATCH_ACCOUNT" ]; then
+    echo "set SCRATCH_ACCOUNT, and use the scratch account's credentials"
+  elif ! terraform -chdir=infra workspace select dr \
+       || [ "$(terraform -chdir=infra workspace show)" != dr ]; then
+    echo "there is no dr workspace here"
+  elif ! RESOURCES=$(terraform -chdir=infra state list); then
+    echo "the dr workspace's state could not be read"
+  elif AZ_HINT="with -var azs=null if infra/dr.tfvars has no azs"
+       ! grep -q '^aws_db_instance.main$' <<< "$RESOURCES"; then
+    # Past destroy, the apply below would build the whole copy again.
+    echo "the copy's instance is not in the state: after a destroy, go on to the next block;"
+    echo "after a destroy that stopped part way, run destroy again by hand ($AZ_HINT)"
+  else
+    # prod.tfvars pins production's zones. dr.tfvars gets the copy's at §5
+    # step 4, and a drill stopped before then was applied with azs=null: without
+    # it, this apply plans the subnets into zones $DR_REGION does not have.
+    AZ_VAR=
+    grep -q '^azs' infra/dr.tfvars || AZ_VAR="-var azs=null"
+    # Nothing writes while the buckets empty: the service is stopped, and the
+    # 03:00 backup and the derived builder are unscheduled. The backups
+    # buckets' versions are GOVERNANCE-locked for 30 days, so only they take
+    # --bypass-governance-retention. Each step runs only if the last worked.
+    terraform -chdir=infra apply -var-file=prod.tfvars -var-file=dr.tfvars $AZ_VAR \
+        -var desired_count=0 -var scheduled_tasks_enabled=false \
+      && aws rds modify-db-instance --region $DR_REGION --db-instance-identifier birdtest-dr \
+        --no-deletion-protection --apply-immediately > /dev/null \
+      && empty birdtest-dr-backups-$A $DR_REGION --bypass-governance-retention \
+      && empty birdtest-dr-artifacts-$A $DR_REGION \
+      && empty birdtest-dr-backups-dr-$A $THIRD_REGION --bypass-governance-retention \
+      && empty birdtest-dr-artifacts-dr-$A $THIRD_REGION \
+      && terraform -chdir=infra destroy -var-file=prod.tfvars -var-file=dr.tfvars $AZ_VAR \
+      && echo "destroyed: now the next block"
+  fi
+  ```
+
+  Then what `destroy` leaves: the instance's final snapshot (rds.tf keeps
+  one, and it exists only once the instance is gone), the staging bucket, the
+  two SSM parameters (Terraform only names them — and the session key may be
+  production's; a `GITHUB_TOKEN` parameter the drill created in `$DR_REGION`
+  goes by hand too), the workspace and `dr.tfvars`. The snapshot is a full copy
+  of production's database, and one left behind also stops the next drill's
+  `destroy`, which makes one of the same name:
+
+  ```bash
+  export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+  A=$(aws sts get-caller-identity --query Account --output text)
+  if [ -z "$DR_REGION" ] || [ -z "$PROD_REPLICA_REGION" ] || [ -z "$A" ] \
+     || [ "$A" != "$SCRATCH_ACCOUNT" ]; then
+    echo "set DR_REGION, PROD_REPLICA_REGION and SCRATCH_ACCOUNT, with the scratch account's credentials"
+  else
+    # Each step counts as done when what it removes is already gone, so a
+    # re-paste finishes what a failure stopped; the workspace and dr.tfvars,
+    # the record of the drill, go only after both.
+    { aws rds delete-db-snapshot --region $DR_REGION --db-snapshot-identifier birdtest-dr-final > /dev/null \
+        || aws rds describe-db-snapshots --region $DR_REGION --db-snapshot-identifier birdtest-dr-final 2>&1 \
+           | grep -q DBSnapshotNotFound; } \
+      && { aws s3 rb --force --region $PROD_REPLICA_REGION s3://birdtest-drill-stage-$A \
+        || aws s3api head-bucket --region $PROD_REPLICA_REGION --bucket birdtest-drill-stage-$A 2>&1 \
+           | grep -q '(404)'; } \
+      && aws ssm delete-parameters --region $DR_REGION \
+           --names /birdtest/DATABASE_URL /birdtest/SESSION_SIGNING_KEY > /dev/null \
+      && terraform -chdir=infra workspace select default \
+      && terraform -chdir=infra workspace delete dr \
+      && mv infra/dr.tfvars infra/dr.tfvars.drill-$(date +%Y%m%d) \
+      && echo "drill torn down"
+  fi
+  ```
+
+  (A source bucket is emptied before its replica, so replication has nothing
+  left to write into the replica. In the teardown a step that fails stops the
+  rest: fix what it printed and paste the block again. Until `destroy` has run
+  every step in it is safe to repeat, and after it the block refuses to run.
+  `workspace delete` refuses a workspace whose state still holds anything. An
+  ops task still running from `scripts/prod-shell.sh` can write to a bucket or
+  hold the cluster: stop it first. A real §5 must not start from the drill's
+  `dr.tfvars`, so it is moved aside.)
+
+---
+
+## Rolling back a deploy
+
+A release that misbehaves goes back to the previous release's images. The
+backend starts against a schema a newer release migrated (it ignores
+migrations it does not know), and migrations after release are additive
+(README, "After a schema change"), so the previous image runs on it. The
+service keeps no healthy task through a deploy, so the site is down from the
+moment the bad task stops until the old one is healthy, and the `-down`
+alarms may fire and clear. Keep each release's three image tags (in its
+release notes, say): `prod.tfvars` holds only the current ones.
+
+1. If the release added a value to an enum the previous image reads -- a new
+   job type, say -- deactivate every job using it first: the previous image
+   fails to read such a row, and one active job of an unknown type stops every
+   claim. README's rule says to ship the reading of a new value a release
+   before anything writes it, which makes this step empty.
+2. Put the previous tags back in `prod.tfvars`: `backend_image`,
+   `derived_builder_image` and `frontend_image` together (the builder must carry
+   the backend's MAGPIE). If the release raised `min_magpie_version`, put the
+   previous value back too, since the backend refuses to start when its own
+   MAGPIE is below the floor. That readmits the builds the raise kept out.
+   The apply uses this checkout's `infra/`, so any change the release made to
+   the task definitions stays unless it is reverted too.
+3. Apply: `terraform -chdir=infra apply -var-file=prod.tfvars`.
+4. Wait for healthy targets, not only a running task. `aws ecs wait
+   services-stable` succeeds once the task *runs*, which a crash-looping task
+   does between restarts:
+
+   ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+   NAME=birdtest   # birdtest-dr for §5's copy
+   for TG in backend frontend; do
+     aws elbv2 wait target-in-service --region "$REGION" --target-group-arn \
+       "$(aws elbv2 describe-target-groups --region "$REGION" --names "$NAME-$TG" \
+          --query 'TargetGroups[0].TargetGroupArn' --output text)" \
+       && echo "$TG healthy"
+   done
+   ```
+
+   A waiter gives up after ten minutes, and the health check's grace is as
+   long (migrations run inside it): run it again before concluding anything.
+
+If the release's migration was not additive (it dropped or renamed something
+the previous image reads), the previous image will fail on it: fix forward
+with a new release instead, or restore to before the deploy with §1, which
+loses every write since.
 
 ---
 
@@ -498,6 +1829,7 @@ this, in order; the service fails new connections between the first and last
 step, so do it in a quiet moment:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 DB_PASSWORD=$(openssl rand -hex 24)
 aws rds modify-db-instance --region "$REGION" --db-instance-identifier birdtest \
   --master-user-password "$DB_PASSWORD" --apply-immediately
@@ -512,6 +1844,6 @@ print(p._replace(netloc="birdtest:" + sys.argv[2] + "@" + p.netloc.rsplit("@", 1
 aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
   --value "$NEW_URL"
 
-# Tasks read SSM at start; the backup and restore-drill tasks read it per run.
+# Tasks read SSM at start; the backup task reads it per run.
 aws ecs update-service --region "$REGION" --cluster "$CLUSTER" --service birdtest --force-new-deployment
 ```

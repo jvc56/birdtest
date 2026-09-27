@@ -1,0 +1,83 @@
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    # A directory's trailing-slash redirect names no host, port or scheme:
+    # absolute, it sent `http://localhost/...` from behind the ALB's https and
+    # from any mapped port. And no version in the Server header.
+    absolute_redirect off;
+    server_tokens off;
+
+    # In production the ALB splits /api off to the backend target group. There
+    # is no ALB in compose, so Nginx does the same routing itself — which also
+    # keeps the app on a single origin, so the session cookie and the CSRF
+    # double-submit behave exactly as they do when deployed.
+    #
+    # The backend's address is ${BACKEND_UPSTREAM}, filled in when the
+    # container starts (the image's envsubst templates): `backend:8080` in
+    # compose, where each service is a host name, and `127.0.0.1:8080` in the
+    # ECS task, whose containers share one network namespace and are *not*
+    # names anything resolves. Written in literally, Nginx resolved `backend`
+    # while loading its configuration, found nothing on Fargate, and exited --
+    # and the frontend container is essential, so the task never started.
+    location /api/ {
+        proxy_pass http://${BACKEND_UPSTREAM};
+        # Nginx's default is 1 MB. A worker result with captured positions is
+        # routinely larger; the backend enforces its own 64 MB ceiling, and
+        # this must not be lower than that or local contributors fail where
+        # deployed ones (straight through the ALB) succeed.
+        client_max_body_size 64m;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Server-Sent Events: without these the job stream is buffered and the
+        # dashboard never sees an event until the connection closes.
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 24h;
+        # Chunked transfer stays on. A results stream that fails part-way is
+        # cut off without its closing chunk, which is how a client knows the
+        # download is short; with chunking off, Nginx answered without a
+        # length and closed the connection, and a cut stream read as a
+        # complete one (the audit's pass 21).
+    }
+
+    location /health {
+        proxy_pass http://${BACKEND_UPSTREAM}/health;
+    }
+
+    # The build's hashed assets: a name is never reused, so cached for good --
+    # and a name that is not there is a 404. Under `location /` a missing
+    # chunk fell through to index.html, a 200 of HTML that `nosniff` refuses
+    # to run as a module, and the page stayed blank.
+    location /_app/immutable/ {
+        try_files $uri =404;
+        # Not `always`: that put a year's `immutable` on the 404 too, and a
+        # browser kept a missing chunk missing -- through a rollback or a
+        # release that brought the same content-hashed name back.
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        add_header X-Content-Type-Options "nosniff" always;
+    }
+
+    # Everything else is the SPA; unknown paths resolve client-side.
+    location / {
+        try_files $uri $uri/ /index.html;
+        # Revalidated on every visit. With no Cache-Control a browser cached
+        # index.html by heuristic -- a tenth of the build's age, a day for a
+        # two-week-old build -- and after a deploy asked for chunks the new
+        # image no longer has: a blank page until the entry expired.
+        add_header Cache-Control "no-cache" always;
+        # Nothing here is meant to be framed or sniffed, and the site is only
+        # ever served over HTTPS once deployed (the ALB redirects port 80).
+        # `add_header` in a location replaces the server's, so they are here,
+        # on the pages; the API sets its own `nosniff` (backend/src/lib.rs).
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header Referrer-Policy "same-origin" always;
+        add_header Content-Security-Policy "frame-ancestors 'none'; object-src 'none'; base-uri 'self'" always;
+    }
+}

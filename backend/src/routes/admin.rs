@@ -6,7 +6,8 @@ use crate::error::{AppError, AppResult};
 use crate::jobs::registry;
 use crate::models::job::{Job, JobStatus, JobType, PlayerConfig};
 use crate::state::AppState;
-use axum::extract::{Path, Query, State};
+use crate::extract::{ApiPath as Path, ApiQuery as Query};
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -26,6 +27,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id", delete(delete_job))
         .route("/users/:id", delete(delete_user))
         .route("/workers", get(super::public::list_workers_admin))
+        .route("/workers/bans", get(list_bans))
         .route("/workers/ban", post(ban_worker))
         .route("/workers/ban/:id", delete(unban_worker))
         .route("/audit-log", get(audit_log))
@@ -164,8 +166,8 @@ async fn delete_input_data(
 #[derive(Deserialize)]
 struct StartImportBody {
     tarball_date: String,
-    /// A tag, branch or commit sha, resolved to a commit at import time so the
-    /// record names a commit and never a moving branch.
+    /// A branch or tag of the data repository, resolved to a commit at import
+    /// time so the record names a commit and never a moving branch.
     #[serde(default = "default_ref")]
     git_ref: String,
 }
@@ -180,7 +182,7 @@ struct StartedImport {
     state: &'static str,
 }
 
-/// Phase 1, in the background. The archive is ~94 MB, so the request returns an
+/// Phase 1, in the background. The archive is ~190 MB, so the request returns an
 /// id immediately and the admin UI polls `GET .../imports/<id>`; nothing waits
 /// on the download and no transaction is held open across it.
 async fn start_import(
@@ -198,9 +200,9 @@ async fn start_import(
         return Err(AppError::bad_request("tarball_date must be YYYYMMDD"));
     }
 
-    // Resolving the ref is a single GitHub API call and its failure modes are
-    // worth reporting synchronously -- a typo'd ref should not become a failed
-    // background task.
+    // Resolving the ref is one to six GitHub API calls (a branch, a tag, the
+    // tag objects it peels) and its failure modes are worth reporting
+    // synchronously -- a typo'd ref should not become a failed background task.
     let commit_sha = crate::inputdata::resolve_ref(&state, &body.git_ref).await?;
 
     let mut tx = state.pool.begin().await?;
@@ -586,6 +588,18 @@ async fn create_player_config(
         return Err(AppError::bad_request("player config is invalid")
             .with_field("num_plies", "a simming player must simulate at least 1 ply"));
     }
+    // A simmer's candidates are the top plays by equity: autoplay's simulating
+    // player generates them that way whatever the config says, so a `score`
+    // simmer would mean equity in a games job and score in an opening-rack one
+    // (whose executor sorts by the player's strategy) -- one config, two
+    // players. Refused rather than given two meanings.
+    if simming && body.sort_strategy.as_deref() == Some("score") {
+        return Err(AppError::bad_request("player config is invalid").with_field(
+            "sort_strategy",
+            "a simming player's candidates are the best plays by equity, in games jobs \
+             whatever the config says; use 'equity' (or leave it out) for a simmer",
+        ));
+    }
     // A simulation stops at whichever comes first, its iteration budget or its
     // time limit, and a time limit makes how far it gets depend on the
     // contributor's hardware: two honest workers would rank the same position
@@ -699,10 +713,27 @@ async fn create_player_config(
     .bind(movegen_margin)
     .bind(admin.0.id)
     .fetch_one(&state.pool)
-    .await?;
+    .await
+    .map_err(|e| match body.cloned_from_id {
+        Some(id) => super::ratings::unknown_config(
+            e.into(),
+            "player_configs_cloned_from_id_fkey",
+            "cloned_from_id",
+            id,
+        ),
+        None => e.into(),
+    })?;
 
     Ok((StatusCode::CREATED, Json(config)))
 }
+
+/// The most blanks a distribution may have for MAGPIE to build a wordmap
+/// (`wmp_maker.c`), and with it a rack info table.
+const MAGPIE_MAX_WORDMAP_BLANKS: u32 = 2;
+
+/// The most racks one leave task forces: 200 times the form's default of 50,
+/// about 80 KB of racks in each claim.
+const MAX_RACKS_PER_TASK: i32 = 10_000;
 
 /// Numbers MAGPIE would refuse, or silently read as "use your own default".
 ///
@@ -710,6 +741,64 @@ async fn create_player_config(
 /// job has been built on the config and dispatched: every worker would fail
 /// the task, and the job would sit there producing nothing. Refusing at
 /// creation puts the error in front of the admin who can fix it.
+const MAGPIE_MAX_PLIES: i32 = 25;
+const MAGPIE_MAX_CAPTURED_PLIES: i32 = 10;
+/// MAGPIE's largest equity (`EQUITY_MAX_DOUBLE`, `-(INT32_MIN + 3) / 1000`),
+/// which it accepts as a margin; above it every worker refuses the task,
+/// "server sent an invalid movegen_margin".
+const MAGPIE_MAX_MARGIN: f64 = 2_147_483.645;
+/// Plays generated. MAGPIE allocates `num_plays + 1` moves per player per
+/// thread before it plays — 2e9 was a 16 GB allocation and a core dump on
+/// every worker — but a static player ranking every opening play needs more
+/// than a rack has: 63,585 for ??EIRST in CSW24. 200,000 is some 11 MB a
+/// player a thread.
+const MAX_NUM_PLAYS: i32 = 200_000;
+/// Plays recorded: each is stored with its rank as a `SMALLINT`.
+const MAX_NUM_PLAYS_RECORDED: i32 = i16::MAX as i32;
+/// The board every MAGPIE the fleet runs is built for (`BOARD_DIM`). A layout
+/// of another size, or one MAGPIE otherwise refuses, loads on no worker: each
+/// fails the task, and after five in a row `magpie contribute` stops.
+const MAGPIE_BOARD_DIM: usize = 15;
+
+/// Why MAGPIE would refuse this board layout — never accepting one its loader
+/// (`board_layout.c`) refuses, and stricter than it only on parser quirks — the file split on newlines with empty lines
+/// ignored, a line's trailing `\r` dropped; a start square `row, col` inside
+/// the board; then exactly `BOARD_DIM` rows of `BOARD_DIM` bonus squares.
+pub(crate) fn layout_problem(content: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(content);
+    let lines: Vec<&str> = text
+        .split('\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    if lines.len() != MAGPIE_BOARD_DIM + 1 {
+        return Some(format!(
+            "has {} rows; every MAGPIE build the fleet runs plays on {MAGPIE_BOARD_DIM}x{MAGPIE_BOARD_DIM}",
+            lines.len().saturating_sub(1)
+        ));
+    }
+    let coords: Vec<&str> = lines[0].split(',').filter(|part| !part.is_empty()).collect();
+    let in_board = |part: &str| {
+        part.trim_matches([' ', '\t', '\n', '\r'])
+            .parse::<i64>()
+            .is_ok_and(|v| (0..MAGPIE_BOARD_DIM as i64).contains(&v))
+    };
+    if coords.len() != 2 || !coords.iter().all(|part| in_board(part)) {
+        return Some(format!("has a start square MAGPIE cannot read: {:?}", lines[0]));
+    }
+    for (row, line) in lines[1..].iter().enumerate() {
+        // Bytes, as MAGPIE counts them (a non-UTF-8 byte reads as three here,
+        // after the lossy decode, and is refused either way).
+        if line.len() != MAGPIE_BOARD_DIM {
+            return Some(format!("row {} is {} squares wide, not {MAGPIE_BOARD_DIM}", row + 1, line.len()));
+        }
+        if let Some(square) = line.chars().find(|c| !matches!(c, ' ' | '\'' | '-' | '"' | '=' | '^' | '~' | '#')) {
+            return Some(format!("row {} has a square MAGPIE does not know: {square:?}", row + 1));
+        }
+    }
+    None
+}
+
 fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     let mut err = AppError::bad_request("player config is invalid");
     if body.name.trim().is_empty() {
@@ -729,8 +818,29 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     if body.num_plays_recorded < 1 {
         err = err.with_field("num_plays_recorded", "must be at least 1");
     }
+    for (field, value, most) in [
+        ("num_plays", body.num_plays, MAX_NUM_PLAYS),
+        ("num_plays_recorded", Some(body.num_plays_recorded), MAX_NUM_PLAYS_RECORDED),
+    ] {
+        if value.is_some_and(|v| v > most) {
+            err = err.with_field(field, format!("must be at most {most}"));
+        }
+    }
     if body.num_plies.is_some_and(|v| v < 0) {
         err = err.with_field("num_plies", "must not be negative");
+    }
+    // MAGPIE's own limits (`MAX_PLIES` in sim_defs.h; a captured position
+    // keeps at most `CAPTURED_PLAY_MAX_PLIES` in autoplay_results.c). Past the
+    // first every worker failed every task of the job; past the second the
+    // plies were cut off without a word.
+    if body.num_plies.is_some_and(|v| v > MAGPIE_MAX_PLIES) {
+        err = err.with_field("num_plies", format!("must be at most {MAGPIE_MAX_PLIES}"));
+    }
+    if body.num_plies_recorded.is_some_and(|v| v > MAGPIE_MAX_CAPTURED_PLIES) {
+        err = err.with_field(
+            "num_plies_recorded",
+            format!("must be at most {MAGPIE_MAX_CAPTURED_PLIES}"),
+        );
     }
     if body.time_limit_secs.is_some_and(|v| v < 0) {
         err = err.with_field("time_limit_secs", "must not be negative");
@@ -747,6 +857,11 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     for (field, value) in non_negative {
         if value.is_some_and(|v| !v.is_finite() || v < 0.0) {
             err = err.with_field(field, "must be a finite, non-negative number");
+        }
+    }
+    for (field, value) in [("inference_margin", body.inference_margin), ("movegen_margin", body.movegen_margin)] {
+        if value.is_some_and(|v| v > MAGPIE_MAX_MARGIN) {
+            err = err.with_field(field, format!("must be at most {MAGPIE_MAX_MARGIN}"));
         }
     }
     if body.utility_spread_scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
@@ -834,7 +949,7 @@ async fn delete_player_config(
 /// Reads an `input_data` row's name, insisting it is the role the caller
 /// expects. The foreign keys cannot express this -- every one of them points at
 /// the same table -- so it is validated wherever a role column is written.
-async fn require_role(
+pub(crate) async fn require_role(
     pool: &sqlx::PgPool,
     id: Uuid,
     role: &str,
@@ -883,6 +998,12 @@ fn one() -> i32 {
     1
 }
 
+/// A games job's default batch: even, so each task gives each player the
+/// first move equally (see [`validate_job_body`]).
+fn two() -> i32 {
+    2
+}
+
 /// Per-job-type configuration, expanded into typed columns rather than stored
 /// as JSON.
 #[derive(Deserialize)]
@@ -898,7 +1019,7 @@ enum JobTypeConfig {
     Game {
         player1_config_id: Uuid,
         player2_config_id: Uuid,
-        #[serde(default = "one")]
+        #[serde(default = "two")]
         games_per_batch: i32,
         min_games: i32,
         max_games: i32,
@@ -992,9 +1113,32 @@ async fn create_job(
 
     let letterdist_name = require_role(&state.pool, body.letterdist_id, "letterdist").await?;
     require_role(&state.pool, body.layout_id, "layout").await?;
+    let layout: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(body.layout_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if let Some(problem) = layout_problem(&layout) {
+        return Err(AppError::bad_request(
+            "the board layout cannot be used: every worker would fail every task",
+        )
+        .with_field("layout_id", problem));
+    }
+    // Parsed now as every claim will parse it: a file the server or MAGPIE
+    // cannot use -- more letters than MAGPIE holds, a malformed row -- was
+    // found by the first claim, as a 500, on a job already created.
+    let content: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(body.letterdist_id)
+        .fetch_one(&state.pool)
+        .await?;
+    let distribution = crate::jobs::racks::LetterDistribution::parse(&content, &letterdist_name)
+        .map_err(|e| {
+            AppError::bad_request("the letter distribution cannot be used")
+                .with_field("letterdist_id", e.message)
+        })?;
+    let blanks = distribution.tiles.iter().find(|t| t.letter == '?').map_or(0, |t| t.count);
 
     // Defaulted from config rather than typed, so the form shows the effective
-    // value; unparseable text is 0.0.0, which no job would accept.
+    // value; a typed one was checked above.
     let floor = crate::version::Version::parse_or_zero(
         body.min_magpie_version
             .as_deref()
@@ -1027,6 +1171,27 @@ async fn create_job(
     .await?;
 
     insert_job_config(&mut tx, &job, &body.config, &letterdist_name).await?;
+    refuse_one_name_for_two_files(&mut tx, &job).await?;
+    // MAGPIE builds a wordmap, and so a rack info table, for at most two
+    // blanks (`cannot create WMP with more than 2 blanks`, an abort): a job
+    // that needs either on `english_super` was created, its build failed
+    // three times, and it never dispatched, with nothing on its page to say
+    // why (the audit's pass 7).
+    if blanks > MAGPIE_MAX_WORDMAP_BLANKS
+        && !crate::derived::needs_for_job(&mut tx, job.id).await?.is_empty()
+    {
+        return Err(AppError::bad_request(
+            "no wordmap or rack info table can be built for this letter distribution",
+        )
+        .with_field(
+            "letterdist_id",
+            format!(
+                "{letterdist_name} has {blanks} blanks, and MAGPIE builds them for at most \
+                 {MAGPIE_MAX_WORDMAP_BLANKS}: no player of this job may use either, and a leave \
+                 job must not use a wordmap"
+            ),
+        ));
+    }
 
     audit::log(
         &mut tx,
@@ -1040,7 +1205,8 @@ async fn create_job(
     .await?;
     tx.commit().await?;
 
-    // Generation 1's zeroed KLV: a multi-megabyte build and an object-store
+    // The zeroed KLV generation 1 starts from (stored as generation 0): a
+    // multi-megabyte build and an object-store
     // write, so it happens after the transaction commits rather than inside it.
     registry::initialize_job_artifacts(&state, &job).await?;
 
@@ -1057,6 +1223,24 @@ async fn create_job(
 /// its request and every rack comes back analysed in one submission, so this
 /// bounds both; 500 is the default.
 const MAX_RACKS_PER_BATCH: i32 = 10_000;
+
+/// The most games one task may play (a pair counts two), and the most when
+/// the job captures positions. A captured position's game is an `i16`, so a
+/// batch past 32,768 games could never be submitted -- every result refused,
+/// the job stuck -- and about 4,000 captured games already pass the 64 MiB
+/// body limit (the audit's pass 21).
+const MAX_GAMES_PER_BATCH: i32 = 10_000;
+const MAX_CAPTURED_GAMES_PER_BATCH: i32 = 1_000;
+
+/// The batch-size bound for a games or game-pairs job, in its own unit.
+fn games_batch_field(mut err: AppError, unit: &str, games_per_unit: i32, batch: i32, capture: bool) -> AppError {
+    let cap = if capture { MAX_CAPTURED_GAMES_PER_BATCH } else { MAX_GAMES_PER_BATCH } / games_per_unit;
+    if batch > cap {
+        let when = if capture { " when capturing positions" } else { "" };
+        err = err.with_field(format!("{unit}s_per_batch"), format!("must be at most {cap}{when}"));
+    }
+    err
+}
 
 /// Settings the schema cannot express and no worker or test could run with.
 ///
@@ -1081,6 +1265,13 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
     }
+    // Read loosely, a typo ("v1.6.0", "1") was 0.0.0: the lowest floor there
+    // is, so a raise meant to keep older builds off the job let them all on.
+    if let Some(text) = body.min_magpie_version.as_deref() {
+        if crate::version::Version::parse_strict(text).is_none() {
+            err = err.with_field("min_magpie_version", "must be a version such as 0.1.1");
+        }
+    }
 
     let sprt = |mut err: AppError,
                 unit: &str,
@@ -1100,9 +1291,11 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         if max_units < 1 {
             err = err.with_field(format!("max_{unit}s"), "must be at least 1");
         }
+        // Not merely above 0: a subnormal alpha made the upper bound
+        // infinite, serialised as `null`, and the public job page threw on it.
         for (field, value) in [("sprt_alpha", alpha), ("sprt_beta", beta)] {
-            if !(value > 0.0 && value < 1.0) {
-                err = err.with_field(field, "must be strictly between 0 and 1");
+            if !(1e-6..1.0).contains(&value) {
+                err = err.with_field(field, "must be at least 0.000001 and below 1");
             }
         }
         if alpha + beta >= 1.0 {
@@ -1110,6 +1303,15 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         }
         if !(elo_low.is_finite() && elo_high.is_finite() && elo_low < elo_high) {
             err = err.with_field("elo_high", "must be a finite number greater than elo_low");
+        }
+        // A bound on what a hypothesis may say: far enough out, both are an
+        // expected score of 1 to the last bit (from about 6,400 Elo), the LLR
+        // is always 0 and the job runs to its cap. Past a thousand no job
+        // between two word-game players means anything.
+        for (field, value) in [("elo_low", elo_low), ("elo_high", elo_high)] {
+            if value.is_finite() && value.abs() > 1000.0 {
+                err = err.with_field(field, "must be between -1000 and 1000");
+            }
         }
         err
     };
@@ -1128,17 +1330,38 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::Game {
-            games_per_batch, min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high, ..
-        } => sprt(
-            err, "game", *games_per_batch, *min_games, *max_games, *sprt_alpha, *sprt_beta,
-            *elo_low, *elo_high,
-        ),
+            games_per_batch, min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
+            capture_positions, ..
+        } => {
+            let mut err = sprt(
+                err, "game", *games_per_batch, *min_games, *max_games, *sprt_alpha, *sprt_beta,
+                *elo_low, *elo_high,
+            );
+            err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
+            // MAGPIE alternates the first mover within one run, from player 1,
+            // and every task is a run of its own: at a batch of 1 player 1
+            // moved first in every game of the job, and SPRT passed two
+            // identical players on the first move alone (+42 Elo; the audit's
+            // pass 18). An even batch gives each player the first move equally
+            // in every task. Game pairs swap it within each pair already.
+            if *games_per_batch >= 1 && games_per_batch % 2 != 0 {
+                err = err.with_field(
+                    "games_per_batch",
+                    "must be even, so each player moves first in half of every task's games",
+                );
+            }
+            err
+        }
         JobTypeConfig::GamePair {
-            pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high, ..
-        } => sprt(
-            err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, *sprt_alpha, *sprt_beta,
-            *elo_low, *elo_high,
-        ),
+            pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
+            capture_positions, ..
+        } => {
+            let err = sprt(
+                err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, *sprt_alpha, *sprt_beta,
+                *elo_low, *elo_high,
+            );
+            games_batch_field(err, "pair", 2, *pairs_per_batch, *capture_positions)
+        }
         JobTypeConfig::Leave {
             num_iterations, generation_count, target_rack_count, racks_per_task, ..
         } => {
@@ -1152,6 +1375,15 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
                     err = err.with_field(field, "must be at least 1");
                 }
             }
+            // Every claim carries its task's forced racks, and so does every
+            // `leave_requests` row: a typo of millions sent the generation's
+            // whole universe with each.
+            if *racks_per_task > MAX_RACKS_PER_TASK {
+                err = err.with_field(
+                    "racks_per_task",
+                    format!("must be at most {MAX_RACKS_PER_TASK}"),
+                );
+            }
             err
         }
     };
@@ -1163,49 +1395,69 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     }
 }
 
-/// An opening-rack job asks for a *ranked list* per rack, and a recorder type
-/// of `best` cannot produce one.
+/// An opening-rack job asks for a *ranked list* per rack, and a static player
+/// with a `best` recorder cannot produce one.
 ///
 /// `-r best` is `MOVE_RECORD_BEST`: move generation keeps the single top play
-/// and discards the rest, so the batch comes back with exactly one move per
-/// rack however many the config says to record -- and, for a simming player,
-/// with nothing for the simulation to choose between, so `num_plies` and
-/// `num_plays` do nothing either. Verified against MAGPIE: `generate` on an
-/// opening rack reports "1 of 1 plays" under `-r1 best` and 100 under
-/// `-r1 all`.
+/// and discards the rest, so a static player's batch comes back with exactly
+/// one move per rack however many the config says to record. Verified against
+/// MAGPIE: `generate` on an opening rack reports "1 of 1 plays" under
+/// `-r1 best` and 100 under `-r1 all`.
 ///
 /// Nothing downstream notices. The racks are analysed, the results are
 /// accepted, `racks_analyzed` climbs, and the corpus quietly holds a
 /// hundredth of the analysis it was configured for. So the contradiction is
 /// refused where it is introduced rather than discovered in the data later.
 ///
-/// `best` with `num_plays_recorded = 1` is coherent and stays legal: "the best
-/// opening play for every rack" is a real job. This rule is scoped to opening
-/// racks; a `games` job's players are applied through autoplay, where the
-/// simmer's candidate list is sized by `num_plays` rather than by the move
-/// recorder, and `best` is the right setting there (PLAN.md, "Position Capture
-/// From Games").
+/// A simulating player is not refused: its candidates are every play up to
+/// `num_plays` whatever its recorder, in opening-rack jobs as in autoplay, so
+/// a `best` simmer ranks as many moves as it records. (MAGPIE's opening-rack
+/// executor once generated them with the recorder, so a `best` simmer reported
+/// the static top play -- PLAN.md.) `best` with `num_plays_recorded = 1` is
+/// coherent for any player: "the best opening play for every rack" is a real
+/// job.
+///
+/// The same quiet shortfall comes from a `num_plays` below `num_plays_recorded`,
+/// static or simulating: an opening-rack analysis sizes its move list from
+/// `num_plays`, so no rack can come back with more, and the job would store
+/// fewer moves than it asks for.
 async fn validate_opening_rack_player(
     conn: &mut sqlx::PgConnection,
     player_config_id: Uuid,
 ) -> AppResult<()> {
-    let row = sqlx::query_as::<_, (String, i32)>(
-        "SELECT recorder_type, num_plays_recorded FROM player_configs WHERE id = $1",
+    let (recorder, recorded, plies, plays) = sqlx::query_as::<_, (String, i32, i32, i32)>(
+        "SELECT recorder_type, num_plays_recorded, num_plies, num_plays
+         FROM player_configs WHERE id = $1",
     )
     .bind(player_config_id)
     .fetch_optional(&mut *conn)
     .await?
     .ok_or_else(|| AppError::bad_request("player config not found"))?;
 
-    if row.0 == "best" && row.1 > 1 {
+    if recorder == "best" && recorded > 1 && plies == 0 {
         return Err(AppError::bad_request(
-            "an opening-rack job cannot rank moves with a 'best' recorder",
+            "an opening-rack job cannot rank moves with a static 'best' recorder",
         )
         .with_field(
             "player_config_id",
             format!(
-                "this config records the single best move, so every rack would come back                  with one move rather than the {} it asks for. Use a config with                  recorder_type 'all' or 'equity', or set num_plays_recorded to 1.",
-                row.1
+                "this static config records the single best move, so every rack would come \
+                 back with one move rather than the {recorded} it asks for. Use a config with \
+                 recorder_type 'all' ('equity' keeps only the moves within its equity \
+                 margin), a simulating one, or set num_plays_recorded to 1."
+            ),
+        ));
+    }
+    if plays < recorded {
+        return Err(AppError::bad_request(
+            "an opening-rack job cannot record more moves than its player generates",
+        )
+        .with_field(
+            "player_config_id",
+            format!(
+                "this config generates {plays} plays per rack, so every rack would come back \
+                 with at most {plays} moves rather than the {recorded} it asks for. Use a \
+                 config with num_plays of at least {recorded}, or a lower num_plays_recorded."
             ),
         ));
     }
@@ -1301,6 +1553,32 @@ async fn validate_capture_play_cap(
                      1's num_plays_recorded."
                 ),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// MAGPIE finds a file by its role and name, so a job cannot pin two
+/// different files under one: its two players on `NWL23.klv2` of two data
+/// releases -- the natural comparison after a MAGPIE-DATA update -- would have
+/// every worker hash its one `NWL23.klv2` against both digests, decline every
+/// task as missing data, and, with the job the only one active, be told to
+/// download data that cannot help (thirty-first audit). Read from the files
+/// the job's tasks will state, after its config is written, so every role is
+/// covered however the job came to pin it.
+async fn refuse_one_name_for_two_files(conn: &mut sqlx::PgConnection, job: &Job) -> AppResult<()> {
+    let files = crate::jobs::expected_data(conn, job).await?;
+    for (i, file) in files.iter().enumerate() {
+        if let Some(other) = files[i + 1..]
+            .iter()
+            .find(|other| other.role == file.role && other.name == file.name && other.sha256 != file.sha256)
+        {
+            return Err(AppError::bad_request(format!(
+                "this job would pin two different {} files named {:?} (from {} and {}): a worker \
+                 finds a file by its name and can hold only one of them. Choose players whose \
+                 files come from the same data release.",
+                file.role, file.name, file.tarball_date, other.tarball_date
+            )));
         }
     }
     Ok(())
@@ -1533,6 +1811,7 @@ async fn activate_job(
     ApiJson(body): ApiJson<ActivateBody>,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
+    let purges = refuse_while_purging(&state, id)?;
 
     if !(0..=100).contains(&body.allocation) {
         return Err(AppError::bad_request("allocation must be between 0 and 100"));
@@ -1554,6 +1833,7 @@ async fn activate_job(
 
     let mut tx = state.pool.begin().await?;
     let job = load_job_for_update(&mut tx, id).await?;
+    refuse_if_purged_since(&state, id, purges)?;
     if job.status == JobStatus::Completed {
         return Err(AppError::conflict("a completed job cannot be reactivated"));
     }
@@ -1585,11 +1865,12 @@ async fn activate_job(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    // The job joins the others level with the one furthest behind, rather
-    // than with a lifetime deficit to work off at their expense. Activation is
-    // also how an allocation is changed, and a new allocation rescales the
-    // ratio, so this runs every time. Under the activation lock, so two jobs
-    // activated together each see the other or neither.
+    // The job joins the others level with the lowest of the jobs being
+    // served, rather than with a lifetime deficit to work off at their
+    // expense. Activation is also how an allocation is changed, and a new
+    // allocation rescales the ratio, so this runs every time. Under the
+    // activation lock, so two jobs activated together each see the other or
+    // neither.
     crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     let updated = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(id)
@@ -1606,6 +1887,8 @@ async fn activate_job(
     )
     .await?;
     tx.commit().await?;
+    state.finish_checks.rearm_idle(id);
+    super::worker::push_after_change(&state, id);
     Ok(Json(updated))
 }
 
@@ -1618,9 +1901,11 @@ async fn deactivate_job(
     jar: CookieJar,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
+    let purges = refuse_while_purging(&state, id)?;
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
+    refuse_if_purged_since(&state, id, purges)?;
     // Completion is final. Flipping a completed job to inactive would be a
     // way around that rule: activation only refuses jobs that are *currently*
     // completed, so deactivate-then-activate would restart it.
@@ -1644,6 +1929,7 @@ async fn deactivate_job(
     )
     .await?;
     tx.commit().await?;
+    super::worker::push_after_change(&state, id);
     Ok(Json(job))
 }
 
@@ -1656,9 +1942,17 @@ async fn complete_job(
     jar: CookieJar,
 ) -> AppResult<Json<Job>> {
     csrf::verify(&method, &headers, &jar)?;
+    let purges = refuse_while_purging(&state, id)?;
 
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
+    refuse_if_purged_since(&state, id, purges)?;
+    // Already completed -- by the server's own finish check, say, while the
+    // admin's page was stale -- is a conflict, not a second completion on
+    // record (the audit's pass 23).
+    if before.status == JobStatus::Completed {
+        return Err(AppError::conflict("this job is already completed"));
+    }
     let job =
         sqlx::query_as::<_, Job>("UPDATE jobs SET status = 'completed' WHERE id = $1 RETURNING *")
             .bind(id)
@@ -1675,6 +1969,9 @@ async fn complete_job(
     )
     .await?;
     tx.commit().await?;
+    // Completion is final: the job's finish-check counters are never read again.
+    state.finish_checks.forget(id);
+    super::worker::push_after_change(&state, id);
     Ok(Json(job))
 }
 
@@ -1716,26 +2013,33 @@ rack_progress={} staged_results={} artifacts={}",
     ))
 }
 
-/// The same, for an account deletion: claims and results are removed with the
-/// user, and nothing else records how much work that was.
+/// The same, for an account deletion, which anonymizes the account and keeps
+/// its work: what is destroyed -- its keys and outstanding codes (and, not
+/// counted, its name, address and password) -- and, separately, the claims
+/// and results that stay under the tombstone. It said `claims=… accepted=…`
+/// as though they were lost with it (the audit's pass 10).
 async fn user_census(conn: &mut sqlx::PgConnection, user_id: Uuid) -> AppResult<String> {
     use sqlx::Row;
     let row = sqlx::query(
         "SELECT
+             (SELECT count(*) FROM api_keys WHERE user_id = $1)                    AS api_keys,
+             (SELECT count(*) FROM email_confirmations WHERE user_id = $1)         AS confirmations,
+             (SELECT count(*) FROM password_reset_tokens WHERE user_id = $1)       AS reset_tokens,
              (SELECT count(*) FROM task_claims WHERE claimed_by_user_id = $1)      AS claims,
              (SELECT count(*) FROM task_claims c
-               WHERE c.claimed_by_user_id = $1 AND c.state = 'completed')          AS accepted,
-             (SELECT count(*) FROM api_keys WHERE user_id = $1)                    AS api_keys",
+               WHERE c.claimed_by_user_id = $1 AND c.state = 'completed')          AS accepted",
     )
     .bind(user_id)
     .fetch_one(conn)
     .await?;
 
     Ok(format!(
-        "claims={} accepted={} api_keys={}",
+        "destroyed: api_keys={} confirmations={} reset_tokens={}; kept: claims={} accepted={}",
+        row.get::<i64, _>("api_keys"),
+        row.get::<i64, _>("confirmations"),
+        row.get::<i64, _>("reset_tokens"),
         row.get::<i64, _>("claims"),
         row.get::<i64, _>("accepted"),
-        row.get::<i64, _>("api_keys"),
     ))
 }
 
@@ -1747,49 +2051,100 @@ struct PurgeResult {
 /// Clear every result and return the job's tasks to `available`. On-demand tasks
 /// are deleted outright — they are regenerated at claim time, and keeping them
 /// would leave the seed cursor advanced past work that was never done.
-/// Give back the contribution each identity earned on this job, before its
-/// claims are destroyed.
+/// What each identity earned on this job, to be given back when its claims
+/// are destroyed.
 ///
 /// The counters on `jobs` belong to the job, so a purge simply zeroes them. The
 /// ones on `users` and `anonymous_workers` do not: they span every job an
 /// identity ever worked on, so a job whose claims are about to disappear has to
 /// hand back exactly what it contributed, or the contributor lists read high
-/// for good and nothing says why. Must run *before* the claims go, since it
-/// counts them.
+/// for good and nothing says why. Must be read *before* the claims go, since it
+/// counts them; and it is exact up to the commit, because the caller holds the
+/// job's dispatch lock and every open claim (`lock_open_claims`), so no claim
+/// of the job can complete in between.
+///
+/// Read here and written by [`Contributions::give_back`] as the caller's last
+/// statement. Written here, as it once was, the update held every
+/// contributor's row for the whole of the deletes that follow -- minutes for a
+/// large job -- and every request those identities made meanwhile waited on
+/// it with a pool connection held: an anonymous worker's `last_seen_at` touch
+/// runs on every worker request, and a submission for *any* job bumps its
+/// contributor's counter. The fleet stalled exactly as it had on the claims.
 ///
 /// `last_completed_at` is deliberately not rewound. Finding the new maximum
 /// means the scan these counters exist to avoid, and it is a display figure
 /// that only ever moves forward; a purge can leave it pointing at a time whose
 /// task is gone.
-async fn release_contributions(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
-    sqlx::query(
-        "UPDATE users u
-         SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
-         FROM (SELECT c.claimed_by_user_id AS id, COUNT(*)::bigint AS n
-               FROM task_claims c JOIN tasks t ON t.id = c.task_id
-               WHERE t.job_id = $1 AND c.state = 'completed'
-                 AND c.claimed_by_user_id IS NOT NULL
-               GROUP BY 1) d
-         WHERE u.id = d.id",
-    )
-    .bind(job_id)
-    .execute(&mut *conn)
-    .await?;
+struct Contributions {
+    users: Vec<(Uuid, i64)>,
+    anonymous: Vec<(Uuid, i64)>,
+}
 
-    sqlx::query(
-        "UPDATE anonymous_workers w
-         SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
-         FROM (SELECT c.claimed_by_anon_uuid AS uuid, COUNT(*)::bigint AS n
-               FROM task_claims c JOIN tasks t ON t.id = c.task_id
-               WHERE t.job_id = $1 AND c.state = 'completed'
-                 AND c.claimed_by_anon_uuid IS NOT NULL
-               GROUP BY 1) d
-         WHERE w.uuid = d.uuid",
-    )
-    .bind(job_id)
-    .execute(&mut *conn)
-    .await?;
-    Ok(())
+impl Contributions {
+    async fn count(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Self> {
+        let users = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT c.claimed_by_user_id, COUNT(*)::bigint
+             FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'completed'
+               AND c.claimed_by_user_id IS NOT NULL
+             GROUP BY 1 ORDER BY 1",
+        )
+        .bind(job_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let anonymous = sqlx::query_as::<_, (Uuid, i64)>(
+            "SELECT c.claimed_by_anon_uuid, COUNT(*)::bigint
+             FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'completed'
+               AND c.claimed_by_anon_uuid IS NOT NULL
+             GROUP BY 1 ORDER BY 1",
+        )
+        .bind(job_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        Ok(Contributions { users, anonymous })
+    }
+
+    /// The caller's last statement before it commits, so the rows are held
+    /// for milliseconds. In id order, so two purges sharing contributors lock
+    /// them in the same order rather than deadlocking at the end of both.
+    async fn give_back(self, conn: &mut sqlx::PgConnection) -> AppResult<()> {
+        let (ids, counts): (Vec<Uuid>, Vec<i64>) = self.users.into_iter().unzip();
+        // Locked in id order first: the update below locks rows in whatever
+        // order its plan visits them, which a sorted array does not decide.
+        sqlx::query("SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE")
+            .bind(&ids)
+            .execute(&mut *conn)
+            .await?;
+        sqlx::query(
+            "UPDATE users u
+             SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
+             FROM UNNEST($1::uuid[], $2::bigint[]) AS d(id, n)
+             WHERE u.id = d.id",
+        )
+        .bind(&ids)
+        .bind(&counts)
+        .execute(&mut *conn)
+        .await?;
+        let (uuids, counts): (Vec<Uuid>, Vec<i64>) = self.anonymous.into_iter().unzip();
+        sqlx::query(
+            "SELECT 1 FROM anonymous_workers WHERE uuid = ANY($1) ORDER BY uuid FOR NO KEY UPDATE",
+        )
+        .bind(&uuids)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(
+            "UPDATE anonymous_workers w
+             SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
+             FROM UNNEST($1::uuid[], $2::bigint[]) AS d(uuid, n)
+             WHERE w.uuid = d.uuid",
+        )
+        .bind(&uuids)
+        .bind(&counts)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Wait out every submission, decline and heartbeat in flight on this job's
@@ -1800,12 +2155,12 @@ async fn release_contributions(conn: &mut sqlx::PgConnection, job_id: Uuid) -> A
 /// opposite order -- so a submission arriving mid-purge waited on the job's row
 /// while the purge waited on that submission's claim: a deadlock, which
 /// Postgres breaks by failing one of the two. And a submission that committed
-/// after `release_contributions` had counted, but before the delete, credited
+/// after `Contributions::count` had counted, but before the delete, credited
 /// its identity for a claim the purge then destroyed, so that contributor's
 /// total read high for good.
 ///
 /// Locking the open claims first, before the job's row, puts destruction in
-/// the order every submission uses, and means `release_contributions` sees
+/// the order every submission uses, and means `Contributions::count` sees
 /// every submission that got in ahead of it. The caller takes the dispatch lock
 /// before this, which is what stops new claims appearing meanwhile.
 async fn lock_open_claims(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<()> {
@@ -1829,7 +2184,82 @@ async fn purge_job(
     jar: CookieJar,
 ) -> AppResult<Json<PurgeResult>> {
     csrf::verify(&method, &headers, &jar)?;
+    let hold = hold_for_purge_or_delete(&state, id)?;
+    run_to_completion(purge_body(state, admin.0.id, id, hold)).await
+}
 
+const ALREADY_RUNNING: &str = "a purge or delete of this job is running; its result will show \
+     on the job's page and in the audit log when it finishes";
+
+/// The hold a purge or delete runs under, taken in the handler: claims skip
+/// the job while it runs, and submissions for its claims are answered at once
+/// (see `jobs::DispatchHolds`). A purge or delete of the job already running
+/// -- one the load balancer stopped waiting for, which the admin page shows as
+/// an error and invites a second click on -- is refused rather than started
+/// again: the second parked a pool connection on the first's locks and then
+/// did all of it over. Checked and taken in one step; checked and then taken
+/// in the spawned task, a double click got two.
+fn hold_for_purge_or_delete(state: &AppState, id: Uuid) -> AppResult<crate::jobs::DispatchHold> {
+    state
+        .dispatch_holds
+        .try_hold_claims(id, state.cfg.heartbeat_timeout)
+        .ok_or_else(|| AppError::conflict(ALREADY_RUNNING))
+}
+
+/// Activating, deactivating or completing a job being purged or deleted would
+/// wait out the whole operation on its row with a pool connection held --
+/// and completing it then finished a job the purge had just emptied.
+/// Returns the job's purge count, for [`refuse_if_purged_since`].
+fn refuse_while_purging(state: &AppState, id: Uuid) -> AppResult<u64> {
+    let taken = state.dispatch_holds.claims_holds_taken(id);
+    if state.dispatch_holds.claims_held(id) {
+        return Err(AppError::conflict(ALREADY_RUNNING));
+    }
+    Ok(taken)
+}
+
+/// Again under the job's row lock: a purge that took the job between the
+/// first check and the lock has committed by the time the lock is had, and
+/// acting on the emptied job -- completing it, above all, for good -- is what
+/// the check exists to prevent. Compared by count, not by whether a hold is
+/// held: a purge of a job with nothing to do after its commit has released
+/// its hold by the time the waiter wakes.
+fn refuse_if_purged_since(state: &AppState, id: Uuid, taken: u64) -> AppResult<()> {
+    if state.dispatch_holds.claims_holds_taken(id) != taken || state.dispatch_holds.claims_held(id) {
+        return Err(AppError::conflict(
+            "the job was purged while this waited for it; look at it again before acting",
+        ));
+    }
+    Ok(())
+}
+
+/// Runs a purge or a delete on a task of its own, and waits for it.
+///
+/// Spawned so that a request dropped mid-way -- the load balancer's idle
+/// timeout, the admin closing the tab -- does not drop the transaction with
+/// it. Dropped with the request, the transaction's rollback waited on its
+/// connection for the running statement (minutes, for a large job's
+/// cascade), while its `DispatchHold`, dropped at once, told claims and
+/// submissions the job was free and started the reclaim grace on a job whose
+/// claims were still locked. On its own task the operation finishes whatever
+/// happens to the request, and the hold lasts at least as long as its locks --
+/// a little longer, to the end of the post-commit steps (a leave job's
+/// generation-0 rebuild), so a claim cannot start a second build of it
+/// alongside; claims skip the job and lifecycle actions answer 409 meanwhile.
+async fn run_to_completion<T: Send + 'static>(
+    operation: impl std::future::Future<Output = AppResult<T>> + Send + 'static,
+) -> AppResult<T> {
+    tokio::spawn(operation)
+        .await
+        .map_err(|e| AppError::task_failed("the operation", e))?
+}
+
+async fn purge_body(
+    state: AppState,
+    admin_id: Uuid,
+    id: Uuid,
+    mut hold: crate::jobs::DispatchHold,
+) -> AppResult<Json<PurgeResult>> {
     let mut tx = state.pool.begin().await?;
     // The same lock every claim takes before deciding what to hand out, and
     // for the same reason. A claim in flight has already read the seed cursor
@@ -1858,7 +2288,7 @@ async fn purge_job(
     audit::log_detail(
         &mut tx,
         "job.purged.census",
-        admin.0.id,
+        admin_id,
         "job",
         id.to_string(),
         Some(id),
@@ -1867,8 +2297,8 @@ async fn purge_job(
     .await?;
 
     // Before the claims go, and for the same reason the census is taken first:
-    // it counts what is about to be destroyed.
-    release_contributions(&mut tx, id).await?;
+    // it counts what is about to be destroyed. Given back last, below.
+    let contributions = Contributions::count(&mut tx, id).await?;
 
     // Records and claims cascade from tasks; leave-gen progress is keyed on
     // the job directly. Ratings are not touched: they belong to rating pools,
@@ -1881,17 +2311,23 @@ async fn purge_job(
     // Every counter on the job describes rows this purge is deleting. Left
     // alone, a purged job would restart owing the scheduler every claim it ever
     // had, and reporting progress it no longer has any results for.
+    //
+    // A completed job goes back to inactive: it has nothing left to be complete
+    // about, and a completed job cannot be activated, so one purged in place
+    // was an empty job nothing could ever run again -- where the purge is
+    // meant to start it over. Active and inactive jobs keep their state.
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
-                         tasks_total = 0, tasks_completed = 0
+                         tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
+                         sprt_decided_status = NULL, sprt_decided_llr = NULL,
+                         sprt_decided_units = NULL,
+                         status = CASE WHEN status = 'completed' THEN 'inactive'::job_status
+                                       ELSE status END
          WHERE id = $1",
     )
     .bind(id)
     .execute(&mut *tx)
     .await?;
-    // A job back at zero claims would otherwise be first in every candidate
-    // list until it had re-issued as many as the jobs beside it.
-    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
@@ -1946,23 +2382,49 @@ async fn purge_job(
     audit::log(
         &mut tx,
         "job.purged",
-        Some(admin.0.id),
+        Some(admin_id),
         None,
         Some("job"),
         Some(id.to_string()),
         Some(id),
     )
     .await?;
+    // A job back at zero claims would otherwise be first in every candidate
+    // list until it had re-issued as many as the jobs beside it. Last, not
+    // beside the counters it follows: the other jobs go on issuing claims for
+    // the minutes the cascade above takes, and parity taken before it left the
+    // purged job that far behind, heading every candidate list until it had
+    // caught up.
+    crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
+    // One matrix build per pool on the next sweep, which is what the sweep
+    // did every time before it had its cheap check. Before the give-back:
+    // this can wait out a running fit, and waiting with every contributor's
+    // row locked stalled every submission of theirs, for any job.
+    crate::ratings::mark_every_pool_for_refit(&mut tx).await?;
+    // Exports describe results this purge deletes. A row left saying `ready`
+    // would hand an admin -- and, once the job completed again, every
+    // download of its results -- a stable-looking artifact of a job that no
+    // longer holds any of it. Deleted with everything else; the objects go
+    // once this commits.
+    let export_objects = crate::exports::purge(&mut tx, id).await?;
+    // Last, and so held for as long as the commit takes: see `Contributions`.
+    contributions.give_back(&mut tx).await?;
     tx.commit().await?;
+    hold.committed();
+    super::worker::push_after_change(&state, id);
+    crate::exports::remove_objects(&state, export_objects);
 
-    // Exports describe results this purge has just deleted. A row left saying
-    // `ready` would hand an admin a stable-looking artifact of a job that no
-    // longer holds any of it.
-    crate::exports::purge(&state, id).await?;
-
-    // The generation-0 KLV was deleted with the artifacts above; rebuild it, or
-    // generation 1 would have nothing to play with.
-    registry::initialize_job_artifacts(&state, &job).await?;
+    // After the commit, so a failure here is not the purge failing: it
+    // committed, and answering 500 invited a second one. Logged instead.
+    //
+    // The generation-0 KLV was deleted with the artifacts above; rebuilt here,
+    // and if that fails, by the next claim (`Acquired::NeedsZeroGeneration`).
+    if let Err(err) = registry::initialize_job_artifacts(&state, &job).await {
+        tracing::error!(
+            job_id = %id, error = %err.message,
+            "rebuilding a purged job's generation-0 KLV failed; the next claim retries it"
+        );
+    }
 
     Ok(Json(PurgeResult { tasks_reset }))
 }
@@ -1976,11 +2438,21 @@ async fn delete_job(
     jar: CookieJar,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
+    let hold = hold_for_purge_or_delete(&state, id)?;
+    run_to_completion(delete_body(state, admin.0.id, id, hold)).await
+}
 
+/// See [`run_to_completion`] and [`hold_for_purge_or_delete`].
+async fn delete_body(
+    state: AppState,
+    admin_id: Uuid,
+    id: Uuid,
+    mut hold: crate::jobs::DispatchHold,
+) -> AppResult<StatusCode> {
     let mut tx = state.pool.begin().await?;
     // The same locks a purge takes, in the same order and for the same
     // reasons: no claim is issued meanwhile, and no submission is between its
-    // claim and its commit when `release_contributions` counts -- see
+    // claim and its commit when `Contributions::count` counts -- see
     // `lock_open_claims`. The cascade below deletes every claim and task, so
     // without them this deadlocked against a submission in flight just as
     // purge did. The merge lock first, as there: the cascade deletes a leave
@@ -1996,7 +2468,7 @@ async fn delete_job(
     audit::log(
         &mut tx,
         "job.deleted",
-        Some(admin.0.id),
+        Some(admin_id),
         None,
         Some("job"),
         Some(id.to_string()),
@@ -2006,7 +2478,7 @@ async fn delete_job(
     audit::log_detail(
         &mut tx,
         "job.deleted.census",
-        admin.0.id,
+        admin_id,
         "job",
         id.to_string(),
         None,
@@ -2014,10 +2486,10 @@ async fn delete_job(
     )
     .await?;
 
-    // Deleting the job cascades its tasks and their claims away, so the
-    // identities that earned them have to be paid back first -- see
-    // `release_contributions`.
-    release_contributions(&mut tx, id).await?;
+    // Deleting the job cascades its tasks and their claims away, so what the
+    // identities earned is counted first and given back last -- see
+    // `Contributions`.
+    let contributions = Contributions::count(&mut tx, id).await?;
 
     let deleted = sqlx::query("DELETE FROM jobs WHERE id = $1")
         .bind(id)
@@ -2026,7 +2498,16 @@ async fn delete_job(
     if deleted.rows_affected() == 0 {
         return Err(AppError::not_found("no such job"));
     }
+    // As a purge does, and before the give-back for the same reason: the
+    // pools this job fed must refit, and marking them can wait out a fit.
+    crate::ratings::mark_every_pool_for_refit(&mut tx).await?;
+    contributions.give_back(&mut tx).await?;
     tx.commit().await?;
+    hold.committed();
+    // Nothing to push: the job is gone. Its open streams are ended; the pages
+    // reconnect, are answered 404, and stop.
+    crate::jobstats::forget(id);
+    state.sse.close(id);
     // Tidiness only: a remembered answer for a job that no longer exists is
     // never asked for, but there is no reason to keep it.
     state.derived_ready.forget(id);
@@ -2083,21 +2564,11 @@ async fn start_export(
     jar: CookieJar,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
 
     let job = crate::jobstats::load_job(&state.pool, id).await?;
+    // Logged by `exports::start`, in the transaction that records the export.
     let export_id = crate::exports::start(&state, &job, admin.0.id).await?;
-
-    let mut conn = state.pool.acquire().await?;
-    audit::log(
-        &mut conn,
-        "job.export_started",
-        Some(admin.0.id),
-        None,
-        Some("job"),
-        Some(id.to_string()),
-        Some(id),
-    )
-    .await?;
 
     Ok((
         StatusCode::ACCEPTED,
@@ -2111,7 +2582,7 @@ async fn get_export(
     _admin: AdminUser,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<ExportDetail>> {
-    let export = sqlx::query_as::<_, ExportRow>(
+    let mut export = sqlx::query_as::<_, ExportRow>(
         "SELECT id, state, bytes, sha256, row_count, positions_bytes, positions_sha256,
                 positions_row_count, error, requested_at, completed_at
          FROM job_exports WHERE job_id = $1
@@ -2132,6 +2603,12 @@ async fn get_export(
                     None => None,
                 };
                 (Some(results), positions)
+            }
+            // Built, and past the store's lifecycle: say so, rather than
+            // `ready` with nothing to download.
+            _ if export.state == "ready" => {
+                export.state = "expired".to_string();
+                (None, None)
             }
             _ => (None, None),
         };
@@ -2159,7 +2636,8 @@ async fn backups(
 ///
 /// Logged rather than returned on failure: a job that exists without its
 /// derived files simply does not dispatch, which is visible at
-/// `GET /api/admin/derived-data` and fixed by activating it again. Failing the
+/// `GET /api/admin/derived-data`, and the next claim that considers the job
+/// queues what has no row (`derived::ready_for_job`). Failing the
 /// creation would leave the admin with no job and a rolled-back transaction
 /// that had already written the generation-0 artifact.
 async fn request_derived_data(state: &AppState, job_id: Uuid) -> AppResult<()> {
@@ -2180,6 +2658,20 @@ struct DerivedDataRow {
     role: String,
     name: String,
     builder: String,
+    // Which files it is built from: two rows can share a role, a name and a
+    // builder -- a lexicon re-released under its name, two distributions
+    // with one name -- and without these the page could not tell them apart,
+    // nor Retry say which it meant.
+    kwg_id: Uuid,
+    klv_id: Option<Uuid>,
+    letterdist_id: Uuid,
+    /// The same, as an admin reads them: each file's path and the tarball it
+    /// was first imported from.
+    made_from: String,
+    /// Whether a builder of this MAGPIE takes the row. One queued under
+    /// another version is never built here, so retrying it only leaves it
+    /// pending for good.
+    buildable: bool,
     state: String,
     sha256: Option<String>,
     bytes: Option<i64>,
@@ -2202,11 +2694,21 @@ async fn list_derived_data(
 ) -> AppResult<Json<Vec<DerivedDataRow>>> {
     Ok(Json(
         sqlx::query_as::<_, DerivedDataRow>(
-            "SELECT role, name, builder, state, sha256, bytes, build_target, error,
-                    attempts, requested_at, built_at
-             FROM derived_data
-             ORDER BY state = 'built', requested_at DESC",
+            "SELECT d.role, d.name, d.builder, d.kwg_id, d.klv_id, d.letterdist_id,
+                    concat_ws(', ', k.path || ' (' || k.tarball_date || ')',
+                                    v.path || ' (' || v.tarball_date || ')',
+                                    l.path || ' (' || l.tarball_date || ')') AS made_from,
+                    d.builder = CASE d.role WHEN 'wmp' THEN $1 ELSE $2 END AS buildable,
+                    d.state, d.sha256, d.bytes, d.build_target, d.error, d.attempts,
+                    d.requested_at, d.built_at
+             FROM derived_data d
+             JOIN input_data k ON k.id = d.kwg_id
+             LEFT JOIN input_data v ON v.id = d.klv_id
+             JOIN input_data l ON l.id = d.letterdist_id
+             ORDER BY d.state = 'built', d.requested_at DESC",
         )
+        .bind(state.builders.wmp())
+        .bind(state.builders.rit())
         .fetch_all(&state.pool)
         .await?,
     ))
@@ -2216,6 +2718,12 @@ async fn list_derived_data(
 struct RetryDerivedBody {
     role: String,
     name: String,
+    /// The one row meant, as the list gives it; all but `klv_id` (null for a
+    /// wordmap) are required.
+    builder: Option<String>,
+    kwg_id: Option<Uuid>,
+    klv_id: Option<Uuid>,
+    letterdist_id: Option<Uuid>,
 }
 
 /// Puts a failed build back in the queue.
@@ -2224,7 +2732,8 @@ struct RetryDerivedBody {
 /// three times failed for a reason that a fourth attempt does not change, and
 /// re-queueing it automatically would spend every builder run on the same
 /// doomed row. An admin retries it after fixing what it named -- most often a
-/// lexicon imported before the server stored its bytes.
+/// lexicon's bytes missing from the object store, which re-importing its
+/// tarball uploads again.
 async fn retry_derived_data(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2234,30 +2743,62 @@ async fn retry_derived_data(
     ApiJson(body): ApiJson<RetryDerivedBody>,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
+    // The row, whole: by role and name alone every failed row of that name
+    // was reset, other builders' included, which no builder of this MAGPIE
+    // then takes; and a partial set matched nothing and was answered "no
+    // failed build". `klv_id` is null for a wordmap.
+    let (Some(builder), Some(kwg_id), Some(letterdist_id)) =
+        (&body.builder, body.kwg_id, body.letterdist_id)
+    else {
+        return Err(AppError::bad_request(
+            "name the build by role, name, builder, kwg_id, klv_id and letterdist_id, as the list gives them",
+        ));
+    };
+    // The reset and its audit row in one transaction: written after, a failed
+    // insert left a build reset with no record of who reset it.
+    let mut tx = state.pool.begin().await?;
     let reset = sqlx::query(
         "UPDATE derived_data
          SET state = 'pending', attempts = 0, error = NULL, leased_until = NULL
-         WHERE role = $1 AND name = $2 AND state = 'failed'",
+         WHERE role = $1 AND name = $2 AND state = 'failed' AND builder = $3
+           AND kwg_id = $4 AND klv_id IS NOT DISTINCT FROM $5 AND letterdist_id = $6
+           -- A builder this version has: retried, any other row sat pending
+           -- for good.
+           AND builder = CASE role WHEN 'wmp' THEN $7 ELSE $8 END",
     )
     .bind(&body.role)
     .bind(&body.name)
-    .execute(&state.pool)
+    .bind(builder)
+    .bind(kwg_id)
+    .bind(body.klv_id)
+    .bind(letterdist_id)
+    .bind(state.builders.wmp())
+    .bind(state.builders.rit())
+    .execute(&mut *tx)
     .await?
     .rows_affected();
     if reset == 0 {
-        return Err(AppError::not_found("no failed build for that role and name"));
+        return Err(AppError::not_found(
+            "no failed build of that row that a builder of this version takes \
+             (retried already, or queued for another version)",
+        ));
     }
-    let mut conn = state.pool.acquire().await?;
     audit::log(
-        &mut conn,
+        &mut tx,
         "derived_data.retried",
         Some(admin.0.id),
         None,
         Some("derived_data"),
-        Some(format!("{} {}", body.role, body.name)),
+        Some(format!(
+            "{} {} {builder} kwg={kwg_id} klv={} letterdist={letterdist_id}",
+            body.role,
+            body.name,
+            body.klv_id.map_or("none".to_string(), |k| k.to_string()),
+        )),
         None,
     )
     .await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2287,11 +2828,15 @@ async fn merge_leave_progress(
     jar: CookieJar,
 ) -> AppResult<Json<crate::jobs::leave_gen::MergeOutcome>> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
     let job = crate::jobstats::load_job(&state.pool, id).await?;
     if job.job_type != JobType::LeaveGeneration {
         return Err(AppError::bad_request("only a leave-generation job stages results"));
     }
-    Ok(Json(crate::jobs::leave_gen::merge_staged_for_job(&state.pool, id, true).await?))
+    let outcome = crate::jobs::leave_gen::merge_staged_for_job(&state.pool, id, true).await?;
+    // The point of the button is current rack figures.
+    super::worker::push_after_change(&state, id);
+    Ok(Json(outcome))
 }
 
 /// Recompute a leave-generation job's KLVs from `leave_rack_progress` and
@@ -2310,6 +2855,7 @@ async fn rebuild_artifacts(
     jar: CookieJar,
 ) -> AppResult<Json<Vec<crate::jobs::leave_gen::ArtifactRebuild>>> {
     csrf::verify(&method, &headers, &jar)?;
+    refuse_while_purging(&state, id)?;
 
     let mut conn = state.pool.acquire().await?;
     let job = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
@@ -2322,7 +2868,31 @@ async fn rebuild_artifacts(
             "only leave generation jobs have artifacts to rebuild",
         ));
     }
+    // Forcing rewrites every generation's object, and a worker that claimed
+    // a task a moment before fetches the new bytes against the old hash,
+    // declines, and sets the job aside. Deactivate first.
+    if query.force && job.status == JobStatus::Active {
+        return Err(AppError::conflict(
+            "deactivate the job before forcing a rebuild: workers mid-task would refuse the \
+             rewritten objects",
+        ));
+    }
     let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
+    // Logged before the first object is rewritten: a rebuild writes one
+    // generation at a time, and one that stopped part-way -- an S3 error, a
+    // failed build, the load balancer's timeout past about twenty generations
+    // (KL-19) -- had replaced objects workers played and written no row at
+    // all, the one below being reached only at the end.
+    audit::log_detail(
+        &mut conn,
+        "job.artifacts_rebuild_started",
+        admin.0.id,
+        "job",
+        job.id.to_string(),
+        Some(job.id),
+        format!("force={}", query.force),
+    )
+    .await?;
     drop(conn);
 
     let report = crate::jobs::leave_gen::rebuild_artifacts(
@@ -2385,6 +2955,16 @@ async fn delete_user(
 
     let mut tx = state.pool.begin().await?;
 
+    // The account is locked first, then counted, then its own rows go, then it
+    // is anonymized: a password reset locks the account before its token too.
+    // Taken the other way round, a reset and a delete of one account
+    // deadlocked, and the delete lost; counted before the lock, a key or code
+    // made in between was destroyed uncounted.
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
     let census = user_census(&mut tx, id).await?;
     audit::log_detail(
         &mut tx,
@@ -2396,11 +2976,19 @@ async fn delete_user(
         census,
     )
     .await?;
-
+    for table in ["api_keys", "email_confirmations", "password_reset_tokens"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
     let anonymized = sqlx::query(
         "UPDATE users SET
              username = 'deleted-' || id::text,
-             email = id::text || '@deleted.invalid',
+             -- Random, not the id: ids are public (`GET /api/users`), and
+             -- `email` is unique, so anyone who registered `<id>@deleted.invalid`
+             -- first made the account impossible to delete.
+             email = gen_random_uuid()::text || '@deleted.invalid',
              password_hash = '!',
              email_confirmed_at = NULL,
              is_admin = false,
@@ -2413,12 +3001,6 @@ async fn delete_user(
     .await?;
     if anonymized.rows_affected() == 0 {
         return Err(AppError::not_found("no such user"));
-    }
-    for table in ["api_keys", "email_confirmations", "password_reset_tokens"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1"))
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
     }
 
     audit::log(
@@ -2434,6 +3016,35 @@ async fn delete_user(
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[derive(Serialize, sqlx::FromRow)]
+struct BanRow {
+    id: Uuid,
+    user_id: Option<Uuid>,
+    username: Option<String>,
+    anon_uuid: Option<Uuid>,
+    reason: Option<String>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Every ban in force, newest first -- what lifting one needs, since
+/// `DELETE /workers/ban/:id` takes the ban's id and nothing else listed them:
+/// a mistaken ban could be lifted only with SQL. One row per banned identity,
+/// so this is bounded by the bans an admin has made.
+async fn list_bans(State(state): State<AppState>, _admin: AdminUser) -> AppResult<Json<Vec<BanRow>>> {
+    Ok(Json(
+        sqlx::query_as::<_, BanRow>(
+            "SELECT b.id, b.user_id, u.username, b.anon_uuid, b.reason, b.created_at
+             FROM worker_bans b LEFT JOIN users u ON u.id = b.user_id
+             ORDER BY b.created_at DESC",
+        )
+        .fetch_all(&state.pool)
+        .await?,
+    ))
+}
+
+/// The longest ban reason accepted.
+const MAX_BAN_REASON_CHARS: usize = 1_000;
 
 #[derive(Deserialize)]
 struct BanBody {
@@ -2454,6 +3065,42 @@ async fn ban_worker(
 
     if body.user_id.is_some() == body.anon_uuid.is_some() {
         return Err(AppError::bad_request("supply exactly one of user_id or anon_uuid"));
+    }
+    // Stored twice (the ban and its audit row) and shown on the admin page: a
+    // sentence, not a document; and no NUL, which Postgres refuses as a `500`
+    // (the audit's pass 22).
+    if let Some(reason) = body.reason.as_deref() {
+        if reason.chars().count() > MAX_BAN_REASON_CHARS {
+            return Err(AppError::bad_request("the reason is too long")
+                .with_field("reason", format!("at most {MAX_BAN_REASON_CHARS} characters")));
+        }
+        if reason.contains('\0') {
+            return Err(AppError::bad_request("the reason holds a NUL character")
+                .with_field("reason", "no NUL characters"));
+        }
+    }
+    // Said plainly rather than left to the foreign key, whose refusal read
+    // "that is still referenced by other records" -- the usual sign of an
+    // anonymous UUID sent as a user id, or the other way round.
+    let exists: bool = match (body.user_id, body.anon_uuid) {
+        (Some(id), _) => sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1)")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?,
+        (_, Some(uuid)) => {
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM anonymous_workers WHERE uuid = $1)")
+                .bind(uuid)
+                .fetch_one(&state.pool)
+                .await?
+        }
+        (None, None) => false,
+    };
+    if !exists {
+        return Err(AppError::not_found(if body.user_id.is_some() {
+            "no account has that id; is it an anonymous worker's UUID?"
+        } else {
+            "no anonymous worker has that UUID; is it an account's id?"
+        }));
     }
 
     let mut tx = state.pool.begin().await?;
@@ -2613,6 +3260,42 @@ async fn load_job_for_update(conn: &mut sqlx::PgConnection, id: Uuid) -> AppResu
 mod tests {
     use super::*;
 
+    /// Nothing MAGPIE's loader (`board_layout.c`) refuses is accepted, and what
+    /// it loads is too, but for parser quirks birdtest is stricter about (e.g. a
+    /// start coordinate past `int` or padded with a vertical tab, a
+    /// whitespace-only coordinate, a NUL, a byte above 0x7f). Counting rows
+    /// alone accepted six layouts MAGPIE refuses and refused two it loads.
+    #[test]
+    fn a_layout_magpie_would_refuse_is_refused() {
+        let standard15 = include_str!("../../../fixtures/versions/20260101/layouts/standard15.txt");
+        assert_eq!(layout_problem(standard15.as_bytes()), None);
+        assert_eq!(layout_problem(standard15.replace('\n', "\r\n").as_bytes()), None, "CRLF");
+        assert_eq!(layout_problem(standard15.trim_end().as_bytes()), None, "no final newline");
+        let blank_inside = standard15.replacen('\n', "\n\n", 3);
+        assert_eq!(layout_problem(blank_inside.as_bytes()), None, "blank lines are skipped");
+
+        let mut super21 = String::from("10, 10\n");
+        for _ in 0..21 {
+            super21.push_str(&" ".repeat(21));
+            super21.push('\n');
+        }
+        let refused = |text: &str, why: &str| {
+            assert!(layout_problem(text.as_bytes()).is_some(), "{why} should be refused");
+        };
+        refused(&super21, "a 21x21 board");
+        refused("\n\n", "an empty file");
+        let body = standard15.trim_end();
+        refused(&format!("{body}\n   \n"), "a trailing line of spaces");
+        refused(&format!("{body}\n\r\n"), "a trailing CRLF blank line");
+        refused(&standard15.replacen("7, 7", "20, 20", 1), "a start square off the board");
+        refused(&standard15.replacen("7, 7", "7", 1), "a start square with one coordinate");
+        let rows: Vec<&str> = standard15.lines().collect();
+        let narrow = format!("{}\n{}\n{}", rows[0], &rows[1][..14], rows[2..].join("\n"));
+        refused(&narrow, "a row 14 squares wide");
+        let odd = standard15.replacen('=', "x", 1);
+        refused(&odd, "an unknown square");
+    }
+
     fn body(config: serde_json::Value) -> CreateJobBody {
         let mut value = serde_json::json!({
             "variant": "classic",
@@ -2654,6 +3337,78 @@ mod tests {
         );
     }
 
+    /// An odd games batch gives player 1 the first move more often in every
+    /// task; at the old default of 1, in every game. An even one is balanced.
+    #[test]
+    fn a_games_batch_must_be_even() {
+        let games = |batch: serde_json::Value| {
+            let mut config = serde_json::json!({
+                "job_type": "games",
+                "player1_config_id": Uuid::nil(),
+                "player2_config_id": Uuid::nil(),
+                "min_games": 100,
+                "max_games": 1000,
+            });
+            if !batch.is_null() {
+                config["games_per_batch"] = batch;
+            }
+            body(config)
+        };
+        for odd in [1, 3, 7] {
+            assert_eq!(fields(validate_job_body(&games(serde_json::json!(odd)))), ["games_per_batch"]);
+        }
+        assert!(validate_job_body(&games(serde_json::json!(2))).is_ok());
+        assert!(validate_job_body(&games(serde_json::json!(10))).is_ok());
+        // The default is even.
+        assert!(validate_job_body(&games(serde_json::Value::Null)).is_ok());
+    }
+
+    /// A batch no result could carry is refused at creation: past 32,768
+    /// captured games the game index overflows, and a thousand captured games
+    /// is already a large body.
+    #[test]
+    fn a_games_batch_is_bounded() {
+        let games = |batch: i32, capture: bool| {
+            body(serde_json::json!({
+                "job_type": "games",
+                "player1_config_id": Uuid::nil(),
+                "player2_config_id": Uuid::nil(),
+                "min_games": 100,
+                "max_games": 100_000,
+                "games_per_batch": batch,
+                "capture_positions": capture,
+            }))
+        };
+        assert!(validate_job_body(&games(10_000, false)).is_ok());
+        assert_eq!(fields(validate_job_body(&games(10_002, false))), ["games_per_batch"]);
+        assert!(validate_job_body(&games(1_000, true)).is_ok());
+        assert_eq!(fields(validate_job_body(&games(1_002, true))), ["games_per_batch"]);
+        assert_eq!(fields(validate_job_body(&games(40_000, true))), ["games_per_batch"]);
+        let pairs = |batch: i32, capture: bool| {
+            game_pairs(serde_json::json!({ "pairs_per_batch": batch, "capture_positions": capture }))
+        };
+        assert!(validate_job_body(&pairs(500, true)).is_ok());
+        assert_eq!(fields(validate_job_body(&pairs(501, true))), ["pairs_per_batch"]);
+        assert!(validate_job_body(&pairs(5_000, false)).is_ok());
+        assert_eq!(fields(validate_job_body(&pairs(5_001, false))), ["pairs_per_batch"]);
+    }
+
+    /// Past a thousand Elo both hypotheses are an expected score of 1: the
+    /// LLR is always 0 and the job runs to its cap without a verdict.
+    #[test]
+    fn elo_hypotheses_past_a_thousand_are_refused() {
+        assert_eq!(
+            fields(validate_job_body(&game_pairs(
+                serde_json::json!({ "elo_low": 7000.0, "elo_high": 8000.0 })
+            ))),
+            ["elo_low", "elo_high"]
+        );
+        assert!(validate_job_body(&game_pairs(
+            serde_json::json!({ "elo_low": -1000.0, "elo_high": 1000.0 })
+        ))
+        .is_ok());
+    }
+
     /// Inverted hypotheses flip the LLR's sign: SPRT would accept the wrong one.
     #[test]
     fn inverted_elo_hypotheses_are_rejected() {
@@ -2685,6 +3440,16 @@ mod tests {
             "racks_per_task": 0,
         }));
         assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "racks_per_task"]);
+        let mut leave = serde_json::json!({
+            "job_type": "leave_generation",
+            "kwg_id": Uuid::nil(),
+            "num_iterations": 10,
+            "target_rack_count": 10,
+            "racks_per_task": MAX_RACKS_PER_TASK,
+        });
+        assert!(validate_job_body(&body(leave.clone())).is_ok());
+        leave["racks_per_task"] = serde_json::json!(MAX_RACKS_PER_TASK + 1);
+        assert_eq!(fields(validate_job_body(&body(leave))), ["racks_per_task"]);
     }
 
     #[test]

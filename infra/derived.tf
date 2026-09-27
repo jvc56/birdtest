@@ -31,6 +31,11 @@ variable "derived_builder_image" {
     comes from the binary that produced it -- the two move together.
   EOT
   type        = string
+
+  validation {
+    condition     = length(trimspace(var.derived_builder_image)) > 0
+    error_message = "derived_builder_image is the backend image built with --target derived-builder, at the same tag as backend_image."
+  }
 }
 
 variable "derived_builder_cpu" {
@@ -41,6 +46,12 @@ variable "derived_builder_cpu" {
   EOT
   type        = number
   default     = 4096
+
+  validation {
+    # Not 256: it takes at most 2 GB, and a table build needs 4.
+    condition     = contains([512, 1024, 2048, 4096, 8192, 16384], var.derived_builder_cpu)
+    error_message = "derived_builder_cpu must be a Fargate CPU size that can hold 4 GB: 512, 1024, 2048, 4096, 8192 or 16384."
+  }
 }
 
 variable "derived_builder_memory" {
@@ -48,21 +59,47 @@ variable "derived_builder_memory" {
     MAGPIE peaks at about 2.4 GB building a rack info table and 710 MB building
     a wordmap, and the builder hashes the output in 8 MB chunks rather than
     reading it in. 8 GB leaves room for a larger lexicon than any shipped
-    today; below 4 GB a table build is killed rather than slow.
+    today; below 4 GB a table build is killed rather than slow. It must also be
+    a Fargate size for derived_builder_cpu: 8 GB is the least 4 vCPU takes.
   EOT
   type        = number
   default     = 8192
+
+  validation {
+    # Fargate's CPU and memory pairs: refused otherwise only by
+    # RegisterTaskDefinition, part-way through an apply.
+    condition = (
+      (var.derived_builder_cpu == 512 && var.derived_builder_memory >= 1024 && var.derived_builder_memory <= 4096 && var.derived_builder_memory % 1024 == 0) ||
+      (var.derived_builder_cpu == 1024 && var.derived_builder_memory >= 2048 && var.derived_builder_memory <= 8192 && var.derived_builder_memory % 1024 == 0) ||
+      (var.derived_builder_cpu == 2048 && var.derived_builder_memory >= 4096 && var.derived_builder_memory <= 16384 && var.derived_builder_memory % 1024 == 0) ||
+      (var.derived_builder_cpu == 4096 && var.derived_builder_memory >= 8192 && var.derived_builder_memory <= 30720 && var.derived_builder_memory % 1024 == 0) ||
+      (var.derived_builder_cpu == 8192 && var.derived_builder_memory >= 16384 && var.derived_builder_memory <= 61440 && var.derived_builder_memory % 4096 == 0) ||
+      (var.derived_builder_cpu == 16384 && var.derived_builder_memory >= 32768 && var.derived_builder_memory <= 122880 && var.derived_builder_memory % 8192 == 0)
+    )
+    error_message = "derived_builder_memory is not a Fargate memory size for derived_builder_cpu's CPU (512 CPU takes 1024-4096; 1024, 2048-8192; 2048, 4096-16384; 4096, 8192-30720, all in 1024 steps; 8192, 16384-61440 in 4096 steps; 16384, 32768-122880 in 8192 steps)."
+  }
+
+  validation {
+    condition     = var.derived_builder_memory >= 4096
+    error_message = "derived_builder_memory must be at least 4096 MiB: MAGPIE peaks at about 2.4 GB building a rack info table, and below 4 GB the build is killed."
+  }
 }
 
 variable "derived_builder_ephemeral_storage_gib" {
   description = <<-EOT
     Scratch space for one conversion at a time: a 1.9 GB rack info table plus
-    the 179 MB wordmap it is built from plus their inputs. The 20 GB Fargate
-    default would do; this is explicit so that a lexicon twice CSW24's size is
-    a number to change rather than a task that dies mid-build.
+    the 179 MB wordmap it is built from plus their inputs. The 20 GiB Fargate
+    default would do (21 is the least that can be set); this is explicit so
+    that a lexicon twice CSW24's size is a number to change rather than a task
+    that dies mid-build.
   EOT
   type        = number
   default     = 30
+
+  validation {
+    condition     = var.derived_builder_ephemeral_storage_gib >= 21 && var.derived_builder_ephemeral_storage_gib <= 200
+    error_message = "Fargate ephemeral storage is 21 to 200 GiB."
+  }
 }
 
 variable "derived_builder_schedule" {
@@ -85,13 +122,21 @@ resource "aws_iam_role" "derived_builder_task" {
 
 # The builder reads the lexicon and leaves bytes the import stored, and writes
 # nothing to the bucket: the derived files themselves are hashed and thrown
-# away, so there is nothing to put. Read-only on the artifact bucket is
-# therefore the whole of it, and is worth stating rather than reusing the web
-# task's role, which can also write.
+# away, so there is nothing to put. It may delete input objects (`inputs/*`),
+# and does so only for one whose bytes are not the ones imported under its
+# content address, so that a re-import uploads it again (an import skips an
+# object that exists); inputs are re-importable and the bucket versioned, so
+# a delete leaves the bytes as a noncurrent version for 90 days
+# (`expire-noncurrent-versions`, s3.tf). Worth stating rather
+# than reusing the web task's role, which can also write.
 data "aws_iam_policy_document" "derived_builder_task" {
   statement {
     actions   = ["s3:GetObject"]
     resources = ["${aws_s3_bucket.artifacts.arn}/*"]
+  }
+  statement {
+    actions   = ["s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/inputs/*"]
   }
   statement {
     actions   = ["s3:ListBucket"]
@@ -124,24 +169,33 @@ resource "aws_ecs_task_definition" "derived_builder" {
       name      = "derived-builder"
       image     = var.derived_builder_image
       essential = true
+      # Stated rather than left to the image's CMD. Given the backend image by
+      # mistake -- the same repository, a different target -- the CMD is the
+      # web server, which never exits: a 4-vCPU task started every five
+      # minutes, each running the startup reapers that fail the live server's
+      # exports and imports. Stated, the wrong image has no `build-derived`
+      # and the task fails at once, which the scheduler's failures show.
+      command = ["build-derived"]
       environment = [
         { name = "S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
         { name = "AWS_REGION", value = var.region },
         { name = "RUST_LOG", value = "birdtest=info" },
-        # Where the throwaway data directories go. The container's default temp
-        # directory is not the ephemeral volume mounted above, and a 1.9 GB
-        # table written to the wrong one fills the layer instead.
+        # Where the throwaway data directories go: a directory the image makes
+        # for them. On Fargate the ephemeral storage above backs the whole
+        # writable layer, /tmp included, so this names the place rather than a
+        # different disk.
         { name = "MAGPIE_SCRATCH_DIR", value = "/scratch" },
         # Threads for a conversion. Matched to the vCPUs above: the whole
         # reason this task exists is that it can give MAGPIE the cores the web
         # task cannot.
-        { name = "MAGPIE_THREADS", value = tostring(var.derived_builder_cpu / 1024) },
+        # Whole vCPUs, at least one: 512 CPU units made "0.5".
+        { name = "MAGPIE_THREADS", value = tostring(max(1, floor(var.derived_builder_cpu / 1024))) },
         { name = "MIN_MAGPIE_VERSION", value = var.min_magpie_version }
       ]
       secrets = [
-        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn },
+        { name = "DATABASE_URL", valueFrom = local.ssm_database_url_arn },
         # Config::from_env requires it, and this process never mints a session.
-        { name = "SESSION_SIGNING_KEY", valueFrom = aws_ssm_parameter.session_signing_key.arn }
+        { name = "SESSION_SIGNING_KEY", valueFrom = local.ssm_session_signing_key_arn }
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -167,8 +221,16 @@ resource "aws_iam_role" "derived_builder_scheduler" {
 
 data "aws_iam_policy_document" "derived_builder_scheduler" {
   statement {
-    actions   = ["ecs:RunTask"]
-    resources = ["${aws_ecs_task_definition.derived_builder.arn_without_revision}:*"]
+    actions = ["ecs:RunTask"]
+    # The schedule names the family without a revision; RunTask's resource is
+    # always a revisioned task-definition ARN (the service authorization
+    # reference), which `:*` matches. The bare family is listed as well, since
+    # no AWS page says outright which one a revisionless schedule is checked
+    # against, and it widens nothing.
+    resources = [
+      aws_ecs_task_definition.derived_builder.arn_without_revision,
+      "${aws_ecs_task_definition.derived_builder.arn_without_revision}:*",
+    ]
     condition {
       test     = "ArnLike"
       variable = "ecs:cluster"
@@ -196,6 +258,7 @@ resource "aws_scheduler_schedule" "derived_builder" {
   description                  = "Drain the wordmap and rack info table build queue"
   schedule_expression          = var.derived_builder_schedule
   schedule_expression_timezone = "UTC"
+  state                        = var.scheduled_tasks_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window {
     mode = "OFF"
@@ -218,9 +281,11 @@ resource "aws_scheduler_schedule" "derived_builder" {
     }
 
     # No retries. The queue is the retry: a row whose build failed is left
-    # `pending` with its attempt counter raised, and the next scheduled run
-    # takes it again. Retrying the task instead would start a second builder
-    # against the same queue for no gain.
+    # `pending` with its attempt counter raised and a wait before its next
+    # attempt (5, then 15 minutes), and the first scheduled run after the
+    # wait takes it again; after three it is `failed` until an admin retries
+    # it. Retrying the task instead would start a second builder against the
+    # same queue for no gain.
     retry_policy {
       maximum_retry_attempts = 0
     }

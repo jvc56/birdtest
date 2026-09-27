@@ -4,6 +4,7 @@
  * wrong, draws a plausible picture rather than failing.
  */
 import type { RatingRow } from '$lib/api';
+import { fitLabel, fitLabels } from './ratingHistory';
 
 export const ROW_HEIGHT = 28;
 export const PAD = { top: 8, right: 24, bottom: 28, left: 180 };
@@ -39,6 +40,10 @@ export function splitByAnchorConnection(ratings: RatingRow[]): {
 /** Clamp runaway intervals so one barely-measured config cannot flatten the
  *  scale for everyone else; the table still reports the real number. */
 export function visibleError(row: RatingRow): number {
+  // The anchor is fixed by definition. Runs before the thirty-second audit
+  // stored the fit's own error for it -- f64::MAX with no games -- which,
+  // drawn at the cap, stretched the scale; newer runs store 0.
+  if (row.is_anchor) return 0;
   return Math.min(row.stderr, MAX_VISIBLE_ERROR);
 }
 
@@ -118,9 +123,15 @@ export function layoutDotPlot(
   };
 }
 
+/** The backend stores an unmeasurable error as f64::MAX. */
+function errorText(stderr: number): string {
+  return Number.isFinite(stderr) && stderr < 1e300 ? stderr.toFixed(1) : '∞';
+}
+
 /** The dot's tooltip. Reports the true standard error, not the clamped one. */
 export function dotTitle(row: RatingRow): string {
-  return `${row.name}: ${row.rating.toFixed(1)} ± ${row.stderr.toFixed(1)} over ${row.pairs_played.toLocaleString()} pairs`;
+  const spread = row.is_anchor ? ' (fixed)' : ` ± ${errorText(row.stderr)}`;
+  return `${row.name}: ${row.rating.toFixed(1)}${spread} over ${row.pairs_played.toLocaleString()} pairs`;
 }
 
 /** The ratings table's rating column: a dash for a config with no scale. */
@@ -131,5 +142,26 @@ export function ratingCell(row: RatingRow): string {
 /** The ratings table's ± column: the true, unclamped standard error. */
 export function stderrCell(row: RatingRow): string {
   if (row.is_anchor) return 'fixed';
-  return row.connected_to_anchor ? `±${row.stderr.toFixed(1)}` : 'unrated';
+  return row.connected_to_anchor ? `±${errorText(row.stderr)}` : 'unrated';
+}
+
+/**
+ * The most characters a row's name shows, its " (anchor)" included: the left
+ * margin is fixed, and a longer name lost its start past the SVG's edge (the
+ * audit's pass 25). 20 characters at 12px fit it in lower case and ordinary
+ * mixed case; wide capitals can still run past (KL-76).
+ */
+export const NAME_CHARS = 20;
+
+const ANCHOR = ' (anchor)';
+
+/**
+ * Each row's label, told apart from the others drawn (see `fitLabels`), the
+ * anchor marked.
+ */
+export function rowLabels(rows: RatingRow[]): string[] {
+  const labels = fitLabels(rows.map((r) => r.name), NAME_CHARS);
+  return labels.map((label, i) =>
+    rows[i].is_anchor ? fitLabel(label, NAME_CHARS - ANCHOR.length) + ANCHOR : label
+  );
 }

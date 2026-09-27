@@ -17,11 +17,11 @@ The cost is that this needs a built MAGPIE and a real MAGPIE-DATA install, so
 bringing up birdtest is no longer a Docker-only operation. It fails naming both
 when either is missing rather than starting something that cannot work.
 
-Each contributor gets its own directory, because `magpie contribute` reads and
-writes `settings.txt` and `contribute.txt` in its working directory: sharing
-one would race on both files and collapse every worker onto a single identity.
-The MAGPIE data directory is symlinked rather than copied, so N workers cost
-nothing but their own settings files.
+Each contributor gets its own directory, because `magpie contribute` writes the
+identity it is issued into the `contribute.txt` in its working directory:
+sharing one would collapse every worker onto a single identity. The MAGPIE data
+directory is symlinked rather than copied (MAGPIE loads its board from `./data`
+before anything else), so N workers cost nothing but their own settings files.
 """
 
 import argparse
@@ -64,8 +64,9 @@ def resolve_magpie(args) -> tuple:
     if not binary.is_file() or not os.access(binary, os.X_OK):
         fail(
             f"no MAGPIE binary at {binary}.\n"
-            "      Build one (`make magpie` in your MAGPIE checkout) and pass --magpie, "
-            "or set MAGPIE_BIN.\n"
+            "      Build one (`make magpie BUILD=portable_release` in your MAGPIE checkout, on\n"
+            "      a host whose glibc is no newer than Debian bookworm's 2.36, since the backend\n"
+            "      container runs it) and pass --magpie, or set MAGPIE_BIN.\n"
             "      Contributors here are always real MAGPIE; there is no fake-worker mode."
         )
 
@@ -89,7 +90,7 @@ def magpie_version(magpie_root: Path) -> Optional[str]:
     """`MAGPIE_VERSION` out of the checkout's source.
 
     The floor exists to keep a fleet off a build too old to speak the protocol,
-    and production sets it to a real release (0.1.0 by default). Locally the
+    and production sets it to a real release (0.1.1 by default). Locally the
     contributor is whatever checkout you built, which may be older -- and then
     every task is declined with "update MAGPIE" and nothing ever runs. Reading
     the constant the binary was built from is exact.
@@ -142,7 +143,12 @@ def write_contribute_settings(directory: Path, args, api_url: str) -> Path:
     ]
     if args.api_key:
         lines.append(f"apikey   {args.api_key}")
-    settings.write_text("\n".join(lines) + "\n")
+    # It may hold an API key: readable by its owner only, from the start --
+    # written first and chmod'd after, it was world-readable in between.
+    settings.unlink(missing_ok=True)
+    fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
     return settings
 
 
@@ -244,7 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
                               default=os.environ.get("MAGPIE_DATA_PATH", "../MAGPIE/data"),
                               help="MAGPIE data directory (default: %(default)s, "
                                    "or $MAGPIE_DATA_PATH)")
-    contributors.add_argument("--workdir", default=".dev-workers",
+    # Under the repo root whatever the working directory: `.gitignore` covers
+    # only the root's `.dev-workers/`, and a contribute.txt holding an API key
+    # written under frontend/ was not ignored (the audit's pass 23).
+    contributors.add_argument("--workdir", default=str(REPO_ROOT / ".dev-workers"),
                               help="where per-worker directories live (default: %(default)s)")
     contributors.add_argument("--reset-workers", action="store_true",
                               help="delete worker directories first, so each starts as a "

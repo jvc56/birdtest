@@ -180,21 +180,110 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
         ));
     }
 
+    // Inserted only while the job is still completed, read under a share lock
+    // on its row: a purge committing meanwhile holds that row, so this waits
+    // for it and then finds the job inactive. Checked once above without a
+    // lock, an export started beside a purge built the emptied job, and the
+    // re-run's completed job then redirected its downloads to that export.
+    let mut tx = state.pool.begin().await?;
+    let still_completed = sqlx::query_scalar::<_, bool>(
+        "SELECT status = 'completed' FROM jobs WHERE id = $1 FOR SHARE",
+    )
+    .bind(job.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(false);
+    if !still_completed {
+        return Err(AppError::conflict(
+            "the job is no longer completed (purged or reactivated meanwhile)",
+        ));
+    }
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO job_exports (job_id, requested_by) VALUES ($1, $2) RETURNING id",
     )
     .bind(job.id)
     .bind(requested_by)
-    .fetch_one(&state.pool)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|err| {
+        let err: AppError = err.into();
+        if err.is_unique_violation() {
+            AppError::conflict("an export of this job is already running")
+        } else {
+            err
+        }
+    })?;
+    // In the transaction that starts it: an export refused (the job not
+    // settled, one already running) writes no row, and one begun always has
+    // one. Written by the handler before this, every refusal was logged as a
+    // start (the adversarial check of the audit's pass 9).
+    crate::audit::log_detail(
+        &mut tx,
+        "job.export_started",
+        requested_by,
+        "job",
+        job.id.to_string(),
+        Some(job.id),
+        format!("export={id}"),
+    )
     .await?;
+    tx.commit().await?;
 
     let (state, job) = (state.clone(), job.clone());
     tokio::spawn(async move { run(state, job, id).await });
     Ok(id)
 }
 
+/// How many exports build at once. Each holds a main-pool connection for the
+/// whole of its corpus read -- minutes, for a full opening-rack job -- on the
+/// pool claims and submissions share; beyond these, an export waits its turn
+/// `running`.
+static EXPORT_BUILDS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+/// Longer than any build of a real corpus takes. A row still `running` past
+/// it is a build that hung (a stalled store call) rather than one in progress,
+/// and with one export per job at a time it would otherwise refuse every
+/// export of the job until a restart reaped it.
+const EXPORT_BUILD_LIMIT: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
 async fn run(state: AppState, job: Job, export_id: Uuid) {
-    match build(&state, &job, export_id).await {
+    let _turn = EXPORT_BUILDS.acquire().await;
+    // Its turn may have come after a purge or a delete removed the row; then
+    // there is nothing to build for, and building would leave objects nobody
+    // names.
+    let still_wanted = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM job_exports WHERE id = $1 AND state = 'running')",
+    )
+    .bind(export_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(true);
+    if !still_wanted {
+        return;
+    }
+    // On a task of its own and under a time limit, so that a panic or a hang
+    // still ends in the row being marked failed below rather than left
+    // `running` -- which, one export per job at a time, refused every later
+    // export of the job until a restart.
+    let build_task = {
+        let (state, job) = (state.clone(), job.clone());
+        tokio::spawn(async move { build(&state, &job, export_id).await })
+    };
+    // Dropping a JoinHandle detaches the task rather than stopping it: a hung
+    // build past its limit would go on holding its connection after its turn
+    // was handed on.
+    let abort = build_task.abort_handle();
+    let outcome = tokio::time::timeout(EXPORT_BUILD_LIMIT, build_task).await;
+    if outcome.is_err() {
+        abort.abort();
+    }
+    let result = match outcome {
+        Ok(Ok(result)) => result,
+        // Logged, not stored: the row's error is shown on the admin page.
+        Ok(Err(panicked)) => Err(AppError::task_failed("the export", panicked)),
+        Err(_) => Err(AppError::internal("the export did not finish within its time limit")),
+    };
+    match result {
         Ok(()) => tracing::info!(job_id = %job.id, %export_id, "job export ready"),
         Err(err) => {
             tracing::warn!(job_id = %job.id, %export_id, error = %err.message, "job export failed");
@@ -265,7 +354,7 @@ async fn off_the_executor<T: Send + 'static>(
 ) -> AppResult<T> {
     tokio::task::spawn_blocking(work)
         .await
-        .map_err(|e| AppError::internal(format!("export compression task failed: {e}")))?
+        .map_err(|e| AppError::task_failed("compressing an export", e))?
 }
 
 /// Stream one query's rows out as gzipped NDJSON, straight into a multipart
@@ -301,7 +390,14 @@ async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> Ap
         };
         let mut batch: Vec<u8> = Vec::with_capacity(COMPRESS_BATCH_BYTES + 64 * 1024);
 
-        let mut rows = sqlx::query(sql).bind(job_id).fetch(&state.pool);
+        // Closed rather than returned when this ends: a pool connection
+        // dropped mid-result is drained before it is reused, so an upload that
+        // failed part way left Postgres building the rest of the corpus on a
+        // connection nothing counted (thirty-first audit). Closing it ends the
+        // query at the server's next write.
+        let mut conn = state.pool.acquire().await?;
+        conn.close_on_drop();
+        let mut rows = sqlx::query(sql).bind(job_id).fetch(&mut *conn);
         while let Some(row) = rows.try_next().await? {
             let line: String = row.get("row");
             batch.extend_from_slice(line.as_bytes());
@@ -321,6 +417,8 @@ async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> Ap
             }
         }
         drop(rows);
+        // Done with the database: the tail below compresses and uploads.
+        drop(conn);
 
         let (tail, bytes, sha256) = off_the_executor(move || {
             let (compressor, part) = compressor.push(batch)?;
@@ -367,6 +465,47 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
 
     let key = format!("exports/{}/{export_id}.ndjson.gz", job.id);
     let results = upload_rows(state, &key, export_query(job.job_type), job.id).await?;
+    let positions_key = format!("exports/{}/{export_id}.positions.ndjson.gz", job.id);
+    let finished = finish_build(state, job, export_id, &key, &positions_key, results).await;
+    // Failed after the results object was written -- the positions' upload, or
+    // marking the row -- and the row will say `failed`, naming neither object:
+    // removed now rather than left to the thirty-day lifecycle rule. (A
+    // positions object never written is a delete of nothing.) Unless the row
+    // says `ready` after all -- the update committed and only its answer was
+    // lost -- or cannot be read to say: a row naming a deleted object would
+    // redirect every download of the job to it.
+    if finished.is_err() && !named_ready(state, export_id).await {
+        for key in [&key, &positions_key] {
+            if let Err(err) = state.artifacts.delete(key).await {
+                tracing::warn!(%export_id, key, error = %err.message, "removing a failed export's object failed");
+            }
+        }
+    }
+    finished
+}
+
+/// Whether the export's row says `ready` -- or cannot be read to say it does
+/// not.
+async fn named_ready(state: &AppState, export_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE((SELECT state = 'ready' FROM job_exports WHERE id = $1), FALSE)",
+    )
+    .bind(export_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(true)
+}
+
+/// The rest of [`build`] once the results object is written: the positions'
+/// object, if the job captured any, and the row marked ready.
+async fn finish_build(
+    state: &AppState,
+    job: &Job,
+    export_id: Uuid,
+    key: &str,
+    positions_key: &str,
+    results: Uploaded,
+) -> AppResult<()> {
 
     // Asked of the rows rather than of the job's `capture_positions` setting:
     // what matters is whether there is anything to export, and a capture job
@@ -379,8 +518,7 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
         .fetch_one(&state.pool)
         .await?;
     let positions = if captured {
-        let positions_key = format!("exports/{}/{export_id}.positions.ndjson.gz", job.id);
-        let uploaded = upload_rows(state, &positions_key, positions_query(), job.id).await?;
+        let uploaded = upload_rows(state, positions_key, positions_query(), job.id).await?;
         Some((positions_key, uploaded))
     } else {
         None
@@ -391,7 +529,7 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
     // overlaps the two. Without the guard a reaped row would come back
     // `ready`, and an admin would be handed a download of an export nobody
     // was sure had finished.
-    sqlx::query(
+    let marked = sqlx::query(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
              row_count = $5, positions_artifact_key = $6, positions_bytes = $7,
@@ -399,16 +537,27 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
          WHERE id = $1 AND state = 'running'",
     )
     .bind(export_id)
-    .bind(&key)
+    .bind(key)
     .bind(results.bytes)
     .bind(&results.sha256)
     .bind(results.rows)
-    .bind(positions.as_ref().map(|(key, _)| key.as_str()))
+    .bind(positions.as_ref().map(|(key, _)| *key))
     .bind(positions.as_ref().map(|(_, p)| p.bytes))
     .bind(positions.as_ref().map(|(_, p)| p.sha256.as_str()))
     .bind(positions.as_ref().map(|(_, p)| p.rows))
     .execute(&state.pool)
-    .await?;
+    .await?
+    .rows_affected();
+    // No row to hand them to -- a purge or delete removed it while this
+    // built, or a new process reaped it -- so nothing will ever name these
+    // objects. Removed now rather than left to the thirty-day lifecycle rule.
+    if marked == 0 {
+        for key in std::iter::once(key).chain(positions.as_ref().map(|(key, _)| *key)) {
+            if let Err(err) = state.artifacts.delete(key).await {
+                tracing::warn!(%export_id, key, error = %err.message, "removing an unclaimed export failed");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -421,14 +570,29 @@ pub struct ReadyExport {
     pub positions_artifact_key: Option<String>,
 }
 
-/// The newest ready export for a job, if there is one.
+/// How long an export's objects are relied on after it is built: a day short
+/// of the bucket's lifecycle rule, which deletes everything under `exports/`
+/// thirty days after it is written (`infra/s3.tf`, `expire-job-exports`). The
+/// two move together.
+///
+/// Past it the row still says `ready`, but the objects are gone or about to
+/// be. Counted as ready, it was what a completed job's result stream
+/// redirected to -- a `404` from the store, every time, with the scan it would
+/// otherwise fall back to never reached -- and what the admin page offered as
+/// a download.
+pub const EXPORT_LIFETIME_DAYS: i32 = 29;
+
+/// The newest ready export for a job whose objects are still in the store, if
+/// there is one.
 pub async fn newest_ready(pool: &sqlx::PgPool, job_id: Uuid) -> AppResult<Option<ReadyExport>> {
     Ok(sqlx::query_as::<_, (Uuid, String, Option<String>)>(
         "SELECT id, artifact_key, positions_artifact_key FROM job_exports
          WHERE job_id = $1 AND state = 'ready' AND artifact_key IS NOT NULL
+           AND completed_at > now() - make_interval(days => $2)
          ORDER BY requested_at DESC LIMIT 1",
     )
     .bind(job_id)
+    .bind(EXPORT_LIFETIME_DAYS)
     .fetch_optional(pool)
     .await?
     .map(|(id, artifact_key, positions_artifact_key)| ReadyExport {
@@ -443,34 +607,38 @@ pub async fn newest_ready(pool: &sqlx::PgPool, job_id: Uuid) -> AppResult<Option
 /// Called by purge, which deletes the results an export describes. A row left
 /// saying `ready` would then hand an admin a stable-looking artifact of a job
 /// that no longer holds any of it, which is worse than no export at all.
-pub async fn purge(state: &AppState, job_id: Uuid) -> AppResult<()> {
+pub async fn purge(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Vec<String>> {
+    // In the purge's own transaction: removed after it, a failure left the
+    // old run's `ready` row to be served -- once the job had completed again
+    // -- as the new run's results. Returns the objects to remove once it has
+    // committed ([`remove_objects`]).
     let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
         "DELETE FROM job_exports WHERE job_id = $1
          RETURNING artifact_key, positions_artifact_key",
     )
     .bind(job_id)
-    .fetch_all(&state.pool)
+    .fetch_all(&mut *conn)
     .await?;
-    let keys: Vec<String> =
-        rows.into_iter().flat_map(|(results, positions)| [results, positions]).flatten().collect();
+    Ok(rows.into_iter().flat_map(|(results, positions)| [results, positions]).flatten().collect())
+}
 
-    // Off the request, because purge is a synchronous admin call and this is
-    // best-effort cleanup of derived data: the rows are already gone, so an
-    // object that survives is one the bucket's lifecycle rule expires rather
-    // than anything anyone can reach. Awaiting an unreachable object store here
-    // would hold the purge response open for the SDK's whole retry budget, once
-    // per object.
-    if !keys.is_empty() {
-        let artifacts = state.artifacts.clone();
-        tokio::spawn(async move {
-            for key in keys {
-                if let Err(err) = artifacts.delete(&key).await {
-                    tracing::warn!(%key, error = %err.message, "could not delete an export object");
-                }
-            }
-        });
+/// Removes a purge's export objects, off the request: best-effort cleanup of
+/// derived data whose rows are already gone, so an object that survives is
+/// one the bucket's lifecycle rule expires rather than anything anyone can
+/// reach. Awaiting an unreachable object store here would hold the purge
+/// response open for the SDK's whole retry budget, once per object.
+pub fn remove_objects(state: &AppState, keys: Vec<String>) {
+    if keys.is_empty() {
+        return;
     }
-    Ok(())
+    let artifacts = state.artifacts.clone();
+    tokio::spawn(async move {
+        for key in keys {
+            if let Err(err) = artifacts.delete(&key).await {
+                tracing::warn!(%key, error = %err.message, "could not delete an export object");
+            }
+        }
+    });
 }
 
 /// Startup reaper. Single instance, so a row left `running` belongs to a

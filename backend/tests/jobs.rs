@@ -559,6 +559,11 @@ async fn a_job_moves_through_its_lifecycle_and_completion_is_final() {
     let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/deactivate"), None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["message"], "a completed job cannot be deactivated");
+    // Completed again -- from a stale page, after the server's own finish
+    // check -- is a conflict, not a second completion on record (pass 23).
+    let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/complete"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["message"], "this job is already completed");
     assert_eq!(lifecycle(&db, job).await.0, "completed", "completion is terminal");
     assert_eq!(claim(&admin.app).await, StatusCode::NO_CONTENT, "a completed job is not offered");
     assert_eq!(task_count(&db, job).await, 1);
@@ -616,6 +621,10 @@ async fn games_history(app: &Router) -> String {
               "plies": [{ "ply": 1, "bingo_percentage": 10.0, "average_score": 30.0 }] },
             { "move": "8D STAINER", "score": 70, "equity": 79.0 },
         ],
+    }, {
+        // A capturing job's result has positions from every game of its batch.
+        "game_index": 1, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);
     let (status, body) = send(
         app,
@@ -863,7 +872,7 @@ async fn a_purge_writes_its_census_before_it_destroys_anything() {
     let census = rows[0].2.as_deref().unwrap();
     assert_eq!(
         census,
-        "tasks=1 claims=1 game_results=1 leave_records=0 positions=1 rack_progress=0 \
+        "tasks=1 claims=1 game_results=1 leave_records=0 positions=2 rack_progress=0 \
          staged_results=0 artifacts=0",
         "the census counts what the purge was about to destroy"
     );
@@ -879,6 +888,62 @@ async fn a_purge_writes_its_census_before_it_destroys_anything() {
     .await
     .unwrap();
     assert_eq!(remaining, (0, 0, 0), "and those rows are gone");
+}
+
+/// I-JOB-13: a job's MAGPIE floor that is not a version is refused. Read
+/// loosely it was 0.0.0 -- the lowest floor there is -- so a raise meant to
+/// keep older builds off the job let every build on.
+#[tokio::test]
+async fn a_malformed_magpie_floor_is_refused() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = admin.static_player("p1", kwg, klv, json!({})).await;
+    let p2 = admin.static_player("p2", kwg, klv, json!({})).await;
+    let job = |floor: &str| {
+        json!({
+            "job_type": "games", "redundancy": 1, "variant": "classic",
+            "letterdist_id": ld, "layout_id": layout, "min_magpie_version": floor,
+            "player1_config_id": p1, "player2_config_id": p2,
+            "min_games": 10, "max_games": 100,
+        })
+    };
+    for floor in ["v1.6.0", "1", "1,6"] {
+        let (status, body) = admin.create_job(job(floor)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{floor}: {body}");
+        assert_eq!(body["fields"][0]["field"], "min_magpie_version", "{floor}: {body}");
+    }
+    assert_eq!(job_count(&db).await, 0);
+    let (status, body) = admin.create_job(job("1.2")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// I-JOB-14: a player config MAGPIE would refuse, or cut short, is refused at
+/// creation: more than 25 plies failed every task of every job it was in, on
+/// every worker, and more than 10 recorded plies were cut to 10 silently.
+#[tokio::test]
+async fn a_player_config_past_magpies_limits_is_refused() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+    let body = |plies: i32, recorded: i32| {
+        json!({
+            "name": format!("p{plies}-{recorded}"), "recorder_type": "best", "kwg_id": kwg,
+            "klv_id": klv, "winpct_id": winpct, "num_plies": plies, "num_plays": 10,
+            "max_iterations": 100, "time_limit_secs": 0, "num_plays_recorded": 1,
+            "num_plies_recorded": recorded,
+        })
+    };
+    for (plies, recorded, field) in [(26, 2, "num_plies"), (5, 11, "num_plies_recorded")] {
+        let (status, response) = admin.post("/api/admin/player-configs", body(plies, recorded)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+        assert_eq!(response["fields"][0]["field"], field, "{response}");
+    }
+    admin.player(body(25, 10)).await;
 }
 
 /// I-JOB-11: a player config referenced by a job of any type -- either seat of

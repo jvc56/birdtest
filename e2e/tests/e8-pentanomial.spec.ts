@@ -7,7 +7,8 @@ import { seededJob, waitUntilSettled } from '../lib/api';
  *
  * The seeded job, once the fake workers have finished it. They favour player
  * 1, so its test must have ended for player 1 -- by accepting H1 or at the
- * cap -- and never by accepting H0.
+ * cap -- and never by accepting H0. A job the finish check completed shows the
+ * verdict it was completed on (`Completed: ...`), not the live status line.
  */
 test('E-8: a finished game-pairs job shows its labelled pentanomial and SPRT verdict', async ({
   page,
@@ -19,10 +20,10 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and SPRT ver
   await page.goto(`/jobs/${job.id}`);
   await expect(page.getByRole('heading', { name: 'Game pairs' })).toBeVisible();
   const sprt = page.locator('.card', { has: page.getByRole('heading', { name: 'SPRT' }) });
-  const verdict = sprt.locator('p', { hasText: '— LLR' });
+  const verdict = sprt.locator('p', { hasText: 'Completed:' });
   await expect(verdict).toBeVisible();
   expect((await verdict.innerText()).replace(/\s+/g, ' ').trim()).toMatch(
-    /^(passed \(H1 accepted\)|terminated at max games) — LLR -?\d+\.\d{3} within \[-?\d+\.\d{2}, \d+\.\d{2}\]\. SPRT is not acted on until 100 pairs are complete\.$/
+    /^Completed: (passed \(H1 accepted\)|stopped at its cap), LLR -?\d+\.\d{3} after [\d,]+ pairs\. With the pairs that were in flight then, LLR -?\d+\.\d{3}, bounds \[-?\d+\.\d{2}, -?\d+\.\d{2}\]\.$/
   );
 
   const table = sprt.locator('table');

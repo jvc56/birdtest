@@ -66,7 +66,7 @@ resource "aws_db_instance" "main" {
 
   instance_class        = var.db_instance_class
   allocated_storage     = var.db_allocated_storage
-  max_allocated_storage = var.db_allocated_storage * 5
+  max_allocated_storage = min(var.db_allocated_storage * 5, 65536) # RDS's ceiling
   storage_encrypted     = true
 
   db_name  = var.project
@@ -77,7 +77,7 @@ resource "aws_db_instance" "main" {
   # created with this placeholder, which the first deploy
   # replaces immediately (README.md, "Deploying"); ignore_changes keeps
   # Terraform from reverting it. The real password lives only in the
-  # DATABASE_URL SSM parameter declared in ssm.tf. The instance is reachable
+  # DATABASE_URL SSM parameter, which ssm.tf names and never reads. The instance is reachable
   # only from the ECS tasks' security group in the meantime. (Setting
   # `password` at all is what turns RDS-managed passwords off; the provider
   # refuses `manage_master_user_password` alongside it, even as false.)
@@ -100,9 +100,63 @@ resource "aws_db_instance" "main" {
   final_snapshot_identifier = "${local.name}-final"
   deletion_protection       = true
 
+  # Class and Multi-AZ changes now rather than at the next maintenance
+  # window (up to a week): scaling up under the CPU alarm, or RUNBOOK §1's
+  # closing apply putting Multi-AZ back, otherwise waited for it.
+  apply_immediately = var.db_apply_immediately
+
   lifecycle {
+    # Not allocated_storage: the provider already ignores the variable being
+    # below an autoscaled size, and ignoring it here as well made raising the
+    # variable -- the way to grow the volume ahead of need -- do nothing.
     ignore_changes = [password]
   }
 
   tags = local.tags
+}
+
+# --- Database alarms -------------------------------------------------------
+# Storage autoscales only up to max_allocated_storage; past it every write
+# fails, the submissions and claims first. CloudWatch has no allocated-storage
+# metric, and FreeStorageSpace is measured against the *current* allocation --
+# a threshold on it either fires from the first apply (autoscaling keeps free
+# space near a tenth) or never. RDS's own events say it instead: "low storage"
+# is the instance running short, and autoscaling that cannot go further.
+resource "aws_db_event_subscription" "db_storage" {
+  name        = "${local.name}-db-storage"
+  sns_topic   = aws_sns_topic.alerts.arn
+  source_type = "db-instance"
+  source_ids  = [aws_db_instance.main.identifier]
+  # "failure" too: an instance that has failed is the other thing nobody
+  # would otherwise hear about until the site was down. "notification" for the
+  # early warning: allocation past 80% of the autoscaling ceiling
+  # (RDS-EVENT-0225) is there, as are low storage burst credits and critically
+  # low memory; "failure" says only that the ceiling has been reached.
+  event_categories = ["low storage", "failure", "notification"]
+  tags             = local.tags
+
+  # RDS checks it may publish when the subscription is made; the topic policy
+  # that lets it is changed in the same apply.
+  depends_on = [aws_sns_topic_policy.alerts]
+}
+
+# Sustained load. The default class is burstable and runs in unlimited mode:
+# out of credits it is billed for the surplus rather than throttled, so the
+# credit balance says little (and reads empty from launch). Busy for fifteen
+# minutes is the signal either way -- a stats payload rebuilt too often, a
+# sweep grown too large.
+resource "aws_cloudwatch_metric_alarm" "db_cpu_high" {
+  alarm_name          = "${local.name}-db-cpu-high"
+  alarm_description   = "birdtest's database has been over 80% CPU for fifteen minutes"
+  namespace           = "AWS/RDS"
+  metric_name         = "CPUUtilization"
+  dimensions          = { DBInstanceIdentifier = aws_db_instance.main.identifier }
+  statistic           = "Average"
+  period              = 300
+  evaluation_periods  = 3
+  threshold           = 80
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  alarm_actions       = [aws_sns_topic.alerts.arn]
+  ok_actions          = [aws_sns_topic.alerts.arn]
+  tags                = local.tags
 }

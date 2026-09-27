@@ -33,9 +33,10 @@ const DISPATCH_LOCK_NAMESPACE: i32 = 1;
 /// - **Games, game pairs and opening racks** pick the next seed with
 ///   `MAX(seed)`, so two overlapping claims compute the same one. The
 ///   `(job_id, seed)` unique index catches that, but only by failing the loser,
-///   and `scheduler::claim` gives up after three attempts -- so past three-way
-///   contention on one job a worker is told `204` while work exists. The lock
-///   costs nothing that was not already being paid: `issue_claim` bumps
+///   and `scheduler::claim` gave up after three attempts (it has eight rounds
+///   now) -- so past three-way contention on one job a worker was told `204`
+///   while work existed. The lock costs nothing that was not already being
+///   paid: `issue_claim` bumps
 ///   `jobs.claims_issued`, which takes the job's row lock until commit, so
 ///   claims against one job already serialize. This only moves the start of
 ///   that window earlier, turning a lost race into a short wait.
@@ -55,6 +56,156 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
     Ok(())
 }
 
+/// Jobs whose dispatch lock this process is holding for a long time: a leave
+/// generation's universe being seeded (tens of seconds), a purge or a delete
+/// (minutes, for a large job).
+///
+/// A claim for such a job skips it without asking the database. The bounded
+/// wait of [`try_lock_job_dispatch`] alone was not enough: each waiter holds a
+/// pool connection for the whole [`DISPATCH_LOCK_WAIT_MS`], and a job that
+/// handed out nothing fell behind its share and so headed every worker's
+/// candidate list (it is lifted as it is passed over now) -- a fleet of idle workers polling every five seconds held
+/// the twenty-connection pool on it, and submissions for every other job
+/// queued. In-process is enough because the service is a single instance
+/// (`desired_count` is validated to at most one); the advisory lock is still
+/// what makes the hold safe, and this only spares the wait.
+///
+/// A purge or a delete also holds every open claim of the job
+/// ([`HoldKind::Claims`]), so a submission or decline for one of them is
+/// answered at once rather than waiting out its lock timeout on a connection;
+/// and if it ends without committing -- the request dropped at the load
+/// balancer's timeout, a deadlock -- the job's claims are not reclaimed for a
+/// heartbeat timeout afterwards: their heartbeats were skipped while it held
+/// them, not missed.
+#[derive(Clone, Default)]
+pub struct DispatchHolds(std::sync::Arc<std::sync::Mutex<HoldsInner>>);
+
+#[derive(Default)]
+struct HoldsInner {
+    /// Per job, how many holds of each kind: `[dispatch only, claims]`.
+    held: std::collections::HashMap<Uuid, [usize; 2]>,
+    /// Jobs whose claims-holding hold ended without committing, and until
+    /// when their claims are not reclaimed.
+    reclaim_not_before: std::collections::HashMap<Uuid, std::time::Instant>,
+    /// Per job, how many claims holds (purges and deletes) have been taken:
+    /// what an action that waited on the job's row compares, since the hold
+    /// itself can be gone by the time it wakes.
+    claims_holds_taken: std::collections::HashMap<Uuid, u64>,
+}
+
+/// What a [`DispatchHold`] holds besides the job's dispatch lock.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HoldKind {
+    /// Nothing else: a seeding. Submissions go ahead.
+    DispatchOnly,
+    /// Every open claim of the job as well: a purge or a delete.
+    Claims,
+}
+
+impl DispatchHolds {
+    /// Marks the job held until the returned guard is dropped. `grace` is how
+    /// long the job's claims are spared reclamation if a [`HoldKind::Claims`]
+    /// hold is dropped without [`DispatchHold::committed`].
+    pub fn hold(&self, job_id: Uuid, kind: HoldKind, grace: std::time::Duration) -> DispatchHold {
+        let mut inner = self.0.lock().expect("dispatch holds poisoned");
+        inner.held.entry(job_id).or_insert([0, 0])[kind as usize] += 1;
+        DispatchHold { holds: self.clone(), job_id, kind, grace, committed: false }
+    }
+
+    /// A [`HoldKind::Claims`] hold, unless one is already held on the job:
+    /// the check and the hold under one lock, so of two purges or deletes
+    /// arriving together exactly one gets it.
+    pub fn try_hold_claims(&self, job_id: Uuid, grace: std::time::Duration) -> Option<DispatchHold> {
+        let mut inner = self.0.lock().expect("dispatch holds poisoned");
+        let counts = inner.held.entry(job_id).or_insert([0, 0]);
+        if counts[HoldKind::Claims as usize] > 0 {
+            return None;
+        }
+        counts[HoldKind::Claims as usize] += 1;
+        *inner.claims_holds_taken.entry(job_id).or_insert(0) += 1;
+        Some(DispatchHold { holds: self.clone(), job_id, kind: HoldKind::Claims, grace, committed: false })
+    }
+
+    /// How many purges or deletes of the job have started in this process.
+    pub fn claims_holds_taken(&self, job_id: Uuid) -> u64 {
+        self.0
+            .lock()
+            .expect("dispatch holds poisoned")
+            .claims_holds_taken
+            .get(&job_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether claims should skip the job.
+    pub fn is_held(&self, job_id: Uuid) -> bool {
+        self.0.lock().expect("dispatch holds poisoned").held.contains_key(&job_id)
+    }
+
+    /// Whether the job's open claims are held, so a submission or decline for
+    /// one would only wait.
+    pub fn claims_held(&self, job_id: Uuid) -> bool {
+        self.0
+            .lock()
+            .expect("dispatch holds poisoned")
+            .held
+            .get(&job_id)
+            .is_some_and(|counts| counts[HoldKind::Claims as usize] > 0)
+    }
+
+    /// Whether any job's claims are held at all -- the cheap check that lets a
+    /// submission skip looking up its job the rest of the time.
+    pub fn any_claims_held(&self) -> bool {
+        self.0
+            .lock()
+            .expect("dispatch holds poisoned")
+            .held
+            .values()
+            .any(|counts| counts[HoldKind::Claims as usize] > 0)
+    }
+
+    /// `job_ids` less the jobs whose claims are in their post-hold grace.
+    pub fn reclaimable(&self, job_ids: &[Uuid]) -> Vec<Uuid> {
+        let mut inner = self.0.lock().expect("dispatch holds poisoned");
+        let now = std::time::Instant::now();
+        inner.reclaim_not_before.retain(|_, until| *until > now);
+        job_ids.iter().copied().filter(|id| !inner.reclaim_not_before.contains_key(id)).collect()
+    }
+}
+
+/// See [`DispatchHolds::hold`].
+pub struct DispatchHold {
+    holds: DispatchHolds,
+    job_id: Uuid,
+    kind: HoldKind,
+    grace: std::time::Duration,
+    committed: bool,
+}
+
+impl DispatchHold {
+    /// The holder's transaction committed: its claims are gone, not spared.
+    pub fn committed(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for DispatchHold {
+    fn drop(&mut self) {
+        let mut inner = self.holds.0.lock().expect("dispatch holds poisoned");
+        if let Some(counts) = inner.held.get_mut(&self.job_id) {
+            counts[self.kind as usize] -= 1;
+            if counts == &[0, 0] {
+                inner.held.remove(&self.job_id);
+            }
+        }
+        if self.kind == HoldKind::Claims && !self.committed {
+            inner
+                .reclaim_not_before
+                .insert(self.job_id, std::time::Instant::now() + self.grace);
+        }
+    }
+}
+
 /// How long a claim waits for a job's dispatch lock before giving up on that
 /// job and trying the next one.
 ///
@@ -66,13 +217,14 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
 /// every other claim for that job blocks for the duration *while holding a
 /// pool connection*, and the pool is twenty -- so one slow claim on one job
 /// stalls submissions and the dashboard for the whole server. With it, the
-/// waiting workers are told there is nothing here right now and go elsewhere.
+/// waiting workers go elsewhere (`Acquired::Busy`).
 const DISPATCH_LOCK_WAIT_MS: u32 = 2_000;
 
 /// Take the job's dispatch lock, giving up after [`DISPATCH_LOCK_WAIT_MS`].
 ///
-/// `false` means another claim holds it: this job has nothing to offer *right
-/// now*, which is exactly what `Acquired::NoWork` says. The caller must not
+/// `false` means another claim holds it: `Acquired::Busy`, which the scheduler
+/// does not read as "no work" -- the job is not lifted as passed over, only left
+/// out of the rest of that request. The caller must not
 /// issue further statements on this connection, since the timed-out statement
 /// aborted the transaction; every caller returns straight away and the claim
 /// path rolls back.
@@ -140,21 +292,50 @@ pub(crate) async fn try_lock_job_dispatch_now(
 /// zeroes it, and the caller reads it before reading the results -- so a purge
 /// in between leaves it below what was observed, and the update does nothing.
 /// Returns whether the job was completed.
+///
+/// `purged_since` is a second witness, asked after the update and before its
+/// commit: a purge of a small job, then as many fresh claims as the check
+/// observed, all between its reads and its update, would pass the first. It
+/// is `DispatchHolds::claims_holds_taken` compared with a count read before
+/// the check read anything.
+///
+/// `decided` is the SPRT verdict the check completed a games job on, with the
+/// units it had, and is stored with the completion (`jobs.sprt_decided_*`).
 pub async fn complete_unless_purged(
     pool: &sqlx::PgPool,
     job_id: Uuid,
     observed_claims_issued: i64,
+    decided: Option<(crate::stats::sprt::SprtResult, u64)>,
+    purged_since: impl Fn() -> bool,
 ) -> AppResult<bool> {
-    Ok(sqlx::query(
-        "UPDATE jobs SET status = 'completed'
+    let status = decided.map(|(sprt, _)| sprt.status.as_str());
+    let mut tx = pool.begin().await?;
+    let completed = sqlx::query(
+        "UPDATE jobs SET status = 'completed',
+                         sprt_decided_status = $3, sprt_decided_llr = $4, sprt_decided_units = $5
          WHERE id = $1 AND status = 'active' AND claims_issued >= $2",
     )
     .bind(job_id)
     .bind(observed_claims_issued)
-    .execute(pool)
+    .bind(status)
+    .bind(decided.map(|(sprt, _)| sprt.llr))
+    .bind(decided.map(|(_, units)| units as i64))
+    .execute(&mut *tx)
     .await?
     .rows_affected()
-        > 0)
+        > 0;
+    // Asked with the job's row locked: a purge that has not yet committed
+    // waits for this commit, and then purges the completed job as it would
+    // any other.
+    if completed && purged_since() {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    if completed {
+        crate::audit::log_server_completion(&mut tx, job_id, status).await?;
+    }
+    tx.commit().await?;
+    Ok(completed)
 }
 
 pub(crate) async fn load_player_spec(
@@ -299,6 +480,7 @@ pub(crate) async fn insert_position_analyses(
     claim_id: Uuid,
     positions: &[PositionAnalysis],
     top_moves: i32,
+    top_plies: i32,
     on_conflict_ignore: bool,
 ) -> AppResult<()> {
     use std::collections::HashMap;
@@ -413,10 +595,21 @@ pub(crate) async fn insert_position_analyses(
     // Only a simming player produces per-ply statistics; for a static player
     // this is empty and nothing is written. A simmed opening-rack batch is
     // racks x moves x plies rows, which is why they go out in batches too.
+    //
+    // Kept to the plies the config records, the way moves are kept to the
+    // plays it records: `num_plies_recorded` is what told the worker how many
+    // to report, and nothing bounded what it sent -- a 64 MB body could hold
+    // tens of thousands of ply rows per move.
     let plies: Vec<(i64, &PlyStats)> = move_ids
         .iter()
         .zip(pending.iter())
-        .flat_map(|(move_id, (_, _, entry))| entry.plies.iter().map(move |ply| (*move_id, ply)))
+        .flat_map(|(move_id, (_, _, entry))| {
+            entry
+                .plies
+                .iter()
+                .filter(|ply| i32::from(ply.ply) < top_plies)
+                .map(move |ply| (*move_id, ply))
+        })
         .collect();
     for chunk in plies.chunks(PLY_ROWS_PER_STATEMENT) {
         let mut builder = sqlx::QueryBuilder::new(
@@ -503,15 +696,30 @@ pub(crate) async fn insert_game_results(
     // How many ranked moves to keep: player 1's num_plays_recorded, which is
     // also the one MAGPIE reads to decide how many to report. From the job's
     // template: it is a setting of an immutable player config.
-    let top_moves = match &template.kind {
-        dispatch::JobKind::Games { player1, .. } | dispatch::JobKind::GamePairs { player1, .. } => {
-            player1.num_plays_recorded
-        }
+    //
+    // Plies are kept to the larger of the two players' `num_plies_recorded`: a
+    // position is either player's, and a player that reports fewer (a static
+    // one reports none) is not truncated by the other's cap.
+    let (top_moves, top_plies) = match &template.kind {
+        dispatch::JobKind::Games { player1, player2, .. }
+        | dispatch::JobKind::GamePairs { player1, player2, .. } => (
+            player1.num_plays_recorded,
+            player1.num_plies_recorded.max(player2.num_plies_recorded),
+        ),
         _ => return Err(template.mismatch("games")),
     };
 
-    insert_position_analyses(conn, job_id, task_id, claim_id, &record.positions, top_moves, true)
-        .await
+    insert_position_analyses(
+        conn,
+        job_id,
+        task_id,
+        claim_id,
+        &record.positions,
+        top_moves,
+        top_plies,
+        true,
+    )
+    .await
 }
 
 /// One file a task needs, as the assignment states it.
@@ -589,4 +797,26 @@ pub async fn expected_data(
             tarball_date: row.get("tarball_date"),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod holds_tests {
+    use super::*;
+
+    #[test]
+    fn only_one_claims_hold_is_taken_at_a_time() {
+        let holds = DispatchHolds::default();
+        let job = Uuid::new_v4();
+        let grace = std::time::Duration::from_secs(1);
+        let seeding = holds.hold(job, HoldKind::DispatchOnly, grace);
+        let first = holds.try_hold_claims(job, grace).expect("a seeding does not hold claims");
+        assert!(holds.try_hold_claims(job, grace).is_none());
+        assert!(holds.try_hold_claims(Uuid::new_v4(), grace).is_some(), "per job");
+        drop(first);
+        assert!(holds.try_hold_claims(job, grace).is_some());
+        drop(seeding);
+        // Counted, so an action that waited on the job's row can tell a purge
+        // came and went meanwhile.
+        assert_eq!(holds.claims_holds_taken(job), 2);
+    }
 }

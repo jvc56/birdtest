@@ -831,8 +831,8 @@ async fn an_opening_rack_result_must_answer_the_racks_it_was_given() {
 /// The next seed is `MAX(seed)`, which a concurrent claim's uncommitted task is
 /// invisible to, so overlapping claims all compute the same one. The
 /// `(job_id, seed)` unique index catches that, but only by failing the loser,
-/// and `scheduler::claim` gives up after three attempts -- so past three-way
-/// contention a worker was told there was nothing to do. Claims for one job
+/// and `scheduler::claim` gave up after three attempts (eight rounds now) -- so
+/// past three-way contention a worker was told there was nothing to do. Claims for one job
 /// already serialize on the `jobs` row (`claims_issued`), so taking the job's
 /// dispatch lock before reading the cursor costs nothing that was not already
 /// being paid and turns the lost race into a short wait.
@@ -1532,6 +1532,40 @@ async fn a_job_is_not_dispatched_until_its_derived_files_are_built() {
     assert!(derived[0]["sha256"].is_string(), "{body}");
 }
 
+/// I-DERIVED-10: a job whose files were built under another builder -- a
+/// deployment whose MAGPIE bumped `wmp-N` -- has them queued under this
+/// binary's builder by the next claim that considers it. Only creating or
+/// activating a job queued anything, so after such a deployment every job
+/// needing a wordmap or a table answered `204` for good, with nothing queued
+/// to show why (thirty-first audit).
+#[tokio::test]
+async fn a_file_built_under_another_builder_is_queued_under_this_one_by_a_claim() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let p1 = deriving_player(&db, "bump-p1", kwg, klv, false).await;
+    let p2 = deriving_player(&db, "bump-p2", kwg, klv, false).await;
+    let job = job_between(&db, p1, p2).await;
+    assert_eq!(db.derived_ready(job).await, 1);
+    // What the previous deployment built: the same file under its builder.
+    sqlx::query("UPDATE derived_data SET builder = 'wmp-0'").execute(&db.pool).await.unwrap();
+    let worker = registered_worker(&db).await;
+
+    let (status, body) = claim_as(&app, &worker).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "nothing is built under wmp-1: {body}");
+    let queued: Vec<(String, String)> =
+        sqlx::query_as("SELECT builder, state FROM derived_data ORDER BY builder")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        queued,
+        vec![("wmp-0".into(), "built".into()), ("wmp-1".into(), "pending".into())],
+        "the claim queued the file under this binary's builder"
+    );
+}
+
 /// Once a job has been found dispatchable, its hashes are answered from memory
 /// for the rest of the process: the query behind them ran for every candidate
 /// job on every claim, and its answer for a dispatchable job cannot change
@@ -2048,6 +2082,17 @@ async fn the_results_feed_filters_by_who_a_name_is() {
     // Unfiltered, all three.
     let (_, body) = send(&app, get_request(&format!("/api/jobs/{job}/results"), &[])).await;
     assert_eq!(body["items"].as_array().unwrap().len(), 3, "{body}");
+
+    // A contributor with claims in another job and none in this one: an empty
+    // page, decided from their claims in this job before reading its records.
+    // (Read the other way, the planner judged their share of this job from
+    // their share of all claims, and walked all of it to return nothing.)
+    let other = db.games_job(1, 2).await;
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{other}/results?worker=keyed"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["items"].as_array().unwrap().len(), 0, "{body}");
+    assert!(body["next_cursor"].is_null(), "{body}");
 }
 
 /// The display pool is what keeps page views off the path workers wait on, and
@@ -2183,4 +2228,185 @@ async fn a_claim_without_a_usable_body_is_told_what_to_send() {
         send(&app, post_json("/api/auth/login", &[], json!({ "username": 5 }))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{answer}");
     assert_eq!(answer["code"], "bad_request", "{answer}");
+}
+
+async fn claim_fresh(app: &axum::Router) -> (StatusCode, serde_json::Value) {
+    send(app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await
+}
+
+async fn decline_as(app: &axum::Router, uuid: &str, token: &serde_json::Value, reason: &str) -> StatusCode {
+    send(
+        app,
+        post_json(
+            "/api/worker/decline",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": token, "reason": reason }),
+        ),
+    )
+    .await
+    .0
+}
+
+/// A-WORKER-19: a task its worker declined is not handed back to that worker
+/// for an hour. It went back to `available` and, the oldest, was every claim
+/// of its job, ahead of any new work -- the worker that had just failed it
+/// included -- and MAGPIE stops after five failures in a row, so one task
+/// that fails everywhere stopped every contributor claiming from the job.
+/// Another worker is still offered it.
+#[tokio::test]
+async fn a_declined_task_is_not_handed_back_to_the_worker_that_declined_it() {
+    let db = TestDb::new().await;
+    db.games_job(1, 1).await;
+    let app = birdtest::app(db.state().await);
+
+    let (status, first) = claim_fresh(&app).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let a = first["worker_uuid"].as_str().unwrap().to_string();
+    let failing = first["task_request"]["seed"].clone();
+    let mut token = first["claim_token"].clone();
+    let mut seeds = vec![failing.clone()];
+    for _ in 0..3 {
+        // The work-in-hand bucket refills one a second.
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert_eq!(decline_as(&app, &a, &token, "task_failed").await, StatusCode::NO_CONTENT);
+        let (status, next) = claim_as(&app, &a).await;
+        assert_eq!(status, StatusCode::OK, "{next}");
+        seeds.push(next["task_request"]["seed"].clone());
+        token = next["claim_token"].clone();
+    }
+    let distinct: std::collections::HashSet<String> = seeds.iter().map(|s| s.to_string()).collect();
+    assert_eq!(distinct.len(), seeds.len(), "each claim a new task: {seeds:?}");
+
+    let (_, other) = claim_fresh(&app).await;
+    assert_eq!(other["task_request"]["seed"], failing, "another worker is offered it");
+}
+
+/// A-WORKER-20: a result carrying captured positions for a job that does not
+/// capture them is refused. They were stored, and the job's export then held
+/// a positions file nobody asked for.
+#[tokio::test]
+async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+    let (status, assignment) = claim_fresh(&app).await;
+    assert_eq!(status, StatusCode::OK, "{assignment}");
+    assert_eq!(assignment["task_request"]["capture_positions"], json!(false));
+    let uuid = assignment["worker_uuid"].as_str().unwrap();
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([{
+        "game_index": 0, "turn_number": 0, "rack": "AEINRST",
+        "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
+        "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
+    }]);
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", uuid)],
+            json!({ "claim_token": assignment["claim_token"], "result": result }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_analysis_records WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+}
+
+
+fn captured(game: i32, turn: i32) -> serde_json::Value {
+    json!({ "game_index": game, "turn_number": turn, "rack": "AEINRST",
+            "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
+            "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }] })
+}
+
+/// A-WORKER-21: what a result for a capturing job must carry, and what no
+/// result may. A capturing job's result with no positions, or none from one of
+/// its games, was accepted and its task completed -- a hole in the corpus for
+/// good; a NUL in a string failed at the insert as a `500`, which MAGPIE
+/// retries until it gives up; and a 100 KB previous play, a score of
+/// `i32::MIN` and a 500 KB bracketed "tile" were stored (the audit's pass 21).
+/// Each is now a `400`, and nothing is stored.
+#[tokio::test]
+async fn a_capturing_jobs_result_is_complete_and_no_result_holds_what_cannot_be_stored() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let with = |positions: Vec<serde_json::Value>| {
+        let mut result = games_result(2, 1);
+        result["positions"] = json!(positions);
+        result
+    };
+    let mut nul = captured(1, 0);
+    nul["moves"][0]["move"] = json!("8D RET\u{0000}AINS");
+    let mut long_previous = captured(1, 1);
+    long_previous["previous_move"] = json!("x".repeat(100_000));
+    let mut low_score = captured(1, 1);
+    low_score["previous_move"] = json!("8D DOG");
+    low_score["previous_move_score"] = json!(i32::MIN);
+    let mut long_tile = captured(1, 0);
+    long_tile["rack"] = json!(format!("[{}]", "Q".repeat(500_000)));
+    let mut long_position = captured(1, 0);
+    long_position["position"] = json!("1".repeat(5_000));
+    let mut long_play = captured(1, 0);
+    long_play["moves"][0]["move"] = json!("8D ".to_string() + &"Q".repeat(300));
+    let cases = [
+        ("no positions", games_result(2, 1), "has none from game 0"),
+        ("none from game 1", with(vec![captured(0, 0)]), "has none from game 1"),
+        ("a NUL in a move", with(vec![captured(0, 0), nul]), "NUL"),
+        ("a 100 KB previous play", with(vec![captured(0, 0), captured(1, 0), long_previous]), "is not a play"),
+        ("a previous play scoring i32::MIN", with(vec![captured(0, 0), captured(1, 0), low_score]), "which no play can score"),
+        ("a 500 KB tile", with(vec![captured(0, 0), long_tile]), "bracketed tile"),
+        ("a 5,000-character position", with(vec![captured(0, 0), long_position]), "is not a position"),
+        ("a 300-character play", with(vec![captured(0, 0), long_play]), "is not a play"),
+    ];
+    // A claim each: a worker's requests are rate limited (A-WORKER-14).
+    for (what, result, says) in cases {
+        let (assignment, uuid) = first_claim(&app).await;
+        let token = assignment["claim_token"].as_str().unwrap();
+        let (status, body) = submit_as(&app, &uuid, token, result).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+        assert!(body["message"].as_str().is_some_and(|m| m.contains(says)), "{what}: expected {says:?} in {body}");
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_analysis_records WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+
+    // The complete result is accepted.
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = assignment["claim_token"].as_str().unwrap();
+    let (status, body) = submit_as(&app, &uuid, token, with(vec![captured(0, 0), captured(1, 0)])).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })), "{body}");
+}
+
+/// A-WORKER-21 (declines): a decline naming a missing file with a NUL in it
+/// failed at the insert as a `500` and left the claim open (the audit's pass
+/// 21). It is a `400`, and the claim can still be declined properly.
+#[tokio::test]
+async fn a_decline_holding_a_nul_is_refused_and_the_claim_stays_declinable() {
+    let db = TestDb::new().await;
+    db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+    let (assignment, uuid) = first_claim(&app).await;
+    let decline = |name: &str| {
+        json!({ "claim_token": assignment["claim_token"], "reason": "missing_data",
+                "missing": [{ "role": "kwg", "name": name, "expected": "abc" }] })
+    };
+    let (status, body) = send(&app, post_json("/api/worker/decline", &[("x-worker-uuid", &uuid)], decline("NWL\u{0000}23"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(&app, post_json("/api/worker/decline", &[("x-worker-uuid", &uuid)], decline("NWL23"))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 }

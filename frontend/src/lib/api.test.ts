@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { api, ApiError } from './api';
+import { api, ApiError, errorText } from './api';
 
 /**
  * lib/api.ts is under test here, not fetch: fetch and document.cookie are
@@ -121,6 +121,21 @@ describe('F-API-3 JSON error body', () => {
     expect(error.code).toBe('conflict');
     expect(error.fields).toEqual({});
   });
+
+  it('carries Retry-After, so a page can say how long to wait', async () => {
+    fetchMock.mockResolvedValueOnce(
+      new Response(JSON.stringify({ code: 'rate_limited', message: 'too many requests' }), {
+        status: 429,
+        headers: { 'content-type': 'application/json', 'retry-after': '718' }
+      })
+    );
+    const limited = (await api.confirmPasswordReset('t', 'p').catch((e: unknown) => e)) as ApiError;
+    expect(limited.status).toBe(429);
+    expect(limited.retryAfter).toBe(718);
+    respond(409, JSON.stringify({ code: 'conflict', message: 'Job is active.' }));
+    const without = (await api.deleteJob('j1').catch((e: unknown) => e)) as ApiError;
+    expect(without.retryAfter).toBeNull();
+  });
 });
 
 describe('F-API-4 error without a JSON body', () => {
@@ -146,6 +161,15 @@ describe('F-API-4 error without a JSON body', () => {
     const second = await api.login({ username: 'a', password: 'b' }).catch((e: unknown) => e);
     expect(second).toBeInstanceOf(ApiError);
     expect((second as ApiError).status).toBe(400);
+  });
+
+  it('says the status when there is neither a body nor a status text (HTTP/2)', async () => {
+    // Over HTTP/2 statusText is always empty, and the load balancer's own 503
+    // page is HTML: the error must still say something a page can show.
+    respond(503, '<html><body>Service Unavailable</body></html>', '');
+    const error = await api.job('j1').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).message).toBe('The server answered 503.');
   });
 
   it('a 200 whose body is not JSON rejects with an ApiError too', async () => {
@@ -189,5 +213,23 @@ describe('F-API-5 credentials', () => {
     await api.job('x');
     expect(lastInit().body).toBeUndefined();
     expect(lastHeaders()).not.toHaveProperty('content-type');
+  });
+});
+
+describe('F-API-6 errorText', () => {
+  it('lists the fields the server named after the message', () => {
+    const e = new ApiError(400, 'bad_request', 'import details are invalid', {
+      git_ref: "letters, digits, '-', '_', '.' and '/' only"
+    });
+    expect(errorText(e)).toBe(
+      "import details are invalid: git_ref letters, digits, '-', '_', '.' and '/' only"
+    );
+  });
+
+  it('is the message alone when there are none', () => {
+    expect(errorText(new ApiError(409, 'conflict', 'that already exists'))).toBe(
+      'that already exists'
+    );
+    expect(errorText(new Error('offline'))).toBe('offline');
   });
 });

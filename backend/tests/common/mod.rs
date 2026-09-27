@@ -123,7 +123,7 @@ async fn ensure_template() {
 /// and the contract fixtures move together.
 pub fn test_builders() -> birdtest::magpie::Builders {
     birdtest::magpie::Builders {
-        magpie_version: "0.1.0".into(),
+        magpie_version: "0.1.1".into(),
         build_target: "nehalem".into(),
         wmp_builder_version: 1,
         rit_builder_version: 1,
@@ -198,11 +198,13 @@ impl TestDb {
             mail_from: "test@birdtest.local".into(),
             public_url: "http://localhost".into(),
             heartbeat_timeout: Duration::from_secs(300),
+            // Uncached: a test reads the stats a submission just changed.
+            stats_cache: Duration::ZERO,
             s3_bucket: "birdtest-test".into(),
             // Nothing in these tests touches the object store; an unroutable
             // endpoint makes an accidental call fail fast rather than reach AWS.
             s3_endpoint: Some("http://127.0.0.1:9".into()),
-            min_magpie_version: "0.1.0".into(),
+            min_magpie_version: "0.1.1".into(),
             magpie_download_url: "https://example.invalid/magpie".into(),
             // A path that is not a binary. Nothing below tier 6 runs a
             // conversion, and a test that reached one should fail loudly
@@ -217,6 +219,7 @@ impl TestDb {
             github_api_url: "http://127.0.0.1:9".into(),
             github_raw_url: "http://127.0.0.1:9".into(),
             trusted_proxy_hops: 0,
+            mail_max_per_second: 1,
         }
     }
 
@@ -270,6 +273,7 @@ impl TestDb {
             derived_ready: Default::default(),
             templates: Default::default(),
             leave_merges: Default::default(),
+            dispatch_holds: Default::default(),
             shutdown: Default::default(),
             // As a process that has been up for longer than the heartbeat
             // timeout, which is the state every reclamation test is about; the
@@ -299,12 +303,27 @@ impl TestDb {
         let mut conn = self.pool.acquire().await.unwrap();
         let needs = birdtest::derived::needs_for_job(&mut conn, job).await.unwrap();
         for (i, need) in needs.iter().enumerate() {
+            // What a build leaves: a row a claim queued (`pending`) is now
+            // `built`, and one nothing queued exists, built.
+            sqlx::query(
+                "DELETE FROM derived_data
+                 WHERE role = $1 AND name = $2 AND builder = $3 AND kwg_id = $4
+                   AND klv_id IS NOT DISTINCT FROM $5 AND letterdist_id = $6",
+            )
+            .bind(&need.role)
+            .bind(&need.name)
+            .bind(builders.for_role(&need.role).unwrap())
+            .bind(need.kwg_id)
+            .bind(need.klv_id)
+            .bind(need.letterdist_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
             sqlx::query(
                 "INSERT INTO derived_data
                      (role, name, builder, kwg_id, klv_id, letterdist_id,
                       state, sha256, bytes, build_target, built_at)
-                 VALUES ($1,$2,$3,$4,$5,$6,'built',$7,1,$8,now())
-                 ON CONFLICT DO NOTHING",
+                 VALUES ($1,$2,$3,$4,$5,$6,'built',$7,1,$8,now())",
             )
             .bind(&need.role)
             .bind(&need.name)
@@ -338,7 +357,11 @@ impl TestDb {
     pub async fn input_data(&self, role: &str, name: &str) -> Uuid {
         let (path, content): (String, Option<&[u8]>) = match role {
             "letterdist" => (format!("letterdistributions/{name}.csv"), Some(TESTDIST)),
-            "layout" => (format!("layouts/{name}.txt"), Some(b"layout".as_slice())),
+            // A real 15x15 layout: job creation refuses a board of any other size.
+            "layout" => (
+                format!("layouts/{name}.txt"),
+                Some(include_bytes!("../../../fixtures/versions/20260101/layouts/standard15.txt").as_slice()),
+            ),
             "kwg" => (format!("lexica/{name}.kwg"), None),
             "klv" => (format!("lexica/{name}.klv2"), None),
             _ => (format!("strategy/{name}.csv"), None),

@@ -17,7 +17,11 @@
   }
 
   async function load() {
-    [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
+    try {
+      [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
+    } catch (e) {
+      error = `Could not load player configs and input data: ${e instanceof Error ? e.message : String(e)}`;
+    }
   }
   onMount(load);
 

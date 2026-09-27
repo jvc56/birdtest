@@ -17,9 +17,9 @@
   import {
     formatResidual,
     isNotable,
-    NON_TRANSITIVE_MIN,
     NOTABLE,
-    notableResiduals,
+    isNonTransitive,
+    significantResiduals,
     residual,
     residualBar,
     residualFill,
@@ -31,7 +31,7 @@
 
   $: names = new Map(ratings.map((r) => [r.player_config_id, r.name]));
   $: sorted = sortResiduals(residuals);
-  $: notable = notableResiduals(residuals);
+  $: significant = significantResiduals(residuals);
 </script>
 
 {#if residuals.length}
@@ -79,10 +79,10 @@
       </table>
     </div>
 
-    {#if notable.length >= NON_TRANSITIVE_MIN}
+    {#if isNonTransitive(residuals)}
       <p class="text-xs text-warning">
-        {notable.length} head-to-heads are more than {(100 * NOTABLE).toFixed(0)} points from what
-        the ratings predict. That is the signature of a non-transitive pool — configs that beat
+        {significant.length} head-to-heads are more than {(100 * NOTABLE).toFixed(0)} points from
+        what the ratings predict, on enough pairs that it is not chance. That is the signature of a non-transitive pool — configs that beat
         some opponents and lose to others in a way no single number per player can express. Read
         the ratings as a summary here, not as a ranking.
       </p>

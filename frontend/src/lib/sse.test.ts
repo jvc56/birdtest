@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { subscribeToJob } from './sse';
+import { resubscribeDelay, subscribeToJob } from './sse';
 
 /** A stand-in EventSource the test drives by hand. */
 class FakeEventSource {
@@ -109,12 +109,13 @@ describe('F-SSE-3 unsubscribe', () => {
     expect(FakeEventSource.instances).toHaveLength(1);
   });
 
-  it('a stream the browser gave up on is reopened after a pause', () => {
+  it('a stream the browser gave up on is reopened after a pause', async () => {
     const onUpdate = vi.fn();
+    vi.stubGlobal('fetch', vi.fn(async () => ({ status: 200 })));
     const unsubscribe = subscribeToJob('j', onUpdate);
     FakeEventSource.instances[0].giveUp();
     expect(FakeEventSource.instances).toHaveLength(1);
-    vi.advanceTimersByTime(5000);
+    await vi.advanceTimersByTimeAsync(5000);
     expect(FakeEventSource.instances).toHaveLength(2);
 
     FakeEventSource.instances[1].emit('stats', '{"n":2}');
@@ -123,6 +124,27 @@ describe('F-SSE-3 unsubscribe', () => {
     // Unsubscribing closes the current stream, not the dead one.
     unsubscribe();
     expect(FakeEventSource.instances[1].closeCalls).toBe(1);
+  });
+
+  it('a job that is gone is not subscribed to again', async () => {
+    // A deleted job's stream closes like a deployment's; asked, the job
+    // answers 404, and the page stops asking every five seconds.
+    const fetch = vi.fn(async () => ({ status: 404 }));
+    vi.stubGlobal('fetch', fetch);
+    subscribeToJob('gone', vi.fn());
+    FakeEventSource.instances[0].giveUp();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(fetch).toHaveBeenCalledWith('/api/jobs/gone', { method: 'GET' });
+    expect(FakeEventSource.instances).toHaveLength(1);
+  });
+
+  it('a job that is gone is said so to the page', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => ({ status: 404 })));
+    const refused = vi.fn();
+    subscribeToJob('gone', vi.fn(), refused);
+    FakeEventSource.instances[0].giveUp();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(refused).toHaveBeenCalledWith(404);
   });
 
   it('a transient error (still reconnecting) does not open a second stream', () => {
@@ -148,5 +170,36 @@ describe('F-SSE-3 unsubscribe', () => {
     FakeEventSource.instances[0].giveUp();
     vi.advanceTimersByTime(60_000);
     expect(FakeEventSource.instances).toHaveLength(1);
+  });
+});
+
+describe('F-SSE-4 backoff', () => {
+  it('doubles from five seconds to a minute, jittered down by at most half', () => {
+    expect([0, 1, 2, 3, 4, 10].map((n) => resubscribeDelay(n, () => 1))).toEqual([
+      5000, 10_000, 20_000, 40_000, 60_000, 60_000
+    ]);
+    expect(resubscribeDelay(0, () => 0)).toBe(2500);
+    expect(resubscribeDelay(4, () => 0)).toBe(30_000);
+  });
+
+  it('a stream refused again and again is asked less often, and an event resets it', async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(1);
+    vi.stubGlobal('fetch', vi.fn(async () => ({ status: 200 })));
+    subscribeToJob('busy', vi.fn());
+    FakeEventSource.instances[0].giveUp();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(FakeEventSource.instances).toHaveLength(2);
+
+    FakeEventSource.instances[1].giveUp();
+    await vi.advanceTimersByTimeAsync(9_999);
+    expect(FakeEventSource.instances).toHaveLength(2);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(FakeEventSource.instances).toHaveLength(3);
+
+    // Working again: the next failure waits five seconds, not twenty.
+    FakeEventSource.instances[2].emit('stats', '{}');
+    FakeEventSource.instances[2].giveUp();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(FakeEventSource.instances).toHaveLength(4);
   });
 });

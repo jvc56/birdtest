@@ -28,10 +28,16 @@ pub fn verify(method: &Method, headers: &HeaderMap, jar: &CookieJar) -> AppResul
         .get(CSRF_HEADER)
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| AppError::forbidden("missing CSRF header"))?;
-    if cookie != header {
+    if !same_token(cookie.as_bytes(), header.as_bytes()) {
         return Err(AppError::forbidden("CSRF token mismatch"));
     }
     Ok(())
+}
+
+/// Equal and not empty, in time that depends on the lengths and not on where
+/// they differ. An empty cookie and an empty header matched.
+fn same_token(a: &[u8], b: &[u8]) -> bool {
+    !a.is_empty() && a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 #[cfg(test)]
@@ -79,6 +85,10 @@ mod tests {
             assert_eq!(err.message, "missing CSRF header");
 
             let err = verify(&method, &headers(Some("forged")), &jar(Some(&token))).unwrap_err();
+            assert_eq!(err.message, "CSRF token mismatch");
+
+            // Empty on both sides is no token, not a match.
+            let err = verify(&method, &headers(Some("")), &jar(Some(""))).unwrap_err();
             assert_eq!(err.message, "CSRF token mismatch");
         }
     }

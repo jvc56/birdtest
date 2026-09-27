@@ -6,9 +6,16 @@
 
   let active: JobListItem[] = [];
 
+  // The job list is a side panel here; a failed load leaves it empty rather
+  // than the whole page broken, and is not an unhandled rejection.
   onMount(async () => {
-    const jobs = await api.jobs();
-    active = jobs.items.filter((job) => job.status === 'active');
+    try {
+      // Filtered by the server: filtered here, only the newest page's
+      // active jobs were ever shown.
+      active = (await api.jobs(0, 'active')).items;
+    } catch {
+      active = [];
+    }
   });
 </script>
 
@@ -31,7 +38,8 @@
     <h2 class="text-lg font-medium">Contribute</h2>
     <p class="text-sm text-muted-foreground">
       You need only <a href="https://github.com/jvc56/MAGPIE">MAGPIE</a> — no Python, no Docker.
-      Put a <code class="rounded bg-muted px-1">contribute.txt</code> beside it:
+      Put a <code class="rounded bg-muted px-1">contribute.txt</code> in the directory you run it
+      from, the one holding its <code class="rounded bg-muted px-1">data/</code>:
     </p>
     <pre class="overflow-x-auto rounded-md bg-muted p-4 text-xs"><code
         >server   {typeof window !== 'undefined' ? window.location.origin : ''}
@@ -39,7 +47,11 @@ threads  7
 maxtasks 0</code
       ></pre>
     <p class="text-sm text-muted-foreground">
-      then run <code class="rounded bg-muted px-1">magpie contribute</code>. Add an
+      then run <code class="rounded bg-muted px-1">./bin/magpie contribute</code> there. A second
+      process in the same directory needs a file of its own — a copy of the one above, without
+      any <code class="rounded bg-muted px-1">uuid</code> line, named on the command line:
+      <code class="rounded bg-muted px-1">./bin/magpie contribute second.txt</code>
+      — since MAGPIE writes the identity it is issued into its file. Add an
       <code class="rounded bg-muted px-1">apikey</code> line to attribute your work to your account
       instead of an anonymous UUID.
     </p>

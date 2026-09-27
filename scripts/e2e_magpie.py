@@ -11,8 +11,9 @@ Each case is selectable with `--cases` (default: every M case):
   and equity. The static player asks for a wordmap, so its job waits for the
   derived-file builder, and MAGPIE builds its own copy and finds it agrees.
 - `M-4` `leave_generation`: full-rack occurrences are staged, a merge folds
-  them into the generation's progress, and nothing is written into MAGPIE's
-  data directory. Real English, so creating the job seeds a 3.2M-rack
+  them into the generation's progress -- every reported rack, blank racks
+  included, matching a rack of the universe -- and nothing is written into
+  MAGPIE's data directory. Real English, so creating the job seeds a 3.2M-rack
   universe: the slow one.
 - `M-5` A worker whose data does not match the job's digests declines with
   `missing_data`, the gap reaches `worker_data_gaps`, and nothing is stored.
@@ -62,6 +63,7 @@ directories its workers used.
 import argparse
 import hashlib
 import io
+import json
 import re
 import shutil
 import signal
@@ -142,7 +144,7 @@ def small_tarball(magpie_root: Path) -> bytes:
 class GitHubStandIn(ThreadingHTTPServer):
     """Answers the two GitHub calls an input-data import makes.
 
-    `SMALL_REF` resolves to `SMALL_SHA`, whose tarball is served from memory.
+    `SMALL_REF`, a branch, resolves to `SMALL_SHA`, whose tarball is served from memory.
     Everything else is GitHub's: a ref resolution is forwarded (with the
     backend's token, if it sent one) and a tarball download redirected, so the
     real MAGPIE-DATA import the other cases rely on is still the real one.
@@ -173,8 +175,10 @@ class _GitHubHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         if self.path.startswith("/api/"):
             rest = self.path[len("/api"):]
-            if re.fullmatch(r"/repos/[^/]+/[^/]+/commits/" + SMALL_REF, rest):
-                return self._send(200, SMALL_SHA.encode())
+            if re.fullmatch(r"/repos/[^/]+/[^/]+/git/ref/heads/" + SMALL_REF, rest):
+                return self._send(200, json.dumps(
+                    {"ref": "refs/heads/" + SMALL_REF,
+                     "object": {"sha": SMALL_SHA, "type": "commit"}}).encode())
             headers = {k: v for k, v in self.headers.items()
                        if k.lower() in ("accept", "authorization", "user-agent")}
             request = urllib.request.Request("https://api.github.com" + rest, headers=headers)
@@ -626,6 +630,17 @@ def case_opening_racks(ctx: Context) -> None:
     run_job(ctx, ctx.data, {"job_type": "opening_rack", "player_config_id": simming_player(ctx),
                             "racks_per_batch": 3, "rack_size": 7}, simulated_statistics)
 
+    # A job may choose racks smaller than a full rack (1 to 7 tiles). The
+    # request does not restate the size, so a worker that required full racks
+    # refused every task of such a job (MAGPIE 0a69b625, fixed after it).
+    def three_tile_racks(job_id: str) -> None:
+        page = ctx.get(f"/api/jobs/{job_id}/results", "results")
+        expect(page["items"] and all(len(r["rack"]) == 3 for r in page["items"]),
+               f"expected analysed 3-tile racks: {page['items'][:3]}")
+
+    run_job(ctx, ctx.data, {"job_type": "opening_rack", "player_config_id": static_best_player(ctx),
+                            "racks_per_batch": 20, "rack_size": 3}, three_tile_racks)
+
 
 def case_leave(ctx: Context) -> None:
     """M-4"""
@@ -647,9 +662,23 @@ def case_leave(ctx: Context) -> None:
             "SELECT COALESCE(SUM(games_played), 0) FROM leave_generation_progress "
             f"WHERE job_id = '{job_id}'"))
         expect(played > 0, "the generation's live counters did not move")
+        # Every rack a real MAGPIE reported names a row of the universe. MAGPIE
+        # spells a rack blanks last (`AEINST?`), the universe blanks first, and
+        # until the thirty-second audit every blank rack was dropped silently.
+        distinct = int(ctx.psql(
+            "SELECT COUNT(DISTINCT r) FROM leave_rack_staging s, unnest(s.racks) r "
+            f"WHERE s.job_id = '{job_id}'"))
         outcome = ctx.post(f"/api/admin/jobs/{job_id}/merge-progress", "merge leave progress")
         expect(outcome["folds_merged"] == staged,
                f"merged {outcome['folds_merged']} staged results, expected {staged}")
+        expect(outcome["racks_updated"] == distinct,
+               f"{distinct - outcome['racks_updated']} of {distinct} reported racks "
+               "matched no rack of the universe")
+        blanks = int(ctx.psql(
+            "SELECT COUNT(*) FROM leave_rack_progress "
+            f"WHERE job_id = '{job_id}' AND generation = 1 AND occurrence_count > 0 "
+            "AND rack LIKE '?%'"))
+        expect(blanks > 0, "no rack holding a blank was counted")
         left = int(ctx.psql(
             f"SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = '{job_id}'"))
         expect(left == 0, f"{left} results still staged after a merge")
@@ -761,7 +790,7 @@ def case_positions(ctx: Context) -> None:
     """M-7: every position `capture_positions` stores is a CGP MAGPIE loads."""
     deactivate_everything(ctx)
     job_id = create_and_activate(ctx, ctx.data,
-                                 games_body(static_players(ctx), 1, capture_positions=True))
+                                 games_body(static_players(ctx), 2, capture_positions=True))
     worker = Worker(ctx, "m7")
     try:
         worker.run(tasks=1)
@@ -870,7 +899,7 @@ def case_rack_info_table(ctx: Context) -> None:
         # Not dispatched while the table is unbuilt: an anonymous claim finds
         # no work at all, since this is the only active job.
         claim = requests.post(f"{ctx.args.api}/api/worker/task",
-                              json={"magpie_version": "0.1.0", "unsupported_jobs": []},
+                              json={"magpie_version": "0.1.1", "unsupported_jobs": []},
                               timeout=30)
         expect(claim.status_code == 204,
                f"a job waiting on its table dispatched: {claim.status_code} {claim.text[:300]}")
@@ -965,7 +994,7 @@ def case_capture(ctx: Context) -> None:
     try:
         # First, from a worker with no identity yet: the assignment that mints
         # one. A games job capturing positions, so its result carries them.
-        one(games_body(static_players(ctx), 1, capture_positions=True), ctx.data)
+        one(games_body(static_players(ctx), 2, capture_positions=True), ctx.data)
         expect(worker.uuid() is not None, "the first assignment minted no worker UUID")
         # Players with a wordmap, so the assignment pins a derived file.
         one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,
@@ -979,10 +1008,13 @@ def case_capture(ctx: Context) -> None:
 
         # A heartbeat goes out thirty seconds into a task, so the last one is a
         # batch far too big to finish: the contributor is stopped once the
-        # heartbeat has been seen.
+        # heartbeat has been seen. The largest batch job creation allows
+        # (10,000 games), with a simming player so it runs for hours -- ten
+        # million, as it was, is refused now.
         deactivate_everything(ctx)
-        jobs.append(create_and_activate(ctx, ctx.data, games_body(static_players(ctx),
-                                                                  10_000_000)))
+        long_players = {"player1_config_id": simming_player(ctx),
+                        "player2_config_id": static_players(ctx)["player1_config_id"]}
+        jobs.append(create_and_activate(ctx, ctx.data, games_body(long_players, 10_000)))
         process = worker.start(1, server=proxy.url)
         deadline = time.time() + min(120, ctx.remaining())
         while "heartbeat.json" not in recorder.captured and time.time() < deadline:

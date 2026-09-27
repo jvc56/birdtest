@@ -47,8 +47,11 @@ test('E-2: a new user registers, confirms, signs in, and makes and deactivates a
   await page.getByPlaceholder('Label (optional)').fill('laptop');
   await page.getByRole('button', { name: 'Generate key' }).click();
   await expect(page.getByText('Copy this key now — it is not shown again.')).toBeVisible();
-  const key = (await page.locator('code.break-all').innerText()).trim();
+  // By its own id: the box also shows the key's contribute.txt line, and a
+  // class shared by both matched two elements (a strict-mode failure).
+  const key = (await page.getByTestId('fresh-key').innerText()).trim();
   expect(key.length).toBeGreaterThanOrEqual(32);
+  await expect(page.getByTestId('fresh-key-line')).toHaveText(`apikey ${key}`);
   const row = page.locator('tbody tr', { hasText: 'laptop' });
   await expect(row).toContainText('active');
 

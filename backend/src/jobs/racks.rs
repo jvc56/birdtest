@@ -52,6 +52,14 @@ pub struct LetterDistribution {
     unenumerable: Option<String>,
 }
 
+/// MAGPIE's `MAX_ALPHABET_SIZE` (`src/def/letter_distribution_defs.h`).
+pub const MAGPIE_MAX_ALPHABET_SIZE: usize = 50;
+/// MAGPIE's `MAX_SHIPPED_LETTER_BYTE_LENGTH`: the longest letter every one of
+/// its letter buffers holds (Catalan's `L·L`). Its parser's own ceiling is 5
+/// bytes (`MAX_LETTER_BYTE_LENGTH`, 6 with the terminator), but some buffers
+/// are sized for the shipped letters and would cut a longer one short.
+const MAGPIE_MAX_LETTER_BYTES: usize = 4;
+
 impl LetterDistribution {
     /// Parses a distribution from the bytes of the `input_data` row a job
     /// pins. There is no path-taking constructor and no `DATA_PATH`: the
@@ -68,27 +76,74 @@ impl LetterDistribution {
         // it (see the field comment).
         let mut machine_letters: Vec<char> = Vec::new();
         let mut unenumerable = None;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
+        // Read as MAGPIE reads it (`ld_create_internal`), so that a file this
+        // accepts -- job creation's check -- is one every worker and builder
+        // accepts, numbered the same way: lines split on '\n' with a trailing
+        // '\r' dropped, empty lines skipped and nothing else (no comments, no
+        // trimming: a `#` row is a letter to MAGPIE, and a whitespace-only line
+        // an error), empty fields dropped, then five or seven columns -- upper,
+        // lower, count, score, is_vowel, and the two fullwidth display forms --
+        // with integer count and score and a vowel flag of 0 or 1. This used to
+        // trim, skip `#` lines and want three columns, so a file MAGPIE refused
+        // passed, and a `#` letter shifted every machine letter after it.
+        let malformed = |line: &str, why: &str| {
+            AppError::internal(format!(
+                "malformed letter distribution line in {origin}: {line:?} ({why})"
+            ))
+        };
+        for raw in text.split('\n') {
+            // Only a line that is empty before its '\r' is dropped: MAGPIE
+            // skips the empty items between two '\n's, but keeps a lone "\r"
+            // -- the blank line of a CRLF file -- and refuses it for having no
+            // columns.
+            if raw.is_empty() {
                 continue;
             }
-            // MAGPIE's files carry seven columns — upper, lower, count, score,
-            // is_vowel, and the two fullwidth display forms. Only the letter and
-            // the count matter here; the rest are read by MAGPIE itself.
-            let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() < 3 {
-                return Err(AppError::internal(format!(
-                    "malformed letter distribution line in {origin}: {line:?}"
-                )));
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            // Empty fields dropped first, then a trailing '\r' stripped, in
+            // MAGPIE's order: a field that is only "\r" is a (then empty)
+            // column to it, and a line with one has a column too many.
+            let cols: Vec<&str> = line
+                .split(',')
+                .filter(|c| !c.is_empty())
+                .map(|c| c.strip_suffix('\r').unwrap_or(c))
+                .collect();
+            if cols.len() != 5 && cols.len() != 7 {
+                return Err(malformed(line, "expected 5 or 7 columns"));
             }
-            let token = cols[0].trim();
-            let letter = token.chars().next().ok_or_else(|| {
-                AppError::internal(format!("empty letter in {origin}"))
-            })?;
-            let count: u32 = cols[2].trim().parse().map_err(|_| {
+            let token = cols[0];
+            if token.trim() != token || cols[1].trim() != cols[1] {
+                return Err(malformed(line, "space around a letter"));
+            }
+            let letter = token.chars().next().ok_or_else(|| malformed(line, "empty letter"))?;
+            // A letter MAGPIE can hold everywhere: past its parser's buffer a
+            // letter ran into the next row's, and past the shipped length
+            // some of its buffers cut it short.
+            if token.len() > MAGPIE_MAX_LETTER_BYTES || cols[1].len() > MAGPIE_MAX_LETTER_BYTES {
+                return Err(malformed(line, "a letter longer than 4 bytes"));
+            }
+            // The fullwidth display forms, when given, have MAGPIE's parser's
+            // own ceiling (5 bytes; a fullwidth letter is 3): past it they
+            // were copied without their terminator.
+            if cols.len() == 7 && (cols[5].len() > 5 || cols[6].len() > 5) {
+                return Err(malformed(line, "a display form longer than 5 bytes"));
+            }
+            // MAGPIE's string_to_int allows surrounding blanks around numbers.
+            fn number(c: &str) -> &str {
+                c.trim_matches([' ', '\t'])
+            }
+            let count: u32 = number(cols[2]).parse().map_err(|_| {
                 AppError::internal(format!("non-numeric tile count in {origin}: {line:?}"))
             })?;
+            // MAGPIE stores a letter's count in a byte: 256 read as none, and
+            // a larger one overran its bag.
+            if count > 255 {
+                return Err(malformed(line, "a tile count above 255"));
+            }
+            number(cols[3]).parse::<i32>().map_err(|_| malformed(line, "non-numeric score"))?;
+            if !matches!(number(cols[4]), "0" | "1") {
+                return Err(malformed(line, "is_vowel must be 0 or 1"));
+            }
             // A letter listed twice would enumerate every rack holding it
             // twice, and give it two machine-letter numbers.
             if unenumerable.is_none() {
@@ -109,6 +164,15 @@ impl LetterDistribution {
 
         if tiles.is_empty() {
             return Err(AppError::internal(format!("{origin} contains no tiles")));
+        }
+        // MAGPIE's per-letter arrays hold MAX_ALPHABET_SIZE letters; a longer
+        // file was written past all of them by every build and worker that
+        // loaded it (and MAGPIE now refuses it, a builder failing mid-job).
+        if machine_letters.len() > MAGPIE_MAX_ALPHABET_SIZE {
+            return Err(AppError::internal(format!(
+                "{origin} has {} letters, and MAGPIE holds at most {MAGPIE_MAX_ALPHABET_SIZE}",
+                machine_letters.len()
+            )));
         }
         // Canonical rack strings are sorted, so sorting the distribution once
         // means the enumeration emits already-canonical strings.
@@ -433,11 +497,11 @@ mod tests {
 
     /// U-RACK-1: the smallest distribution there is. Written out of order, so
     /// the machine-letter numbering (file order) and the enumeration order
-    /// (sorted) visibly differ; with a comment, a blank line and the short
-    /// five-column form, which the parser skips and accepts respectively.
+    /// (sorted) visibly differ; with a blank line, a CRLF ending and the short
+    /// five-column form, which the parser skips and accepts, as MAGPIE does.
     #[test]
     fn a_minimal_two_letter_distribution_parses() {
-        let text = b"# two letters\nB,b,1,3,0\n\nA,a,2,1,1\n";
+        let text = b"B,b,1,3,0\r\n\nA,a,2,1,1\n";
         let distribution = LetterDistribution::parse(text, "two").unwrap();
         assert_eq!(distribution.tiles.len(), 2);
         assert_eq!(count_of(&distribution, 'A'), Some(2));
@@ -467,6 +531,58 @@ mod tests {
         }
     }
 
+    /// U-RACK-9: a distribution MAGPIE cannot hold -- more letters than its
+    /// `MAX_ALPHABET_SIZE` -- is refused, naming the file; one at the limit
+    /// parses. (MAGPIE loaded a longer one and wrote past every per-letter
+    /// array; job creation now refuses it up front.)
+    #[test]
+    fn a_distribution_past_magpies_alphabet_is_refused() {
+        let rows = |n: usize| -> String {
+            (0..n)
+                .map(|i| {
+                    let letter = char::from_u32(0x100 + i as u32).unwrap();
+                    format!("{letter},{letter},1,1,0\n")
+                })
+                .collect()
+        };
+        assert!(LetterDistribution::parse(rows(MAGPIE_MAX_ALPHABET_SIZE).as_bytes(), "fifty").is_ok());
+        let message = parse_error(&rows(MAGPIE_MAX_ALPHABET_SIZE + 1));
+        assert!(message.contains("at most 50"), "{message}");
+        assert!(message.contains("origin-name.csv"), "{message}");
+    }
+
+    /// U-RACK-10: what MAGPIE refuses, this refuses, and what MAGPIE numbers,
+    /// this numbers the same. A comment line, a whitespace-only line, the wrong
+    /// column count, a non-integer score, a vowel flag other than 0 or 1 and a
+    /// letter with a space round it are each refused (MAGPIE refuses the first
+    /// five, and would read the last as a two-character letter); a `#` row is a
+    /// letter, and takes its machine letter.
+    #[test]
+    fn it_reads_a_distribution_as_magpie_does() {
+        for (text, why) in [
+            ("# upper,lower,count,score,vowel\nA,a,1,1,1\n", "a comment"),
+            ("A,a,1,1,1\n  \n", "a whitespace-only line"),
+            ("A,a,1,1,1\r\n\r\nB,b,1,1,0\r\n", "a CRLF blank line"),
+            ("A,a,1,1,1\r\n\r\n", "a trailing CRLF blank line"),
+            ("C,\r,c,2,3,0\n", "a field that is only a carriage return"),
+            ("A,a,256,1,1\n", "a count above 255"),
+            ("ABCDE,abcde,1,1,1\n", "a five-byte letter"),
+            ("A,a,1,1,1,AAAAAA,a\n", "a six-byte display form"),
+            ("A,a,1,1\n", "four columns"),
+            ("A,a,1,1,1,A\n", "six columns"),
+            ("A,a,1,one,1\n", "a non-integer score"),
+            ("A,a,1,1,2\n", "a vowel flag of 2"),
+            (" A,a,1,1,1\n", "a space before the letter"),
+        ] {
+            // Refused (parse_error panics otherwise), naming the file.
+            let message = parse_error(text);
+            assert!(message.contains("origin-name.csv"), "{why}: {message}");
+        }
+        let hash = LetterDistribution::parse(b"#,#,1,1,0\nA,a,1,1,1\n", "hash").unwrap();
+        assert_eq!(hash.machine_letter('#'), Some(0));
+        assert_eq!(hash.machine_letter('A'), Some(1), "numbered after the `#` row");
+    }
+
     /// U-RACK-2: each malformed shape is refused for its own reason, and every
     /// message names the file it came from.
     #[test]
@@ -475,7 +591,7 @@ mod tests {
             ("A,a,9,1,1\nB,b\n", "malformed letter distribution line"),
             ("A,a,nine,1,1\n", "non-numeric tile count"),
             ("", "contains no tiles"),
-            ("# only a comment\n\n", "contains no tiles"),
+            ("\n\n", "contains no tiles"),
         ];
         for (text, reason) in cases {
             let message = parse_error(text);

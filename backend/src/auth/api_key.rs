@@ -46,19 +46,112 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     }
 }
 
-/// [`hash_password`] on the blocking pool.
-pub async fn hash_password_off_the_executor(password: String) -> AppResult<String> {
-    tokio::task::spawn_blocking(move || hash_password(&password))
-        .await
-        .map_err(|e| AppError::internal(format!("password hashing task failed: {e}")))?
+/// How many Argon2 runs may hold memory at once. Each takes 19 MiB (the
+/// crate's default parameters) on the blocking pool, which would run hundreds
+/// together: seven addresses' worth of logins and registrations — within
+/// every per-address limit, needing no account — took the process past its
+/// 2 GiB task, which the single instance does not survive (thirty-second
+/// audit). Four is 76 MiB, and four at a time on one vCPU is as fast as more.
+const ARGON2_CONCURRENCY: usize = 4;
+/// How long a request waits for a turn before it is told to come back: past
+/// this the queue is a flood, not a busy minute.
+const ARGON2_QUEUE_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+static ARGON2_PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(ARGON2_CONCURRENCY);
+
+async fn argon2_turn() -> AppResult<tokio::sync::SemaphorePermit<'static>> {
+    match tokio::time::timeout(ARGON2_QUEUE_WAIT, ARGON2_PERMITS.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        Ok(Err(_)) => Err(AppError::internal("the password queue is closed")),
+        Err(_) => Err(AppError {
+            retry_after: Some(10),
+            ..AppError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "the server is busy checking passwords; try again in a few seconds",
+            )
+        }),
+    }
 }
 
-/// [`verify_password`] on the blocking pool. A task that fails verifies
-/// nothing.
-pub async fn verify_password_off_the_executor(password: String, hash: String) -> bool {
-    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+type Argon2Job = Box<dyn FnOnce() + Send + 'static>;
+
+/// The threads Argon2 runs on: exactly `ARGON2_CONCURRENCY`, for good. Each
+/// run allocates its 19 MiB on the thread it runs on, and glibc keeps a
+/// thread's freed memory for that thread; on the blocking pool, which rotates
+/// work across many threads, that held 36 runs' worth after a flood although
+/// only four ran at a time (694 MB measured). On four threads of its own it
+/// is four runs' worth.
+fn argon2_threads() -> &'static std::sync::mpsc::Sender<Argon2Job> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<Argon2Job>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (sender, receiver) = std::sync::mpsc::channel::<Argon2Job>();
+        let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
+        for n in 0..ARGON2_CONCURRENCY {
+            let receiver = receiver.clone();
+            std::thread::Builder::new()
+                .name(format!("argon2-{n}"))
+                .spawn(move || loop {
+                    let job = match receiver.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => return,
+                    };
+                    match job {
+                        Ok(job) => job(),
+                        Err(_) => return,
+                    }
+                })
+                .expect("an Argon2 thread starts");
+        }
+        sender
+    })
+}
+
+/// Runs `work` on an Argon2 thread once a turn is free. A panic in it is
+/// caught there, so the thread lives on, and reported as a failure.
+///
+/// The turn travels with the job and is given back when the job is done, not
+/// when the request is: held by the request, a client that hung up gave its
+/// turn back while its run stayed queued, so the queue grew past the turns
+/// with nothing shedding it — 2,000 abandoned logins left a fresh one waiting
+/// 46 s, and no request was ever told `503` (the audit's adversarial check). A
+/// job whose requester has gone is skipped.
+async fn on_an_argon2_thread<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> AppResult<T> {
+    let turn = argon2_turn().await?;
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    argon2_threads()
+        .send(Box::new(move || {
+            let _turn = turn;
+            if sender.is_closed() {
+                return;
+            }
+            if let Ok(value) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+                let _ = sender.send(value);
+            }
+        }))
+        .map_err(|_| AppError::internal("the password threads are gone"))?;
+    receiver
         .await
-        .unwrap_or(false)
+        .map_err(|_| AppError::internal("hashing a password did not finish"))
+}
+
+/// [`hash_password`] on an Argon2 thread, one of at most `ARGON2_CONCURRENCY`.
+pub async fn hash_password_off_the_executor(password: String) -> AppResult<String> {
+    on_an_argon2_thread(move || hash_password(&password)).await?
+}
+
+/// [`verify_password`] on an Argon2 thread, one of at most
+/// `ARGON2_CONCURRENCY`. A run that fails verifies nothing; a request that
+/// waited too long for its turn is a `503`.
+pub async fn verify_password_off_the_executor(password: String, hash: String) -> AppResult<bool> {
+    match on_an_argon2_thread(move || verify_password(&password, &hash)).await {
+        Ok(verified) => Ok(verified),
+        // Waited too long for a turn: the caller is told to come back.
+        Err(err) if err.status == axum::http::StatusCode::SERVICE_UNAVAILABLE => Err(err),
+        Err(_) => Ok(false),
+    }
 }
 
 /// Single-use codes emailed to the user (confirmation, password reset). Stored
@@ -76,6 +169,50 @@ pub fn hash_code(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Argon2 runs wait for one of `ARGON2_CONCURRENCY` turns: with every
+    /// turn taken, a hash does not start, and it runs as soon as one is given
+    /// back. Unbounded, a flood of logins held 19 MiB each on hundreds of
+    /// blocking threads and took the process past its memory.
+    #[tokio::test]
+    async fn argon2_runs_wait_for_a_turn() {
+        let held = ARGON2_PERMITS.acquire_many(ARGON2_CONCURRENCY as u32).await.unwrap();
+        let hashing = tokio::spawn(hash_password_off_the_executor("correct horse".into()));
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!hashing.is_finished(), "a hash ran with every turn taken");
+        drop(held);
+        let hash = tokio::time::timeout(std::time::Duration::from_secs(10), hashing)
+            .await
+            .expect("it runs once a turn is free")
+            .unwrap()
+            .unwrap();
+        assert!(verify_password("correct horse", &hash));
+    }
+
+    /// A request that goes away gives its turn back only when its run is
+    /// done or skipped: abandoned requests cannot queue runs past the turns.
+    #[tokio::test]
+    async fn abandoned_argon2_runs_do_not_queue_past_the_turns() {
+        let mut abandoned = Vec::new();
+        // A run takes ~30 ms here, so a thousand queued runs are seconds of
+        // wait for four threads; skipped, they are nothing.
+        for _ in 0..1000 {
+            let request = tokio::spawn(hash_password_off_the_executor("abandoned".into()));
+            tokio::time::sleep(std::time::Duration::from_micros(200)).await;
+            request.abort();
+            abandoned.push(request);
+        }
+        let started = std::time::Instant::now();
+        let hash = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            hash_password_off_the_executor("fresh".into()),
+        )
+        .await
+        .expect("a fresh request is not stuck behind abandoned ones")
+        .unwrap();
+        assert!(verify_password("fresh", &hash));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+    }
 
     /// U-AUTH-1: lookup is an exact match on the hash, so hashing must be
     /// deterministic -- and two generated keys must not collide.

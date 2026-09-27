@@ -6,9 +6,9 @@ use std::time::Duration;
 ///
 /// In development every value comes from the environment (`.env` is loaded on
 /// startup). In ECS the same variables are populated by the task definition,
-/// which pulls the secret-valued ones from SSM Parameter Store and Secrets
-/// Manager — so the process only ever reads environment variables and there is
-/// no separate secrets code path.
+/// which pulls the secret-valued ones from SSM Parameter Store -- so the
+/// process only ever reads environment variables and there is no separate
+/// secrets code path.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_url: String,
@@ -23,6 +23,12 @@ pub struct Config {
     pub mail_from: String,
     pub public_url: String,
     pub heartbeat_timeout: Duration,
+    /// How old a job's stats payload may be when served: the job page, the
+    /// stream's first event, and the spacing of live pushes. The payload
+    /// reads the job's whole history (its contributors, its game results),
+    /// which grows without bound; rebuilt on every view and every second a
+    /// busy job was watched, it cost a second of database time per second.
+    pub stats_cache: Duration,
     pub s3_bucket: String,
     pub s3_endpoint: Option<String>,
     /// The oldest MAGPIE that may contribute at all. Enforced, not advisory:
@@ -66,6 +72,12 @@ pub struct Config {
     /// peer; 1 is right behind the ALB and behind the local Nginx. See
     /// `clientip`.
     pub trusted_proxy_hops: usize,
+    /// The most account mails sent a second under `ses`: the account's
+    /// sending rate (1 in SES's sandbox, 14 by default after). Sends past it
+    /// wait their turn; sent at once, a burst of registrations exceeded the
+    /// rate and SES refused them -- lost mail, and the mail-failed alarm, at
+    /// any visitor's call (the audit's pass 25).
+    pub mail_max_per_second: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,15 +124,25 @@ fn parsed<T: std::str::FromStr>(lookup: Lookup, key: &str, default: T) -> Result
     }
 }
 
+/// [`parsed`] for a number of seconds that must lie in `min..=max`: out of
+/// range, a value fails startup naming the setting and its range.
+fn seconds_in(lookup: Lookup, key: &str, default: u64, min: u64, max: u64) -> Result<Duration> {
+    let value = parsed(lookup, key, default)?;
+    if !(min..=max).contains(&value) {
+        anyhow::bail!("{key} must be between {min} and {max} seconds, got {value}");
+    }
+    Ok(Duration::from_secs(value))
+}
+
 /// `DATABASE_URL` if it is set; otherwise one assembled from `DB_HOST`,
 /// `DB_PORT`, `DB_NAME`, `DB_USER` and `DB_PASSWORD`.
 ///
-/// The parts exist for the deployment. RDS manages the master password in
-/// Secrets Manager and rotates it (every seven days by default), so a
-/// hand-written `DATABASE_URL` in SSM goes stale by itself. ECS can inject the
-/// password straight from the managed secret, and the host is a Terraform
-/// output, so neither needs to be copied anywhere by hand. The password is
-/// percent-encoded: a generated one can contain `@`, `/` or `:`.
+/// The parts are for a deployment that injects the password on its own --
+/// from a secret RDS manages and rotates, say. This one does not: the master
+/// password is set by hand and lives only inside the `DATABASE_URL` SSM
+/// parameter (`infra/rds.tf`, README.md "Deploying"), because a password RDS
+/// rotated would leave that URL stale. The password is percent-encoded: a
+/// generated one can contain `@`, `/` or `:`.
 fn resolve_database_url(get: impl Fn(&str) -> Option<String>) -> Result<String> {
     if let Some(url) = get("DATABASE_URL") {
         return Ok(url);
@@ -179,6 +201,24 @@ impl Config {
         if mail_backend == MailBackend::File && mail_outbox_dir.is_none() {
             anyhow::bail!("MAIL_BACKEND=file needs MAIL_OUTBOX_DIR, the directory to write to");
         }
+        // Real mail goes out from a real address with links to the real site.
+        // The defaults are a laptop's: under `ses` they sent from
+        // `birdtest.local`, which SES refuses, with links to localhost.
+        let (mail_from, public_url) = (var("MAIL_FROM"), var("PUBLIC_URL"));
+        if mail_backend == MailBackend::Ses {
+            for (key, value) in [("MAIL_FROM", &mail_from), ("PUBLIC_URL", &public_url)] {
+                if value.is_none() {
+                    anyhow::bail!("MAIL_BACKEND=ses needs {key}; its default is only for local use");
+                }
+            }
+        }
+        // Links are built as `{PUBLIC_URL}/confirm-email?...`: a trailing
+        // slash made them `//confirm-email`.
+        let public_url = public_url
+            .as_deref()
+            .unwrap_or("http://localhost:5173")
+            .trim_end_matches('/')
+            .to_string();
 
         let secure_cookies = match var_or("SECURE_COOKIES", "false").as_str() {
             "true" => true,
@@ -186,37 +226,53 @@ impl Config {
             other => anyhow::bail!("SECURE_COOKIES must be 'true' or 'false', got {other:?}"),
         };
 
-        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.0");
-        if crate::version::Version::parse_or_zero(&min_magpie_version)
-            == crate::version::Version::ZERO
-            && min_magpie_version.trim() != "0.0.0"
-        {
-            anyhow::bail!("MIN_MAGPIE_VERSION {min_magpie_version:?} is not a version");
+        let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.1");
+        // Strictly, as a job's floor is: the new-job form offers this value,
+        // and one read loosely here ("0.2.0-rc1") was then refused there on
+        // every job an admin created without touching the field.
+        if crate::version::Version::parse_strict(&min_magpie_version).is_none() {
+            anyhow::bail!(
+                "MIN_MAGPIE_VERSION {min_magpie_version:?} is not a version (major.minor[.patch])"
+            );
+        }
+
+        let bind_addr = var_or("BIND_ADDR", "0.0.0.0:8080");
+        if bind_addr.parse::<std::net::SocketAddr>().is_err() {
+            anyhow::bail!("BIND_ADDR must be an IP address and port, got {bind_addr:?}");
         }
 
         Ok(Self {
             database_url: resolve_database_url(var)?,
-            bind_addr: var_or("BIND_ADDR", "0.0.0.0:8080"),
+            bind_addr,
             session_signing_key,
-            session_ttl: Duration::from_secs(parsed_u64("SESSION_TTL_SECONDS", 604_800)?),
+            // A minute to a year: 0 issued sessions already expired, and a
+            // TTL past what a date can hold panicked every sign-in.
+            session_ttl: seconds_in(lookup, "SESSION_TTL_SECONDS", 604_800, 60, 31_536_000)?,
             secure_cookies,
             mail_backend,
             mail_outbox_dir,
-            mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
-            public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
-            heartbeat_timeout: Duration::from_secs(parsed_u64("HEARTBEAT_TIMEOUT_SECONDS", 300)?),
+            mail_from: mail_from.unwrap_or_else(|| "no-reply@birdtest.local".into()),
+            public_url,
+            // At least 180 s. Below MAGPIE's thirty-second cadence a live claim
+            // lapsed, and each claim request handed the fleet's running tasks
+            // to someone else (the audit's pass 12). 180 is six heartbeats. It
+            // is not a promise for a bad link: one heartbeat stalled until
+            // MAGPIE gives up on it leaves about 187 s between recorded ones,
+            // which lapses a claim at the floor, and one that crawls lapses it
+            // at any setting (KL-83); the default is 300. At most a day, which
+            // the restart grace and SQL intervals can hold.
+            heartbeat_timeout: seconds_in(lookup, "HEARTBEAT_TIMEOUT_SECONDS", 300, 180, 86_400)?,
+            stats_cache: Duration::from_secs(parsed_u64("JOB_STATS_CACHE_SECONDS", 10)?),
             s3_bucket: var_or("S3_BUCKET", "birdtest-artifacts"),
             s3_endpoint: var("S3_ENDPOINT"),
-            // 0.1.0 is `birdtest-contribute`'s pre-release version. Neither
-            // birdtest nor the branch is in production yet, so everything the
-            // protocol relies on -- every result-changing setting stated on
-            // the request rather than taken from the worker's build, input
-            // data and derived files checked against the hashes the job pins,
-            // the word info table switched off before every load, a seed on
-            // every task -- is in 0.1.0. The version moves only when a
-            // release changes what a task computes, and this floor moves with
-            // it; until then there is nothing below it to refuse, and the
-            // floor exists so that the first such release can raise it.
+            // 0.1.1 is the `birdtest-contribute` version the backend image
+            // pins. The branch's version moves whenever a change can alter
+            // what a task computes, and this floor moves with it: it is the
+            // only way to keep a build known to compute something wrong off
+            // the fleet. 0.1.0 is below it because builds reporting it
+            // include ones where a capturing static player played its worst
+            // move, and every one of them played a leave task after its
+            // first with the previous task's KLV.
             min_magpie_version,
             magpie_download_url: var_or(
                 "MAGPIE_DOWNLOAD_URL",
@@ -233,6 +289,11 @@ impl Config {
                 .trim_end_matches('/')
                 .to_string(),
             trusted_proxy_hops: parsed(lookup, "TRUSTED_PROXY_HOPS", 0usize)?,
+            mail_max_per_second: match parsed(lookup, "MAIL_MAX_PER_SECOND", 1u32)? {
+                // Past a billion the pacer's period is 0, and startup panicked.
+                n @ 1..=1000 => n,
+                n => anyhow::bail!("MAIL_MAX_PER_SECOND must be 1 to 1000, got {n}"),
+            },
         })
     }
 }
@@ -274,14 +335,15 @@ mod tests {
             ("MAIL_BACKEND", "Console", "ses", |c| format!("{:?}", c.mail_backend)),
             ("MAIL_FROM", "no-reply@birdtest.local", "a@b.c", |c| c.mail_from.clone()),
             ("PUBLIC_URL", "http://localhost:5173", "https://x.y", |c| c.public_url.clone()),
-            ("HEARTBEAT_TIMEOUT_SECONDS", "300", "70", |c| {
+            ("HEARTBEAT_TIMEOUT_SECONDS", "300", "180", |c| {
                 c.heartbeat_timeout.as_secs().to_string()
             }),
+            ("JOB_STATS_CACHE_SECONDS", "10", "0", |c| c.stats_cache.as_secs().to_string()),
             ("S3_BUCKET", "birdtest-artifacts", "other", |c| c.s3_bucket.clone()),
             ("S3_ENDPOINT", "None", "http://minio:9000", |c| {
                 c.s3_endpoint.clone().unwrap_or_else(|| "None".into())
             }),
-            ("MIN_MAGPIE_VERSION", "0.1.0", "1.10.0", |c| c.min_magpie_version.clone()),
+            ("MIN_MAGPIE_VERSION", "0.1.1", "1.10.0", |c| c.min_magpie_version.clone()),
             ("MAGPIE_DOWNLOAD_URL", "https://github.com/jvc56/MAGPIE", "https://d", |c| {
                 c.magpie_download_url.clone()
             }),
@@ -294,6 +356,7 @@ mod tests {
                 c.github_token.clone().unwrap_or_else(|| "None".into())
             }),
             ("TRUSTED_PROXY_HOPS", "0", "2", |c| c.trusted_proxy_hops.to_string()),
+            ("MAIL_MAX_PER_SECOND", "1", "14", |c| c.mail_max_per_second.to_string()),
             ("GITHUB_API_URL", "https://api.github.com", "http://fixtures:80", |c| {
                 c.github_api_url.clone()
             }),
@@ -310,7 +373,14 @@ mod tests {
             // An empty value is unset, not an empty setting.
             let empty = config(&[(key, "")]).unwrap();
             assert_eq!(read(&empty), *default, "{key} empty");
-            let given = config(&[(key, set)]).unwrap();
+            let given = match *key {
+                // Which needs a sender and a site of its own (U-CFG-2).
+                "MAIL_BACKEND" => {
+                    config(&[(key, set), ("MAIL_FROM", "a@b.c"), ("PUBLIC_URL", "https://x.y")])
+                }
+                _ => config(&[(key, set)]),
+            }
+            .unwrap();
             let expected = if *key == "MAIL_BACKEND" { "Ses" } else { set };
             assert_eq!(read(&given), expected, "{key} set");
         }
@@ -335,18 +405,40 @@ mod tests {
         for (key, value) in [
             ("HEARTBEAT_TIMEOUT_SECONDS", "5m"),
             ("SESSION_TTL_SECONDS", "-1"),
+            // Out of range: a claim lapsing between heartbeats, a session
+            // born expired, an instant past what a date holds.
+            ("HEARTBEAT_TIMEOUT_SECONDS", "0"),
+            ("HEARTBEAT_TIMEOUT_SECONDS", "179"),
+            ("HEARTBEAT_TIMEOUT_SECONDS", "86401"),
+            ("HEARTBEAT_TIMEOUT_SECONDS", "18446744073709551615"),
+            ("SESSION_TTL_SECONDS", "0"),
+            ("SESSION_TTL_SECONDS", "31536001"),
+            // A host name: it failed only after the migrations.
+            ("BIND_ADDR", "localhost:8080"),
             ("MAGPIE_THREADS", "two"),
             ("TRUSTED_PROXY_HOPS", "one"),
+            ("MAIL_MAX_PER_SECOND", "0"),
+            ("MAIL_MAX_PER_SECOND", "2000000000"),
             ("SECURE_COOKIES", "yes"),
             ("MAIL_BACKEND", "smtp"),
             // The file backend with nowhere to write.
             ("MAIL_BACKEND", "file"),
+            // SES with the local sender and site.
+            ("MAIL_BACKEND", "ses"),
         ] {
             let err = config(&[(key, value)]).unwrap_err();
             assert!(err.to_string().contains(key), "{key}={value}: {err}");
         }
         let file = config(&[("MAIL_BACKEND", "file"), ("MAIL_OUTBOX_DIR", "/outbox")]).unwrap();
         assert_eq!(file.mail_backend, MailBackend::File);
+        let ses = [("MAIL_BACKEND", "ses"), ("MAIL_FROM", "a@b.c"), ("PUBLIC_URL", "https://x.y")];
+        for missing in ["MAIL_FROM", "PUBLIC_URL"] {
+            let pairs: Vec<_> = ses.into_iter().filter(|(k, _)| *k != missing).collect();
+            let err = config(&pairs).unwrap_err();
+            assert!(err.to_string().contains(missing), "{err}");
+        }
+        let slash = config(&[("PUBLIC_URL", "https://x.y//")]).unwrap();
+        assert_eq!(slash.public_url, "https://x.y");
     }
 
     /// U-CFG-3: `MIN_MAGPIE_VERSION` goes through `Version`, so a malformed
@@ -354,7 +446,9 @@ mod tests {
     /// client; an explicit 0.0.0 is still a floor someone chose.
     #[test]
     fn a_malformed_version_floor_fails_startup() {
-        for bad in ["latest", "v1", "1.x", "one.two.three"] {
+        // And strictly, as a job's floor is: "0.2.0-rc1" and "1.6.x" were
+        // accepted here and refused on every job created from the form.
+        for bad in ["latest", "v1", "1.x", "one.two.three", "0.2.0-rc1", "1.6.x", "1.6.0.1"] {
             let err = config(&[("MIN_MAGPIE_VERSION", bad)]).unwrap_err();
             assert!(err.to_string().contains("MIN_MAGPIE_VERSION"), "{bad}: {err}");
         }

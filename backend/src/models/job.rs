@@ -51,12 +51,22 @@ pub struct Job {
     pub claims_issued: i64,
     /// Where the job's share is measured from: the scheduler orders on
     /// `(claims_issued - claims_baseline) / allocation`. Reset to parity with
-    /// the other jobs offering work on activation, on an allocation change and
-    /// on a purge; see `scheduler::join_at_parity`.
+    /// the jobs being served on activation, on an allocation change and on a
+    /// purge (`scheduler::join_at_parity`); lifted to parity when a claim passes
+    /// the job over for want of a task (`scheduler::lift_passed_over`), on its
+    /// first claim after a heartbeat timeout unserved, and on each claim within
+    /// `scheduler::JOIN_SETTLE` of joining.
     pub claims_baseline: i64,
     /// When the job last issued a claim. What `scheduler::join_at_parity` reads
-    /// to tell a job being served from one that is only on offer.
+    /// to tell a job being served from one that is only on offer, and the
+    /// claim path to tell a job returning from a spell unserved.
     pub last_claimed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The SPRT verdict the job was completed on, if the finish check completed
+    /// it: `passed`, `failed` or `terminated_at_max`, the LLR it crossed at,
+    /// and the units it had then. All three or none.
+    pub sprt_decided_status: Option<String>,
+    pub sprt_decided_llr: Option<f64>,
+    pub sprt_decided_units: Option<i64>,
     /// Games recorded by the first accepted result of each task; the dashboard's
     /// progress numerator, maintained in the submit transaction rather than
     /// summed on read. A pairs job's unit count is half of it.
@@ -64,6 +74,10 @@ pub struct Job {
     /// Distinct opening racks with an accepted analysis, on the same terms.
     pub racks_analyzed: i64,
     pub created_at: DateTime<Utc>,
+    /// When the job last joined the jobs on offer: its activation, a purge, or
+    /// its first claim after a spell unserved. The scheduler settles a job for
+    /// an hour from it (`scheduler::JOIN_SETTLE`); the ETA's rate is measured
+    /// from it.
     pub activated_at: Option<DateTime<Utc>>,
     pub deactivated_at: Option<DateTime<Utc>>,
 }

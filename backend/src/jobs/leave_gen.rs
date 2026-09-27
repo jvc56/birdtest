@@ -58,10 +58,15 @@ impl JobHandler for LeaveGenHandler {
         template: &JobTemplate,
         task_id: Uuid,
     ) -> AppResult<Self::Request> {
+        // The artifact's hash is read from the row that names it rather than
+        // stored with the request: one source, whichever path sends the task.
         let row = sqlx::query(
-            "SELECT lexicon, variant, letter_distribution, board_layout, generation, seed,
-                    forced_racks, num_games, previous_artifact_key, use_wordmap
-             FROM leave_requests WHERE task_id = $1",
+            "SELECT r.lexicon, r.variant, r.letter_distribution, r.board_layout, r.generation,
+                    r.seed, r.forced_racks, r.num_games, r.previous_artifact_key, r.use_wordmap,
+                    COALESCE(a.served_sha256, a.sha256) AS previous_artifact_sha256
+             FROM leave_requests r
+             JOIN leave_generation_artifacts a ON a.artifact_key = r.previous_artifact_key
+             WHERE r.task_id = $1",
         )
         .bind(task_id)
         .fetch_one(&mut *conn)
@@ -76,15 +81,20 @@ impl JobHandler for LeaveGenHandler {
             forced_racks: row.get("forced_racks"),
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
+            previous_artifact_sha256: row.get("previous_artifact_sha256"),
             use_wordmap: row.get("use_wordmap"),
             bingo_bonus: template.data.bingo_bonus,
         })
     }
 
-    fn process_response(response: Self::Response) -> AppResult<Self::Record> {
+    fn process_response(mut response: Self::Response) -> AppResult<Self::Record> {
         if response.racks.is_empty() {
             return Err(AppError::bad_request("leave result carried no rack occurrences"));
         }
+        for occurrence in &mut response.racks {
+            spell_as_the_universe(&mut occurrence.rack);
+        }
+        // After spelling: one rack under two spellings is a duplicate too.
         super::plausibility::check_rack_occurrences(&response.racks)?;
         Ok(LeaveRecord { racks: response.racks })
     }
@@ -103,6 +113,35 @@ impl JobHandler for LeaveGenHandler {
         stage_fold(conn, template.job_id, task_id, record).await
     }
 }
+
+/// A reported rack spelled as the generation's universe spells it: its letters
+/// in code-point order (`racks::RackIndex`), so a blank, `?`, comes first.
+///
+/// MAGPIE spells a rack in its own machine-letter order, the distribution
+/// file's, with blanks last: it plays the forced `?AEINST` and reports
+/// `AEINST?`, and German's `AEINRSÄ` comes back `AÄEINRS`. The merge matches
+/// racks exactly and drops what matches nothing, so every rack holding a blank
+/// — 22% of English's — never gained an occurrence, was forced on every lap,
+/// and an English generation could never close (the audit's pass 6). A rack
+/// with a bracketed multi-character letter is left as it is: leave generation
+/// refuses such distributions, and it matches nothing either way.
+///
+/// In place, and only for a string that could be a rack: seven letters of at
+/// most four bytes. Anything else is left for plausibility to refuse without
+/// a copy -- spelled first, a 60 MiB "rack" cost 300 MB and a third of a
+/// second before it was refused, past the large-result budget (the audit's
+/// pass 7).
+pub fn spell_as_the_universe(rack: &mut String) {
+    if rack.len() > MAX_RACK_BYTES || rack.contains(['[', ']']) {
+        return;
+    }
+    let mut letters: Vec<char> = rack.chars().collect();
+    letters.sort_unstable();
+    *rack = letters.into_iter().collect();
+}
+
+/// The longest a full rack's string can be: seven letters of up to four bytes.
+const MAX_RACK_BYTES: usize = 7 * 4;
 
 /// Records that a claim did a task's work, without adding its occurrences to
 /// the generation.
@@ -246,6 +285,16 @@ async fn stage_fold(
 /// the rating fits' (2).
 const MERGE_LOCK_NAMESPACE: i32 = 3;
 
+/// About how many of the generation's racks one pass of a merge sums (see
+/// [`merge_staged`]): their hash table, 74-90 MB for 400,000, fits the pass's
+/// hash memory (`work_mem` 64 MB times `hash_mem_multiplier`, 2 by default),
+/// so the pass spills nothing. The database backend running it peaks at about
+/// 130 MB in all, the statement's other rows included.
+pub const MERGE_RACKS_PER_PASS: i64 = 400_000;
+
+/// Merges running at once, across every job (see [`merge_staged_in_slices`]).
+static MERGE_TURNS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
 /// Take `job_id`'s merge lock for the rest of the caller's transaction, waiting
 /// out a merge that is running.
 ///
@@ -286,10 +335,10 @@ pub struct MergeOutcome {
 /// refresh the generation's summary (racks at target, the rack furthest from
 /// it) while the rows are warm.
 ///
-/// One statement takes the staged rows and applies their sum, so a staged
-/// submission is either still staged or folded in, never both and never
-/// neither; a submission that commits while this runs is simply not in the
-/// statement's snapshot, and waits for the next merge.
+/// One transaction reads which rows are staged, applies their sum and deletes
+/// exactly those rows, so a staged submission is either still staged or
+/// folded in, never both and never neither; a submission that commits while
+/// this runs is not among the rows read, and waits for the next merge.
 ///
 /// Merges of one job serialize on an advisory lock: two of them would
 /// otherwise each take a disjoint set of staged rows and then update
@@ -309,6 +358,19 @@ pub async fn merge_staged(
     generation: i32,
     wait: bool,
 ) -> AppResult<Option<MergeOutcome>> {
+    merge_staged_in_slices(pool, job_id, generation, wait, MERGE_RACKS_PER_PASS).await
+}
+
+/// [`merge_staged`], summing at most about `racks_per_pass` of the
+/// generation's racks a pass. Public so a test can make a small universe take
+/// several passes.
+pub async fn merge_staged_in_slices(
+    pool: &sqlx::PgPool,
+    job_id: Uuid,
+    generation: i32,
+    wait: bool,
+    racks_per_pass: i64,
+) -> AppResult<Option<MergeOutcome>> {
     let mut tx = pool.begin().await?;
     if wait {
         lock_merges(&mut tx, job_id).await?;
@@ -323,40 +385,134 @@ pub async fn merge_staged(
             return Ok(None);
         }
     }
+    // At most two merges at once, whatever their jobs: a pass's backend holds
+    // about 130 MB, and each job's claims and sweep start their own merges on
+    // a database the Terraform sizes at 1 GiB. Taken after the job's lock, so
+    // a turn is only ever held by a merge that is running: taken before it,
+    // two callers waiting on one job's running merge held both turns and
+    // every other job's merges gave up or waited behind them (the audit's
+    // pass 7). A caller that would not wait gives up here as at the lock.
+    let _turn = if wait {
+        MERGE_TURNS.acquire().await.map_err(|_| AppError::internal("merges are closed"))?
+    } else {
+        match MERGE_TURNS.try_acquire() {
+            Ok(turn) => turn,
+            Err(_) => return Ok(None),
+        }
+    };
 
     let started = std::time::Instant::now();
-    // An UPDATE rather than an upsert: the generation's universe is every full
-    // rack, seeded up front, so a rack with no row is not a rack of this
-    // distribution and must not create one.
-    let row = sqlx::query(
-        "WITH taken AS (
-             DELETE FROM leave_rack_staging
-             WHERE job_id = $1 AND generation = $2
-             RETURNING racks, counts, equity_sums
-         ),
-         folded AS (
-             SELECT u.rack, SUM(u.count)::bigint AS count, SUM(u.equity_sum) AS equity_sum
-             FROM taken, UNNEST(taken.racks, taken.counts, taken.equity_sums)
-                  AS u(rack, count, equity_sum)
-             GROUP BY u.rack
-         ),
-         applied AS (
-             UPDATE leave_rack_progress p SET
-                 occurrence_count = p.occurrence_count + f.count,
-                 equity_sum       = p.equity_sum + f.equity_sum,
-                 updated_at       = now()
-             FROM folded f
-             WHERE p.job_id = $1 AND p.generation = $2 AND p.rack = f.rack
-             RETURNING 1
-         )
-         SELECT (SELECT COUNT(*) FROM taken) AS folds, (SELECT COUNT(*) FROM applied) AS racks",
+    // What this merge takes: the rows staged now. A result staged while it
+    // runs waits for the next one, whole.
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id FROM leave_rack_staging WHERE job_id = $1 AND generation = $2 ORDER BY id",
     )
     .bind(job_id)
     .bind(generation)
-    .fetch_one(&mut *tx)
+    .fetch_all(&mut *tx)
     .await?;
-    let outcome =
-        MergeOutcome { folds_merged: row.get("folds"), racks_updated: row.get("racks") };
+    // In one statement the merge's temporary files grew with everything
+    // staged: 2.9 GB for 200 results of 150,000 racks, on a volume of 20 GiB,
+    // and a backlog after an outage is larger (the audit's pass 6). Two
+    // things spilled. `UNNEST(a, b, c)` in `FROM` materializes each array
+    // before anything reads it; unnested in the select list, the arrays
+    // stream. And the sum over every element staged was a sort of all of
+    // them, or a hash table of every rack of the generation -- 650 MB for
+    // English, past any sensible `work_mem`. So the racks are summed a slice
+    // at a time, by hash, a pass per slice, with the slice's hash table held
+    // in memory: 400,000 racks take 74-90 MB, and a pass spills nothing however
+    // much is staged. The number of passes follows the generation's size, not
+    // the backlog (eight for English), so a merge's time grows linearly with
+    // what is staged; each rack's row is still written once. (A first version
+    // took a pass per fifty results, which bounded the spill but made the
+    // time grow as the square of the backlog: 7.7 minutes at a thousand.)
+    // The generation's size from its summary, which every merge keeps; counted
+    // only before the first. Nothing to count at all when nothing is staged.
+    let universe: i64 = if ids.is_empty() {
+        0
+    } else {
+        sqlx::query_scalar(
+            "SELECT COALESCE(
+                 (SELECT racks_total FROM leave_generation_progress
+                  WHERE job_id = $1 AND generation = $2 AND merged_at IS NOT NULL),
+                 (SELECT COUNT(*) FROM leave_rack_progress WHERE job_id = $1 AND generation = $2))",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .fetch_one(&mut *tx)
+        .await?
+    };
+    let per_pass = racks_per_pass.max(1);
+    let passes = if ids.is_empty() {
+        0
+    } else {
+        ((universe + per_pass - 1) / per_pass).clamp(1, i64::from(i32::MAX)) as i32
+    };
+    // The planner cannot see how few racks a slice holds (it guesses from
+    // `unnest`), and would sort every element staged instead; with sorting
+    // off it sums them in a hash table and sorts only the slice's sums.
+    sqlx::query("SET LOCAL work_mem = '64MB'").execute(&mut *tx).await?;
+    sqlx::query("SET LOCAL enable_sort = off").execute(&mut *tx).await?;
+    let (mut racks_updated, mut reported) = (0i64, 0i64);
+    for pass in 0..passes {
+        // An UPDATE rather than an upsert: the generation's universe is every
+        // full rack, seeded up front, so a rack with no row is not a rack of
+        // this distribution and must not create one.
+        let row = sqlx::query(
+            "WITH folded AS (
+                 SELECT u.rack, SUM(u.count)::bigint AS count, SUM(u.equity_sum) AS equity_sum
+                 FROM (SELECT unnest(s.racks) AS rack, unnest(s.counts) AS count,
+                              unnest(s.equity_sums) AS equity_sum
+                       FROM leave_rack_staging s
+                       WHERE s.id = ANY($3)) u
+                 WHERE $4 = 1 OR (hashtext(u.rack) & 2147483647) % $4 = $5
+                 GROUP BY u.rack
+                 -- In key order, so the update walks the primary key rather
+                 -- than probing it at random: on a database whose memory
+                 -- does not hold the generation (1 GiB, the Terraform's
+                 -- default) a merge took 11 minutes unsorted and 2 sorted.
+                 ORDER BY u.rack
+             ),
+             applied AS (
+                 UPDATE leave_rack_progress p SET
+                     occurrence_count = p.occurrence_count + f.count,
+                     equity_sum       = p.equity_sum + f.equity_sum,
+                     updated_at       = now()
+                 FROM folded f
+                 WHERE p.job_id = $1 AND p.generation = $2 AND p.rack = f.rack
+                 RETURNING 1
+             )
+             SELECT (SELECT COUNT(*) FROM applied) AS racks, (SELECT COUNT(*) FROM folded) AS reported",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .bind(&ids)
+        .bind(passes)
+        .bind(pass)
+        .fetch_one(&mut *tx)
+        .await?;
+        racks_updated += row.get::<i64, _>("racks");
+        reported += row.get::<i64, _>("reported");
+    }
+    sqlx::query("RESET work_mem").execute(&mut *tx).await?;
+    sqlx::query("RESET enable_sort").execute(&mut *tx).await?;
+    let folds_merged = sqlx::query("DELETE FROM leave_rack_staging WHERE id = ANY($1)")
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected() as i64;
+    let outcome = MergeOutcome { folds_merged, racks_updated };
+    // A rack that matched no row is not one of the distribution's full racks
+    // as the universe spells them: a broken client, or a spelling the server
+    // has stopped undoing. Dropped either way, but not silently -- it was
+    // silent while a fifth of every result went nowhere.
+    let unmatched = reported - racks_updated;
+    if unmatched > 0 {
+        tracing::warn!(
+            job_id = %job_id, generation, unmatched,
+            "a merge dropped racks that are not in the generation's universe"
+        );
+    }
 
     // The summary the dashboard reads, recomputed only when the rows moved (or
     // it has never been computed): a count over the generation, which was the
@@ -677,10 +833,9 @@ pub const SWEEP_WHILE_TASKS_REMAIN: i64 = 100;
 /// walking past racks already at target; here the set below target is small by
 /// construction, so the exclusion is too.
 ///
-/// Which one is decided from the generation's summary row, which a merge
-/// refreshes -- the same age as the counts both selections read. Going from the
-/// first to the second is safe at any moment, because the second excludes
-/// everything out; nothing goes the other way, since counts only grow.
+/// Which one is decided at a lap's boundary ([`at_boundary`]) and then kept:
+/// a lap in progress runs to its end, and the tail, once begun, runs to the
+/// generation's close.
 ///
 /// `lexicon` is the name of the row the job pins, from its template.
 pub async fn next_step(
@@ -694,22 +849,22 @@ pub async fn next_step(
         return Ok(LeaveGenStep::Finished);
     };
 
-    // Absent until the universe is seeded, which the caller has checked; read
-    // as "few" if it is missing anyway, since that selection assumes nothing.
-    let below_target: i64 = sqlx::query_scalar(
-        "SELECT racks_total - racks_at_target FROM leave_generation_progress
-         WHERE job_id = $1 AND generation = $2",
+    // Where the generation is: mid-lap (a cursor), in its tail (a row with no
+    // cursor), or at a lap's boundary (no row).
+    let place: Option<Option<String>> = sqlx::query_scalar(
+        "SELECT cursor_rack FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2",
     )
     .bind(job_id)
     .bind(generation)
     .fetch_optional(&mut *conn)
-    .await?
-    .unwrap_or(0);
-
-    let selected = if below_target > SWEEP_WHILE_TASKS_REMAIN * i64::from(config.racks_per_task) {
-        sweep(conn, job_id, generation, config).await?
-    } else {
-        furthest_below_target(conn, job_id, generation, config).await?
+    .await?;
+    let selected = match place {
+        Some(Some(cursor)) => match continue_lap(conn, job_id, generation, config, &cursor).await? {
+            Some(selected) => selected,
+            None => at_boundary(conn, job_id, generation, config).await?,
+        },
+        Some(None) => furthest_below_target(conn, job_id, generation, config).await?,
+        None => at_boundary(conn, job_id, generation, config).await?,
     };
     let racks = match selected {
         Selected::Racks(racks) => racks,
@@ -719,8 +874,8 @@ pub async fn next_step(
     // Never optional: generation 1 reads the zeroed KLV written at generation
     // 0 when the job was created, so every generation fetches its leaves the
     // same way.
-    let previous_artifact_key = sqlx::query_scalar::<_, String>(
-        "SELECT artifact_key FROM leave_generation_artifacts
+    let (previous_artifact_key, previous_artifact_sha256) = sqlx::query_as::<_, (String, String)>(
+        "SELECT artifact_key, COALESCE(served_sha256, sha256) FROM leave_generation_artifacts
          WHERE job_id = $1 AND generation = $2",
     )
     .bind(job_id)
@@ -747,6 +902,7 @@ pub async fn next_step(
         seed: rand::random(),
         forced_racks: racks,
         previous_artifact_key,
+        previous_artifact_sha256,
         num_games: config.num_iterations,
         use_wordmap: config.use_wordmap,
         bingo_bonus: job_data.bingo_bonus,
@@ -771,6 +927,25 @@ async fn claims_in_flight(conn: &mut PgConnection, job_id: Uuid, generation: i32
     )
     .bind(job_id)
     .bind(generation)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// Whether any rack of the generation is below target, holding nothing out:
+/// one probe of `leave_rack_progress_pick_idx` from its lowest count.
+async fn any_rack_below_target(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    config: &LeaveConfig,
+) -> AppResult<bool> {
+    Ok(sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM leave_rack_progress
+                        WHERE job_id = $1 AND generation = $2 AND occurrence_count < $3)",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .bind(config.target_rack_count as i64)
     .fetch_one(&mut *conn)
     .await?)
 }
@@ -902,7 +1077,8 @@ async fn racks_after(
 ///
 /// A **lap** is one pass over the universe, handing out every rack that is
 /// below target as the pass reaches it. `leave_selection_cursors` holds the
-/// last rack handed out; its row exists exactly while a lap has racks left.
+/// last rack handed out; its row holds one exactly while a lap has racks left
+/// (a row with no rack means the generation is in its tail: [`at_boundary`]).
 ///
 /// What makes a sweep need no exclusion list is the rule for *starting* a lap:
 /// only with no claim of the generation in flight and nothing staged. From
@@ -919,51 +1095,95 @@ async fn racks_after(
 ///
 /// A cursor row lost to a partial restore, or deleted by a purge, is a lap not
 /// started: the same rule applies, and nothing is handed out twice.
+async fn continue_lap(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    config: &LeaveConfig,
+    cursor: &str,
+) -> AppResult<Option<Selected>> {
+    let (racks, more) = racks_after(conn, job_id, generation, config, cursor).await?;
+    if more {
+        sqlx::query(
+            "UPDATE leave_selection_cursors SET cursor_rack = $3
+             WHERE job_id = $1 AND generation = $2",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .bind(racks.last())
+        .execute(&mut *conn)
+        .await?;
+        return Ok(Some(Selected::Racks(racks)));
+    }
+    // The lap ends here: with this task if it found any racks, already if
+    // it did not (a merge since the last claim can put the racks that were
+    // left at target).
+    sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2")
+        .bind(job_id)
+        .bind(generation)
+        .execute(&mut *conn)
+        .await?;
+    Ok((!racks.is_empty()).then_some(Selected::Racks(racks)))
+}
+
+/// A lap's boundary: where a lap starts, the tail begins, and a generation is
+/// found complete -- and only with nothing of the generation in flight or
+/// staged (see [`continue_lap`]'s rule), so the lap's stragglers are never part of
+/// what a selection must exclude.
+///
+/// Which way it goes is read from the generation's summary row, which a merge
+/// refreshes -- the same age as the counts both selections read. Once the tail
+/// has begun it is remembered, as a cursor row with no rack, and every later
+/// claim of the generation goes straight to it: its own claims are what is out
+/// then, at most the racks below target. Nothing goes back to a sweep, since
+/// counts only grow. The tail used to begin wherever a merge put the summary
+/// under the threshold, mid-lap included, and every claim then hashed the
+/// racks of every sweep claim still out: at a thousand workers 0.45 s a claim
+/// inside the dispatch lock, until those claims drained and a merge ran
+/// (thirty-first audit).
+async fn at_boundary(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    generation: i32,
+    config: &LeaveConfig,
+) -> AppResult<Selected> {
+    if let Some(step) = nothing_to_hand_out(conn, job_id, generation).await? {
+        return Ok(Selected::Step(step));
+    }
+    // Absent until the universe is seeded, which the caller has checked; read
+    // as "few" if it is missing anyway, since the tail assumes nothing.
+    let below_target: i64 = sqlx::query_scalar(
+        "SELECT racks_total - racks_at_target FROM leave_generation_progress
+         WHERE job_id = $1 AND generation = $2",
+    )
+    .bind(job_id)
+    .bind(generation)
+    .fetch_optional(&mut *conn)
+    .await?
+    .unwrap_or(0);
+    if below_target <= SWEEP_WHILE_TASKS_REMAIN * i64::from(config.racks_per_task) {
+        sqlx::query(
+            "INSERT INTO leave_selection_cursors (job_id, generation, cursor_rack)
+             VALUES ($1, $2, NULL)
+             ON CONFLICT (job_id, generation) DO UPDATE SET cursor_rack = NULL",
+        )
+        .bind(job_id)
+        .bind(generation)
+        .execute(&mut *conn)
+        .await?;
+        return furthest_below_target(conn, job_id, generation, config).await;
+    }
+    sweep(conn, job_id, generation, config).await
+}
+
+/// Starts a lap, which is also how a generation is found complete: a pass from
+/// the top that finds no rack below target.
 async fn sweep(
     conn: &mut PgConnection,
     job_id: Uuid,
     generation: i32,
     config: &LeaveConfig,
 ) -> AppResult<Selected> {
-    let cursor: Option<String> = sqlx::query_scalar(
-        "SELECT cursor_rack FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2",
-    )
-    .bind(job_id)
-    .bind(generation)
-    .fetch_optional(&mut *conn)
-    .await?;
-
-    if let Some(cursor) = cursor {
-        let (racks, more) = racks_after(conn, job_id, generation, config, &cursor).await?;
-        if more {
-            sqlx::query(
-                "UPDATE leave_selection_cursors SET cursor_rack = $3
-                 WHERE job_id = $1 AND generation = $2",
-            )
-            .bind(job_id)
-            .bind(generation)
-            .bind(racks.last())
-            .execute(&mut *conn)
-            .await?;
-            return Ok(Selected::Racks(racks));
-        }
-        // The lap ends here: with this task if it found any racks, already if
-        // it did not (a merge since the last claim can put the racks that were
-        // left at target).
-        sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1 AND generation = $2")
-            .bind(job_id)
-            .bind(generation)
-            .execute(&mut *conn)
-            .await?;
-        if !racks.is_empty() {
-            return Ok(Selected::Racks(racks));
-        }
-    }
-
-    // Starting a lap, which is also how a generation is found complete.
-    if let Some(step) = nothing_to_hand_out(conn, job_id, generation).await? {
-        return Ok(Selected::Step(step));
-    }
     let (racks, more) = racks_after(conn, job_id, generation, config, "").await?;
     if racks.is_empty() {
         return Ok(Selected::Step(claim_transition(conn, job_id, generation).await?));
@@ -1054,10 +1274,20 @@ async fn furthest_below_target(
     // With nothing in flight the only racks held out of the selection above
     // are those of staged tasks, so an empty selection means "no rack is below
     // target" only once nothing is staged.
-    Ok(Selected::Step(match nothing_to_hand_out(conn, job_id, generation).await? {
-        Some(step) => step,
-        None => claim_transition(conn, job_id, generation).await?,
-    }))
+    if let Some(step) = nothing_to_hand_out(conn, job_id, generation).await? {
+        return Ok(Selected::Step(step));
+    }
+    // ...as of those reads, which each see their own moment. A claim declined
+    // or lapsed after the selection, or a merge committed after it, took racks
+    // the selection held out and that the two reads no longer see as out:
+    // closing on that closed the generation with them below target, a
+    // declined task's at zero. So the counts are read once more, holding
+    // nothing out, as the sweep does -- and a rack still below target is work
+    // the next claim hands out.
+    if any_rack_below_target(conn, job_id, generation, config).await? {
+        return Ok(Selected::Step(LeaveGenStep::NoWorkYet));
+    }
+    Ok(Selected::Step(claim_transition(conn, job_id, generation).await?))
 }
 
 /// Write a generation's rack universe at zero occurrences: every full rack the
@@ -1118,7 +1348,7 @@ pub async fn seed_generation(
                 rows.into_bytes()
             })
             .await
-            .map_err(|e| AppError::internal(format!("enumerating a rack universe failed: {e}")))?
+            .map_err(|e| AppError::task_failed("enumerating a rack universe", e))?
         };
         copy.send(rows).await?;
         start += CHUNK;
@@ -1213,6 +1443,9 @@ pub async fn run_transition(
     let key = artifact_key(job_id, generation);
     artifacts.put(&key, klv).await?;
     close_generation(pool, job_id, generation, &key, &sha256, &builders.klv(), config).await?;
+    // The generation closed -- and the job perhaps completed -- tens of
+    // seconds after the last submission: nothing else would tell open pages.
+    crate::routes::worker::push_after_change(state, job_id);
     Ok(key)
 }
 
@@ -1232,6 +1465,14 @@ pub async fn close_generation(
     config: &LeaveConfig,
 ) -> AppResult<()> {
     let mut tx = pool.begin().await?;
+    // The merge lock first, as a purge and a delete take it: they hold it for
+    // their whole transaction, so this waits holding nothing and then finds its
+    // transition row gone. Without it the close locked that row and then
+    // waited on the job's row (the artifact insert's foreign-key check) while
+    // the purge, holding the job's row, waited on the transition row -- a
+    // deadlock Postgres resolved by aborting the purge after it had run for
+    // its whole length.
+    lock_merges(&mut tx, job_id).await?;
     // Claiming ownership back, and the one place this transition can find out
     // it no longer has any. A purge deletes the transitions row along with the
     // artifacts and progress rows -- all while a transition spawned before it
@@ -1295,13 +1536,24 @@ pub async fn close_generation(
         .execute(&mut *tx)
         .await?;
 
+    // Guarded on `active`, as every other automatic completion is: an admin
+    // who deactivated the job during its last transition decided something,
+    // and it stands. Reactivated, its first claim finds the last generation
+    // closed and completes it then.
     if generation >= config.generation_count {
-        sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
             .bind(job_id)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected()
+            > 0;
+        if completed {
+            crate::audit::log_server_completion(&mut tx, job_id, Some("last generation built")).await?;
+        }
     }
     tx.commit().await?;
+    // The page's generation count and status moved without a submission.
+    crate::jobstats::forget(job_id);
 
     // The next generation's universe is NOT written here. It is seeded when
     // that generation opens -- see `ensure_universe`, called from the claim
@@ -1369,6 +1621,18 @@ pub struct ArtifactRebuild {
     pub generation: i32,
     pub artifact_key: String,
     pub stored_sha256: String,
+    /// What workers are sent to check the object against: the hash of what
+    /// the object holds, once this check has accounted for it.
+    pub served_sha256: String,
+    /// The object's hash as this check found it, before any rewrite; `None`
+    /// when it was missing.
+    pub object_sha256: Option<String>,
+    /// Whether the object found is the first build, this rebuild, or what
+    /// was already served. When it is none of them and the rows do not
+    /// reproduce the recorded bytes, nothing is changed: workers go on being
+    /// sent `served_sha256` (and refuse the object) until an admin forces a
+    /// rebuild or restores the right object version.
+    pub object_accounted_for: bool,
     pub rebuilt_sha256: String,
     pub matches: bool,
     /// Whether the stored artifact was written by the builder this rebuild
@@ -1397,7 +1661,13 @@ pub struct ArtifactRebuild {
 ///   and that is evidence to look at rather than a fault to paper over: it is
 ///   equally consistent with a corrupted object and with a legitimate change to
 ///   MAGPIE's KLV builder. Rewriting on sight would destroy the only copy of
-///   whichever one it was. `force` is the deliberate override.
+///   whichever one it was. `force` is the deliberate override. The one
+///   exception is an object that is neither the first build, nor this
+///   rebuild, nor what was being served, while the rows reproduce the first
+///   build exactly: nothing here accounts for those bytes (another run's KLV
+///   under the same key, after a purge and a copy-back of the old rows), and
+///   the recorded ones are known, so they are put back -- the bucket is
+///   versioned, so the replaced object is kept as a noncurrent version.
 /// - **It does not treat a different builder as a mismatch.** Until MAGPIE
 ///   built these, there was one implementation and differing bytes could only
 ///   mean corruption. Now a MAGPIE upgrade can legitimately change them, so an
@@ -1418,7 +1688,8 @@ pub async fn rebuild_artifacts(
     force: bool,
 ) -> AppResult<Vec<ArtifactRebuild>> {
     let rows = sqlx::query(
-        "SELECT generation, artifact_key, sha256, builder
+        "SELECT generation, artifact_key, sha256, builder,
+                COALESCE(served_sha256, sha256) AS served_sha256
          FROM leave_generation_artifacts
          WHERE job_id = $1
          ORDER BY generation",
@@ -1434,6 +1705,7 @@ pub async fn rebuild_artifacts(
         let artifact_key: String = row.get("artifact_key");
         let stored_sha256: String = row.get("sha256");
         let stored_builder: String = row.get("builder");
+        let was_served: String = row.get("served_sha256");
 
         let klv = if generation == 0 {
             zero_klv(magpie, distribution).await?
@@ -1449,15 +1721,66 @@ pub async fn rebuild_artifacts(
         // permission. Replacing one that is present does -- and replacing one
         // built by a different builder needs it twice over, since the
         // difference is expected rather than evidence of anything.
-        let rewritten = !object_present || force;
-        if rewritten {
+        let object_sha256 = if object_present {
+            // Its error is an admin's to read: with its cause.
+            Some(hex::encode(Sha256::digest(artifacts.get_for_build(&artifact_key).await?)))
+        } else {
+            None
+        };
+        // What workers are sent has to be what the object holds -- but only
+        // bytes something here accounts for: the first build, this rebuild,
+        // or what was already being served. Any object's hash was taken
+        // before, so after a mistaken purge, a re-run and a copy-back of the
+        // old rows, the re-run's KLV was approved and played as the old
+        // run's leaves. An object nothing accounts for is replaced when the
+        // rows reproduce the recorded bytes, and otherwise left for an admin
+        // (`object_accounted_for`, and `force`).
+        let object_accounted_for = object_sha256.as_ref().is_none_or(|object| {
+            *object == stored_sha256 || *object == rebuilt_sha256 || *object == was_served
+        });
+        let rewritten = !object_present || force || (!object_accounted_for && matches);
+        let served_sha256 = if rewritten {
             artifacts.put(&artifact_key, klv).await?;
+            Some(rebuilt_sha256.clone())
+        } else if object_accounted_for {
+            object_sha256.clone()
+        } else {
+            None
+        };
+        // Set from the bytes actually stored, every time, rather than only
+        // after a rewrite: a rebuild cut off between its upload and this
+        // update (the request dropped, the update failing) left the row on
+        // the old hash, and a re-run found the object present, rewrote
+        // nothing, and never fixed it -- every worker refusing the job until
+        // someone forced it. `sha256` keeps the first hash.
+        // Only onto the row this check read: a check running across a purge
+        // and a re-run that closed this generation again would otherwise put
+        // the old run's hash on the new run's row, and every worker refuse
+        // its KLV.
+        if let Some(served) = &served_sha256 {
+            sqlx::query(
+                "UPDATE leave_generation_artifacts
+                 SET served_sha256 = NULLIF($3, sha256)
+                 WHERE job_id = $1 AND generation = $2
+                   AND sha256 = $4 AND COALESCE(served_sha256, sha256) = $5",
+            )
+            .bind(job_id)
+            .bind(generation)
+            .bind(served)
+            .bind(&stored_sha256)
+            .bind(&was_served)
+            .execute(pool)
+            .await?;
         }
+        let served_sha256 = served_sha256.unwrap_or(was_served);
 
         report.push(ArtifactRebuild {
             generation,
             artifact_key,
             stored_sha256,
+            served_sha256,
+            object_sha256,
+            object_accounted_for,
             rebuilt_sha256,
             matches,
             same_builder,
@@ -1515,6 +1838,11 @@ async fn generation_klv(
             .map_err(|e| AppError::internal(format!("could not write the rack equity csv: {e}")))?,
     );
 
+    // Closed rather than drained if this stops early (a write that fails): a
+    // pool connection dropped mid-result reads the rest of its 3.2 million rows
+    // first (see `exports::upload_rows`).
+    let mut conn = pool.acquire().await?;
+    conn.close_on_drop();
     let mut rows = sqlx::query(
         "SELECT rack, occurrence_count, equity_sum
          FROM leave_rack_progress
@@ -1523,7 +1851,7 @@ async fn generation_klv(
     )
     .bind(job_id)
     .bind(generation)
-    .fetch(pool);
+    .fetch(&mut *conn);
 
     let mut written: u64 = 0;
     while let Some(row) = rows.try_next().await? {
@@ -1540,6 +1868,8 @@ async fn generation_klv(
         written += 1;
     }
     drop(rows);
+    // Not held through the conversion below.
+    drop(conn);
     csv.flush()
         .await
         .map_err(|e| AppError::internal(format!("could not write the rack equity csv: {e}")))?;
@@ -1604,4 +1934,30 @@ async fn read_built_klv(scratch: &ScratchData, name: &str) -> AppResult<Vec<u8>>
 /// shape those take.
 pub fn artifact_key(job_id: Uuid, generation: i32) -> String {
     format!("leaves/{job_id}/generation-{generation}.klv2")
+}
+
+#[cfg(test)]
+mod tests {
+    fn spelled(rack: &str) -> String {
+        let mut rack = rack.to_string();
+        super::spell_as_the_universe(&mut rack);
+        rack
+    }
+
+    /// A reported rack is spelled as the universe spells it: letters in
+    /// code-point order, blanks first, whatever order MAGPIE wrote them in.
+    #[test]
+    fn a_reported_rack_is_spelled_as_the_universe_spells_it() {
+        assert_eq!(spelled("AEINST?"), "?AEINST");
+        assert_eq!(spelled("AEINR??"), "??AEINR");
+        assert_eq!(spelled("AEINRST"), "AEINRST");
+        // German: MAGPIE's machine letters put Ä after A; the universe after Z.
+        assert_eq!(spelled("AÄEINRS"), "AEINRSÄ");
+        assert_eq!(spelled("ŻAĄ?"), "?AĄŻ");
+        // A bracketed letter is not reordered: it matches nothing either way.
+        assert_eq!(spelled("[L·L]AEIOU"), "[L·L]AEIOU");
+        // Nor is anything too long to be a rack, which plausibility refuses.
+        let long = "ZYX".repeat(1000);
+        assert_eq!(spelled(&long), long);
+    }
 }

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type ApiKey } from '$lib/api';
+  import { api, ApiError, type ApiKey } from '$lib/api';
   import { goto } from '$app/navigation';
   import { session } from '$lib/auth';
   import { datetime } from '$lib/format';
@@ -11,7 +11,12 @@
   let error = '';
 
   async function load() {
-    keys = await api.apiKeys();
+    try {
+      keys = await api.apiKeys();
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+      return;
+    }
   }
   onMount(load);
 
@@ -29,7 +34,18 @@
   }
 
   async function toggle(key: ApiKey) {
-    await api.setApiKeyActive(key.id, !key.is_active);
+    error = '';
+    try {
+      await api.setApiKeyActive(key.id, !key.is_active);
+    } catch (e) {
+      // Resuming is limited per account; say how long to wait.
+      const minutes =
+        e instanceof ApiError && e.status === 429 && e.retryAfter !== null
+          ? Math.max(1, Math.ceil(e.retryAfter / 60))
+          : null;
+      const wait = minutes === null ? '' : ` — try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`;
+      error = (e instanceof Error ? e.message : String(e)) + wait;
+    }
     await load();
   }
 
@@ -49,7 +65,12 @@
   async function revoke(key: ApiKey) {
     if (!confirm('Permanently revoke this key? Workers using it will stop being authenticated.'))
       return;
-    await api.revokeApiKey(key.id);
+    error = '';
+    try {
+      await api.revokeApiKey(key.id);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    }
     await load();
   }
 </script>
@@ -59,8 +80,8 @@
 <div class="space-y-6">
   <div class="card">
     <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-4">
-      <div><dt class="text-muted-foreground">Username</dt><dd>{$session?.username}</dd></div>
-      <div><dt class="text-muted-foreground">Email</dt><dd>{$session?.email}</dd></div>
+      <div class="min-w-0"><dt class="text-muted-foreground">Username</dt><dd class="break-all">{$session?.username}</dd></div>
+      <div class="min-w-0"><dt class="text-muted-foreground">Email</dt><dd class="break-all">{$session?.email}</dd></div>
       <div><dt class="text-muted-foreground">Role</dt><dd>{$session?.is_admin ? 'admin' : 'contributor'}</dd></div>
       <div>
         <dt class="text-muted-foreground">Tasks completed</dt>
@@ -85,15 +106,21 @@
     <div>
       <h2 class="text-lg font-medium">API keys</h2>
       <p class="text-sm text-muted-foreground">
-        Pass one to the worker with <code class="rounded bg-muted px-1">--api-key</code> to credit
-        your work to this account. Up to 100 keys; deactivate one to suspend it without losing it.
+        Add one to the <code class="rounded bg-muted px-1">contribute.txt</code> you run MAGPIE with, as a
+        line <code class="rounded bg-muted px-1">apikey &lt;key&gt;</code>, to credit your work to this
+        account. Use one key per machine: machines sharing a key share its rate limit. Up to 100
+        keys; deactivate one to suspend it without losing it.
       </p>
     </div>
 
     {#if freshKey}
       <div class="rounded-md border border-warning/40 bg-warning/10 p-3">
         <p class="text-sm font-medium text-warning">Copy this key now — it is not shown again.</p>
-        <code class="mt-2 block break-all font-mono text-xs">{freshKey}</code>
+        <code data-testid="fresh-key" class="mt-2 block break-all font-mono text-xs">{freshKey}</code>
+        <p class="mt-2 text-sm text-muted-foreground">Its line for contribute.txt:</p>
+        <code data-testid="fresh-key-line" class="mt-1 block break-all font-mono text-xs"
+          >apikey {freshKey}</code
+        >
       </div>
     {/if}
 
@@ -103,6 +130,7 @@
     </form>
     {#if error}<p class="field-error">{error}</p>{/if}
 
+    <div class="overflow-x-auto">
     <table class="table">
       <thead>
         <tr><th>Label</th><th>Created</th><th>Last used</th><th>Status</th><th></th></tr>
@@ -126,5 +154,6 @@
         {/each}
       </tbody>
     </table>
+    </div>
   </div>
 </div>

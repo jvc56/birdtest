@@ -14,6 +14,11 @@ with workers](PLAN.md#input-data-and-capability-negotiation), and what is
 [TESTING.md](TESTING.md) is what is guaranteed and how it is checked, and
 [RUNBOOK.md](RUNBOOK.md) is the recovery procedure itself.
 
+The command blocks here and in RUNBOOK.md are bash: in zsh, run `bash` first.
+Stock zsh treats a `#` as a word, so a commented line fails or passes its
+comment on as arguments, and an apostrophe in a comment opens a quote that
+swallows the rest of the paste.
+
 ## Layout
 
 | Path | What it is |
@@ -53,7 +58,10 @@ nothing about what your change did.
 builder.** The server publishes the hash of a copy it built itself, and nothing
 in the compose stack builds one on its own — production runs the builder as a
 scheduled task ([infra/derived.tf](infra/derived.tf)). Run it once, after
-creating such a job, and it drains the queue and exits:
+creating such a job, and it builds what is queued — up to eight files a run —
+and exits. A build that failed waits 5 minutes (then 15) before it is tried
+again, so a run straight after a failure builds nothing; `/admin/derived-data`
+shows the error, and the Retry button once a build has failed three times:
 
 ```bash
 docker compose run --rm derived-builder
@@ -103,10 +111,10 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 | `--no-up` | off | Assume the stack is already running |
 
 Each contributor gets its own directory under `--workdir`, holding its
-`contribute.txt`, the `settings.txt` MAGPIE writes, a `contribute.log`, and a
-symlink to your data directory. They need separate directories because
-`magpie contribute` reads and writes both files in its working directory —
-sharing one would race on them and collapse every worker onto a single
+`contribute.txt`, a `contribute.log`, and a symlink to your data directory
+(MAGPIE loads its board from `./data` before anything else). Each needs a
+`contribute.txt` of its own because MAGPIE writes the identity it is issued
+into that file — sharing one would collapse every worker onto a single
 identity. Watch one with `tail -f .dev-workers/worker-01/contribute.log`.
 
 Ctrl-C stops the contributors and leaves the stack up, so the site stays
@@ -135,7 +143,8 @@ actually have. If those diverge, every worker declines every task.
 ### Doing it by hand
 
 `docker compose up` still brings up just the stack — database, object storage,
-backend and frontend — with Docker as the only host dependency:
+backend and frontend. Docker is the only host dependency besides a MAGPIE
+build, which the backend mounts and refuses to start without (below):
 
 ```bash
 docker compose up --build
@@ -176,8 +185,8 @@ magpie BUILD=portable_release`) and set `MAGPIE_ROOT` if the checkout is not at
 server's builder and the fleet's identical.
 
 **The version floor stops an old MAGPIE from contributing.**
-`MIN_MAGPIE_VERSION` defaults to `0.1.0`, `birdtest-contribute`'s pre-release
-version, which is what the branch reports. A checkout that reports something
+`MIN_MAGPIE_VERSION` defaults to `0.1.1`, the version `birdtest-contribute`
+reports. A checkout that reports something
 lower has every task declined with "update MAGPIE" until you update it or lower
 the floor — on the server *and* on the job, which records its own floor at
 creation:
@@ -188,24 +197,33 @@ MIN_MAGPIE_VERSION=0.0.0 docker compose up -d
 
 `dev.py` reads the version out of your checkout and sets both for you.
 
-Leave-generation jobs write one progress row per full 7-tile rack at creation
-time — 3,199,724 rows for a real English bag, copied again for every later
-generation — and build a zeroed KLV. Worth knowing before you create one by hand.
+Leave-generation jobs build a zeroed KLV at creation, and each generation writes
+one progress row per full 7-tile rack — 3,199,724 rows for a real English bag —
+when its first claim finds the universe missing (seeded off the claim path, so
+that claim is answered at once). Worth knowing before you create one by hand.
 Opening-rack jobs only *count* their rack space (3,199,724 racks for English)
 and address it by range, so they are cheap to create.
 
 ### Contributing with MAGPIE
 
 A contributor needs only MAGPIE — no Python, no Docker, nothing else to
-install. Put a `contribute.txt` beside it:
+install. Put a `contribute.txt` in the directory you run it from, the one
+holding its `data/` (MAGPIE reads both from its working directory):
 
-```
+```text
 server   http://localhost:5173
 threads  7
 maxtasks 0
 ```
 
-then run `magpie contribute`. Settings never go on the command line, so an API
+then run `./bin/magpie contribute` there. A second process in the same
+directory needs a file of its own — a copy of the one above, without the
+`uuid` line MAGPIE appends on a first run, named on the command line
+(`./bin/magpie contribute second.txt`): MAGPIE appends the identity it is issued
+to that file. (A directory of its own does not work unless it also holds
+MAGPIE's `data/`, or a link to it: MAGPIE loads its default board from
+`./data` before it reads anything else.) Settings never
+go on the command line, so an API
 key stays out of shell history and `ps` output. Wordmaps (`.wmp`) make game
 play dramatically faster, so MAGPIE always wants one for a lexicon it's
 contributing with; it derives the word list and the wordmap from the `.kwg` it
@@ -258,6 +276,18 @@ docker compose exec postgres \
 docker compose restart backend
 ```
 
+After release, a schema change is a new numbered migration, never an edit, and
+it is **additive**: new tables, new nullable or defaulted columns, new
+indexes. A drop or a rename waits for a later release, once no image that
+reads the old shape can run. A new value in an enum type (`job_type`,
+`job_status`, `task_state`, `claim_state`) is not additive in this sense: the
+backend reads those into closed Rust enums, and one row the previous image
+cannot read fails every query that reads it, the claim's included. Ship the
+reading of a new value in one release and write it in a later one. The previous image then runs on the newer
+schema. The backend starts against a database with migrations it does not
+know (it refuses only an applied migration whose file changed), so rolling
+back is an image change (RUNBOOK, "Rolling back a deploy").
+
 ### Without Docker
 
 The backend and frontend still run directly on the host if you would rather:
@@ -269,16 +299,140 @@ minio minio-init` gives you one without the rest of the stack.
 
 ## Deploying
 
-`infra/` is a complete Terraform description of the AWS side. Two values must
-be set out of band right after the first `terraform apply` — Terraform manages
-the parameter *names* but never their values.
+A first deployment, in order (each step is described below):
+
+1. Tools: Terraform 1.9, the AWS CLI with the Session Manager plugin, `jq`,
+   `openssl`, and `python3` for RUNBOOK.md's procedures.
+2. Build and push the three images (below, "The three images"), and push
+   MAGPIE's `birdtest-contribute` first — the backend image fetches the commit
+   `docker/Dockerfile` pins.
+3. Request an ACM certificate for the site's hostname in the stack's region,
+   add its validation CNAME, and wait for it: the first apply creates the HTTPS
+   listener, which refuses a certificate still pending validation and leaves
+   the apply half done. First the request, which prints the certificate's ARN
+   and, once ACM has made it (a few seconds), the CNAME to add:
+   ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+   REGION=us-east-1   # the stack's region, as prod.tfvars will say (step 4)
+   SITE_HOSTNAME=''   # the site's hostname, e.g. birdtest.example.org
+   # Pasted again, this requests a second certificate: to see the first one's
+   # CNAME, run describe-certificate with its ARN instead.
+   if [ -z "$SITE_HOSTNAME" ]; then
+     echo "set SITE_HOSTNAME first" >&2
+   elif ARN=$(aws acm request-certificate --region "$REGION" --domain-name "$SITE_HOSTNAME" \
+       --validation-method DNS --query CertificateArn --output text); then
+     echo "ARN=$ARN   # for the next block, and acm_certificate_arn in prod.tfvars"
+     for _ in $(seq 60); do   # up to five minutes
+       CNAME=$(aws acm describe-certificate --region "$REGION" --certificate-arn "$ARN" \
+         --query 'Certificate.DomainValidationOptions[0].ResourceRecord.[Name,Value]' \
+         --output text) && [ -n "$CNAME" ] && [ "$CNAME" != None ] && break
+       CNAME=''
+       sleep 5
+     done
+     if [ -n "$CNAME" ]; then echo "add this CNAME: $CNAME"
+     else echo "no CNAME yet: ask describe-certificate for it by hand" >&2; fi
+   fi
+   ```
+   Then, with the CNAME in DNS, wait for it. DNS validation can take half an
+   hour, and the CLI's own wait gives up after about four minutes (older CLIs
+   waited forty), so it is asked again, up to ten times:
+   ```bash
+   export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+   if [ -z "${ARN:-}" ] || [ -z "${REGION:-}" ]; then
+     echo "no ARN or REGION: run the block above first (or set both from it)" >&2
+   else
+     validated=''
+     for round in $(seq 10); do
+       if out=$(aws acm wait certificate-validated --region "$REGION" --certificate-arn "$ARN" 2>&1); then
+         validated=yes
+         break
+       fi
+       echo "$out" >&2
+       # Only a wait that ran out on a certificate still pending is worth
+       # another: one that failed validation or timed out, one this region
+       # does not have, denied access, expired credentials or no network fail
+       # the same way each time.
+       case "$out" in *"Max attempts exceeded"*PENDING_VALIDATION*) ;; *) break ;; esac
+       [ "$round" -lt 10 ] && echo "not validated yet; waiting again" >&2
+     done
+     if [ -n "$validated" ]; then echo "acm_certificate_arn = \"$ARN\""   # for prod.tfvars, step 4
+     else echo "not validated: see the error above (check the CNAME, REGION and credentials); a failed or timed-out certificate needs a new request" >&2; fi
+   fi
+   ```
+4. Write `infra/prod.tfvars` with the eight variables that have no default --
+   `backend_image`, `derived_builder_image`, `frontend_image`, `alert_email`,
+   `acm_certificate_arn`, `ses_domain`, `mail_from_address`, `public_url` --
+   and `region` if it is not us-east-1, with `dr_region` (default us-west-2)
+   if the stack is in us-west-2: the two must differ. Then
+   `terraform -chdir=infra init` and
+   `terraform -chdir=infra apply -var-file=prod.tfvars -var desired_count=0 -var scheduled_tasks_enabled=false`
+   -- the scheduled builder and backup would fail until step 6 creates the two
+   SSM parameters. Then pin the zones the stack chose:
+   `AZS=$(terraform -chdir=infra output -json azs) && ! grep -q '^azs' infra/prod.tfvars && printf '\nazs = %s\n' "$AZS" >> infra/prod.tfvars`. Left to
+   the default, the pair is recomputed on every plan, and a change to what the
+   region reports would plan to replace the subnets the database sits in.
+5. Add the SES DNS records straight away (the `ses_dkim_records`,
+   `ses_mail_from_records` outputs, and `ses_dmarc_record`'s unless the
+   domain has a DMARC record already -- a second one voids both; SES looks for
+   the first two for about 72 hours) and request SES production access, which
+   can take a day.
+6. Confirm the SNS subscription mail, set the database password and the two
+   SSM parameters (below), then
+   `terraform -chdir=infra apply -var-file=prod.tfvars` (one task, and the
+   scheduled tasks on). This apply creates the `-down` alarms before the
+   task is healthy, so expect an ALARM mail for each and an OK a few minutes
+   later.
+7. Point DNS at the load balancer, run the alert-path checks, and make the
+   first admin. Until production access is granted SES sends only to verified
+   identities, so the first admin's confirmation mail arrives only if their
+   address is in `ses_domain` or verified on its own (below, "SES starts in the
+   sandbox").
+
+`infra/` is a complete Terraform description of the AWS side. Keep the stack's
+variables in `infra/prod.tfvars` (not committed: it names the account's
+certificate and addresses) and pass `-var-file=prod.tfvars` to every `apply`,
+`plan` and `import` — RUNBOOK.md's recovery steps assume it, and a command run
+without it evaluates the configuration in the default region, prompting for
+eight variables. Two SSM parameters must be created out of band right after
+the first `terraform apply` — Terraform only names them, and never reads or
+writes them, so their values stay out of its state — so make the first apply
+with `-var desired_count=0 -var scheduled_tasks_enabled=false`, create them as
+below, and apply again with the service at one task and the schedules on:
+started before they exist, the service's tasks cannot start, the
+derived-data builder fails every five minutes, and a 03:00 backup fails
+without starting, which only the 36-hour staleness alarm reports.
+
+**Terraform's state is local** — `infra/terraform.tfstate`, ignored by git, on
+the machine that applied. RUNBOOK.md's recovery steps and both ops scripts read
+it (`terraform output`), so keep it somewhere that survives that machine and
+the stack's region: copy it off after every apply, or configure a remote
+backend (an S3 bucket in another region, versioned, with locking) before the
+first one. The repository does not choose one for you. Keep `infra/prod.tfvars`
+(and RUNBOOK §5's `infra/dr.tfvars`, when there is one) with it: the state
+records no input variables, and every later apply and the region-loss rebuild
+read them. Neither holds a secret. (A stack applied before the thirty-second
+audit's pass 17 managed the two SSM parameters as resources, and every refresh
+wrote their decrypted values into the state: its next apply drops them from
+the state without deleting them (an apply does; a `destroy` run first would
+delete them), but older copies of the state —
+`infra/terraform.tfstate.backup` among them — and a versioned backend's
+history still hold them — so after that apply, rotate both, as below and in
+RUNBOOK.md, "Rotating the database password".)
 
 The database master password is set by hand, not managed by RDS (RDS rotation
 would break the fixed `DATABASE_URL`). Terraform creates the instance with a
 placeholder; replace it, then write the URL:
 
 ```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
 DB_INSTANCE=birdtest   # the RDS identifier Terraform created
+# The stack's region on every command: with the CLI's default elsewhere,
+# put-parameter quietly creates the parameters in the wrong region, the real
+# ones are never created, and the service cannot start on the second apply.
+# Assigned first: `export X=$(...)` hides a failed command. Both names: the
+# CLI's version 1 reads only AWS_DEFAULT_REGION.
+REGION=$(terraform -chdir=infra output -raw region)
+export AWS_REGION=$REGION AWS_DEFAULT_REGION=$REGION
 DB_PASSWORD=$(openssl rand -hex 24)   # hex: nothing to percent-encode in a URL
 aws rds modify-db-instance --db-instance-identifier "$DB_INSTANCE" \
   --master-user-password "$DB_PASSWORD" --apply-immediately
@@ -298,13 +452,111 @@ To rotate the password later, run the same `modify-db-instance` and
 
 `acm_certificate_arn` has no default either. The site is HTTPS-only — port 80
 redirects — because the backend sets `Secure` cookies, which a browser will not
-keep over plain HTTP. `min_magpie_version` defaults to `0.1.0`,
-`birdtest-contribute`'s pre-release version — nothing is in production yet, so
-everything the protocol relies on is in it; raise it whenever a MAGPIE release
-changes results. `derived_builder_image`
+keep over plain HTTP. The API is not redirected but refused (`426`), so a
+worker set to `http://` fails at once rather than sending its credential in
+the clear on every request. `public_url`, `ses_domain` and `mail_from_address` have
+none: they are what every confirmation and reset mail links to and is sent
+from, and a placeholder left in is refused. `min_magpie_version` defaults to
+`0.1.1`, the `birdtest-contribute` version the backend image pins; raise it
+whenever a MAGPIE release changes results, since it is the only way to keep a
+build that computes something wrong off the fleet. `derived_builder_image`
 has no default — it is the backend image built with `--target derived-builder`,
 and it must carry the same MAGPIE as `backend_image`, since the builder version
 recorded beside every hash comes from the binary that produced it.
+
+The three images are built from this repository and pushed to a registry of
+your choice (Terraform creates none), at one tag per release:
+
+```bash
+docker build --pull --platform linux/amd64 -f docker/Dockerfile --target backend         -t $REGISTRY/birdtest-backend:$TAG .
+docker build --pull --platform linux/amd64 -f docker/Dockerfile --target derived-builder -t $REGISTRY/birdtest-derived-builder:$TAG .
+docker build --pull --platform linux/amd64 frontend -t $REGISTRY/birdtest-frontend:$TAG
+docker push ...   # all three, then apply with backend_image, derived_builder_image, frontend_image
+```
+
+Build for `linux/amd64`, which is what the Fargate task definitions run, even on
+an arm64 machine: the backend's MAGPIE build targets `-march=nehalem`, and an
+arm64 frontend image fails on Fargate with "exec format error". Docker Desktop
+emulates amd64 as it is; on an arm64 Linux host, register the emulator first
+(`docker run --privileged --rm tonistiigi/binfmt --install amd64`), and expect
+the emulated release builds to be slow.
+
+The backend image fetches MAGPIE at `docker/Dockerfile`'s `MAGPIE_COMMIT`
+from GitHub, so that commit must be pushed to `birdtest-contribute` first.
+
+**Check that the alarms reach you** after the first apply (once the SNS
+subscription is confirmed), and after any change to the alerts topic: nothing
+else will say an alert was dropped. With `REGION` set as above:
+
+```bash
+export AWS_PAGER=""   # no pager: one would swallow the rest of a paste
+# A function, not a variable holding the command: zsh does not split one. Not
+# named `tf`: that is a common alias for terraform, and in bash an alias is
+# expanded in a function definition -- `tf() {...}` then redefined
+# `terraform` as a function calling itself.
+tfout() { terraform -chdir=infra output -raw "$@"; }
+SUFFIX=""   # the stack's name_suffix: "-dr" for RUNBOOK §5's copy
+# To OK first: a fresh stack's staleness alarm is already in ALARM (no backup
+# has run), and setting the state it is in sends nothing.
+aws cloudwatch set-alarm-state --region "$REGION" --alarm-name "birdtest$SUFFIX-backup-stale" \
+  --state-value OK --state-reason "testing the alert path"
+aws cloudwatch set-alarm-state --region "$REGION" --alarm-name "birdtest$SUFFIX-backup-stale" \
+  --state-value ALARM --state-reason "testing the alert path"     # a mail arrives
+aws rds describe-event-subscriptions --region "$REGION" --subscription-name "birdtest$SUFFIX-db-storage" \
+  --query 'EventSubscriptionsList[0].Status' --output text      # "active"
+
+# A backup run that fails: its failure mail arrives. The task's entry point is
+# `bash -c`, so the override is the whole script, one string.
+aws ecs run-task --region "$REGION" --cluster "$(tfout cluster_name)" \
+  --task-definition "$(tfout backup_task_definition)" --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$(terraform -chdir=infra output -json service_subnet_ids | jq -r 'join(",")')],securityGroups=[$(tfout service_security_group_id)],assignPublicIp=ENABLED}" \
+  --overrides '{"containerOverrides":[{"name":"backup","command":["exit 1"]}]}'
+```
+
+Then `AWS/Events` `TriggeredRules` for `birdtest$SUFFIX-backup-failed` is 1 and
+its `FailedInvocations` 0. (RUNBOOK §5 runs the same checks with `SUFFIX=-dr`.)
+
+**SES starts in the sandbox.** A new account's SES sends only to verified
+addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
+is granted every registration and password reset to anyone else fails -- and
+answers the caller as if it had not, so the `-mail-failed` alarm fires instead.
+Request it, and add the `ses_dkim_records` output's CNAME records (each
+`<token>._domainkey.<domain>` to `<token>.dkim.amazonses.com`), the
+`ses_mail_from_records` output's MX and TXT records and, if the domain has no
+DMARC record, the `ses_dmarc_record` output's TXT record, before opening
+registration.
+
+**Raise `mail_max_per_second`** in `prod.tfvars` to the account's maximum send
+rate once production access is granted (the SES console shows it; 14 is usual):
+the backend spaces its sends to it, and at the default of 1 a burst of
+registrations waits in line.
+
+**Mail has three alarms** (`infra/ses.tf`), to the same topic as the rest:
+`-mail-failed` on any account mail that failed to send (the backend's log says
+why, with SES's own code; search it for `mail_failed`), and `-ses-bounce-rate`
+and `-ses-complaint-rate` at 4% and 0.08%, below the 5% and 0.1% at which SES
+reviews an account (it may pause one at 10% and 0.5%, which would stop every
+confirmation and reset). `-mail-failed` sends no OK: it clears itself after
+five minutes with no failed send, which is not mail working again. Addresses
+that hard-bounced or complained are suppressed account-wide, so a made-up
+address bounces once. Registration mails any address it is given, so the bounce
+rate is one a visitor can push (KL-91): on the bounce alarm, look for a burst
+of new unconfirmed accounts (`users` rows with no `email_confirmed_at`).
+
+**The database is reachable only from inside the VPC** — no public address, no
+bastion, and its security group admits only the service's. SQL runs through
+`scripts/prod-sql.sh`, which starts the ops task (`infra/ops.tf`: the postgres
+image, `DATABASE_URL` from SSM, the service's network) with psql reading the
+SQL and prints what psql printed; `scripts/prod-shell.sh` opens an interactive
+shell in the same task through ECS Exec, for RUNBOOK.md's longer procedures
+(the task outlives the session, which ECS ends after twenty idle minutes:
+`scripts/prod-shell.sh --attach <task>` returns to it). The first admin is made that way,
+after registering and confirming the account through the site — there is no
+endpoint for it, by design:
+
+```bash
+scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lower('alice') RETURNING username"
+```
 
 `alert_email` has no default: `terraform apply` refuses to run without
 somewhere to send backup failures, because an unmonitored backup is the failure
@@ -348,14 +600,34 @@ Recovering from anything is [RUNBOOK.md](RUNBOOK.md).
 ### Locally
 
 ```bash
-./scripts/dev-dump.sh before-experiment      # database + artifact bucket
-./scripts/dev-restore.sh .dev-backups/before-experiment
+./scripts/dev-dump.sh before-experiment                # database + artifact bucket
+SCRUB=0 ./scripts/dev-restore.sh .dev-backups/before-experiment
 ```
 
-`dev-restore.sh` also takes a production dump directory, and scrubs it on the
-way in (`scripts/scrub.sql`: emails become `@example.invalid`, every password
-becomes `birdtest-local`, credentials and tokens are truncated). Restoring
-production data locally without that is a disclosure risk, not a shortcut.
+`dev-restore.sh` scrubs every restore unless `SCRUB=0` is set (and refuses any
+value but 0 or 1) — your own snapshot too, whose addresses, passwords (your
+admin's included), API keys, worker identities and backup history it would
+reset, hence the `SCRUB=0` above. It also takes a production dump directory, which must be
+scrubbed on the way in (`scripts/scrub.sql`: emails become `@example.invalid`,
+every password becomes `birdtest-local`, credentials and tokens are truncated,
+every anonymous worker's UUID -- its whole credential -- is replaced, and ban
+reasons are blanked). Restoring production data locally without that is a
+disclosure risk, not a shortcut. A restore goes into a copy, is scrubbed
+there, and replaces the stack's database in one transaction only when both
+have succeeded, so one that fails or is stopped before then leaves the stack as
+it was (a stop during the swap waits for it and says which way it went); one
+that fails or is stopped after it — in the artifact mirror — leaves the
+database restored and the bucket not, says so, and exits 1. A process
+killed outright (`kill -9`) leaves its copy, unscrubbed if the scrub had not
+run, in the dev Postgres until the next restore drops it. `dev-dump.sh` refuses
+a name that exists unless `FORCE=1`, and leaves nothing behind when it fails.
+Snapshots taken before the audit's pass 24 hold no artifacts on Linux (the
+mirror could not write them, and said nothing): a restore of one leaves the
+bucket as it is.
+
+The stack's ports are published on loopback only: with the repo's fixed
+passwords and signing key, a stack holding a restored dump was open to anyone
+on the same network. `BIND_HOST=0.0.0.0` opens them when that is wanted.
 
 After any schema change, prove a dump still round-trips:
 
@@ -364,6 +636,8 @@ docker compose up -d postgres backend
 ./scripts/restore-roundtrip.sh
 ```
 
-It seeds a row in every table a result touches, dumps, restores into a fresh
-database, and checks row counts, referential integrity, the denormalized task
+On an empty database (a fresh schema) it first seeds a row in each of seven
+core tables; any other it round-trips as it is, which proves only as much as
+its own rows do, and it wants the stack idle while it runs. It dumps, restores
+into a fresh database, and checks row counts, referential integrity, the denormalized task
 counters, and that `BYTEA` and `DOUBLE PRECISION` columns survived intact.

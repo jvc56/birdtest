@@ -11,10 +11,31 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
-    readonly fields: Record<string, string> = {}
+    readonly fields: Record<string, string> = {},
+    /** Seconds to wait, from `Retry-After`, when the server gave one. */
+    readonly retryAfter: number | null = null
   ) {
     super(message);
   }
+}
+
+/** `Retry-After` in seconds; its HTTP-date form is not one the server sends. */
+function retryAfterSeconds(header: string | null): number | null {
+  const seconds = header === null ? NaN : Number(header);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null;
+}
+
+/**
+ * What a form shows for a failed request: the message, and which fields the
+ * server said were wrong and why. The message alone ("job settings are
+ * invalid") tells the admin nothing to change.
+ */
+export function errorText(e: unknown): string {
+  const message = e instanceof Error ? e.message : String(e);
+  const fields = e instanceof ApiError ? Object.entries(e.fields) : [];
+  return fields.length
+    ? `${message}: ${fields.map(([field, why]) => `${field} ${why}`).join('; ')}`
+    : message;
 }
 
 function csrfToken(): string {
@@ -59,8 +80,12 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     throw new ApiError(
       response.status,
       payload?.code ?? 'error',
-      payload?.message ?? response.statusText,
-      fields
+      // Over HTTP/2 -- the load balancer's -- `statusText` is always empty,
+      // so an answer with no JSON (the ALB's own 502/503 during a deploy)
+      // produced an error with no message, and pages showed nothing at all.
+      payload?.message ?? (response.statusText || `The server answered ${response.status}.`),
+      fields,
+      retryAfterSeconds(response.headers.get('retry-after'))
     );
   }
   return payload as T;
@@ -101,7 +126,7 @@ export interface JobListItem {
   id: string;
   job_type: JobType;
   status: JobStatus;
-  /** The job's share of the fleet while active; null until first activated. 0% means what inactive means. */
+  /** The job's share of claims while active (not of worker time: PLAN's KL-88); null until first activated. 0% means what inactive means. */
   allocation: number | null;
   redundancy: number;
   created_at: string;
@@ -111,6 +136,20 @@ export interface JobListItem {
   max_units: number | null;
   /** Workers are declining this job and none is completing it — usually data nobody has. */
   stalled: boolean;
+}
+
+/**
+ * A job's own row, as the admin actions (create, activate, deactivate,
+ * complete) return it -- not the list's summary, which adds counts.
+ */
+export interface JobRow {
+  id: string;
+  job_type: JobType;
+  status: JobStatus;
+  allocation: number | null;
+  redundancy: number;
+  variant: string;
+  created_at: string;
 }
 
 export interface SprtResult {
@@ -143,7 +182,14 @@ export interface GameStats {
   win_pct: number;
   loss_pct: number;
   draw_pct: number;
+  /** The test over every accepted result, recomputed on each read. */
   sprt: SprtResult;
+  /**
+   * What a completed job stopped on, when the finish check completed it. Results
+   * in flight at that moment still land, so `sprt` can move afterwards; this is
+   * the decision that stands.
+   */
+  decided?: { status: SprtResult['status']; llr: number; units: number };
 }
 
 export interface JobStats {
@@ -173,6 +219,8 @@ export interface JobStats {
   };
   leave_generation?: {
     current_generation: number;
+    /** Generations whose KLV is built; `current_generation` stops at the last one. */
+    generations_closed: number;
     generation_count: number;
     target_rack_count: number;
     /** Live: accepted tasks of the in-progress generation, and the games they played. */
@@ -325,6 +373,14 @@ export interface DerivedData {
   name: string;
   /** The builder that produced the hash, e.g. `wmp-1`. */
   builder: string;
+  /** Its files, as paths and the tarballs they came from. */
+  made_from: string;
+  /** Whether a builder of this server's MAGPIE takes it. */
+  buildable: boolean;
+  /** The files it is built from: what tells two rows of one name apart. */
+  kwg_id: string;
+  klv_id: string | null;
+  letterdist_id: string;
   /** `pending` | `building` | `built` | `failed`. */
   state: string;
   sha256: string | null;
@@ -336,11 +392,21 @@ export interface DerivedData {
   built_at: string | null;
 }
 
-/** Per generation, what rebuilding a leave job's KLV from the database found. */
+/** A ban in force; `id` is what lifting it takes. */
+export interface WorkerBan {
+  id: string;
+  user_id: string | null;
+  username: string | null;
+  anon_uuid: string | null;
+  reason: string | null;
+  created_at: string;
+}
+
 /** A completed job's results as one gzipped NDJSON object; see PLAN.md, "Exports". */
 export interface JobExport {
   id: string;
-  state: 'running' | 'ready' | 'failed';
+  /** `expired`: built, but older than the artifact store keeps exports. */
+  state: 'running' | 'ready' | 'expired' | 'failed';
   bytes: number | null;
   sha256: string | null;
   row_count: number | null;
@@ -360,6 +426,7 @@ export interface JobExport {
   positions_download_url?: string;
 }
 
+/** Per generation, what rebuilding a leave job's KLV from the database found. */
 export interface ArtifactRebuild {
   generation: number;
   artifact_key: string;
@@ -376,6 +443,16 @@ export interface ArtifactRebuild {
   matches: boolean;
   object_present: boolean;
   rewritten: boolean;
+  /** The hash workers are sent and verify against. */
+  served_sha256: string;
+  /** The object's hash as the check found it; null when it was missing. */
+  object_sha256: string | null;
+  /**
+   * Whether the object held the first build, this rebuild, or what was being
+   * served. When not, and it was not rewritten, workers refuse it until an
+   * admin restores the right version or forces a rebuild.
+   */
+  object_accounted_for: boolean;
 }
 
 export interface ApiKey {
@@ -420,7 +497,8 @@ export const api = {
   revokeApiKey: (id: string) => del<void>(`/api/me/api-keys/${id}`),
 
   // Public
-  jobs: (page = 0) => get<Page<JobListItem>>(`/api/jobs?page=${page}`),
+  jobs: (page = 0, status?: JobStatus) =>
+    get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
   /** Cursor-paginated; see {@link CursorPage}. `?rack=` returns one rack's whole list. */
   jobResults: (id: string, params: Record<string, string | number> = {}) =>
@@ -472,8 +550,15 @@ export const api = {
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
   backups: () => get<BackupStatus>('/api/admin/backups'),
   derivedData: () => get<DerivedData[]>('/api/admin/derived-data'),
-  retryDerivedData: (role: string, name: string) =>
-    post<void>('/api/admin/derived-data/retry', { role, name }),
+  retryDerivedData: (row: DerivedData) =>
+    post<void>('/api/admin/derived-data/retry', {
+      role: row.role,
+      name: row.name,
+      builder: row.builder,
+      kwg_id: row.kwg_id,
+      klv_id: row.klv_id,
+      letterdist_id: row.letterdist_id
+    }),
   /** `409` unless the job is completed and its last claims have landed. */
   startExport: (id: string) =>
     post<{ id: string; state: string }>(`/api/admin/jobs/${id}/export`),
@@ -487,11 +572,11 @@ export const api = {
   rebuildArtifacts: (id: string, force = false) =>
     post<ArtifactRebuild[]>(`/api/admin/jobs/${id}/rebuild-artifacts?force=${force}`),
   createJob: (body: Record<string, unknown>) =>
-    post<{ job: JobListItem }>('/api/admin/jobs', body),
+    post<{ job: JobRow }>('/api/admin/jobs', body),
   activateJob: (id: string, allocation: number) =>
-    post<JobListItem>(`/api/admin/jobs/${id}/activate`, { allocation }),
-  deactivateJob: (id: string) => post<JobListItem>(`/api/admin/jobs/${id}/deactivate`),
-  completeJob: (id: string) => post<JobListItem>(`/api/admin/jobs/${id}/complete`),
+    post<JobRow>(`/api/admin/jobs/${id}/activate`, { allocation }),
+  deactivateJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/deactivate`),
+  completeJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/complete`),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),
@@ -501,6 +586,7 @@ export const api = {
   banWorker: (body: { user_id?: string; anon_uuid?: string; reason?: string }) =>
     post<{ id: string }>('/api/admin/workers/ban', body),
   unbanWorker: (id: string) => del<void>(`/api/admin/workers/ban/${id}`),
+  workerBans: () => get<WorkerBan[]>('/api/admin/workers/bans'),
   auditLog: (params: Record<string, string | number> = {}) =>
     get<Page<Record<string, unknown>>>(
       `/api/admin/audit-log?${new URLSearchParams(

@@ -2,6 +2,57 @@ use crate::config::Config;
 use crate::error::{AppError, AppResult};
 use std::sync::Arc;
 
+/// An error with its causes, for errors only an admin reads (stored for an
+/// import, an export or a derived build, or answered on an admin route):
+/// "dispatch failure" alone told the admin nothing (the audit's pass 7).
+fn chain(error: &dyn std::error::Error) -> String {
+    aws_sdk_s3::error::DisplayErrorContext(error).to_string()
+}
+
+/// [`chain`] for an SDK call's error: a service error as its code and message
+/// (`AccessDenied: Access Denied`) rather than with the raw response it came
+/// in, whose headers and body made a stored error of two kilobytes (pass 10);
+/// a transport failure with everything, since that is where its cause is.
+fn sdk<E>(error: &aws_sdk_s3::error::SdkError<E, aws_sdk_s3::config::http::HttpResponse>) -> String
+where
+    E: std::error::Error + aws_sdk_s3::error::ProvideErrorMetadata + 'static,
+{
+    match error {
+        aws_sdk_s3::error::SdkError::ServiceError(service) => {
+            let err = service.err();
+            match (err.code(), err.message()) {
+                (Some(code), Some(message)) => format!("{code}: {message}"),
+                (Some(code), None) => code.to_string(),
+                // No code: not S3 answering -- a proxy's HTML, an empty 403 --
+                // whose status and the start of whose body are the cause.
+                _ => {
+                    let raw = service.raw();
+                    let body = raw
+                        .body()
+                        .bytes()
+                        .map(|b| String::from_utf8_lossy(&b[..b.len().min(200)]).into_owned())
+                        .unwrap_or_default();
+                    let status = raw.status().as_u16();
+                    match body.trim() {
+                        "" => format!("HTTP {status}"),
+                        body => format!("HTTP {status}: {body}"),
+                    }
+                }
+            }
+        }
+        other => chain(other),
+    }
+}
+
+/// An SDK error as a response to a worker may carry it, with its causes --
+/// request ids, codes, a host name holding the bucket's -- logged beside it:
+/// the causes in the body told a worker more than it needs (pass 8). Only the
+/// object fetch a worker's request makes uses it.
+fn cause(error: &dyn std::error::Error) -> String {
+    tracing::warn!(error = %aws_sdk_s3::error::DisplayErrorContext(error), "an object store call failed");
+    error.to_string()
+}
+
 /// S3 (or MinIO in dev — the SDK is identical, only the endpoint differs).
 #[derive(Clone)]
 pub struct ArtifactStore {
@@ -28,7 +79,7 @@ impl ArtifactStore {
             .body(body.into())
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 put {key} failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("S3 put {key} failed: {}", sdk(&e))))?;
         Ok(key.to_string())
     }
 
@@ -46,9 +97,9 @@ impl ArtifactStore {
             .await
         {
             Ok(_) => Ok(true),
-            Err(e) => match e.into_service_error() {
-                aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_) => Ok(false),
-                other => Err(AppError::internal(format!("S3 head {key} failed: {other}"))),
+            Err(e) => match e.as_service_error() {
+                Some(aws_sdk_s3::operation::head_object::HeadObjectError::NotFound(_)) => Ok(false),
+                _ => Err(AppError::internal(format!("S3 head {key} failed: {}", sdk(&e)))),
             },
         }
     }
@@ -68,7 +119,7 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 multipart start {key} failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("S3 multipart start {key} failed: {}", sdk(&e))))?;
         let upload_id = started
             .upload_id()
             .ok_or_else(|| AppError::internal("S3 returned no upload id"))?
@@ -104,12 +155,13 @@ impl ArtifactStore {
             .key(key)
             .presigned(config)
             .await
-            .map_err(|e| AppError::internal(format!("S3 presign {key} failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("S3 presign {key} failed: {}", sdk(&e))))?;
         Ok(request.uri().to_string())
     }
 
-    /// Remove an object. Used only for exports, which are derived data with a
-    /// finite life; the leave-generation KLVs are never deleted.
+    /// Remove an object: exports, which are derived data with a finite life,
+    /// and (by the derived builder) a damaged input. The leave-generation KLVs
+    /// are never deleted.
     pub async fn delete(&self, key: &str) -> AppResult<()> {
         self.client
             .delete_object()
@@ -117,11 +169,36 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::internal(format!("S3 delete {key} failed: {e}")))?;
+            .map_err(|e| AppError::internal(format!("S3 delete {key} failed: {}", sdk(&e))))?;
         Ok(())
     }
 
     pub async fn get(&self, key: &str) -> AppResult<Vec<u8>> {
+        Ok(self.get_bytes(key).await?.to_vec())
+    }
+
+    /// [`Self::get`] for the derived-file builder, whose errors are stored for
+    /// an admin to read at `/admin/derived-data` and never sent to a client:
+    /// with the SDK's whole cause, where a response carries only the first
+    /// line ("dispatch failure" told the admin nothing -- the audit's pass 7).
+    pub async fn get_for_build(&self, key: &str) -> AppResult<Vec<u8>> {
+        Ok(self.get_bytes_as(key, true).await?.to_vec())
+    }
+
+    /// The object's bytes as S3 handed them over, without a copy.
+    ///
+    /// Only a missing key is a 404. Every other failure -- throttling, a
+    /// timeout, credentials -- was one too, and a worker told a leave
+    /// generation's KLV does not exist does not retry: every leave worker's
+    /// run ended on a transient S3 error. They are 503 with a `Retry-After`.
+    pub async fn get_bytes(&self, key: &str) -> AppResult<axum::body::Bytes> {
+        self.get_bytes_as(key, false).await
+    }
+
+    /// `for_admin`: the error as [`sdk`] gives it, for a stored or admin-read
+    /// error; otherwise plain, for a worker's response.
+    async fn get_bytes_as(&self, key: &str, for_admin: bool) -> AppResult<axum::body::Bytes> {
+        use aws_sdk_s3::operation::get_object::GetObjectError;
         let object = self
             .client
             .get_object()
@@ -129,14 +206,23 @@ impl ArtifactStore {
             .key(key)
             .send()
             .await
-            .map_err(|e| AppError::not_found(format!("no artifact at {key}: {e}")))?;
+            .map_err(|e| {
+                if let Some(GetObjectError::NoSuchKey(_)) = e.as_service_error() {
+                    return AppError::not_found(format!("no artifact at {key}"));
+                }
+                let why = if for_admin { sdk(&e) } else { cause(&e.into_service_error()) };
+                unavailable(format!("S3 get {key} failed: {why}"))
+            })?;
 
         let bytes = object
             .body
             .collect()
             .await
-            .map_err(|e| AppError::internal(format!("S3 read {key} failed: {e}")))?;
-        Ok(bytes.into_bytes().to_vec())
+            .map_err(|e| {
+                let why = if for_admin { chain(&e) } else { cause(&e) };
+                unavailable(format!("S3 read {key} failed: {why}"))
+            })?;
+        Ok(bytes.into_bytes())
     }
 }
 
@@ -170,7 +256,7 @@ impl MultipartUpload {
             .send()
             .await
             .map_err(|e| {
-                AppError::internal(format!("S3 upload part {part_number} of {} failed: {e}", self.key))
+                AppError::internal(format!("S3 upload part {part_number} of {} failed: {}", self.key, sdk(&e)))
             })?;
         self.parts.push(
             aws_sdk_s3::types::CompletedPart::builder()
@@ -181,20 +267,29 @@ impl MultipartUpload {
         Ok(())
     }
 
-    pub async fn finish(self) -> AppResult<String> {
+    /// Complete the upload; one that fails to complete is aborted, so its
+    /// parts are not left for the lifecycle rule.
+    pub async fn finish(mut self) -> AppResult<String> {
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-            .set_parts(Some(self.parts))
+            .set_parts(Some(std::mem::take(&mut self.parts)))
             .build();
-        self.client
+        let finished = self
+            .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(&self.key)
             .upload_id(&self.upload_id)
             .multipart_upload(completed)
             .send()
-            .await
-            .map_err(|e| AppError::internal(format!("S3 multipart finish {} failed: {e}", self.key)))?;
-        Ok(self.key)
+            .await;
+        match finished {
+            Ok(_) => Ok(self.key),
+            Err(e) => {
+                let err = AppError::internal(format!("S3 multipart finish {} failed: {}", self.key, sdk(&e)));
+                self.abort().await;
+                Err(err)
+            }
+        }
     }
 
     /// Abandon the upload, so its parts do not sit in the bucket being billed.
@@ -212,5 +307,13 @@ impl MultipartUpload {
         {
             tracing::warn!(key = %self.key, %err, "could not abort a multipart upload");
         }
+    }
+}
+
+/// An object-store failure worth retrying: 503, asked back in thirty seconds.
+fn unavailable(message: String) -> AppError {
+    AppError {
+        retry_after: Some(30),
+        ..AppError::new(axum::http::StatusCode::SERVICE_UNAVAILABLE, "unavailable", message)
     }
 }

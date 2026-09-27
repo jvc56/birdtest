@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# Run SQL against the production database, from inside the VPC.
+#
+#   scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lower('alice') RETURNING username"
+#   scripts/prod-sql.sh < fix.sql
+#
+# The database is not publicly accessible and its security group admits only
+# the service's, so nothing on an operator's machine can reach it -- no psql
+# from a laptop, no bastion. This runs the ops task (infra/ops.tf): the
+# postgres image (so a psql matching the server), DATABASE_URL from SSM, and
+# the service's subnets and security group. Its command is psql reading the
+# SQL given here, and what psql prints is read back from CloudWatch Logs.
+# For anything interactive, scripts/prod-shell.sh opens a shell in the same
+# task instead. Needs the AWS CLI, jq and the
+# Terraform state in infra/ (or INFRA_DIR).
+#
+# Statements run with ON_ERROR_STOP, in one transaction (--single-transaction):
+# anything that fails rolls the whole script back. The SQL travels as an
+# environment override, which ECS caps at about 8 KB in total -- and which AWS
+# keeps in its records of the task, as CloudWatch keeps what psql prints for
+# thirty days: never put a secret in the SQL, and never select personal
+# columns (addresses, hashes) through it. scripts/prod-shell.sh is for that.
+set -euo pipefail
+
+sql=${1:-$(cat)}
+[[ -n "$sql" ]] || { echo "usage: $0 'SQL' (or SQL on stdin)" >&2; exit 2; }
+
+tf() { terraform -chdir="${INFRA_DIR:-$(cd "$(dirname "$0")/.." && pwd)/infra}" output "$@"; }
+# Every AWS call in the stack's own region, not the CLI's default -- which,
+# during a region loss, is usually the region that was lost.
+export AWS_REGION AWS_DEFAULT_REGION
+AWS_REGION=$(tf -raw region)
+AWS_DEFAULT_REGION=$AWS_REGION
+cluster=$(tf -raw cluster_name)
+# After a region-loss drill the workspace may still be the DR stack's.
+echo "workspace $(terraform -chdir="${INFRA_DIR:-$(cd "$(dirname "$0")/.." && pwd)/infra}" workspace show), region $AWS_REGION, cluster $cluster" >&2
+task_definition=$(tf -raw ops_task_definition)
+subnets=$(tf -json service_subnet_ids | jq -r 'join(",")')
+security_group=$(tf -raw service_security_group_id)
+log_group=$(tf -raw log_group_name)
+
+overrides=$(jq -n --arg sql "$sql" '{
+  containerOverrides: [{
+    name: "ops",
+    environment: [{ name: "BIRDTEST_SQL", value: $sql }],
+    command: ["printf %s \"$BIRDTEST_SQL\" | psql \"$DATABASE_URL\" -X -v ON_ERROR_STOP=1 --single-transaction -f -"]
+  }]
+}')
+
+started=$(aws ecs run-task --cluster "$cluster" --task-definition "$task_definition" \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$subnets],securityGroups=[$security_group],assignPublicIp=ENABLED}" \
+  --overrides "$overrides" --output json)
+task_arn=$(jq -r '.tasks[0].taskArn // empty' <<<"$started")
+if [[ -z "$task_arn" ]]; then
+  echo "the task did not start:" >&2
+  jq '.failures' <<<"$started" >&2
+  exit 1
+fi
+echo "running $task_arn" >&2
+# Polled without a cap. `aws ecs wait tasks-stopped` gives up after ten
+# minutes and exits, with no output, while the SQL goes on running and
+# commits -- and running it again would run it twice. A task ECS no longer
+# describes reads `None`: just after run-task (ECS is eventually consistent,
+# so it is asked again) or long after it stopped (ECS forgets stopped tasks
+# after about an hour: a laptop that slept through the run), which counts as
+# stopped once the task has been seen, or after five minutes of it. A failed
+# call reads empty, and is asked again.
+seen=false
+unseen=0
+while :; do
+  sleep 10
+  status=$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
+    --query 'tasks[0].lastStatus' --output text 2>/dev/null) || status=""
+  [[ "$status" == STOPPED ]] && break
+  if [[ "$status" == None ]]; then
+    unseen=$((unseen + 1))
+    { $seen || (( unseen >= 30 )); } && break
+  elif [[ -n "$status" ]]; then
+    seen=true
+    unseen=0
+  fi
+done
+
+# All of psql's output, page by page: one call returns at most 10,000 events
+# or 1 MB. A task that never started its container has no stream at all, and
+# its stopped reason says why. Read a few seconds after the stop: CloudWatch
+# takes that long to ingest the last lines, which are psql's ERROR when there
+# is one -- read at once, the output ended before it and only the exit code
+# said anything had gone wrong.
+sleep 10
+task_id=${task_arn##*/}
+token=""
+while :; do
+  page=$(aws logs get-log-events --log-group-name "$log_group" \
+    --log-stream-name "ops/ops/$task_id" --start-from-head \
+    ${token:+--next-token "$token"} --output json 2>/dev/null) || {
+    echo "no output from the task:" >&2
+    aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
+      --query 'tasks[0].[stoppedReason, containers[0].reason]' --output text >&2
+    exit 1
+  }
+  jq -r '.events[].message' <<<"$page"
+  next=$(jq -r '.nextForwardToken' <<<"$page")
+  [[ "$next" == "$token" ]] && break
+  token=$next
+done
+
+exit_code=$(aws ecs describe-tasks --cluster "$cluster" --tasks "$task_arn" \
+  --query 'tasks[0].containers[0].exitCode' --output text)
+if [[ "$exit_code" == None ]]; then
+  # Forgotten by ECS: whether psql succeeded is in its output above, and the
+  # SQL may well have committed -- read that before running anything again.
+  echo "the task's exit status is no longer known; read its output above" >&2
+  exit 2
+fi
+[[ "$exit_code" == "0" ]] || { echo "psql exited $exit_code" >&2; exit 1; }

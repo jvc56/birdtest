@@ -1,8 +1,9 @@
 //! Sequential Probability Ratio Test over game (or game-pair) outcomes.
 //!
 //! The hypotheses are stated in Elo: H0 says the Elo difference is `elo_low`,
-//! H1 says it is `elo_high`. We use the standard normal approximation to the
-//! log-likelihood ratio used by fishtest: treat each unit's score as a draw
+//! H1 says it is `elo_high`. We use a normal approximation to the
+//! log-likelihood ratio of the kind fishtest has used (it overstates |LLR|
+//! when nearly every unit scores alike; PLAN KL-87): treat each unit's score as a draw
 //! from a distribution with unknown mean, and compare the likelihood of the
 //! observed sample mean under the two hypothesised means.
 //!
@@ -202,6 +203,16 @@ pub fn evaluate(
 impl SprtStatus {
     pub fn is_finished(self) -> bool {
         !matches!(self, SprtStatus::Running)
+    }
+
+    /// As serialized, and as `jobs.sprt_decided_status` stores it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SprtStatus::Running => "running",
+            SprtStatus::Passed => "passed",
+            SprtStatus::Failed => "failed",
+            SprtStatus::TerminatedAtMax => "terminated_at_max",
+        }
     }
 }
 

@@ -131,7 +131,9 @@ mod tests {
     /// expired by the time it is checked; no waiting.
     #[test]
     fn an_expired_session_is_rejected() {
-        let cfg = config(KEY, "0");
+        // Zero is refused as configuration; set here, as nothing else can.
+        let mut cfg = config(KEY, "3600");
+        cfg.session_ttl = std::time::Duration::ZERO;
         let token = issue(&cfg, Uuid::new_v4(), "carol", false, 0).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let err = verify(&cfg, &token).unwrap_err();

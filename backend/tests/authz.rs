@@ -208,6 +208,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("DELETE", "/api/admin/jobs/:id", Admin, ""),
     ("DELETE", "/api/admin/users/:id", Admin, ""),
     ("GET", "/api/admin/workers", Admin, ""),
+    ("GET", "/api/admin/workers/bans", Admin, ""),
     ("POST", "/api/admin/workers/ban", Admin, r#"{"user_id":"00000000-0000-4000-8000-000000000001"}"#),
     ("DELETE", "/api/admin/workers/ban/:id", Admin, ""),
     ("GET", "/api/admin/audit-log", Admin, ""),
@@ -223,7 +224,12 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("POST", "/api/admin/jobs/:id/rebuild-artifacts", Admin, ""),
     ("POST", "/api/admin/jobs/:id/merge-progress", Admin, ""),
     ("GET", "/api/admin/derived-data", Admin, ""),
-    ("POST", "/api/admin/derived-data/retry", Admin, r#"{"role":"wmp","name":"NWL23"}"#),
+    (
+        "POST",
+        "/api/admin/derived-data/retry",
+        Admin,
+        r#"{"role":"wmp","name":"NWL23","builder":"wmp-1","kwg_id":"00000000-0000-0000-0000-000000000001","klv_id":null,"letterdist_id":"00000000-0000-0000-0000-000000000002"}"#,
+    ),
     ("GET", "/api/admin/backups", Admin, ""),
     ("GET", "/api/admin/fleet", Admin, ""),
     (
@@ -591,10 +597,14 @@ async fn a_deactivated_or_revoked_api_key_is_refused_by_every_worker_endpoint() 
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "an active key is served (nothing to do): {body}");
 
+    // A fresh app, and so fresh rate limiters, for each round: every
+    // presented key is charged its own bucket (burst 5) before its lookup,
+    // live or dead, and a round is five requests on top of the claim above.
     let refused_everywhere = |label: &'static str| {
-        let app = app.clone();
+        let db = &db;
         let bearer = bearer.clone();
         async move {
+            let app = birdtest::app(db.state().await);
             let mut checked = 0;
             for (method, path, _, body) in routes_with(&[Worker]) {
                 let (status, response) = send(&app, request(method, path, &bearer, body)).await;

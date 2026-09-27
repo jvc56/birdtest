@@ -16,8 +16,19 @@
       await api.login({ username, password });
       await refreshSession();
       // Come back to whatever the user was trying to reach before the guard
-      // redirected them here.
-      goto($page.url.searchParams.get('next') ?? '/account');
+      // redirected them here -- a path on this site only: `goto` refuses
+      // anything else, which left a signed-in user on this page, unmoved.
+      // Resolved rather than pattern-matched: `/\evil.com` and a path with a
+      // tab in it both start with a single '/' and resolve off-site.
+      // The whole URL once it is known to be this site's: its path alone
+      // (`/.//evil.com` resolves to the path `//evil.com`) reads off-site.
+      let next: URL | null = null;
+      try {
+        next = new URL($page.url.searchParams.get('next') ?? '/account', $page.url.origin);
+      } catch {
+        next = null;
+      }
+      await goto(next && next.origin === $page.url.origin ? next.href : '/account');
     } catch (e) {
       error = (e as Error).message;
     } finally {
@@ -44,7 +55,7 @@
         required
       />
     </div>
-    {#if error}<p class="field-error">{error}</p>{/if}
+    {#if error}<p class="field-error" role="alert">{error}</p>{/if}
     <button class="btn-primary w-full" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
     <div class="flex justify-between text-sm text-muted-foreground">
       <a href="/reset-password">Forgot password?</a>

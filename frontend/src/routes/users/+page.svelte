@@ -5,28 +5,38 @@
   import Pagination from '$lib/components/Pagination.svelte';
 
   let result: Page<Record<string, any>> | null = null;
+  let loadError = '';
 
   async function load(page: number) {
-    result = await api.users(page);
+    loadError = '';
+    try {
+      result = await api.users(page);
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   }
   onMount(() => load(0));
 </script>
 
 <h1 class="mb-6 text-2xl font-semibold">Registered users</h1>
 
-{#if !result}
+{#if loadError}
+  <p class="text-sm text-destructive">Could not load the users: {loadError}</p>
+{:else if !result}
   <p class="text-muted-foreground">Loading…</p>
 {:else}
   <div class="card overflow-x-auto p-0">
     <table class="table">
       <thead>
-        <tr><th>Username</th><th>Joined</th><th class="text-right">Tasks completed</th></tr>
+        <!-- "Joined" is dropped on a phone, as on /workers: with it the count ran
+             out of the box at 320 pixels whatever the name. -->
+        <tr><th>Username</th><th class="hidden sm:table-cell">Joined</th><th class="text-right">Tasks completed</th></tr>
       </thead>
       <tbody>
         {#each result.items as user}
           <tr>
-            <td>{user.username}{#if user.is_admin}<span class="ml-2 text-xs text-primary">admin</span>{/if}</td>
-            <td>{datetime(user.created_at)}</td>
+            <td><span class="break-all">{user.username}</span>{#if user.is_admin}<span class="ml-2 whitespace-nowrap text-xs text-primary">admin</span>{/if}</td>
+            <td class="hidden sm:table-cell">{datetime(user.created_at)}</td>
             <td class="text-right tabular-nums">{Number(user.tasks_completed).toLocaleString()}</td>
           </tr>
         {:else}

@@ -603,6 +603,7 @@ async fn the_rack_target_is_not_sent_to_the_worker() {
             "lexicon",
             "num_games",
             "previous_artifact_key",
+            "previous_artifact_sha256",
             "seed",
             "use_wordmap",
             "variant",

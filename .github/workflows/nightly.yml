@@ -5,6 +5,11 @@
 # the results land, then the M-5..M-11 cases (see scripts/e2e_magpie.py).
 name: Nightly MAGPIE end-to-end
 
+# Read-only: the token reaches the backend container (for MAGPIE-DATA
+# lookups), so it should be able to do nothing else.
+permissions:
+  contents: read
+
 on:
   schedule:
     - cron: "0 6 * * *"
@@ -15,9 +20,17 @@ on:
         default: birdtest-contribute
 
 jobs:
+  # Twice: the MAGPIE commit docker/Dockerfile pins -- what production runs,
+  # which nothing else put through a real task: a pin that refused every
+  # short opening rack passed every PR check (AUDIT_FINDINGS_19 1.1) -- and
+  # the branch head, what the next pin will be.
   e2e:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        magpie: [pin, head]
     # The checkout the compose file mounts into the backend (and the
     # derived-builder) as /magpie. Unset, compose falls back to ../MAGPIE,
     # which does not exist here, and the backend exits at start with no
@@ -26,10 +39,25 @@ jobs:
       MAGPIE_ROOT: ${{ github.workspace }}/magpie
     steps:
       - uses: actions/checkout@v4
+      - name: Which MAGPIE
+        id: magpie-ref
+        # Through the environment, not pasted into the script: a dispatched
+        # ref is free text.
+        env:
+          LEG: ${{ matrix.magpie }}
+          HEAD_REF: ${{ inputs.magpie_ref || 'birdtest-contribute' }}
+        run: |
+          if [ "$LEG" = pin ]; then
+            ref="$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)"
+          else
+            ref="$(printf '%s' "$HEAD_REF" | tr -d '\n')"
+          fi
+          [ -n "$ref" ] || { echo "no MAGPIE ref (is ARG MAGPIE_COMMIT= in docker/Dockerfile?)" >&2; exit 1; }
+          printf 'ref=%s\n' "$ref" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE
-          ref: ${{ inputs.magpie_ref || 'birdtest-contribute' }}
+          ref: ${{ steps.magpie-ref.outputs.ref }}
           path: magpie
       - name: Cache MAGPIE data
         id: magpie-data
@@ -70,6 +98,10 @@ jobs:
           # variables, so docker-compose.yml reads these names instead.
           BIRDTEST_GITHUB_API_URL: http://host.docker.internal:8481/api
           BIRDTEST_GITHUB_RAW_URL: http://host.docker.internal:8481/raw
+          # Compose's defaults (2 and 3) suit a laptop; the runner has four
+          # cores and nothing else to do.
+          CARGO_BUILD_JOBS: "4"
+          MAKE_JOBS: "4"
         run: docker compose up -d --build --wait postgres minio minio-init backend
 
       - uses: actions/setup-python@v5
@@ -126,6 +158,14 @@ jobs:
             < backend/migrations/0001_initial.sql
       - name: Dump, drop, restore, verify
         run: ./scripts/restore-roundtrip.sh
+      # RUNBOOK.md §2.2's copy-back, through its failure and re-run cases, in
+      # three databases of its own.
+      - name: Selective restore of a purged job
+        run: timeout 600 ./scripts/restore-job-check.sh
+      # RUNBOOK.md §1's re-application of the security actions a full restore
+      # undoes, its two blocks as written, through their refusals and re-runs.
+      - name: Security actions re-applied after a full restore
+        run: timeout 300 ./scripts/reapply-check.sh
       - if: always()
         run: docker compose down -v
 

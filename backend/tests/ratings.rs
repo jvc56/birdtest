@@ -102,8 +102,8 @@ async fn game_result(db: &TestDb, job: Uuid, tally: (i32, i32, i32), pent: Optio
     .await
     .unwrap();
     let claim: Uuid = sqlx::query_scalar(
-        "INSERT INTO task_claims (task_id, claim_token, state, claimed_by_anon_uuid, completed_at)
-         VALUES ($1, gen_random_uuid(), 'completed', $2, now()) RETURNING id",
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_anon_uuid, completed_at)
+         VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), gen_random_uuid(), 'completed', $2, now()) RETURNING id",
     )
     .bind(task)
     .bind(worker)
@@ -130,6 +130,14 @@ async fn game_result(db: &TestDb, job: Uuid, tally: (i32, i32, i32), pent: Optio
     .execute(&db.pool)
     .await
     .unwrap();
+    // As the submission that stores a first result does: the sweep reads this
+    // running total to decide whether a pool's evidence moved.
+    sqlx::query("UPDATE jobs SET games_completed = games_completed + $2 WHERE id = $1")
+        .bind(job)
+        .bind(i64::from(wins + losses + ties))
+        .execute(&db.pool)
+        .await
+        .unwrap();
 }
 
 /// A pool over `scope` and `variant` whose members are `anchor` and `others`.
@@ -414,8 +422,8 @@ async fn redundant_copy(db: &TestDb, job: Uuid, task: Uuid, pent: [i32; 5], seco
         .await
         .unwrap();
     let claim: Uuid = sqlx::query_scalar(
-        "INSERT INTO task_claims (task_id, claim_token, state, claimed_by_anon_uuid, completed_at)
-         VALUES ($1, gen_random_uuid(), 'completed', $2, now()) RETURNING id",
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_anon_uuid, completed_at)
+         VALUES ($1, (SELECT job_id FROM tasks WHERE id = $1), gen_random_uuid(), 'completed', $2, now()) RETURNING id",
     )
     .bind(task)
     .bind(worker)
@@ -524,7 +532,7 @@ async fn a_fit_stores_one_run_and_one_rating_per_member() {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-    assert_eq!((trigger.as_str(), method.as_str()), ("manual", "bradley_terry_mm"));
+    assert_eq!((trigger.as_str(), method.as_str()), ("manual", "bradley_terry_newton"));
 
     let stored = stored_ratings(&db, run).await;
     let mut rated: Vec<Uuid> = stored.keys().copied().collect();
@@ -690,6 +698,41 @@ async fn the_sweep_refits_only_the_pools_whose_evidence_grew() {
 
     assert_eq!(ratings::recompute_stale(&db.pool).await.unwrap(), 0, "nothing grew");
     assert_eq!((run_count(&db, busy).await, run_count(&db, quiet).await), (2, 1));
+}
+
+/// I-RATE-9b: the sweep also repairs a membership change whose own refit never
+/// ran -- the route commits the membership and then fits in a separate step,
+/// and a dropped request or a failed fit left the pool's newest run describing
+/// the old membership. When the config added had no pairs in the pool, the
+/// evidence count did not move and nothing ever noticed.
+#[tokio::test]
+async fn the_sweep_refits_a_pool_whose_membership_changed_without_a_refit() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let anchor = db.static_player("a-anchor", admin).await;
+    let rival = db.static_player("b-rival", admin).await;
+    let newcomer = db.static_player("c-newcomer", admin).await;
+    let scope = scope(&db).await;
+    let job = pairs_job(&db, "classic", scope, anchor, rival).await;
+    pair_result(&db, job, [0, 1, 1, 0, 0]).await;
+    let pool = pool(&db, "pool", "classic", scope, anchor, &[rival], 2000.0).await;
+    ratings::recompute(&db.pool, pool, Trigger::Manual).await.unwrap();
+
+    // A member with no pairs, added behind the route's back: no refit ran.
+    add_member(&db, pool, newcomer).await;
+    assert_eq!(ratings::recompute_stale(&db.pool).await.unwrap(), 1);
+    let newest: Uuid = sqlx::query_scalar(
+        "SELECT id FROM rating_runs WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
+    )
+    .bind(pool)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(stored_ratings(&db, newest).await.contains_key(&newcomer), "the newcomer is rated");
+    assert_eq!(ratings::recompute_stale(&db.pool).await.unwrap(), 0, "and then it is current");
+
+    remove_member(&db, pool, newcomer).await;
+    assert_eq!(ratings::recompute_stale(&db.pool).await.unwrap(), 1, "a removal likewise");
 }
 
 /// I-RATE-10: two pools over the same configs and the same set of jobs, scoped
@@ -933,6 +976,90 @@ async fn creating_a_pool_makes_its_anchor_a_member() {
     assert_eq!(list[0]["members"], 1, "{list}");
 }
 
+/// A-RATE-3b: a pool is validated the way a job is. A variant no job can have,
+/// a distribution row that is really a layout, or an anchor rating whose
+/// logistic scale overflows each made a pool that rated no one, or rated
+/// everyone at infinity -- and a pool cannot be deleted. Each is refused, and
+/// nothing is created.
+#[tokio::test]
+async fn a_pool_that_could_rate_no_one_is_refused() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let scope = scope(&db).await;
+    let anchor = db.static_player("a-anchor", admin).await;
+    let body = |variant: &str, letterdist: Uuid, rating: f64| {
+        json!({
+            "name": "pool",
+            "variant": variant,
+            "letterdist_id": letterdist,
+            "layout_id": scope.layout,
+            "anchor_player_config_id": anchor,
+            "anchor_rating": rating,
+        })
+    };
+
+    for (what, bad) in [
+        ("a variant no job has", body("scrabble", scope.letterdist, 2000.0)),
+        ("a layout as the distribution", body("classic", scope.layout, 2000.0)),
+        ("an overflowing anchor rating", body("classic", scope.letterdist, 200_000.0)),
+        ("an anchor that does not exist", {
+            let mut b = body("classic", scope.letterdist, 2000.0);
+            b["anchor_player_config_id"] = json!(Uuid::new_v4());
+            b
+        }),
+        ("a board no job can be created on", {
+            let mut board = b"10, 10\n".to_vec();
+            for _ in 0..21 {
+                board.extend_from_slice(&[b' '; 21]);
+                board.push(b'\n');
+            }
+            let super21: Uuid = sqlx::query_scalar(
+                "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+                 VALUES ('layouts/standard21.txt', 'layout', 'standard21', repeat('2', 64), $1,
+                         '20260101', $2)
+                 RETURNING id",
+            )
+            .bind(board.len() as i64)
+            .bind(&board)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            let mut b = body("classic", scope.letterdist, 2000.0);
+            b["layout_id"] = json!(super21);
+            b
+        }),
+        ("a letter distribution no job can be created on", {
+            let garbled = b"this is not a letter distribution\n".to_vec();
+            let garbled_id: Uuid = sqlx::query_scalar(
+                "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+                 VALUES ('letterdists/garbled.csv', 'letterdist', 'garbled', repeat('3', 64), $1,
+                         '20260101', $2)
+                 RETURNING id",
+            )
+            .bind(garbled.len() as i64)
+            .bind(&garbled)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+            body("classic", garbled_id, 2000.0)
+        }),
+    ] {
+        let (status, response) = send(
+            &app,
+            request("POST", "/api/admin/rating-pools", &admin_headers(&state.cfg, admin), Some(bad)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {response}");
+    }
+    let pools: i64 = sqlx::query_scalar("SELECT count(*) FROM rating_pools")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(pools, 0);
+}
+
 /// A-RATE-4: adding a member and removing one each refit the pool and return
 /// the new run, which includes the newcomer and then no longer does.
 #[tokio::test]
@@ -979,6 +1106,73 @@ async fn adding_and_removing_a_member_each_refit_the_pool() {
     assert_eq!(run_count(&db, f.pool).await, 3);
 }
 
+/// A-RATE-4b: adding a config that does not exist is a 400 on its field, and
+/// to a pool that does not exist a 404 -- not the 409 "still referenced" a
+/// bare foreign-key failure maps to. Neither refits anything.
+#[tokio::test]
+async fn adding_an_unknown_member_or_to_an_unknown_pool_says_which() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let f = fixture(&db).await;
+    let headers = admin_headers(&state.cfg, f.admin);
+    let runs = run_count(&db, f.pool).await;
+
+    let ghost = Uuid::new_v4();
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/rating-pools/{}/members", f.pool),
+            &headers,
+            Some(json!({ "player_config_id": ghost })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "player_config_id", "{body}");
+
+    let (status, body) = send(
+        &app,
+        request(
+            "POST",
+            &format!("/api/admin/rating-pools/{}/members", Uuid::new_v4()),
+            &headers,
+            Some(json!({ "player_config_id": f.rival })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(run_count(&db, f.pool).await, runs);
+}
+
+/// A config that is not a member is not removed: a second click was logged
+/// as a removal and refitted the pool (the audit's pass 22).
+#[tokio::test]
+async fn removing_a_config_that_is_not_a_member_is_a_404() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let f = fixture(&db).await;
+    let stranger = Uuid::new_v4();
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/rating-pools/{}/members/{stranger}", f.pool),
+            &admin_headers(&state.cfg, f.admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let logged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'rating_pool.member_removed'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(logged, 0);
+}
+
 /// A-RATE-5: removing the anchor is refused, with a message that says what to
 /// do instead, and changes nothing.
 #[tokio::test]
@@ -1001,7 +1195,7 @@ async fn removing_the_anchor_is_refused_with_the_fix_named() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     let message = body["message"].as_str().unwrap();
     assert!(message.contains("cannot remove the pool's anchor"), "{message}");
-    assert!(message.contains("Point the pool at a different anchor first"), "{message}");
+    assert!(message.contains("create a pool anchored on it"), "{message}");
 
     let still: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM rating_pool_members
@@ -1089,6 +1283,66 @@ async fn history_is_in_time_order_and_leaves_out_unrated_configs() {
     assert_eq!(points, expected);
 }
 
+/// A-RATE-6b: history carries only what the chart draws -- the six current
+/// members rated highest in the newest run -- where it sent every member's
+/// every point on each view of a public page; and a config removed from the
+/// pool takes none of the six, however high it was rated.
+#[tokio::test]
+async fn history_carries_the_six_highest_current_members() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let admin = db.user("root", true).await;
+    let scope = scope(&db).await;
+    let anchor = db.static_player("anchor", admin).await;
+    let mut others = Vec::new();
+    for i in 0..8 {
+        others.push(db.static_player(&format!("m{i}"), admin).await);
+    }
+    let removed = db.static_player("removed", admin).await;
+    let pool = pool(&db, "pool", "classic", scope, anchor, &others, 2000.0).await;
+
+    // Two runs; member i rated 1900 + 10 i, the removed config above them all.
+    for at in ["2026-03-01", "2026-03-02"] {
+        let run: Uuid = sqlx::query_scalar(
+            "INSERT INTO rating_runs (pool_id, computed_at, trigger, iterations, converged,
+                                      pairs_used, jobs_used)
+             VALUES ($1, $2::timestamptz, 'evidence', 1, true, 1, 1) RETURNING id",
+        )
+        .bind(pool)
+        .bind(at)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        let mut rows = vec![(anchor, 2000.0), (removed, 2500.0)];
+        rows.extend(others.iter().enumerate().map(|(i, c)| (*c, 1900.0 + 10.0 * i as f64)));
+        for (config, rating) in rows {
+            sqlx::query(
+                "INSERT INTO player_config_ratings
+                     (run_id, player_config_id, rating, stderr, pairs_played,
+                      connected_to_anchor, is_anchor)
+                 VALUES ($1, $2, $3, 10, 1, true, $4)",
+            )
+            .bind(run)
+            .bind(config)
+            .bind(rating)
+            .bind(config == anchor)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    let (status, body) =
+        send(&app, get_request(&format!("/api/rating-pools/{pool}/history"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut names: Vec<String> =
+        body.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap().to_string()).collect();
+    assert_eq!(names.len(), 12, "six configs at two runs: {names:?}");
+    names.sort();
+    names.dedup();
+    assert_eq!(names, ["anchor", "m3", "m4", "m5", "m6", "m7"]);
+}
+
 /// A-RATE-7: recompute is an admin action -- refused without a session and
 /// with a non-admin one, before anything is fit -- and an admin's stores a
 /// new manual run and returns it.
@@ -1126,4 +1380,24 @@ async fn only_an_admin_can_recompute_and_it_stores_a_new_run() {
     assert_eq!(trigger, "manual");
     assert_eq!(evidence(&db, run).await, (2, 1));
     assert_eq!(run_count(&db, f.pool).await, 1);
+}
+
+/// A self-play job (both seats one config, which creation allows) is not
+/// counted as evidence the fit used: the fit ignores it, and the page's "over
+/// N pairs from M jobs" said otherwise.
+#[tokio::test]
+async fn a_self_play_job_is_not_counted_as_evidence() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let scope = scope(&db).await;
+    let anchor = db.static_player("a-anchor", admin).await;
+    let rival = db.static_player("b-rival", admin).await;
+    let real = pairs_job(&db, "classic", scope, anchor, rival).await;
+    pair_result(&db, real, [1, 2, 3, 2, 1]).await;
+    let mirror = pairs_job(&db, "classic", scope, rival, rival).await;
+    pair_result(&db, mirror, [0, 5, 10, 5, 0]).await;
+    let pool = pool(&db, "pool", "classic", scope, anchor, &[rival], 2000.0).await;
+
+    let run = ratings::recompute(&db.pool, pool, Trigger::Manual).await.unwrap();
+    assert_eq!(evidence(&db, run).await, (9, 1), "the real job's nine pairs, and it alone");
 }

@@ -11,7 +11,8 @@ use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::ratings::{self, Trigger};
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use crate::extract::ApiPath as Path;
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -151,7 +152,7 @@ async fn pool_detail(
 
     let run = sqlx::query(
         "SELECT id, computed_at, trigger, iterations, converged, pairs_used, jobs_used
-         FROM rating_runs WHERE pool_id = $1 ORDER BY computed_at DESC LIMIT 1",
+         FROM rating_runs WHERE pool_id = $1 ORDER BY computed_at DESC, id DESC LIMIT 1",
     )
     .bind(id)
     .fetch_optional(&state.read_pool)
@@ -252,52 +253,88 @@ struct HistoryPoint {
 /// chart a few hundred pixels wide.
 const MAX_HISTORY_RUNS: i64 = 500;
 
+/// How many configs the history carries: the chart draws this many
+/// (`SERIES_CAP` in `frontend/src/lib/charts/ratingHistory.ts`).
+const HISTORY_CONFIGS: i64 = 6;
+
 /// The pool's rating history, oldest first: the chart's time axis. Snapshots per
 /// run rather than a mutated current value are what make this possible at all.
 ///
 /// Thinned to at most [`MAX_HISTORY_RUNS`] runs, evenly spaced over the pool's
 /// whole history, with the first and the newest always kept -- so the chart
 /// still starts where the pool started and ends at the rating the page shows.
+///
+/// Only the [`HISTORY_CONFIGS`] current members rated highest in the newest
+/// run: the chart draws no more. Every member's points went out on every view
+/// of this public page -- 9.5 MB at 100 members, a second of the display
+/// pool's time, and forty at once answered `503` to other readers (the audit's
+/// pass 25) -- and a removed config could take one of the six places.
 async fn pool_history(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Vec<HistoryPoint>>> {
-    let rows = sqlx::query(
+    // The kept runs, by themselves: a plain query on the pool's runs.
+    let runs: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
         "WITH runs AS (
              SELECT id, computed_at,
-                    row_number() OVER (ORDER BY computed_at) AS n,
+                    row_number() OVER (ORDER BY computed_at, id) AS n,
                     count(*) OVER () AS total
              FROM rating_runs WHERE pool_id = $1
-         ),
-         kept AS (
-             SELECT id, computed_at FROM runs
-             WHERE total <= $2
-                OR (n - 1) % ((total + $2 - 1) / $2) = 0
-                OR n = total
          )
-         SELECT kept.computed_at, r.player_config_id, c.name, r.rating, r.stderr
-         FROM kept
-         JOIN player_config_ratings r ON r.run_id = kept.id
-         JOIN player_configs c        ON c.id = r.player_config_id
-         WHERE r.connected_to_anchor
-         ORDER BY kept.computed_at ASC, c.name ASC",
+         SELECT id, computed_at FROM runs
+         WHERE total <= $2
+            OR (n - 1) % ((total + $2 - 1) / $2) = 0
+            OR n = total
+         ORDER BY n",
     )
     .bind(id)
     .bind(MAX_HISTORY_RUNS)
     .fetch_all(&state.read_pool)
     .await?;
+    let Some(&(newest, _)) = runs.last() else {
+        return Ok(Json(Vec::new()));
+    };
+    let shown: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT r.player_config_id, c.name
+         FROM player_config_ratings r
+         JOIN player_configs c ON c.id = r.player_config_id
+         JOIN rating_pool_members m ON m.pool_id = $2 AND m.player_config_id = r.player_config_id
+         WHERE r.run_id = $1 AND r.connected_to_anchor
+         ORDER BY r.rating DESC, r.player_config_id
+         LIMIT $3",
+    )
+    .bind(newest)
+    .bind(id)
+    .bind(HISTORY_CONFIGS)
+    .fetch_all(&state.read_pool)
+    .await?;
+    // Each (run, config) by the ratings' primary key: at most 501 × 6 rows.
+    let run_ids: Vec<Uuid> = runs.iter().map(|(run, _)| *run).collect();
+    let config_ids: Vec<Uuid> = shown.iter().map(|(config, _)| *config).collect();
+    let rows: Vec<(Uuid, Uuid, f64, f64)> = sqlx::query_as(
+        "SELECT run_id, player_config_id, rating, stderr
+         FROM player_config_ratings
+         WHERE run_id = ANY($1) AND player_config_id = ANY($2) AND connected_to_anchor",
+    )
+    .bind(&run_ids)
+    .bind(&config_ids)
+    .fetch_all(&state.read_pool)
+    .await?;
 
-    Ok(Json(
-        rows.iter()
-            .map(|row| HistoryPoint {
-                computed_at: row.get("computed_at"),
-                player_config_id: row.get("player_config_id"),
-                name: row.get("name"),
-                rating: row.get("rating"),
-                stderr: row.get("stderr"),
-            })
-            .collect(),
-    ))
+    let at: std::collections::HashMap<Uuid, chrono::DateTime<chrono::Utc>> = runs.into_iter().collect();
+    let names: std::collections::HashMap<Uuid, String> = shown.into_iter().collect();
+    let mut points: Vec<HistoryPoint> = rows
+        .into_iter()
+        .map(|(run, config, rating, stderr)| HistoryPoint {
+            computed_at: at[&run],
+            player_config_id: config,
+            name: names[&config].clone(),
+            rating,
+            stderr,
+        })
+        .collect();
+    points.sort_by(|a, b| a.computed_at.cmp(&b.computed_at).then_with(|| a.name.cmp(&b.name)));
+    Ok(Json(points))
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +358,12 @@ fn default_anchor_rating() -> f64 {
     2000.0
 }
 
+/// How far from zero an anchor may be pinned. Ratings are a logistic scale
+/// (`10^(r/400)`), which overflows a double a little past ±123,000 and turned
+/// every rating in the pool into ±inf -- stored, serialized as `null`, and the
+/// pool's page broke on it. Nothing plausible is anywhere near this.
+const MAX_ABS_ANCHOR_RATING: f64 = 10_000.0;
+
 async fn create_pool(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -330,6 +373,48 @@ async fn create_pool(
     ApiJson(body): ApiJson<CreatePoolBody>,
 ) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
     csrf::verify(&method, &headers, &jar)?;
+
+    // Validated the way a job is: a pool's scope is compared with its jobs'
+    // (variant, distribution, layout), so a pool scoped to a variant no job
+    // can have, or to a distribution row that is really a layout, matches
+    // nothing and rates no one, silently.
+    let mut err = AppError::bad_request("rating pool details are invalid");
+    if body.name.trim().is_empty() {
+        err = err.with_field("name", "must not be empty");
+    }
+    if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
+        err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
+    }
+    if !body.anchor_rating.is_finite() || body.anchor_rating.abs() > MAX_ABS_ANCHOR_RATING {
+        err = err.with_field(
+            "anchor_rating",
+            format!("must be a number between -{MAX_ABS_ANCHOR_RATING} and {MAX_ABS_ANCHOR_RATING}"),
+        );
+    }
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+    let letterdist_name = super::admin::require_role(&state.pool, body.letterdist_id, "letterdist").await?;
+    super::admin::require_role(&state.pool, body.layout_id, "layout").await?;
+    // Nor a distribution no job can be created on (`create_job` parses it).
+    let letterdist: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(body.letterdist_id)
+        .fetch_one(&state.pool)
+        .await?;
+    crate::jobs::racks::LetterDistribution::parse(&letterdist, &letterdist_name).map_err(|e| {
+        AppError::bad_request("no job can be created on that letter distribution")
+            .with_field("letterdist_id", e.message)
+    })?;
+    // A board no job can be created on is a pool no job will ever match: it
+    // would rate no one, silently.
+    let layout: Vec<u8> = sqlx::query_scalar("SELECT content FROM input_data WHERE id = $1")
+        .bind(body.layout_id)
+        .fetch_one(&state.pool)
+        .await?;
+    if let Some(problem) = super::admin::layout_problem(&layout) {
+        return Err(AppError::bad_request("no job can be created on that board layout")
+            .with_field("layout_id", problem));
+    }
 
     let mut tx = state.pool.begin().await?;
     let pool_id: Uuid = sqlx::query_scalar(
@@ -344,7 +429,15 @@ async fn create_pool(
     .bind(body.anchor_player_config_id)
     .bind(body.anchor_rating)
     .fetch_one(&mut *tx)
-    .await?;
+    .await
+    .map_err(|e| {
+        unknown_config(
+            e.into(),
+            "rating_pools_anchor_player_config_id_fkey",
+            "anchor_player_config_id",
+            body.anchor_player_config_id,
+        )
+    })?;
 
     // The anchor is a member by construction: a pool whose fixed point is not
     // in the pool has nothing to fix.
@@ -373,6 +466,22 @@ async fn create_pool(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": pool_id }))))
 }
 
+/// A foreign-key failure on `constraint`, a config reference, is the caller
+/// naming a config that does not exist: a 400 on that field, not the generic
+/// 409 ("still referenced by other records"), which says the opposite. Any
+/// other failure -- another key of the same insert included -- is left as it
+/// was.
+pub(crate) fn unknown_config(err: AppError, constraint: &str, field: &str, id: Uuid) -> AppError {
+    if err.db_code.as_deref() == Some(crate::error::FOREIGN_KEY_VIOLATION)
+        && err.db_constraint.as_deref() == Some(constraint)
+    {
+        AppError::bad_request("that player config does not exist")
+            .with_field(field, format!("no player config {id}"))
+    } else {
+        err
+    }
+}
+
 #[derive(Deserialize)]
 struct MemberBody {
     player_config_id: Uuid,
@@ -395,6 +504,13 @@ async fn add_member(
     csrf::verify(&method, &headers, &jar)?;
 
     let mut tx = state.pool.begin().await?;
+    // Pools are never deleted, so a pool seen here is still there for the
+    // insert, and a foreign-key failure on it can only be the config.
+    sqlx::query("SELECT 1 FROM rating_pools WHERE id = $1")
+        .bind(pool_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found("rating pool not found"))?;
     sqlx::query(
         "INSERT INTO rating_pool_members (pool_id, player_config_id, added_by)
          VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
@@ -403,7 +519,15 @@ async fn add_member(
     .bind(body.player_config_id)
     .bind(admin.0.id)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(|e| {
+        unknown_config(
+            e.into(),
+            "rating_pool_members_player_config_id_fkey",
+            "player_config_id",
+            body.player_config_id,
+        )
+    })?;
     audit::log(
         &mut tx,
         "rating_pool.member_added",
@@ -448,16 +572,23 @@ async fn remove_member(
     if is_anchor {
         return Err(AppError::bad_request(
             "cannot remove the pool's anchor: every other rating is measured against it. \
-             Point the pool at a different anchor first.",
+             A pool's anchor is fixed; to rate against another, create a pool anchored on it.",
         ));
     }
 
     let mut tx = state.pool.begin().await?;
-    sqlx::query("DELETE FROM rating_pool_members WHERE pool_id = $1 AND player_config_id = $2")
+    // A config that is not a member -- a second click -- removes nothing, and
+    // is answered so rather than logged and refitted as a removal (the audit's
+    // pass 22).
+    let removed = sqlx::query("DELETE FROM rating_pool_members WHERE pool_id = $1 AND player_config_id = $2")
         .bind(pool_id)
         .bind(config_id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+    if removed == 0 {
+        return Err(AppError::not_found("that player config is not in this pool"));
+    }
     audit::log(
         &mut tx,
         "rating_pool.member_removed",

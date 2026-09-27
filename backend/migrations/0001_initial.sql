@@ -2,7 +2,9 @@
 
 CREATE TABLE users (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    username             TEXT NOT NULL UNIQUE,
+    -- Unique whatever its case: users_username_lower_idx, below, which a
+    -- plain UNIQUE here only duplicated (an index write per user update).
+    username             TEXT NOT NULL,
     email                TEXT NOT NULL UNIQUE,
     password_hash        TEXT NOT NULL,
     email_confirmed_at   TIMESTAMPTZ,
@@ -37,6 +39,12 @@ CREATE TABLE users (
 CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at ASC)
     WHERE deleted_at IS NULL;
 
+-- Serves the account half of /api/workers, in that list's order (see
+-- anonymous_workers_contribution_idx). A deleted account keeps its place there:
+-- its work was done, and it is listed under its anonymized name.
+CREATE INDEX users_worker_rank_idx ON users (tasks_completed DESC, id)
+    WHERE tasks_completed > 0;
+
 CREATE TABLE email_confirmations (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id     UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -55,6 +63,21 @@ CREATE TABLE password_reset_tokens (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Confirmation and reset look a token up by its hash, and the stale-account
+-- release (and a user's delete) reaches both tables by user through the
+-- cascade; neither table is reaped, so each was a sequential scan growing
+-- without bound, on unauthenticated routes.
+CREATE INDEX email_confirmations_code_idx   ON email_confirmations (code_hash);
+CREATE INDEX email_confirmations_user_idx   ON email_confirmations (user_id);
+CREATE INDEX password_reset_tokens_hash_idx ON password_reset_tokens (token_hash);
+CREATE INDEX password_reset_tokens_user_idx ON password_reset_tokens (user_id);
+
+-- One account per username whatever its case: "Josh" and "josh" side by side
+-- on a public leaderboard is an impersonation. Login matches the same way, so
+-- whoever registered "Josh" can sign in as "josh"; this index serves it.
+CREATE UNIQUE INDEX users_username_lower_idx ON users (lower(username));
+
+
 CREATE TABLE api_keys (
     id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -64,6 +87,9 @@ CREATE TABLE api_keys (
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_used_at TIMESTAMPTZ
 );
+-- A user's keys: the key list, the hundred-key check, and the cascade when a
+-- user is deleted or an expired unconfirmed account is released.
+CREATE INDEX api_keys_user_idx ON api_keys (user_id);
 -- Enforce the 100-key limit per user at the application layer, not via a DB constraint.
 
 -- Workers
@@ -87,7 +113,7 @@ CREATE TABLE anonymous_workers (
 -- identity in one ranking. Partial: an identity that has completed nothing is
 -- not a contributor and is not listed.
 CREATE INDEX anonymous_workers_contribution_idx
-    ON anonymous_workers (tasks_completed DESC) WHERE tasks_completed > 0;
+    ON anonymous_workers (tasks_completed DESC, uuid) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -361,20 +387,16 @@ CREATE TABLE jobs (
     --
     -- Not nullable: every job pins input data, and a client too old to
     -- understand expected_data contributes unverified rather than declining,
-    -- so "no floor" is not a state worth being able to express. 0.1.0 is
-    -- `birdtest-contribute`'s pre-release version: neither birdtest nor the
-    -- branch is in production yet, so everything the protocol relies on --
-    -- every result-changing setting stated on the request, input data and
-    -- derived files checked against the hashes the job pins, the word info
-    -- table switched off before every load, a seed on every task -- is in
-    -- 0.1.0, and the version moves only when a release changes what a task
-    -- computes. The default here is the same value as the server's
+    -- so "no floor" is not a state worth being able to express. 0.1.1 is
+    -- the `birdtest-contribute` version the backend image pins; the branch's
+    -- version moves whenever a change can alter what a task computes, and the
+    -- floor moves with it. The default here is the same value as the server's
     -- MIN_MAGPIE_VERSION, which create_job writes explicitly; the two are kept
     -- equal so a row written any other way (a restore, a hand insert) does not
     -- floor a job below the server.
     min_magpie_major INT NOT NULL DEFAULT 0 CHECK (min_magpie_major >= 0),
     min_magpie_minor INT NOT NULL DEFAULT 1 CHECK (min_magpie_minor >= 0),
-    min_magpie_patch INT NOT NULL DEFAULT 0 CHECK (min_magpie_patch >= 0),
+    min_magpie_patch INT NOT NULL DEFAULT 1 CHECK (min_magpie_patch >= 0),
     -- Every claim ever issued for this job, abandoned and declined ones
     -- included: the deficit the scheduler orders on. Kept as a counter rather
     -- than counted, because counting task_claims on every claim request costs
@@ -404,6 +426,20 @@ CREATE TABLE jobs (
     -- climb, and a newcomer put level with *it* then took every claim from the
     -- jobs that were actually running until it had caught up with them.
     last_claimed_at TIMESTAMPTZ,
+    -- The SPRT verdict a games or game-pairs job was completed on, as the
+    -- finish check saw it: NULL for every other job, and for one completed any
+    -- other way (by an admin, or at its cap in the claim path). The live
+    -- figures are recomputed from every accepted result, and the claims in
+    -- flight when a job completes are still played and accepted -- so without
+    -- this the page of a job that passed could drift back to "running" with no
+    -- record anywhere of the decision that stopped it. A purge clears it.
+    sprt_decided_status TEXT CHECK (sprt_decided_status IN ('passed', 'failed', 'terminated_at_max')),
+    sprt_decided_llr    DOUBLE PRECISION,
+    sprt_decided_units  BIGINT,
+    CONSTRAINT jobs_sprt_decided_together CHECK (
+        (sprt_decided_status IS NULL) = (sprt_decided_llr IS NULL)
+        AND (sprt_decided_status IS NULL) = (sprt_decided_units IS NULL)
+    ),
     -- Progress totals the dashboard reads, maintained in the submit transaction
     -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
     -- incremented
@@ -431,6 +467,13 @@ CREATE TABLE jobs (
     -- partial restore recomputes them (RUNBOOK 2.3).
     tasks_total     BIGINT NOT NULL DEFAULT 0 CHECK (tasks_total >= 0),
     tasks_completed BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    -- When a result was last accepted for the job, to the minute (the
+    -- submission that stores one sets it at most once a minute). The job
+    -- list's `stalled` flag asks "none in a day"; answered from the claims, it
+    -- joined every task of the job to the day's completions -- growing with
+    -- the job's whole history, on every list view. Display only; a purge
+    -- clears it, a partial restore recomputes it (RUNBOOK 2.3).
+    last_completed_at TIMESTAMPTZ,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     activated_at    TIMESTAMPTZ,
     deactivated_at  TIMESTAMPTZ
@@ -445,9 +488,10 @@ CREATE TABLE jobs (
 --   For autoplay in birdtest, always use 'best'.
 --
 -- sort_strategy (-s1 / -s2): 'equity' = sort by equity (score + leave value) — standard static
---   player; 'score' = sort by raw score only. A simming player sorts its candidates too, before
---   simulating them, so every row states one. Both static and simming players are valid in
---   games/game_pairs jobs.
+--   player; 'score' = sort by raw score only, for a static player. A simming player's candidates
+--   are the top plays by equity (autoplay generates them so whatever the row says), so a simmer
+--   is always 'equity': config creation refuses 'score' for one. Both static and simming
+--   players are valid in games/game_pairs jobs.
 --
 -- Simulation columns are all NULL for a static (no-sim) player.
 
@@ -668,6 +712,10 @@ CREATE TABLE job_exports (
 -- The newest ready export for a job, which is what a download resolves to.
 CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
 
+-- One export of a job at a time. Only the page's disabled button stopped a
+-- second, and each holds a pool connection for the whole corpus read.
+CREATE UNIQUE INDEX job_exports_one_running_idx ON job_exports (job_id) WHERE state = 'running';
+
 -- Tasks
 
 CREATE TYPE task_state AS ENUM ('available', 'claimed', 'completed');
@@ -709,7 +757,6 @@ CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed);
 -- redundancy above 1 leaves tasks available until their slots fill, so that is
 -- not a short list.
 CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'available';
-CREATE INDEX tasks_claimed_idx ON tasks (state) WHERE state = 'claimed';
 
 -- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
 --
@@ -729,6 +776,13 @@ CREATE TYPE claim_state AS ENUM ('claimed', 'completed', 'abandoned', 'declined'
 CREATE TABLE task_claims (
     id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id              UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- The task's job, copied at claim time and never changed (a task never
+    -- moves between jobs). Without it "this contributor's claims in this job"
+    -- -- the public feed's `?worker=` -- meant every claim the contributor ever
+    -- made, or every task of the job: seconds for a heavy contributor. With it,
+    -- one range of the identity indexes below. No foreign key of its own:
+    -- claims go with their task, and their task with its job.
+    job_id               UUID NOT NULL,
     claim_token          UUID NOT NULL,
     state                claim_state NOT NULL DEFAULT 'claimed',
     claimed_by_user_id   UUID REFERENCES users(id),
@@ -742,18 +796,31 @@ CREATE TABLE task_claims (
     CONSTRAINT claim_has_single_owner CHECK (
         (claimed_by_user_id IS NOT NULL)::int + (claimed_by_anon_uuid IS NOT NULL)::int = 1
     )
-);
+)
+-- Room on each page for a claim's heartbeats. A heartbeat changes only
+-- `last_heartbeat_at`, which no index covers, so it can be a HOT update -- an
+-- in-page rewrite that touches none of this table's nine indexes -- but only
+-- if the row's page has space, and claims are appended, so at the default
+-- fillfactor of 100 a claim's first heartbeat found its page full and wrote a
+-- new entry into every index: two a minute for every claim in flight.
+WITH (fillfactor = 85);
 
 -- Prevent a single identity from filling more than one live slot on the same
 -- task. 'declined' must be excluded alongside 'abandoned': a worker that
 -- declined a task for missing data and then fixed its data has to be able to
 -- claim that task again.
+--
+-- Each covers only its own kind of identity: a claim has exactly one, and a
+-- NULL key constrains nothing, so indexing the other kind's claims under NULL
+-- was dead weight -- nearly half of each index, and an index write per claim
+-- insert and per completion that nothing read. A lookup by `= $n` implies the
+-- `IS NOT NULL`, so every reader still uses them.
 CREATE UNIQUE INDEX task_claims_user_unique_idx
     ON task_claims (task_id, claimed_by_user_id)
-    WHERE state NOT IN ('abandoned', 'declined');
+    WHERE state NOT IN ('abandoned', 'declined') AND claimed_by_user_id IS NOT NULL;
 CREATE UNIQUE INDEX task_claims_anon_unique_idx
     ON task_claims (task_id, claimed_by_anon_uuid)
-    WHERE state NOT IN ('abandoned', 'declined');
+    WHERE state NOT IN ('abandoned', 'declined') AND claimed_by_anon_uuid IS NOT NULL;
 
 -- What a worker said it was missing when it declined. The server records gaps
 -- for humans; it does not route on them (the client sends its own unsupported
@@ -921,8 +988,8 @@ CREATE TABLE leave_generation_progress (
 );
 
 -- Where a leave generation's selection sweep has got to: the last rack handed
--- out in the lap under way. A row exists exactly while a lap has racks left to
--- hand out: the task that takes the last of them deletes it.
+-- out in the lap under way. A row with a rack exists exactly while a lap has
+-- racks left to hand out: the task that takes the last of them deletes it.
 --
 -- While many racks are below target, racks are handed out in primary-key order
 -- from this cursor rather than lowest count first. Everything behind the cursor
@@ -933,13 +1000,17 @@ CREATE TABLE leave_generation_progress (
 -- every staged result are exactly the lowest, and each claim hashed and
 -- skipped all of them inside the job's dispatch lock.
 --
+-- Once few racks are below target the generation turns, at a lap's boundary,
+-- to lowest count first, and stays there: a row with a NULL cursor_rack
+-- (`leave_gen::at_boundary`).
+--
 -- Read and written only under that lock. A row that goes missing (a purge, a
 -- partial restore) is a lap not started, which waits for what is in flight and
 -- staged before it selects anything; nothing is handed out twice.
 CREATE TABLE leave_selection_cursors (
     job_id      UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     generation  INT NOT NULL,
-    cursor_rack TEXT NOT NULL,
+    cursor_rack TEXT,
     PRIMARY KEY (job_id, generation)
 );
 
@@ -962,7 +1033,13 @@ CREATE TABLE position_analysis_records (
     -- rack across turns and games.
     id              BIGSERIAL PRIMARY KEY,
     task_claim_id   UUID NOT NULL REFERENCES task_claims(id) ON DELETE CASCADE,
-    task_id         UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    -- The task, for the in-game dedup key below. Deliberately not a foreign
+    -- key: a record goes with its claim (above) or its job (below), both of
+    -- which cascade through their own indexes, so a cascade from the task
+    -- only added an index entry and a foreign-key probe per record -- the same
+    -- pattern `position_analysis_moves.task_id` and the staging table's were
+    -- removed for.
+    task_id         UUID NOT NULL,
     -- Denormalized from the task. Every read of a job's records -- the public
     -- results feed, the rack lookup, the admin stream, the export -- filtered
     -- on the job and could only reach it through `tasks`, which put the filter
@@ -1079,14 +1156,17 @@ CREATE INDEX position_analysis_moves_record_idx
 -- Per-ply simulation stats for each candidate move. Only populated for simming
 -- player configs; a static player has no per-ply statistics to record.
 CREATE TABLE position_analysis_plies (
-    id               BIGSERIAL PRIMARY KEY,
     move_id          BIGINT NOT NULL REFERENCES position_analysis_moves(id) ON DELETE CASCADE,
     ply              SMALLINT NOT NULL,
     bingo_percentage DOUBLE PRECISION NOT NULL,
     average_score    DOUBLE PRECISION NOT NULL,
-    -- The UNIQUE above is the index the cascade from moves uses: move_id is
+    -- The natural key, and the index the cascade from moves uses: move_id is
     -- its leading column, so there is deliberately no second index on it.
-    UNIQUE (move_id, ply)
+    -- There was a BIGSERIAL `id` beside it that nothing referenced or read --
+    -- every reader goes through move_id and the insert conflicts on this key
+    -- -- at some 30 bytes a row between the column and its index: 2 to 5 GB
+    -- for one simming opening-rack job's tens of millions of plies.
+    PRIMARY KEY (move_id, ply)
 );
 
 -- Shared by games and game pairs: one row per accepted claim, holding the
@@ -1146,7 +1226,11 @@ CREATE TABLE game_results (
              -- player 1 either way. A worker that miscounts fails here rather
              -- than silently biasing a rating pool.
              AND (pent_0 + pent_1 + pent_2 + pent_3 + pent_4) * 2 = games
-             AND pent_1 + 2 * pent_2 + 3 * pent_3 + 4 * pent_4 = 2 * wins + ties)
+             AND pent_1 + 2 * pent_2 + 3 * pent_3 + 4 * pent_4 = 2 * wins + ties
+             -- And on the draws: a pair scoring one or three half-points holds
+             -- exactly one, a pair scoring two holds none or two.
+             AND ties - pent_1 - pent_3 BETWEEN 0 AND 2 * pent_2
+             AND (ties - pent_1 - pent_3) % 2 = 0)
     ),
 
     -- The divergent subset: pairs whose two games did not play identically.
@@ -1195,6 +1279,15 @@ CREATE TABLE leave_generation_artifacts (
     -- query; the ON CONFLICT DO NOTHING on insert means the row keeps the
     -- FIRST hash, so a later mismatch is evidence rather than an overwrite.
     sha256        TEXT NOT NULL CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    -- SHA-256 of the bytes the object store holds *now*, when they are not
+    -- the bytes first written; NULL while they are. Set by every
+    -- `rebuild_artifacts` check from the object it wrote, or found and could
+    -- account for. Workers are sent this (or `sha256` when it is NULL) and
+    -- refuse bytes that do not match, so it has to follow the object: a
+    -- rebuild under a changed builder wrote new bytes, the row kept the old
+    -- hash, and every task of the next generation failed its check on every
+    -- worker. `sha256` stays the first hash, as the evidence it is.
+    served_sha256 TEXT CHECK (served_sha256 ~ '^[0-9a-f]{64}$'),
     -- The MAGPIE KLV builder that wrote these bytes ('klv-1').
     --
     -- MAGPIE builds these artifacts, so an upgrade can legitimately change the
@@ -1306,7 +1399,7 @@ CREATE TABLE rating_runs (
     -- Why this run happened: 'membership' (an admin added or removed a config),
     -- 'evidence' (new results arrived), or 'manual'.
     trigger       TEXT NOT NULL,
-    method        TEXT NOT NULL DEFAULT 'bradley_terry_mm',
+    method        TEXT NOT NULL DEFAULT 'bradley_terry_newton',
     -- Fit provenance. A run that did not converge is still stored and still
     -- displayed, flagged: hiding it would leave the page silently stale.
     iterations    INT NOT NULL,
@@ -1314,7 +1407,13 @@ CREATE TABLE rating_runs (
     -- How much evidence went in, so a run can be compared to its predecessor
     -- without re-reading game_results.
     pairs_used    BIGINT NOT NULL,
-    jobs_used     INT NOT NULL
+    jobs_used     INT NOT NULL,
+    -- The pool's eligible jobs' `games_completed`, summed, as of the fit: what
+    -- the sweep compares before deciding to build the evidence matrix at all.
+    -- Building it to find nothing had changed was the sweep's whole cost, for
+    -- every pool every two minutes. NULL on a run that did not record it,
+    -- which the next sweep refits.
+    evidence_games BIGINT
 );
 
 CREATE INDEX rating_runs_pool_idx ON rating_runs (pool_id, computed_at DESC);
@@ -1422,20 +1521,35 @@ CREATE UNIQUE INDEX task_claims_token_idx     ON task_claims (claim_token);
 CREATE INDEX        task_claims_task_idx      ON task_claims (task_id);
 CREATE INDEX        task_claims_open_idx      ON task_claims (task_id) WHERE state = 'claimed';
 -- Completed claims by time. The ETA (`jobstats::estimate_eta`, on every
--- detail view and live push) and the job list's `stalled` flag both ask
--- "how many of this job's claims completed in the last hour / day", and
--- task_claims has no job column, so the alternative plan walks every task of
--- the job and every claim of each -- the job's whole history, for a question
--- about its last hour. Through this index the scan is bounded by the fleet's
--- recent completions instead, whatever the job's age.
+-- detail view and live push) asks "how many of this job's claims completed
+-- in the last hour" (the job list's `stalled` flag reads
+-- `jobs.last_completed_at` instead), and no index on task_claims leads with the job, so
+-- the alternative plan walks every task of the job and every claim of each
+-- -- the job's whole history, for a question about its last hour. Through
+-- this index the scan is bounded by the fleet's recent completions instead,
+-- whatever the job's age -- as long as the query's bound is one the planner
+-- can read: a constant `now() - interval '1 hour'`, not a parameter.
 CREATE INDEX        task_claims_completed_idx ON task_claims (completed_at DESC)
     WHERE state = 'completed';
-CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id);
-CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid);
--- (job_id, state), not job_id alone: the job list counts a job's tasks and its
--- completed tasks for every job on the page, and with state in the index both
--- are index-only rather than a heap visit per task.
-CREATE INDEX        tasks_job_idx             ON tasks (job_id, state);
+-- Partial for the reason the unique indexes above are.
+-- Keyed by identity, job and completion time: an identity's completed claims
+-- in one job, newest first, are one backward range -- the results feed's
+-- `?worker=` reads a page through them whatever the contributor's share of the
+-- job. Only completed claims have a `completed_at`; the rest sit at the NULL
+-- end, outside the range. A lookup by identity alone still uses the leading
+-- column. The completion time adds nothing to a claim's updates: completing
+-- one changes `state`, which the open-claims index's predicate reads, so that
+-- update was never a HOT one, and a heartbeat touches neither.
+CREATE INDEX        task_claims_user_idx      ON task_claims (claimed_by_user_id, job_id, completed_at)
+    WHERE claimed_by_user_id IS NOT NULL;
+CREATE INDEX        task_claims_anon_idx      ON task_claims (claimed_by_anon_uuid, job_id, completed_at)
+    WHERE claimed_by_anon_uuid IS NOT NULL;
+-- There is no (job_id, state) index. Every job-scoped read of `tasks` -- the
+-- detail page's counts, which sum `accepted_count` and so read the heap
+-- anyway; the census; the opening-rack finish check, which needs `seed` --
+-- is served as well by `tasks_seed_unique_idx (job_id, seed)`, and a state
+-- index cost an entry on every task insert and every state change, on the
+-- claim and submit paths, for no reader that needed it.
 -- (task_id, submitted_at) rather than task_id alone: the per-task "first
 -- accepted result" read that every aggregate uses orders on both.
 CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitted_at);
@@ -1445,7 +1559,6 @@ CREATE INDEX        game_results_task_idx     ON game_results (task_id, submitte
 CREATE INDEX        game_results_feed_idx
     ON game_results (job_id, submitted_at DESC, task_claim_id DESC);
 CREATE INDEX        leave_records_task_idx    ON leave_records (task_id);
-CREATE INDEX        position_records_task_idx ON position_analysis_records (task_id);
 CREATE INDEX        audit_log_created_idx     ON audit_log (created_at DESC);
 CREATE INDEX        audit_log_job_idx         ON audit_log (job_id);
 

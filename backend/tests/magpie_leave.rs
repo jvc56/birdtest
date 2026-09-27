@@ -432,6 +432,40 @@ async fn generation_zeros_klv_exists_at_creation_and_is_worth_exactly_nothing() 
     scratch_root.assert_clean();
 }
 
+/// I-LEAVE-18: a leave job whose generation-0 KLV was never written -- its
+/// build failed after the creation or purge committed -- builds it at the next
+/// claim and then dispatches, rather than failing every claim until an admin
+/// happens to activate it again.
+#[tokio::test]
+#[ignore = "needs a real MAGPIE (MAGPIE_BIN) and MinIO (TEST_S3_ENDPOINT); tier 6"]
+async fn a_missing_generation_zero_klv_is_built_by_the_next_claim() {
+    let scratch_root = ScratchRoot::new();
+    let db = TestDb::new().await;
+    let (state, _bucket) = real_state(&db).await;
+    let (job, _) = leave_job(&db, &state, 1, 1, None).await;
+    let key = leave_gen::artifact_key(job, 0);
+    sqlx::query("DELETE FROM leave_generation_artifacts WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    state.artifacts.delete(&key).await.unwrap();
+    let app = birdtest::app(state.clone());
+
+    let (status, body) = claim(&app).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(
+        wait_for(|| async { artifact(&db, job, 0).await.is_some() }).await,
+        "the claim built generation 0"
+    );
+    let (status, task) = claim(&app).await;
+    assert_eq!(status, StatusCode::OK, "{task}");
+    assert_eq!(task["task_request"]["previous_artifact_key"], json!(key));
+
+    drop((app, state));
+    scratch_root.assert_clean();
+}
+
 /// I-LEAVE-4: a transition drains what is staged into the generation's rows,
 /// has MAGPIE fold them into a KLV, uploads it, records its digest and the
 /// builder, and marks the generation complete -- and the bytes are exactly the
@@ -523,7 +557,8 @@ async fn a_transition_folds_the_generation_into_the_klv_it_uploads_and_closes_it
 /// zeroed generation 0 and a folded generation 1 hash to what was recorded
 /// when they were written. A lost object is rewritten with those bytes. And
 /// the comparison is a real one: rows that drift after the close rebuild to a
-/// different digest, reported as a mismatch and left alone.
+/// different digest, reported as a mismatch and left alone. Whatever the
+/// object holds, the check leaves workers sent its hash.
 #[tokio::test]
 #[ignore = "needs a real MAGPIE (MAGPIE_BIN) and MinIO (TEST_S3_ENDPOINT); tier 6"]
 async fn a_rebuild_reproduces_every_generations_bytes() {
@@ -596,6 +631,73 @@ async fn a_rebuild_reproduces_every_generations_bytes() {
         report[1].stored_sha256,
         "the stored KLV was left alone"
     );
+
+    // Forced, it writes the new bytes -- and what workers are told to check
+    // the object against follows them, while the first hash stays as evidence.
+    // Left behind, every task of the next generation failed its check.
+    let report = rebuild(true).await.unwrap();
+    assert_eq!(summary(&report)[1], (1, false, true, true, true));
+    let (first, served): (String, Option<String>) = sqlx::query_as(
+        "SELECT sha256, served_sha256 FROM leave_generation_artifacts
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(first, report[1].stored_sha256);
+    assert_eq!(served.as_deref(), Some(report[1].rebuilt_sha256.as_str()));
+    assert_eq!(sha256(&state.artifacts.get(&key).await.unwrap()), report[1].rebuilt_sha256);
+    assert!(report[0].rewritten);
+    let unchanged: Option<String> = sqlx::query_scalar(
+        "SELECT served_sha256 FROM leave_generation_artifacts WHERE job_id = $1 AND generation = 0",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged, None, "rewritten with the same bytes, it still serves the first hash");
+
+    // An operator puts the older object version back (RUNBOOK §3). A check
+    // that rewrites nothing still makes what workers are sent the object's
+    // own hash: left at the forced bytes' hash, every worker declined it.
+    state.artifacts.put(&key, kept).await.unwrap();
+    let report = rebuild(false).await.unwrap();
+    assert_eq!(summary(&report)[1], (1, false, true, true, false));
+    assert_eq!(report[1].served_sha256, report[1].stored_sha256);
+    let served: Option<String> = sqlx::query_scalar(
+        "SELECT served_sha256 FROM leave_generation_artifacts WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(served, None, "the object holds the first bytes again");
+
+    // Bytes nothing accounts for -- another run's KLV under this key -- are
+    // not approved. With the rows drifted they are left for an admin, and
+    // workers go on being sent the first hash.
+    state.artifacts.put(&key, b"another run's leaves".to_vec()).await.unwrap();
+    let report = rebuild(false).await.unwrap();
+    assert_eq!(summary(&report)[1], (1, false, true, true, false));
+    assert!(!report[1].object_accounted_for);
+    assert_eq!(report[1].served_sha256, report[1].stored_sha256);
+    assert_eq!(report[1].object_sha256.as_deref(), Some(sha256(b"another run's leaves").as_str()));
+    // With rows that reproduce the first build, the first build is put back.
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = occurrence_count - 1
+         WHERE job_id = $1 AND generation = 1
+           AND rack = (SELECT MIN(rack) FROM leave_rack_progress WHERE job_id = $1 AND generation = 1)",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let report = rebuild(false).await.unwrap();
+    assert_eq!(summary(&report)[1], (1, true, true, true, true));
+    assert!(!report[1].object_accounted_for);
+    assert_eq!(sha256(&state.artifacts.get(&key).await.unwrap()), report[1].stored_sha256);
+    assert_eq!(report[1].served_sha256, report[1].stored_sha256);
 
     drop(state);
     scratch_root.assert_clean();

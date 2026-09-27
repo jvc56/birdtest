@@ -1,6 +1,12 @@
 # syntax=docker/dockerfile:1.7
+
+# The commit this image's hashes are produced by, declared once for every
+# stage (each takes it with a bare `ARG MAGPIE_COMMIT`). CI reads it from this
+# line. MIN_MAGPIE_VERSION must never exceed the version this commit reports.
+ARG MAGPIE_COMMIT=8f2f5d7515237972ca792e21314d1de3a9b005d2
 #
-# Backend and fake-worker.
+# The backend, the derived-data builder, and the end-to-end suite's fake
+# worker.
 #
 # The backend image carries a pinned MAGPIE. The server builds the reference
 # copy of every wordmap, rack info table and leave-generation KLV with it, and
@@ -13,9 +19,10 @@
 # contributor's laptop runs, and the whole point is that two builds of one
 # commit agree byte for byte. See MAGPIE's Makefile.
 #
-# The fake worker still needs no MAGPIE: it submits synthetic results. The real
-# contributor client is MAGPIE itself, via `magpie contribute` — see PLAN.md's
-# "Worker Client".
+# The fake worker needs no MAGPIE: it submits synthetic results, and exists only
+# for the end-to-end suite (e2e/), which needs contributions on cue. It is not a
+# contributor client, in production or local development: that is MAGPIE
+# itself, via `magpie contribute` — see PLAN.md's "Worker Client".
 #
 # Build with `--target backend`, `--target derived-builder` or
 # `--target fake-worker`.
@@ -26,14 +33,12 @@
 
 FROM debian:bookworm-slim AS magpie-build
 
-# The commit this image's hashes are produced by. Passed as a build argument
-# and recorded on the image, so "which MAGPIE built this wordmap" is a `docker
-# inspect` rather than a guess. CI's magpie-contract and nightly jobs test the
-# head of `birdtest-contribute` rather than this commit, on purpose: they are
-# what notices a MAGPIE-side change before the pin is moved to it. Moving the
-# pin is a deliberate step, and MIN_MAGPIE_VERSION must never exceed the
-# version this commit reports.
-ARG MAGPIE_COMMIT=47b57aadffbb1e720e1251bb81b4a37ad31b87cd
+# Recorded on the image, so "which MAGPIE built this wordmap" is a `docker
+# inspect` rather than a guess. Pull requests' CI builds and tests this commit;
+# the nightly runs tier 6 against both this commit and the head of
+# `birdtest-contribute` -- the head is what notices a MAGPIE-side change
+# before the pin is moved to it. Moving the pin is a deliberate step.
+ARG MAGPIE_COMMIT
 ARG MAGPIE_REPO=https://github.com/jvc56/MAGPIE.git
 
 RUN apt-get update \
@@ -43,10 +48,13 @@ RUN apt-get update \
 WORKDIR /src
 # A shallow fetch of the one commit, rather than a clone of the history: the
 # repository is large and none of it is wanted except this tree.
+# The pin is a full commit: a branch name here built a moving target and wrote
+# the name into the image's label.
 RUN git init -q . \
  && git remote add origin "$MAGPIE_REPO" \
  && git fetch -q --depth 1 origin "$MAGPIE_COMMIT" \
- && git checkout -q FETCH_HEAD
+ && git checkout -q FETCH_HEAD \
+ && test "$(git rev-parse HEAD)" = "$MAGPIE_COMMIT"
 
 # MAGPIE loads a default board layout before it parses any argument, and its
 # `data/` is gitignored, so without this even `magpie builders` fails. The
@@ -64,7 +72,10 @@ COPY backend/src/magpie_standard15.txt /src/data/layouts/standard15.txt
 # whatever happens. The server parses this exact output to record which builder
 # produced every hash it publishes, so an image whose MAGPIE cannot print it is
 # an image that cannot dispatch a job needing a wordmap.
-RUN make magpie BUILD=portable_release -j"$(nproc)" \
+# MAKE_JOBS caps the LTO compiles as CARGO_BUILD_JOBS caps cargo: BuildKit
+# builds this stage beside the backend's.
+ARG MAKE_JOBS
+RUN make magpie BUILD=portable_release -j"${MAKE_JOBS:-$(nproc)}" \
  && ./bin/magpie builders | tee /dev/stderr | grep -q '"wmp_builder_version"'
 
 # ---------------------------------------------------------------------------
@@ -79,7 +90,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY backend/Cargo.toml backend/Cargo.lock ./
+COPY backend/Cargo.toml backend/Cargo.lock backend/build.rs ./
 COPY backend/src ./src
 COPY backend/migrations ./migrations
 
@@ -91,9 +102,17 @@ ARG CARGO_BUILD_JOBS
 # Cache mounts keep the registry and target directory across rebuilds. The
 # binary is copied out inside the same RUN because a cache mount is not part of
 # the resulting layer.
+#
+# The target cache is shared by every build on the machine, whichever checkout
+# it comes from, and COPY keeps each file's mtime: a checkout whose files were
+# older than the last build's was Fresh to cargo, and its image shipped the
+# other checkout's binary (thirty-second audit, pass 15). Touching this
+# crate's own files first makes it always rebuild; its dependencies stay
+# cached.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release \
+    find src migrations build.rs Cargo.toml -type f -exec touch {} + \
+ && cargo build --release --locked \
  && cp target/release/birdtest /usr/local/bin/birdtest \
  && cp target/release/build-derived /usr/local/bin/build-derived
 
@@ -108,7 +127,7 @@ RUN apt-get update \
 WORKDIR /app
 COPY --from=backend-build /usr/local/bin/birdtest /usr/local/bin/birdtest
 COPY --from=magpie-build /src/bin/magpie /usr/local/bin/magpie
-ARG MAGPIE_COMMIT=47b57aadffbb1e720e1251bb81b4a37ad31b87cd
+ARG MAGPIE_COMMIT
 LABEL org.birdtest.magpie-commit="$MAGPIE_COMMIT"
 # Still no data directory. MAGPIE is run against a throwaway directory built
 # per conversion from the bytes the job pins — the object store for lexica and
@@ -138,7 +157,9 @@ CMD ["birdtest"]
 
 FROM backend AS derived-builder
 COPY --from=backend-build /usr/local/bin/build-derived /usr/local/bin/build-derived
-# Ephemeral storage for the scratch directories; the task definition mounts it.
+# Where the scratch directories go. On Fargate this is the task's ephemeral
+# storage, which backs the whole writable layer, /tmp included: nothing is
+# mounted here.
 ENV MAGPIE_SCRATCH_DIR=/scratch
 USER root
 RUN mkdir -p /scratch && chown birdtest:birdtest /scratch
@@ -148,8 +169,9 @@ CMD ["build-derived"]
 # ---------------------------------------------------------------------------
 # Fake worker
 # ---------------------------------------------------------------------------
-# Speaks the worker API and submits synthetic results. No MAGPIE, so this image
-# is a few hundred KB on top of python-slim and starts instantly.
+# Test-only: the end-to-end suite's stand-in for a contributor. Speaks the
+# worker API and submits synthetic results. No MAGPIE, so this image is a few
+# hundred KB on top of python-slim and starts instantly.
 
 FROM python:3.11-slim AS fake-worker
 

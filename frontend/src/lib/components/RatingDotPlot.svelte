@@ -12,7 +12,7 @@
    * the interval says which one to believe.
    */
   import type { RatingRow } from '$lib/api';
-  import { dotPlotX, dotTitle, layoutDotPlot, PAD } from '$lib/charts/ratingDotPlot';
+  import { dotPlotX, dotTitle, layoutDotPlot, PAD, rowLabels } from '$lib/charts/ratingDotPlot';
 
   export let ratings: RatingRow[] = [];
 
@@ -28,6 +28,7 @@
   $: bounds = layout.bounds;
   $: ticks = layout.ticks;
   $: height = layout.height;
+  $: labels = rowLabels(rated.map((r) => r.row));
 </script>
 
 <div class="w-full" bind:clientWidth={width}>
@@ -54,14 +55,15 @@
         </text>
       {/each}
 
-      {#each rated as { row, cx, cy, x1, x2 }}
+      {#each rated as { row, cx, cy, x1, x2 }, i}
         <text
           x={PAD.left - 10}
           y={cy + 4}
           text-anchor="end"
           class="fill-foreground text-[12px]"
         >
-          {row.name}{row.is_anchor ? ' (anchor)' : ''}
+          <title>{row.name}{row.is_anchor ? ' (anchor)' : ''}</title>
+          {labels[i]}
         </text>
 
         <line

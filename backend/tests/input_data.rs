@@ -88,6 +88,11 @@ struct Fixture {
     requests: Mutex<Vec<String>>,
 }
 
+/// A `/git/ref/…` or `/git/tags/…` answer naming `sha` of `kind`.
+fn ref_json(sha: &str, kind: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "object": { "sha": sha, "type": kind } })).unwrap()
+}
+
 impl Fixture {
     fn new() -> Arc<Self> {
         let fixture = Arc::new(Fixture {
@@ -96,8 +101,12 @@ impl Fixture {
             gate: tokio::sync::Semaphore::new(0),
             requests: Mutex::new(Vec::new()),
         });
-        fixture.put("/repos/example/data/commits/main", COMMIT.as_bytes().to_vec());
+        fixture.put("/repos/example/data/git/ref/heads/main", ref_json(COMMIT, "commit"));
         fixture
+    }
+
+    fn requested(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
     }
 
     fn put(&self, path: &str, bytes: Vec<u8>) {
@@ -637,7 +646,29 @@ async fn an_import_is_started_polled_while_running_and_confirmed_over_http() {
     assert_eq!(body["message"], "tarball_date must be YYYYMMDD");
     let (status, body) = start(json!({ "tarball_date": DATE, "git_ref": "no-such-branch" })).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["message"], "no such ref \"no-such-branch\" in example/data");
+    assert_eq!(body["message"], "no branch or tag \"no-such-branch\" in example/data");
+    // A ref is a ref name: `..` segments walked GitHub's API elsewhere with the
+    // server's token.
+    for bad in ["../../../user", "main?per_page=100", "a//b", ""] {
+        let (status, body) = start(json!({ "tarball_date": DATE, "git_ref": bad })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+    }
+    // And a branch or a tag of the repository, found among its own refs:
+    // `/commits/{ref}` resolved a sha (a whole one or five characters of
+    // one), a pull request's ref or a `git describe` name from any fork, and
+    // GitHub serves a fork's files under the upstream's name.
+    for fork in [
+        "pull/1/head", "refs/pull/7/merge", COMMIT, "0123456", "01234", "x-0-g0123456789ab",
+        "v1-1-g0123456789abcdef0123456789abcdef01234567",
+    ] {
+        let (status, body) = start(json!({ "tarball_date": DATE, "git_ref": fork })).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{fork}: {body}");
+    }
+    assert!(
+        !fixture.requested().iter().any(|r| r.contains("/commits/")),
+        "resolved through /commits/: {:?}",
+        fixture.requested()
+    );
 
     let (status, started) = start(json!({ "tarball_date": DATE })).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{started}");
@@ -895,3 +926,160 @@ async fn a_file_only_derived_data_refers_to_can_be_deleted_and_takes_that_data_w
         assert_eq!(audited, 1);
     }
 }
+
+/// I-INPUT (PLAN.md, "Whole task 30 min"): an import has a time limit from
+/// download to staged. The client's timeouts are per connection and per read,
+/// so a download that kept trickling kept its import `running` for as long as
+/// it lasted -- still `running` at 130 s with a 120 s read timeout, in the
+/// thirty-first audit's reproduction. Here the limit is 3 s and the tarball
+/// arrives a piece every 2 s.
+#[tokio::test]
+async fn an_import_that_outlasts_its_time_limit_fails() {
+    let db = TestDb::new().await;
+    let archive = tarball(&fixture_files());
+    let whole = format!("/example/data/{COMMIT}/versioned-tarballs/data-{DATE}.tgz");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = Router::new().fallback(move |uri: Uri| {
+        let archive = archive.clone();
+        let whole = whole.clone();
+        async move {
+            if uri.path() != whole {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let pieces: Vec<Vec<u8>> = archive.chunks(archive.len() / 8 + 1).map(|c| c.to_vec()).collect();
+            let stream = futures::stream::unfold((pieces, 0usize), |(pieces, i)| async move {
+                if i >= pieces.len() {
+                    return None;
+                }
+                if i > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                let chunk = axum::body::Bytes::from(pieces[i].clone());
+                Some((Ok::<_, std::io::Error>(chunk), (pieces, i + 1)))
+            });
+            Body::from_stream(stream).into_response()
+        }
+    });
+    tokio::spawn(async move { axum::serve(listener, server).await.unwrap() });
+    let (state, _bucket) = import_state(&db, &format!("http://{addr}")).await;
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO input_data_imports (tarball_date, commit_sha) VALUES ($1, $2) RETURNING id",
+    )
+    .bind(DATE)
+    .bind(COMMIT)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+
+    let started = std::time::Instant::now();
+    birdtest::inputdata::run_import_within(state, id, DATE.into(), COMMIT.into(), std::time::Duration::from_secs(3))
+        .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(6), "{:?}", started.elapsed());
+    let (state, error, _) = import_state_row(&db, id).await;
+    assert_eq!(state, "failed");
+    assert!(error.unwrap_or_default().contains("did not finish within"));
+}
+
+/// I-INPUT-8b: a lexicon object whose bytes are not the ones imported is
+/// deleted by the build that finds it, so that re-importing the tarball
+/// uploads it again. An import skips an object that exists, so while the
+/// damaged one stayed, the remedy the build's error gave -- import again --
+/// changed nothing, and the build failed the same way after every retry.
+#[tokio::test]
+async fn a_damaged_lexicon_object_is_replaced_by_the_next_import() {
+    let db = TestDb::new().await;
+    let (_fixture, state, _bucket) = standard_import_setup(&db).await;
+    let admin = Admin::new(&db, state.clone()).await;
+    let import = run_import(&db, &state).await;
+    let (status, body) = admin.confirm(import).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (kwg, name, path, key): (Uuid, String, String, String) = sqlx::query_as(
+        "SELECT id, name, path, object_key FROM input_data WHERE role = 'kwg' ORDER BY path LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let letterdist: Uuid =
+        sqlx::query_scalar("SELECT id FROM input_data WHERE role = 'letterdist' ORDER BY path LIMIT 1")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    state.artifacts.put(&key, b"damaged".to_vec()).await.unwrap();
+    sqlx::query(
+        "INSERT INTO derived_data (role, name, builder, kwg_id, letterdist_id)
+         VALUES ('wmp', $1, $2, $3, $4)",
+    )
+    .bind(&name)
+    .bind(state.builders.wmp())
+    .bind(kwg)
+    .bind(letterdist)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let took = birdtest::derived::build_next(&state.pool, &state.artifacts, &state.magpie, &state.builders)
+        .await
+        .unwrap();
+    assert!(took);
+    let error: Option<String> = sqlx::query_scalar("SELECT error FROM derived_data")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let error = error.unwrap();
+    assert!(error.contains("has been deleted") && error.contains("import its tarball again"), "{error}");
+    assert!(!state.artifacts.exists(&key).await.unwrap(), "the damaged object is gone");
+
+    let again = run_import(&db, &state).await;
+    assert_eq!(import_state_row(&db, again).await.0, "staged");
+    assert_eq!(state.artifacts.get(&key).await.unwrap(), fixture_file(&path), "uploaded again, whole");
+}
+
+/// A-ADMIN-5b: a ref resolves among the repository's own branches, then its
+/// tags, by name: a branch named like a sha (the real `20260101`, which shape
+/// checks refused), a lightweight tag, and an annotated tag peeled to its
+/// commit. A tag that names a tree is not a commit.
+#[tokio::test]
+async fn a_ref_resolves_among_the_repositorys_own_branches_and_tags() {
+    let db = TestDb::new().await;
+    let fixture = Fixture::new();
+    let sha = |n: u8| format!("{:040x}", n);
+    fixture.put("/repos/example/data/git/ref/heads/20260101", ref_json(&sha(1), "commit"));
+    fixture.put("/repos/example/data/git/ref/tags/v1", ref_json(&sha(2), "commit"));
+    fixture.put("/repos/example/data/git/ref/tags/v2", ref_json(&sha(3), "tag"));
+    fixture.put(&format!("/repos/example/data/git/tags/{}", sha(3)), ref_json(&sha(4), "commit"));
+    fixture.put("/repos/example/data/git/ref/tags/tree", ref_json(&sha(5), "tree"));
+    let base = fake_github(fixture.clone()).await;
+    let (state, _bucket) = import_state(&db, &base).await;
+
+    let resolve = |r: &'static str| {
+        let state = state.clone();
+        async move { birdtest::inputdata::resolve_ref(&state, r).await }
+    };
+    assert_eq!(resolve("main").await.unwrap(), COMMIT);
+    assert_eq!(resolve("20260101").await.unwrap(), sha(1));
+    assert_eq!(resolve("v1").await.unwrap(), sha(2));
+    assert_eq!(resolve("v2").await.unwrap(), sha(4), "an annotated tag, peeled");
+    assert_eq!(resolve("tree").await.unwrap_err().status, StatusCode::BAD_REQUEST);
+    assert_eq!(resolve("nope").await.unwrap_err().status, StatusCode::NOT_FOUND);
+    // A prefix picks the kind: a name that is both a branch and a tag
+    // resolves as the branch bare, as the tag with `tags/`.
+    fixture.put("/repos/example/data/git/ref/tags/main", ref_json(&sha(6), "commit"));
+    assert_eq!(resolve("main").await.unwrap(), COMMIT);
+    assert_eq!(resolve("heads/main").await.unwrap(), COMMIT);
+    assert_eq!(resolve("refs/tags/main").await.unwrap(), sha(6));
+    assert_eq!(resolve("tags/main").await.unwrap(), sha(6));
+    // A tag of a tag is followed to its commit.
+    fixture.put("/repos/example/data/git/ref/tags/v3", ref_json(&sha(7), "tag"));
+    fixture.put(&format!("/repos/example/data/git/tags/{}", sha(7)), ref_json(&sha(3), "tag"));
+    assert_eq!(resolve("v3").await.unwrap(), sha(4));
+    // A tag that names itself is followed four hops and then refused, and
+    // says why.
+    fixture.put("/repos/example/data/git/ref/tags/loop", ref_json(&sha(8), "tag"));
+    fixture.put(&format!("/repos/example/data/git/tags/{}", sha(8)), ref_json(&sha(8), "tag"));
+    let err = resolve("loop").await.unwrap_err();
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(err.message.contains("more than four deep"), "{}", err.message);
+}
+

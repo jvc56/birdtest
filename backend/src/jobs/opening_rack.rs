@@ -108,6 +108,7 @@ impl JobHandler for OpeningRackHandler {
             claim_id,
             &record.positions,
             player.num_plays_recorded,
+            player.num_plies_recorded,
             false,
         )
         .await?;

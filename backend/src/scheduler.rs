@@ -110,10 +110,34 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
     .await?)
 }
 
+/// How long after joining a job is settled against the lowest of each
+/// claiming worker's other candidates (see [`join_at_parity`]). Every class of workers that could run
+/// it claims it at once if it sits below that class's pace, so an hour is
+/// long; a class of a few workers on long tasks is still seen.
+pub const JOIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// The ratio a job joining the jobs being served starts at: the lowest ratio
+/// among the other active jobs above 0% that issued a claim within `$2`
+/// seconds of the most recent claim any of them issued. NULL when none of
+/// them ever has.
+///
+/// "Within the window of the latest claim", not "of now": after a quiet spell
+/// -- a deployment gap, a quiet night -- the jobs that were being served when
+/// the fleet stopped are still the ones that set the pace, where "of now"
+/// counted none, and the fallback that needed picked a job nobody could run
+/// (twelve claims of twelve, the audit's pass 19).
+const PARITY_TARGET: &str = "(SELECT MIN(p.ratio)
+     FROM (SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
+                  o.last_claimed_at,
+                  MAX(o.last_claimed_at) OVER () AS latest
+           FROM jobs o
+           WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1) p
+     WHERE p.last_claimed_at > p.latest - make_interval(secs => $2))";
+
 /// Put `job_id` level with the jobs already **being served**: set its
 /// `claims_baseline` so that its deficit ratio equals the lowest ratio among
-/// the other active jobs above 0% that issued a claim within `served_within`
-/// -- or, when none has, among all of them; or zero when there are none.
+/// them ([`PARITY_TARGET`]) -- or, when no other job has ever issued a claim,
+/// the highest ratio among the jobs on offer; or zero when there are none.
 ///
 /// The deficit the scheduler orders on is a ratio of claims issued to share.
 /// Measured over a job's whole life, that made every change to the set of jobs
@@ -139,50 +163,140 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
 /// position of the flows in service. A job can be active and above 0% and
 /// still not be served: its derived files are building (or failed), it is
 /// pinned to data the fleet does not have yet, its MAGPIE floor is above what
-/// the workers run, its generation is mid-transition. Its ratio stands still
-/// while the others climb -- and a newcomer put level with *that* job was, for
-/// every worker that could not run the lagging one, first in the list until it
-/// had caught up with the jobs that were running: the takeover this function
-/// exists to prevent, by another door. (Demonstrated before this was changed:
-/// a veteran at 100,000 claims, a job nobody could run at zero, a newcomer --
-/// twelve of the next twelve claims went to the newcomer.) `last_claimed_at`
-/// rides the `UPDATE jobs` every claim already makes, and `served_within` is
-/// the heartbeat timeout: a job that has not issued a claim for that long is
-/// not being served in any sense the fleet would notice. With no job served
-/// that recently -- a quiet server, the first activation in a while -- every
-/// job on offer counts, as before.
+/// the workers run. Its ratio stands still while the others climb, and a
+/// newcomer put level with it took every claim until it caught up with the
+/// jobs that were running. (Demonstrated: a veteran at 100,000 claims, a job
+/// nobody could run at zero, a newcomer -- twelve of the next twelve claims
+/// went to the newcomer.) `last_claimed_at` rides the `UPDATE jobs` every
+/// claim already makes, and `served_within` is the heartbeat timeout.
 ///
-/// What this does not cover, deliberately: a job only a *minority* of the
-/// fleet can run is served, recently, and still lags, so a newcomer joining
-/// level with it is ahead of the rest for the majority. No single ratio
-/// describes a fleet that is really two queues; PLAN.md records it as a limit.
+/// **Where, in a split fleet.** When the fleet is split by capability -- a
+/// release rolling out, data some workers lack -- there is no one pace: each
+/// class of workers runs its own jobs at its own rate, and the job only some
+/// can run lags the rest for as long as the split lasts. That lag is the
+/// scheduler working (the minority's job gets all the minority), but it means
+/// no single join point is right. Level with the leader, a newcomer only the
+/// lagging class can run waited behind that class's job without limit (none
+/// of 1,000 claims, the audit's pass 19); level with the lowest, a newcomer
+/// everyone can run was level with the minority's job and took every claim of
+/// the majority until it had caught theirs (pass 20). So the join is in two
+/// steps. It starts at the lowest ratio served, below no class's pace, so it
+/// is never starved; and for [`JOIN_SETTLE`] after joining, each claim of the
+/// job lifts it level with the lowest of the claiming worker's other
+/// candidates ([`issue_claim`], [`pace_for`]), so the first claim from each
+/// class that runs faster than the lowest puts it level with that class's
+/// jobs. A structural lag is left alone -- within the class that runs it, a
+/// lagging job keeps pace -- and only a job that joined is settled. A worker
+/// that declines the job as one it cannot run undoes its settling
+/// ([`unsettle`]); a job with nothing to hand out is kept from dragging the
+/// lowest down by [`lift_passed_over`]; and each claim is checked for its
+/// turn ([`try_claim_from_job`]), so no concurrent burst puts one job ahead
+/// for the settling to mistake for a pace.
 ///
 /// The baseline may go negative (a job with no claims joining a busy fleet is
-/// credited the claims that put it level); ratios never do, since the minimum
-/// it copies is itself a ratio of a count that only grows.
+/// credited the claims that put it level).
 pub async fn join_at_parity(
     conn: &mut sqlx::PgConnection,
     job_id: Uuid,
     served_within: std::time::Duration,
 ) -> AppResult<()> {
-    sqlx::query(
-        "WITH others AS (
-             SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
-                    COALESCE(o.last_claimed_at > now() - make_interval(secs => $2), FALSE) AS served
-             FROM jobs o
-             WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1
-         )
-         UPDATE jobs j
-         SET claims_baseline = j.claims_issued - floor(
-                 COALESCE((SELECT MIN(ratio) FROM others WHERE served),
-                          (SELECT MIN(ratio) FROM others), 0)
+    // `activated_at` is when the job last joined: activation sets it, and a
+    // purge and a return from a spell unserved are joins too. It starts the
+    // settling window, and the rate window of the job's ETA.
+    sqlx::query(&format!(
+        "UPDATE jobs j
+         SET activated_at = CASE WHEN j.status = 'active' THEN now() ELSE j.activated_at END,
+             claims_baseline = j.claims_issued - floor(
+                 COALESCE({PARITY_TARGET},
+                          (SELECT MAX((o.claims_issued - o.claims_baseline)::float8 / o.allocation)
+                           FROM jobs o
+                           WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1),
+                          0)
                  * COALESCE(j.allocation, 0)
              )::bigint
-         WHERE j.id = $1",
-    )
+         WHERE j.id = $1"
+    ))
     .bind(job_id)
     .bind(served_within.as_secs_f64())
     .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Undo the settling a worker that cannot run `job_id` gave it: within
+/// [`JOIN_SETTLE`] of joining, put its ratio back down to where it joined --
+/// the lowest served ([`PARITY_TARGET`]) -- if it is above that. Called on a
+/// decline that says the worker cannot run the job at all.
+///
+/// A data gap is not something the server can filter on: every worker
+/// without the job's data is issued one claim of it before its unsupported
+/// set says so, and that claim settled the job at the pace of a class that
+/// will never run it. A job only a minority had the data for was lifted by
+/// the majority's first claims past the minority's own lagging job, and the
+/// minority -- the only workers that could run it -- never reached it: none of
+/// 400 claims (the audit's pass 20). A worker that can run it settles it again
+/// with its next claim.
+pub async fn unsettle(
+    conn: &mut sqlx::PgConnection,
+    job_id: Uuid,
+    served_within: std::time::Duration,
+) -> AppResult<()> {
+    sqlx::query(&format!(
+        "UPDATE jobs
+         SET claims_baseline = GREATEST(claims_baseline,
+                 claims_issued - floor({PARITY_TARGET} * allocation)::bigint)
+         WHERE id = $1 AND status = 'active' AND allocation > 0
+           AND activated_at > now() - make_interval(secs => $3)"
+    ))
+    .bind(job_id)
+    .bind(served_within.as_secs_f64())
+    .bind(JOIN_SETTLE.as_secs_f64())
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Lift the jobs a worker passed over for want of a task level with the one
+/// it claimed from, as that job stood before the claim (`pace`, from the
+/// candidate list), never lowering any.
+///
+/// Start-time fair queuing credits only a flow with something to send. A job
+/// with no task to hand out -- a games job whose every game is in flight, a
+/// generation being built, a dispatch hold (a seeding, a purge) -- sits ahead
+/// of the job claimed in the list because its ratio stood still, and banked
+/// that as debt: the moment it had work again it took every claim until it had
+/// caught up, and a newcomer put level with it did the same. Lifted each time
+/// a worker that could have run it takes something else, it stays level with
+/// the jobs those workers are running.
+///
+/// Before the claim, not after: start-time fair queuing's virtual time is the
+/// start of the claim in service. Lifted past it, a job with a moment's gap
+/// was put a whole claim of the job chosen ahead of the rest -- a ratio unit
+/// when that job is at 1% -- and waited 49 claims when its work came back
+/// (the audit's pass 20).
+///
+/// After the claim committed, in a statement of its own: the rows are locked
+/// in id order and a row another claim holds is skipped (that claim, or the
+/// next, lifts it), so this neither waits nor deadlocks. Only a lift is
+/// written -- a job already level is not touched -- but a job with nothing to
+/// hand out is below the pace again after each claim, so while it has none,
+/// each claim that passes it over writes its row once.
+async fn lift_passed_over(pool: &PgPool, passed_over: &[Uuid], pace: f64) -> AppResult<()> {
+    sqlx::query(
+        "WITH lifted AS (
+             SELECT k.id, k.claims_issued - floor($2 * k.allocation)::bigint AS baseline
+             FROM jobs k
+             WHERE k.id = ANY($1) AND k.status = 'active' AND k.allocation > 0
+               AND k.claims_issued - floor($2 * k.allocation)::bigint < k.claims_baseline
+             ORDER BY k.id
+             FOR NO KEY UPDATE OF k SKIP LOCKED
+         )
+         UPDATE jobs j SET claims_baseline = l.baseline
+         FROM lifted l WHERE j.id = l.id",
+    )
+    .bind(passed_over)
+    .bind(pace)
+    .execute(pool)
     .await?;
     Ok(())
 }
@@ -316,9 +430,18 @@ async fn shutdown_or_idle(
 ///
 /// Safe against a submission for the same claim racing it: the submit path
 /// holds the claim row locked from its lookup to its commit, and this
-/// statement re-checks `state = 'claimed'` after waiting on that lock, so a
-/// claim is either abandoned here or completed there -- never both, which is
-/// what would decrement the task's counter twice.
+/// statement skips a locked claim rather than waiting on it, so a claim is
+/// either abandoned here or completed there -- never both, which is what would
+/// decrement the task's counter twice.
+///
+/// Skipped, not waited on: a claim somebody holds locked is being submitted,
+/// declined, purged or deleted, and is not lapsed in any sense that matters.
+/// Waiting was what let one purge stall the fleet -- it holds every open claim
+/// of its job for as long as its deletes run, and a reclaim run by *any* claim
+/// request, for any job, blocked on the first of them once it lapsed, holding
+/// a pool connection -- and two reclaims locking overlapping claims in
+/// different orders could deadlock. A claim skipped now is reclaimed by the
+/// next claim request after its lock is released, if it still needs to be.
 pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> AppResult<u64> {
     reclaim_expired_for(pool, &[job_id], timeout_secs).await
 }
@@ -328,7 +451,7 @@ pub async fn reclaim_expired(pool: &PgPool, job_id: Uuid, timeout_secs: f64) -> 
 /// The scan is the same either way: the planner reaches the expired claims
 /// through the partial index on open claims -- one entry per claim currently in
 /// flight across the fleet -- and filters by job afterwards, because
-/// `task_claims` has no job column to narrow on. Run per job, a claim request
+/// no index on `task_claims` leads with the job. Run per job, a claim request
 /// therefore paid that scan once per candidate, for a set of rows that does not
 /// depend on the job at all. Run once over all of them it is a single pass and
 /// a single round trip.
@@ -338,14 +461,20 @@ pub async fn reclaim_expired_for(
     timeout_secs: f64,
 ) -> AppResult<u64> {
     let result = sqlx::query(
-        "WITH expired AS (
-             UPDATE task_claims c
-             SET state = 'abandoned'
-             FROM tasks t
-             WHERE c.task_id = t.id
-               AND t.job_id = ANY($1)
+        "WITH lapsed AS (
+             SELECT c.id
+             FROM task_claims c
+             JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = ANY($1)
                AND c.state = 'claimed'
                AND COALESCE(c.last_heartbeat_at, c.claimed_at) < now() - make_interval(secs => $2)
+             FOR UPDATE OF c SKIP LOCKED
+         ),
+         expired AS (
+             UPDATE task_claims c
+             SET state = 'abandoned'
+             FROM lapsed
+             WHERE c.id = lapsed.id
              RETURNING c.task_id
          ),
          counts AS (
@@ -394,7 +523,14 @@ pub async fn reclaim_lapsed(state: &AppState, job_ids: &[Uuid]) -> AppResult<u64
     if std::time::Instant::now() < state.reclaim_from {
         return Ok(0);
     }
-    reclaim_expired_for(&state.pool, job_ids, state.cfg.heartbeat_timeout.as_secs_f64()).await
+    // Nor the claims of a job a purge or delete held and then let go without
+    // committing: their heartbeats were skipped while it held them, not missed
+    // (`jobs::DispatchHolds`).
+    let job_ids = state.dispatch_holds.reclaimable(job_ids);
+    if job_ids.is_empty() {
+        return Ok(0);
+    }
+    reclaim_expired_for(&state.pool, &job_ids, state.cfg.heartbeat_timeout.as_secs_f64()).await
 }
 
 /// Walk the candidate jobs in deficit order and hand out the first available
@@ -420,10 +556,22 @@ pub async fn claim(
         }));
     }
 
-    // The outer retry exists for two cases: a leave-gen generation transition
-    // (which creates new work mid-request) and a lost race on the `(job_id,
-    // seed)` unique index when two workers generate the same on-demand task.
-    for _attempt in 0..3 {
+    // The outer retry exists for three cases: a leave-gen generation
+    // transition (which creates new work mid-request), a lost race on the
+    // `(job_id, seed)` unique index when two workers generate the same
+    // on-demand task, and a claim that found every job with work outrun
+    // (`JobClaimError::LostRace`). The last is common when many workers claim
+    // at once, so it has more rounds; and the last round takes the first job
+    // with work without the turn check, since an `Idle` while work exists sends
+    // a worker to sleep for seconds -- with equal jobs and 32 workers claiming
+    // together, 67 to 166 claims of 1,920 did (the audit's pass 21).
+    //
+    // A job found busy (`JobClaimError::Busy`) is not tried again in the
+    // request: waiting on it again cost 2 s a round, and a claim waited 16 s
+    // and was told there was nothing (pass 21). It stays a rival (below).
+    let mut busy: Vec<Uuid> = Vec::new();
+    for attempt in 0..CLAIM_ROUNDS {
+        let last_round = attempt + 1 == CLAIM_ROUNDS;
         let jobs = candidate_jobs(&state.pool, caps).await?;
         if jobs.is_empty() {
             return shutdown_or_idle(state, caps).await;
@@ -442,27 +590,84 @@ pub async fn claim(
         }
 
         let mut retry_outer = false;
-        for job in &jobs {
+        let mut passed_over = Vec::new();
+        // Whether a job lost a race (`JobClaimError::LostRace`): it has work,
+        // so a claim that found nothing else goes round again.
+        let mut outrun = false;
+        for (i, job) in jobs.iter().enumerate() {
+            if busy.contains(&job.id) {
+                continue;
+            }
+            let rivals = if last_round {
+                Vec::new()
+            } else {
+                jobs.iter()
+                    .enumerate()
+                    .filter(|(j, other)| {
+                        *j != i && !passed_over.contains(&other.id) && !busy.contains(&other.id)
+                    })
+                    .map(|(_, other)| other.id)
+                    .collect()
+            };
+            // A busy job stays a rival, in every round, with a ratio unit of
+            // slack rather than one of its claims: a 1% job's claim is a whole
+            // unit, the largest any claim can be. Dropped as a rival, the 1%
+            // job beside a busy 99% one took every claim for as long as the
+            // lock was held, and the 99% job's settling forgave the lot (49
+            // claims where 30 is fair, the audit's pass 21); kept with one of
+            // its own claims of slack, the job beside it could not be claimed
+            // at all.
+            let busy_rivals: Vec<Uuid> = busy.iter().copied().filter(|id| *id != job.id).collect();
+            let standing = Standing {
+                served_within: state.cfg.heartbeat_timeout,
+                // Settled a ratio unit short while it has been busy: see
+                // `was_recently_busy`.
+                pace: pace_for(&jobs, i).map(|pace| if was_recently_busy(job.id) { pace - 1.0 } else { pace }),
+                rivals,
+                busy_rivals,
+            };
             // One job that cannot dispatch -- a leave-generation job whose
             // generation-0 artifact never got written, a config row a bad
             // restore left out -- must not take every other job down with it.
             // Failing the whole claim here would answer every worker with a
             // 500 for as long as that job sits at the head of the list, and
             // every client retries 500s. It is logged loudly and skipped.
-            match try_claim_from_job(state, identity, job, caps).await {
-                Ok(Some(outcome)) => return Ok(ClaimOutcome::Task(Box::new(outcome))),
-                Ok(None) => continue,
+            match try_claim_from_job(state, identity, job, caps, standing).await {
+                Ok(Some(outcome)) => {
+                    lift_after_claim(state, &passed_over, job).await;
+                    return Ok(ClaimOutcome::Task(Box::new(outcome)));
+                }
+                Ok(None) => {
+                    passed_over.push(job.id);
+                    continue;
+                }
+                Err(JobClaimError::LostRace) => {
+                    outrun = true;
+                    continue;
+                }
+                Err(JobClaimError::Busy) => {
+                    mark_busy(job.id);
+                    busy.push(job.id);
+                    continue;
+                }
                 Err(JobClaimError::Retry) => {
                     retry_outer = true;
                     break;
                 }
                 Err(JobClaimError::Fatal(err)) => {
                     tracing::error!(job_id = %job.id, error = %err.message, "claiming from job failed; skipping job");
+                    passed_over.push(job.id);
                     continue;
                 }
             }
         }
-
+        // A job that lost a race has work: the claim goes round again rather
+        // than take it unchecked at once -- two jobs can each be outrun by the
+        // other, and taking one anyway was the burst the check exists to
+        // prevent (175 claims where 30 is fair, pass 20).
+        if !retry_outer && outrun {
+            retry_outer = true;
+        }
         if !retry_outer {
             // Jobs this worker can run exist; none had a task to hand out.
             return Ok(ClaimOutcome::Idle);
@@ -472,9 +677,87 @@ pub async fn claim(
     Ok(ClaimOutcome::Idle)
 }
 
+/// Lift the jobs passed over on the way to `chosen` to where it stood before
+/// its claim. Not fatal: a job not lifted now is lifted by the next claim that
+/// passes it over.
+async fn lift_after_claim(state: &AppState, passed_over: &[Uuid], chosen: &Job) {
+    if let (false, Some(pace)) = (passed_over.is_empty(), ratio(chosen)) {
+        if let Err(err) = lift_passed_over(&state.pool, passed_over, pace).await {
+            tracing::error!(error = %err.message, "lifting passed-over jobs failed");
+        }
+    }
+}
+
+/// The pace of the worker whose candidate list is `jobs` as seen from its
+/// `i`th candidate, which a job still settling after joining is lifted to
+/// (`issue_claim`): the lowest ratio among its *other* candidates -- the jobs
+/// just passed over included, so a job that paused for one claim still holds
+/// it (pass 20) -- less one of that job's claims and one of this one's. A job
+/// taking its fair turn sits that far behind it at most: that job's last
+/// claim moved it on, and the turn check lets that job run one of its claims
+/// ahead (`try_claim_from_job`). Lifted past that, it lost every tie: 8 : 4
+/// at 50/50.
+fn pace_for(jobs: &[Job], i: usize) -> Option<f64> {
+    let other = if i == 0 { jobs.get(1)? } else { &jobs[0] };
+    let alloc = f64::from(other.allocation.filter(|a| *a > 0)?);
+    let own = f64::from(jobs[i].allocation.filter(|a| *a > 0)?);
+    Some((other.claims_issued - other.claims_baseline - 1) as f64 / alloc - 1.0 / own)
+}
+
+/// How many times a claim reads the candidate list before answering `Idle`.
+const CLAIM_ROUNDS: usize = 8;
+
+/// How long after a job was found busy it is settled a ratio unit short.
+const BUSY_MEMORY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// When each job was last found busy, in this process.
+static RECENTLY_BUSY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn mark_busy(job_id: Uuid) {
+    if let Ok(mut busy) = RECENTLY_BUSY.lock() {
+        let now = std::time::Instant::now();
+        busy.retain(|_, at| now.duration_since(*at) < BUSY_MEMORY);
+        busy.insert(job_id, now);
+    }
+}
+
+/// Whether `job_id` was found busy within [`BUSY_MEMORY`]. Such a job is
+/// settled a ratio unit short of its pace: while it was busy the jobs beside it
+/// could run up to a unit ahead of it (its slack as a busy rival), a lead it is
+/// owed back -- settled all the way, it forgave the lead, and every further
+/// spell added another (a 10% job beside a settling 90% one took 400 claims of
+/// 2,400 over twenty spells, where 240 is fair; the audit's pass 22). Not
+/// settled at all, a newcomer found busy once in a split fleet took the
+/// majority's claims until it had caught theirs, as before settling existed
+/// (the majority job's first came 331st). A unit short, the spell's lead is
+/// paid back and a join's gap, far wider, is still closed.
+fn was_recently_busy(job_id: Uuid) -> bool {
+    RECENTLY_BUSY
+        .lock()
+        .map(|busy| busy.get(&job_id).is_some_and(|at| at.elapsed() < BUSY_MEMORY))
+        .unwrap_or(false)
+}
+
+/// A job's deficit ratio as the candidate list read it; `None` at 0%.
+fn ratio(job: &Job) -> Option<f64> {
+    job.allocation
+        .filter(|a| *a > 0)
+        .map(|a| (job.claims_issued - job.claims_baseline) as f64 / f64::from(a))
+}
+
 enum JobClaimError {
     /// Something changed underneath us; re-run job selection.
     Retry,
+    /// Claims made while this one was on its way moved the job past another
+    /// of the worker's candidates (see `try_claim_from_job`): go on to the
+    /// next; if none has a task, the claim goes round again.
+    LostRace,
+    /// Another claim held the job's dispatch lock past the bounded wait. Not
+    /// a pass-over -- a job that is merely busy has work, and lifting it would
+    /// forgive the claims it is owed. The job is left out of the rest of the
+    /// request.
+    Busy,
     Fatal(AppError),
 }
 
@@ -483,7 +766,14 @@ async fn try_claim_from_job(
     identity: &WorkerIdentity,
     job: &Job,
     caps: &WorkerCapabilities,
+    standing: Standing,
 ) -> Result<Option<TaskClaim>, JobClaimError> {
+    // Its dispatch lock is held for a long time -- seeding, a purge -- and the
+    // wait for it would be spent holding a pool connection to learn that there
+    // is nothing here right now. See `jobs::DispatchHolds`.
+    if state.dispatch_holds.is_held(job.id) {
+        return Ok(None);
+    }
     // Before the dispatch lock, because a job with a table still building has
     // nothing to hand out and taking the lock would only make every other
     // claim for it wait. The hashes travel with the claim, so a task issued
@@ -503,6 +793,12 @@ async fn try_claim_from_job(
     // claim. Only a miss on either takes a pool connection: the common case is
     // a hit, and a connection held for a lookup the cache answers is one a
     // worker's claim or submission is waiting for.
+    // A job whose template failed to load a moment ago is passed over as if it
+    // had no task, without a connection or a log line; it is tried (and
+    // logged) again once a minute (`JobTemplates::recently_failed`).
+    if state.templates.get(job.id).is_none() && state.templates.recently_failed(job.id) {
+        return Ok(None);
+    }
     let (derived, template) = match (state.derived_ready.get(job.id), state.templates.get(job.id)) {
         (Some(derived), Some(template)) => (derived, template),
         (derived, template) => {
@@ -539,6 +835,70 @@ async fn try_claim_from_job(
 
     let mut tx = state.pool.begin().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
 
+    // Is it still this job's turn? Claims arriving together read the same
+    // candidate list and all land on its first job; for a job at 1% each is a
+    // whole ratio unit, and 32 concurrent claims put it 32 units ahead -- paid
+    // back only slowly, and forgiven by anything that lifts a job that lags
+    // (307 to 324 claims where 30 is fair, the audit's pass 20). So, holding
+    // the job's dispatch lock -- which every claim of it takes, so none is in
+    // flight -- its ratio must not be more than one of that job's claims past
+    // any of the worker's other candidates still in play (`Standing::rivals`):
+    // every one of them, not only the next, since a worker that found its
+    // first job outrun and went on to its last otherwise checked nothing. The
+    // one claim is the slack concurrency needs -- with none, only the lowest
+    // job could ever be claimed, and a fleet claiming together went idle a
+    // third of the time -- and it is the rival's claim, so a job at 99% can
+    // run a whole 1% claim ahead while the job at 1% can run a hundredth
+    // ahead: no burst. Checked before the dispatch does any work, so a claim
+    // that is not the job's turn costs a lookup -- made holding the job's
+    // dispatch lock, so queued behind the claims on it. (`registry::acquire`
+    // takes the same lock again, at once.)
+    if !standing.rivals.is_empty() || !standing.busy_rivals.is_empty() {
+        match crate::jobs::try_lock_job_dispatch(&mut tx, job.id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = tx.rollback().await;
+                return Err(JobClaimError::Busy);
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(JobClaimError::Fatal(err));
+            }
+        }
+        let outrun = sqlx::query_scalar::<_, bool>(
+            "SELECT (j.claims_issued - j.claims_baseline)::float8 / j.allocation
+                    > LEAST(
+                        COALESCE((SELECT MIN((o.claims_issued - o.claims_baseline + 1)::float8 / o.allocation)
+                                  FROM jobs o WHERE o.id = ANY($2) AND o.allocation > 0),
+                                 'Infinity'::float8),
+                        COALESCE((SELECT MIN((o.claims_issued - o.claims_baseline)::float8 / o.allocation + 1)
+                                  FROM jobs o WHERE o.id = ANY($3) AND o.allocation > 0),
+                                 'Infinity'::float8))
+             FROM jobs j WHERE j.id = $1 AND j.allocation > 0",
+        )
+        .bind(job.id)
+        .bind(&standing.rivals)
+        .bind(&standing.busy_rivals)
+        .fetch_optional(&mut *tx)
+        .await;
+        match outrun {
+            Ok(Some(false)) => {}
+            Ok(Some(true)) => {
+                let _ = tx.rollback().await;
+                return Err(JobClaimError::LostRace);
+            }
+            // Parked at 0% on its way: nothing to hand out.
+            Ok(None) => {
+                let _ = tx.rollback().await;
+                return Ok(None);
+            }
+            Err(err) => {
+                let _ = tx.rollback().await;
+                return Err(JobClaimError::Fatal(err.into()));
+            }
+        }
+    }
+
     let acquired = match registry::acquire(&mut tx, job, identity, &template).await {
         Ok(acquired) => acquired,
         Err(err) => {
@@ -552,6 +912,10 @@ async fn try_claim_from_job(
     };
 
     match acquired {
+        Acquired::Busy => {
+            let _ = tx.rollback().await;
+            Err(JobClaimError::Busy)
+        }
         Acquired::NoWork => {
             // Committed rather than rolled back, for the one thing a claim that
             // hands out nothing may have written: a leave job's sweep deleting
@@ -561,6 +925,20 @@ async fn try_claim_from_job(
             // before answering `NoWork`, and a transaction the dispatch lock's
             // timeout aborted commits as the rollback it already is.
             let _ = tx.commit().await;
+            // A job with nothing to hand out may be done with nobody left to
+            // say so; checked off this request, and paced per job.
+            if job.job_type != JobType::LeaveGeneration
+                && state.finish_checks.should_check_idle(job.id)
+            {
+                let (spawn_state, job_id) = (state.clone(), job.id);
+                tokio::spawn(async move {
+                    if let Err(err) =
+                        crate::routes::worker::finish_idle_job(&spawn_state, job_id).await
+                    {
+                        tracing::warn!(%job_id, error = %err.message, "idle finish check failed");
+                    }
+                });
+            }
             Ok(None)
         }
         Acquired::JobFinished => {
@@ -572,12 +950,21 @@ async fn try_claim_from_job(
             // job cannot be reactivated. Guarded on `active` as well: an admin
             // may have deactivated the job between selection and here, and
             // that decision stands.
-            sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
+            let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
                 .bind(job.id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| JobClaimError::Fatal(e.into()))?;
+                .map_err(|e| JobClaimError::Fatal(e.into()))?
+                .rows_affected()
+                > 0;
+            if completed {
+                crate::audit::log_server_completion(&mut tx, job.id, Some("last generation built"))
+                    .await
+                    .map_err(JobClaimError::Fatal)?;
+            }
             tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
+            // No submission is coming to push this to open pages.
+            crate::routes::worker::push_after_change(state, job.id);
             Ok(None)
         }
         Acquired::NeedsUniverse { generation } => {
@@ -597,6 +984,42 @@ async fn try_claim_from_job(
                     tracing::error!(
                         job_id = %spawn_job.id, generation, error = %err.message,
                         "seeding a leave generation's rack universe failed"
+                    );
+                }
+            });
+            Ok(None)
+        }
+        Acquired::NeedsZeroGeneration => {
+            let _ = tx.rollback().await;
+            // One build per job at a time: every claim finds the KLV missing
+            // until the first build lands, and each would otherwise start one.
+            static BUILDING: std::sync::Mutex<Vec<Uuid>> = std::sync::Mutex::new(Vec::new());
+            {
+                let mut building = BUILDING.lock().expect("zero-generation builds poisoned");
+                if building.contains(&job.id) {
+                    return Ok(None);
+                }
+                building.push(job.id);
+            }
+            // Cleared however the build ends -- a panic included, which left
+            // the job marked as building until the process restarted.
+            struct Built(Uuid);
+            impl Drop for Built {
+                fn drop(&mut self) {
+                    if let Ok(mut building) = BUILDING.lock() {
+                        building.retain(|id| *id != self.0);
+                    }
+                }
+            }
+            let (spawn_state, spawn_job) = (state.clone(), job.clone());
+            tokio::spawn(async move {
+                let _built = Built(spawn_job.id);
+                let built =
+                    crate::jobs::registry::initialize_job_artifacts(&spawn_state, &spawn_job).await;
+                if let Err(err) = built {
+                    tracing::error!(
+                        job_id = %spawn_job.id, error = %err.message,
+                        "building a leave job's generation-0 KLV failed"
                     );
                 }
             });
@@ -671,7 +1094,7 @@ async fn try_claim_from_job(
             Ok(None)
         }
         Acquired::Task { task_id, request, created } => {
-            match issue_claim(&mut tx, identity, job, caps, task_id, created).await {
+            match issue_claim(&mut tx, identity, job, caps, task_id, created, standing).await {
                 // The job stopped being active between its selection and this
                 // claim reaching its row: nothing is handed out.
                 Ok(None) => {
@@ -759,6 +1182,7 @@ async fn issue_claim(
     caps: &WorkerCapabilities,
     task_id: Uuid,
     task_created: bool,
+    standing: Standing,
 ) -> AppResult<Option<Uuid>> {
     // A worker that arrived with no identity becomes a real one only now,
     // when there is a task to attach it to and a response body to return its
@@ -773,15 +1197,16 @@ async fn issue_claim(
     let claim_token = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO task_claims
-             (task_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
+             (task_id, job_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid,
               magpie_version)
-         VALUES ($1, $2, $3, $4, $5)",
+         VALUES ($1, $6, $2, $3, $4, $5)",
     )
     .bind(task_id)
     .bind(claim_token)
     .bind(identity.user_id())
     .bind(identity.anon_uuid())
     .bind(caps.magpie_version.to_string())
+    .bind(job.id)
     .execute(&mut **tx)
     .await?;
 
@@ -819,14 +1244,47 @@ async fn issue_claim(
     // completed job a result landing after an export had checked that nothing
     // was in flight. Postgres re-checks the condition on the row it waited
     // for, so a claim that loses that race hands out nothing.
-    let still_active = sqlx::query(
+    //
+    // Two lifts ride along, each only ever raising the job's ratio:
+    //
+    // - A job that has not been served for a window -- one nobody could run
+    //   (its MAGPIE floor above the fleet's, its data not yet out, all its
+    //   work in flight) -- rejoins at parity here, on its first claim back,
+    //   as a newcomer does ([`join_at_parity`]), and that starts its settling
+    //   window. Its ratio stood still while the others climbed, and it took
+    //   every claim of the workers that could now run it until it had caught
+    //   up. The window is measured from the latest claim of any other job, so
+    //   a quiet fleet leaves every job where it was; a job never claimed
+    //   counts from when it joined.
+    // - A job within [`JOIN_SETTLE`] of joining is lifted level with `pace`,
+    //   this worker's pace (`pace_for`): it joined at the lowest pace served,
+    //   and the workers of a faster class, taking it first, would otherwise
+    //   have given it every claim until it caught their jobs.
+    let still_active = sqlx::query(&format!(
         "UPDATE jobs
-         SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $2,
-             last_claimed_at = now()
-         WHERE id = $1 AND status = 'active'",
-    )
+         SET claims_issued = claims_issued + 1, tasks_total = tasks_total + $3,
+             last_claimed_at = now(),
+             claims_baseline = CASE
+                 WHEN NOT COALESCE(allocation > 0, FALSE) THEN claims_baseline
+                 WHEN {STALE}
+                     THEN LEAST(claims_baseline,
+                                claims_issued - floor({PARITY_TARGET} * allocation)::bigint,
+                                claims_issued - floor($4 * allocation)::bigint)
+                 WHEN activated_at > now() - make_interval(secs => $5)
+                     THEN LEAST(claims_baseline, claims_issued - floor($4 * allocation)::bigint)
+                 ELSE claims_baseline
+             END,
+             activated_at = CASE
+                 WHEN COALESCE(allocation > 0, FALSE) AND {STALE} THEN now()
+                 ELSE activated_at
+             END
+         WHERE id = $1 AND status = 'active'"
+    ))
     .bind(job.id)
+    .bind(standing.served_within.as_secs_f64())
     .bind(i64::from(task_created))
+    .bind(standing.pace)
+    .bind(JOIN_SETTLE.as_secs_f64())
     .execute(&mut **tx)
     .await?
     .rows_affected()
@@ -835,11 +1293,38 @@ async fn issue_claim(
     Ok(still_active.then_some(claim_token))
 }
 
+/// What a claim needs to keep its job's ratio level with the others: see
+/// [`issue_claim`].
+struct Standing {
+    /// The heartbeat timeout: unserved for this long, a job rejoins.
+    served_within: std::time::Duration,
+    /// The claiming worker's pace (`pace_for`), which a job still settling
+    /// after joining is lifted to.
+    pace: Option<f64>,
+    /// The worker's other candidates still in play -- all but the jobs it
+    /// passed over for want of a task and those found busy (`busy_rivals`) --
+    /// none of which the job may have been moved past by the time this claim
+    /// holds its dispatch lock. Empty in the last round.
+    rivals: Vec<Uuid>,
+    /// Jobs found busy earlier in the request, which the job may run at most a
+    /// ratio unit past.
+    busy_rivals: Vec<Uuid>,
+}
+
+/// A job unserved for `$2` seconds before the latest claim of any other job
+/// on offer: nobody could run it, or it had nothing to hand out.
+const STALE: &str = "COALESCE(last_claimed_at, activated_at)
+     <= (SELECT MAX(o.last_claimed_at) FROM jobs o
+         WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> $1)
+        - make_interval(secs => $2)";
+
 /// Release a claim that ended in something other than a submission.
 ///
 /// Decline and expiry are the same operation -- mark the claim terminal, drop
 /// the job's live claim count, recompute the task against `redundancy` -- and
-/// writing it twice is how the counter drifts. A drifting counter makes the
+/// writing it twice is how the counter drifts. (Expiry does write it twice:
+/// `reclaim_expired_for` releases many claims in one statement with the same
+/// formula. Keep the two in step.) A drifting counter makes the
 /// scheduler believe a job is saturated and dispatch quietly stops, days later
 /// and nowhere near the cause.
 ///
@@ -890,15 +1375,6 @@ async fn run_leave_generation_transition(
     if job.job_type != JobType::LeaveGeneration {
         return Ok(());
     }
-    let config = sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
-        .bind(job.id)
-        .fetch_one(&state.pool)
-        .await?;
-
-    let mut conn = state.pool.acquire().await?;
-    let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
-    drop(conn);
-
     // This request owns the transition: `next_step` wrote the
     // `leave_generation_transitions` row that stops any other claim starting the
     // same one. If it fails, ownership has to go back, or the generation would
@@ -906,14 +1382,20 @@ async fn run_leave_generation_transition(
     // store error would cost half an hour of idle workers. Backdating
     // `started_at` hands it to the next claim through the same takeover path,
     // which keeps the attempt count and says in the log that a transition was
-    // started and did not finish.
-    let result = leave_gen::run_transition(
-        state,
-        job.id,
-        generation,
-        &config,
-        &job_data.letterdist,
-    )
+    // started and did not finish. The reads before the transition are inside
+    // the guard too: outside it, as they were, a failure in either kept
+    // ownership for the half hour (thirty-first audit).
+    let result = async {
+        let config =
+            sqlx::query_as::<_, LeaveConfig>("SELECT * FROM job_leave_config WHERE job_id = $1")
+                .bind(job.id)
+                .fetch_one(&state.pool)
+                .await?;
+        let mut conn = state.pool.acquire().await?;
+        let job_data = crate::jobs::load_job_data(&mut conn, job.id).await?;
+        drop(conn);
+        leave_gen::run_transition(state, job.id, generation, &config, &job_data.letterdist).await
+    }
     .await;
 
     let key = match result {
@@ -960,6 +1442,12 @@ async fn seed_leave_universe(state: &AppState, job: &Job, generation: i32) -> Ap
     if !crate::jobs::try_lock_job_dispatch_now(&mut tx, job.id).await? {
         return Ok(());
     }
+    // Until the commit below releases the lock.
+    let _hold = state.dispatch_holds.hold(
+        job.id,
+        crate::jobs::HoldKind::DispatchOnly,
+        state.cfg.heartbeat_timeout,
+    );
     let job_data = crate::jobs::load_job_data(&mut tx, job.id).await?;
     leave_gen::ensure_universe(&mut tx, job.id, generation, &job_data.letterdist).await?;
     tx.commit().await?;

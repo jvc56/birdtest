@@ -7,7 +7,7 @@
 //! noticing.
 //!
 //! Phase 1 runs as a spawned task rather than inside the request: the archive
-//! is ~94 MB, and a request that waits that long needs a timeout far above the
+//! is ~190 MB, and a request that waits that long needs a timeout far above the
 //! framework default and must not hold a transaction open across the network
 //! I/O. birdtest runs as a single instance, so the task needs no lease -- and,
 //! for the same reason, startup may fail any row still marked `running`.
@@ -22,13 +22,14 @@ use uuid::Uuid;
 /// Limits on the archive walk. Every one of them aborts the import rather than
 /// skipping the entry: a malformed archive is not a partially trustworthy one.
 mod limits {
-    /// The real tarball is ~94 MB.
+    /// The real tarball is ~190 MB (`data-20251004.tgz`, five chunks).
     pub const COMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
     /// `download_data.sh` stops at 26 (`aa`..`az`); this is headroom without
     /// being unbounded.
     pub const CHUNKS: u32 = 64;
     pub const UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
-    /// Real gzip on this content runs about 3-4x; a bomb is thousands. Checked
+    /// Real gzip on this content runs about 1.3x (190 MB to 250 MB); a bomb is
+    /// thousands. Checked
     /// continuously rather than at the end, which is the case a total cap alone
     /// lets through.
     pub const EXPANSION_RATIO: u64 = 20;
@@ -36,7 +37,55 @@ mod limits {
     pub const ENTRY_BYTES: u64 = 128 * 1024 * 1024;
     /// MAGPIE-DATA has low hundreds of files.
     pub const ENTRIES: usize = 5_000;
+    /// A PAX extension header or GNU long name is a few hundred bytes.
+    pub const EXTENSION_BYTES: u64 = 64 * 1024;
+    /// A letter distribution or a layout, kept in its row and read by the
+    /// server: the real ones are hundreds of bytes. Up to the per-entry cap, a
+    /// 128 MiB one was stored, parsed at job creation and copied once per
+    /// alias (the audit's pass 11).
+    pub const CONTENT_BYTES: u64 = 64 * 1024;
 }
+
+/// The decompressed stream, counted: every byte the tar reader takes, entry
+/// data, headers and skipped data alike, against the total and the ratio. The
+/// walk reads the archive raw (see [`walk_archive`]), so nothing is held that
+/// the walk did not ask for; this bounds the work of what it skips.
+struct Capped<R> {
+    inner: R,
+    read: u64,
+    limit: u64,
+}
+
+impl<R: std::io::Read> std::io::Read for Capped<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        if self.read > self.limit {
+            return Err(std::io::Error::other(format!(
+                "archive expands past the {} GiB cap, or more than {}x what was downloaded",
+                limits::UNCOMPRESSED_BYTES / 1024 / 1024 / 1024,
+                limits::EXPANSION_RATIO
+            )));
+        }
+        Ok(n)
+    }
+}
+
+fn decompressed(compressed: &[u8]) -> Capped<flate2::read::MultiGzDecoder<&[u8]>> {
+    Capped {
+        // Every member, as `tar -xzf` reads them: a release gzipped in two
+        // members walked only the first, and pinned nothing of the second.
+        inner: flate2::read::MultiGzDecoder::new(compressed),
+        read: 0,
+        // What the stream bounds is only work: an entry's data is judged
+        // before it is read and an extension header is refused past 64 KiB, so
+        // what is decompressed here is held nowhere. The floor is for archives
+        // of many small entries, whose headers alone compress eighty to one.
+        limit: limits::UNCOMPRESSED_BYTES
+            .min(limits::EXPANSION_RATIO.saturating_mul(compressed.len() as u64).max(64 * 1024 * 1024)),
+    }
+}
+
 
 /// A file the archive contained, hashed.
 #[derive(Debug)]
@@ -79,6 +128,17 @@ fn classify(entry_path: &str) -> Option<(String, String, String)> {
         _ => return None,
     };
     let name = basename.strip_suffix(suffix)?.to_string();
+    // A name MAGPIE would refuse is not importable. Every name a task carries
+    // becomes a path on the worker, which checks it against one rule
+    // (`[A-Za-z0-9_-]+`; a rack info table joins a lexicon and leaves with one
+    // `.`) and fails the task otherwise -- after claiming it, as a failure, so
+    // a job pinned to `CSW24.v2` would have stopped every worker it reached.
+    // Skipped like any file birdtest does not pin, so no job can be made on it.
+    if name.is_empty()
+        || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
     Some((format!("{dir}/{basename}"), role.to_string(), name))
 }
 
@@ -110,23 +170,128 @@ pub fn input_object_key(sha256: &str) -> String {
     format!("inputs/{sha256}")
 }
 
-/// Resolves a git ref to a commit sha, so `main` is pinned at import time and
-/// the record names a commit rather than a branch.
+/// How long resolving a ref may take, all of it.
+const RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// The most of one GitHub answer read while resolving: a ref's JSON is a few
+/// hundred bytes.
+const RESOLVE_BODY_BYTES: usize = 64 * 1024;
+
+fn resolve_timed_out() -> AppError {
+    AppError::bad_request(format!(
+        "GitHub did not answer within {} seconds; try again",
+        RESOLVE_TIMEOUT.as_secs()
+    ))
+}
+
+/// Resolves a branch or a tag of `MAGPIE_DATA_REPO`, by name, to a commit sha,
+/// so `main` is pinned at import time and the record names a commit rather
+/// than a branch.
+///
+/// Only through the endpoints that list the repository's own refs
+/// (`/git/ref/heads/…`, then `/git/ref/tags/…`). `/commits/{ref}` resolved a
+/// commit sha, a pull request's ref, an abbreviated sha of five characters or
+/// a `git describe` name from any fork, and GitHub serves a fork's files under
+/// the upstream's raw URLs: anyone who can open a pull request could author
+/// the tarball an admin imported. Refusing refs by their shape missed forms
+/// and refused a real branch named `20260101` (the audit's pass 11).
 pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
-    let url = format!(
-        "{}/repos/{}/commits/{}",
-        state.cfg.github_api_url, state.cfg.magpie_data_repo, git_ref
-    );
+    // A ref is a git ref name. Put into the URL as given, `..` segments
+    // resolved -- `../../../user` asked GitHub's API for another endpoint,
+    // with the server's token -- and `?` or `#` rewrote the query.
+    let well_formed = !git_ref.is_empty()
+        && git_ref.len() <= 255
+        && !git_ref.split('/').any(|segment| segment.is_empty() || segment == "." || segment == "..")
+        && git_ref
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'));
+    if !well_formed {
+        return Err(AppError::bad_request("that is not a git ref name")
+            .with_field("git_ref", "letters, digits, '-', '_', '.' and '/' only"));
+    }
+    tokio::time::timeout(RESOLVE_TIMEOUT, resolve_branch_or_tag(state, git_ref))
+        .await
+        .map_err(|_| resolve_timed_out())?
+}
+
+async fn resolve_branch_or_tag(state: &AppState, git_ref: &str) -> AppResult<String> {
+    // A bare name is a branch, else a tag; `heads/`, `tags/` (or `refs/…`)
+    // picks one, for a name that is both.
+    let (kinds, name): (&[&str], &str) = if let Some(name) =
+        git_ref.strip_prefix("refs/heads/").or_else(|| git_ref.strip_prefix("heads/"))
+    {
+        (&["heads"], name)
+    } else if let Some(name) =
+        git_ref.strip_prefix("refs/tags/").or_else(|| git_ref.strip_prefix("tags/"))
+    {
+        (&["tags"], name)
+    } else {
+        (&["heads", "tags"], git_ref)
+    };
+    let mut found = None;
+    for kind in kinds {
+        if let Some(answer) = github_json(state, &format!("git/ref/{kind}/{name}")).await? {
+            found = Some(answer);
+            break;
+        }
+    }
+    let Some(found) = found else {
+        return Err(AppError::not_found(format!(
+            "no branch or tag {git_ref:?} in {}",
+            state.cfg.magpie_data_repo
+        )));
+    };
+    let (mut sha, mut kind) = ref_object(&found, git_ref)?;
+    // An annotated tag names a tag object, which names the commit -- or,
+    // rarely, another tag: followed a few hops.
+    for _ in 0..4 {
+        if kind != "tag" {
+            break;
+        }
+        let tag = github_json(state, &format!("git/tags/{sha}")).await?.ok_or_else(|| {
+            AppError::bad_request(format!("GitHub has no tag object {sha} for {git_ref:?}"))
+        })?;
+        (sha, kind) = ref_object(&tag, git_ref)?;
+    }
+    if kind == "tag" {
+        return Err(AppError::bad_request(format!(
+            "{git_ref:?} is a tag of a tag more than four deep; name the commit's own tag"
+        )));
+    }
+    if kind != "commit" {
+        return Err(AppError::bad_request(format!(
+            "{git_ref:?} names a {kind}, not a commit"
+        )));
+    }
+    Ok(sha)
+}
+
+/// `object.sha` and `object.type` of a ref or tag object, checked.
+fn ref_object(value: &serde_json::Value, git_ref: &str) -> AppResult<(String, String)> {
+    let sha = value["object"]["sha"].as_str().unwrap_or_default().to_string();
+    let kind = value["object"]["type"].as_str().unwrap_or_default().to_string();
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(format!(
+            "GitHub's answer for {git_ref:?} names no commit sha"
+        )));
+    }
+    Ok((sha, kind))
+}
+
+/// One GitHub API answer for `/repos/{MAGPIE_DATA_REPO}/{path}`, as JSON:
+/// `None` for a 404, read to at most `RESOLVE_BODY_BYTES`.
+async fn github_json(state: &AppState, path: &str) -> AppResult<Option<serde_json::Value>> {
+    let url = format!("{}/repos/{}/{}", state.cfg.github_api_url, state.cfg.magpie_data_repo, path);
     let mut request = state
         .http
         .get(&url)
         .header("User-Agent", "birdtest")
-        .header("Accept", "application/vnd.github.sha");
+        .header("Accept", "application/vnd.github+json");
     if let Some(token) = &state.cfg.github_token {
         request = request.bearer_auth(token);
     }
 
-    let response = request.send().await.map_err(github_error)?;
+    let mut response = request.send().await.map_err(github_error)?;
     let status = response.status();
     if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
     {
@@ -151,24 +316,24 @@ pub async fn resolve_ref(state: &AppState, git_ref: &str) -> AppResult<String> {
         )));
     }
     if status == reqwest::StatusCode::NOT_FOUND {
-        return Err(AppError::not_found(format!(
-            "no such ref {git_ref:?} in {}",
-            state.cfg.magpie_data_repo
-        )));
+        return Ok(None);
     }
     if !status.is_success() {
-        return Err(AppError::bad_request(format!(
-            "GitHub returned {status} resolving {git_ref:?}"
-        )));
+        return Err(AppError::bad_request(format!("GitHub returned {status} for {path}")));
     }
 
-    let sha = response.text().await.map_err(github_error)?.trim().to_string();
-    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(AppError::bad_request(format!(
-            "GitHub returned something that is not a commit sha: {sha:?}"
-        )));
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(github_error)? {
+        body.extend_from_slice(&chunk);
+        if body.len() > RESOLVE_BODY_BYTES {
+            return Err(AppError::bad_request(format!(
+                "GitHub's answer for {path} is larger than a ref's"
+            )));
+        }
     }
-    Ok(sha)
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| AppError::bad_request(format!("GitHub's answer for {path} is not JSON: {e}")))
 }
 
 fn header(response: &reqwest::Response, name: &str) -> Option<String> {
@@ -280,6 +445,58 @@ fn chunk_suffix(index: u32) -> String {
     format!("{first}{second}")
 }
 
+/// A PAX extended header's records, `<length> <key>=<value>\n` each, split by
+/// their stated lengths as POSIX defines them. The tar crate's own parser
+/// splits on newlines, so a value holding one -- which POSIX allows and GNU tar
+/// and macOS write for extended attributes -- refused a correct archive; and it
+/// took a keyword after extra blanks as a different keyword, where GNU tar
+/// skips them, which let a `size` record past its refusal.
+fn pax_records(data: &[u8]) -> AppResult<Vec<(&[u8], &[u8])>> {
+    let malformed = || AppError::bad_request("archive has a malformed PAX record");
+    let mut records = Vec::new();
+    let mut at = 0;
+    while at < data.len() {
+        let rest = &data[at..];
+        let space = rest.iter().position(|b| *b == b' ').ok_or_else(malformed)?;
+        let digits = &rest[..space];
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+            return Err(malformed());
+        }
+        let length: usize = std::str::from_utf8(digits).ok().and_then(|d| d.parse().ok()).ok_or_else(malformed)?;
+        if length <= space + 1 || length > rest.len() || rest[length - 1] != b'\n' {
+            return Err(malformed());
+        }
+        let body = &rest[space + 1..length - 1];
+        if body.first().is_some_and(|b| *b == b' ' || *b == b'\t') {
+            return Err(malformed());
+        }
+        let equals = body.iter().position(|b| *b == b'=').ok_or_else(malformed)?;
+        records.push((&body[..equals], &body[equals + 1..]));
+        at += length;
+    }
+    Ok(records)
+}
+
+/// A header's size field as GNU tar reads it: octal digits padded with spaces
+/// or NULs, or base-256. GNU tar also takes a base-64 form (`+...`) that the
+/// tar crate reads as octal, and the two then disagree on where every later
+/// header starts; any such field is refused.
+fn plain_size_field(header: &tar::Header) -> bool {
+    let field = &header.as_old().size;
+    // Base-256 only as a positive number whose value fits the eight bytes the
+    // tar crate reads: GNU tar reads the whole field and skips an entry it
+    // cannot, where the crate would read on.
+    (field[0] == 0x80 && field[1..4] == [0, 0, 0])
+        || field.iter().all(|b| matches!(b, b'0'..=b'7' | b' ' | 0))
+}
+
+/// A path as GNU tar extracts it: `./` and empty segments dropped, so
+/// `./data/lexica/A.kwg` and `data//lexica/A.kwg` are the file
+/// `data/lexica/A.kwg` for the one-name-per-file rule too.
+fn normalise(path: &str) -> String {
+    path.split('/').filter(|part| !part.is_empty() && *part != ".").collect::<Vec<_>>().join("/")
+}
+
 /// Walks the gzipped tar, hashing every entry it recognises.
 ///
 /// This is the one place birdtest parses an untrusted container format, so
@@ -288,9 +505,21 @@ fn chunk_suffix(index: u32) -> String {
 /// expected `data/<dir>/<basename>` shape. No filesystem path is ever
 /// constructed from an archive name -- the import hashes bytes and has no
 /// reason to form one.
+///
+/// **Raw, and extensions read here.** The tar reader, left to interpret
+/// extensions itself, reads and holds data inside its own `next()`, where no
+/// cap of the walk's can reach: a PAX header's or a GNU long name's data whole
+/// (a 400 KB gzip held 465 MB), a PAX `size` that makes the reader and a first
+/// pass disagree on where every later header starts, and GNU sparse extension
+/// blocks expanded to 2.6 times their size (1.1 GB from a 44 MB gzip). Three
+/// patches in the thirty-first audit each closed one; this replaced them. The
+/// reader runs raw -- every header is an entry, and every entry's data is the
+/// size its own header gives -- and the walk reads an extension header's data
+/// itself, bounded, taking from it only a path or a link target for the entry
+/// after it. A PAX `size` or sparse record, and a sparse entry, are refused:
+/// nothing a data release contains needs one.
 pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult<Vec<ImportedFile>> {
-    let decoder = flate2::read::GzDecoder::new(compressed);
-    let mut archive = tar::Archive::new(decoder);
+    let mut archive = tar::Archive::new(decompressed(compressed));
     let mut files = Vec::new();
     // Symlinks at pinned paths, resolved once every regular file is read:
     // (link's mapped path, role, name, target as written, target's archive
@@ -298,18 +527,34 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
     let mut links: Vec<(String, String, String, String, String)> = Vec::new();
     let mut total_uncompressed: u64 = 0;
     let mut entry_count: usize = 0;
+    // Every pinned path, file or alias: a tarball naming one twice (an
+    // appended `tar -r`, or a hostile one) staged and confirmed a row for
+    // each, of which a worker extracting it holds only the last.
+    let mut seen = std::collections::HashSet::new();
 
     let entries = archive
         .entries()
-        .map_err(|e| AppError::bad_request(format!("not a readable tar archive: {e}")))?;
+        .map_err(|e| AppError::bad_request(format!("not a readable tar archive: {e}")))?
+        .raw(true);
+    // A long name, or a PAX `path` or `linkpath`, for the entry after it.
+    let mut next_path: Option<String> = None;
+    let mut next_link: Option<String> = None;
+    // Whether a PAX header already stands before the next entry: GNU tar
+    // applies the last of several, the walk would apply their union.
+    let mut pax_pending = false;
 
     for entry in entries {
         let mut entry =
             entry.map_err(|e| AppError::bad_request(format!("malformed tar entry: {e}")))?;
 
+        let entry_type = entry.header().entry_type();
+        let pax = entry_type.is_pax_local_extensions() || entry_type.is_pax_global_extensions();
+        let extension = pax || entry_type.is_gnu_longname() || entry_type.is_gnu_longlink();
         // Every entry, not every pinned file: directories, symlinks and
-        // unrecognised paths are what a hostile archive would multiply.
-        entry_count += 1;
+        // unrecognised paths are what a hostile archive would multiply. Not an
+        // extension header, which a POSIX-format tarball writes one of per
+        // entry, and whose bytes are counted below.
+        entry_count += usize::from(!extension);
         if entry_count > limits::ENTRIES {
             return Err(AppError::bad_request(format!(
                 "archive has more than {} entries",
@@ -317,7 +562,107 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
             )));
         }
 
-        let entry_type = entry.header().entry_type();
+        // A ustar header whose version is not "00" has its path prefix read
+        // by GNU tar and not by the tar crate.
+        let raw = entry.header().as_bytes();
+        if &raw[257..263] == b"ustar\0" && &raw[263..265] != b"00" {
+            return Err(AppError::bad_request("archive has a ustar header of an unknown version"));
+        }
+        if !plain_size_field(entry.header()) {
+            return Err(AppError::bad_request("archive has an entry size in a form extractors read differently"));
+        }
+        // The size of the data that follows this header, which is what the
+        // raw reader reads or skips: counted before a byte of it is read,
+        // whatever the entry is.
+        let size = entry
+            .header()
+            .size()
+            .map_err(|e| AppError::bad_request(format!("unreadable entry size: {e}")))?;
+        // Each kind's own bound first, for the clearer refusal, then the
+        // running total and the ratio.
+        if extension && size > limits::EXTENSION_BYTES {
+            return Err(AppError::bad_request(format!(
+                "archive has an extension header larger than {} KiB",
+                limits::EXTENSION_BYTES / 1024
+            )));
+        }
+        if entry_type.is_file() && size > limits::ENTRY_BYTES {
+            let path = next_path.clone().or_else(|| entry.path().ok().map(|p| p.to_string_lossy().to_string()));
+            return Err(AppError::bad_request(format!(
+                "{} is larger than the {} MiB per-entry cap",
+                path.unwrap_or_default(),
+                limits::ENTRY_BYTES / 1024 / 1024
+            )));
+        }
+        total_uncompressed += size;
+        check_expansion(total_uncompressed, compressed.len() as u64)?;
+
+        if extension {
+            let mut data = Vec::with_capacity(size as usize);
+            (&mut entry)
+                .take(limits::EXTENSION_BYTES + 1)
+                .read_to_end(&mut data)
+                .map_err(|e| AppError::bad_request(format!("unreadable extension header: {e}")))?;
+            // One name for an entry: GNU tar, given two (a second PAX header, a
+            // long name beside a PAX path), extracts under one the walk would
+            // not have chosen, and so pins bytes under a name no worker has.
+            let two_names = || {
+                AppError::bad_request("archive gives one entry two names, which extractors resolve differently")
+            };
+            if !pax {
+                // A GNU long name is NUL-terminated.
+                let text = String::from_utf8_lossy(data.split(|b| *b == 0).next().unwrap_or(&[])).to_string();
+                let slot = if entry_type.is_gnu_longname() { &mut next_path } else { &mut next_link };
+                if slot.replace(text).is_some() {
+                    return Err(two_names());
+                }
+                continue;
+            }
+            if entry_type.is_pax_local_extensions() {
+                if pax_pending {
+                    return Err(AppError::bad_request(
+                        "archive puts two PAX headers before one entry, which extractors resolve differently",
+                    ));
+                }
+                pax_pending = true;
+            }
+            for (key, value) in pax_records(&data)? {
+                let key = String::from_utf8_lossy(key);
+                let key = key.as_ref();
+                if key == "size" || key.starts_with("GNU.sparse") {
+                    return Err(AppError::bad_request(format!(
+                        "archive has a PAX `{key}` record, which no data release needs"
+                    )));
+                }
+                if matches!(key, "path" | "linkpath") {
+                    // A global header's name would apply to every entry after
+                    // it, for an extractor that honours it.
+                    if entry_type.is_pax_global_extensions() {
+                        return Err(AppError::bad_request(format!(
+                            "archive has a global PAX `{key}` record"
+                        )));
+                    }
+                    if value.contains(&0) {
+                        return Err(AppError::bad_request(format!("archive has a NUL in a PAX `{key}`")));
+                    }
+                    let value = String::from_utf8_lossy(value).to_string();
+                    let slot = if key == "path" { &mut next_path } else { &mut next_link };
+                    if slot.replace(value).is_some() {
+                        return Err(two_names());
+                    }
+                }
+            }
+            continue;
+        }
+        let long_path = next_path.take();
+        let long_link = next_link.take();
+        pax_pending = false;
+
+        // GNU tar reads data after a directory or a link header that claims
+        // some, where the walk would skip it.
+        if (entry_type.is_dir() || entry_type.is_symlink()) && size != 0 {
+            return Err(AppError::bad_request("archive has a directory or link entry with data"));
+        }
         if entry_type.is_dir() {
             continue;
         }
@@ -331,16 +676,27 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
             )));
         }
 
-        let path = entry
-            .path()
-            .map_err(|e| AppError::bad_request(format!("unreadable entry path: {e}")))?
-            .to_string_lossy()
-            .to_string();
+        let path = match long_path {
+            Some(path) => path,
+            None => entry
+                .path()
+                .map_err(|e| AppError::bad_request(format!("unreadable entry path: {e}")))?
+                .to_string_lossy()
+                .to_string(),
+        };
         if path.starts_with('/') || path.split('/').any(|part| part == "..") {
             return Err(AppError::bad_request(format!(
                 "archive contains an unsafe path: {path:?}"
             )));
         }
+        // GNU tar makes a directory of any entry whose name ends in `/`, and
+        // does not skip its data as the walk would: a file so named is refused.
+        if path.ends_with('/') && !entry_type.is_dir() {
+            return Err(AppError::bad_request(format!(
+                "archive names a file {path:?} as a directory"
+            )));
+        }
+        let path = normalise(&path);
 
         // MAGPIE-DATA ships aliases as symlinks -- `CSW24_super21.klv2 ->
         // CSW21_super21.klv2` -- and `download_data.sh` extracts them as such,
@@ -352,20 +708,26 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
             let Some((mapped_path, role, name)) = classify(&path) else {
                 continue;
             };
-            let target = entry
-                .link_name()
-                .ok()
-                .flatten()
-                .map(|target| target.to_string_lossy().to_string())
-                .unwrap_or_default();
+            let target = long_link.unwrap_or_else(|| {
+                entry
+                    .link_name()
+                    .ok()
+                    .flatten()
+                    .map(|target| target.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
             let Some(resolved) = resolve_link(&path, &target) else {
                 return Err(unresolvable_link(&path, &target));
             };
+            if !seen.insert(mapped_path.clone()) {
+                return Err(twice(&path));
+            }
             links.push((mapped_path, role, name, target, resolved));
             continue;
         }
 
-        let size = entry.header().size().unwrap_or(0);
+        // `size` is the data's own: a PAX `size`, which would override it for
+        // an interpreting reader, is refused above.
         if size > limits::ENTRY_BYTES {
             return Err(AppError::bad_request(format!(
                 "{path} is larger than the {} MiB per-entry cap",
@@ -374,20 +736,28 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         }
 
         let Some((mapped_path, role, name)) = classify(&path) else {
-            // An unrecognised directory: still counted against the caps, but
+            // An unrecognised directory: counted against the caps above, but
             // not something birdtest pins.
-            total_uncompressed += size;
-            check_expansion(total_uncompressed, compressed.len() as u64)?;
             continue;
         };
+        if !seen.insert(mapped_path.clone()) {
+            return Err(twice(&path));
+        }
+        if keeps_content(&role) && size > limits::CONTENT_BYTES {
+            return Err(AppError::bad_request(format!(
+                "{path} is larger than the {} KiB a {role} file may be",
+                limits::CONTENT_BYTES / 1024
+            )));
+        }
 
         let mut bytes = Vec::with_capacity(size as usize);
-        entry
+        (&mut entry)
+            .take(limits::ENTRY_BYTES + 1)
             .read_to_end(&mut bytes)
             .map_err(|e| AppError::bad_request(format!("could not read {path}: {e}")))?;
-
-        total_uncompressed += bytes.len() as u64;
-        check_expansion(total_uncompressed, compressed.len() as u64)?;
+        if bytes.len() as u64 != size {
+            return Err(AppError::bad_request(format!("{path} is not the size its header gives")));
+        }
 
         let sha256 = hex::encode(Sha256::digest(&bytes));
         let content = keeps_content(&role).then(|| bytes.clone());
@@ -431,6 +801,16 @@ pub fn walk_archive(compressed: &[u8], progress: Option<&Progress>) -> AppResult
         let Some(file) = resolved else {
             return Err(unresolvable_link(&format!("data/{mapped_path}"), written));
         };
+        // An alias whose row keeps its bytes (a distribution, a layout) is
+        // those bytes again: counted against the caps as they are. As a
+        // zero-byte entry, a few hundred aliases of one large file held and
+        // stored it a few hundred times (the audit's pass 11). A lexicon's
+        // alias copies nothing -- its row shares the target's object, and a
+        // worker extracts it as a link -- so it costs nothing to count.
+        if keeps_content(role) {
+            total_uncompressed += file.bytes as u64;
+            check_expansion(total_uncompressed, compressed.len() as u64)?;
+        }
         let alias = ImportedFile {
             path: mapped_path.clone(),
             role: role.clone(),
@@ -473,6 +853,10 @@ fn resolve_link(link_path: &str, target: &str) -> Option<String> {
     }
     let resolved = parts.join("/");
     resolved.starts_with("data/").then_some(resolved)
+}
+
+fn twice(path: &str) -> AppError {
+    AppError::bad_request(format!("archive names {path} more than once"))
 }
 
 fn unresolvable_link(path: &str, target: &str) -> AppError {
@@ -537,13 +921,38 @@ impl Progress {
 
 /// Phase 1, off the request thread: fetch, hash, diff, stage.
 pub async fn run_import(state: AppState, import_id: Uuid, tarball_date: String, commit_sha: String) {
+    run_import_within(state, import_id, tarball_date, commit_sha, IMPORT_LIMIT).await
+}
+
+/// How long an import may take, download to staged (PLAN.md, "Whole task").
+/// The HTTP client's timeouts are per connection and per read, so a download
+/// that kept trickling kept its import `running`, holding up to the download
+/// cap in memory, for as long as the trickle lasted (thirty-first audit).
+pub const IMPORT_LIMIT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// [`run_import`] with its time limit given.
+pub async fn run_import_within(
+    state: AppState,
+    import_id: Uuid,
+    tarball_date: String,
+    commit_sha: String,
+    limit: std::time::Duration,
+) {
     let progress = std::sync::Arc::new(Progress::new(state.pool.clone(), import_id));
-    match stage(&state, import_id, &tarball_date, &commit_sha, &progress).await {
+    let staged = tokio::time::timeout(limit, stage(&state, import_id, &tarball_date, &commit_sha, &progress))
+        .await
+        .unwrap_or_else(|_| {
+            Err(AppError::bad_request(format!(
+                "the import did not finish within its {} s; start it again",
+                limit.as_secs()
+            )))
+        });
+    match staged {
         Ok(staged) => {
             progress.flush_entries().await;
-            // Guarded on `running`: a process that started while this one was
-            // working reaps rows left `running` as failed, and a deployment
-            // overlaps the two for a few seconds. Without the guard this would
+            // Guarded on `running`: a process that starts reaps rows left
+            // `running` as failed, and a rollback or a manual restart could
+            // overlap two for a moment. Without the guard this would
             // flip a reaped row back to `staged` with the reaper's error still
             // on it, and the admin would confirm a diff nobody was sure of.
             let _ = sqlx::query(
@@ -574,7 +983,7 @@ pub async fn run_import(state: AppState, import_id: Uuid, tarball_date: String, 
 ///
 /// Uploaded at staging time because that is when the bytes exist: the archive
 /// is in memory, and re-downloading it at confirmation would mean fetching
-/// 94 MB again for files the server has already hashed.
+/// 190 MB again for files the server has already hashed.
 ///
 /// An object already present is skipped. Keys are digests, so a file unchanged
 /// between two tarballs -- which is most of them -- is uploaded once, and an
@@ -616,7 +1025,7 @@ async fn stage(
             Ok::<_, AppError>((files, body))
         })
         .await
-        .map_err(|e| AppError::internal(format!("reading the archive failed: {e}")))??
+        .map_err(|e| AppError::task_failed("reading the archive", e))??
     };
     // Before anything is staged: a row that names an object has to be a row
     // whose object is there, or the first derived build from it fails with a
@@ -624,7 +1033,7 @@ async fn stage(
     // keeps a multi-minute upload out of it.
     upload_inputs(state, &mut files).await?;
     // The whole archive is no longer needed once its entries are in `files`,
-    // and it is about 300 MB uncompressed.
+    // and it is some 190 MB.
     drop(body);
 
     let mut tx = state.pool.begin().await?;
@@ -777,6 +1186,11 @@ mod tests {
         // Unrecognised directories and suffixes are ignored rather than
         // rejected: MAGPIE-DATA carries more than birdtest pins.
         assert_eq!(classify("data/quackle/whatever.dat"), None);
+        // A name the worker would refuse as a path is not importable.
+        assert_eq!(classify("data/lexica/CSW24.v2.kwg"), None);
+        assert_eq!(classify("data/lexica/CSW 24.kwg"), None);
+        assert_eq!(classify("data/lexica/.kwg"), None);
+        assert!(classify("data/lexica/CSW21_ab-2.kwg").is_some());
         assert_eq!(classify("data/lexica/NWL23.wmp"), None);
         assert_eq!(classify("testdata/lexica/NWL23.kwg"), None);
         assert_eq!(classify("data/lexica/nested/NWL23.kwg"), None);
@@ -928,6 +1342,55 @@ mod tests {
         }
         // One upload for the one set of bytes.
         assert_eq!(files.iter().filter(|f| f.stored.is_some()).count(), 1);
+    }
+
+    /// U-ARCHIVE-5b: an alias counts as its target's bytes against the caps,
+    /// and a file the server keeps in its row (a distribution, a layout) is at
+    /// most 64 KiB. As a zero-byte entry, a few hundred aliases of one large
+    /// layout were held, staged and inserted a few hundred times over: 150 of a
+    /// 4 MiB one took 600 MiB from a 263 KiB gzip.
+    #[test]
+    fn aliases_count_as_their_targets_bytes_and_kept_files_are_small() {
+        let noise = |n: usize| -> Vec<u8> {
+            let mut x: u32 = 0x9e37_79b9;
+            (0..n)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    x as u8
+                })
+                .collect()
+        };
+        // Too large to keep in a row, whatever its aliases.
+        let big = noise(100 * 1024);
+        let refused = walk_archive(&tarball(&[("data/layouts/big.txt", &big)]), None).unwrap_err();
+        assert!(refused.message.contains("KiB a layout file may be"), "{}", refused.message);
+
+        // Sixty aliases of 60 KiB of noise: sixty times the bytes, past the
+        // expansion ratio.
+        let layout = noise(60 * 1024);
+        let names: Vec<String> = (0..60).map(|i| format!("data/layouts/alias{i}.txt")).collect();
+        let links: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "real.txt")).collect();
+        let refused =
+            walk_archive(&tarball_with_links(&[("data/layouts/real.txt", &layout)], &links), None)
+                .unwrap_err();
+        assert!(refused.message.contains("expan") || refused.message.contains("ratio"), "{}", refused.message);
+
+        // A handful, as MAGPIE-DATA ships, is fine.
+        let few: Vec<(&str, &str)> = names.iter().take(3).map(|n| (n.as_str(), "real.txt")).collect();
+        let files =
+            walk_archive(&tarball_with_links(&[("data/layouts/real.txt", &layout)], &few), None).unwrap();
+        assert_eq!(files.len(), 4);
+
+        // A lexicon's aliases are links on the worker and no copy on the
+        // server, so sixty of the same noise cost nothing against the caps.
+        let lex_names: Vec<String> = (0..60).map(|i| format!("data/lexica/ALIAS{i}.kwg")).collect();
+        let lex_links: Vec<(&str, &str)> = lex_names.iter().map(|n| (n.as_str(), "REAL.kwg")).collect();
+        let files =
+            walk_archive(&tarball_with_links(&[("data/lexica/REAL.kwg", &layout)], &lex_links), None)
+                .unwrap();
+        assert_eq!(files.len(), 61);
     }
 
     /// A symlink at a pinned path that leaves the archive, dangles, loops, or
@@ -1144,5 +1607,438 @@ mod tests {
         assert_eq!(limits::EXPANSION_RATIO, 20);
         assert_eq!(limits::ENTRY_BYTES, 128 * 1024 * 1024);
         assert_eq!(limits::ENTRIES, 5_000);
+        assert_eq!(limits::CONTENT_BYTES, 64 * 1024);
+    }
+
+    /// A gzipped tar of one pinned entry whose ustar header says 0 bytes while
+    /// a PAX `size` record says `pax_size`, and no data at all: a walk that
+    /// judges the entry before reading it refuses it on the PAX size; one that
+    /// read the header's size read it (a truncation here, 900 MiB of zeros from
+    /// a 4 MiB gzip in the thirty-first audit's reproduction).
+    fn pax_sized(path: &str, pax_size: u64) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append_pax_extensions([("size", pax_size.to_string().as_bytes())]).unwrap();
+        let mut head = tar::Header::new_ustar();
+        head.set_path(path).unwrap();
+        head.set_size(0);
+        head.set_mode(0o644);
+        head.set_entry_type(tar::EntryType::Regular);
+        head.set_cksum();
+        builder.append(&head, std::io::empty()).unwrap();
+        let tar = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// U-ARCHIVE-8: a PAX `size` record is refused, pinned entry or not: an
+    /// interpreting reader follows it over the header's own field, which is how
+    /// a header saying 0 and a record saying 900 MiB passed every cap, and how a
+    /// record could make two passes disagree on where every later header
+    /// starts. No data release needs one.
+    #[test]
+    fn a_pax_size_record_is_refused() {
+        for (path, size) in [
+            ("data/lexica/BIG.kwg", limits::ENTRY_BYTES + 1),
+            ("data/lexica/BOMB.kwg", 100 * 1024 * 1024),
+            ("data/quackle/skipped.dat", 100 * 1024 * 1024),
+        ] {
+            let err = walk_archive(&pax_sized(path, size), None).unwrap_err();
+            assert!(err.message.contains("PAX `size` record"), "{path}: {}", err.message);
+        }
+    }
+
+    /// U-ARCHIVE: a tarball naming one pinned path twice -- two files, or a file
+    /// and an alias -- is refused; it staged and confirmed a row for each.
+    #[test]
+    fn an_archive_naming_a_path_twice_is_refused() {
+        let archive = tarball(&[("data/lexica/NWL23.kwg", b"one" as &[u8]), ("data/lexica/NWL23.kwg", b"two")]);
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(err.message.contains("more than once"), "{}", err.message);
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut head = tar::Header::new_gnu();
+        head.set_size(3);
+        head.set_mode(0o644);
+        head.set_entry_type(tar::EntryType::Regular);
+        head.set_cksum();
+        builder.append_data(&mut head, "data/lexica/CSW21.klv2", &b"klv"[..]).unwrap();
+        builder.append_data(&mut head, "data/lexica/CSW24.klv2", &b"klv"[..]).unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        builder.append_link(&mut link, "data/lexica/CSW24.klv2", "CSW21.klv2").unwrap();
+        let tar = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        let err = walk_archive(&encoder.finish().unwrap(), None).unwrap_err();
+        assert!(err.message.contains("more than once"), "a file and an alias: {}", err.message);
+    }
+
+    /// U-ARCHIVE-10: an extension header -- a PAX record or a GNU long name,
+    /// which the tar reader reads whole before the walk sees an entry -- larger
+    /// than a few KiB is refused before it is read, and every decompressed byte
+    /// counts against the caps, headers and skipped data included. A 400 KB
+    /// gzip with a 400 MB PAX header held 465 MB, and was accepted.
+    #[test]
+    fn a_large_extension_header_is_refused_before_it_is_read() {
+        let mut builder = tar::Builder::new(Vec::new());
+        let big = "x".repeat(1024 * 1024);
+        builder.append_pax_extensions([("comment", big.as_bytes())]).unwrap();
+        let mut head = tar::Header::new_ustar();
+        head.set_path("data/lexica/A.kwg").unwrap();
+        head.set_size(5);
+        head.set_mode(0o644);
+        head.set_entry_type(tar::EntryType::Regular);
+        head.set_cksum();
+        builder.append(&head, &b"bytes"[..]).unwrap();
+        let tar = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        let err = walk_archive(&encoder.finish().unwrap(), None).unwrap_err();
+        assert!(err.message.contains("extension header"), "{}", err.message);
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut long = tar::Header::new_gnu();
+        long.set_path("././@LongLink").unwrap();
+        long.set_size(100 * 1024);
+        long.set_mode(0o644);
+        long.set_entry_type(tar::EntryType::GNULongName);
+        long.set_cksum();
+        builder.append(&long, &vec![b'a'; 100 * 1024][..]).unwrap();
+        let tar = builder.into_inner().unwrap();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut encoder, &tar).unwrap();
+        let err = walk_archive(&encoder.finish().unwrap(), None).unwrap_err();
+        assert!(err.message.contains("extension header"), "a GNU long name: {}", err.message);
+    }
+
+    /// U-ARCHIVE-10: data the walk skips -- a directory entry claiming a size --
+    /// is counted as it is decompressed, so a small gzip cannot make the server
+    /// inflate gigabytes it never keeps.
+    #[test]
+    fn skipped_data_counts_against_the_caps() {
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let size = 96 * 1024 * 1024;
+        let head = header("data/emptydir/", tar::EntryType::Directory, size);
+        std::io::Write::write_all(&mut encoder, head.as_bytes()).unwrap();
+        let zeros = vec![0u8; 1024 * 1024];
+        for _ in 0..size / zeros.len() as u64 {
+            std::io::Write::write_all(&mut encoder, &zeros).unwrap();
+        }
+        let archive = encoder.finish().unwrap();
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(err.message.contains("20x"), "{}", err.message);
+    }
+
+    fn peak_resident_mib() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() / 1024
+    }
+
+    /// U-ARCHIVE-11: a GNU sparse entry is refused as it is met, its extension
+    /// blocks never expanded: an interpreting reader built 64 bytes of bookkeeping
+    /// for every 24 of them, 1.1 GB from a 44 MB gzip, before the walk saw the
+    /// entry to refuse it.
+    #[test]
+    fn a_sparse_entry_is_refused_unexpanded() {
+        let blocks = 32 * 1024 * 1024 / 512;
+        let mut head = tar::Header::new_gnu();
+        head.set_path("data/other/sparse").unwrap();
+        head.set_size(0);
+        head.set_mode(0o644);
+        head.set_entry_type(tar::EntryType::GNUSparse);
+        {
+            let gnu = head.as_gnu_mut().unwrap();
+            gnu.isextended[0] = 1;
+            gnu.set_real_size(blocks as u64 * 21);
+        }
+        head.set_cksum();
+        let mut tar = head.as_bytes().to_vec();
+        let mut offset = 0u64;
+        for i in 0..blocks {
+            let mut ext = [0u8; 512];
+            for j in 0..21 {
+                offset += 1;
+                ext[j * 24..j * 24 + 12].copy_from_slice(format!("{offset:011o}\0").as_bytes());
+                ext[j * 24 + 12..j * 24 + 24].copy_from_slice(b"00000000000\0");
+            }
+            ext[504] = u8::from(i + 1 < blocks);
+            tar.extend_from_slice(&ext);
+        }
+        tar.extend_from_slice(&[0u8; 1024]);
+        let archive = gzip(&tar);
+        drop(tar);
+        std::fs::write("/proc/self/clear_refs", "5").unwrap();
+        let before = peak_resident_mib();
+        let err = walk_archive(&archive, None).unwrap_err();
+        assert!(err.message.contains("non-regular"), "{}", err.message);
+        assert!(peak_resident_mib() < before + 16, "{} MiB held", peak_resident_mib() - before);
+    }
+
+    /// U-ARCHIVE-8: a PAX `size` record ahead of an ordinary entry cannot make
+    /// the walk and the reader disagree on where the next header starts, and so
+    /// slip a large extension header past its bound: the record itself is
+    /// refused. (Against a first pass that read raw and a walk that did not, an
+    /// 8 MiB PAX header after it was read whole and the archive accepted.)
+    #[test]
+    fn a_pax_size_record_cannot_move_the_next_header() {
+        let mut builder = tar::Builder::new(Vec::new());
+        builder.append_pax_extensions([("size", &b"1024"[..])]).unwrap();
+        let mut pad = tar::Header::new_ustar();
+        pad.set_path("data/other/pad").unwrap();
+        pad.set_size(0);
+        pad.set_mode(0o644);
+        pad.set_entry_type(tar::EntryType::Regular);
+        pad.set_cksum();
+        builder.append(&pad, std::io::empty()).unwrap();
+        let mut tar = builder.into_inner().unwrap();
+        tar.extend_from_slice(&[0u8; 1024]);
+        let mut rest = tar::Builder::new(Vec::new());
+        let big = "x".repeat(8 * 1024 * 1024);
+        rest.append_pax_extensions([("comment", big.as_bytes())]).unwrap();
+        let mut kwg = tar::Header::new_ustar();
+        kwg.set_path("data/lexica/A.kwg").unwrap();
+        kwg.set_size(5);
+        kwg.set_mode(0o644);
+        kwg.set_entry_type(tar::EntryType::Regular);
+        kwg.set_cksum();
+        rest.append(&kwg, &b"bytes"[..]).unwrap();
+        tar.extend_from_slice(&rest.into_inner().unwrap());
+        let err = walk_archive(&gzip(&tar), None).unwrap_err();
+        assert!(err.message.contains("PAX `size` record"), "{}", err.message);
+    }
+
+    /// U-ARCHIVE-12: what a release built by another tool carries still walks:
+    /// a PAX `path` (and an `mtime`, which Python's tarfile writes for a
+    /// fractional time) names the entry after it, and so does a GNU long name.
+    #[test]
+    fn pax_paths_and_long_names_name_the_entry_after_them() {
+        let long = format!("data/lexica/{}.kwg", "L".repeat(120));
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([("mtime", &b"1759000000.25"[..]), ("path", &b"data/lexica/PAX.kwg"[..])])
+            .unwrap();
+        let mut head = tar::Header::new_ustar();
+        head.set_path("data/lexica/truncated.kwg").unwrap();
+        head.set_size(3);
+        head.set_mode(0o644);
+        head.set_entry_type(tar::EntryType::Regular);
+        head.set_cksum();
+        builder.append(&head, &b"pax"[..]).unwrap();
+        let mut gnu = tar::Header::new_gnu();
+        gnu.set_size(4);
+        gnu.set_mode(0o644);
+        gnu.set_entry_type(tar::EntryType::Regular);
+        builder.append_data(&mut gnu, &long, &b"long"[..]).unwrap();
+        let files = walk_archive(&gzip(&builder.into_inner().unwrap()), None).unwrap();
+        let mut named: Vec<(String, i64)> = files.iter().map(|f| (f.path.clone(), f.bytes)).collect();
+        named.sort();
+        assert_eq!(named, vec![(long.trim_start_matches("data/").to_string(), 4), ("lexica/PAX.kwg".to_string(), 3)]);
+    }
+
+    /// U-ARCHIVE-12: one name for one entry. A second PAX header, or a long
+    /// name beside a PAX path, before an entry, and a global PAX `path` --
+    /// each of which GNU tar resolves to a name the walk would not choose -- is
+    /// refused; a global header of comments (as `git archive` writes) is not.
+    #[test]
+    fn an_entry_given_two_names_is_refused() {
+        fn archive(extensions: &[(tar::EntryType, &[u8])]) -> Vec<u8> {
+            let mut tar = Vec::new();
+            for (kind, data) in extensions {
+                let mut head = tar::Header::new_ustar();
+                head.set_path("././@Ext").unwrap();
+                head.set_size(data.len() as u64);
+                head.set_mode(0o644);
+                head.set_entry_type(*kind);
+                head.set_cksum();
+                tar.extend_from_slice(head.as_bytes());
+                tar.extend_from_slice(data);
+                tar.resize(tar.len().div_ceil(512) * 512, 0);
+            }
+            let mut head = tar::Header::new_ustar();
+            head.set_path("data/lexica/HDR.kwg").unwrap();
+            head.set_size(3);
+            head.set_mode(0o644);
+            head.set_entry_type(tar::EntryType::Regular);
+            head.set_cksum();
+            tar.extend_from_slice(head.as_bytes());
+            tar.extend_from_slice(b"abc");
+            tar.resize(tar.len().div_ceil(512) * 512 + 1024, 0);
+            gzip(&tar)
+        }
+        // A record counts its own length digits: two here.
+        let path = |name: &str| format!("{} path=data/lexica/{name}.kwg\n", 25 + name.len());
+        let x = tar::EntryType::XHeader;
+        let first = path("FIRST");
+        let again = path("AGAIN");
+        for (what, extensions) in [
+            ("two PAX paths", vec![(x, first.as_bytes()), (x, again.as_bytes())]),
+            ("a PAX path and a long name", vec![(x, first.as_bytes()), (tar::EntryType::GNULongName, &b"data/lexica/L.kwg\0"[..])]),
+            ("a global path", vec![(tar::EntryType::XGlobalHeader, first.as_bytes())]),
+        ] {
+            let err = walk_archive(&archive(&extensions), None).unwrap_err();
+            assert!(
+                ["two names", "global PAX", "two PAX headers"].iter().any(|m| err.message.contains(m)),
+                "{what}: {}",
+                err.message
+            );
+        }
+        let files = walk_archive(&archive(&[(tar::EntryType::XGlobalHeader, b"18 comment=abc123\n")]), None).unwrap();
+        assert_eq!(files[0].path, "lexica/HDR.kwg", "a comment-only global header is fine");
+    }
+
+    /// A raw ustar entry: `header` bytes as given, then `data` padded to a block.
+    fn raw_entry(tar: &mut Vec<u8>, path: &str, kind: tar::EntryType, data: &[u8]) -> tar::Header {
+        let mut head = tar::Header::new_ustar();
+        head.set_path(path).unwrap();
+        head.set_size(data.len() as u64);
+        head.set_mode(0o644);
+        head.set_entry_type(kind);
+        head.set_cksum();
+        tar.extend_from_slice(head.as_bytes());
+        tar.extend_from_slice(data);
+        tar.resize(tar.len().div_ceil(512) * 512, 0);
+        head
+    }
+
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        let body = [format!(" {key}=").as_bytes(), value, b"\n"].concat();
+        let mut length = body.len() + 1;
+        while length.to_string().len() + body.len() != length {
+            length += 1;
+        }
+        [length.to_string().as_bytes(), &body].concat()
+    }
+
+    /// U-ARCHIVE-13: PAX records are split by their stated lengths, as POSIX
+    /// defines them: a value holding a newline -- an extended attribute, which
+    /// GNU tar and macOS write -- walks (the tar crate's parser split on it and
+    /// refused a correct release), and a keyword after an extra blank, which
+    /// GNU tar reads as the keyword, is refused rather than read as another.
+    #[test]
+    fn pax_records_are_split_by_their_lengths() {
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "././@PaxHeader", tar::EntryType::XHeader, &pax_record("SCHILY.xattr.user.test", b"\x01\n\x02"));
+        raw_entry(&mut tar, "data/lexica/CSW24.kwg", tar::EntryType::Regular, b"lexicon\n");
+        tar.extend_from_slice(&[0u8; 1024]);
+        let files = walk_archive(&gzip(&tar), None).unwrap();
+        assert_eq!(files.len(), 1);
+
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "././@PaxHeader", tar::EntryType::XHeader, b"15  size=1024\n");
+        raw_entry(&mut tar, "data/lexica/C.kwg", tar::EntryType::Regular, b"");
+        tar.extend_from_slice(&[0u8; 1024]);
+        let err = walk_archive(&gzip(&tar), None).unwrap_err();
+        assert!(err.message.contains("malformed PAX record"), "{}", err.message);
+    }
+
+    /// U-ARCHIVE-14: headers GNU tar reads otherwise than the tar crate are
+    /// refused, each of which let the two disagree on a name or on where the
+    /// next header starts: a base-64 size, a directory or link with data, a
+    /// ustar header of another version, a NUL in a PAX path.
+    #[test]
+    fn headers_extractors_read_differently_are_refused() {
+        let with = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "data/lexica/A.kwg", tar::EntryType::Regular, b"abc");
+            edit(&mut tar);
+            tar.extend_from_slice(&[0u8; 1024]);
+            walk_archive(&gzip(&tar), None).unwrap_err().message
+        };
+        let base64 = with(&|tar| {
+            tar[124..136].copy_from_slice(b"+12\0\0\0\0\0\0\0\0\0");
+            let mut head = tar::Header::from_byte_slice(&tar[..512]).clone();
+            head.set_cksum();
+            tar[..512].copy_from_slice(head.as_bytes());
+        });
+        assert!(base64.contains("size in a form"), "{base64}");
+        let version = with(&|tar| {
+            tar[263..265].copy_from_slice(b"01");
+            let mut head = tar::Header::from_byte_slice(&tar[..512]).clone();
+            head.set_cksum();
+            tar[..512].copy_from_slice(head.as_bytes());
+        });
+        assert!(version.contains("unknown version"), "{version}");
+
+        let base256 = with(&|tar| {
+            tar[124] = 0x81;
+            let mut head = tar::Header::from_byte_slice(&tar[..512]).clone();
+            head.set_cksum();
+            tar[..512].copy_from_slice(head.as_bytes());
+        });
+        assert!(base256.contains("size in a form"), "{base256}");
+
+        // A file named as a directory, which GNU tar makes a directory of
+        // without skipping its data.
+        for name in ["data/quackle/junk/", "data/lexica/X.kwg/"] {
+            let mut tar = Vec::new();
+            let mut head = tar::Header::new_ustar();
+            head.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
+            head.set_size(512);
+            head.set_mode(0o644);
+            head.set_entry_type(tar::EntryType::Regular);
+            head.set_cksum();
+            tar.extend_from_slice(head.as_bytes());
+            tar.extend_from_slice(&[b'x'; 512]);
+            tar.extend_from_slice(&[0u8; 1024]);
+            let err = walk_archive(&gzip(&tar), None).unwrap_err();
+            assert!(err.message.contains("as a directory"), "{name}: {}", err.message);
+        }
+
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "data/lexica/", tar::EntryType::Directory, &[b'x'; 512]);
+        tar.extend_from_slice(&[0u8; 1024]);
+        let err = walk_archive(&gzip(&tar), None).unwrap_err();
+        assert!(err.message.contains("with data"), "{}", err.message);
+
+        let mut tar = Vec::new();
+        raw_entry(&mut tar, "././@PaxHeader", tar::EntryType::XHeader, &pax_record("path", b"data/lexica/A.kwg\0junk"));
+        raw_entry(&mut tar, "data/lexica/B.kwg", tar::EntryType::Regular, b"abc");
+        tar.extend_from_slice(&[0u8; 1024]);
+        let err = walk_archive(&gzip(&tar), None).unwrap_err();
+        assert!(err.message.contains("NUL"), "{}", err.message);
+    }
+
+    /// U-ARCHIVE-9 as GNU tar names paths: `./data/...` and `data//...` are
+    /// the same file as `data/...`, so naming it again that way is naming it
+    /// twice.
+    #[test]
+    fn a_path_named_twice_in_two_spellings_is_refused() {
+        for spelling in ["./data/lexica/NWL23.kwg", "data//lexica/NWL23.kwg"] {
+            let mut tar = Vec::new();
+            raw_entry(&mut tar, "data/lexica/NWL23.kwg", tar::EntryType::Regular, b"one");
+            // Written as bytes: the builder's `set_path` would tidy the spelling.
+            let start = tar.len();
+            raw_entry(&mut tar, "data/lexica/X.kwg", tar::EntryType::Regular, b"two");
+            let mut head = tar::Header::from_byte_slice(&tar[start..start + 512]).clone();
+            head.as_old_mut().name = [0; 100];
+            head.as_old_mut().name[..spelling.len()].copy_from_slice(spelling.as_bytes());
+            head.set_cksum();
+            tar[start..start + 512].copy_from_slice(head.as_bytes());
+            tar.extend_from_slice(&[0u8; 1024]);
+            let err = walk_archive(&gzip(&tar), None).unwrap_err();
+            assert!(err.message.contains("more than once"), "{spelling}: {}", err.message);
+        }
+    }
+
+    /// U-ARCHIVE-15: a tarball gzipped in several members walks every member,
+    /// as `tar -xzf` reads them; only the first was read.
+    #[test]
+    fn every_gzip_member_is_walked() {
+        // One tar stream, gzipped as two members: its first entry in one, its
+        // second and the end-of-archive blocks in the other.
+        let mut head = Vec::new();
+        raw_entry(&mut head, "data/lexica/A.kwg", tar::EntryType::Regular, b"one");
+        let mut tail = Vec::new();
+        raw_entry(&mut tail, "data/lexica/B.kwg", tar::EntryType::Regular, b"two");
+        tail.extend_from_slice(&[0u8; 1024]);
+        let (first, second) = (gzip(&head), gzip(&tail));
+        let files = walk_archive(&[first, second].concat(), None).unwrap();
+        let mut paths: Vec<_> = files.iter().map(|f| f.path.clone()).collect();
+        paths.sort();
+        assert_eq!(paths, ["lexica/A.kwg", "lexica/B.kwg"]);
     }
 }

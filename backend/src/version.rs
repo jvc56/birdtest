@@ -29,6 +29,28 @@ impl Version {
     /// because every job's floor is at least `0.0.1` -- which is the correct
     /// outcome and needs no special case. Trailing pre-release or build
     /// metadata (`1.4.0-rc1`) is ignored rather than rejected.
+    /// `major.minor[.patch]`, digits only, and nothing else: what an admin
+    /// types as a job's floor. `None` for anything `parse_or_zero` would
+    /// have read as 0.0.0 -- the most permissive floor there is -- or read
+    /// only in part ("1.6.x").
+    pub fn parse_strict(text: &str) -> Option<Self> {
+        let parts: Vec<&str> = text.trim().split('.').collect();
+        if !(2..=3).contains(&parts.len())
+            || parts.iter().any(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
+        }
+        let number = |p: &str| p.parse::<i32>().ok();
+        Some(Self {
+            major: number(parts[0])?,
+            minor: number(parts[1])?,
+            patch: match parts.get(2) {
+                Some(p) => number(p)?,
+                None => 0,
+            },
+        })
+    }
+
     pub fn parse_or_zero(text: &str) -> Self {
         let core = text.trim().split(['-', '+']).next().unwrap_or("");
         let mut parts = core.split('.');
@@ -52,6 +74,15 @@ impl fmt::Display for Version {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_strict_parse_takes_only_a_whole_version() {
+        assert_eq!(Version::parse_strict("1.6"), Some(Version { major: 1, minor: 6, patch: 0 }));
+        assert_eq!(Version::parse_strict(" 0.1.1 "), Some(Version { major: 0, minor: 1, patch: 1 }));
+        for text in ["v1.6.0", "1", "1,6", "1.6.x", "1..6", "1.6.0.1", "", "1.-6", "99999999999.0"] {
+            assert_eq!(Version::parse_strict(text), None, "{text:?}");
+        }
+    }
 
     #[test]
     fn compares_numerically_not_lexically() {

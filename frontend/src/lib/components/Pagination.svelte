@@ -14,7 +14,7 @@
     Previous
   </button>
   <span class="text-muted-foreground">
-    Page {page + 1}{#if total >= 0} of {Math.max(1, Math.ceil(total / perPage))}{/if}
+    Page {page + 1}{#if total >= 0}{' '}of {Math.max(1, Math.ceil(total / perPage))}{/if}
   </span>
   <button class="btn-secondary" disabled={!hasNext} on:click={() => onChange(page + 1)}>
     Next

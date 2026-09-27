@@ -27,6 +27,18 @@ const RATING_RUN_THIN_INTERVAL: std::time::Duration = std::time::Duration::from_
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Large allocations always from `mmap`, and so given back when freed. By
+    // default glibc raises this threshold to the size of the last large block
+    // freed, after which Argon2's 19 MiB buffers came from per-thread arenas
+    // and stayed there: after a burst of sign-ins and registrations, eleven
+    // arenas held 600 MB between them, where only four runs are ever allowed
+    // at once (thirty-second audit). Fixing the threshold turns the dynamic
+    // behaviour off.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: mallopt only sets allocator parameters; 1 MiB is a valid value.
+    unsafe {
+        libc::mallopt(libc::M_MMAP_THRESHOLD, 1 << 20);
+    }
     // Local development reads `.env`; in ECS the same variables arrive from the
     // task definition, so a missing file is not an error.
     let _ = dotenvy::dotenv();
@@ -87,6 +99,13 @@ async fn main() -> Result<()> {
     let read_pool = db::connect_read(&cfg.database_url).await?;
 
     let state = AppState::new(cfg.clone(), pool, read_pool, magpie, builders).await;
+
+    // The address is taken before the reapers below: a second process started
+    // on a taken address failed the first one's running imports, exports and
+    // transitions, and only then exited (the audit's pass 12). Connections
+    // wait in the backlog until serving starts, a moment later.
+    let addr: SocketAddr = cfg.bind_addr.parse()?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
 
     // Single instance: an import row left `running` belongs to a process that
     // is gone, so nothing else can be working on it.
@@ -215,8 +234,8 @@ async fn main() -> Result<()> {
     let shutdown = state.shutdown.clone();
     let app = birdtest::app(state);
 
-    let addr: SocketAddr = cfg.bind_addr.parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // The bound address: `BIND_ADDR` with port 0 is given one here.
+    let addr = listener.local_addr().unwrap_or(addr);
     tracing::info!(%addr, "birdtest listening");
 
     // `ConnectInfo` is the peer address `clientip` falls back to.

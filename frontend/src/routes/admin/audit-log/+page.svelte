@@ -8,14 +8,20 @@
   let action = '';
   let targetType = '';
   let page = 0;
+  let loadError = '';
 
   async function load(next: number) {
     page = next;
-    result = await api.auditLog({
-      page: next,
-      ...(action ? { action } : {}),
-      ...(targetType ? { target_type: targetType } : {})
-    });
+    loadError = '';
+    try {
+      result = await api.auditLog({
+        page: next,
+        ...(action ? { action } : {}),
+        ...(targetType ? { target_type: targetType } : {})
+      });
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   }
   onMount(() => load(0));
 </script>
@@ -34,7 +40,9 @@
   <button class="btn-primary">Filter</button>
 </form>
 
-{#if !result}
+{#if loadError}
+  <p class="text-sm text-destructive">Could not load the audit log: {loadError}</p>
+{:else if !result}
   <p class="text-muted-foreground">Loading…</p>
 {:else}
   <div class="card overflow-x-auto p-0">

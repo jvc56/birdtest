@@ -4,10 +4,15 @@
 
   let pools: RatingPoolListItem[] = [];
   let loaded = false;
+  let loadError = '';
 
   onMount(async () => {
-    pools = await api.ratingPools();
-    loaded = true;
+    try {
+      pools = await api.ratingPools();
+      loaded = true;
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   });
 </script>
 
@@ -22,17 +27,21 @@
     </p>
   </div>
 
-  {#if !loaded}
+  {#if loadError}
+    <p class="text-sm text-destructive">Could not load the rating pools: {loadError}</p>
+  {:else if !loaded}
     <p class="text-sm text-muted-foreground">Loading…</p>
   {:else if !pools.length}
     <div class="card space-y-2">
       <h2 class="text-lg font-medium">No rating pools yet</h2>
       <p class="text-sm text-muted-foreground">
-        An admin creates a pool by naming its variant, letter distribution and board layout, then
-        picking the anchor config that fixes the scale.
+        A pool is created through the admin API (<code>POST /api/admin/rating-pools</code>) by
+        naming its variant, letter distribution and board layout, then picking the anchor config
+        that fixes the scale; there is no form for it yet.
       </p>
     </div>
   {:else}
+    <div class="overflow-x-auto">
     <table class="table">
       <thead>
         <tr>
@@ -59,5 +68,6 @@
         {/each}
       </tbody>
     </table>
+    </div>
   {/if}
 </section>

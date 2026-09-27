@@ -199,29 +199,220 @@ async fn the_eleventh_login_from_one_address_is_rate_limited_even_with_the_right
     assert_eq!(elsewhere.status, StatusCode::OK, "another address is unaffected: {elsewhere:?}");
 }
 
+/// `RateLimiters::login_account`: `Quota::per_minute(100)`, the cap on one
+/// username from every address together.
+const LOGINS_PER_ACCOUNT_PER_MINUTE: usize = 100;
+
 /// A-AUTH-11 (login, per username), the half that matters since addresses are
-/// cheap: the eleventh attempt on one username in a minute is 429 although
-/// every attempt came from a different address -- with the right password too,
-/// and whatever case or padding the name is typed with. Another username is
-/// unaffected.
+/// cheap: the hundred-and-first attempt on one username in a minute is 429
+/// although every attempt came from a different address -- with the right
+/// password too, and whatever case or padding the name is typed with. Another
+/// username is unaffected. (The attempts name an account that does not exist,
+/// which has a bucket of its own so that a 429 does not say which names do.)
 #[tokio::test]
-async fn the_eleventh_login_for_one_username_is_rate_limited_from_any_address() {
+async fn a_username_tried_from_everywhere_is_rate_limited() {
     let db = TestDb::new().await;
     let app = proxied_app(&db).await;
-    confirmed_user(&db, "target", PASSWORD).await;
     confirmed_user(&db, "bystander", PASSWORD).await;
 
-    for i in 0..LOGINS_PER_MINUTE {
-        let response = login_from(&app, &format!("203.0.113.{i}"), "target", WRONG).await;
+    for i in 0..LOGINS_PER_ACCOUNT_PER_MINUTE {
+        let ip = format!("10.{}.{}.1", i / 200, i % 200);
+        let response = login_from(&app, &ip, "target", WRONG).await;
         assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
     }
-    let right = login_from(&app, "203.0.113.200", "target", PASSWORD).await;
-    assert_rate_limited(&right, "the right password on a spent username");
+    let limited = login_from(&app, "203.0.113.200", "target", PASSWORD).await;
+    assert_rate_limited(&limited, "a spent username");
     let padded = login_from(&app, "203.0.113.201", " TARGET ", PASSWORD).await;
     assert_rate_limited(&padded, "case and padding do not make it another username");
 
     let other = login_from(&app, "203.0.113.202", "bystander", PASSWORD).await;
     assert_eq!(other.status, StatusCode::OK, "another username is unaffected: {other:?}");
+}
+
+/// A-AUTH-11b: an account's bucket is the account's, however its name is
+/// spelled. Postgres lowers `İ` to `i` and Rust to `i̇`, so while the bucket
+/// was keyed on Rust's lowering, `TİM` signed in to `tim` from a bucket of its
+/// own, and every such spelling was a fresh hundred guesses.
+#[tokio::test]
+async fn an_accounts_login_bucket_does_not_depend_on_how_its_name_is_spelled() {
+    let db = TestDb::new().await;
+    let app = proxied_app(&db).await;
+    confirmed_user(&db, "tim", PASSWORD).await;
+
+    let spelled = login_from(&app, "198.51.100.1", "TİM", PASSWORD).await;
+    assert_eq!(spelled.status, StatusCode::OK, "the database matches `TİM` to `tim`: {spelled:?}");
+
+    // Until the bucket is spent: each wrong guess at a real account costs an
+    // Argon2 verify, and the bucket refills a little while they run.
+    let mut spent = false;
+    for i in 1..2 * LOGINS_PER_ACCOUNT_PER_MINUTE {
+        let ip = format!("10.{}.{}.1", i / 200, i % 200);
+        let response = login_from(&app, &ip, "tim", WRONG).await;
+        if response.status == StatusCode::TOO_MANY_REQUESTS {
+            spent = true;
+            break;
+        }
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
+    }
+    assert!(spent, "the account's bucket never ran out");
+    let limited = login_from(&app, "203.0.113.210", "TİM", PASSWORD).await;
+    assert_rate_limited(&limited, "the same account spelled with a dotted capital I");
+}
+
+/// `routes::public::MAX_LIVE_STREAMS_PER_ADDRESS`.
+const LIVE_STREAMS_PER_ADDRESS: usize = 32;
+
+/// A-PUBLIC-6c (on the router): one address holds at most its share of live
+/// streams, each for as long as its response lives -- the place is the
+/// handler's to hold, not just the helper's to count -- and another address is
+/// unaffected. A stream given up gives its place back.
+#[tokio::test]
+async fn one_address_holds_at_most_its_share_of_live_streams() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    let app = proxied_app(&db).await;
+    let stream = |ip: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(get_request(
+                &format!("/api/jobs/{job}/stream"),
+                &[("x-forwarded-for".to_string(), ip.to_string())],
+            ))
+            .await
+            .unwrap()
+        }
+    };
+
+    let mut open = Vec::new();
+    for i in 0..LIVE_STREAMS_PER_ADDRESS {
+        let response = stream("198.51.100.77").await;
+        assert_eq!(response.status(), StatusCode::OK, "#{i}");
+        open.push(response);
+    }
+    let refused = stream("198.51.100.77").await;
+    assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(refused.headers().contains_key(RETRY_AFTER));
+    assert_eq!(stream("198.51.100.78").await.status(), StatusCode::OK, "another address");
+
+    drop(open.pop());
+    assert_eq!(stream("198.51.100.77").await.status(), StatusCode::OK, "a place came back");
+}
+
+/// A-WORKER-16 (on the router): made-up worker credentials pay their
+/// address's bucket before their lookup, and past its burst are refused with
+/// a `Retry-After` -- while a real worker at the same address, whose
+/// credential resolved, goes on being served. (The previous gate refused
+/// every worker request from the address, real ones included.)
+#[tokio::test]
+async fn made_up_worker_credentials_are_limited_per_address_and_real_ones_are_not() {
+    let db = TestDb::new().await;
+    db.games_job(1, 2).await;
+    let app = proxied_app(&db).await;
+    let shared = "203.0.113.99";
+
+    // A real worker behind the shared address: its first claim mints a UUID.
+    let first = send_raw(
+        &app,
+        post_json("/api/worker/task", &[("x-forwarded-for", shared)], claim_body("1.0.0", &[])),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{first:?}");
+    let uuid = first.body["worker_uuid"].as_str().expect("a minted uuid").to_string();
+    let token = first.body["claim_token"].clone();
+    let heartbeat = |uuid: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            send_raw(
+                &app,
+                post_json(
+                    "/api/worker/heartbeat",
+                    &[("x-forwarded-for", shared), ("x-worker-uuid", uuid.as_str())],
+                    json!({ "claim_token": token }),
+                ),
+            )
+            .await
+        }
+    };
+    let real = heartbeat(uuid.clone()).await;
+    assert_ne!(real.status, StatusCode::TOO_MANY_REQUESTS, "{real:?}");
+
+    let bogus = |ip: &'static str, i: usize| {
+        let key = format!("Bearer not-a-key-{i}");
+        let app = app.clone();
+        async move {
+            send_raw(
+                &app,
+                post_json(
+                    "/api/worker/heartbeat",
+                    &[("x-forwarded-for", ip), ("authorization", key.as_str())],
+                    json!({}),
+                ),
+            )
+            .await
+        }
+    };
+    let mut limited = None;
+    let started = std::time::Instant::now();
+    for i in 0..150 {
+        let response = bogus(shared, i).await;
+        if response.status == StatusCode::TOO_MANY_REQUESTS {
+            limited = Some(i);
+            assert_rate_limited(&response, "past the address's burst");
+            break;
+        }
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
+    }
+    // A burst of 100, refilled at 5 a second while the loop runs: on a
+    // loaded machine the loop takes long enough to earn a few more.
+    let refilled = (started.elapsed().as_secs_f64() * 5.0).ceil() as usize;
+    assert!(limited.is_some_and(|i| (99..=101 + refilled).contains(&i)), "{limited:?} after {refilled} refilled");
+
+    let still = heartbeat(uuid).await;
+    assert_ne!(still.status, StatusCode::TOO_MANY_REQUESTS, "the real worker is served: {still:?}");
+    assert_eq!(bogus("203.0.113.100", 0).await.status, StatusCode::UNAUTHORIZED, "another address");
+}
+
+/// A-AUTH-11c: redeeming confirmation and reset links is limited per
+/// address -- both are unauthenticated writes on the main pool, and a reset
+/// scores a password first. The twenty-first in a minute is a 429.
+#[tokio::test]
+async fn redeeming_links_is_limited_per_address() {
+    let db = TestDb::new().await;
+    let app = proxied_app(&db).await;
+    for i in 0..20 {
+        let path = if i % 2 == 0 { "/api/auth/confirm-email" } else { "/api/auth/reset-password/confirm" };
+        let body = json!({ "code": "nope", "token": "nope", "password": "correct horse battery staple 42" });
+        let response = send_raw(&app, post_json(path, &[("x-forwarded-for", "192.0.2.44")], body)).await;
+        assert_eq!(response.status, StatusCode::BAD_REQUEST, "#{i} {path}: {response:?}");
+    }
+    let limited = send_raw(
+        &app,
+        post_json("/api/auth/confirm-email", &[("x-forwarded-for", "192.0.2.44")], json!({ "code": "nope" })),
+    )
+    .await;
+    assert_rate_limited(&limited, "the twenty-first link from one address");
+}
+
+/// A-BOUND-2: one address trying wrong passwords for an account cannot lock
+/// its owner out. Keyed on the username alone at the per-address rate, one
+/// wrong guess every six seconds from anywhere held any account -- an admin's,
+/// whose name is public -- out of signing in, right password or not.
+#[tokio::test]
+async fn a_stranger_cannot_lock_an_account_out_of_signing_in() {
+    let db = TestDb::new().await;
+    let app = proxied_app(&db).await;
+    confirmed_user(&db, "target", PASSWORD).await;
+
+    for i in 0..LOGINS_PER_MINUTE {
+        let response = login_from(&app, "203.0.113.66", "target", WRONG).await;
+        assert_eq!(response.status, StatusCode::UNAUTHORIZED, "#{i}: {response:?}");
+    }
+    let limited = login_from(&app, "203.0.113.66", "target", WRONG).await;
+    assert_rate_limited(&limited, "the guessing address");
+
+    let owner = login_from(&app, "198.51.100.7", "target", PASSWORD).await;
+    assert_eq!(owner.status, StatusCode::OK, "the owner signs in from their own address: {owner:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -294,6 +485,15 @@ async fn a_player_config_refuses_input_data_of_the_wrong_role() {
         .await
         .unwrap();
     assert_eq!(created, 0, "a refused config is not stored");
+
+    // A clone of a config that does not exist names the field; the foreign
+    // key's bare failure was a 409 "still referenced by other records".
+    let mut cloned = body(kwg, klv, winpct);
+    cloned["cloned_from_id"] = json!(nothing);
+    let (status, response) =
+        send(&app, post_json("/api/admin/player-configs", &headers, cloned)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown clone source: {response}");
+    assert_eq!(response["fields"][0]["field"], "cloned_from_id", "{response}");
 
     let (status, response) =
         send(&app, post_json("/api/admin/player-configs", &headers, body(kwg, klv, winpct))).await;
@@ -758,4 +958,73 @@ async fn a_freshly_built_production_state_grants_the_restart_grace() {
     let (third, _) = first_claim(&app).await;
     assert_eq!(claim_state(&db, token(&silent)).await, "abandoned", "reclaimed once the grace is over");
     assert_eq!(third["task_request"]["seed"], silent["task_request"]["seed"], "and its task handed out again");
+}
+
+/// A-BOUND-11: the API's answers carry `X-Content-Type-Options: nosniff`. The
+/// pages get it from Nginx; the API is served by the load balancer straight
+/// from the backend, so it has to set its own -- the Nginx comment said it did,
+/// and nothing did.
+#[tokio::test]
+async fn api_responses_are_not_sniffed() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    for path in ["/health", "/api/jobs", "/api/jobs/00000000-0000-0000-0000-000000000000"] {
+        let response = send_raw(&app, Request::get(path).body(Body::empty()).unwrap()).await;
+        assert_eq!(
+            response.headers.get("x-content-type-options").map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "{path}"
+        );
+    }
+}
+
+/// A-BOUND-12: a malformed id in a path is a JSON `404`, and a malformed query
+/// string a JSON `400` -- not axum's plain-text rejections, which broke the
+/// API's promise that every failure carries a `code` and a `message`.
+#[tokio::test]
+async fn malformed_paths_and_queries_answer_json() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let response =
+        send_raw(&app, Request::get("/api/jobs/not-a-uuid").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "{response:?}");
+    assert_eq!(response.body["code"], "not_found", "{response:?}");
+    let response =
+        send_raw(&app, Request::get("/api/jobs?page=many").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST, "{response:?}");
+    assert_eq!(response.body["code"], "bad_request", "{response:?}");
+    // And an endpoint that does not exist, or a method one does not take.
+    let response =
+        send_raw(&app, Request::get("/api/no-such-thing").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "{response:?}");
+    assert_eq!(response.body["code"], "not_found", "{response:?}");
+    let response = send_raw(&app, Request::delete("/api/jobs").body(Body::empty()).unwrap()).await;
+    assert_eq!(response.status, StatusCode::METHOD_NOT_ALLOWED, "{response:?}");
+    assert_eq!(response.body["code"], "method_not_allowed", "{response:?}");
+}
+
+/// A-MIGRATE-1: a rolled-back image starts against the schema a newer one
+/// migrated -- a migration the database has and the binary does not is
+/// allowed -- but an applied migration whose file changed is still refused.
+/// sqlx refuses the first by default, and with no healthy task kept through
+/// a deploy the rolled-back service crash-looped with nothing serving.
+#[tokio::test]
+async fn a_rolled_back_image_starts_on_a_newer_schema() {
+    let db = TestDb::new().await;
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations
+             (version, description, success, checksum, execution_time)
+         VALUES (99999999999999, 'a later release', TRUE, '\\x00', 1)",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    birdtest::db::migrate(&db.pool).await.expect("the newer migration is left alone");
+
+    sqlx::query("UPDATE _sqlx_migrations SET checksum = '\\x01' WHERE version = 1")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let err = birdtest::db::migrate(&db.pool).await.expect_err("an edited migration");
+    assert!(format!("{err:#}").contains("modified"), "{err:#}");
 }

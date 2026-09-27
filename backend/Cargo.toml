@@ -4,14 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+libc = "0.2"
 axum = { version = "0.7", features = ["macros"] }
 axum-extra = { version = "0.9", features = ["cookie"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors", "fs"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "fs", "set-header"] }
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
@@ -27,6 +28,7 @@ anyhow = "1"
 dotenvy = "0.15"
 futures = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
+http-body-util = "0.1"
 hex = "0.4"
 sha2 = "0.10"
 aws-config = { version = "1", features = ["behavior-version-latest"] }
@@ -51,4 +53,9 @@ tower = { version = "0.4", features = ["util"] }
 opt-level = 3
 
 [profile.dev.package.blake2]
+opt-level = 3
+
+# Password scoring: close to a second for a crafted password even optimized,
+# so the tests that time it see what production does.
+[profile.dev.package.zxcvbn]
 opt-level = 3

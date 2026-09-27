@@ -249,6 +249,23 @@ async fn a_completed_jobs_stream_redirects_to_its_ready_export() {
         assert!(location.contains(&key), "{query}: {location} is not {key}");
         assert_eq!(download(location).await, state.artifacts.get(&key).await.unwrap());
     }
+
+    // Past the lifetime the bucket keeps an export for, the stream goes back to
+    // the database rather than redirect to an object that is gone, and the
+    // admin page says so rather than offer a dead download.
+    sqlx::query("UPDATE job_exports SET completed_at = completed_at - interval '30 days' WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (status, _, body) = send_raw(&app, get_request(&stream, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "an expired export is not redirected to");
+    assert_eq!(body.lines().count(), 1);
+    let (status, detail) =
+        send(&app, get_request(&format!("/api/admin/jobs/{job}/export"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    assert_eq!(detail["state"], "expired", "{detail}");
+    assert!(detail["download_url"].is_null(), "{detail}");
 }
 
 /// PLAN.md, "Exports": only a games job that captured something grows a
@@ -349,6 +366,28 @@ async fn export_state(db: &TestDb, id: Uuid) -> (String, Option<String>, bool) {
     .unwrap()
 }
 
+/// I-EXPORT-8: one export of a job runs at a time. Only the page's disabled
+/// button stopped a second, and each holds a pool connection for its whole
+/// corpus read.
+#[tokio::test]
+async fn a_job_has_one_export_running_at_a_time() {
+    let db = TestDb::new().await;
+    let (state, _bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+    complete(&db, job).await;
+    export_row(&db, job, "running").await;
+
+    let borrowed: Vec<(&str, &str)> =
+        headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, body) =
+        send(&app, post_json(&format!("/api/admin/jobs/{job}/export"), &borrowed, json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("already running"), "{body}");
+}
+
 /// PLAN.md, "Exports" and the schema's comment on `job_exports`: birdtest is a
 /// single instance, so at startup an export still `running` belongs to a
 /// process that is gone. `fail_orphaned` marks it failed with a reason and
@@ -411,7 +450,8 @@ async fn wait_for_lock_waiter(db: &TestDb, statement: &str) {
 /// `exports::build`'s guard: a process starting while an export runs --
 /// a rolling deployment overlaps the two -- reaps its row, and the export's
 /// own task finishing afterwards must not bring it back `ready`, or an admin
-/// is handed an export nobody was sure had finished.
+/// is handed an export nobody was sure had finished; and it removes the
+/// objects it uploaded, which nothing will name.
 ///
 /// Deterministic: the export is held at its first read of the results until
 /// the row has been reaped, and the app runs on a pool of its own, named, so
@@ -469,7 +509,13 @@ async fn an_export_reaped_while_it_ran_is_not_brought_back_ready() {
         assert!(Instant::now() < deadline, "the export never reached its final update");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(bucket.keys().await.len(), 2, "the export did run to the end");
+    // It ran to the end -- and, finding its row gone from `running`, removed
+    // the two objects it had uploaded, which nothing would ever name.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !bucket.keys().await.is_empty() {
+        assert!(Instant::now() < deadline, "the unclaimed objects were left behind");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 
     let (state_, error, _) = export_state(&db, id).await;
     assert_eq!(state_, "failed");
@@ -487,4 +533,197 @@ async fn an_export_reaped_while_it_ran_is_not_brought_back_ready() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "streamed from the database, not redirected");
+}
+
+/// Corpus queries still running in this test's database, other than the
+/// caller's own.
+async fn corpus_scans_running(db: &TestDb) -> i64 {
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect(&db.url).await.unwrap();
+    let running = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity
+         WHERE state = 'active' AND pid <> pg_backend_pid() AND datname = current_database()
+           AND query LIKE '%jsonb_build_object(''moves''%'",
+    )
+    .fetch_one(&mut conn)
+    .await
+    .unwrap();
+    conn.close().await.ok();
+    running
+}
+
+/// I-EXPORT: a reader that stops early takes its query down with it. A pool
+/// connection dropped mid-result is drained before it goes back to the pool,
+/// so each `curl | head` spot check of the results stream -- and each export
+/// whose upload failed -- left Postgres building the whole corpus on a
+/// connection no cap counted: ten of them held a ten-connection pool, and
+/// every claim waited out its acquire timeout (thirty-first audit). The
+/// connection is now closed rather than drained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reader_that_hangs_up_ends_its_corpus_query() {
+    use http_body_util::BodyExt;
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    let task: Uuid = sqlx::query_scalar("INSERT INTO tasks (job_id, seed, state) VALUES ($1, 0, 'completed') RETURNING id")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+         VALUES ($1, $2, gen_random_uuid(), 'completed', $3, now()) RETURNING id",
+    )
+    .bind(task)
+    .bind(job)
+    .bind(admin)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves)
+         SELECT $1, $2, $3, 'R' || g, 5 FROM generate_series(1, 150000) g",
+    )
+    .bind(claim)
+    .bind(task)
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_moves (record_id, rank, move, score, equity)
+         SELECT r.id, k, md5(random()::text), 10, random()
+         FROM position_analysis_records r, generate_series(1, 5) k WHERE r.job_id = $1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("ANALYZE").execute(&db.pool).await.unwrap();
+
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    for _ in 0..3 {
+        let response = app.clone().oneshot(get_request(&path, &headers)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body();
+        assert!(!body.frame().await.unwrap().unwrap().data_ref().unwrap().is_empty());
+        drop(body);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut running = corpus_scans_running(&db).await;
+    while running > 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        running = corpus_scans_running(&db).await;
+    }
+    assert_eq!(running, 0, "a hung-up reader's corpus query is still running");
+    assert_eq!(state.result_streams.available_permits(), birdtest::state::MAX_CONCURRENT_RESULT_STREAMS);
+}
+
+/// PLAN.md, "Exports": a stream is complete exactly when it ends cleanly. A
+/// corpus query the database ends part-way (a failover, an operator's
+/// `pg_terminate_backend`) ended the body as a finished download does, the
+/// rows so far reading as the whole corpus (the audit's pass 20); it now ends
+/// in an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_the_database_cuts_off_ends_in_an_error() {
+    use http_body_util::BodyExt;
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    let task: Uuid = sqlx::query_scalar("INSERT INTO tasks (job_id, seed, state) VALUES ($1, 0, 'completed') RETURNING id")
+        .bind(job).fetch_one(&db.pool).await.unwrap();
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+         VALUES ($1, $2, gen_random_uuid(), 'completed', $3, now()) RETURNING id",
+    )
+    .bind(task).bind(job).bind(admin).fetch_one(&db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves)
+         SELECT $1, $2, $3, 'R' || g, 5 FROM generate_series(1, 150000) g",
+    )
+    .bind(claim).bind(task).bind(job).execute(&db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_moves (record_id, rank, move, score, equity)
+         SELECT r.id, k, md5(random()::text), 10, random()
+         FROM position_analysis_records r, generate_series(1, 5) k WHERE r.job_id = $1",
+    )
+    .bind(job).execute(&db.pool).await.unwrap();
+    sqlx::query("ANALYZE").execute(&db.pool).await.unwrap();
+
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    let response = app.clone().oneshot(get_request(&path, &headers)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut text = String::new();
+    let first = body.frame().await.unwrap().unwrap();
+    text.push_str(std::str::from_utf8(first.data_ref().unwrap()).unwrap());
+
+    // The database ends the query (a failover, an operator's
+    // pg_terminate_backend, a restart of the instance).
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect(&db.url).await.unwrap();
+    let killed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          WHERE pid <> pg_backend_pid() AND datname = current_database()
+            AND query LIKE '%jsonb_build_object(''moves''%') k",
+    )
+    .fetch_one(&mut conn).await.unwrap();
+    assert_eq!(killed, 1, "the corpus query was not found running");
+
+    let mut errored = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    text.push_str(std::str::from_utf8(data).unwrap());
+                }
+            }
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    let lines = text.lines().count();
+    assert!(errored, "the stream ended cleanly after {lines} of 150000 records: a truncated download looks complete");
+}
+
+/// PLAN.md, "Exports": an export that fails leaves no object behind. Failing
+/// after its objects were written -- here the row cannot be marked ready -- the
+/// row said `failed` and named neither, and both waited thirty days for the
+/// lifecycle rule (the audit's pass 20).
+#[tokio::test]
+async fn an_export_that_fails_after_uploading_removes_its_objects() {
+    let db = TestDb::new().await;
+    let (state, bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+    complete(&db, job).await;
+    // Marking the row ready fails, as a lost connection or a failover would.
+    sqlx::query(
+        "CREATE FUNCTION refuse_ready() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.state = 'ready' THEN RAISE EXCEPTION 'refused for the test'; END IF;
+             RETURN NEW;
+         END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER refuse_ready BEFORE UPDATE ON job_exports FOR EACH ROW EXECUTE FUNCTION refuse_ready()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let export = export_and_wait(&app, job, &headers).await;
+    assert_eq!(export["state"], "failed", "{export}");
+    assert_eq!(bucket.keys().await, Vec::<String>::new(), "a failed export's objects are left in the store");
 }

@@ -1,12 +1,15 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
-  import { api, type InputData, type JobType, type PlayerConfig } from '$lib/api';
-  import { jobTypeLabel } from '$lib/format';
+  import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
+  import { blankFields, jobTypeLabel } from '$lib/format';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
   let error = '';
+  // Whether `error` is the last submit's: only that is cleared by an edit, not
+  // a failure to load the form's choices.
+  let fromSubmit = false;
   let busy = false;
 
   let jobType: JobType = 'game_pairs';
@@ -47,23 +50,37 @@
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
-  // The combination job creation refuses, surfaced before the submit rather
-  // than as the error that comes back from it: `-r best` is MOVE_RECORD_BEST,
-  // so movegen keeps one play and the rest of the ranking never exists.
+  // The two combinations job creation refuses, surfaced before the submit
+  // rather than as the error that comes back from it. `-r best` is
+  // MOVE_RECORD_BEST, so a static player's movegen keeps one play and the rest
+  // of the ranking never exists (a simmer ranks every play up to num_plays
+  // whatever its recorder). And no player reports more plays than num_plays,
+  // which sizes the move list.
   $: selectedConfig = configs.find((config) => config.id === playerConfigId);
   $: openingRackConflict =
-    jobType === 'opening_rack' &&
-    selectedConfig &&
-    selectedConfig.recorder_type === 'best' &&
-    selectedConfig.num_plays_recorded > 1
-      ? `${selectedConfig.name} records only the best move, so this job would store one play per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
-      : null;
+    jobType !== 'opening_rack' || !selectedConfig
+      ? null
+      : selectedConfig.recorder_type === 'best' &&
+          selectedConfig.num_plays_recorded > 1 &&
+          selectedConfig.num_plies === 0
+        ? `${selectedConfig.name} is static and records only the best move, so this job would store one play per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
+        : selectedConfig.num_plays < selectedConfig.num_plays_recorded
+          ? `${selectedConfig.name} generates ${selectedConfig.num_plays} plays, so this job would store at most that many per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
+          : null;
 
   function firstOfRole(role: string): string {
     return files.find((f) => f.role === role)?.id ?? '';
   }
 
   onMount(async () => {
+    try {
+      await loadChoices();
+    } catch (e) {
+      error = `Could not load player configs and input data: ${e instanceof Error ? e.message : String(e)}`;
+    }
+  });
+
+  async function loadChoices() {
     [configs, files] = await Promise.all([api.playerConfigs(), api.inputData()]);
     if (configs.length) {
       playerConfigId = configs[0].id;
@@ -78,7 +95,7 @@
     leaveKwgId = firstOfRole('kwg');
     serverFloor = (await api.clientVersion()).min_magpie_version;
     minMagpieVersion = serverFloor;
-  });
+  }
 
   function body(): Record<string, unknown> {
     const common = {
@@ -125,13 +142,24 @@
   }
 
   async function submit() {
-    busy = true;
     error = '';
+    // A cleared number box binds as null, and the server's answer to a null
+    // setting names the whole request ("data did not match any variant"),
+    // not the field.
+    const request = body();
+    const blank = blankFields(request);
+    if (blank.length) {
+      error = `Fill in every setting: ${blank.join(', ')} is empty.`;
+      fromSubmit = true;
+      return;
+    }
+    busy = true;
     try {
-      const created = await api.createJob(body());
+      const created = await api.createJob(request);
       goto(`/admin/jobs/${created.job.id}`);
     } catch (e) {
-      error = (e as Error).message;
+      error = errorText(e);
+      fromSubmit = true;
     } finally {
       busy = false;
     }
@@ -144,10 +172,20 @@
   whole active set first.
 </p>
 
-<form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit}>
+<!-- Any edit clears the last server error: a submit the browser blocks never
+     reaches submit(), which is where it was cleared, so it lingered. -->
+<form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
   <div>
     <label class="label" for="type">Job type</label>
-    <select id="type" class="input" bind:value={jobType}>
+    <select
+      id="type"
+      class="input"
+      bind:value={jobType}
+      on:change={() => {
+        // A games batch is even (see the field below).
+        if (jobType === 'games' && batchSize % 2 !== 0) batchSize += 1;
+      }}
+    >
       {#each types as type}<option value={type}>{jobTypeLabel(type)}</option>{/each}
     </select>
   </div>
@@ -170,7 +208,10 @@
   <div class="grid grid-cols-3 gap-3">
     <div>
       <label class="label" for="variant">Variant</label>
-      <input id="variant" class="input" bind:value={variant} />
+      <select id="variant" class="input" bind:value={variant}>
+        <option value="classic">classic</option>
+        <option value="wordsmog">wordsmog</option>
+      </select>
     </div>
     <div>
       <label class="label" for="ld">Letter distribution</label>
@@ -193,7 +234,7 @@
   {#if jobType === 'opening_rack'}
     <div>
       <label class="label" for="pc">Player config</label>
-      <select id="pc" class="input" bind:value={playerConfigId}>
+      <select id="pc" class="input" bind:value={playerConfigId} required>
         {#each configs as config}
           <option value={config.id}>
             {config.name} — recorder {config.recorder_type}, {config.num_plays_recorded} play{config.num_plays_recorded === 1
@@ -205,14 +246,16 @@
     </div>
     {#if openingRackConflict}
       <p class="field-error">
-        {openingRackConflict} Pick a config whose recorder is <strong>all</strong> or
-        <strong>equity</strong>, or one that records a single play.
+        {openingRackConflict} Pick a static config whose recorder is <strong>all</strong>
+        and that generates at least as many plays as it records, a simulating one that
+        does, or one that records a single play.
       </p>
     {/if}
     <p class="text-xs text-muted-foreground">
-      The recorder is shown because it decides whether this job can rank anything at all:
-      <strong>best</strong> keeps only the top move, so every rack would come back with one
-      analysis however many plays the config says to record. Tasks address <em>ranges</em> of the
+      The recorder is shown because it decides whether a static player can rank anything at
+      all: <strong>best</strong> keeps only the top move, so every rack would come back with one
+      analysis however many plays the config says to record. A simulating player ranks every
+      play up to its number of plays, whatever its recorder. Tasks address <em>ranges</em> of the
       rack space and are generated as workers claim them, so creating the job writes no rows
       however large the space is.
     </p>
@@ -220,13 +263,13 @@
     <div class="grid grid-cols-2 gap-3">
       <div>
         <label class="label" for="p1">Player 1</label>
-        <select id="p1" class="input" bind:value={player1}>
+        <select id="p1" class="input" bind:value={player1} required>
           {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
         </select>
       </div>
       <div>
         <label class="label" for="p2">Player 2</label>
-        <select id="p2" class="input" bind:value={player2}>
+        <select id="p2" class="input" bind:value={player2} required>
           {#each configs as config}<option value={config.id}>{config.name}</option>{/each}
         </select>
       </div>
@@ -236,11 +279,25 @@
         <label class="label" for="batch">
           {jobType === 'games' ? 'Games' : 'Pairs'} per batch
         </label>
-        <input id="batch" type="number" min="1" class="input" bind:value={batchSize} />
+        <input
+          id="batch"
+          type="number"
+          min={jobType === 'games' ? 2 : 1}
+          max={jobType === 'games' ? 10000 : 5000}
+          step={jobType === 'games' ? 2 : 1}
+          class="input"
+          bind:value={batchSize}
+        />
+        {#if jobType === 'games'}
+          <p class="mt-1 text-xs text-muted-foreground">
+            Even: MAGPIE gives player 1 the first move in a task's first game and alternates, so
+            an odd batch hands player 1 the first move more often.
+          </p>
+        {/if}
       </div>
       <div>
         <label class="label" for="min">Min before SPRT</label>
-        <input id="min" type="number" min="1" class="input" bind:value={minUnits} />
+        <input id="min" type="number" min="0" class="input" bind:value={minUnits} />
       </div>
       <div>
         <label class="label" for="max">Hard cap</label>
@@ -248,10 +305,10 @@
       </div>
     </div>
     <div class="grid grid-cols-4 gap-3">
-      <div><label class="label" for="alpha">α</label><input id="alpha" type="number" step="0.01" class="input" bind:value={sprtAlpha} /></div>
-      <div><label class="label" for="beta">β</label><input id="beta" type="number" step="0.01" class="input" bind:value={sprtBeta} /></div>
-      <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" class="input" bind:value={eloLow} /></div>
-      <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" class="input" bind:value={eloHigh} /></div>
+      <div><label class="label" for="alpha">α</label><input id="alpha" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtAlpha} /></div>
+      <div><label class="label" for="beta">β</label><input id="beta" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtBeta} /></div>
+      <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloLow} /></div>
+      <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloHigh} /></div>
     </div>
   {:else}
     <div>
@@ -282,7 +339,7 @@
       </div>
       <div>
         <label class="label" for="rpt">Racks per task</label>
-        <input id="rpt" type="number" min="1" class="input" bind:value={racksPerTask} />
+        <input id="rpt" type="number" min="1" max="10000" class="input" bind:value={racksPerTask} />
       </div>
     </div>
     <label class="flex items-center gap-2">
@@ -291,6 +348,8 @@
     </label>
   {/if}
 
-  {#if error}<p class="field-error">{error}</p>{/if}
+  <!-- Announced: an error that appears after a submit is otherwise silent to a
+       screen reader. -->
+  {#if error}<p class="field-error" role="alert">{error}</p>{/if}
   <button class="btn-primary" disabled={busy}>{busy ? 'Creating…' : 'Create job'}</button>
 </form>

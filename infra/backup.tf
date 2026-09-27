@@ -6,9 +6,8 @@
 # --- Encryption key --------------------------------------------------------
 # A dump contains argon2 password hashes, email addresses, API key hashes and
 # unexpired reset tokens, so it is encrypted with a customer-managed key rather
-# than the S3 default. The key policy is where the asymmetry lives: the task
-# that writes backups may encrypt but never decrypt, so a compromised backup
-# task can create a backup and cannot read one.
+# than the S3 default. The asymmetry lives in the key policy and the task's
+# IAM: the task that writes backups can create one and cannot read one.
 
 resource "aws_kms_key" "backups" {
   description             = "${local.name} logical database backups"
@@ -35,14 +34,40 @@ data "aws_iam_policy_document" "backups_key" {
     }
   }
 
-  # Write-only. Note the absence of kms:Decrypt.
   statement {
-    sid       = "BackupTaskEncryptOnly"
+    sid       = "BackupTaskEncrypt"
     actions   = ["kms:Encrypt", "kms:GenerateDataKey*", "kms:DescribeKey"]
     resources = ["*"]
     principals {
       type        = "AWS"
       identifiers = [aws_iam_role.backup_task.arn]
+    }
+  }
+
+  # A multipart upload under SSE-KMS needs kms:Decrypt: S3 decrypts the data
+  # key to complete it, on the caller's behalf. `aws s3 cp` goes multipart
+  # past 8 MB, and a directory-format dump has a file per table, so without
+  # this every nightly upload of a real database was refused. Only through S3,
+  # and only for this bucket (with a bucket key the context is the bucket's
+  # ARN): the task cannot decrypt anything itself, and it holds no
+  # s3:GetObject, so the backups stay unreadable to it.
+  statement {
+    sid       = "BackupTaskMultipartViaS3"
+    actions   = ["kms:Decrypt"]
+    resources = ["*"]
+    principals {
+      type        = "AWS"
+      identifiers = [aws_iam_role.backup_task.arn]
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "kms:ViaService"
+      values   = ["s3.${var.region}.amazonaws.com"]
+    }
+    condition {
+      test     = "StringLike"
+      variable = "kms:EncryptionContext:aws:s3:arn"
+      values   = ["${aws_s3_bucket.backups.arn}*"]
     }
   }
 
@@ -161,7 +186,14 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups" {
 resource "aws_s3_bucket" "backups_dr" {
   provider = aws.dr
   bucket   = "${local.name}-backups-dr-${data.aws_caller_identity.current.account_id}"
-  tags     = local.tags
+  # S3 replicates nothing from a source with Object Lock into a destination
+  # without it: every replication would fail, and the dumps would never leave
+  # the region. No default retention here -- each replica carries its source
+  # object's retention. Like the source's, decided at creation: on a stack
+  # applied without it, the bucket is replaced (empty it first; its contents
+  # are copies).
+  object_lock_enabled = true
+  tags                = local.tags
 }
 
 resource "aws_s3_bucket_public_access_block" "backups_dr" {
@@ -212,6 +244,22 @@ resource "aws_s3_bucket_lifecycle_configuration" "backups_dr" {
     expiration {
       days = var.backup_retention_days
     }
+
+    # Expiring a replica only adds a delete marker; the bytes stay until the
+    # noncurrent version goes, as in the source bucket.
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+  }
+
+  rule {
+    id     = "abort-incomplete-uploads"
+    status = "Enabled"
+    filter {}
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
   }
 }
 
@@ -229,10 +277,14 @@ data "aws_iam_policy_document" "backup_replication" {
     resources = [aws_s3_bucket.backups.arn]
   }
   statement {
+    # The two retention reads: replicating from an Object Lock bucket copies
+    # each object's retention, and fails without them.
     actions = [
       "s3:GetObjectVersionForReplication",
       "s3:GetObjectVersionAcl",
       "s3:GetObjectVersionTagging",
+      "s3:GetObjectRetention",
+      "s3:GetObjectLegalHold",
     ]
     resources = ["${aws_s3_bucket.backups.arn}/*"]
   }
@@ -332,7 +384,7 @@ resource "aws_iam_role_policy" "backup_task" {
 data "aws_iam_policy_document" "backup_execution_ssm" {
   statement {
     actions   = ["ssm:GetParameters"]
-    resources = [aws_ssm_parameter.database_url.arn]
+    resources = [local.ssm_database_url_arn]
   }
 }
 
@@ -375,7 +427,7 @@ resource "aws_ecs_task_definition" "backup" {
         { name = "PGDUMP_JOBS", value = tostring(var.backup_dump_jobs) },
       ]
       secrets = [
-        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn }
+        { name = "DATABASE_URL", valueFrom = local.ssm_database_url_arn }
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -411,8 +463,16 @@ resource "aws_iam_role" "scheduler" {
 
 data "aws_iam_policy_document" "scheduler" {
   statement {
-    actions   = ["ecs:RunTask"]
-    resources = ["${aws_ecs_task_definition.backup.arn_without_revision}:*"]
+    actions = ["ecs:RunTask"]
+    # The schedule names the family without a revision; RunTask's resource is
+    # always a revisioned task-definition ARN (the service authorization
+    # reference), which `:*` matches. The bare family is listed as well, since
+    # no AWS page says outright which one a revisionless schedule is checked
+    # against, and it widens nothing.
+    resources = [
+      aws_ecs_task_definition.backup.arn_without_revision,
+      "${aws_ecs_task_definition.backup.arn_without_revision}:*",
+    ]
     condition {
       test     = "ArnLike"
       variable = "ecs:cluster"
@@ -441,6 +501,7 @@ resource "aws_scheduler_schedule" "backup" {
   description                  = "Nightly pg_dump to s3://${aws_s3_bucket.backups.bucket}"
   schedule_expression          = var.backup_schedule
   schedule_expression_timezone = "UTC"
+  state                        = var.scheduled_tasks_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window {
     mode = "OFF"
@@ -462,8 +523,9 @@ resource "aws_scheduler_schedule" "backup" {
       }
     }
 
-    # A dump that fails is retried once; a dump that fails twice is an alarm,
-    # not something to keep hammering the database with.
+    # Retries a RunTask call the scheduler could not make (a throttle, a
+    # capacity error) -- not a dump that ran and failed: that is the failure
+    # alarm's, and the next night's.
     retry_policy {
       maximum_retry_attempts       = 1
       maximum_event_age_in_seconds = 3600
@@ -522,9 +584,17 @@ data "aws_iam_policy_document" "alerts_topic" {
   statement {
     actions   = ["SNS:Publish"]
     resources = [aws_sns_topic.alerts.arn]
+    # RDS's event subscription (rds.tf) publishes as events.rds.
     principals {
       type        = "Service"
-      identifiers = ["events.amazonaws.com", "cloudwatch.amazonaws.com"]
+      identifiers = ["events.amazonaws.com", "cloudwatch.amazonaws.com", "events.rds.amazonaws.com"]
+    }
+    # Only on this account's behalf: a service principal alone would let any
+    # account's rule or alarm publish here.
+    condition {
+      test     = "StringEquals"
+      variable = "aws:SourceAccount"
+      values   = [data.aws_caller_identity.current.account_id]
     }
   }
 }
@@ -558,8 +628,11 @@ resource "aws_cloudwatch_metric_alarm" "backup_stale" {
 
 # --- Restore drill ---------------------------------------------------------
 # A restore procedure that has never run is a hypothesis. This one restores the
-# newest dump into a throwaway database on the same instance every month and
-# runs the verification queries against it (PLAN.md, "Drills").
+# newest dump into a throwaway Postgres of its own, started inside the task,
+# every month and runs the verification queries against it (PLAN.md,
+# "Drills"). It never connects to the production instance, so it holds no
+# credentials for it: the drill's disk is the task's ephemeral storage, which
+# must hold the downloaded dump and the restored database side by side.
 #
 # Its role is the mirror image of the backup task's: read and decrypt, never
 # write. Between the two, no single compromised role can both read old backups
@@ -610,7 +683,7 @@ resource "aws_ecs_task_definition" "restore_drill" {
   task_role_arn            = aws_iam_role.drill_task.arn
 
   ephemeral_storage {
-    size_in_gib = var.backup_ephemeral_storage_gib
+    size_in_gib = var.restore_ephemeral_storage_gib
   }
 
   container_definitions = jsonencode([
@@ -626,9 +699,7 @@ resource "aws_ecs_task_definition" "restore_drill" {
         { name = "AWS_REGION", value = var.region },
         { name = "AWS_DEFAULT_REGION", value = var.region },
         { name = "PGRESTORE_JOBS", value = tostring(var.backup_dump_jobs) },
-      ]
-      secrets = [
-        { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn }
+        { name = "DRILL_TARGET", value = "local" },
       ]
       logConfiguration = {
         logDriver = "awslogs"
@@ -646,8 +717,16 @@ resource "aws_ecs_task_definition" "restore_drill" {
 
 data "aws_iam_policy_document" "drill_scheduler" {
   statement {
-    actions   = ["ecs:RunTask"]
-    resources = ["${aws_ecs_task_definition.restore_drill.arn_without_revision}:*"]
+    actions = ["ecs:RunTask"]
+    # The schedule names the family without a revision; RunTask's resource is
+    # always a revisioned task-definition ARN (the service authorization
+    # reference), which `:*` matches. The bare family is listed as well, since
+    # no AWS page says outright which one a revisionless schedule is checked
+    # against, and it widens nothing.
+    resources = [
+      aws_ecs_task_definition.restore_drill.arn_without_revision,
+      "${aws_ecs_task_definition.restore_drill.arn_without_revision}:*",
+    ]
     condition {
       test     = "ArnLike"
       variable = "ecs:cluster"
@@ -675,7 +754,7 @@ resource "aws_scheduler_schedule" "restore_drill" {
   description                  = "Monthly restore of the newest dump into a throwaway database"
   schedule_expression          = var.backup_restore_drill_schedule
   schedule_expression_timezone = "UTC"
-  state                        = var.restore_drill_enabled ? "ENABLED" : "DISABLED"
+  state                        = var.scheduled_tasks_enabled && var.restore_drill_enabled ? "ENABLED" : "DISABLED"
 
   flexible_time_window {
     mode = "OFF"

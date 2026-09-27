@@ -67,6 +67,18 @@ describe('F-CHART-6 ResidualMatrix non-transitivity flag', () => {
     expect(isNonTransitive([...triangle, small('x', 'y')])).toBe(true);
   });
 
+  it('is not raised by residuals too few pairs stand behind', () => {
+    // Twenty points off on ten pairs each is well inside sampling noise.
+    const young = [big('a', 'b', 1), big('b', 'c', 1), big('a', 'c', -1)].map((c) => ({
+      ...c,
+      pairs: 10
+    }));
+    expect(notableResiduals(young)).toHaveLength(3);
+    expect(isNonTransitive(young)).toBe(false);
+    // The same misses on a thousand pairs each are not.
+    expect(isNonTransitive(young.map((c) => ({ ...c, pairs: 1000 })))).toBe(true);
+  });
+
   it('counts a residual as notable just past the threshold and not just below it', () => {
     expect(NOTABLE).toBe(0.05);
     expect(notableResiduals([cell('a', 'b', 0.551, 0.5)])).toHaveLength(1);

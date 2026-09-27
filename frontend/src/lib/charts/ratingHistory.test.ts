@@ -11,7 +11,11 @@ import {
   PALETTE,
   preferredSlot,
   SERIES_CAP,
-  seriesPath
+  seriesPath,
+  fitLabel,
+  fitLabels,
+  LABEL_CHARS,
+  spreadLabels
 } from './ratingHistory';
 
 const DAY = 86_400_000;
@@ -186,5 +190,57 @@ describe('RatingHistoryChart scales', () => {
     expect(seriesPath(series, d, 720)).toBe(
       `M${PAD.left},${HEIGHT - PAD.bottom} L${720 - PAD.right},${PAD.top}`
     );
+  });
+});
+
+describe('end labels', () => {
+  it('shortens a long name in the middle, keeping the end that tells configs apart', () => {
+    const a = fitLabel('simmer-CSW24-4ply-1000iters-gk16');
+    const b = fitLabel('simmer-CSW24-4ply-1000iters-none');
+    expect(a.length).toBe(LABEL_CHARS);
+    expect(a).not.toBe(b);
+    expect(a.startsWith('simmer')).toBe(true);
+    expect(a.endsWith('-gk16')).toBe(true);
+    expect(a).toContain('…');
+    expect(fitLabel('short-name')).toBe('short-name');
+    expect(fitLabel('x'.repeat(LABEL_CHARS))).toBe('x'.repeat(LABEL_CHARS));
+  });
+
+  it('moves labels apart, within bounds, in their original order', () => {
+    const ys = [100, 104, 30, 102];
+    const out = spreadLabels(ys, 13, 20, 240);
+    const sorted = [...out].sort((a, b) => a - b);
+    for (let k = 1; k < sorted.length; k++) expect(sorted[k] - sorted[k - 1]).toBeGreaterThanOrEqual(13);
+    expect(out[2]).toBe(30);
+    // The order of the lines' ends is kept.
+    expect(out[0]).toBeLessThan(out[3]);
+    expect(out[3]).toBeLessThan(out[1]);
+    // Crowded at the bottom: pushed back up, still apart and inside.
+    const low = spreadLabels([238, 239, 240], 13, 20, 240);
+    expect(Math.max(...low)).toBeLessThanOrEqual(240);
+    expect(Math.min(...low)).toBeGreaterThanOrEqual(20);
+    expect([...low].sort((a, b) => a - b)[1] - Math.min(...low)).toBeGreaterThanOrEqual(13);
+  });
+});
+
+describe('labels drawn together', () => {
+  it('tell apart configs that differ in the middle of their names', () => {
+    const names = [
+      'static-CSW24-equity',
+      'simmer-CSW24-4ply-1000iters-gk16',
+      'simmer-CSW24-4ply-1000iters-none',
+      'simmer-CSW24-2ply-inference-on',
+      'simmer-CSW24-2ply-inference-off',
+      'simmer-CSW24-4ply-inference-on',
+      'simmer-CSW24-4ply-inference-off'
+    ];
+    const labels = fitLabels(names);
+    expect(new Set(labels).size).toBe(names.length);
+    for (const label of labels) expect(label.length).toBeLessThanOrEqual(LABEL_CHARS);
+    expect(labels[0]).toBe(fitLabel('static-CSW24-equity'));
+    // Alike even after the family's shared start is dropped: widened where they differ.
+    const alike = fitLabels(['x-aaaaaaaaaaaa1bbbbbbbbbbbb', 'x-aaaaaaaaaaaa2bbbbbbbbbbbb', 'y']);
+    expect(alike[0]).not.toBe(alike[1]);
+    expect(alike[0].length).toBeLessThanOrEqual(LABEL_CHARS);
   });
 });

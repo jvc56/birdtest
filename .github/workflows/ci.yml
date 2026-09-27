@@ -1,9 +1,13 @@
 # Per pull request, cheapest first (TESTING.md, "Per pull request"): the
 # backend's lint, unit, contract and integration tests against a Postgres
-# service, the frontend's type check and build, both images the deployment
-# runs, the end-to-end journeys, the Terraform, and MAGPIE's half of the
-# contract fixtures.
+# service, the frontend's type check and build, the three images the
+# deployment runs, the end-to-end journeys, the Terraform, the scripts that
+# can be checked without Docker, and MAGPIE's half of the contract fixtures.
 name: CI
+
+# Read-only: nothing here writes to the repository or its releases.
+permissions:
+  contents: read
 
 on:
   push:
@@ -13,6 +17,7 @@ on:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     services:
       postgres:
         image: postgres:16
@@ -45,7 +50,7 @@ jobs:
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=birdtest -e MINIO_ROOT_PASSWORD=birdtestbirdtest \
             cgr.dev/chainguard/minio:latest server /data
-          until curl -fsS http://localhost:9000/minio/health/live; do sleep 1; done
+          timeout 60 bash -c 'until curl -fsS http://localhost:9000/minio/health/live; do sleep 1; done'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -62,6 +67,7 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: frontend
@@ -69,7 +75,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
       - run: npm ci
@@ -79,6 +85,7 @@ jobs:
 
   images:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       # Builds MAGPIE from the pinned commit as well as the Rust binary, so a
@@ -91,13 +98,15 @@ jobs:
       # directories do: MAGPIE loads a default layout before it parses any
       # argument, and the image deliberately carries no data directory. The
       # grep is the check -- MAGPIE reports failures on stderr and exits 0, so
-      # running it bare would pass whatever happened.
+      # running it bare would pass whatever happened. The build target too:
+      # production runs this binary, and tiers 5 and 6 never do, so a
+      # `-march=native` build would pass everything else.
       - name: The image's MAGPIE reports its builders
         run: |
           docker run --rm \
             -v "$PWD/backend/src/magpie_standard15.txt:/probe/data/layouts/standard15.txt:ro" \
             -w /probe --entrypoint magpie birdtest-backend builders \
-            | tee /dev/stderr | grep -q '"wmp_builder_version"'
+            | tee /dev/stderr | grep '"wmp_builder_version"' | grep -q '"build_target":"nehalem"'
       - name: Derived-file builder image
         run: docker build -f docker/Dockerfile --target derived-builder -t birdtest-derived-builder .
       - name: Frontend image
@@ -117,10 +126,21 @@ jobs:
       # directories it fills itself. Built in the backend image's own base,
       # so the binary links against the glibc it will run on rather than the
       # runner's newer one.
+      # The MAGPIE this branch pins (docker/Dockerfile), not the branch's head:
+      # a MAGPIE change pushed ahead of the pin would otherwise fail, or pass,
+      # a pull request that does not include it. The nightly tests the head.
+      - name: Read the pinned MAGPIE commit
+        id: magpie-pin
+        # An empty pin (the ARG renamed) would check out MAGPIE's default
+        # branch and test that instead, silently.
+        run: |
+          commit="$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)"
+          [ -n "$commit" ] || { echo "no ARG MAGPIE_COMMIT= in docker/Dockerfile" >&2; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE
-          ref: birdtest-contribute
+          ref: ${{ steps.magpie-pin.outputs.commit }}
           path: magpie
       - name: Build MAGPIE
         run: |
@@ -129,7 +149,7 @@ jobs:
              && make magpie BUILD=portable_release -j"$(nproc)"'
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
           cache-dependency-path: e2e/package-lock.json
       - uses: actions/setup-python@v5
@@ -158,6 +178,7 @@ jobs:
   # unescaped quotes in variables.tf that made every `terraform init` fail.
   terraform:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: infra
@@ -170,22 +191,49 @@ jobs:
       - run: terraform init -backend=false -input=false
       - run: terraform validate
 
+  # Scripts checked without Docker or AWS.
+  scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: dev-restore.sh scrubs unless told 0, and refuses anything else
+        run: ./scripts/dev-restore-check.sh
+      - name: every bash block in RUNBOOK.md and README.md parses
+        run: ./scripts/runbook-check.sh RUNBOOK.md README.md
+
   # MAGPIE's half of the contract. Each repository
   # tests against its own copy of the fixtures, so a fixture changed here and
   # not copied to MAGPIE would pass both suites while breaking the protocol.
-  # This runs MAGPIE's contribute tests against *this* branch's fixtures.
-  # It does not catch a MAGPIE-side change; the nightly end-to-end job does.
+  # This runs the pinned MAGPIE's contribute tests against *this* branch's
+  # fixtures. A MAGPIE-side change past the pin is the nightly's to catch.
   magpie-contract:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      # The MAGPIE this branch pins (docker/Dockerfile), not the branch's head:
+      # a MAGPIE change pushed ahead of the pin would otherwise fail, or pass,
+      # a pull request that does not include it. The nightly tests the head.
+      - name: Read the pinned MAGPIE commit
+        id: magpie-pin
+        # An empty pin (the ARG renamed) would check out MAGPIE's default
+        # branch and test that instead, silently.
+        run: |
+          commit="$(sed -n 's/^ARG MAGPIE_COMMIT=//p' docker/Dockerfile | head -n 1)"
+          [ -n "$commit" ] || { echo "no ARG MAGPIE_COMMIT= in docker/Dockerfile" >&2; exit 1; }
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v4
         with:
           repository: jvc56/MAGPIE
-          ref: birdtest-contribute
+          ref: ${{ steps.magpie-pin.outputs.commit }}
           path: magpie
       - name: Use this branch's contract fixtures
-        run: cp contract-fixtures/*.json magpie/test/birdtest_contract/
+        # Cleared first: a fixture renamed or removed here stayed in MAGPIE's
+        # copy, and its test passed on the stale file.
+        run: |
+          rm -f magpie/test/birdtest_contract/*.json
+          cp contract-fixtures/*.json magpie/test/birdtest_contract/
       - name: Cache MAGPIE data
         id: magpie-data
         uses: actions/cache@v4
@@ -201,7 +249,8 @@ jobs:
       - name: Build and run MAGPIE's contribute tests
         working-directory: magpie
         run: make magpie_test && ./bin/magpie_test contribute
-      # The derived-file builders, pinned by hash. birdtest publishes the
+      # The derived-file builders, pinned by hash (and the KLV builders, whose
+      # version "Check artifacts" reports). birdtest publishes the
       # SHA-256 of the wordmap and rack info table its server built, and every
       # worker refuses one whose bytes differ -- so a builder change that
       # slipped through without a version bump would take the fleet down, job
@@ -213,14 +262,47 @@ jobs:
       # And the conversions birdtest's server actually invokes. A rename or a
       # changed positional argument here is a server that cannot build
       # anything, discovered on deploy rather than in CI.
-      - name: Check the conversions birdtest invokes still exist
+      - name: Check the conversions birdtest invokes still work
         working-directory: magpie
+        shell: bash
         run: |
+          set -euo pipefail
           make magpie
-          ./bin/magpie builders
-          for conversion in dawg2wordmap klvwmp2rit rackequity2klv; do
-            if ! ./bin/magpie help convert | grep -q "$conversion"; then
-              echo "magpie no longer offers '$conversion', which birdtest runs" >&2
-              exit 1
-            fi
+          magpie="$PWD/bin/magpie"
+          # MAGPIE exits 0 on an error, so the output is what says it worked.
+          "$magpie" builders | tee /dev/stderr | grep -q '"klv_builder_version"'
+          # Each command as the server runs it (backend/src/magpie.rs): in a
+          # scratch root whose ./data holds the inputs, on MAGPIE's two-letter
+          # test lexicon. A help text that still names a conversion says nothing
+          # about its arguments, and `createdata klv` was not in it at all.
+          scratch=$(mktemp -d)
+          mkdir -p "$scratch/data/lexica" "$scratch/data/letterdistributions" "$scratch/data/layouts"
+          # The layout the server writes (backend/src/magpie.rs), not MAGPIE's
+          # own copy: a renamed default would otherwise pass here and fail
+          # every conversion on the server.
+          cp ../backend/src/magpie_standard15.txt "$scratch/data/layouts/standard15.txt"
+          cp testdata/lexica/CSW21_ab.kwg testdata/lexica/CSW21_ab.klv2 "$scratch/data/lexica/"
+          cp testdata/letterdistributions/english_ab.csv "$scratch/data/letterdistributions/"
+          # english_ab's eight full racks, A^k B^(7-k), for rackequity2klv.
+          python3 - "$scratch/data/lexica/racks.csv" <<'PY'
+          import sys
+          with open(sys.argv[1], "w") as f:
+              for a in range(8):
+                  f.write(f"{'A' * a}{'B' * (7 - a)},{a + 1},{a - 3}\n")
+          PY
+          cd "$scratch"
+          run() {
+            echo "+ magpie $*"
+            out=$("$magpie" "$@" 2>&1) || { echo "$out" >&2; exit 1; }
+            if grep -q '(error ' <<<"$out"; then echo "$out" >&2; exit 1; fi
+          }
+          run convert dawg2wordmap CSW21_ab english_ab -threads 1
+          run convert klvwmp2rit CSW21_ab english_ab CSW21_ab CSW21_ab -threads 1
+          run createdata klv zero english_ab
+          run convert rackequity2klv racks english_ab -threads 1
+          for f in CSW21_ab.wmp CSW21_ab.rit zero.klv2 racks.klv2; do
+            test -s "data/lexica/$f" || { echo "magpie wrote no data/lexica/$f" >&2; exit 1; }
           done
+          if ls data/lexica | grep -q '\.tmp$'; then
+            echo "magpie left temporaries: $(ls data/lexica)" >&2; exit 1
+          fi

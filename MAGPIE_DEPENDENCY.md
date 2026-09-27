@@ -197,9 +197,11 @@ together with the builder that produced it.
   is birdtest's fleet that a silent change would take down.
 - **The server rebuilds on a bump.** Deploying a server with a newer MAGPIE
   records new hashes under the new builder version; old ones stay for workers
-  still on the old builder until the floor moves past them. Activating a job
-  again is what re-queues its files, which is why activation requests them as
-  well as creation.
+  still on the old builder until the floor moves past them. The first claim
+  that considers a job after the deployment queues its files under the new
+  builder (as creating or activating it does); until the thirty-first audit
+  only activation did, and every running job needing a wordmap or a table
+  handed out nothing after such a deployment until an admin re-activated it.
 
 **One departure.** The proposal had a worker decline immediately when its
 builder version differed, to avoid a wasted three-minute build. That is not what
@@ -394,10 +396,11 @@ both existed.
   zero.
 - `klvwmp2rit` takes the KLV's and the wordmap's names separately.
 - `BUILD=portable_release`.
-- `MAGPIE_VERSION` 0.1.0, the branch's pre-release version. It was incremented
-  through 0.5.1 as birdtest and MAGPIE changed together, but none of that is in
-  production, so it is 0.1.0 until the first release; the floor is the same
-  value and moves with it.
+- `MAGPIE_VERSION` 0.1.1. It moves with every change that can alter what a
+  task computes or submits, and birdtest's floor moves with it (0.1.1: a
+  capturing static player no longer plays its worst move; a leave task plays
+  the KLV it fetched, not the previous task's; a `429` no longer sleeps for
+  hours).
 
 **birdtest**
 

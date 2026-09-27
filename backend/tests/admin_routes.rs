@@ -232,7 +232,7 @@ async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
         assert_eq!(job["created_by"], json!(admin.id), "{created}");
         assert_eq!(
             (&job["min_magpie_major"], &job["min_magpie_minor"], &job["min_magpie_patch"]),
-            (&json!(0), &json!(1), &json!(0)),
+            (&json!(0), &json!(1), &json!(1)),
             "the server's floor is the default: {created}"
         );
 
@@ -267,6 +267,24 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
     let german = db.input_data("letterdist", "german").await;
     let winpct = db.input_data("winpct", "winpct").await;
     let other_winpct = db.input_data("winpct", "winpct2").await;
+    // More letters than MAGPIE holds: parsed at job creation now, rather than
+    // failing every claim of the job (and overrunning MAGPIE's arrays).
+    let too_many: String = (0..51)
+        .map(|i| {
+            let letter = char::from_u32(0x100 + i).unwrap();
+            format!("{letter},{letter},1,1,0\n")
+        })
+        .collect();
+    let oversized: Uuid = sqlx::query_scalar(
+        "INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
+         VALUES ('letterdistributions/huge.csv', 'letterdist', 'huge', $1, 1, '20251004', $2)
+         RETURNING id",
+    )
+    .bind(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"huge")))
+    .bind(too_many.as_bytes())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
 
     let plain = created_config(&admin, static_config("static", &files)).await;
     let simmer = created_config(&admin, simming_config("simmer", &files, Some(winpct))).await;
@@ -291,6 +309,7 @@ async fn job_creation_refuses_each_impossible_combination_and_says_which() {
         ("a letter distribution that does not exist", with(&|body| body["letterdist_id"] = json!(Uuid::new_v4())), "no input data row"),
         ("a layout that does not exist", with(&|body| body["layout_id"] = json!(Uuid::new_v4())), "no input data row"),
         ("a lexicon given as the letter distribution", with(&|body| body["letterdist_id"] = json!(files.kwg)), "expected a letterdist row"),
+        ("a letter distribution MAGPIE cannot hold", with(&|body| body["letterdist_id"] = json!(oversized)), "cannot be used"),
         ("a player config that does not exist", with(&|body| body["player2_config_id"] = json!(Uuid::new_v4())), "player config not found"),
     ];
     for (name, body, says) in cases {
@@ -603,6 +622,15 @@ async fn a_ban_by_either_identity_refuses_the_next_claim_and_unban_restores_it()
         let (status, refusal) = admin.post("/api/admin/workers/ban", body).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
         assert!(message(&refusal).contains("exactly one of user_id or anon_uuid"), "{refusal}");
+    }
+    // A reason is a sentence, and holds no NUL, which was a `500` (the audit's
+    // pass 22).
+    // Each refusal says which, on the field.
+    for (reason, said) in [("x".repeat(1_001), "too long"), ("spam\u{0}".to_string(), "NUL")] {
+        let (status, refusal) = admin.post("/api/admin/workers/ban", json!({ "user_id": user, "reason": reason })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+        assert!(message(&refusal).contains(said), "{refusal}");
+        assert_eq!(refusal["fields"][0]["field"], "reason", "{refusal}");
     }
     let (status, _) = admin.delete(&format!("/api/admin/workers/ban/{}", Uuid::new_v4())).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

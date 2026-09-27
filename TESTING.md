@@ -68,20 +68,22 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 152 | `#[cfg(test)]` in `jobs::plausibility` (22), `inputdata` (17), `stats::sprt` (12), `stats::bradley_terry` (12), `jobs::racks` (13), `error` (7), `config` (7), `routes::admin` (7), `jobs::handler` (6), `backups` (5), `auth::api_key` (4), `auth::session` (4), `clientip` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `extract` (3), `magpie` (3), `models::job` (3), `jobs::opening_rack` (3), `version` (3), `email` (2), `sse` (2), `exports`, `jobs::dispatch`, `jobs::game`, `jobs::game_pair` (1 each) |
-| 1F Frontend unit | 93 | Vitest, `frontend/src/lib/`: `format.test.ts` (17), `api.test.ts` (13), `auth.test.ts` (9), `sse.test.ts` (8), and `charts/`: `ratingDotPlot.test.ts` (16), `ratingHistory.test.ts` (14), `residuals.test.ts` (10), `pentanomial.test.ts` (6) |
-| 2 Integration | 135 | `backend/tests/`: `leave_gen.rs` (27), `ratings.rs` (22), `scheduler.rs` (18), `stats.rs` (12), `input_data.rs` (11), `jobs.rs` (12), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (6), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 147 | `backend/tests/`: `worker_api.rs` (43), `admin_api.rs` (25), `worker_routes.rs` (15), `auth_routes.rs` (14), `boundaries.rs` (11), `admin_routes.rs` (10), `public_api.rs` (9), `authz.rs` (7), `auth_api.rs` (5), `account.rs` (4), `finish.rs` (3), `fake_worker.rs` (1) |
+| 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 126 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `ratingHistory.test.ts` (17), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 223 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (26), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 10 | Playwright journeys `E-1`..`E-10` in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 10 cases + 13 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 13 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (6), `magpie_routes.rs` (2) |
+| 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 461 backend tests.
+--run-ignored all` runs 636 backend tests (the per-tier counts above are
+from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
+they had drifted by up to 17).
 
-Tier 2 was the largest gap and the highest value, and is now the largest tier.
+Tier 2 was the largest gap and the highest value.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
 of exactly this shape shipped and were found by hand before the harness existed
 — a three-column `INSERT` into a table with a fourth `NOT NULL` column, and a
@@ -148,7 +150,7 @@ incidentally by higher tiers.
 | `lib/sse.ts` | 1F | Covered (`F-SSE-*`) |
 | `lib/auth.ts` | 1F | Covered (`F-AUTH-*`) |
 | Chart maths | 1F | Covered (`F-CHART-*`). The arithmetic moved out of the components into `lib/charts/*.ts` so it could be tested; the `.svelte` files that draw it are exercised only by tier 5 |
-| Every page under `routes/` | 5 | Partial — the ten journeys. `/users`, `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them; their endpoints are tier 3 |
+| Every page under `routes/` | 5 | Partial — the eleven journeys (E-10 visits `/users`). `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them; their endpoints are tier 3 |
 
 ### Scripts and cross-repo
 
@@ -157,7 +159,9 @@ incidentally by higher tiers.
 | `worker/fake_worker.py` output shapes | 1 | Covered — a captured submission for every job type and every `--mode` (`U-FAKE-*`) |
 | `scripts/seed.py` | 5, 6 (used by both) | Covered by use: `e2e/run.sh` and `e2e_magpie.py` both seed through it |
 | `scripts/dev.py` | Manual | Deliberate — see [Not tested](#what-is-deliberately-not-tested) |
-| `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh` | Nightly | Covered (`S-BACKUP-*`) |
+| `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh`, RUNBOOK §1's re-apply step | Nightly | Covered (`S-BACKUP-*`) |
+| `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`, `-2`) |
+| `scripts/dev-restore.sh` | CI (`scripts`) | Covered (`S-BACKUP-6`: its `SCRUB` rule against a stub `COMPOSE`, and that the scrub is the copy's) |
 | birdtest ↔ MAGPIE wire | 4 + 6 | Covered — `C-1`..`C-9` on both sides, and tier 6 |
 
 ---
@@ -240,11 +244,30 @@ against it, so a change in ordering silently re-points existing rows.
   every rack with a blank comes after every rack without in the index — and a
   rack containing one round-trips through `rack_at`. *(Covered:
   `racks::tests::blanks_lead_their_racks_and_sit_at_the_end_of_the_index`.)*
+- `U-RACK-9` A distribution with more letters than MAGPIE's `MAX_ALPHABET_SIZE`
+  (50) is refused, naming the file; one at the limit parses. MAGPIE loaded a
+  longer one and wrote past every per-letter array. *(Covered:
+  `racks::tests::a_distribution_past_magpies_alphabet_is_refused`; job creation
+  refuses one in `A-ADMIN-3`.)* (Twenty-second audit.)
 
 ### `U-ERR-*` — error mapping (`error.rs`)
 
 Every handler returns `AppResult`, so this type decides what a caller sees.
 
+- `U-RACK-10` The parser reads a distribution as MAGPIE does: a comment line,
+  a whitespace-only line, four or six columns, a non-integer score, a vowel
+  flag other than 0 or 1 and a letter with a space round it are each refused,
+  a CRLF ending and a blank line are accepted, and a `#` row is a letter that
+  takes its machine letter. It used to trim, skip `#` lines and want three
+  columns, so job creation passed files every worker then refused, and a `#`
+  letter shifted the numbering. *(Covered:
+  `racks::tests::it_reads_a_distribution_as_magpie_does`,
+  `racks::tests::a_minimal_two_letter_distribution_parses`.)* (Twenty-third
+  audit; since the twenty-fourth, also refused as MAGPIE refuses them or
+  cannot hold them: a CRLF blank line (a lone `\r`), a field that is only
+  `\r`, a count above 255 (MAGPIE keeps it in a byte), and a letter longer
+  than 4 bytes (MAGPIE's shipped maximum; some of its buffers hold no more),
+  and, since the twenty-fifth, a fullwidth display form longer than 5 bytes.)
 - `U-ERR-1` Each `AppError` constructor maps to its documented HTTP status:
   `bad_request` → 400, `unauthorized` → 401, `forbidden` → 403, `not_found` →
   404, `conflict` → 409, `rate_limited` → 429, `internal` → 500. *(Covered:
@@ -263,6 +286,22 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
   payload_too_large` in the same shape; and a body above the blocking-pool
   threshold parses to the same value as one below it. *(Covered:
   `extract::tests::*`.)*
+- `U-ERR-6` **Request bodies are read in two tiers** (`extract::read_body`): a
+  large body (declaring over 1 MiB) is reserved whole before a byte is read
+  and given back, owner and all, when dropped; past the budget, or past one
+  owner's 64 MiB share, it is refused at once with `503` and `Retry-After`, never
+  queued holding part of it; a small body never touches the budget, one
+  declaring nothing is cut off at 1 MiB, and a large body declared to a route
+  without the budget is `413` unread; a stalled large body is let go with its
+  reservation. *(Covered: `extract::tests::a_large_body_is_reserved_whole_and_given_back`,
+  `…::a_large_body_that_cannot_be_reserved_is_refused_at_once`,
+  `…::a_small_body_never_waits_and_an_undeclared_one_is_bounded`,
+  `…::a_stalled_large_body_is_let_go_with_its_reservation`.)* (Thirty-first
+  audit: a caller with no credentials held a dozen 60 MiB uploads open and took
+  the web task from 38 MB to 778 MB. The audit's first fix, one budget for every
+  body charged as bytes arrived, let 192 identity-less claims make every
+  heartbeat wait ten seconds for a `503`; its adversarial check found that, and
+  these tests are the redesign's.)
 - `U-ERR-4` A `sqlx::Error` converted into `AppError` becomes a 500 whose public
   message does **not** contain the SQL string or the database URL. A leaked
   query in an error body is the failure this test exists for. *(Covered:
@@ -302,6 +341,20 @@ Every handler returns `AppResult`, so this type decides what a caller sees.
   `csrf::tests::tokens_are_unpredictable`.)*
 - `U-AUTH-8` A confirmation code is stored only as its hash. *(Covered:
   `api_key::tests::a_confirmation_code_is_stored_only_as_its_hash`.)*
+- `U-AUTH-9` Argon2 runs wait for one of four turns: with every turn taken, a
+  hash does not start, and it runs once one is given back. Unbounded, a flood
+  of sign-ins and registrations from seven addresses took the process to
+  2.6 GB; bounded, and with the allocator's mmap threshold pinned, the same
+  flood peaked at 129 MB and fell back to 52 MB (measured on a native backend;
+  the memory half is not a unit test). *(Covered:
+  `api_key::tests::argon2_runs_wait_for_a_turn`.)* (Thirty-second audit.)
+- `U-AUTH-9b` A request that goes away does not leave its Argon2 run queued
+  past the four turns: the turn goes with the run, and a run whose requester
+  has gone is skipped. A thousand aborted requests leave a fresh hash under a
+  second (it fails when the request holds the turn: the run took 8.4 s).
+  *(Covered:
+  `api_key::tests::abandoned_argon2_runs_do_not_queue_past_the_turns`.)*
+  (Thirty-second audit.)
 
 ### `U-CFG-*` — configuration (`config.rs`)
 
@@ -323,8 +376,13 @@ process environment, so no test mutates `std::env` under another.
   `config::tests::a_malformed_version_floor_fails_startup`.)*
 - `U-CFG-4` A value that is present but malformed — a duration, a count, a
   boolean, an unknown `MAIL_BACKEND`, `MAIL_BACKEND=file` with no
-  `MAIL_OUTBOX_DIR` — fails startup naming the setting rather than becoming its
-  default. *(Covered:
+  `MAIL_OUTBOX_DIR`, `MAIL_BACKEND=ses` with no `MAIL_FROM` or `PUBLIC_URL`
+  (whose defaults are a laptop's; pass 24, which also drops a `PUBLIC_URL`'s
+  trailing slash, that made links `//confirm-email`), a heartbeat timeout outside 180 s to a day (below
+  MAGPIE's cadence a live claim lapsed and was handed on, thirty-second audit),
+  a session TTL outside a minute to a year, a `BIND_ADDR` that is not an
+  address — fails startup naming the setting
+  rather than becoming its default. *(Covered:
   `config::tests::a_malformed_value_is_refused_rather_than_defaulted`.)*
 
 ### `U-WIRE-*` — wire types (`jobs/handler.rs`, `models/job.rs`)
@@ -359,6 +417,18 @@ process environment, so no test mutates `std::env` under another.
   `GameConfig` and a `GamePairConfig`, so the two job types cannot diverge.
   *(Covered: `job::tests::sprt_params_read_the_same_settings_from_games_and_pairs`.)*
 
+### `U-DISPATCH-*` — the job template cache (`jobs/dispatch.rs`)
+
+- `U-DISPATCH-1` Forgetting a job drops its template, and forgetting an unknown
+  one is nothing. *(Covered: `dispatch::tests::a_forgotten_job_is_read_again`.)*
+- `U-DISPATCH-2` A job whose template failed to load is passed over for a
+  minute, without a connection or a log line, then tried again; forgetting the
+  job clears it. Without it, a job that never issues a claim heads every
+  candidate list, and every claim of every worker paid a pool connection, the
+  read and parse, and an error line for it. *(Covered:
+  `dispatch::tests::a_job_whose_template_failed_is_passed_over_for_a_while`.)*
+  (Twenty-fourth audit.)
+
 ### `U-PLAUS-*` — plausibility gaps (`jobs/plausibility.rs`)
 
 Thirteen rules were covered before these -- the thirteenth, that a leave batch
@@ -370,12 +440,24 @@ The two that were missing:
   `game_pairs` and does not for `games` — the pairs-versus-games unit confusion
   that the `min_pairs`/`max_pairs` naming exists to keep straight. The rule is
   `plausibility::check_batch_size` against `games_dispatched`, which
-  `registry::store_result` runs for both job types; there is no
+  `registry::decode_result` runs for both job types; there is no
   `check_against_task`, as this entry first named it. *(Covered:
   `plausibility::tests::a_pairs_batch_dispatches_two_games_a_pair_and_a_games_batch_does_not`.)*
 - `U-PLAUS-2` A batch reporting one game more, and one fewer, than dispatched is
   rejected; the exact count passes. *(Covered:
   `plausibility::tests::a_batch_one_game_off_in_either_direction_is_rejected`.)*
+- `U-PLAUS-3` A rack is counted in tiles, a bracketed multi-character letter
+  (`[L·L]`, `[NY]`, `[QU]`) being one: seven Catalan tiles pass and eight do
+  not, and an unclosed or empty bracket is malformed. Counted in characters,
+  every captured position of a Catalan games job was refused. *(Covered:
+  `plausibility::tests::racks_are_bounded_by_what_a_rack_holds`.)* (Eleventh
+  audit.)
+- `U-PLAUS-4` A negative `num_moves` is refused (cast to `usize` it was larger
+  than any list), and per-ply statistics must be numbered from 0 in order, with
+  a bingo percentage in [0, 100] and a finite, non-negative average score.
+  *(Covered:
+  `plausibility::tests::a_worker_cannot_report_more_moves_than_it_generated`,
+  `plausibility::tests::per_ply_statistics_are_statistics`.)* (Eleventh audit.)
 
 ### `U-STATS-*` — pinned numbers (`stats/sprt.rs`, `stats/bradley_terry.rs`)
 
@@ -398,6 +480,46 @@ computed outside the code, in 40-digit decimal from PLAN.md's formulas.
   (400/ln 10)/√(n·p·(1−p)): 49.1348… Elo for an even 50 games, a tenth of that
   at 5,000, and 1.2687… for 75% over 100,000. *(Covered:
   `bradley_terry::tests::more_games_narrow_the_standard_error`.)*
+- `U-STATS-5` The fit returns noiseless evidence's own ratings, within a few
+  Elo, for the shapes that defeated the old one-config-at-a-time solver and
+  its prior toward the anchor (KL-74): a 12-member group joined to the anchor
+  by one 300-pair job (every member's error at least the link's ≈28 Elo), a
+  30-member group, a disconnected island (unrated, its internal gap intact)
+  and a hundred-member pool (under a second in a debug build); a 20-config
+  chain and a 12-rung ladder within 0.6 of each config's error (KL-79). And for
+  the shapes the audit's adversarial checks found: a config over a gauntlet of
+  twenty lightly played opponents within half its error; conceding a quarter
+  or half point lowers the conceding config's rating in the cases pinned (the
+  rare exception, under an Elo, is KL-79's); twenty baselines swept by both the
+  anchor and a config 400 above it leave that config within one error; a
+  strong tier 1,000 above joined by one job within about half its error; two
+  tiers of lightly played configs 600 or 800 Elo apart, joined by one small
+  job, the upper within 1.5 of its shown error, which includes the prior's
+  pull (1.7 and more without it); a
+  newcomer's sweep shrunk the same in a young pool as a mature one; a field
+  that swept the anchor held in place by its virtual games, not floated by
+  unrelated young configs; clean
+  sweeps contradicting the rest of a pool converge with finite errors; a
+  newcomer's clean sweep rates higher the more pairs it swept; a well-played
+  head-to-head is its maximum likelihood; and a fit with million-pair
+  head-to-heads says it converged. *(Covered:
+  `bradley_terry::tests::a_thinly_linked_cluster_is_fitted_where_it_is_with_the_links_error`,
+  `a_long_chain_reaches_its_top`, `a_large_cluster_is_not_pulled_toward_the_anchor`,
+  `an_island_does_not_stop_the_fit_converging`,
+  `a_clean_sweep_of_a_group_stays_finite`, `a_hundred_member_pool_fits_quickly`,
+  `contradicting_clean_sweeps_do_not_throw_the_fit_into_saturation`,
+  `a_newcomers_clean_sweep_rates_higher_the_more_it_swept`,
+  `a_well_played_head_to_head_is_its_maximum_likelihood`,
+  `a_gauntlet_of_lightly_played_opponents_does_not_hold_a_config_back`,
+  `a_fit_at_the_answer_with_huge_head_to_heads_says_it_converged`,
+  `a_clean_sweep_rates_at_least_a_near_sweep`,
+  `shared_swept_baselines_do_not_pull_a_config_toward_the_anchor`,
+  `a_ladder_is_not_compressed_past_its_errors`,
+  `a_strong_tier_joined_thinly_is_not_pulled_to_the_centre`,
+  `a_newcomer_is_shrunk_the_same_in_a_young_pool_as_a_mature_one`,
+  `a_field_that_swept_the_anchor_does_not_float_on_young_configs`,
+  `the_error_shown_covers_what_the_prior_pulls_a_thin_tier`.)*
+  (Thirty-second audit.)
 
 ### `U-FAKE-*` — fake worker shapes (`worker/fake_worker.py`)
 
@@ -458,8 +580,77 @@ path, nothing recognisable, and a bomb by compression ratio.)
   and refusing them refused the whole release. *(Covered:
   `inputdata::tests::a_symlink_alias_is_pinned_with_its_targets_bytes`,
   `inputdata::tests::a_symlink_that_is_not_an_alias_inside_the_archive_is_refused`.)*
+- `U-ARCHIVE-5b` An alias of a letter distribution or layout counts as its
+  target's bytes against the archive's total and ratio (a lexicon's is a link
+  on the worker and no second copy on the server, so costs nothing), and a letter distribution or layout — kept in its row — is
+  at most 64 KiB. As a zero-byte entry, a few hundred aliases of one large
+  layout were held, staged and inserted a few hundred times over (150 of a
+  4 MiB one: 600 MiB from a 263 KiB gzip). *(Covered:
+  `inputdata::tests::aliases_count_as_their_targets_bytes_and_kept_files_are_small`.)*
+  (Thirty-second audit.)
 - `U-ARCHIVE-6` The limits are PLAN.md's table; changing one is a design change.
   *(Covered: `inputdata::tests::the_walk_limits_are_the_ones_the_design_states`.)*
+- `U-ARCHIVE-7` A file whose name MAGPIE would refuse as a path — a `.`, a
+  space, an empty name — is not importable, so no job can be pinned to it and
+  stop every worker it reaches. *(Covered:
+  `inputdata::tests::ignores_what_birdtest_does_not_pin`.)* (Twelfth audit.)
+- `U-ARCHIVE-8` A PAX `size` record is refused, pinned entry or not, and so
+  cannot make the walk and the reader disagree on where the next header
+  starts. *(Covered: `inputdata::tests::a_pax_size_record_is_refused`,
+  `inputdata::tests::a_pax_size_record_cannot_move_the_next_header`.)*
+  (Thirty-first audit: first a header saying 0 and a record saying 900 MiB
+  passed every cap and was read whole, 927 MiB resident from a 4 MiB gzip; then,
+  with the size honoured, a record ahead of an ordinary entry slipped an 8 MiB
+  PAX header past a first pass that read raw. The walk is raw since, and reads
+  extension headers itself.)
+- `U-ARCHIVE-9` An archive naming one pinned path twice — two files, or a file
+  and an alias — is refused. *(Covered:
+  `inputdata::tests::an_archive_naming_a_path_twice_is_refused`.)* (Thirty-first
+  audit: both were staged and confirmed as rows, of which a worker extracting
+  the tarball holds only the last.)
+- `U-ARCHIVE-10` An extension header — a PAX record or a GNU long name, which
+  the walk reads itself (an interpreting reader read it whole, before the walk
+  saw an entry) — larger than 64 KiB is refused before it is read, and every decompressed byte, headers and
+  skipped data included, counts against the 1 GiB cap (and the ratio, past a
+  64 MiB floor for archives of many tiny entries). *(Covered:
+  `inputdata::tests::a_large_extension_header_is_refused_before_it_is_read`,
+  `inputdata::tests::skipped_data_counts_against_the_caps`.)* (Thirty-first
+  audit, second pass: a 400 KB gzip with a 400 MB PAX header held 465 MB and
+  was accepted.)
+- `U-ARCHIVE-13` PAX records are split by their stated lengths: a value with a
+  newline (an extended attribute, as GNU tar and macOS write) walks, and a
+  keyword after an extra blank is refused rather than read as another.
+  *(Covered: `inputdata::tests::pax_records_are_split_by_their_lengths`.)*
+  (Thirty-first audit, pass 4: the tar crate's parser split on newlines and
+  refused such a release, and read `"  size"` as a keyword other than `size`.)
+- `U-ARCHIVE-14` Headers GNU tar reads otherwise than the tar crate are
+  refused: a base-64 size, a base-256 size other than a positive eight-byte
+  one, a directory or link with data, a file whose name ends in `/` (GNU tar
+  makes it a directory and reads on into its data), a ustar header of another
+  version, a NUL in a PAX path, a second PAX header before one entry.
+  *(Covered: `inputdata::tests::headers_extractors_read_differently_are_refused`,
+  and `an_entry_given_two_names_is_refused` for the second header.)*
+- `U-ARCHIVE-15` A tarball gzipped in several members walks every member, as
+  `tar -xzf` does; and a path spelled `./data/...` or `data//...` is the same
+  file as `data/...` for the one-name rule. *(Covered:
+  `inputdata::tests::every_gzip_member_is_walked`,
+  `inputdata::tests::a_path_named_twice_in_two_spellings_is_refused`.)*
+- `U-ARCHIVE-11` A GNU sparse entry is refused as it is met, its extension
+  blocks never expanded. *(Covered:
+  `inputdata::tests::a_sparse_entry_is_refused_unexpanded`, which also bounds
+  what the walk holds.)* (Thirty-first audit, third pass: an interpreting reader
+  built 64 bytes for every 24 of them, 1.1 GB from a 44 MB gzip.)
+- `U-ARCHIVE-12` What another tool writes still walks: a PAX `path` (with an
+  `mtime`, as Python's `tarfile` writes) and a GNU long name each name the entry
+  after them — once: a second name for the same entry (another PAX header, a
+  long name beside a PAX path) and a global PAX `path` are refused, as GNU tar
+  would extract under a name the walk did not choose, while a comment-only
+  global header walks. *(Covered:
+  `inputdata::tests::pax_paths_and_long_names_name_the_entry_after_them`,
+  `inputdata::tests::an_entry_given_two_names_is_refused`.)* Also
+  checked by hand in the thirty-first audit: 51 release files (133 MB) packed by
+  GNU tar and, with PAX headers on every member, by Python's `tarfile`, both
+  walked to the same 37 pinned files.
 
 ---
 
@@ -484,8 +675,10 @@ colours whenever their ratings crossed.
 
 Each entry's tests are the `describe` block named for its id.
 
-- `F-FMT-1` `workerLabel` renders a username when present, "Anonymous" plus a
-  short UUID prefix when not, and never leaks a full UUID. *(Covered:
+- `F-FMT-1` `workerLabel` renders a username when present, "Anonymous" plus
+  the whole sixteen-character pseudonym when not (what `?worker=` takes;
+  eight characters were shared by several contributors at a few hundred
+  thousand), and never leaks a full UUID passed by mistake. *(Covered:
   `format.test.ts`.)*
 - `F-FMT-2` `duration` renders seconds, minutes, hours and days at the right
   boundaries, and `null` as a dash rather than "null". *(Covered:
@@ -498,6 +691,11 @@ Each entry's tests are the `describe` block named for its id.
   `toString` that an object literal answers. *(Covered: `format.test.ts`.)*
 - `F-FMT-5` `sprtLabel` covers all four statuses. *(Covered:
   `format.test.ts`.)*
+- `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
+  number box as `null`, and `Number(null)` is 0, which the player-config form
+  wrote into configs that cannot be edited), and a request's blank required
+  fields are named before it is sent (the job form). *(Covered:
+  `format.test.ts`.)* (Twenty-second audit.)
 
 ### `F-API-*` — `lib/api.ts`
 
@@ -506,12 +704,19 @@ Each entry's tests are the `describe` block named for its id.
 - `F-API-2` A 204 resolves to `undefined` rather than throwing on an empty body.
   *(Covered: `api.test.ts`.)*
 - `F-API-3` A 4xx with a JSON error body rejects with an `ApiError` carrying
-  `status`, `code`, `message` and `fields`. *(Covered: `api.test.ts`.)*
+  `status`, `code`, `message` and `fields`, and `Retry-After` in seconds when
+  the server sent one (the reset page says how long to wait). *(Covered:
+  `api.test.ts`.)*
 - `F-API-4` A 4xx with an empty or non-JSON body still rejects with an
-  `ApiError`, not a `SyntaxError` — as does a 200 whose body is not JSON.
+  `ApiError`, not a `SyntaxError` — as does a 200 whose body is not JSON —
+  and its message is never empty, the status text being empty over HTTP/2
+  (seventeenth audit).
   *(Covered: `api.test.ts`.)*
 - `F-API-5` Every request sets `credentials: 'include'`. *(Covered:
   `api.test.ts`.)*
+- `F-API-6` `errorText` lists the fields the server named after the message,
+  and is the message alone when there are none; the job, player-config and
+  input-data import forms show it. *(Covered: `api.test.ts`.)*
 
 ### `F-SSE-*` — `lib/sse.ts`
 
@@ -521,7 +726,29 @@ Each entry's tests are the `describe` block named for its id.
   *(Covered: `sse.test.ts`.)*
 - `F-SSE-3` The returned function closes the `EventSource`, and calling it twice
   is safe; a stream the browser gave up on is reopened after a pause, and an
-  unsubscribe cancels a pending reopen. *(Covered: `sse.test.ts`.)*
+  unsubscribe cancels a pending reopen; a job that answers a 4xx other than
+  408 or 429 (deleted, or a bad id) is not subscribed to again (sixteenth and
+  seventeenth audits). *(Covered: `sse.test.ts`.)*
+- `F-SSE-4` A stream refused again and again is asked less often: the wait
+  doubles from 5 s to a minute, jittered down by up to half, and an event
+  resets it. At a fixed 5 s, every page the server's stream cap refused asked
+  again, with a stats read first, every five seconds (twenty-first audit).
+  *(Covered: `sse.test.ts`.)*
+
+### `F-IMPORT-*` — `lib/importWatch.ts`
+
+- `F-IMPORT-1` The import page's polling: it reads at once and polls while the
+  import runs; it stops once staged (keeping the id) and forgets a failed one;
+  a late `running` cannot undo a newer `staged`; an earlier import's late answer
+  cannot touch a newer watch (it put that import on the page, stopped the new
+  one's poll and forgot its id, and Insert then confirmed the wrong import); a
+  503 or a network failure keeps it polling; a 404 forgets the import, a 401
+  keeps it and reports the lapsed session; an older read's error after a newer
+  success is ignored; stopping ignores answers in flight, and a watch after
+  stop starts nothing (a start the admin left the page during began a poll
+  nothing could clear). *(Covered:
+  `importWatch.test.ts`.)* (Twenty-fourth audit: this logic was wrong three
+  audits running.)
 
 ### `F-CHART-*` — chart maths
 
@@ -532,7 +759,10 @@ Test the pure functions; do not snapshot the SVG.
   `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-2` It clamps a runaway error bar rather than letting one
   barely-measured config flatten the scale, and still reports the true number in
-  the table. *(Covered: `charts/ratingDotPlot.test.ts`.)*
+  the table. The anchor has no bar at all, whatever error the fit stored for it
+  (with no games, `f64::MAX`, which was drawn at the cap). An error the fit
+  could not measure (`f64::MAX`) reads `±∞` in the table (`± ∞` in the
+  tooltip), not `±1.8e308`. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-3` A config with `connected_to_anchor: false` is listed as unrated
   and **not** drawn at a position. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-4` `RatingHistoryChart` caps at six series, picks them by latest
@@ -549,7 +779,8 @@ Test the pure functions; do not snapshot the SVG.
   `charts/ratingHistory.test.ts`; it used to colour by rank.)*
 - `F-CHART-6` `ResidualMatrix` sorts by absolute residual descending, and flags
   the non-transitive case only when at least three head-to-heads exceed the
-  threshold. *(Covered: `charts/residuals.test.ts`; the component now sorts
+  threshold on enough pairs to be at least three standard errors out — the
+  same misses on ten pairs each do not raise it. *(Covered: `charts/residuals.test.ts`; the component now sorts
   itself instead of drawing in the order it is handed.)*
 - `F-CHART-7` The job page maps pentanomial buckets to the right labels — index
   0 is "P1 lost both", index 4 "won both". An off-by-one here inverts the
@@ -570,7 +801,31 @@ Test the pure functions; do not snapshot the SVG.
 - `F-AUTH-2` `signOut` clears the store even if the request fails, so the UI
   cannot be left showing a session that is gone. *(Covered: `auth.test.ts`.)*
 
+### `F-DOCS-*` — contributor instructions in `routes/`
+
+- `F-DOCS-1` No page tells a contributor to pass an API key on the command line
+  (`--api-key` is the test-only Python worker's flag; `magpie contribute` reads
+  a key only from an `apikey` line in `contribute.txt`), and the account page
+  shows that line for a freshly created key, under the test ids E-2 reads it
+  by; and none puts `contribute.txt` beside the binary (MAGPIE reads it from its
+  working directory); and a second process is run on a file of its own in the
+  same directory (`./bin/magpie contribute second.txt`), never "in a directory
+  of its own", where MAGPIE cannot load its board. The pages' text, read as
+  source. *(Covered: `contributeDocs.test.ts`.)* (Thirty-first audit: the
+  account page said `--api-key`, which MAGPIE rejects; thirty-second: the home
+  page's second-process advice could not start.)
+
 ---
+
+### `F-NGINX-*` — the proxy in front of the app
+
+- `F-NGINX-1` The Nginx template (compose and local stacks; deployed, the load
+  balancer sends `/api/` past it) turns chunked transfer off nowhere, in any
+  case or quoting, and proxies `/api/` over HTTP/1.1, unbuffered for SSE: with
+  chunking off, a results stream cut off part-way closed like a finished
+  download through the proxy — curl exited 0 after 15,641 of 150,000 lines,
+  and with the line removed exited 18. *(Covered: `nginxConfig.test.ts`.)*
+  (Thirty-second audit, passes 21 and 22.)
 
 ## 2. Integration
 
@@ -732,6 +987,119 @@ The single most important group. Every entry is about a decision made in SQL.
   taking all twelve; and issuing a claim stamps `jobs.last_claimed_at`, which
   is what "served" reads. *(Covered:
   `admin_api::a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity`.)*
+- `I-SCHED-3c` **A job with nothing to hand out does not set parity.** A
+  games job at its cap, its one task in flight, is served and stands still;
+  each claim that passes it over lifts it level with the job claimed
+  (`scheduler::lift_passed_over`), so the newcomer, joining at the lowest
+  served ratio and settling against the lowest of each worker's other
+  candidates, splits the next 900 claims 2:1 with the veteran, the veteran's
+  first claim within twelve (without the lift, it fails). *(Covered:
+  `admin_api::a_newcomer_is_not_put_level_with_a_job_that_has_run_out_of_work`.)*
+  (Thirty-second audit, passes 19 and 20.)
+- `I-SCHED-3d` After a quiet spell (no job has claimed within the heartbeat
+  timeout of now), "served" is measured from the latest claim, so a newcomer
+  still joins level with the veteran, not a job nobody can run: 6/6, where it
+  took 12 of 12. *(Covered:
+  `admin_api::after_a_quiet_spell_a_newcomer_still_joins_level_with_the_jobs_served`.)*
+- `I-SCHED-3e` **A newcomer is not starved behind a lagging job.** In a split
+  fleet — 30% of claims from workers that can run only an old-floor job at
+  10%, which then leads — a newcomer at 40% beside the majority's lagging job
+  gets its share of the next 1,000 claims (200 to 350; joined at the leader it
+  got none). *(Covered:
+  `admin_api::in_a_split_fleet_a_newcomer_is_not_starved_behind_a_lagging_job`.)*
+- `I-SCHED-3f` A job only a minority can run lags while served; a newcomer the
+  same minority can run gets its share (50 to 120 of that minority's 200
+  claims; it got none). *(Covered:
+  `admin_api::a_minority_newcomer_is_not_starved_behind_a_lagging_minority_job`.)*
+- `I-SCHED-3g` **A job nobody could run does not bank what it missed.** Unserved
+  for a heartbeat timeout (a MAGPIE floor nobody met for an hour), it rejoins
+  at parity on its first claim back (`scheduler::issue_claim`): the veteran
+  gets 19 to 21 of the next 40 claims, where it got none. *(Covered:
+  `admin_api::a_job_nobody_could_run_rejoins_at_parity_when_the_fleet_can`.)*
+- `I-SCHED-3h` **Jobs that lag together keep their shares.** Two jobs at 45%
+  that half the fleet runs, beside a 10% job the other half can only run,
+  split their half evenly (490 to 510 of 1,000 each), where bounding each lag
+  against the job just claimed gave 978 : 22. *(Covered:
+  `admin_api::jobs_lagging_together_keep_their_shares`.)*
+- `I-SCHED-3i` **A concurrent burst is paid back.** Thirty-two workers claiming
+  at once over a 1% and a 99% job: the 1% job gets at most 45 of about 3,000
+  claims (fair is 30, and 30 in practice), where forgiving the lag made it
+  64 to 87. *(Covered:
+  `admin_api::a_concurrent_burst_to_a_small_job_is_paid_back`.)*
+- `I-SCHED-3j` **A newcomer is settled level with each class that runs it.** In
+  a fleet where a job at 40% only the 20% of claims from MAGPIE 2 can run lags
+  the job at 50% everyone runs, a newcomer everyone can run, joining at the
+  lowest served ratio — the minority job's — is lifted level with the
+  majority's job by the majority's first claim of it: the majority job gets
+  its first claim within twelve and 640 to 690 of the majority's 800, where
+  the newcomer took claims until the 331st. *(Covered:
+  `admin_api::a_newcomer_everyone_can_run_is_not_put_level_with_a_minority_job`.)*
+- `I-SCHED-3k` An allocation changed in the same split (20% to 19%) is a join
+  and settles the same way: 515 to 570 of 800 to the job at 40%, where its
+  first claim came 476th. *(Covered:
+  `admin_api::an_allocation_changed_in_a_split_fleet_takes_nothing_over`.)*
+- `I-SCHED-3l` A job nobody could run for an hour, returning in the same
+  split, rejoins and settles: 640 to 690 of 800 to the majority's job, where
+  its first came 331st. *(Covered:
+  `admin_api::a_returning_job_in_a_split_fleet_takes_nothing_over`.)*
+- `I-SCHED-3m` A job passed over for a moment is lifted to where the job
+  claimed stood before its claim: a 50% job passed over while a 1% job was
+  claimed takes its next turn at once and 140 to 160 of the next 300, where
+  it waited 49 claims. *(Covered:
+  `admin_api::a_job_passed_over_for_a_moment_waits_for_nothing`.)*
+- `I-SCHED-3n` **A job with nothing to hand out banks no debt.** Held for 200
+  claims beside a job at the same share, it does not take the claims after
+  the hold in a row: the other job's first comes within three. *(Covered:
+  `admin_api::a_job_with_nothing_to_hand_out_banks_no_debt`.)*
+- `I-SCHED-3o` **A burst is paid back in a job's first hour too.** The jobs of
+  3i activated through the endpoint, so both are settling: the 1% job gets at
+  most 40 (30 in practice), where settling forgave the payback of a burst —
+  307 to 324 — until each claim was checked for its turn under the job's
+  dispatch lock. *(Covered:
+  `admin_api::a_burst_in_the_first_hour_is_paid_back`.)*
+- `I-SCHED-3p` **A decline undoes the settling.** A newcomer only the minority
+  has the data for, declined `missing_data` through the endpoint by each
+  majority worker it is issued to, gets 60 to 100 of the minority's 400
+  claims (fair 80), where the majority's claims settled it past the
+  minority's own job and it got none. *(Covered:
+  `admin_api::a_newcomer_the_majority_declines_is_not_settled_at_its_pace`.)*
+- `I-SCHED-3q` A newcomer settles against the lowest of the worker's other
+  candidates, those just passed over included: with the minority's own job
+  paused for one claim it still gets 80 to 120 of the minority's 200, where
+  it was settled past the paused job and got none. *(Covered:
+  `admin_api::a_newcomer_is_not_settled_past_a_job_paused_for_a_moment`.)*
+  (Thirty-second audit, pass 20: the lag window removed, joining settled,
+  claims checked for their turn. Each rule switched off fails its own tests:
+  the settling 3j, 3k and 3l; the rejoin 3g and 3l; the pass-over lift 3c and
+  3n; the turn check 3o (and 3i, in about one run in four); the undoing on a
+  decline 3p; the lowest-other
+  pace 3q. On pass 20's first design, 3j to 3m fail; on its second, 3o to 3q.)
+- `I-SCHED-3r` **No claim is told there is nothing while work exists.** Three
+  jobs at equal shares, 32 workers claiming together: every one of 1,920
+  claims gets a task, 600 to 680 each, where a claim that found each job a
+  claim past another for eight rounds answered `204` (67 to 166 of 1,920 across runs). *(Covered:
+  `admin_api::equal_jobs_claimed_together_leave_no_worker_idle`.)*
+- `I-SCHED-3s` A job whose dispatch lock another holder keeps costs a claim
+  one wait: three claims each get the other job within 5 s, where the third
+  waited 16 s and got nothing. *(Covered:
+  `admin_api::a_busy_job_costs_a_claim_one_wait`.)*
+- `I-SCHED-3t` A busy job stays a rival, with a ratio unit of slack: the 1%
+  job beside a busy 99% one (both settling) takes at most two of five claims
+  while the lock is held and 33 of about 3,000 in all, where it took every
+  claim of the spell and the settling forgave them (49 where 30 is fair).
+  *(Covered: `admin_api::a_busy_large_job_does_not_hand_a_small_one_its_claims`.)*
+  (Thirty-second audit, pass 21.)
+- `I-SCHED-3u` Repeated busy spells on a settling job are paid back: a job
+  found busy is settled a ratio unit short for ten minutes, so a 10% job
+  beside a busy 90% one gets its tenth over three spells (within 5), where
+  each spell's lead was forgiven. *(Covered:
+  `admin_api::repeated_busy_spells_on_a_settling_job_are_paid_back`.)*
+  (Thirty-second audit, pass 22.)
+- `I-SCHED-3v` Short, not unsettled: a newcomer found busy once in the split of
+  3j is still settled, the majority job's first claim within sixteen, where it
+  came 331st. *(Covered:
+  `admin_api::a_newcomer_busy_once_is_still_settled`.)*
+  (Thirty-second audit, pass 22.)
 - `I-SCHED-4` Abandoned claims count toward a job's share. Abandon many claims
   on one job and confirm its share does **not** grow — excluding them would let
   a job with flaky workers accumulate more than its share. The counter is
@@ -787,7 +1155,9 @@ The single most important group. Every entry is about a decision made in SQL.
   and `task_claims_anon_unique_idx` are partial on
   `WHERE state NOT IN ('abandoned','declined')`. Drop `'declined'` from either
   and a worker that declines a task is permanently barred from claiming it again
-  after fixing its data. Nothing else catches this. *(Covered:
+  after fixing its data. Nothing else catches this. (Within an hour of the
+  decline it is offered other work instead, `A-WORKER-19`; after it, the same
+  task.) *(Covered:
   `scheduler::a_worker_that_declined_a_task_can_claim_the_same_task_again`.)*
 - `I-SCHED-16` One worker cannot hold two simultaneous claims on the same task,
   by either identity type. *(Covered:
@@ -845,6 +1215,12 @@ job creation touches needs one caller here.
   every column populated, and reads back identical. *(Covered:
   `jobs::each_job_type_stores_every_setting_it_was_created_with`,
   `jobs::a_leave_generation_job_stores_every_setting_it_was_created_with`.)*
+- `I-JOB-1b` A `games` job's batch is even (default 2), and a games or
+  game-pairs job's Elo hypotheses lie within ±1000: MAGPIE gives player 1 the first move in each
+  task's first game, so at a batch of 1 player 1 moved first in every game and
+  SPRT passed two identical players (thirty-second audit, pass 18). *(Covered:
+  `routes::admin::tests::a_games_batch_must_be_even`,
+  `routes::admin::tests::elo_hypotheses_past_a_thousand_are_refused`.)*
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
   accepted; two with different `movegen_margin` are rejected. The regression
@@ -893,6 +1269,24 @@ job creation touches needs one caller here.
 - `I-JOB-12` `delete_user` leaves their contributions attributed but anonymised,
   per the design, and does not cascade away results. *(Covered:
   `admin_api::a_user_with_history_can_be_deleted`.)*
+- `I-JOB-13` A job's `min_magpie_version` that is not `major.minor[.patch]` is
+  `400` (it was read as 0.0.0, the most permissive floor). *(Covered:
+  `jobs::a_malformed_magpie_floor_is_refused`, `version::tests::a_strict_parse_takes_only_a_whole_version`.)*
+  (Fifteenth audit.)
+- `I-JOB-14` A player config with more than 25 plies (MAGPIE's `MAX_PLIES`) or
+  more than 10 recorded plies (what a captured position keeps) is `400`.
+  *(Covered: `jobs::a_player_config_past_magpies_limits_is_refused`.)*
+  (Fifteenth audit.)
+- `I-JOB-14b` A simming player config with `sort_strategy = 'score'` is `400`:
+  a simmer's candidates are the top plays by equity in a games job whatever
+  the row says, so `score` would give one config two meanings. A static one
+  may sort by score (twenty-ninth audit). *(Covered:
+  `admin_api::a_simming_player_config_is_bounded_by_iterations_not_time`.)*
+- `I-JOB-14c` An opening-rack job refuses a static player with a `best`
+  recorder and more than one recorded play, and any player whose `num_plays` is
+  below its `num_plays_recorded`: each would store fewer moves per rack than it
+  asks for. A `best` simmer is accepted (twenty-ninth audit). *(Covered:
+  `admin_api::an_opening_rack_job_cannot_rank_moves_with_a_best_recorder`.)*
 
 ### `I-SUBMIT-*` — result submission (`jobs/mod.rs`, `jobs/*.rs`)
 
@@ -901,8 +1295,10 @@ job creation touches needs one caller here.
   `submissions::a_games_result_stores_one_row_with_no_pair_columns`.)*
 - `I-SUBMIT-2` A `game_pairs` result inserts the pentanomial, and the database
   CHECK rejects a row whose buckets disagree with the counts: on the pair count,
-  and separately on player 1's half-points with the pair count right. The two
-  rules are clauses of one named constraint,
+  separately on player 1's half-points with the pair count right, and on the
+  draws with both right (two win-and-draw pairs beside no ties); the route
+  refuses each with its own message. The rules are clauses of one named
+  constraint,
   `game_results_pentanomial_all_or_nothing`, not two constraints, so each is
   shown to fire on its own. *(Covered:
   `submissions::a_pairs_result_stores_its_pentanomial_and_the_schema_refuses_a_contradiction`.)*
@@ -1002,8 +1398,13 @@ job creation touches needs one caller here.
   `leave_generation::every_dispatched_generation_carries_its_predecessors_klv`.)*
 - `I-LEAVE-8` **`rebuild_artifacts` reproduces bytes.** `run_transition` and
   `rebuild_artifacts` share `generation_means` precisely so a rebuild cannot
-  drift; fold, rebuild, compare digests. *(Covered, tier 6 opt-in:
-  `magpie_leave::a_rebuild_reproduces_every_generations_bytes`.)*
+  drift; fold, rebuild, compare digests. And a forced rebuild that writes
+  different bytes records them as `served_sha256` — what workers are told to
+  check the object against — while `sha256` keeps the first hash; and a check
+  that rewrites nothing still sets it from the object the key holds, so an
+  older object version copied back is served under its own hash again
+  (fourteenth audit). *(Covered,
+  tier 6 opt-in: `magpie_leave::a_rebuild_reproduces_every_generations_bytes`.)*
 - `I-LEAVE-9` A job with `generation_count > 1` advances to the next generation
   and finishes after the last. *(Covered:
   `leave_generation::a_two_generation_job_advances_and_finishes_after_its_last`;
@@ -1029,8 +1430,11 @@ job creation touches needs one caller here.
   runs -- the claim transaction that decides a generation is complete commits
   rather than rolls back, or the row that stops a second transition would be
   discarded -- and a transition that *fails* hands ownership back immediately
-  instead of waiting out the takeover timeout. *(Covered:
-  `leave_gen::the_transition_owner_is_committed_before_the_transition_runs`.)*
+  instead of waiting out the takeover timeout -- including one that fails
+  reading the job's config or distribution before it starts, which kept
+  ownership for the half hour until the thirty-first audit. *(Covered:
+  `leave_gen::the_transition_owner_is_committed_before_the_transition_runs`,
+  `leave_gen::a_transition_that_fails_before_it_starts_hands_ownership_back`.)*
 - `I-LEAVE-14` **A result for a closed generation is credited but not folded**:
   the claim completes and the `leave_records` row is written, and the closed
   generation's `occurrence_count` does not move — so a rebuild of that
@@ -1049,12 +1453,61 @@ job creation touches needs one caller here.
   and in the database's `rack` order within one, across the boundary between
   two generations. *(Covered:
   `leave_gen::the_leave_results_feed_pages_through_every_generation_in_order`.)*
+- `I-LEAVE-16b` A made-up cursor on the leave results feed costs a page, not a
+  walk: the feed stepped down from the cursor's generation one empty read at a
+  time, so a cursor naming generation 2,147,483,647 held a display-pool
+  connection for as long as the client waited. It now goes to the next
+  generation with rows in one probe. *(Covered:
+  `leave_gen::a_made_up_generation_in_a_cursor_costs_one_page`.)* (Twenty-fifth
+  audit.)
 - `I-LEAVE-17` **A count no game could produce is refused, because staged it
   wedges the generation.** A result reporting `i64::MAX` occurrences is a `400`
   and stages nothing, and an honest result for the same claim is then accepted
   and merges; the same number staged by hand makes `merge_staged` fail, twice
   running. *(Covered:
   `leave_gen::a_count_no_game_could_produce_is_refused_before_it_can_wedge_the_merge`.)*
+- `I-LEAVE-18` **A missing generation-0 KLV heals.** A leave job whose zeroed
+  KLV was never written (its build failed after creation or a purge committed)
+  builds it on the next claim, one build at a time, and then dispatches.
+  *(Covered, tier 6 opt-in:
+  `magpie_leave::a_missing_generation_zero_klv_is_built_by_the_next_claim`.)*
+  (Fifteenth audit.)
+- `I-LEAVE-19` **A generation turns to its tail only where a lap would start**
+  -- nothing in flight, nothing staged -- and stays there: a summary under the
+  threshold mid-lap leaves the sweep running, a lap's end with claims out waits
+  for them, and the tail, once begun (a cursor row with no rack), carries on
+  with its own claims out. *(Covered:
+  `leave_gen::a_generation_turns_to_its_tail_only_where_a_lap_would_start`.)*
+  (Thirty-first audit: it turned mid-lap, and each claim then hashed every sweep
+  claim's racks inside the dispatch lock, 0.45 s a claim at a thousand workers.)
+- `I-LEAVE-20` **A rack counts however the worker spells it.** MAGPIE writes a
+  rack's letters in its machine-letter order with blanks last (`AEINST?` for
+  the forced `?AEINST`); matched exactly, every blank rack went uncounted and an
+  English generation never closed. The whole universe forced in one task and
+  reported reversed is counted rack for rack; one rack under two spellings in
+  one result is refused as a duplicate. *(Covered:
+  `leave_gen::a_rack_counts_however_the_worker_spells_it`,
+  `jobs::leave_gen::tests::a_reported_rack_is_spelled_as_the_universe_spells_it`
+  (German's `Ä` too), and tier 6's `M-4` against a real MAGPIE.)* (Thirty-second
+  audit.)
+- `I-LEAVE-21` **A merge sums what is staged in passes, exactly.** A pass per
+  400,000 racks of the generation, each over a slice of the racks by hash, so
+  a pass's hash table fits in memory however much is staged; here slices of
+  about fifty over 149 racks, 110 results, three passes, every rack's total
+  exact. *(Covered:
+  `leave_gen::a_merge_of_a_backlog_sums_it_in_passes_exactly`.)* (Thirty-second
+  audit.)
+- `I-LEAVE-22` A merge takes one of the process's two merge turns only once it
+  holds its job's lock, so merges waiting on one job leave every other job
+  free to merge. *(Covered:
+  `leave_gen::merges_waiting_on_one_job_leave_other_jobs_free_to_merge`.)*
+  (Thirty-second audit.)
+- `I-LEAVE-23` A declined leave task is reissued as it stands, the decliner
+  included, and no rack is forced by two open claims: skipped for its
+  decliner, the claim went to rack selection, which forced the same racks
+  again on a second claim. *(Covered:
+  `leave_gen::a_declined_leave_task_is_reissued_as_it_stands`.)*
+  (Thirty-second audit.)
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 
@@ -1066,13 +1519,16 @@ permanent.
   (`ratings.rs`'s `assert_only_the_control_counted`), and
   `ratings::a_head_to_head_counts_pairs_and_scores_half_points_over_four`.)*
 - `I-RATE-2` Excluded: wrong `variant`, wrong `letterdist_id`, wrong `layout_id`,
-  a job whose player is not a pool member, and a plain `games` job. One test per
-  exclusion, because each is a separate clause. *(Covered:
+  a job whose player is not a pool member, a plain `games` job, and a self-play
+  job (both seats one config), which is also left out of the run's
+  `pairs_used` and `jobs_used`. One test per exclusion, because each is a
+  separate clause. *(Covered:
   `ratings::a_pairs_job_in_another_variant_is_not_evidence`,
   `ratings::a_pairs_job_on_another_letter_distribution_is_not_evidence`,
   `ratings::a_pairs_job_on_another_board_layout_is_not_evidence`,
   `ratings::a_pairs_job_against_a_non_member_is_not_evidence`,
-  `ratings::a_plain_games_job_is_not_evidence`.)*
+  `ratings::a_plain_games_job_is_not_evidence`,
+  `ratings::a_self_play_job_is_not_counted_as_evidence` (thirty-second audit).)*
 - `I-RATE-3` The pair is the unit: a head-to-head's `games` equals pairs, not
   games, and its score is the half-point total over four. Under redundancy 2 a
   task is evidence once, through its first accepted copy. *(Covered:
@@ -1096,6 +1552,11 @@ permanent.
 - `I-RATE-9` `recompute_stale` refits a pool whose evidence grew and skips one
   whose `pairs_used` is unchanged. *(Covered:
   `ratings::the_sweep_refits_only_the_pools_whose_evidence_grew`.)*
+- `I-RATE-9b` It also refits a pool whose membership changed without a refit —
+  a config added or removed with no pairs in the pool leaves `pairs_used` where
+  it was — and then leaves it alone. *(Covered:
+  `ratings::the_sweep_refits_a_pool_whose_membership_changed_without_a_refit`.)*
+  (Eleventh audit.)
 - `I-RATE-10` Two pools with different scopes over the same jobs produce
   different, internally consistent fits. *(Covered:
   `ratings::pools_of_different_scopes_fit_different_consistent_ratings`.)*
@@ -1144,6 +1605,14 @@ permanent.
   `worker_api::contributions_are_counted_as_they_arrive`.)*
 - `I-STATS-8` ETA is `None` without recent throughput rather than infinity.
   *(Covered: `stats::the_eta_is_none_without_recent_throughput`.)*
+- `I-STATS-8b` A games job's ETA divides by the redundancy: units left at claims
+  an hour × batch ÷ redundancy. *(Covered:
+  `stats::the_games_eta_divides_by_redundancy`.)* (Sixteenth audit.)
+- `I-STATS-8c` A job activated less than an hour ago is measured since its
+  activation (at least a minute), not over the hour: ten minutes in, the hour's
+  average read six times the real time left. *(Covered:
+  `stats::a_new_jobs_eta_is_measured_since_it_was_activated`.)* (Twenty-second
+  audit.)
 - `I-STATS-9` **The finish check** completes a job at SPRT significance and at
   the hard cap, and does **not** complete below `min_units` even with a crossed
   LLR. There is no `finish_if_done`, as this entry first named it: the check is
@@ -1154,6 +1623,14 @@ permanent.
   `stats::a_job_completes_at_its_hard_cap_without_a_verdict`,
   `stats::a_crossed_llr_below_min_games_does_not_complete_the_job`; the
   bounds themselves by `U-STATS-1`, `-3`.)*
+- `I-STATS-9e` The verdict a job completed on is stored with the completion —
+  status, LLR and units — and reported beside the live figures; a result in
+  flight at completion lands and moves the live LLR, and the stored verdict
+  stays. *(Covered:
+  `stats::a_job_completes_on_the_batch_that_crosses_the_bound_and_not_before`,
+  `stats::a_job_driven_to_h0_completes_with_its_sprt_failed`,
+  `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`.)*
+  (Eleventh audit; the in-flight half, twelfth.)
 - `I-STATS-9a` **Debounced under load.** With a claim held open the whole time,
   so the job is never idle, the check runs on the `SPRT_CHECK_EVERY`th
   submission and not before, and the open claim's result is still accepted
@@ -1169,10 +1646,37 @@ permanent.
   task is done. *(Covered:
   `finish::an_opening_rack_job_completes_once_its_racks_are_handed_out_and_all_accepted`,
   `finish::a_declined_opening_rack_task_keeps_its_job_active_until_it_is_done`.)*
-- `I-STATS-9d` A finish check overtaken by a purge does not complete the job,
-  and an SPRT job hands out nothing past its cap. *(Covered:
+- `I-STATS-9d` A finish check overtaken by a purge does not complete the job
+  -- by either witness: the claim counter below what was observed, or a purge
+  counted meanwhile however many claims followed it (nineteenth audit) -- and
+  an SPRT job hands out nothing past its cap. *(Covered:
   `admin_api::a_finish_check_overtaken_by_a_purge_does_not_complete_the_job`,
   `worker_api::sprt_jobs_hand_out_nothing_past_their_cap`.)*
+- `I-STATS-9f` **A job with nothing left to hand out and nothing in flight
+  completes on the next claim.** An opening-rack job, and a games job at its
+  cap, deactivated while their last tasks were out: the results land with no
+  finish check, and after reactivation the first claim that finds the job empty
+  completes it (off the request, at most every ten seconds per job, at once
+  after an activation). *(Covered:
+  `finish::a_job_whose_last_results_landed_while_inactive_completes_once_reactivated`,
+  `finish::a_games_job_at_its_cap_whose_results_landed_while_inactive_completes`.)*
+  (Thirty-second audit.)
+- `I-STATS-10` A stats build takes one connection from its pool, not one per
+  statement (eight): on a saturated display pool a build waited out the
+  acquire timeout once per statement and answered in tens of seconds, where
+  one wait (two, with the job page's own read of the job) makes it a quick
+  `503`. *(Covered:
+  `stats::a_stats_build_takes_one_connection`.)* (Thirty-second audit.)
+- `I-STATS-10b` Viewers waiting on one job's build that fails are all told
+  busy when it does: each retried it in turn, and on a saturated pool the k-th
+  waited k acquire timeouts (six took six seconds at a one-second timeout; now
+  about one). *(Covered:
+  `stats::viewers_waiting_on_a_failed_build_are_answered_together`.)*
+  (Thirty-second audit.)
+- `I-STATS-11` The stats payload cache serves a payload until it expires or is
+  forgotten (every admin action), and a build reads the job's row itself, so a
+  copy read before an admin action is not cached as newer than it. *(Covered:
+  `stats::the_stats_cache_follows_admin_changes`.)* (Seventeenth audit.)
 
 ### `I-INPUT-*` — input data import (`inputdata.rs`)
 
@@ -1200,6 +1704,12 @@ import can be watched) and a per-test MinIO bucket.
   whose lexica have not changed uploads nothing. *(Covered:
   `input_data::lexica_and_leaves_are_stored_once_by_digest`,
   `inputdata::tests::the_roles_a_derived_build_needs_go_to_the_object_store`.)*
+- `I-INPUT-8b` A lexicon object whose bytes are not those imported is deleted
+  by the build that finds it, and the next import uploads it again whole. An
+  import skips an object that exists, so while the damaged one stayed, the
+  build's remedy (import again) changed nothing. *(Covered:
+  `input_data::a_damaged_lexicon_object_is_replaced_by_the_next_import`.)*
+  (Thirty-second audit.)
 - `I-INPUT-4` A second import of the same tarball is a no-op. *(Covered:
   `input_data::a_second_import_of_the_same_tarball_is_a_no_op`.)*
 - `I-INPUT-5` `fail_orphaned_imports` fails a row left `running` by a restart
@@ -1215,6 +1725,11 @@ import can be watched) and a per-test MinIO bucket.
   `input_data::a_failed_import_records_its_error_and_stages_nothing`.)*
 - `I-INPUT-9` An import staged and never confirmed expires after a day and says
   so. *(Covered: `admin_api::an_unconfirmed_import_expires_after_a_day_and_says_so`.)*
+- `I-INPUT-10` An import has a time limit, download to staged (PLAN.md's "Whole
+  task"), and one that outlasts it fails and says so. *(Covered:
+  `input_data::an_import_that_outlasts_its_time_limit_fails`.)* (Thirty-first
+  audit: the client's timeouts are per read, and a trickling download kept its
+  import `running` as long as it lasted.)
 
 ### `I-AUDIT-*` — audit log (`audit.rs`)
 
@@ -1258,7 +1773,10 @@ runs against a real MinIO.
   URL, both under `exports/`. *(Covered:
   `exports::a_completed_jobs_export_is_its_stream_and_its_positions_behind_presigned_urls`.)*
 - `I-EXPORT-2` A completed job's stream answers `303` to its newest ready
-  export, and with `?positions=true` to the positions object. *(Covered:
+  export, and with `?positions=true` to the positions object — until the
+  export is older than the bucket keeps it (`EXPORT_LIFETIME_DAYS`), when the
+  stream goes back to the database and the admin detail says `expired`.
+  *(Covered:
   `exports::a_completed_jobs_stream_redirects_to_its_ready_export`.)*
 - `I-EXPORT-3` A job with nothing captured exports one object, and an empty
   corpus is still a valid export — one gzip stream of nothing, `row_count` 0.
@@ -1267,7 +1785,9 @@ runs against a real MinIO.
   `exports::a_purge_deletes_both_export_objects_and_the_row`.)*
 - `I-EXPORT-5` At startup an export still `running` is failed with a reason;
   ready and failed ones are left alone; and an export reaped while its task
-  still runs is not brought back `ready` when the task finishes. *(Covered:
+  still runs is not brought back `ready` when the task finishes, and removes
+  the objects it uploaded (fifteenth audit: they were left for the lifecycle
+  rule). *(Covered:
   `exports::startup_fails_exports_left_running_and_leaves_the_rest_alone`,
   `exports::an_export_reaped_while_it_ran_is_not_brought_back_ready`.)*
 - `I-EXPORT-6` Only a completed job can be exported, not until its last claims
@@ -1278,6 +1798,31 @@ runs against a real MinIO.
 - `I-EXPORT-7` The uploaded parts are one gzip stream of exactly the lines
   pushed, and the recorded digest and size describe those bytes. *(Covered:
   `exports::tests::the_parts_are_one_gzip_stream_of_what_was_pushed`.)*
+- `I-EXPORT-8` One export of a job runs at a time: a second request while one
+  is `running` is a 409. *(Covered:
+  `exports::a_job_has_one_export_running_at_a_time`.)* (Thirteenth audit.)
+- `I-EXPORT-9` A reader that stops early ends its corpus query: the connection
+  is closed, not drained back into the pool. *(Covered for the results stream:
+  `exports::a_reader_that_hangs_up_ends_its_corpus_query`. An export whose
+  upload fails, and KLV generation, take the same `close_on_drop` and are not
+  tested separately.)* (Thirty-first audit:
+  each hang-up left Postgres building the whole corpus on a connection no cap
+  counted; ten held a ten-connection pool, and every claim timed out.)
+- `I-EXPORT-10` A results stream is complete exactly when it ends cleanly: a
+  corpus query the database ends part-way (`pg_terminate_backend` after the
+  first frame) ends the body in an error, where it ended as a finished
+  download after 869 of 150,000 records. *(Covered:
+  `exports::a_stream_the_database_cuts_off_ends_in_an_error`. The connection
+  and a completed leave job's settle are taken before the response head, so
+  their failures are a status; not tested separately.)* (Thirty-second audit,
+  pass 20.)
+- `I-EXPORT-11` An export that fails after writing its objects removes them:
+  with marking the row ready made to fail (a trigger), the row says `failed`
+  and the store holds nothing, where both objects were left for the
+  thirty-day rule. *(Covered:
+  `exports::an_export_that_fails_after_uploading_removes_its_objects`. A
+  multipart upload that fails to complete is aborted, and a row that says
+  `ready` after all keeps its objects; not tested separately.)* (Thirty-second audit, pass 20.)
 
 ### `I-DATA-*` — the pinned-row invariant
 
@@ -1331,11 +1876,19 @@ runs against a real MinIO.
   exists to prevent. *(Covered:
   `derived::a_row_for_a_builder_this_binary_lacks_is_left_alone_and_blocks_nothing`;
   such a row at the head of the queue stopped every build behind it.)*
-- `I-DERIVED-7` A build whose `kwg` row predates `object_key` fails with a
-  message naming the remedy (re-import the tarball), and is retried the bounded
+- `I-DERIVED-7` A build whose `kwg` row has neither bytes nor an object key fails
+  with a message naming the remedy (delete the row and what pins it, and import
+  again: re-importing alone leaves a known row as it is, which the message
+  wrongly promised until the thirty-first audit), and is retried the bounded
   `MAX_ATTEMPTS` (3) times and then left `failed` — not retried forever, and
-  not failed on the first attempt as this entry implied. *(Covered:
+  not failed on the first attempt as this entry implied. Between attempts it
+  waits, 5 and then 15 minutes: taken again at once it was still the oldest
+  row, so one builder run spent all three in seconds and a passing S3 outage
+  failed a build for good (thirty-second audit). *(Covered:
   `derived::a_build_from_a_lexicon_stored_before_object_keys_fails_naming_the_remedy`.)*
+  A stalled input fetch ends after five minutes and is recorded as a failure
+  (checked by hand against a listener that never answers: 300 s, the row back
+  to `pending`; it used to hold the builder task for good).
 - `I-DERIVED-8` A claim's `derived` entries name the table by
   `<lexicon>.<leaves>`, and two jobs on one lexicon with different leaves get
   two different names and two different hashes. *(Covered:
@@ -1348,6 +1901,12 @@ runs against a real MinIO.
   a wordmap keyed on the wrong player would silently break. *(Covered:
   `worker_api::players_on_different_lexicons_need_a_wordmap_each`; the shared
   case by `I-DERIVED-1`.)*
+- `I-DERIVED-10` A job whose files were built under another builder -- after a
+  deployment whose MAGPIE bumped a builder version -- has them queued under
+  this binary's builder by the next claim that considers it. *(Covered:
+  `worker_api::a_file_built_under_another_builder_is_queued_under_this_one_by_a_claim`.)*
+  (Thirty-first audit: only creating or activating a job queued anything, so
+  every such job answered `204` for good.)
 
 ---
 
@@ -1394,22 +1953,94 @@ below.
 ### `A-AUTH-*` — `routes/auth.rs`
 
 - `A-AUTH-1` Register → confirm → login succeeds and sets a session cookie.
+  The confirmation mail does not carry the username, the registrant's own
+  text, to the address they typed (thirty-second audit).
   *(Covered: `auth_routes::register_confirm_and_login_gives_a_working_session`.)*
 - `A-AUTH-2` An unconfirmed login is 403 with a message naming the fix.
   *(Covered: `auth_routes::an_unconfirmed_login_is_refused_with_the_fix_named`.)*
 - `A-AUTH-3` **A wrong password and an unknown username return an identical
   401** — body and status both, so the endpoint cannot enumerate accounts.
   *(Covered: `auth_routes::a_wrong_password_and_an_unknown_username_answer_identically`.)*
+- `A-AUTH-3b` Scoring a password does not hold the executor: a hundred
+  characters of zxcvbn's substitution letters take it close to a second, and
+  on the executor one address's registrations or resets stalled every request
+  (`/health` 8.5 s). Scored off the executor, a single-threaded test
+  runtime ticks throughout (a 1.08 s gap on the executor). A reset with a
+  wrong link is refused before any scoring. *(Covered:
+  `auth_routes::scoring_a_crafted_password_does_not_stall_the_server`.)*
+  (Thirty-second audit.)
+- `A-AUTH-3c` Scoring has turns of its own: sixteen crafted passwords being
+  scored do not hold up a sign-in (3.9 s behind them on sign-in's Argon2
+  turns), and each reset link buys five scorings an hour from any number of
+  addresses, then `429`. *(Covered:
+  `auth_routes::scoring_never_holds_up_a_sign_in_and_a_link_buys_few`.)*
+  (Thirty-second audit.)
 - `A-AUTH-4` **Registering a taken address returns the same body as a fresh
   registration.** Assert the bodies are byte-identical. *(Covered:
   `auth_routes::registering_a_taken_address_answers_exactly_like_a_new_registration`.)*
+- `A-AUTH-4b` An account that never confirmed holds its address and username
+  only while its confirmation link works: registering over it before then is
+  answered like any taken address, with a notice saying an account is waiting;
+  after, the next registration takes both. *(Covered:
+  `auth_routes::an_expired_unconfirmed_account_gives_up_its_address_and_username`.)*
+  (Eleventh audit.)
+- `A-AUTH-4c` A username is taken whatever its case, and signs in whatever its
+  case. *(Covered:
+  `auth_routes::a_username_is_taken_and_signs_in_whatever_its_case`.)*
+  (Thirteenth audit; the sign-in half, fourteenth.)
+- `A-AUTH-4d` The auth and account routes refuse bodies over 16 KiB (`413`),
+  and a rate-limit key longer than 128 bytes is kept as its digest. *(Covered:
+  `auth_routes::an_oversized_auth_body_is_refused`,
+  `ratelimit::key_tests::a_long_key_is_one_bucket_kept_small`.)* (Nineteenth
+  audit.)
+- `A-AUTH-4e` The notice to a confirmed address's owner names their account,
+  and so does the reset mail: sign-in asks for a username, which someone who
+  has forgotten they signed up, or their password, may have forgotten too.
+  *(Covered: `auth_routes::the_owner_of_a_taken_address_is_told_their_username`,
+  and the reset mail's in
+  `auth_routes::a_reset_request_answers_the_same_for_known_and_unknown_addresses`.)*
+  (Thirty-second audit.)
+- `A-AUTH-4f` A username holds no line break, control or invisible (format)
+  character: it is written into mail to an address's owner, and a stranger
+  can register someone's address (KL-34). An account named so before the rule
+  is mailed with those characters as `?`. Joiners stand only between letters
+  of scripts written with them (Persian, Devanagari, Sinhala) or inside emoji
+  sequences (`🏳️‍🌈`), and variation selectors only after a pictograph, an
+  ideograph or on a keycap — never beside a Latin letter, accented or not, or
+  a Cyrillic one (pass 7's first version let `zoë` plus a selector through). *(Covered:
+  `auth_routes::a_username_cannot_carry_a_message_into_mail`,
+  `routes::auth::tests::a_username_holds_no_line_break_or_hidden_character`.)*
+  (Thirty-second audit.)
+- `A-AUTH-4g` A name that differs from a taken one only in joiners or variation
+  selectors is taken, since where a script allows them they may change nothing
+  a reader sees (`ب‍ببب` beside `بببب`, `❤️❤❤` beside `❤❤❤`); and an
+  unconfirmed twin whose link has expired gives the name up, as an exact one
+  does. *(Covered:
+  `auth_routes::a_name_differing_only_in_joiners_is_taken`.)* (Thirty-second
+  audit.)
+- `A-AUTH-4h` The notice to a taken address's owner is limited to five an hour
+  per address, whatever client address asks, and one past it is skipped: the
+  sixth registration is answered with the same bytes and sends nothing.
+  *(Covered: `auth_routes::a_taken_address_is_sent_five_notices_an_hour_at_most`;
+  with the limit removed, a sixth notice lands.)* (Thirty-second audit, pass 24.)
+- `A-AUTH-4i` An address registers only bare (`x <victim@…>` and lists are
+  refused) and only as SES would parse it: a dot-atom local part and host-name
+  labels, so `a..b@x.com`, `.a@x.com` and `a@exa_mple.com` are refused rather
+  than failing to send — which any visitor could have used to raise the
+  mail-failed alarm. *(Covered:
+  `routes::auth::tests::only_a_bare_address_is_an_email`.)* (Thirty-second
+  audit; the SES syntax, pass 24.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
   scored the new password without the account's context. *(Covered:
   `auth_routes::registration_refuses_weak_passwords_and_ones_built_from_the_username_or_email`,
   `auth_routes::a_reset_refuses_a_password_built_from_the_account_and_keeps_the_link`;
   the email's local part alone was accepted.)*
-- `A-AUTH-6` A confirmation code is single-use; replaying it fails. *(Covered:
+- `A-AUTH-6` A confirmation code is single-use: replaying it changes nothing.
+  Opened again for an account it confirmed (a double click, a mail scanner that
+  followed it first), it is answered "email already confirmed" rather than
+  "invalid" with an offer to register again (twenty-second audit); for any
+  other account it fails. *(Covered:
   `auth_routes::a_confirmation_code_works_once`.)*
 - `A-AUTH-7` An expired confirmation code fails. *(Covered:
   `auth_routes::an_expired_confirmation_code_is_refused`.)*
@@ -1418,9 +2049,21 @@ below.
   disclose either. *(Covered:
   `auth_routes::a_reset_request_answers_the_same_for_known_and_unknown_addresses`,
   `auth_routes::a_reset_request_does_not_wait_on_the_mail_it_sends`.)*
+- `A-AUTH-8b` Every link in mail — a confirmation, a notice's sign-in and reset
+  pages, a reset link — is on `PUBLIC_URL`, whatever `Host` or
+  `X-Forwarded-Host` the request names: a link built from either would mail a
+  reset token to a host the requester chose. *(Covered:
+  `auth_routes::mailed_links_are_on_the_public_url_whatever_the_request_names`.)*
+  (Thirty-second audit, pass 24.)
 - `A-AUTH-9` A reset token is single-use, expires, and is invalidated by a
   successful reset. *(Covered:
   `auth_routes::a_reset_token_is_single_use_spent_by_any_reset_and_expires`.)*
+- `A-AUTH-9b` A password reset and an email confirmation lock the account
+  before its links, the order an admin's delete takes (`A-ADMIN-22`): with
+  the account held, each waits holding none of its links. Links first, each
+  deadlocked with a delete (a reset only when two links were out). *(Covered:
+  `auth_routes::a_reset_and_a_confirmation_lock_the_account_before_its_links`.)*
+  (Thirty-second audit.)
 - `A-AUTH-10` Logout clears the cookie, so the browser is signed out. It does
   not revoke the token: a session is a signed token, not a stored row, so there
   is nothing per-session to delete, and a copy of the cookie taken before
@@ -1437,6 +2080,21 @@ below.
   limited both ways too (`A-BOUND-1`, `-2`). *(Covered:
   `auth_routes::the_eleventh_registration_from_one_address_is_rate_limited`,
   `auth_routes::the_sixth_reset_for_one_address_is_rate_limited_from_any_ip`.)*
+- `A-AUTH-11b` An account's login bucket is the account's however its name is
+  spelled: `TİM` signs in to `tim` (Postgres lowers `İ` to `i`) and shares its
+  bucket. *(Covered:
+  `boundaries::an_accounts_login_bucket_does_not_depend_on_how_its_name_is_spelled`;
+  keyed on Rust's lowering, each spelling had a bucket of its own. Twentieth
+  audit.)*
+- `A-AUTH-11c` Redeeming confirmation and reset links is limited per address:
+  the twenty-first in a minute is a 429. Both are unauthenticated writes on the
+  main pool, and a reset scores a password first. *(Covered:
+  `boundaries::redeeming_links_is_limited_per_address`.)* (Twenty-first audit.)
+- `A-AUTH-12` A confirmed address and a password reset are on record
+  (`user.email_confirmed`, `user.password_reset`); sign-in attempts are not,
+  by design (PLAN, "Audit actions"). *(Covered:
+  `auth_routes::a_confirmation_and_a_reset_are_on_record`.)* (Thirty-second
+  audit, pass 22.)
 
 ### `A-WORKER-*` — `routes/worker.rs`
 
@@ -1449,11 +2107,13 @@ below.
 - `A-WORKER-2` A claim with a malformed `magpie_version` is rejected rather than
   assumed. Unparseable text reads as `0.0.0`, below the floor, so the worker is
   handed nothing and told to update (a floor of `0.0.0` would admit it; the
-  shipped floor is `0.1.0`); a version that is not a string is a `400` naming
+  shipped floor is `0.1.1`); a version that is not a string is a `400` naming
   the field. *(Covered:
   `worker_routes::a_malformed_magpie_version_is_refused_rather_than_assumed`.)*
 - `A-WORKER-3` An `unsupported_jobs` list over 200 is **truncated, not
-  rejected** — a truncated list costs at most a wasted claim. *(Covered:
+  rejected** — a truncated list costs at most a wasted claim — and the newest
+  200 are kept: MAGPIE appends and never prunes, so keeping the first dropped
+  the live entries (thirty-second audit, pass 19). *(Covered:
   `worker_routes::an_oversized_unsupported_list_is_truncated_not_rejected`.)*
 - `A-WORKER-4` A first claim with no identity mints an anon UUID and returns it
   in the body; the client reusing it is recognised. An idle poll mints nothing,
@@ -1506,6 +2166,76 @@ below.
 - `A-WORKER-14` Worker endpoints are rate limited per identity: the 6th request
   in a second is 429, and a different identity is unaffected. *(Covered:
   `worker_routes::worker_requests_are_limited_per_identity`.)*
+- `A-WORKER-14b` An account's worker is limited per API key: a key's sixth
+  request in a burst is 429 and the account's other key is not. *(Covered:
+  `worker_routes::an_accounts_workers_are_limited_per_key`.)* (Thirteenth
+  audit.)
+- `A-WORKER-16` Worker credentials are charged before their lookup (a
+  main-pool query): each its own bucket, and one that has not resolved lately
+  its address's too (burst 100). Made-up keys get 401s, then 429s with
+  `Retry-After`, while a real worker at the same address -- whose credential
+  resolved -- goes on being served, and another address is unaffected.
+  *(Covered:
+  `boundaries::made_up_worker_credentials_are_limited_per_address_and_real_ones_are_not`,
+  `ratelimit::key_tests::unknown_credentials_pay_their_address_and_known_ones_do_not`.)*
+  (Twenty-first audit; the twenty-second's redesign: the first gate refused
+  every worker request from the address, real ones included. The
+  twenty-third's order: an unknown credential pays its address first, so a
+  refused flood leaves no per-credential bucket behind -- asserted on the
+  limiter's size.)
+- `A-WORKER-14c` A credential's claims and its work in hand (heartbeats,
+  declines, results, artifacts) are limited separately, so idle machines
+  sharing a key cannot spend a busy one's heartbeats. *(Covered:
+  `worker_routes::idle_claims_cannot_starve_a_busy_machines_heartbeats`,
+  and `worker_requests_are_limited_per_identity` for each bucket's own burst.)*
+  (Thirty-first audit: on one bucket, eight machines on one identity had eleven
+  of eleven heartbeats refused in five minutes.)
+- `A-WORKER-17` A worker route refuses a caller it would refuse anyway -- no
+  identity, or an unknown one -- before reading the body, and the routes other
+  than the result accept at most 1 MiB. *(Covered:
+  `worker_routes::a_caller_the_route_refuses_is_answered_before_its_body`,
+  `worker_routes::a_claim_body_is_small`.)* (Thirty-first audit; see `U-ERR-6`.)
+- `A-WORKER-18` **Nothing a caller does with bodies makes a heartbeat wait**:
+  with the large-result budget spent by three stalled 60 MiB uploads, and two
+  hundred claims stalled a byte short of a megabyte each, a heartbeat is
+  answered at once; a fourth large result is refused at once with
+  `Retry-After`; a first claim declaring more than 16 KiB is refused before its
+  body; and one worker may have 64 MiB of large results in flight -- two 8 MiB
+  ones at once, but not a 60 MiB one beside them -- its reservations given back
+  as they end. *(Covered:
+  `worker_routes::a_heartbeat_never_waits_behind_other_bodies`,
+  `worker_routes::a_worker_may_send_a_share_of_large_results_at_once`,
+  `worker_routes::a_chunked_first_claim_is_held_to_its_bound` — a first claim
+  sent without a length is held to 16 KiB too, which the header check alone did
+  not do, in the audit's second pass.)*
+  (Thirty-first audit; one at a time, as first written, serialized a fleet on
+  one key.)
+- `A-WORKER-19` A task a worker declined is not offered to that worker again
+  for an hour (outside leave generation, `I-LEAVE-23`): declined, it was the oldest available task and went straight
+  back to whoever claimed next — the worker that had just failed it included —
+  so one task that fails everywhere stopped every contributor claiming from
+  its job (MAGPIE stops after five failures in a row). Another worker is still
+  offered it. *(Covered:
+  `worker_api::a_declined_task_is_not_handed_back_to_the_worker_that_declined_it`.)*
+  (Thirty-second audit.)
+- `A-WORKER-20` A result carrying captured positions for a job that does not
+  capture them is refused, and nothing is stored; a capturing job's result
+  with two positions for one turn of one game is refused too. *(Covered:
+  `worker_api::positions_from_a_job_that_does_not_capture_them_are_refused`,
+  `jobs::game::tests::one_captured_position_a_turn`.)* (Thirty-second audit.)
+- `A-WORKER-21` A capturing job's result must carry positions from every game
+  of its batch, and no result may hold a NUL in a string, a play over 256
+  characters, a previous play scoring outside 0 to 100,000 or a bracketed tile
+  over 8 characters, nor a position over 4,096, nor a decline a NUL in a
+  missing file: each is a `400`,
+  where a result with no positions was accepted and completed its task, a NUL
+  was a `500` that left the claim open, and the rest were stored. *(Covered:
+  `worker_api::a_capturing_jobs_result_is_complete_and_no_result_holds_what_cannot_be_stored`,
+  `worker_api::a_decline_holding_a_nul_is_refused_and_the_claim_stays_declinable`,
+  `plausibility::tests::a_nul_is_found_only_where_json_escapes_one`,
+  `plausibility::tests::a_bracketed_tile_is_a_few_letters`; job creation's
+  bound on a games batch, `routes::admin::tests::a_games_batch_is_bounded`.)*
+  (Thirty-second audit, pass 21.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*
@@ -1526,7 +2256,8 @@ below.
   are enforced where the player is made, at player-config creation, not at job
   creation as this entry first listed them, so no job can name such a config.
   A config's `kwg_id`, `klv_id` and `winpct_id` must each name a file of that
-  role (`A-BOUND-3`). *(Covered:
+  role (`A-BOUND-3`). A letter distribution MAGPIE cannot hold (`U-RACK-9`) is
+  refused at creation, not by every claim as a 500. *(Covered:
   `admin_routes::job_creation_refuses_each_impossible_combination_and_says_which`,
   which asserts the player-config half too.)*
 - `A-ADMIN-4` Activate / deactivate / complete / purge / delete each return the
@@ -1534,8 +2265,18 @@ below.
   `admin_routes::each_lifecycle_action_answers_its_shape_and_a_read_agrees`; the
   allocation cap by `A-BOUND-7`.)*
 - `A-ADMIN-5` Import start → poll → confirm over HTTP, including that polling
-  reports progress while running. *(Covered:
+  reports progress while running. The ref is resolved only among the
+  repository's own branches and tags: a sha (whole or five characters), a
+  pull request's ref or a `git describe` name — which `/commits/{ref}`
+  resolved from any fork, served under the upstream's name — is not found,
+  and `/commits/` is never asked (thirty-second audit). *(Covered:
   `input_data::an_import_is_started_polled_while_running_and_confirmed_over_http`.)*
+- `A-ADMIN-5b` A branch named like a sha (`20260101`, a real one), a
+  lightweight tag, an annotated tag (peeled to its commit) and a tag of a tag
+  all resolve; a `heads/`, `tags/` or `refs/tags/` prefix picks a branch or a
+  tag sharing one name; a tag naming a tree is refused. *(Covered:
+  `input_data::a_ref_resolves_among_the_repositorys_own_branches_and_tags`.)*
+  (Thirty-second audit.)
 - `A-ADMIN-6` Confirming an import that is not `staged` is rejected. *(Covered:
   `input_data::only_a_staged_import_can_be_confirmed`.)*
 - `A-ADMIN-7` `input-data` list and delete, including the in-use refusal.
@@ -1552,6 +2293,11 @@ below.
   `admin_routes::only_a_leave_jobs_artifacts_can_be_rebuilt`; the rebuild,
   which runs MAGPIE, by the opt-in
   `magpie_routes::rebuilding_artifacts_restores_what_is_missing_and_is_idempotent`.)*
+- `A-ADMIN-11b` A forced artifact rebuild is in the audit log before it
+  rewrites anything: one that stopped part-way had replaced objects and
+  written no row, the only one coming at the end. *(Covered, tier 6 opt-in:
+  `magpie_routes::a_forced_rebuild_is_logged_before_it_rewrites_anything`.)*
+  (Thirty-second audit.)
 - `A-ADMIN-12` Ban and unban by user id and by anon UUID; a banned worker's next
   claim is refused; unban restores it. *(Covered:
   `admin_routes::a_ban_by_either_identity_refuses_the_next_claim_and_unban_restores_it`,
@@ -1561,6 +2307,71 @@ below.
 - `A-ADMIN-14` `delete_user` over HTTP. *(Covered:
   `admin_api::a_user_with_history_can_be_deleted`; an admin cannot delete
   themself, `A-BOUND-8`.)*
+- `A-ADMIN-15` Purging a completed job returns it to inactive, clears its
+  stored verdict, and it can be activated again. *(Covered:
+  `admin_api::purging_a_completed_job_returns_it_to_inactive`.)* (Eleventh
+  audit's fix, twelfth audit's test.)
+- `A-ADMIN-15b` An export's `job.export_started` row is written in the
+  transaction that records the export: a refused one (the job not completed,
+  one already running) writes none, and a begun one exactly one. *(Covered:
+  `admin_api::only_a_completed_job_can_be_exported`.)* (Thirty-second audit.)
+- `A-ADMIN-16` While a purge or delete holds a job's claims, a submission for
+  one is answered `503` at once; and a hold that ends without committing spares
+  the job's claims from reclamation, so the submission lands afterwards.
+  *(Covered:
+  `admin_api::a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims`.)*
+  (Twelfth audit.)
+- `A-ADMIN-17` A worker request's `last_seen_at` touch does not wait on its
+  identity's locked row (a purge giving back contributions, a submission
+  committing). *(Covered:
+  `admin_api::a_locked_identity_row_does_not_hold_up_its_requests`.)* (Twelfth
+  audit.)
+- `A-ADMIN-18` A deleted account's tombstone address cannot be squatted (a
+  registered `<id>@deleted.invalid` no longer blocks the delete), and the bans
+  in force are listed with the id lifting one takes. *(Covered:
+  `admin_api::a_deleted_accounts_tombstone_cannot_be_squatted_and_bans_are_listed`.)*
+  (Thirteenth audit.) Banning an identity that does not exist is `404`
+  (`admin_api::an_identity_can_be_banned_once_and_unbanning_lifts_it`;
+  fourteenth audit).
+- `A-ADMIN-19` A purge or delete of a job whose purge or delete is already
+  running is `409` (checked and held in one step: a double click got two), as
+  are activating, deactivating and completing it; all are allowed once it has
+  finished. *(Covered:
+  `admin_api::a_second_purge_or_delete_is_refused_while_one_runs`.)* (Fourteenth
+  audit.)
+- `A-ADMIN-20` A job cannot pin two different files under one role and name
+  (MAGPIE finds a file by name, so every worker would decline every task); the
+  same file on both sides, and two differently named files, are still a job.
+  *(Covered: `admin_api::a_job_cannot_pin_two_files_under_one_name`.)*
+  (Thirty-first audit.)
+- `A-ADMIN-21` A config or job no worker can run is refused at creation, each
+  at its boundary: a margin past MAGPIE's largest equity (2,147,483.645 taken,
+  .646 refused, either margin), `num_plays` past 200,000, `num_plays_recorded`
+  past 32,767, and a board layout MAGPIE's loader would refuse — every worker
+  failed every task of such a job, and `magpie contribute` stops after five
+  failures in a row; and an SPRT `alpha` below 0.000001, whose infinite upper
+  bound the job page could not print (and `beta`, for symmetry), each checked
+  just below the floor and at it. The layout check never accepts
+  what MAGPIE's loader refuses, and agrees with it on CRLF files, blank lines,
+  trailing whitespace, row widths, unknown squares and start squares (it is
+  stricter only on parser quirks). *(Covered:
+  `admin_api::a_config_or_job_no_worker_can_run_is_refused`,
+  `routes::admin::tests::a_layout_magpie_would_refuse_is_refused`.)*
+  (Thirty-second audit.)
+- `A-ADMIN-22` Deleting an account locks the account before its own rows:
+  with the account held, the delete waits holding none of its reset links.
+  *(Covered: `admin_api::deleting_an_account_locks_it_before_its_rows`.)*
+  (Thirty-second audit.)
+- `A-ADMIN-23` A job that needs a wordmap or a rack info table, on a
+  distribution with more than two blanks (`english_super`), is refused at
+  creation: MAGPIE builds neither for more than two and aborts, so the job
+  never dispatched. The same job without them is created. *(Covered:
+  `admin_api::a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused`.)*
+  (Thirty-second audit.)
+- `A-ADMIN-24` Retry resets the one failed build it names, by builder and by
+  the files it is built from; it reset every failed row of that role and name,
+  other builders' included. *(Covered:
+  `admin_api::a_retry_resets_only_the_build_it_names`.)* (Thirty-second audit.)
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -1571,13 +2382,33 @@ below.
   `ratings::a_pool_with_no_run_renders_empty`.)*
 - `A-RATE-3` Creating a pool adds the anchor as a member automatically.
   *(Covered: `ratings::creating_a_pool_makes_its_anchor_a_member`.)*
+- `A-RATE-3b` A pool is validated like a job: a variant no job has, a
+  distribution id that is a layout row, an anchor rating whose scale would
+  overflow, and a board or a letter distribution no job can be created on
+  (thirty-second audit) are each a 400, and nothing is created. *(Covered:
+  `ratings::a_pool_that_could_rate_no_one_is_refused`.)* (Eleventh audit.)
 - `A-RATE-4` Adding and removing a member each trigger a refit and return a new
   `run_id`. *(Covered: `ratings::adding_and_removing_a_member_each_refit_the_pool`.)*
-- `A-RATE-5` Removing the anchor is refused with a message naming the fix.
+- `A-RATE-4b` Adding a config that does not exist is a `400` on
+  `player_config_id`, and adding to a pool that does not exist a `404`; an
+  anchor that does not exist is a `400` too. None was the `409` "still
+  referenced" a bare foreign-key failure maps to. *(Covered:
+  `ratings::adding_an_unknown_member_or_to_an_unknown_pool_says_which`,
+  `ratings::a_pool_that_could_rate_no_one_is_refused`.)*
+- `A-RATE-5` Removing the anchor is refused with a message naming what to do —
+  an anchor is fixed, so a pool anchored elsewhere (it named an operation that
+  did not exist until the eleventh audit).
   *(Covered: `ratings::removing_the_anchor_is_refused_with_the_fix_named`.)*
 - `A-RATE-6` History returns points in time order and excludes unrated configs.
   *(Covered: `ratings::history_is_in_time_order_and_leaves_out_unrated_configs`,
   `admin_api::a_long_rating_history_is_thinned_but_keeps_its_ends`.)*
+- `A-RATE-6b` History carries only the configs the chart draws: the six current
+  members rated highest in the newest run. Every member's every point went out
+  on each view of this public page — 9.5 MB at 100 members, and forty views at
+  once answered `503` to other readers — and a removed config could take one
+  of the six. *(Covered:
+  `ratings::history_carries_the_six_highest_current_members`.)* (Thirty-second
+  audit, pass 25.)
 - `A-RATE-7` Recompute is admin-only and returns a new run. *(Covered:
   `ratings::only_an_admin_can_recompute_and_it_stores_a_new_run`.)*
 
@@ -1588,14 +2419,36 @@ below.
   `public_api::the_job_list_paginates_and_clamps_its_page_size`,
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`; ties had no
   `id` tie-break.)*
+- `A-PUBLIC-1c` The job list's `stalled` flag is set for an active job with a
+  decline and no accepted result in a day, and cleared by a result.
+  *(Covered: `public_api::the_job_list_flags_a_stalled_job`.)* (Nineteenth
+  audit: nothing tested it.)
+- `A-PUBLIC-1b` `?status=` filters the job list and its total. *(Covered:
+  `public_api::the_job_list_filters_by_status`.)* (Eighteenth audit.) Deleting
+  a job ends its open streams (`sse::tests::closing_a_job_ends_its_streams`).
 - `A-PUBLIC-2` Job detail returns the right stats block for each job type, and
   404s for an unknown id. *(Covered:
   `public_api::job_detail_carries_the_stats_block_of_its_type`.)*
 - `A-PUBLIC-3` `job_results` paginates and filters, and returns `total = -1`
-  where an exact count is deliberately not computed. *(Covered:
+  where an exact count is deliberately not computed. A `?worker=` with no
+  claims in this job is an empty page decided from their claims here, not by
+  walking the job (twenty-sixth audit). *(Covered:
   `public_api::the_results_feed_paginates_and_filters_without_counting`,
   `worker_api::the_results_feed_walks_every_row_exactly_once`,
   `worker_api::the_results_feed_filters_by_who_a_name_is`.)*
+- `A-PUBLIC-3b` A `?worker=` page is read through the contributor's claims in
+  the job, newest completion first, and pages exactly in the unfiltered feed's
+  order, including inside one opening-rack batch. A name that is both an
+  account and a pseudonym is both contributors' work, merged (twenty-seventh
+  audit). *(Covered:
+  `public_api::the_filtered_feed_pages_through_a_contributors_claims`.)*
+- `A-PUBLIC-3c` A contributor's claim range names no `state`, so the planner
+  cannot choose the fleet-wide completed-claims index for it, and a name that
+  is two identities is two pages merged, not one sort over both identities'
+  claims (twenty-eighth audit). Each page breaks the tie at the cursor's time
+  with a negation, not a row comparison the planner estimates from the time
+  column a second time (twenty-ninth audit). *(Covered:
+  `routes::public::tests::a_contributors_page_is_read_through_their_own_index`.)*
 - `A-PUBLIC-4` `rack_lookup` finds an analysed rack, however it is typed, with
   its whole ranked list. A rack with no analysis yet is a `200` with an empty
   list, not a 404 as this entry first said — the rack is a valid question
@@ -1608,6 +2461,26 @@ below.
 - `A-PUBLIC-6` The SSE stream ends cleanly when the client disconnects.
   *(Covered: `public_api::the_stream_unsubscribes_when_the_client_disconnects`,
   `sse::tests::subscribers_are_counted_and_forgotten_when_they_leave`.)*
+- `A-PUBLIC-6b` Live streams are capped (2,000 across every job): past the cap
+  a stream is a `503` with `Retry-After`, and an ended stream gives its place
+  back. *(Covered: `routes::public::tests::a_stream_past_the_cap_is_told_to_come_back`.)*
+  (Twentieth audit: a public route with no bound on open connections.)
+- `A-PUBLIC-6c` One address holds at most 32 live streams, each for as long as
+  its response lives; a refusal holds nothing, and another address is
+  unaffected. *(Covered: `routes::public::tests::one_address_cannot_hold_every_stream`,
+  and on the router `boundaries::one_address_holds_at_most_its_share_of_live_streams`,
+  which fails if the handler stops holding its place for the stream's life.)*
+  (Twenty-first audit: the global cap alone let one host hold every place.)
+- `A-PUBLIC-6d` A job's live pushes are at most one per `JOB_STATS_CACHE_SECONDS`
+  however its submissions arrive — six submissions over two and a half seconds
+  under a ten-second interval push at most once — while an admin's change is
+  pushed at once, mid-interval. *(Covered:
+  `public_api::live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not`,
+  `sse::tests::an_urgent_push_cuts_the_cool_down_short`,
+  `public_api::submissions_during_a_cool_down_are_pushed_when_it_ends`, which
+  checks that what arrived during a cool-down is pushed when it ends.)* (Thirty-second audit:
+  a job whose submissions came slower than one build was rebuilt and pushed for
+  each.)
 - `A-PUBLIC-6a` The SSE stream ends when the process is told to stop: it has no
   end of its own, and graceful shutdown waits for every open response, so an
   open dashboard used to hold every deployment until the runtime's `SIGKILL`
@@ -1636,8 +2509,29 @@ below.
 - `A-ACCOUNT-4` Deactivating a key stops it authenticating; reactivating
   restores it; revoking is permanent. *(Covered:
   `account::deactivation_suspends_a_key_reactivation_restores_it_and_revocation_is_final`.)*
+- `A-ACCOUNT-4b` The `Bearer` scheme is read in any case (RFC 7235): `bearer
+  <key>` was no credential, so a deactivated key's claim minted an anonymous
+  identity. *(Covered: `account::the_bearer_scheme_is_read_in_any_case`.)*
+  (Thirty-second audit.)
 - `A-ACCOUNT-5` One user cannot see or modify another's keys. *(Covered:
   `account::one_user_cannot_see_or_change_anothers_keys`.)*
+- `A-ACCOUNT-6` An account's key creation is a burst of a hundred (the cap), then
+  ten an hour: a hundred keys at once are allowed, a key made after revoking one
+  is `429`, and another account is unaffected. *(Covered:
+  `account::key_churn_is_rate_limited_per_account`.)* (Fourteenth audit; the
+  burst, fifteenth.)
+- `A-ACCOUNT-7` A key's label is at most 100 characters. *(Covered:
+  `account::a_key_label_is_bounded`.)* (Seventeenth audit.)
+- `A-ACCOUNT-8` A key's whole life is on record: issued, suspended, resumed
+  and revoked, each writes an audit row by the key's id (not its label, the
+  owner's free text), where none did and a revoked key left no trace at all;
+  a suspend or resume that changes nothing writes none. *(Covered:
+  `account::a_keys_life_is_on_record`.)* (Thirty-second audit, pass 22.)
+- `A-ACCOUNT-9` Resuming an account's keys is rate limited (`key_changes`):
+  toggling a key 300 times, the last 50 resumes are `429`s with no row, and
+  the owner can still suspend and revoke; unlimited, one account wrote 4,000
+  audit rows in ten seconds. *(Covered: `account::key_changes_are_rate_limited_per_account`.)*
+  (Thirty-second audit, pass 23.)
 
 ### `A-BOUND-*` — boundaries (`backend/tests/boundaries.rs`)
 
@@ -1648,13 +2542,24 @@ silent.
 - `A-BOUND-1` The eleventh login from one address is 429, even with the right
   password. *(Covered:
   `boundaries::the_eleventh_login_from_one_address_is_rate_limited_even_with_the_right_password`.)*
-- `A-BOUND-2` The eleventh login for one username is 429 from any address — the
-  half that stops a distributed guess. *(Covered:
-  `boundaries::the_eleventh_login_for_one_username_is_rate_limited_from_any_address`.)*
+- `A-BOUND-2` One address guessing an account's password cannot lock its owner
+  out: its eleventh attempt is 429, and the right password from another address
+  signs in. And the hundred-and-first attempt on one username in a minute is
+  429 from any address — the half that stops a distributed guess. (Until the
+  eleventh audit the username limit was 10 a minute from everywhere, which let
+  one address hold any account, an admin's included, out indefinitely.)
+  *(Covered: `boundaries::a_stranger_cannot_lock_an_account_out_of_signing_in`,
+  `boundaries::a_username_tried_from_everywhere_is_rate_limited`.)*
 - `A-BOUND-3` A player config's `kwg_id`, `klv_id` and `winpct_id` must each
   name an `input_data` row of that role; the foreign keys only say the row
-  exists. Each swap is a 400 naming both roles, and creates nothing. *(Covered:
+  exists. Each swap is a 400 naming both roles, and creates nothing. A
+  `cloned_from_id` that names no config is a `400` on that field, not the
+  generic foreign-key `409` (twenty-first audit). *(Covered:
   `boundaries::a_player_config_refuses_input_data_of_the_wrong_role`.)*
+- `A-MIGRATE-1` A rolled-back image starts against a schema a newer one
+  migrated (a migration the database has and the binary does not), and an
+  applied migration whose file changed is still refused (twenty-ninth audit).
+  *(Covered: `boundaries::a_rolled_back_image_starts_on_a_newer_schema`.)*
 - `A-BOUND-4` A valid result bigger than axum's 2 MB default — a capture batch
   — is accepted, which only the route's own `MAX_RESULT_BYTES` limit allows.
   *(Covered: `boundaries::a_capture_result_of_several_megabytes_is_accepted`.)*
@@ -1682,6 +2587,13 @@ silent.
   start plus the heartbeat timeout (`I-SCHED-20`), so the grace cannot be lost
   in the wiring while every test that sets it by hand still passes. *(Covered:
   `boundaries::a_freshly_built_production_state_grants_the_restart_grace`.)*
+- `A-BOUND-11` Every API answer, errors included, carries
+  `X-Content-Type-Options: nosniff`. *(Covered:
+  `boundaries::api_responses_are_not_sniffed`.)* (Sixteenth audit.)
+- `A-BOUND-12` A malformed id in a path is a JSON `404` and a malformed query a
+  JSON `400`, like every other failure -- as are an unknown endpoint (`404`) and
+  a method an endpoint does not take (`405`, nineteenth audit). *(Covered:
+  `boundaries::malformed_paths_and_queries_answer_json`.)* (Seventeenth audit.)
 
 ---
 
@@ -1734,12 +2646,35 @@ branch's copy.
 Client→server results are not only parsed: each runs through its job type's
 validation, as a submission would, so a captured result the server would
 refuse fails here.
-MAGPIE's half, in `test/contribute_test.c`, is two tests:
+MAGPIE's half, in `test/contribute_test.c`, is four tests:
 `test_contract_fixtures_carry_every_key_contribute_reads` (every key
-`contribute` reads off a server message is in its fixture) and
+`contribute` reads off a server message is in its fixture, and the assigned
+`worker_uuid` is in the form the client takes — the server's
+`a_first_claim_is_assigned_a_worker_uuid` checks it sends that exact value),
 `test_results_carry_every_key_the_server_reads` (the serializers a task's
 result is built with still produce every key the result fixtures carry, so a
-key renamed in MAGPIE fails there rather than every submission).
+key renamed in MAGPIE fails there rather than every submission),
+`test_only_a_data_shutdown_is_waited_out_for_a_set_aside_job` (the wait-or-exit
+decision on each of the three shutdown fixtures) and
+`test_the_claim_body_matches_the_claim_fixture` (the claim body, built from the
+fixture's version and ids, has its keys and values). MAGPIE's sanitizer CI
+shard runs them (`contribute` in its `rest` shard).
+
+Beyond the wire, `contribute_test.c` holds MAGPIE's regression tests for what
+the contribute path plays and how it talks. Two came from the eleventh audit:
+`test_a_rewritten_klv_is_read_again` (a KLV rewritten on disk under a name
+already loaded is read again, and an unchanged one is not — from the second
+leave task in a process the previous generation's KLV was being played, which
+tier 6's `M-4`, one generation long, could not see) and the `Retry-After`
+clamp in `test_http_retries_outlast_a_server_deployment` (a `429` was waited
+out for the connect time in microseconds, read as seconds); and
+`test_a_request_must_state_its_distribution_and_layout` now also refuses a
+path-escaping name in any player object; and `test_a_player_must_state_every_setting`
+refuses a player without its leaves (twelfth audit), which a load would
+otherwise take from whatever was loaded last. `test_an_abandoned_temporary_is_removed`
+(fourteenth audit): a write's `<name>.<pid>.tmp` sibling untouched for an hour
+— a killed writer's, up to 1.9 GB for a rack info table — is removed by the
+next write of the name, and a fresh one or another name's is not.
 
 **Capture** is `scripts/capture_contract.py`, a recording proxy that sits
 between `magpie contribute` and the backend, forwards everything unchanged, and
@@ -1815,8 +2750,34 @@ admin in once and the admin journeys reuse its storage state.
 - `E-9` The password reset flow end to end. *(Covered:
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
 - `E-10` A page renders correctly at phone width — one journey, not all of them.
-  *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list and a
-  job page, nothing wider than the screen.)*
+  *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list, a
+  job page and both rankings, nothing wider than the screen and each ranking's
+  own column inside its box — a pseudonym's sixteen characters pushed it out,
+  thirty-second audit. The contributors' list is measured with a row in it;
+  the job page again with a 32-character creator and contributor, and both
+  lists with a 32-character username and a tombstone (and the contributors'
+  list a pseudonym), which the seed does not register.)* The screen is the device's width:
+  compared with `innerWidth`, as it was, the check could not fail, because a
+  phone's browser widens its layout viewport to fit what overflows — and the
+  header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and
+  "Register" off it (thirty-first audit; the header now wraps). Checked against
+  a build of the pages with the API mocked: 533 before, 393 after.
+- `E-11` An admin job page whose first read fails shows nothing the server
+  did not say: the data gaps it read apart, the job's own allocation (from the
+  stream if the read failed), the failed reads tried again and their error
+  cleared, a value the admin types kept through the retries, and Activate
+  sending it — through an action's read too, since only Activate sends it
+  (the job's own allocation is shown beside the box). And `E-11b`: a read
+  started before a live payload does not land over it — a slow retry put back
+  the status the stream had moved past, on a job that sends nothing more. And
+  `E-11c`: a job deleted while its page is open (by another admin) is said to
+  be gone and its actions disabled — only a failed read noticed before.
+  *(Covered: `e11-admin-job-first-read.spec.ts`, three tests: the first
+  `GET /api/jobs/:id` and the first two gap reads answered `503`; and the
+  stream mocked to say `completed` while a retry's read is held, asserting
+  the held read carried the old status; and a delete through the API.)* The reads ran one after another: the page said
+  "No worker has declined this job", showed 100, and Activate sent it
+  (thirty-second audit, pass 16).
 
 ### Reading confirmation codes
 
@@ -1824,10 +2785,10 @@ Two journeys need to read an emailed code, and they do it through
 `MAIL_BACKEND=file`.
 
 **First, shrink the problem.** Only `E-2` (register → confirm → log in) and
-`E-9` (password reset) need a code at all. The other eight need a *confirmed
+`E-9` (password reset) need a code at all. The other nine need a *confirmed
 admin*, which `e2e/run.sh` seeds through `scripts/seed.py` before Playwright
 starts — so those journeys start at login. That turns "how does the browser
-read mail" into a question about two tests rather than ten.
+read mail" into a question about two tests rather than eleven.
 
 **`MAIL_BACKEND=file`** writes one message per file into `MAIL_OUTBOX_DIR`,
 named by timestamp and sanitised recipient
@@ -1896,11 +2857,17 @@ It has two halves:
   `MAGPIE_BIN=../MAGPIE/bin/magpie cargo nextest run --run-ignored all`:
   `magpie_smoke.rs` (5; the server's own conversions in a scratch directory
   laid out by `magpie.rs`, and the builder versions read out of the binary; no
-  database), `magpie_leave.rs` (6; leave transitions on real KLVs and a real
+  database), `magpie_leave.rs` (7; leave transitions on real KLVs and a real
   object store, so also `TEST_S3_ENDPOINT`) and `magpie_routes.rs` (2; leave-job
   creation and `rebuild-artifacts` through the router). `MAGPIE_ROOT` (default
   `../MAGPIE`) is where `magpie_smoke.rs` finds MAGPIE's small test lexicon.
-  Nothing in CI runs these; they are part of a full local run.
+  The pull-request run skips these; the nightly runs them against the MAGPIE
+  it builds, and they are part of a full local run. Run them against MAGPIE's
+  sanitizer build (`make magpie`, the default `BUILD=dev`) as well as the
+  release one when MAGPIE's side has changed: the twentieth audit's
+  out-of-bounds write on a lower-case rack (`magpie_leave.rs`'s misnamed-rack
+  case) passed on the release build and is a stack-buffer-overflow under
+  AddressSanitizer.
 
 The backend itself is not opt-in about MAGPIE: it runs a pinned MAGPIE for
 every derived file and every leave-generation KLV, reads the builder versions
@@ -1912,8 +2879,7 @@ works — the directory it lays out, the names it invokes, the bytes it gets
 back.
 
 **Correctness is established by version and capability probe.**
-`birdtest-contribute` reports `0.1.0`, the shipped `MIN_MAGPIE_VERSION` default
-and the branch's pre-release version; a checkout reporting anything lower is refused. The
+`birdtest-contribute` reports `0.1.1`, the shipped `MIN_MAGPIE_VERSION` default; a checkout reporting anything lower is refused. The
 probe additionally asks the binary what it can do: that `contribute` is a
 registered command, and that it accepts the current required claim body.
 
@@ -1939,9 +2905,15 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   *(Covered: `case_opening_racks`, for a static and a simming player, asserting
   the simulated statistics — win%, per-ply stats — are stored too. The static
   player asks for a wordmap, so the job also waits on the derived-file builder
-  and MAGPIE finds its own copy agrees.)*
+  and MAGPIE finds its own copy agrees. A third job uses 3-tile racks: jobs
+  choose a rack size from 1 to 7 and the request does not restate it, and a
+  worker that required full racks refused every such task (MAGPIE `0a69b625`;
+  reproduced, fixed in `34bf6f0c`; twenty-third audit).)*
 - `M-4` One `leave_generation` task lands, is staged, moves the generation's
-  live counters, and a merge folds it into `leave_rack_progress`. *(Covered:
+  live counters, and a merge folds it into `leave_rack_progress` -- every rack
+  a real MAGPIE reported matching a rack of the universe, and a rack holding a
+  blank counted (73 of 870 matched nothing before the thirty-second audit).
+  *(Covered:
   `case_leave`, which also checks that nothing is written into MAGPIE's data
   directory.)*
 - `M-5` A worker whose data digests do not match declines with `missing_data`
@@ -2018,21 +2990,136 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
   snapshot, so they included every row committed during the dump and the drill
   of any backup taken while the service was in use failed. `backup.sh` now
   holds one exported repeatable-read snapshot for the dump and every fact about
-  it. *(Covered: `backup-drill-check.sh`, step 2.)*
+  it. The drill restores into a Postgres it starts inside its own container,
+  as the production task does, and never into the stack's database (the check
+  asserts it left nothing there). *(Covered: `backup-drill-check.sh`, step 2.)*
+- `S-BACKUP-2b` The drill of an empty bucket (a new stack before its first
+  backup) passes and says there is nothing to drill; the drill of a prefix with
+  no backups in a bucket that has some fails, with a message. The empty case
+  was meant to pass since the twenty-third audit but never could: `aws s3 ls`
+  exits 1 on an empty listing, and `set -e` ended the drill, silently, before
+  the check. *(Covered: `backup-drill-check.sh`, step 2b.)* (Twenty-fourth
+  audit.)
 - `S-BACKUP-3` A backup that cannot upload exits non-zero and leaves an
   `ok = false` row. *(Covered: `backup-drill-check.sh`, step 3.)*
 - `S-BACKUP-4` A dump of the current schema restores into an empty database and
   comes back identical: row counts, referential integrity, the denormalized
   task counters, and `BYTEA` and `DOUBLE PRECISION` columns intact, over a seed
-  with a row in every table a result touches. *(Covered:
+  of a row in each of `users`, `input_data`, `jobs`, `tasks`, `task_claims`,
+  `game_results` and `backups` (it said "every table a result touches", which
+  it never was: no leave or position-analysis row goes through it). *(Covered:
   `scripts/restore-roundtrip.sh`, which had fallen three `NOT NULL` columns
   behind the schema and could not run.)*
+- `S-BACKUP-5` **A purged job's rows are copied back as RUNBOOK §2.2 says**
+  (`scripts/restore-job.sh`): not before the scratch restore has finished, not
+  from production as its scratch copy, not into a job production has active,
+  not into a job production has completed since the purge, not beside an export
+  of the job made since, not for a job the
+  scratch copy holds nothing of; nothing with
+  `COPYBACK_DUMP_ONLY`; not from a copy taken after the purge — one already
+  holding the purge's audit row, whether of a games job that went on running or
+  of a leave job with only its generation-0 artifact written back; a deleted job
+  restored whole, its `jobs` row inactive, with its config, player config and
+  input data, and resumed after a run stopped once the `jobs` row was in;
+  batches smaller than a line;
+  the job's merge lock held while it loads; every rating pool left to refit
+  on the restored rows;
+  position analyses back through their parents' ids; a row production holds under a restored
+  row's key with other contents stops the run with that batch not loaded and
+  another job untouched; the same run, after §2.0, finishes what the stopped one
+  began; a job loaded in several batches comes back row for row, and again
+  changes nothing; the sequences end past the restored ids. *(Covered:
+  `scripts/restore-job-check.sh`.)* (Thirty-first audit: §2.2 was a pasted loop
+  that loaded each table in one statement, whose foreign-key queue -- 12 bytes
+  a row, measured -- would exhaust a `db.t4g.micro` on a large job, and whose
+  `ON CONFLICT DO NOTHING` dropped a conflicting row silently. Measured on 1.5
+  million progress rows: the queue peaked at 18.9 MB in one statement and at
+  3.2 MB, whatever the job's size, in batches.)
 
-Both run nightly (`restore-roundtrip` and `backup-drill` in
-`.github/workflows/nightly.yml`), each against the schema applied to an empty
+All three run nightly (`restore-roundtrip`, which runs `S-BACKUP-5` and `-7` too, and
+`backup-drill` in `.github/workflows/nightly.yml`), each against the schema applied to an empty
 database — which is also the migration replay the nightly list asks for. The
 monthly production drill (`restore-drill.sh` on the newest real dump) remains
 the real check of the backups themselves.
+
+- `S-BACKUP-6` `dev-restore.sh` scrubs a restore unless `SCRUB=0`, and refuses
+  any other value (`yes`, `true`, `2`, padded spaces) before a single compose
+  call — `SCRUB=yes` used to skip the scrub, restoring a production dump's real
+  addresses and password hashes. The scrub is of the copy the run created,
+  not the stack's database. *(Covered: `scripts/dev-restore-check.sh`, a stub
+  compose, in CI's `scripts` job; it fails with the scrub aimed at
+  `birdtest`.)* (Thirty-second audit; the copy, pass 24.)
+- `S-BACKUP-7` RUNBOOK §1's step that re-applies what a restore undid for
+  security, its two blocks read from RUNBOOK.md as written, against a restored
+  and a damaged database. It refuses URLs that reach the wrong instance either
+  way; an apply before a whole export, without a reviewed `/tmp/after-exclude`,
+  against another server than the export's, or with an exclusion that matches
+  nothing (rolled back) or is not an id. It applies the audited actions the
+  restored instance lacks (revocations, suspensions, resets, confirmations,
+  bans and lifts, deletions — each target's last, an admin deleted, one whose
+  transaction began before the restore point), and not a bad migration's
+  unaudited changes nor an action from before the point; it leaves out an
+  actor — its key revocations, suspensions and confirmations too — or one
+  action by id, keeps the restored password when the last reset is left out
+  or the account was deleted there by a left-out action (and lists the
+  passwords it copies), demotes only from the reviewed list and keeps an edit
+  to it (showing the proposal beside it); an action an hour after the
+  restored instance's newest row and hours before the damaged one's is
+  applied; it refuses ids the two logs use for different rows (the restored
+  instance writing after the repoint, a renumbered damaged log); pasted
+  again, it changes nothing; and it asks only for actions the backend writes.
+  Of 26 faults put into the step one at a time (the pass 25 reviewer's 22 and
+  four more), each fails it but one: the completion mark set before the
+  demotion file is written, which would take a failure between the two lines
+  to show.
+  *(Covered: `scripts/reapply-check.sh`, nightly in `restore-roundtrip`.)*
+  (Thirty-second audit, pass 23; the fourth form, pass 24; the ids and the
+  cases above, pass 25.)
+- `S-RUNBOOK-1` Every bash block in RUNBOOK.md parses: an operator pastes them
+  during an incident, and one that does not leaves a continuation prompt that
+  swallows what is pasted next — an apostrophe in a `${STAMP:?…}` message did
+  that to the restore's backup-settings command. README.md's blocks too. Every
+  fence is parsed: blocks indented in a list are read too (the first cut read
+  16 of 25), a fence labelled anything but exactly `bash`, `sql` or `text`
+  (`Bash`, `sh`, `bash title=…`, unlabelled), a fence run after any other text
+  on its line (a quote mark, a list marker, a nested list), a fence never
+  closed, a line less indented than its block's fence, or a closer indented
+  past it is refused; code must be printable ASCII (a no-break space after a
+  backslash ended the command); a block
+  must parse with nothing said (`bash -n` only warns of a heredoc never
+  terminated) and must not end in a backslash; and a block that mentions
+  `aws` must turn the pager off in its first line of code (the pager
+  swallowed a pasted `wait`; an export after the first call was too late).
+  *(Covered: `scripts/runbook-check.sh RUNBOOK.md README.md`, `bash -n` per
+  block, in CI's `scripts` job.)*
+  (Thirty-second audit.)
+- `S-SCRUB-1` A scrubbed dump holds no credential: every anonymous worker's
+  UUID is replaced, with its claims, ban and audit rows following it and what
+  it did kept, and an open claim's token is replaced; twice over, as the script
+  allows. *(Covered: `account::a_scrubbed_dump_keeps_no_worker_credential`,
+  which also pins `anonymous_workers`' columns to the ones the script copies.)*
+  (Thirty-first audit: the UUIDs, each a whole credential, survived scrubbing.)
+- `S-SCRUB-2` A scrubbed dump holds no ban reason (an admin's free text about a
+  person), in the ban or its audit row; and the script refuses to run unless
+  asked for by name (`-v dev_copy=1`), since its old usage line pointed it at
+  production; `dev_copy` must be true, not merely set. *(Covered: the reasons
+  in `account::a_scrubbed_dump_keeps_no_worker_credential`; the refusal —
+  run from a file, and pasted into an interactive psql, where it aborts the
+  transaction so nothing after it runs, whatever `ON_ERROR_ROLLBACK` a
+  psqlrc sets — and
+  `dev-restore.sh`'s restoring into a copy swapped in, in one transaction,
+  only when whole and scrubbed — a dump cut in its data, one missing a file,
+  SIGTERM and SIGHUP part-way, a copy that cannot be renamed, SIGINT during a
+  held swap (which it waits out and reports), two restores at once, a failed
+  artifact mirror (exit 1), TERM, HUP and INT at half-second steps through a
+  whole run (36 runs), and a Ctrl-C to the whole process group during the
+  mirror (pass 25: the compose CLI caught it, and the container went on
+  mirroring with `--remove` after the script exited), each leave a `birdtest`,
+  a message that says which, the backend running and no mirror container — and `dev-dump.sh`'s writing
+  aside, leaving nothing when it fails or is stopped and the old snapshot
+  when stopped replacing it, and its artifact mirror, by hand against the real
+  mc image: the audit's passes 23 and 24 replayed each against a throwaway
+  compose stack.)*
 
 ---
 
@@ -2057,11 +3144,23 @@ Unit-testing HCL tests the plan, not the deployment, and the failure mode that
 matters — an apply that breaks production — is not reachable from a test suite.
 Backup *restores* are covered by the monthly drill, which is the real check.
 
-**The SES mail backend.** Every tier runs `console` or `file`; `ses` is
-exercised by production and by the first confirmation email after a deploy.
-Testing it would mean a mocked SDK, which tests the mock. What is shared —
-composing the message, sending off the request path (`A-AUTH-8`) — runs under
-the other two.
+**The SES mail backend, against SES.** Every tier runs `console` or `file`;
+what they share — composing the message, sending off the request path
+(`A-AUTH-8`) — runs under both. The real SDK is run against a local endpoint
+(`email::tests::a_refused_send_keeps_what_ses_said`: a refusal is logged
+as SES's `code: message`, where it read `service error`, and a send with no
+answer as its causes; `a_send_nobody_answers_times_out`: a send an endpoint
+takes and never answers fails after its time, where it hung silently;
+`a_burst_of_sends_is_paced_in_order`: eight sends at four a second reach SES
+spread over two seconds and in the order they were queued, where a burst past
+the account's rate was refused, and then the newest waiter won each turn;
+`a_full_mail_queue_refuses_rather_than_growing`;
+`a_mail_that_waited_past_its_link_is_not_sent` — pass 25), and
+`email::tests::every_failed_send_is_logged_as_the_alarm_expects` ties each
+failure line's `alarm = "mail_failed"` field to the alarm's JSON filter in
+`infra/ses.tf`. What SES itself accepts,
+delivers and counts as a bounce is exercised by production, and by the first
+confirmation email after a deploy.
 
 **Generated and vendored code.** Vendored cJSON in MAGPIE, SvelteKit's
 `.svelte-kit` output.
@@ -2177,8 +3276,8 @@ Serving it offline takes two settings and a static tree.
 `GITHUB_API_URL` and fetches tarballs from `GITHUB_RAW_URL`, both defaulting to
 the real hosts (`MAGPIE_DATA_REPO` substitutes only the `owner/repo` segment).
 `fixtures/build.sh` also writes `fixtures/github/`, the two answers an import
-asks GitHub for — `api/repos/birdtest/fixtures/commits/main` resolving to a
-fixed sha, and `raw/birdtest/fixtures/<sha>/versioned-tarballs/` holding the
+asks GitHub for — `api/repos/birdtest/fixtures/git/ref/heads/main`, the branch
+as JSON naming a fixed sha, and `raw/birdtest/fixtures/<sha>/versioned-tarballs/` holding the
 tarballs — which the e2e stack's `fixtures` service (Nginx,
 `fixtures/nginx.conf`) serves with the backend's two URLs pointed at it. Tier 2
 points the same two settings at an in-process stand-in that serves a tarball
@@ -2278,29 +3377,39 @@ for `leave_generation` deliberately.
 
 GitHub Actions.
 
-**Per pull request** (`.github/workflows/ci.yml`), six jobs in parallel:
+**Per pull request** (`.github/workflows/ci.yml`), seven jobs in parallel:
 
 1. **backend** — a Postgres 16 service and a MinIO container, with
    `TEST_DATABASE_URL` and `TEST_S3_ENDPOINT` pointing at them; `cargo clippy
-   --locked --all-targets -- -D warnings`, then `cargo test --locked`: tiers 1,
-   2, 3 and 4. The `#[ignore]`d tier-6 tests are not run.
+   --locked --all-targets -- -D warnings`, then `cargo nextest run --locked
+   --no-fail-fast` (tiers 1, 2, 3 and 4; `backend/.config/nextest.toml` kills a
+   test at ten minutes) and `cargo test --locked --doc`. The `#[ignore]`d
+   tier-6 tests are not run here; the nightly runs them.
 2. **frontend** — `npm ci`, `npm run check`, `npm test` (tier 1F), `npm run
    build`.
 3. **images** — the backend image (which builds the pinned MAGPIE too), a probe
    that the image's MAGPIE runs and reports its builders, the derived-file
    builder image, and the frontend image.
-4. **e2e** — tier 5: MAGPIE `birdtest-contribute` built `portable_release`
+4. **e2e** — tier 5: MAGPIE at the commit `docker/Dockerfile` pins, built `portable_release`
    inside `debian:bookworm-slim` (the backend image's glibc), Playwright's
    Chromium, then `e2e/run.sh`; the Playwright report and traces are uploaded
    on failure.
 5. **terraform** — `terraform fmt -check -recursive` and `terraform validate`
    (no AWS credentials).
-6. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE
-   `birdtest-contribute`, copy this branch's `contract-fixtures/` over its
+6. **scripts** — `scripts/dev-restore-check.sh`: `dev-restore.sh`'s `SCRUB`
+   rule against a stub `COMPOSE`, with no Docker; `scripts/runbook-check.sh`:
+   every bash block in RUNBOOK.md and README.md parses, fences labelled and
+   placed so none goes unread, and each `aws` block turns the pager off first
+   (five minutes at most).
+7. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
+   commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
    `test/birdtest_contract/`, and run `magpie_test contribute`; then
-   `magpie_test builderhash` (the derived-file builders against their pinned
-   hashes) and a check that the conversions the server invokes
-   (`dawg2wordmap`, `klvwmp2rit`, `rackequity2klv`) still exist. A fixture
+   `magpie_test builderhash` (the wordmap, rack info table and both KLV
+   builders -- `createdata klv` and `rackequity2klv` -- against their pinned
+   hashes), and then every command the server invokes (`convert dawg2wordmap`,
+   `convert klvwmp2rit`, `createdata klv`, `convert rackequity2klv`), run as
+   the server runs it on MAGPIE's two-letter test data, each required to exit 0
+   with no error and to write its file. A fixture
    changed here and not in MAGPIE fails here; a MAGPIE-side change is caught
    by the nightly run.
 
@@ -2309,15 +3418,35 @@ GitHub Actions.
 - **e2e** — tier 6: MAGPIE built `portable_release` with a real
   `download_data.sh` install, the compose stack (`postgres`, `minio`,
   `backend`) with its GitHub URLs on the script's stand-in, and
-  `scripts/e2e_magpie.py` running every `M-*` case. Dispatchable by hand
-  against another MAGPIE ref.
+  `scripts/e2e_magpie.py` running every `M-*` case, then the opt-in Rust
+  tests (`cargo nextest run --run-ignored ignored-only`) against the same
+  MAGPIE. Run twice, as a matrix: against the commit `docker/Dockerfile` pins
+  (what production runs -- a pin that refused every short opening rack passed
+  every other check, twenty-third audit) and against the branch head.
+  Dispatchable by hand against another MAGPIE ref (the head leg).
 - **restore-roundtrip** — the schema applied to an empty database (the
-  migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`).
+  migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`),
+  `scripts/restore-job-check.sh` (`S-BACKUP-5`) and
+  `scripts/reapply-check.sh` (`S-BACKUP-7`).
 - **backup-drill** — Postgres and MinIO up, the schema applied, then
-  `scripts/backup-drill-check.sh` (`S-BACKUP-1`..`3`).
+  `scripts/backup-drill-check.sh` (`S-BACKUP-1`..`3`, and `S-BACKUP-2b`).
 
 Nightly failures are an alert rather than a blocked merge, because they are
 slower and more environment-sensitive than a pull request should wait on.
+
+**While the pin is unpushed.** GitHub serves a commit only once it is on a
+branch it can reach, so until `docker/Dockerfile`'s `MAGPIE_COMMIT` is pushed to
+`birdtest-contribute`:
+- `images`, `e2e` and `magpie-contract` fail: the image fetches the commit, and
+  the other two check it out.
+- The nightly's pin leg fails at its checkout. Its head leg builds whatever the
+  branch's remote head is, which may be older than the backend's
+  `MIN_MAGPIE_VERSION` allows.
+- `backend`, `frontend`, `terraform` and `scripts` are unaffected.
+
+Push the pin before relying on CI. Once pushed, it must stay reachable: a
+rebase or force-push of the branch past it breaks rebuilding that release,
+and so rolling back to it.
 
 ---
 
@@ -2335,7 +3464,8 @@ slower and more environment-sensitive than a pull request should wait on.
 **The runner is `cargo nextest run`** (run from `backend/`). It runs each test in
 its own process, and `backend/.config/nextest.toml` reports a test as slow after
 a minute and kills it after ten, so a hang fails the run instead of stalling it.
-`cargo test` runs the same tests — CI uses it — without that ceiling.
+`cargo test` runs the same tests without that ceiling; CI uses nextest, and
+`cargo test --doc` for the doctests nextest does not run.
 `--run-ignored all` adds the tier-6 Rust tests to everything else; a full local
 run is `cargo nextest run --run-ignored all` with every variable below set.
 

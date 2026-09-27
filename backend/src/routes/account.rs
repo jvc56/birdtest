@@ -3,7 +3,8 @@ use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::models::user::ApiKeyRow;
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use crate::extract::ApiPath as Path;
+use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{get, patch};
 use axum::{Json, Router};
@@ -14,12 +15,15 @@ use uuid::Uuid;
 /// The plan's cap. Enforced here rather than as a DB constraint so the error is
 /// a clean 409 instead of a constraint violation.
 const MAX_API_KEYS: i64 = 100;
+const MAX_KEY_LABEL_CHARS: usize = 100;
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/me", get(me))
         .route("/api/me/api-keys", get(list_keys).post(create_key))
         .route("/api/me/api-keys/:id", patch(set_key_active).delete(revoke_key))
+        // As the auth routes: nothing here takes more than a label.
+        .layer(axum::extract::DefaultBodyLimit::max(super::auth::SMALL_BODY_BYTES))
 }
 
 #[derive(Serialize)]
@@ -89,6 +93,15 @@ async fn create_key(
     ApiJson(body): ApiJson<CreateKeyBody>,
 ) -> AppResult<(StatusCode, Json<CreatedKey>)> {
     csrf::verify(&method, &headers, &jar)?;
+    // Bounded: listed on every view of the account page and kept in every
+    // nightly dump, and only the request body's 2 MB limit stood in the way.
+    if body.label.as_ref().is_some_and(|label| label.chars().count() > MAX_KEY_LABEL_CHARS) {
+        return Err(AppError::bad_request("the key's label is too long")
+            .with_field("label", format!("must be at most {MAX_KEY_LABEL_CHARS} characters")));
+    }
+    // Each key is a worker rate-limit bucket of its own, so making keys is
+    // limited too: revoke-and-create would otherwise be unlimited rate.
+    crate::ratelimit::check(&state.limits.key_creation, &format!("u:{}", user.id))?;
 
     // Count and insert under the account's row lock. Counted and then inserted
     // as two statements on the pool, requests arriving together each read the
@@ -97,10 +110,14 @@ async fn create_key(
     // The limit is enforced here rather than in the schema, so this is the
     // only thing that enforces it.
     let mut tx = state.pool.begin().await?;
-    sqlx::query("SELECT 1 FROM users WHERE id = $1 FOR UPDATE")
+    // `deleted_at` rechecked under the lock: a request that authenticated
+    // before its account's deletion committed waited here for it, and then
+    // inserted a key after the delete had removed the account's keys.
+    sqlx::query("SELECT 1 FROM users WHERE id = $1 AND deleted_at IS NULL FOR UPDATE")
         .bind(user.id)
-        .execute(&mut *tx)
-        .await?;
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::unauthorized("this account no longer exists"))?;
     let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM api_keys WHERE user_id = $1")
         .bind(user.id)
         .fetch_one(&mut *tx)
@@ -120,6 +137,7 @@ async fn create_key(
     .bind(&body.label)
     .fetch_one(&mut *tx)
     .await?;
+    crate::audit::log_account(&mut tx, "api_key.created", user.id, "api_key", id.to_string()).await?;
     tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(CreatedKey { id, label: body.label, key: raw })))
@@ -140,17 +158,47 @@ async fn set_key_active(
     ApiJson(body): ApiJson<SetActiveBody>,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
-
-    let updated = sqlx::query("UPDATE api_keys SET is_active = $1 WHERE id = $2 AND user_id = $3")
-        .bind(body.is_active)
-        .bind(id)
-        .bind(user.id)
-        .execute(&state.pool)
-        .await?;
-
-    if updated.rows_affected() == 0 {
-        return Err(AppError::not_found("no such API key"));
+    // Resuming a key is limited, suspending it is not: a back-and-forth needs
+    // both, so this bounds the audit rows it writes, and an owner suspending
+    // keys after a takeover is never held back by a thief who drained the
+    // bucket (the audit's pass 23).
+    if body.is_active {
+        crate::ratelimit::check(&state.limits.key_changes, &format!("u:{}", user.id))?;
     }
+
+    // Only a change is written and logged. A row for every call let one
+    // account grow the audit log at request rate -- 8,000 rows in nine seconds
+    // (the audit's pass 22) -- and suspending is still not limited.
+    let mut tx = state.pool.begin().await?;
+    let changed = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE api_keys SET is_active = $1 WHERE id = $2 AND user_id = $3 AND is_active <> $1
+         RETURNING id",
+    )
+    .bind(body.is_active)
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match changed {
+        Some(_) => {
+            let action = if body.is_active { "api_key.reactivated" } else { "api_key.deactivated" };
+            crate::audit::log_account(&mut tx, action, user.id, "api_key", id.to_string()).await?;
+        }
+        None => {
+            // Already as asked, or not this account's key.
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM api_keys WHERE id = $1 AND user_id = $2)",
+            )
+            .bind(id)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(AppError::not_found("no such API key"));
+            }
+        }
+    }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -163,15 +211,19 @@ async fn revoke_key(
     jar: CookieJar,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
+    // Not rate limited: every revoke needs a key made first, which
+    // `key_creation` limits, and an owner revoking a thief's keys must not wait.
 
-    let deleted = sqlx::query("DELETE FROM api_keys WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(user.id)
-        .execute(&state.pool)
-        .await?;
-
-    if deleted.rows_affected() == 0 {
-        return Err(AppError::not_found("no such API key"));
-    }
+    // The row goes; the audit row, in the same transaction, is the only record
+    // that the key existed and when it was revoked.
+    let mut tx = state.pool.begin().await?;
+    sqlx::query_scalar::<_, Uuid>("DELETE FROM api_keys WHERE id = $1 AND user_id = $2 RETURNING id")
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such API key"))?;
+    crate::audit::log_account(&mut tx, "api_key.revoked", user.id, "api_key", id.to_string()).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

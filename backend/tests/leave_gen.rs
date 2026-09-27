@@ -1500,6 +1500,36 @@ async fn the_leave_results_feed_pages_through_every_generation_in_order() {
     assert_eq!(seen, expected, "newest generation first, then by rack");
 }
 
+/// I-LEAVE-16b: a made-up cursor costs a page, not a walk. The feed read its
+/// generations `current - 1` at a time from the cursor's, so a cursor naming
+/// generation 2,147,483,647 stepped down one empty read at a time on the
+/// display pool, for as long as the client waited. It now goes from an empty
+/// generation to the next one with rows in one probe.
+#[tokio::test]
+async fn a_made_up_generation_in_a_cursor_costs_one_page() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    {
+        let mut conn = db.pool.acquire().await.unwrap();
+        let data = birdtest::jobs::load_job_data(&mut conn, job).await.unwrap();
+        birdtest::jobs::leave_gen::seed_generation(&mut conn, job, 2, &data.letterdist)
+            .await
+            .unwrap();
+    }
+    let app = birdtest::app(db.state().await);
+    let forged = birdtest::routes::encode_cursor(&[i32::MAX.to_string(), String::new()]);
+
+    let started = std::time::Instant::now();
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{job}/results?per_page=5&cursor={forged}"), &[]))
+            .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 5, "{body}");
+    assert!(items.iter().all(|i| i["generation"] == 2), "the newest real generation: {body}");
+}
+
 /// Claims one leave task and returns the assignment, without submitting.
 async fn claim_one(app: &axum::Router) -> serde_json::Value {
     let (status, body) =
@@ -1524,6 +1554,231 @@ async fn submit(app: &axum::Router, assignment: &serde_json::Value, racks: &[(&s
     .await;
     assert_eq!(status, StatusCode::OK, "{accepted}");
     assert_eq!(accepted["accepted"], true, "{accepted}");
+}
+
+/// I-LEAVE-20: a rack counts however the worker spells it. MAGPIE writes a
+/// rack's letters in its own machine-letter order with blanks last
+/// (`AEINST?` for the forced `?AEINST`), and the merge matched racks exactly:
+/// every rack holding a blank went uncounted, was forced on every lap, and the
+/// generation never closed. Here the whole universe is forced in one task and
+/// reported reversed; every rack counts. One rack under two spellings in one
+/// result is a duplicate.
+#[tokio::test]
+async fn a_rack_counts_however_the_worker_spells_it() {
+    let db = TestDb::new().await;
+    let (job, seeded) = leave_job(&db, 200).await;
+    let app = birdtest::app(db.state().await);
+
+    let task = claim_one(&app).await;
+    let forced = forced_racks(&task);
+    assert_eq!(forced.len() as i64, seeded, "one task forces the whole universe");
+    assert!(forced.iter().any(|r| r.starts_with('?')), "the universe has blank racks: {forced:?}");
+    let reversed: Vec<String> = forced.iter().map(|r| r.chars().rev().collect()).collect();
+    let pairs: Vec<(&str, i64)> = reversed.iter().map(|r| (r.as_str(), 3)).collect();
+    submit(&app, &task, &pairs).await;
+    let merged = birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap().unwrap();
+    assert_eq!(merged.racks_updated, seeded, "{merged:?}");
+    let uncounted: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = 1 AND occurrence_count <> 3",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(uncounted, 0);
+
+    let task = claim_one(&app).await;
+    let blank = forced.iter().find(|r| r.starts_with('?')).unwrap();
+    let blank_last = format!("{}?", &blank[1..]);
+    let result = json!({ "racks": [
+        { "rack": blank, "count": 1, "mean": 1.0 },
+        { "rack": blank_last, "count": 1, "mean": 1.0 },
+    ]});
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/result",
+            &[("x-worker-uuid", task["worker_uuid"].as_str().unwrap())],
+            json!({ "claim_token": task["claim_token"], "result": result }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("more than once"), "{body}");
+}
+
+/// I-LEAVE-21: a merge sums what is staged in passes, a slice of the racks at
+/// a time, so a pass's hash table fits in memory however much is staged --
+/// and every rack's total is still exact, each row written once. A hundred
+/// and ten staged results over this universe of 149 racks, in slices of about
+/// fifty: three passes.
+#[tokio::test]
+async fn a_merge_of_a_backlog_sums_it_in_passes_exactly() {
+    let db = TestDb::new().await;
+    let (job, seeded) = leave_job(&db, 2).await;
+    let universe = racks_in_sweep_order(&db, job).await;
+    assert_eq!(universe.len() as i64, seeded);
+    // Result i reports every rack whose position is not a multiple of i+2,
+    // i+1 occurrences each at mean 1.
+    let mut expected = vec![0i64; universe.len()];
+    for i in 0..110usize {
+        let chosen: Vec<usize> = (0..universe.len()).filter(|k| k % (i + 2) != 0).collect();
+        let racks: Vec<&str> = chosen.iter().map(|&k| universe[k].as_str()).collect();
+        let counts: Vec<i64> = chosen.iter().map(|_| (i + 1) as i64).collect();
+        let sums: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+        for &k in &chosen {
+            expected[k] += (i + 1) as i64;
+        }
+        sqlx::query(
+            "INSERT INTO leave_rack_staging (job_id, generation, task_id, racks, counts, equity_sums)
+             VALUES ($1, 1, $2, $3, $4, $5)",
+        )
+        .bind(job)
+        .bind(Uuid::new_v4())
+        .bind(&racks)
+        .bind(&counts)
+        .bind(&sums)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    let merged = birdtest::jobs::leave_gen::merge_staged_in_slices(&db.pool, job, 1, true, 50)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(merged.folds_merged, 110);
+    assert_eq!(merged.racks_updated, expected.iter().filter(|&&e| e > 0).count() as i64);
+    let rows: Vec<(String, i64, f64)> = sqlx::query_as(
+        "SELECT rack, occurrence_count, equity_sum FROM leave_rack_progress
+         WHERE job_id = $1 AND generation = 1 ORDER BY rack",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    for (k, (rack, count, sum)) in rows.iter().enumerate() {
+        assert_eq!(rack, &universe[k]);
+        assert_eq!((*count, *sum), (expected[k], expected[k] as f64), "{rack}");
+    }
+    let staged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_staging WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(staged, 0);
+}
+
+/// I-LEAVE-22: a merge takes one of the process's merge turns only once it
+/// holds its job's lock. Taken before, two merges waiting on one job's
+/// running merge (or purge) held both turns, and every other job's merges
+/// gave up or waited behind them.
+#[tokio::test]
+async fn merges_waiting_on_one_job_leave_other_jobs_free_to_merge() {
+    let db = TestDb::new().await;
+    let (x, _) = leave_job(&db, 2).await;
+    let (y, _) = leave_job(&db, 2).await;
+    let rack: String = racks_in_sweep_order(&db, y).await.remove(0);
+    for job in [x, y] {
+        sqlx::query(
+            "INSERT INTO leave_rack_staging (job_id, generation, task_id, racks, counts, equity_sums)
+             VALUES ($1, 1, $2, ARRAY[$3], ARRAY[1::bigint], ARRAY[1.0::float8])",
+        )
+        .bind(job)
+        .bind(Uuid::new_v4())
+        .bind(&rack)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    }
+    // X's running merge, or a purge of X, holds X's merge lock.
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(3, hashtext($1::text))")
+        .bind(x)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let waiting: Vec<_> = (0..2)
+        .map(|_| {
+            let pool = db.pool.clone();
+            tokio::spawn(async move { birdtest::jobs::leave_gen::merge_staged(&pool, x, 1, true).await })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let merged = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        birdtest::jobs::leave_gen::merge_staged(&db.pool, y, 1, false),
+    )
+    .await
+    .expect("Y's merge is not held up by X")
+    .unwrap();
+    assert_eq!(merged.map(|m| m.folds_merged), Some(1), "Y merged while X was held");
+
+    holder.rollback().await.unwrap();
+    for merge in waiting {
+        merge.await.unwrap().unwrap();
+    }
+    let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leave_rack_staging")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(left, 0);
+}
+
+/// I-LEAVE-23: a declined leave task is reissued as it stands, the decliner
+/// included, and its racks are never forced by two open claims. Skipped for
+/// its decliner (as games tasks are, A-WORKER-19), the decliner's claim went
+/// to rack selection, which does not count an available task's racks as out:
+/// the same racks went out again on a second claim, and in the tail every
+/// decline made another task of them for the same worker.
+#[tokio::test]
+async fn a_declined_leave_task_is_reissued_as_it_stands() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let first = claim_one(&app).await;
+    let uuid = first["worker_uuid"].as_str().unwrap().to_string();
+    let declined = forced_racks(&first);
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let (status, body) = send(
+        &app,
+        post_json(
+            "/api/worker/decline",
+            &[("x-worker-uuid", uuid.as_str())],
+            json!({ "claim_token": first["claim_token"], "reason": "task_failed" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, again) = send(
+        &app,
+        post_json("/api/worker/task", &[("x-worker-uuid", uuid.as_str())], claim_body("1.0.0", &[])),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{again}");
+    assert_eq!(forced_racks(&again), declined, "the same task, as it stands");
+    let _other = claim_one(&app).await;
+
+    let doubled: Vec<String> = sqlx::query_scalar(
+        "SELECT rack FROM (
+             SELECT unnest(r.forced_racks) AS rack
+             FROM task_claims c JOIN leave_requests r ON r.task_id = c.task_id
+             WHERE c.job_id = $1 AND c.state = 'claimed') out
+         GROUP BY rack HAVING COUNT(*) > 1",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(doubled.is_empty(), "racks forced by two open claims: {doubled:?}");
+    let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert!(tasks <= 2, "no copy of the declined task was made: {tasks}");
 }
 
 /// The generation's racks in the order a sweep visits them: the primary key's,
@@ -1672,4 +1927,120 @@ async fn a_sweep_that_finds_nothing_below_target_closes_the_generation() {
     assert!(matches!(next_step(&db, job).await, Step::Transition));
     let step = next_step(&db, job).await;
     assert!(matches!(step, Step::InProgress), "{step:?}");
+}
+
+/// A generation turns to its tail -- lowest count first, with everything out
+/// excluded -- only where a lap would start: nothing in flight, nothing staged.
+/// It turned whenever a merge put the summary under the threshold, mid-lap,
+/// and then every claim hashed the racks of every sweep claim still out: some
+/// 0.45 s a claim inside the dispatch lock at a thousand workers, until those
+/// claims drained and a merge ran (thirty-first audit). Here the summary drops
+/// under the threshold mid-lap; the sweep carries on, the lap's end waits for
+/// its claims, and only then does the tail begin, remembered as a cursor row
+/// with no rack, and carry on with its own claims out.
+#[tokio::test]
+async fn a_generation_turns_to_its_tail_only_where_a_lap_would_start() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 1).await;
+    let app = birdtest::app(db.state().await);
+    let order = racks_in_sweep_order(&db, job).await;
+
+    let first = claim_one(&app).await;
+    let second = claim_one(&app).await;
+    assert_eq!([forced_racks(&first), forced_racks(&second)].concat(), order[..2]);
+
+    // What a merge might leave: a few racks short, one of them far short, and
+    // the summary under the threshold.
+    sqlx::query(
+        "UPDATE leave_rack_progress SET occurrence_count = CASE
+             WHEN rack = $2 THEN 0 WHEN rack = ANY($3) THEN 500 ELSE 1000 END
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .bind(&order[140])
+    .bind(&order[..52])
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE leave_generation_progress SET racks_at_target = racks_total - 53
+         WHERE job_id = $1 AND generation = 1",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let third = claim_one(&app).await;
+    assert_eq!(forced_racks(&third), order[2..3], "mid-lap, the sweep carries on");
+
+    // The lap ends with its claims still out: the tail waits for them.
+    sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1").bind(job).execute(&db.pool).await.unwrap();
+    let (status, body) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "not the tail with the lap's claims out: {body}");
+
+    for assignment in [&first, &second, &third] {
+        let rack = forced_racks(assignment)[0].clone();
+        submit(&app, assignment, &[(&rack, 1000)]).await;
+    }
+    birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap();
+
+    let tail = claim_one(&app).await;
+    assert_eq!(forced_racks(&tail), order[140..141], "the tail: lowest count first");
+    let marker: Option<String> =
+        sqlx::query_scalar("SELECT cursor_rack FROM leave_selection_cursors WHERE job_id = $1 AND generation = 1")
+            .bind(job)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(marker, None, "the tail is remembered");
+    let next = claim_one(&app).await;
+    assert_ne!(forced_racks(&next), order[140..141], "with its own claim out, the tail carries on");
+}
+
+/// A transition that fails before it starts -- reading the job's config or its
+/// letter distribution -- hands ownership back at once too, as PLAN.md says of
+/// any failure the server survives. Those two reads ran outside the guard, and
+/// a transient error in either left the owner row standing: the generation
+/// handed out nothing until the half-hour takeover timeout (thirty-first
+/// audit). Forced here by removing the config row once the claim path has it
+/// in its template.
+#[tokio::test]
+async fn a_transition_that_fails_before_it_starts_hands_ownership_back() {
+    let db = TestDb::new().await;
+    let (job, _) = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    // One claim loads the job's template; its task is then taken away again,
+    // so nothing is in flight.
+    claim_one(&app).await;
+    sqlx::query("DELETE FROM tasks WHERE job_id = $1").bind(job).execute(&db.pool).await.unwrap();
+    sqlx::query("DELETE FROM leave_selection_cursors WHERE job_id = $1").bind(job).execute(&db.pool).await.unwrap();
+    sqlx::query("UPDATE leave_rack_progress SET occurrence_count = 1000 WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM job_leave_config WHERE job_id = $1").bind(job).execute(&db.pool).await.unwrap();
+
+    let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let owned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM leave_generation_transitions WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(owned, 1, "the claim took ownership of the transition");
+    let released = wait_for(|| async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT started_at <= to_timestamp(0) FROM leave_generation_transitions
+             WHERE job_id = $1 AND generation = 1",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    })
+    .await;
+    assert!(released, "a transition that failed before it started hands ownership back");
 }

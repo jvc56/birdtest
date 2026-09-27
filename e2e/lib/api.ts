@@ -39,6 +39,11 @@ export class AdminApi {
     return body<T>(response, `POST ${path}`);
   }
 
+  async delete(path: string): Promise<void> {
+    const response = await this.ctx.delete(path, { headers: { 'x-csrf-token': this.csrf } });
+    if (!response.ok()) throw new Error(`DELETE ${path}: ${response.status()} ${await response.text()}`);
+  }
+
   async dispose() {
     await this.ctx.dispose();
   }

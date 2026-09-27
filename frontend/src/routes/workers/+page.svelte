@@ -5,9 +5,15 @@
   import Pagination from '$lib/components/Pagination.svelte';
 
   let result: Page<Record<string, any>> | null = null;
+  let loadError = '';
 
   async function load(page: number) {
-    result = await api.workers(page);
+    loadError = '';
+    try {
+      result = await api.workers(page);
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   }
   onMount(() => load(0));
 </script>
@@ -17,20 +23,24 @@
   Every worker that has completed a task, authenticated or anonymous.
 </p>
 
-{#if !result}
+{#if loadError}
+  <p class="text-sm text-destructive">Could not load the contributors: {loadError}</p>
+{:else if !result}
   <p class="text-muted-foreground">Loading…</p>
 {:else}
   <div class="card overflow-x-auto p-0">
     <table class="table">
       <thead>
-        <tr><th>#</th><th>Contributor</th><th>Last result</th><th class="text-right">Tasks completed</th></tr>
+        <!-- "Last result" is dropped on a phone: with a pseudonym's sixteen
+             characters it pushed the column the list is ranked by out of the box. -->
+        <tr><th>#</th><th>Contributor</th><th class="hidden sm:table-cell">Last result</th><th class="text-right">Tasks completed</th></tr>
       </thead>
       <tbody>
         {#each result.items as worker, i}
           <tr>
             <td class="tabular-nums text-muted-foreground">{result.page * result.per_page + i + 1}</td>
-            <td>{workerLabel(worker)}</td>
-            <td>{datetime(worker.last_seen_at)}</td>
+            <td class="break-all">{workerLabel(worker)}</td>
+            <td class="hidden sm:table-cell">{datetime(worker.last_seen_at)}</td>
             <td class="text-right tabular-nums">{Number(worker.tasks_completed).toLocaleString()}</td>
           </tr>
         {:else}

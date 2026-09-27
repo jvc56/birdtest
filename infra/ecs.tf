@@ -5,6 +5,17 @@
 resource "aws_ecs_cluster" "main" {
   name = local.name
   tags = local.tags
+
+  # ECS Exec (scripts/prod-shell.sh, RUNBOOK §2 and §5) is not logged. By
+  # default a session is logged through the task's awslogs driver, which asks
+  # the ops task role for CloudWatch Logs permissions it does not have -- and
+  # a transcript there would hold what the operator echoes, `DATABASE_URL`
+  # among it (thirty-second audit, pass 17).
+  configuration {
+    execute_command_configuration {
+      logging = "NONE"
+    }
+  }
 }
 
 resource "aws_cloudwatch_log_group" "main" {
@@ -152,10 +163,45 @@ resource "aws_lb_target_group" "frontend" {
   tags = local.tags
 }
 
-# Plain HTTP only redirects. The backend runs with SECURE_COOKIES=true, and a
-# browser discards a Secure cookie set over http, so serving the app on port 80
-# would make signing in silently impossible -- and would send session cookies
-# and API keys in the clear if it did not.
+# The site is down: no healthy target behind the load balancer for ten
+# minutes. Nothing else alarms on it -- a crash-looping task, a rollback onto a
+# schema it refuses, a health check that never passes -- and the service keeps
+# no healthy task through a deploy, so ten minutes, not one, clears a deploy
+# (migrations run inside the health check grace) without paging. Only while
+# the service is meant to run: at desired_count 0 (a first apply, RUNBOOK §5's
+# first step) there is nothing to be healthy. The task runs both containers,
+# but each has its own target group and health check.
+resource "aws_cloudwatch_metric_alarm" "no_healthy_targets" {
+  for_each = var.desired_count > 0 ? {
+    backend  = aws_lb_target_group.backend.arn_suffix
+    frontend = aws_lb_target_group.frontend.arn_suffix
+  } : {}
+
+  alarm_name        = "${local.name}-${each.key}-down"
+  alarm_description = "birdtest's ${each.key} has had no healthy target for ten minutes"
+  namespace         = "AWS/ApplicationELB"
+  metric_name       = "HealthyHostCount"
+  dimensions = {
+    TargetGroup  = each.value
+    LoadBalancer = aws_lb.main.arn_suffix
+  }
+  statistic           = "Maximum"
+  period              = 60
+  evaluation_periods  = 10
+  threshold           = 1
+  comparison_operator = "LessThanThreshold"
+  # No datapoints at all -- as with nothing registered -- counts as down.
+  treat_missing_data = "breaching"
+  alarm_actions      = [aws_sns_topic.alerts.arn]
+  ok_actions         = [aws_sns_topic.alerts.arn]
+  tags               = local.tags
+}
+
+# Plain HTTP redirects pages (and refuses the API, below). The backend runs
+# with SECURE_COOKIES=true, and a browser discards a Secure cookie set over
+# http, so serving the app on port 80 would make signing in silently
+# impossible -- and would send session cookies and API keys in the clear if it
+# did not.
 resource "aws_lb_listener" "http" {
   load_balancer_arn = aws_lb.main.arn
   port              = 80
@@ -167,6 +213,33 @@ resource "aws_lb_listener" "http" {
       port        = "443"
       protocol    = "HTTPS"
       status_code = "HTTP_301"
+    }
+  }
+}
+
+# Except the API: a worker configured with `server http://...` was redirected,
+# and MAGPIE followed -- sending its API key or anonymous UUID in the clear on
+# every request, with nothing to show for it (an anonymous worker simply
+# worked; a keyed one lost its key header at the scheme change and its work
+# with it). Refused here instead, so the first request fails and says why.
+# The app never calls the API over http -- its page is redirected -- though
+# someone opening a copied http://.../api/... link now reads the 426's text.
+resource "aws_lb_listener_rule" "http_api_refused" {
+  listener_arn = aws_lb_listener.http.arn
+  priority     = 1
+
+  condition {
+    path_pattern {
+      values = ["/api/*"]
+    }
+  }
+
+  action {
+    type = "fixed-response"
+    fixed_response {
+      content_type = "text/plain"
+      status_code  = "426"
+      message_body = "birdtest's API is served over https only: set server to https://, and treat any API key sent over http as disclosed (revoke it on the site)."
     }
   }
 }
@@ -230,8 +303,8 @@ data "aws_iam_policy_document" "execution_ssm" {
   statement {
     actions = ["ssm:GetParameters"]
     resources = compact([
-      aws_ssm_parameter.database_url.arn,
-      aws_ssm_parameter.session_signing_key.arn,
+      local.ssm_database_url_arn,
+      local.ssm_session_signing_key_arn,
       var.github_token_parameter_arn,
     ])
   }
@@ -257,6 +330,21 @@ data "aws_iam_policy_document" "task" {
   statement {
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.artifacts.arn]
+  }
+  # A failed or abandoned streaming upload (an export, a KLV) is aborted rather
+  # than left for the bucket's seven-day rule to find.
+  statement {
+    actions   = ["s3:AbortMultipartUpload"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/*"]
+  }
+  # Purging a job deletes its exports' objects, which hold the results the
+  # purge has just removed. Exports only: every other object here -- input
+  # data, derived files, leave-generation KLVs -- the web process never
+  # deletes, and a compromised one should not be able to either. (The derived
+  # builder's own role may delete a damaged `inputs/` object; derived.tf.)
+  statement {
+    actions   = ["s3:DeleteObject"]
+    resources = ["${aws_s3_bucket.artifacts.arn}/exports/*"]
   }
   statement {
     actions   = ["ses:SendEmail"]
@@ -286,11 +374,16 @@ resource "aws_ecs_task_definition" "main" {
       image        = var.backend_image
       essential    = true
       portMappings = [{ containerPort = 8080, protocol = "tcp" }]
+      # Fargate's most. The default 30 s SIGKILLs the graceful shutdown's
+      # in-flight work -- a submission's insert, an artifact rebuild -- that
+      # it exists to let finish.
+      stopTimeout = 120
       environment = [
         { name = "BIND_ADDR", value = "0.0.0.0:8080" },
         { name = "SECURE_COOKIES", value = "true" },
         { name = "MAIL_BACKEND", value = "ses" },
         { name = "MAIL_FROM", value = var.mail_from_address },
+        { name = "MAIL_MAX_PER_SECOND", value = tostring(var.mail_max_per_second) },
         { name = "PUBLIC_URL", value = var.public_url },
         { name = "S3_BUCKET", value = aws_s3_bucket.artifacts.bucket },
         { name = "AWS_REGION", value = var.region },
@@ -306,8 +399,8 @@ resource "aws_ecs_task_definition" "main" {
       # definition or in Terraform state.
       secrets = concat(
         [
-          { name = "DATABASE_URL", valueFrom = aws_ssm_parameter.database_url.arn },
-          { name = "SESSION_SIGNING_KEY", valueFrom = aws_ssm_parameter.session_signing_key.arn }
+          { name = "DATABASE_URL", valueFrom = local.ssm_database_url_arn },
+          { name = "SESSION_SIGNING_KEY", valueFrom = local.ssm_session_signing_key_arn }
         ],
         # Optional: unauthenticated GitHub ref resolution for input-data
         # imports is 60 calls an hour per IP.
@@ -329,6 +422,12 @@ resource "aws_ecs_task_definition" "main" {
       image        = var.frontend_image
       essential    = true
       portMappings = [{ containerPort = 80, protocol = "tcp" }]
+      # The containers of one awsvpc task share a network namespace, so the
+      # backend is on localhost; `backend`, compose's name for it, resolves to
+      # nothing here and Nginx would refuse to start.
+      environment = [
+        { name = "BACKEND_UPSTREAM", value = "127.0.0.1:8080" },
+      ]
       logConfiguration = {
         logDriver = "awslogs"
         options = {
@@ -371,6 +470,12 @@ resource "aws_ecs_service" "main" {
   # silently does not hold exactly when the code changes.
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
+
+  # The backend migrates before it binds, and the load balancer's checks
+  # (3 x 10 s) fail until it does. Without a grace period ECS replaced a task
+  # whose migration took more than about thirty seconds -- killed mid-way,
+  # rolled back, retried forever, with nothing serving.
+  health_check_grace_period_seconds = 600
 
   network_configuration {
     subnets          = aws_subnet.public[*].id

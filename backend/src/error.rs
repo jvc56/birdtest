@@ -18,7 +18,11 @@ pub struct AppError {
     /// scheduler losing a race on a unique index -- match on this rather than
     /// on the message text, which is localised by the server's `lc_messages`
     /// and is not an interface.
-    pub db_code: Option<String>,
+    pub db_code: Option<Box<str>>,
+    /// The constraint a database violation names, for a handler that maps
+    /// one foreign key to what the caller got wrong (and leaves the rest
+    /// alone).
+    pub db_constraint: Option<Box<str>>,
 }
 
 /// SQLSTATE for a unique-constraint violation.
@@ -54,6 +58,7 @@ impl AppError {
             fields: Vec::new(),
             retry_after: None,
             db_code: None,
+            db_constraint: None,
         }
     }
 
@@ -77,6 +82,15 @@ impl AppError {
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, "conflict", message)
     }
+    /// A blocking task that did not finish — it panicked, or the runtime is
+    /// shutting down. The join error, a panic's message included, is logged
+    /// and not sent: only a database error's text is scrubbed from a `500`
+    /// otherwise.
+    pub fn task_failed(what: &str, err: tokio::task::JoinError) -> Self {
+        tracing::error!(error = %err, "{what} did not finish");
+        Self::internal(format!("{what} did not finish"))
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
@@ -107,7 +121,10 @@ impl IntoResponse for AppError {
         let retry_after = self.retry_after;
         // The API conventions promise a client never sees a database error or
         // a stack trace; the detail is in the log line above.
-        let message = if self.status.is_server_error() && self.db_code.is_some() {
+        // Scrubbed for a 500 only: a busy server's 503 (a statement timeout, a
+        // lock wait given up) carries a database code too, and "internal
+        // error" told the user it had failed rather than to try again.
+        let message = if self.status == StatusCode::INTERNAL_SERVER_ERROR && self.db_code.is_some() {
             "internal error".to_string()
         } else {
             self.message
@@ -155,12 +172,31 @@ impl From<sqlx::Error> for AppError {
                             "that read took too long and was cancelled",
                         )
                     },
+                    // A statement that gave up waiting for a row lock (the
+                    // bounded waits on the worker paths): something long-held
+                    // the row -- a purge, a delete -- and a retry after it
+                    // finishes gets a clean answer. MAGPIE retries a 5xx.
+                    Some(LOCK_NOT_AVAILABLE) => AppError {
+                        retry_after: Some(5),
+                        ..AppError::new(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "unavailable",
+                            "that claim is busy; try again shortly",
+                        )
+                    },
                     _ => AppError::internal(format!("database error: {db}")),
                 };
-                if error.status.is_server_error() {
-                    error.message = format!("database error: {db}");
+                // The database's own words go to the log, never to the
+                // client: a 500's are scrubbed when it is rendered, and a
+                // 503's say "try again" in words of our own. Written over the
+                // 503's message, as they were, they reached the page once only
+                // 500s were scrubbed ("database error: canceling statement due
+                // to statement timeout").
+                if error.status == StatusCode::SERVICE_UNAVAILABLE {
+                    tracing::warn!(code = ?code, error = %db, "database busy");
                 }
-                error.db_code = code;
+                error.db_code = code.map(String::into_boxed_str);
+                error.db_constraint = db.constraint().map(Box::from);
                 error
             }
             // Every connection of the pool asked was busy for the whole
@@ -344,6 +380,24 @@ mod tests {
         let (status, _, body) = rendered(fk).await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(!body.to_string().contains("jobs_config_fk"), "{body}");
+    }
+
+    /// A busy database's 503 says to try again in words of our own; the
+    /// database's message (a statement timeout, a lock wait given up) was
+    /// written over it and, once only 500s were scrubbed, reached the page.
+    #[tokio::test]
+    async fn a_busy_databases_503_keeps_its_own_message() {
+        for (code, ours) in [
+            (QUERY_CANCELED, "that read took too long and was cancelled"),
+            (LOCK_NOT_AVAILABLE, "that claim is busy; try again shortly"),
+        ] {
+            let err: AppError =
+                db_error(code, "could not obtain lock on row in relation \"task_claims\"").into();
+            let (status, _, body) = rendered(err).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body["message"], ours, "{body}");
+            assert!(!body.to_string().contains("task_claims"), "{body}");
+        }
     }
 
     #[test]

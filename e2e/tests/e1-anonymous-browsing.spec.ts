@@ -26,7 +26,9 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await expect(page.getByRole('heading', { name: 'Jobs' })).toBeVisible();
   const row = page.locator('tr', { has: page.locator(`a[href="/jobs/${job.id}"]`) });
   await expect(row).toContainText('Game pairs');
-  await expect(row).toContainText('units');
+  // Progress in the job's own unit (the list said `units` until the
+  // fourteenth audit).
+  await expect(row).toContainText(/\d[\d,]* \/ [\d,]+ pairs/);
 
   await row.getByRole('link', { name: 'Game pairs' }).click();
   await expect(page).toHaveURL(new RegExp(`/jobs/${job.id}$`));
@@ -35,13 +37,13 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   // Anonymous workers are shown by pseudonym, never by the UUID that is
   // their credential.
   const contributors = page.locator('.card', { has: page.getByRole('heading', { name: 'Contributors' }) });
-  await expect(contributors.getByText(/^Anonymous · [0-9a-f]{8}$/).first()).toBeVisible();
+  await expect(contributors.getByText(/^Anonymous · [0-9a-f]{16}$/).first()).toBeVisible();
 
   await page.getByRole('link', { name: 'Contributors' }).click();
   await expect(page).toHaveURL(/\/workers$/);
   await expect(page.getByRole('heading', { name: 'Contributors' })).toBeVisible();
   const leaders = page.locator('tbody tr');
-  await expect(leaders.first()).toContainText(/Anonymous · [0-9a-f]{8}/);
+  await expect(leaders.first()).toContainText(/Anonymous · [0-9a-f]{16}/);
   // Ranked by tasks completed, most first.
   const counts = (await leaders.locator('td:last-child').allInnerTexts()).map((text) =>
     Number(text.replace(/,/g, ''))

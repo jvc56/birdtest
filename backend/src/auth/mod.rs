@@ -4,6 +4,7 @@ pub mod session;
 
 use crate::clientip::ClientIp;
 use crate::error::{AppError, AppResult};
+use crate::ratelimit::WorkerBucket;
 use crate::state::AppState;
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -83,7 +84,12 @@ pub fn public_anon_id(uuid: Uuid) -> String {
 #[derive(Debug, Clone)]
 pub enum WorkerIdentity {
     /// An API key tied to an account.
-    User { user_id: Uuid },
+    User {
+        user_id: Uuid,
+        /// The API key presented: the unit a worker's requests are rate
+        /// limited by (see [`WorkerIdentity::rate_key`]).
+        key_id: Uuid,
+    },
     /// A UUID the server issued earlier, presented in `X-Worker-UUID`.
     Anonymous { uuid: Uuid },
     /// No identity presented at all: a contributor that has never been issued
@@ -103,7 +109,7 @@ pub enum WorkerIdentity {
 impl WorkerIdentity {
     pub fn user_id(&self) -> Option<Uuid> {
         match self {
-            WorkerIdentity::User { user_id } => Some(*user_id),
+            WorkerIdentity::User { user_id, .. } => Some(*user_id),
             WorkerIdentity::Anonymous { .. } | WorkerIdentity::Unregistered { .. } => None,
         }
     }
@@ -129,9 +135,16 @@ impl WorkerIdentity {
     /// Stable string used to key per-worker rate limits. An unregistered
     /// worker has no stable identity yet, so it is limited by address -- keying
     /// on its freshly drawn UUID would give every request its own bucket.
+    ///
+    /// An account's worker is limited per API key, not per account. Keyed on
+    /// the account, every machine a contributor ran under one account shared a
+    /// request a second: six idle machines polling every five seconds used it
+    /// all, and MAGPIE, which gives up on a claim or a submission after a run
+    /// of `429`s, stopped or threw away finished work. A machine is a key, and
+    /// an account's keys are capped.
     pub fn rate_key(&self) -> String {
         match self {
-            WorkerIdentity::User { user_id } => format!("u:{user_id}"),
+            WorkerIdentity::User { key_id, .. } => format!("k:{key_id}"),
             WorkerIdentity::Anonymous { uuid } => format!("a:{uuid}"),
             WorkerIdentity::Unregistered { client_ip, .. } => format!("ip:{client_ip}"),
         }
@@ -149,30 +162,76 @@ impl WorkerIdentity {
         }
     }
 
-    /// Applies the right per-worker rate limit for this identity.
+    /// Applies the per-worker rate limit an identity has not already paid.
+    /// A key or a UUID is charged in the extractor, before its lookup, on the
+    /// credential as presented (`ratelimit::CredentialGate`), so only an
+    /// unregistered worker is charged here, per address. (Key churn is
+    /// bounded where keys are made.)
     pub fn check_rate_limit(&self, state: &AppState) -> AppResult<()> {
-        let limiter = match self {
-            WorkerIdentity::Unregistered { .. } => &state.limits.unregistered_worker,
-            _ => &state.limits.worker,
-        };
-        crate::ratelimit::check(limiter, &self.rate_key())
+        match self {
+            WorkerIdentity::User { .. } | WorkerIdentity::Anonymous { .. } => Ok(()),
+            WorkerIdentity::Unregistered { .. } => {
+                crate::ratelimit::check(&state.limits.unregistered_worker, &self.rate_key())
+            }
+        }
     }
 }
 
+/// A [`WorkerIdentity`] the server already knows, rate limited: for the worker
+/// routes that refuse an unregistered caller. Checked here, as an extractor
+/// that reads only the headers, so the refusal comes *before* the body is read
+/// -- in the handler it came after, and the result route reads up to 64 MiB
+/// of anyone's body first (thirty-first audit).
+pub struct RegisteredWorker(pub WorkerIdentity);
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for RegisteredWorker {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let identity = WorkerIdentity::resolve(parts, state, WorkerBucket::WorkInHand).await?;
+        identity.check_rate_limit(state)?;
+        identity.require_registered()?;
+        // Who a large body is from, for its share of the large-body budget
+        // (`extract::read_body`).
+        parts.extensions.insert(crate::extract::BodyOwner(identity.rate_key()));
+        Ok(Self(identity))
+    }
+}
+
+/// The claim route's identity: charged to its credential's claim bucket
+/// (`ratelimit::WorkerBucket`). Every other worker route takes a
+/// [`RegisteredWorker`].
 #[axum::async_trait]
 impl FromRequestParts<AppState> for WorkerIdentity {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        Self::resolve(parts, state, WorkerBucket::Claims).await
+    }
+}
+
+impl WorkerIdentity {
+    async fn resolve(parts: &mut Parts, state: &AppState, bucket: WorkerBucket) -> Result<Self, AppError> {
+        // Every credential is charged before its lookup, which is a
+        // main-pool query (`ratelimit::CredentialGate`).
+        let ClientIp(client_ip) = ClientIp::from_request_parts(parts, state).await?;
+        let gate = &state.limits.worker_credentials;
+
         let bearer = parts
             .headers
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::to_owned);
+            // The scheme is case-insensitive (RFC 7235): `bearer <key>` was
+            // read as no credential and minted an anonymous identity.
+            .and_then(|v| v.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, key)| key.trim().to_owned());
 
         let identity = if let Some(raw_key) = bearer {
             let hash = api_key::hash_key(&raw_key);
+            let presented = format!("k:{hash}");
+            gate.admit(&state.limits.worker, &presented, bucket, client_ip)?;
             // Lookup, `last_used_at` touch and ban check in one statement.
             // This runs on every worker request -- every claim, heartbeat and
             // submission -- so three round trips here were three on the
@@ -181,22 +240,25 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             //
             // The touch is throttled: `last_used_at` answers "is this key in
             // use", which a minute's resolution answers as well as a write per
-            // request does.
-            let row = sqlx::query_as::<_, (Uuid, bool)>(
+            // request does. And it skips a locked row rather than waiting on
+            // it, like the anonymous touch below.
+            let row = sqlx::query_as::<_, (Uuid, Uuid, bool)>(
                 "WITH found AS (
                      SELECT k.id AS key_id, u.id AS user_id, k.last_used_at
                      FROM api_keys k JOIN users u ON u.id = k.user_id
-                     WHERE k.key_hash = $1 AND k.is_active
+                     WHERE k.key_hash = $1 AND k.is_active AND u.deleted_at IS NULL
                  ),
                  touched AS (
                      UPDATE api_keys k SET last_used_at = now()
-                     FROM found
-                     WHERE k.id = found.key_id
-                       AND (found.last_used_at IS NULL
-                            OR found.last_used_at < now() - interval '60 seconds')
+                     WHERE k.id = (
+                         SELECT k2.id FROM api_keys k2 JOIN found ON found.key_id = k2.id
+                         WHERE found.last_used_at IS NULL
+                            OR found.last_used_at < now() - interval '60 seconds'
+                         FOR NO KEY UPDATE OF k2 SKIP LOCKED
+                     )
                      RETURNING 1
                  )
-                 SELECT found.user_id,
+                 SELECT found.user_id, found.key_id,
                         EXISTS (SELECT 1 FROM worker_bans b
                                 WHERE b.user_id = found.user_id) AS banned
                  FROM found",
@@ -205,11 +267,13 @@ impl FromRequestParts<AppState> for WorkerIdentity {
             .fetch_optional(&state.pool)
             .await?
             .ok_or_else(|| AppError::unauthorized("unknown or inactive API key"))?;
-
-            if row.1 {
+            if row.2 {
                 return Err(AppError::forbidden("this worker identity is banned"));
             }
-            WorkerIdentity::User { user_id: row.0 }
+            // Only once it is known not to be banned: a banned credential
+            // remembered never paid its address's bucket again.
+            gate.remember(&presented);
+            WorkerIdentity::User { user_id: row.0, key_id: row.1 }
         } else {
             let raw = parts
                 .headers
@@ -221,6 +285,8 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     let uuid = Uuid::parse_str(raw.trim()).map_err(|_| {
                         AppError::bad_request("X-Worker-UUID is not a valid UUID")
                     })?;
+                    let presented = format!("a:{uuid}");
+                    gate.admit(&state.limits.worker, &presented, bucket, client_ip)?;
 
                     // Only identities the server itself issued are accepted. A
                     // client-invented UUID would otherwise let anyone
@@ -229,15 +295,25 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     // at most once a minute, and the ban check rides along in
                     // the same statement rather than costing a second round
                     // trip on every worker request.
+                    //
+                    // The touch skips a row somebody holds locked rather than
+                    // waiting: it is observational, and it runs on every worker
+                    // request. A submission holds its contributor's row while it
+                    // commits, and a purge or delete gives back what a job's
+                    // contributors earned at its end; a touch that waited held a
+                    // pool connection for as long as either did.
                     let banned = sqlx::query_scalar::<_, bool>(
                         "WITH known AS (
                              SELECT uuid, last_seen_at FROM anonymous_workers WHERE uuid = $1
                          ),
                          touched AS (
                              UPDATE anonymous_workers w SET last_seen_at = now()
-                             FROM known
-                             WHERE w.uuid = known.uuid
-                               AND known.last_seen_at < now() - interval '60 seconds'
+                             WHERE w.uuid = (
+                                 SELECT a.uuid FROM anonymous_workers a
+                                 WHERE a.uuid = $1
+                                   AND a.last_seen_at < now() - interval '60 seconds'
+                                 FOR NO KEY UPDATE SKIP LOCKED
+                             )
                              RETURNING 1
                          )
                          SELECT EXISTS (SELECT 1 FROM worker_bans b
@@ -258,10 +334,10 @@ impl FromRequestParts<AppState> for WorkerIdentity {
                     if banned {
                         return Err(AppError::forbidden("this worker identity is banned"));
                     }
+                    gate.remember(&presented);
                     WorkerIdentity::Anonymous { uuid }
                 }
                 None => {
-                    let ClientIp(client_ip) = ClientIp::from_request_parts(parts, state).await?;
                     // Nothing to ban: this identity does not exist yet.
                     return Ok(WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip });
                 }

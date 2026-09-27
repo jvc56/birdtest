@@ -225,6 +225,13 @@ async fn register_confirm_and_login_gives_a_working_session() {
     // The address is stored trimmed and lowercased, and mailed there.
     let mail = outbox.wait_for("newcomer@example.invalid", 1).await;
     assert!(mail[0].contains("Subject: Confirm your birdtest account"), "{}", mail[0]);
+    // The username is the registrant's own text and the address is any
+    // address they typed: the mail does not carry the one to the other.
+    assert!(
+        mail[0].lines().filter(|line| !line.starts_with("To:")).all(|line| !line.contains("newcomer")),
+        "{}",
+        mail[0]
+    );
     let code = link_param(&mail[0], "code");
 
     let response = post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await;
@@ -328,6 +335,195 @@ async fn registering_a_taken_address_answers_exactly_like_a_new_registration() {
     assert!(!notice.contains("code="), "the notice carries no confirmation code: {notice}");
 }
 
+/// A-AUTH-4e: the notice to a confirmed address's owner names their account,
+/// so someone who has forgotten they signed up can sign in -- sign-in asks for
+/// the username, which nothing else would tell them.
+#[tokio::test]
+async fn the_owner_of_a_taken_address_is_told_their_username() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+    confirmed_user(&db, "forgetful", PASSWORD).await;
+
+    let taken = register(&app, "newcomer", "forgetful@example.invalid", PASSWORD, "").await;
+    assert_eq!(taken.status, StatusCode::CREATED, "{taken:?}");
+    let mail = outbox.wait_for("forgetful@example.invalid", 1).await;
+    assert!(mail[0].contains("it already has one: forgetful."), "{}", mail[0]);
+    assert!(mail[0].contains("/login as forgetful"), "{}", mail[0]);
+}
+
+/// A-AUTH-4h: the notice to a taken address's owner is limited per address,
+/// whatever client address asks, and one past the limit is skipped rather
+/// than refused: the caller gets the same `201`, the owner no sixth mail.
+#[tokio::test]
+async fn a_taken_address_is_sent_five_notices_an_hour_at_most() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 1).await;
+    let app = birdtest::app(state);
+    confirmed_user(&db, "buried", PASSWORD).await;
+
+    let mut answers = Vec::new();
+    for i in 0..6 {
+        let ip = format!("203.0.113.{i}");
+        let response = register(&app, &format!("digger{i}"), "buried@example.invalid", PASSWORD, &ip).await;
+        assert_eq!(response.status, StatusCode::CREATED, "#{i}: {response:?}");
+        answers.push(response.bytes);
+    }
+    assert!(answers.windows(2).all(|pair| pair[0] == pair[1]), "the sixth answered differently");
+    outbox.wait_for("buried@example.invalid", 5).await;
+    // Sent off the request path, a sixth would land after its answer.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(outbox.messages_to("buried@example.invalid").len(), 5);
+}
+
+/// A-AUTH-8b: every link in mail is on `PUBLIC_URL`, whatever host the request
+/// names: a link built from `Host` or `X-Forwarded-Host` would send a reset
+/// token to whoever asked for it to be mailed.
+#[tokio::test]
+async fn mailed_links_are_on_the_public_url_whatever_the_request_names() {
+    let db = TestDb::new().await;
+    let outbox = Outbox::new();
+    let mut cfg = db.config();
+    cfg.mail_backend = MailBackend::File;
+    cfg.mail_outbox_dir = Some(outbox.0.clone());
+    cfg.public_url = "https://birdtest.example".into();
+    let app = birdtest::app(db.state_with(cfg).await);
+    confirmed_user(&db, "linked", PASSWORD).await;
+
+    let forged = [("host", "evil.example"), ("x-forwarded-host", "evil.example")];
+    let body = |username: &str, email: &str| json!({ "username": username, "email": email, "password": PASSWORD });
+    let fresh = post(&app, "/api/auth/register", &forged, body("newcomer", "newcomer@example.invalid")).await;
+    assert_eq!(fresh.status, StatusCode::CREATED, "{fresh:?}");
+    let taken = post(&app, "/api/auth/register", &forged, body("othercomer", "linked@example.invalid")).await;
+    assert_eq!(taken.status, StatusCode::CREATED, "{taken:?}");
+    let reset = post(&app, "/api/auth/reset-password/request", &forged, json!({ "email": "linked@example.invalid" })).await;
+    assert_eq!(reset.status, StatusCode::OK, "{reset:?}");
+
+    let mut mail = outbox.wait_for("newcomer@example.invalid", 1).await;
+    mail.extend(outbox.wait_for("linked@example.invalid", 2).await);
+    let links: Vec<&str> = mail.iter().flat_map(|m| m.split_whitespace()).filter(|w| w.contains("://")).collect();
+    // The confirmation, the notice's sign-in and reset pages, the reset link.
+    assert_eq!(links.len(), 4, "{mail:?}");
+    for link in links {
+        assert!(link.starts_with("https://birdtest.example/"), "{link} in {mail:?}");
+    }
+}
+
+/// A-AUTH-4f: a username goes into mail to an address's owner, and a stranger
+/// can register anyone's address under a name of their choosing (KL-34), so a
+/// name with a line break or an invisible character is refused; an account
+/// named so before the rule is mailed with those characters shown as `?`.
+#[tokio::test]
+async fn a_username_cannot_carry_a_message_into_mail() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+
+    for name in ["Prize! call\n\nevil.xyz", "tab\there", "abc\u{202E}fdp", "zero\u{200B}w", "a\u{2028}b"] {
+        let refused = register(&app, name, "victim@example.invalid", PASSWORD, "").await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{name:?}: {refused:?}");
+        assert!(refused.json()["fields"].to_string().contains("username"), "{refused:?}");
+    }
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users").fetch_one(&db.pool).await.unwrap();
+    assert_eq!(users, 0);
+
+    let id = confirmed_user(&db, "olderaccount", PASSWORD).await;
+    sqlx::query("UPDATE users SET username = $1 WHERE id = $2")
+        .bind("Prize!\n\nevil.xyz")
+        .bind(id)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let known = reset_request(&app, "olderaccount@example.invalid", "").await;
+    assert_eq!(known.status, StatusCode::OK, "{known:?}");
+    let taken = register(&app, "newcomer", "olderaccount@example.invalid", PASSWORD, "").await;
+    assert_eq!(taken.status, StatusCode::CREATED, "{taken:?}");
+    let mail = outbox.wait_for("olderaccount@example.invalid", 2).await;
+    for message in &mail {
+        assert!(!message.contains("evil.xyz\n") && !message.contains("\n\nevil.xyz"), "{message}");
+        assert!(message.contains("Prize!??evil.xyz"), "{message}");
+    }
+}
+
+/// A-AUTH-4b: an account that never confirmed its address holds the address
+/// and the username only while its confirmation link works. Registering over
+/// it while it does is answered like any taken address, and the notice says
+/// what is waiting; once the link has expired, the next registration takes
+/// both. Held for ever, it was a dead end -- no sign-in, no reset, no new code
+/// -- and a way to squat anyone's address.
+#[tokio::test]
+async fn an_expired_unconfirmed_account_gives_up_its_address_and_username() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+
+    let first = register(&app, "squatter", "owner@example.invalid", PASSWORD, "").await;
+    assert_eq!(first.status, StatusCode::CREATED, "{first:?}");
+    let early = register(&app, "realowner", "owner@example.invalid", PASSWORD, "").await;
+    assert_eq!(early.bytes, first.bytes, "{early:?}");
+    let usernames = || async {
+        sqlx::query_scalar::<_, String>("SELECT username FROM users ORDER BY username")
+            .fetch_all(&db.pool)
+            .await
+            .unwrap()
+    };
+    assert_eq!(usernames().await, vec!["squatter".to_string()]);
+    let mail = outbox.wait_for("owner@example.invalid", 2).await;
+    assert!(
+        mail.iter().any(|m| m.contains("already waiting for the address to be confirmed")),
+        "the notice says an account is waiting, not to sign in: {mail:?}"
+    );
+
+    sqlx::query("UPDATE email_confirmations SET expires_at = now() - interval '1 minute'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let late = register(&app, "realowner", "owner@example.invalid", PASSWORD, "").await;
+    assert_eq!(late.status, StatusCode::CREATED, "{late:?}");
+    assert_eq!(usernames().await, vec!["realowner".to_string()]);
+    let mail = outbox.wait_for("owner@example.invalid", 3).await;
+    let codes = mail.iter().filter(|m| m.contains("code=")).count();
+    assert_eq!(codes, 2, "the new account is sent its own code: {mail:?}");
+
+    // The username went with it.
+    let name = register(&app, "squatter", "someone@example.invalid", PASSWORD, "").await;
+    assert_eq!(name.status, StatusCode::CREATED, "{name:?}");
+}
+
+/// A-AUTH-4c: a username is taken whatever its case -- "Josh" and "josh" side
+/// by side on a public list is an impersonation. And, being one name, it signs
+/// in whatever its case.
+#[tokio::test]
+async fn a_username_is_taken_and_signs_in_whatever_its_case() {
+    let db = TestDb::new().await;
+    let (state, _outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+    let first = register(&app, "Josh", "josh@example.invalid", PASSWORD, "").await;
+    assert_eq!(first.status, StatusCode::CREATED, "{first:?}");
+    let second = register(&app, "josh", "other@example.invalid", PASSWORD, "").await;
+    assert_eq!(second.status, StatusCode::CONFLICT, "{second:?}");
+    assert_eq!(second.json()["fields"][0]["field"], "username", "{second:?}");
+
+    sqlx::query("UPDATE users SET email_confirmed_at = now()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let response = login(&app, "josh", PASSWORD).await;
+    assert_eq!(response.status, StatusCode::OK, "{response:?}");
+    assert_eq!(response.json()["username"], "Josh", "the account's own spelling");
+}
+
+/// A-AUTH-4d: the auth routes take small bodies. A megabyte "username" was
+/// accepted and became a megabyte key in the per-username login limiter, kept
+/// until its sweep -- a few addresses could run the task out of memory.
+#[tokio::test]
+async fn an_oversized_auth_body_is_refused() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let response = login(&app, &"x".repeat(64 * 1024), PASSWORD).await;
+    assert_eq!(response.status, StatusCode::PAYLOAD_TOO_LARGE, "{response:?}");
+}
+
 /// A-AUTH-5: a weak password is refused, and so is one derived from the
 /// username or the email address -- each of which would score as strong
 /// without them as context, so it is the context that refuses it.
@@ -381,7 +577,11 @@ async fn confirmed(db: &TestDb, username: &str) -> bool {
         .unwrap()
 }
 
-/// A-AUTH-6: a confirmation code confirms once; replaying it is refused.
+/// A-AUTH-6: a confirmation code confirms once. Opened again (a double
+/// click, a mail scanner that followed it first) it changes nothing and is
+/// answered as the success it already was, not "invalid" with an offer to
+/// register again; a spent code of an account that is not confirmed is still
+/// refused.
 #[tokio::test]
 async fn a_confirmation_code_works_once() {
     let db = TestDb::new().await;
@@ -393,9 +593,30 @@ async fn a_confirmation_code_works_once() {
     assert_eq!(first.status, StatusCode::OK, "{first:?}");
     assert!(confirmed(&db, "onceonly").await);
 
+    let used_at = || async {
+        sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+            "SELECT max(used_at) FROM email_confirmations",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+    let spent = used_at().await;
     let replay = post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await;
-    assert_eq!(replay.status, StatusCode::BAD_REQUEST, "{replay:?}");
-    assert_eq!(replay.json()["message"], "that confirmation link is invalid or has expired");
+    assert_eq!(replay.status, StatusCode::OK, "{replay:?}");
+    assert_eq!(replay.json()["message"], "email already confirmed");
+    assert_eq!(used_at().await, spent, "the replay changed nothing");
+
+    // The same spent code, for an account that is somehow not confirmed, is
+    // not taken as proof of anything.
+    sqlx::query("UPDATE users SET email_confirmed_at = NULL WHERE username = 'onceonly'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let refused = post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{refused:?}");
+    assert_eq!(refused.json()["message"], "that confirmation link is invalid or has expired");
+    assert!(!confirmed(&db, "onceonly").await);
 }
 
 /// A-AUTH-7: an expired confirmation code is refused and leaves the account
@@ -448,6 +669,9 @@ async fn a_reset_request_answers_the_same_for_known_and_unknown_addresses() {
 
     let mail = outbox.wait_for("forgetful@example.invalid", 1).await;
     assert!(mail[0].contains("/reset-password/confirm?token="), "{}", mail[0]);
+    // Signing in asks for the username, which someone resetting may also have
+    // forgotten; the mail goes only to the address's owner.
+    assert!(mail[0].contains("Your birdtest username is forgetful."), "{}", mail[0]);
     // The unknown address's request came first; by the time the known one's
     // mail has landed, anything it had sent would have too.
     assert!(outbox.messages_to("nobody@example.invalid").is_empty());
@@ -455,8 +679,10 @@ async fn a_reset_request_answers_the_same_for_known_and_unknown_addresses() {
 
 /// A-AUTH-8, the timing half: the reset mail is sent off the request path. With
 /// a mailer that cannot send at all, the request still answers exactly as it
-/// does for an unknown address -- where registration, which does wait on its
-/// mail, fails -- so the response cannot depend on how long the send takes.
+/// does for an unknown address, so the response cannot depend on how long the
+/// send takes. Registration's mail goes the same way now: it waited on its
+/// send, except for a taken address whose notice its per-address limit
+/// skipped, which answered that much sooner.
 #[tokio::test]
 async fn a_reset_request_does_not_wait_on_the_mail_it_sends() {
     let db = TestDb::new().await;
@@ -470,8 +696,8 @@ async fn a_reset_request_does_not_wait_on_the_mail_it_sends() {
     let app = birdtest::app(db.state_with(cfg).await);
     confirmed_user(&db, "forgetful", PASSWORD).await;
 
-    let control = register(&app, "newcomer", "newcomer@example.invalid", PASSWORD, "").await;
-    assert_eq!(control.status, StatusCode::INTERNAL_SERVER_ERROR, "the mailer fails: {control:?}");
+    let registered = register(&app, "newcomer", "newcomer@example.invalid", PASSWORD, "").await;
+    assert_eq!(registered.status, StatusCode::CREATED, "not held up by its mail: {registered:?}");
 
     let unknown = reset_request(&app, "nobody@example.invalid", "").await;
     let known = reset_request(&app, "forgetful@example.invalid", "").await;
@@ -689,4 +915,264 @@ async fn a_reset_refuses_a_password_built_from_the_account_and_keeps_the_link() 
     let response = reset_confirm(&app, &token, NEW_PASSWORD).await;
     assert_eq!(response.status, StatusCode::OK, "the refused attempts spent the link: {response:?}");
     assert_eq!(login(&app, "vexmorlandtriq", NEW_PASSWORD).await.status, StatusCode::OK);
+}
+
+/// Waits until one statement on this test's database is waiting for a lock.
+async fn a_statement_waits_for_a_lock(db: &TestDb) {
+    for _ in 0..400 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("no statement came to wait for the account's lock");
+}
+
+/// Whether the account's rows in `table` are free to lock right now.
+async fn rows_are_free(db: &TestDb, table: &str, user: Uuid) -> bool {
+    let mut probe = db.pool.begin().await.unwrap();
+    let free = sqlx::query(&format!("SELECT 1 FROM {table} WHERE user_id = $1 FOR UPDATE NOWAIT"))
+        .bind(user)
+        .fetch_all(&mut *probe)
+        .await
+        .is_ok();
+    probe.rollback().await.unwrap();
+    free
+}
+
+/// A-AUTH-9b: a password reset and an email confirmation lock the account
+/// before its links, the order an admin's delete takes them in (which
+/// `admin_api` pins). Links first, a reset and a delete deadlocked when the
+/// account had two reset links out, and so did a confirmation and a delete.
+#[tokio::test]
+async fn a_reset_and_a_confirmation_lock_the_account_before_its_links() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+
+    // A reset, held at the account.
+    let user = confirmed_user(&db, "lockorder", PASSWORD).await;
+    assert_eq!(reset_request(&app, "lockorder@example.invalid", "").await.status, StatusCode::OK);
+    let mail = outbox.wait_for("lockorder@example.invalid", 1).await;
+    let token = link_param(&mail[0], "token");
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let reset = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            post(
+                &app,
+                "/api/auth/reset-password/confirm",
+                &[],
+                json!({ "token": token, "password": "a brand new quartz otter 91" }),
+            )
+            .await
+        })
+    };
+    a_statement_waits_for_a_lock(&db).await;
+    assert!(rows_are_free(&db, "password_reset_tokens", user).await, "the reset took its link first");
+    holder.rollback().await.unwrap();
+    let reset = reset.await.unwrap();
+    assert_eq!(reset.status, StatusCode::OK, "{reset:?}");
+
+    // A confirmation, held at the account.
+    let registered = register(&app, "unconfirmed", "unconfirmed@example.invalid", PASSWORD, "").await;
+    assert_eq!(registered.status, StatusCode::CREATED, "{registered:?}");
+    let mail = outbox.wait_for("unconfirmed@example.invalid", 1).await;
+    let code = link_param(&mail[0], "code");
+    let user: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username = 'unconfirmed'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(user)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    let confirm = {
+        let app = app.clone();
+        tokio::spawn(async move { post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await })
+    };
+    a_statement_waits_for_a_lock(&db).await;
+    assert!(rows_are_free(&db, "email_confirmations", user).await, "the confirmation took its code first");
+    holder.rollback().await.unwrap();
+    let confirm = confirm.await.unwrap();
+    assert_eq!(confirm.status, StatusCode::OK, "{confirm:?}");
+}
+
+/// A-AUTH-3b: scoring a password does not hold the executor. zxcvbn takes close
+/// to a second on a hundred characters of its substitution letters; run on
+/// the executor, one address's requests stalled every other request (`/health`
+/// 8.5 s). On this test's single thread, a stall is a gap in the ticks. A
+/// reset with a wrong link is refused before any scoring at all.
+#[tokio::test]
+async fn scoring_a_crafted_password_does_not_stall_the_server() {
+    let db = TestDb::new().await;
+    let (state, _outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+    let crafted: String = "4@8({[<3&69!|1i7+05$%2".repeat(5).chars().take(100).collect();
+
+    let started = std::time::Instant::now();
+    let request = {
+        let (app, crafted) = (app.clone(), crafted.clone());
+        // An address that is not one: the request is refused after scoring,
+        // with no hash and no row.
+        tokio::spawn(async move { register(&app, "crafted", "not an address", &crafted, "").await })
+    };
+    let mut worst = Duration::ZERO;
+    let mut last = std::time::Instant::now();
+    while !request.is_finished() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        worst = worst.max(last.elapsed());
+        last = std::time::Instant::now();
+    }
+    let scored_in = started.elapsed();
+    let refused = request.await.unwrap();
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{refused:?}");
+    assert!(scored_in > Duration::from_millis(200), "the password was cheap to score: {scored_in:?}");
+    assert!(worst < Duration::from_millis(100), "the executor stalled for {worst:?}");
+
+    let started = std::time::Instant::now();
+    let wrong = post(
+        &app,
+        "/api/auth/reset-password/confirm",
+        &[],
+        json!({ "token": "no such link", "password": crafted }),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{wrong:?}");
+    assert!(wrong.json()["message"].as_str().unwrap().contains("invalid or has expired"), "{wrong:?}");
+    assert!(started.elapsed() < Duration::from_millis(100), "{:?}", started.elapsed());
+}
+
+/// A-AUTH-3c: scoring has turns of its own, so a queue of crafted passwords
+/// being scored never holds up a sign-in. On sign-in's Argon2 turns, a reset
+/// link replayed with weak passwords from eight addresses kept every sign-in
+/// at `503`. And each scoring a reset link buys is counted against the link,
+/// whoever sends it: its sixth in an hour is a `429`.
+#[tokio::test]
+async fn scoring_never_holds_up_a_sign_in_and_a_link_buys_few() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 1).await;
+    let app = birdtest::app(state);
+    confirmed_user(&db, "signer", PASSWORD).await;
+    let crafted: String = "4@8({[<3&69!|1i7+05$%2".repeat(5).chars().take(100).collect();
+
+    let scorings: Vec<_> = (0..16)
+        .map(|i| {
+            let (app, crafted) = (app.clone(), crafted.clone());
+            tokio::spawn(async move {
+                register(&app, &format!("crafted{i}"), "not an address", &crafted, &format!("10.9.0.{i}"))
+                    .await
+            })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    let signed_in = login(&app, "signer", PASSWORD).await;
+    let waited = started.elapsed();
+    assert_eq!(signed_in.status, StatusCode::OK, "{signed_in:?}");
+    assert!(waited < Duration::from_millis(1500), "a sign-in waited {waited:?} behind scoring");
+    for scoring in scorings {
+        let answer = scoring.await.unwrap();
+        assert!(
+            matches!(answer.status, StatusCode::BAD_REQUEST | StatusCode::SERVICE_UNAVAILABLE),
+            "{answer:?}"
+        );
+    }
+
+    assert_eq!(reset_request(&app, "signer@example.invalid", "").await.status, StatusCode::OK);
+    let mail = outbox.wait_for("signer@example.invalid", 1).await;
+    let token = link_param(&mail[0], "token");
+    for attempt in 0..6 {
+        let answer = post(
+            &app,
+            "/api/auth/reset-password/confirm",
+            &[("x-forwarded-for", &format!("10.8.0.{attempt}"))],
+            json!({ "token": token, "password": "password" }),
+        )
+        .await;
+        let wanted = if attempt < 5 { StatusCode::BAD_REQUEST } else { StatusCode::TOO_MANY_REQUESTS };
+        assert_eq!(answer.status, wanted, "attempt {attempt}: {answer:?}");
+    }
+}
+
+/// A-AUTH-4g: a name that differs from a taken one only in joiners or
+/// variation selectors is taken too. Where a script allows them they may
+/// still change nothing a reader sees, and each such twin was an account.
+#[tokio::test]
+async fn a_name_differing_only_in_joiners_is_taken() {
+    let db = TestDb::new().await;
+    let (state, _outbox) = mail_state(&db, 1).await;
+    let app = birdtest::app(state);
+
+    let first = register(&app, "\u{0628}\u{0628}\u{0628}\u{0628}", "one@example.invalid", PASSWORD, "10.7.0.1").await;
+    assert_eq!(first.status, StatusCode::CREATED, "{first:?}");
+    for (i, twin) in ["\u{0628}\u{200D}\u{0628}\u{0628}\u{0628}", "\u{0628}\u{200C}\u{0628}\u{0628}\u{0628}"]
+        .into_iter()
+        .enumerate()
+    {
+        let again = register(&app, twin, &format!("twin{i}@example.invalid"), PASSWORD, &format!("10.7.1.{i}")).await;
+        assert_eq!(again.status, StatusCode::CONFLICT, "{twin:?}: {again:?}");
+    }
+    // An unconfirmed twin whose link has expired gives up the name, as an
+    // exact one does: refused as taken and never released, it held the name
+    // for good.
+    let lapsed = register(&app, "\u{0633}\u{200D}\u{0633}\u{0633}", "lapsed@example.invalid", PASSWORD, "10.7.3.1").await;
+    assert_eq!(lapsed.status, StatusCode::CREATED, "{lapsed:?}");
+    sqlx::query("UPDATE email_confirmations SET expires_at = now() - interval '1 minute'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let claimed = register(&app, "\u{0633}\u{0633}\u{0633}", "claimer@example.invalid", PASSWORD, "10.7.3.2").await;
+    assert_eq!(claimed.status, StatusCode::CREATED, "the expired twin gave it up: {claimed:?}");
+
+    let emoji = register(&app, "\u{2764}\u{2764}\u{2764}", "two@example.invalid", PASSWORD, "10.7.2.1").await;
+    assert_eq!(emoji.status, StatusCode::CREATED, "{emoji:?}");
+    let selected = register(&app, "\u{2764}\u{FE0F}\u{2764}\u{2764}", "three@example.invalid", PASSWORD, "10.7.2.2").await;
+    assert_eq!(selected.status, StatusCode::CONFLICT, "{selected:?}");
+}
+
+
+/// A-AUTH-12: a confirmed address and a reset password are on record. A reset
+/// ends every session as "sign out everywhere" does, which was logged; the
+/// reset and the confirmation left no row (the audit's pass 22).
+#[tokio::test]
+async fn a_confirmation_and_a_reset_are_on_record() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+    let code = registered_code(&app, &outbox, "recorded").await;
+    assert_eq!(post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await.status, StatusCode::OK);
+    let email = "recorded@example.invalid";
+    assert_eq!(reset_request(&app, email, "").await.status, StatusCode::OK);
+    let token = link_param(&outbox.wait_for(email, 2).await[1], "token");
+    assert_eq!(reset_confirm(&app, &token, NEW_PASSWORD).await.status, StatusCode::OK);
+
+    let user: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username = 'recorded'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE actor_user_id = $1 AND target_id = $2 ORDER BY id",
+    )
+    .bind(user)
+    .bind(user.to_string())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(actions.contains(&"user.email_confirmed".to_string()), "{actions:?}");
+    assert!(actions.contains(&"user.password_reset".to_string()), "{actions:?}");
 }

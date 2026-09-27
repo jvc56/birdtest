@@ -18,7 +18,7 @@ test.beforeAll(async () => {
       job_type: 'games',
       player1_config_id: await api.playerConfigId('static-equity'),
       player2_config_id: await api.playerConfigId('static-score'),
-      games_per_batch: 1,
+      games_per_batch: 2,
       min_games: 100000,
       max_games: 100000
     },
@@ -52,9 +52,9 @@ test('E-5: an admin bans a worker and that worker can no longer claim', async ({
     await page.goto('/admin/workers');
     await expect(page.getByRole('heading', { name: 'Worker bans' })).toBeVisible();
     const row = page.locator('tbody tr', { hasText: uuid });
-    await expect(row).toContainText(/Anonymous · [0-9a-f]{8}/);
+    await expect(row).toContainText(/Anonymous · [0-9a-f]{16}/);
     await row.getByRole('button', { name: 'Select' }).click();
-    await expect(page.getByLabel('User ID or anonymous UUID')).toHaveValue(uuid);
+    await expect(page.getByLabel('Anonymous UUID', { exact: true })).toHaveValue(uuid);
     await page.getByLabel('Reason').fill('e2e: submitting nonsense');
     await page.getByRole('button', { name: 'Ban worker' }).click();
     await expect(page.getByText(`Banned ${uuid}.`)).toBeVisible();

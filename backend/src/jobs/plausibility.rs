@@ -25,7 +25,7 @@
 //! count that cannot correspond to any game, a truncated batch reported as
 //! complete.
 
-use super::handler::{GameAggregate, MoveEntry, RackOccurrence};
+use super::handler::{GameAggregate, MoveEntry, PlyStats, RackOccurrence};
 use crate::error::{AppError, AppResult};
 
 /// Tiles on a rack. Matches MAGPIE's `RACK_SIZE`; a submission naming more is
@@ -39,14 +39,40 @@ const MAX_RACK_TILES: usize = 7;
 const MIN_SCORE_MEAN: f64 = -100.0;
 const MAX_SCORE_MEAN: f64 = 3000.0;
 
-/// The theoretical maximum for a single play is a little over 1,700 points.
-/// Rounded up; a play cannot score negative points, and a pass or exchange
-/// scores exactly zero.
-const MAX_MOVE_SCORE: i32 = 2000;
+/// Far above any play on any board MAGPIE ships. The theoretical maximum on
+/// the 15x15 board is a little over 1,700 points, but the 21x21 one
+/// (`standard21`) has quadruple-word corners with two triple-word squares
+/// between them on each edge -- an edge-long word is worth 144 times its
+/// tiles -- so a cap near 2,000 is not safe there, and a false positive would
+/// refuse the same seeded task on every retry. (Job creation now refuses any
+/// board but 15x15, which is all the fleet's MAGPIE builds play; the bound
+/// stays wide for a build that plays the other.) A play cannot score negative
+/// points, and a pass or exchange scores exactly zero.
+const MAX_MOVE_SCORE: i32 = 100_000;
+
+/// The longest play MAGPIE could write (a 21-tile word with multi-letter
+/// tiles, its coordinate, an exchange's tiles) is well under this; a play
+/// string past it is not a play (a 100 KB `previous_move` was stored, the
+/// audit's pass 21).
+const MAX_PLAY_CHARS: usize = 256;
+/// A position in CGP: a 21x21 board row by row, the racks, the scores, the
+/// options -- under a kilobyte.
+const MAX_POSITION_CHARS: usize = 4096;
+/// The letters inside one bracketed tile: `[CH]`, `[L·L]`. A 500 KB
+/// "tile" counted as one and was stored (pass 21).
+const MAX_TILE_CHARS: usize = 8;
 
 /// Equity is a score-scale quantity, so it lives in the same order of
 /// magnitude as a score plus a leave adjustment.
-const MAX_ABS_EQUITY: f64 = 5000.0;
+const MAX_ABS_EQUITY: f64 = 200_000.0;
+
+/// A leave-generation rack's mean is the mean equity of the best play made from
+/// that full rack — score plus leave — so a 21x21 board raises it too. It keeps
+/// the bound move equities had before they were widened for that board: the
+/// shipped lexicons stop at 15 letters, which caps a play at ×36 (a quadruple
+/// and two triples), low thousands at most, and a rack's mean is at most its
+/// best play; only a 21-letter edge word reaches ×144.
+const MAX_ABS_RACK_MEAN: f64 = 5_000.0;
 
 fn finite(value: f64, field: &str) -> AppResult<()> {
     if !value.is_finite() {
@@ -91,12 +117,50 @@ pub fn check_game_aggregate(aggregate: &GameAggregate, field: &str) -> AppResult
     Ok(())
 }
 
+/// How many tiles a rack spelled the way MAGPIE spells one holds, or `None`
+/// if the spelling is malformed.
+///
+/// A tile is one character, except that a letter whose name is more than one
+/// character is written in brackets (`ld_ml_to_hl`): Catalan's `[L·L]`,
+/// `[NY]` and `[QU]` are one tile each. Counted as characters, a full Catalan
+/// rack holding one was ten or eleven "tiles", and every captured position of
+/// a Catalan games job was refused.
+pub fn rack_tiles(rack: &str) -> Option<usize> {
+    let mut tiles = 0;
+    let mut chars = rack.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '[' => {
+                let mut letter_chars = 0;
+                loop {
+                    match chars.next()? {
+                        ']' => break,
+                        '[' => return None,
+                        _ => letter_chars += 1,
+                    }
+                }
+                if letter_chars == 0 || letter_chars > MAX_TILE_CHARS {
+                    return None;
+                }
+            }
+            ']' => return None,
+            _ => {}
+        }
+        tiles += 1;
+    }
+    Some(tiles)
+}
+
 /// A rack as the worker spelled it. Blanks are conventionally `?`, so this
-/// counts characters rather than validating the alphabet — the letter
+/// counts tiles rather than validating the alphabet — the letter
 /// distribution is what decides which letters exist, and that check belongs
 /// with the distribution, not here.
 pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
-    let tiles = rack.chars().count();
+    let tiles = rack_tiles(rack).ok_or_else(|| {
+        AppError::bad_request(format!(
+            "{context}: rack {rack:?} has a malformed bracketed tile (unclosed, stray, nested, empty or over {MAX_TILE_CHARS} characters)"
+        ))
+    })?;
     if tiles == 0 {
         return Err(AppError::bad_request(format!("{context}: empty rack")));
     }
@@ -104,6 +168,61 @@ pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
         return Err(AppError::bad_request(format!(
             "{context}: rack {rack:?} has {tiles} tiles, more than a rack holds"
         )));
+    }
+    Ok(())
+}
+
+/// A play as written: bounded in length.
+pub fn check_play_text(play: &str, context: &str) -> AppResult<()> {
+    if play.chars().count() > MAX_PLAY_CHARS {
+        return Err(AppError::bad_request(format!(
+            "{context}: a play of more than {MAX_PLAY_CHARS} characters is not a play"
+        )));
+    }
+    Ok(())
+}
+
+/// A captured position's own fields: its CGP bounded in length, the play that
+/// led to it bounded too, and that play's score a score.
+pub fn check_position_text(
+    position: &str,
+    previous_move: Option<&str>,
+    previous_move_score: Option<i32>,
+    context: &str,
+) -> AppResult<()> {
+    if position.chars().count() > MAX_POSITION_CHARS {
+        return Err(AppError::bad_request(format!(
+            "{context}: a position of more than {MAX_POSITION_CHARS} characters is not a position"
+        )));
+    }
+    if let Some(play) = previous_move {
+        check_play_text(play, context)?;
+    }
+    if let Some(score) = previous_move_score {
+        if !(0..=MAX_MOVE_SCORE).contains(&score) {
+            return Err(AppError::bad_request(format!(
+                "{context}: the previous play scores {score}, which no play can score"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A result's JSON text holds no NUL character. Postgres refuses one in a
+/// string, and the insert failed as a `500` -- which MAGPIE retries until it
+/// gives up, leaving the claim open (the audit's pass 21). JSON can carry one
+/// only escaped, as `\u0000` after an odd run of backslashes.
+pub fn refuse_nul(json: &str) -> AppResult<()> {
+    let bytes = json.as_bytes();
+    let mut from = 0;
+    while let Some(at) = json[from..].find("u0000").map(|i| from + i) {
+        let backslashes = bytes[..at].iter().rev().take_while(|b| **b == b'\\').count();
+        if backslashes % 2 == 1 {
+            return Err(AppError::bad_request(
+                "a string in the result holds a NUL character, which cannot be stored",
+            ));
+        }
+        from = at + 5;
     }
     Ok(())
 }
@@ -116,7 +235,8 @@ pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
 /// more moves than it claims to have generated.
 pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -> AppResult<()> {
     if let Some(num_moves) = num_moves {
-        if (num_moves as usize) < moves.len() {
+        // Negative first: cast to usize it is enormous, and passed.
+        if num_moves < 0 || (num_moves as usize) < moves.len() {
             return Err(AppError::bad_request(format!(
                 "{context}: reported {} moves but claims only {num_moves} were generated",
                 moves.len()
@@ -125,6 +245,7 @@ pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -
     }
 
     for entry in moves {
+        check_play_text(&entry.play, context)?;
         if entry.score < 0 || entry.score > MAX_MOVE_SCORE {
             return Err(AppError::bad_request(format!(
                 "{context}: play {:?} scores {}, which no play can score",
@@ -156,6 +277,40 @@ pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -
                 )));
             }
         }
+        check_plies(&entry.plies, &format!("{context}: play {:?}", entry.play))?;
+    }
+    Ok(())
+}
+
+/// A simulated play's per-ply statistics. MAGPIE numbers the plies from 0 in
+/// order, so a ply out of order or repeated is a broken client; a percentage
+/// outside [0, 100] or a mean score no play can reach is not a statistic.
+/// How many are *kept* is the player config's `num_plies_recorded`, applied
+/// where they are stored.
+fn check_plies(plies: &[PlyStats], context: &str) -> AppResult<()> {
+    let mut previous: Option<i16> = None;
+    for ply in plies {
+        if ply.ply < 0 || previous.is_some_and(|p| ply.ply <= p) {
+            return Err(AppError::bad_request(format!(
+                "{context}: ply {} is out of order; plies are numbered from 0, ascending",
+                ply.ply
+            )));
+        }
+        previous = Some(ply.ply);
+        finite(ply.bingo_percentage, &format!("{context}: bingo_percentage"))?;
+        if !(0.0..=100.0).contains(&ply.bingo_percentage) {
+            return Err(AppError::bad_request(format!(
+                "{context}: bingo percentage {} at ply {} is not a percentage",
+                ply.bingo_percentage, ply.ply
+            )));
+        }
+        finite(ply.average_score, &format!("{context}: average_score"))?;
+        if !(0.0..=f64::from(MAX_MOVE_SCORE)).contains(&ply.average_score) {
+            return Err(AppError::bad_request(format!(
+                "{context}: average score {} at ply {} is one no play can score",
+                ply.average_score, ply.ply
+            )));
+        }
     }
     Ok(())
 }
@@ -174,7 +329,7 @@ pub fn check_rack_occurrences(racks: &[RackOccurrence]) -> AppResult<()> {
         check_rack(&occurrence.rack, "leave result")?;
         // Leave generation observes full racks only. Anything shorter would
         // name no row of the generation's rack universe.
-        let tiles = occurrence.rack.chars().count();
+        let tiles = rack_tiles(&occurrence.rack).unwrap_or(0);
         if tiles != MAX_RACK_TILES {
             return Err(AppError::bad_request(format!(
                 "leave result: rack {:?} has {tiles} tiles; leave generation reports full \
@@ -190,7 +345,7 @@ pub fn check_rack_occurrences(racks: &[RackOccurrence]) -> AppResult<()> {
             )));
         }
         finite(occurrence.mean, &format!("leave result: mean equity of {:?}", occurrence.rack))?;
-        if occurrence.mean.abs() > MAX_ABS_EQUITY {
+        if occurrence.mean.abs() > MAX_ABS_RACK_MEAN {
             return Err(AppError::bad_request(format!(
                 "leave result: rack {:?} has an implausible mean equity {}",
                 occurrence.rack, occurrence.mean
@@ -220,9 +375,9 @@ const MAX_RACK_OCCURRENCES_PER_GAME: i64 = 1000;
 /// [`check_rack_occurrences`] bounds a count from below and nothing bounded it
 /// from above, and this is the one job type where that is not only wrong data
 /// but a wedge. Occurrences are **summed** -- into `bigint` columns, by a merge
-/// that folds every staged result of the generation in one statement. A count
-/// out of an uninitialised buffer is as likely to be near 2^63 as anywhere:
-/// staged, it made that statement fail with `bigint out of range`, every time,
+/// that folds every staged result of the generation, a slice of the racks per
+/// statement. A count out of an uninitialised buffer is as likely to be near
+/// 2^63 as anywhere: staged, it made its slice's statement fail with `bigint out of range`, every time,
 /// for every merge of the generation -- the periodic one, the one a claim asks
 /// for, and the drain a transition will not close without. The generation could
 /// never close and nothing short of deleting the staged row by hand fixed it.
@@ -231,7 +386,7 @@ const MAX_RACK_OCCURRENCES_PER_GAME: i64 = 1000;
 /// subtracted back out.
 ///
 /// Like the batch-size rule it needs the task -- the games it was dispatched
-/// with -- so it runs from `registry::store_result`. The bound is on the total,
+/// with -- so it runs from `registry::decode_result`. The bound is on the total,
 /// which bounds every count in it.
 pub fn check_rack_occurrence_total(racks: &[RackOccurrence], num_games: i32) -> AppResult<()> {
     let ceiling = i64::from(num_games.max(0)).saturating_mul(MAX_RACK_OCCURRENCES_PER_GAME);
@@ -248,16 +403,6 @@ pub fn check_rack_occurrence_total(racks: &[RackOccurrence], num_games: i32) -> 
     Ok(())
 }
 
-/// Checks a game batch against the size the task was dispatched with.
-///
-/// The size rule needs the job, which `process_response` does not have, so it
-/// runs from `registry::store_result` instead. It is the strongest check
-/// available at submission time and the only one that catches a worker
-/// reporting work it did not do: the batch size was fixed when the task was
-/// dispatched, so a result of any other size is answering a question nobody
-/// asked. `expected_games` is the job's batch size -- doubled for pairs, which
-/// play two games each -- which every request of the job denormalizes and
-/// which the job's template carries, so no request row is read for it.
 /// The games a game task was dispatched to play, which is what
 /// [`check_batch_size`] holds its result to: the job's batch size, which counts
 /// pairs -- two games each -- when `game_pairs` is set, as on the request.
@@ -269,6 +414,16 @@ pub fn games_dispatched(batch_size: i32, game_pairs: bool) -> i32 {
     }
 }
 
+/// Checks a game batch against the size the task was dispatched with.
+///
+/// The size rule needs the job, which `process_response` does not have, so it
+/// runs from `registry::decode_result` instead. It is the strongest check
+/// available at submission time and the only one that catches a worker
+/// reporting work it did not do: the batch size was fixed when the task was
+/// dispatched, so a result of any other size is answering a question nobody
+/// asked. `expected_games` is the job's batch size -- doubled for pairs, which
+/// play two games each -- which every request of the job denormalizes and
+/// which the job's template carries, so no request row is read for it.
 pub fn check_batch_size(reported_games: i32, expected_games: i32) -> AppResult<()> {
     if reported_games != expected_games {
         return Err(AppError::bad_request(format!(
@@ -343,6 +498,13 @@ mod tests {
         assert!(check_rack("AE?", "x").is_ok(), "blanks are legal tiles");
         assert!(check_rack("", "x").is_err());
         assert!(check_rack("AEINRSTU", "x").is_err());
+        // A multi-character letter is one tile, bracketed as MAGPIE writes it.
+        assert!(check_rack("A[L·L]E[NY]I[QU]S", "x").is_ok(), "seven Catalan tiles");
+        assert!(check_rack("A[L·L]E[NY]I[QU]ST", "x").is_err(), "eight Catalan tiles");
+        assert_eq!(rack_tiles("[L·L][L·L]"), Some(2));
+        assert_eq!(rack_tiles("A[NY"), None);
+        assert_eq!(rack_tiles("A]"), None);
+        assert_eq!(rack_tiles("[]"), None);
     }
 
     fn move_entry(score: i32, equity: f64) -> MoveEntry {
@@ -361,7 +523,10 @@ mod tests {
         assert!(check_moves(&[move_entry(74, 80.0)], None, "x").is_ok());
         assert!(check_moves(&[move_entry(0, -12.0)], None, "x").is_ok(), "a pass scores zero");
         assert!(check_moves(&[move_entry(-5, 0.0)], None, "x").is_err());
-        assert!(check_moves(&[move_entry(9_000, 0.0)], None, "x").is_err());
+        // A 21x21 board can score far past the 15x15 board's ~1,700.
+        assert!(check_moves(&[move_entry(9_000, 9_010.0)], None, "x").is_ok());
+        assert!(check_moves(&[move_entry(150_000, 0.0)], None, "x").is_err());
+        assert!(check_moves(&[move_entry(30, 250_000.0)], None, "x").is_err());
         assert!(check_moves(&[move_entry(30, f64::NAN)], None, "x").is_err());
     }
 
@@ -371,6 +536,28 @@ mod tests {
         assert!(check_moves(&moves, Some(50), "x").is_ok(), "truncation is normal");
         assert!(check_moves(&moves, Some(2), "x").is_ok());
         assert!(check_moves(&moves, Some(1), "x").is_err());
+        // Cast to usize, -1 was larger than any list and passed.
+        assert!(check_moves(&moves, Some(-1), "x").is_err());
+    }
+
+    fn ply(ply: i16, bingo_percentage: f64, average_score: f64) -> PlyStats {
+        PlyStats { ply, bingo_percentage, average_score }
+    }
+
+    #[test]
+    fn per_ply_statistics_are_statistics() {
+        let with = |plies: Vec<PlyStats>| {
+            let mut entry = move_entry(30, 30.0);
+            entry.plies = plies;
+            check_moves(&[entry], None, "x")
+        };
+        assert!(with(vec![ply(0, 12.5, 31.0), ply(1, 20.0, 35.2)]).is_ok());
+        assert!(with(vec![ply(0, 140.0, 31.0)]).is_err(), "not a percentage");
+        assert!(with(vec![ply(0, 12.5, -3.0)]).is_err(), "no play scores negative");
+        assert!(with(vec![ply(0, f64::NAN, 3.0)]).is_err());
+        assert!(with(vec![ply(-1, 12.5, 31.0)]).is_err());
+        assert!(with(vec![ply(1, 12.5, 31.0), ply(0, 12.5, 31.0)]).is_err(), "out of order");
+        assert!(with(vec![ply(0, 12.5, 31.0), ply(0, 12.5, 31.0)]).is_err(), "repeated");
     }
 
     #[test]
@@ -409,9 +596,9 @@ mod tests {
         assert!(check_rack_occurrences(&[occurrence("AEINRST", 0)]).is_err());
     }
 
-    /// Occurrences are summed into `bigint` columns by one statement per
-    /// generation, so a count no game could produce is not only wrong: near
-    /// 2^63 it overflows that statement on every merge, and the generation can
+    /// Occurrences are summed into `bigint` columns across every staged result
+    /// of a generation, so a count no game could produce is not only wrong:
+    /// near 2^63 it overflows the merge's sum on every merge, and the generation can
     /// never close.
     #[test]
     fn a_leave_batch_cannot_report_more_occurrences_than_its_games_drew() {
@@ -433,9 +620,9 @@ mod tests {
     /// U-PLAUS-1: a pairs job's batch size counts pairs, so the games it
     /// dispatched are twice that; a games job's batch is already games. The
     /// confusion the `min_pairs`/`max_pairs` naming exists to prevent.
-    /// (TESTING.md calls this `check_against_task`; the rule is
-    /// `check_batch_size` against `games_dispatched`, which `registry::
-    /// store_result` runs for both job types.)
+    /// (TESTING.md once called this `check_against_task`; the rule is
+    /// `check_batch_size` against `games_dispatched`, which
+    /// `registry::decode_result` runs for both job types.)
     #[test]
     fn a_pairs_batch_dispatches_two_games_a_pair_and_a_games_batch_does_not() {
         assert_eq!(games_dispatched(10, true), 20);
@@ -471,6 +658,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A NUL reaches the text only escaped, after an odd run of backslashes;
+    /// an escaped backslash before `u0000` is the text "\u0000", not a NUL.
+    #[test]
+    fn a_nul_is_found_only_where_json_escapes_one() {
+        assert!(refuse_nul(r#"{"a":"x\u0000y"}"#).is_err());
+        assert!(refuse_nul(r#"{"a":"x\\\u0000"}"#).is_err());
+        assert!(refuse_nul(r#"{"a":"x\\u0000"}"#).is_ok());
+        assert!(refuse_nul(r#"{"a":"u0000"}"#).is_ok());
+        assert!(refuse_nul(r#"{"a":"plain"}"#).is_ok());
+    }
+
+    #[test]
+    fn a_bracketed_tile_is_a_few_letters() {
+        assert_eq!(rack_tiles("[CH]AB"), Some(3));
+        assert_eq!(rack_tiles("[L·L]"), Some(1));
+        assert_eq!(rack_tiles(&format!("[{}]", "Q".repeat(9))), None);
     }
 }
 
@@ -517,7 +722,7 @@ mod fixture_tests {
 
     /// The batch every fixture was captured against: the contract
     /// assignments' `num_games` (10 games, or 10 pairs, and 10,000 games for
-    /// leave generation), which is the job setting `store_result` reads.
+    /// leave generation), which is the job setting `decode_result` reads.
     const BATCH: i32 = 10;
     const LEAVE_GAMES: i32 = 10_000;
 
@@ -526,9 +731,11 @@ mod fixture_tests {
             .map_err(|e| AppError::bad_request(format!("malformed task response: {e}")))
     }
 
-    // What `registry::store_result` runs on a submission before it stores it,
+    // What `registry::decode_result` runs on a submission before it is stored,
     // one job type each, in its order: decode, `process_response`, then the
-    // checks against the task. Everything short of the database -- which for
+    // checks against the task -- all but `refuse_uncaptured_positions`, which
+    // needs the job's capture setting (the fixture tests have no job), and the
+    // route's `refuse_nul`. Everything short of the database -- which for
     // an opening-rack batch is also `check_batch_against_task`, comparing the
     // racks with the task's range.
 

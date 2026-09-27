@@ -24,6 +24,11 @@ pub enum Acquired {
     Task { task_id: Uuid, request: TaskRequest, created: bool },
     /// This job has nothing to hand out right now; try the next one.
     NoWork,
+    /// Another claim held the job's dispatch lock past the bounded wait. Not
+    /// "no work": the scheduler does not lift the job as passed over. It is not
+    /// tried again in the request, but stays a rival of the others, with a
+    /// ratio unit of slack.
+    Busy,
     /// Leave generation only: the current generation is finished and must be
     /// aggregated before more tasks exist. Handled outside the transaction.
     NeedsGenerationTransition { generation: i32 },
@@ -31,6 +36,10 @@ pub enum Acquired {
     /// been written yet. It is seeded on its own task, and the job has nothing
     /// to hand out until that commits.
     NeedsUniverse { generation: i32 },
+    /// Leave generation only: generation 1 is due but the zeroed KLV it plays
+    /// with was never written -- its build failed after the job's creation or
+    /// purge committed. Built on its own task; nothing to hand out until then.
+    NeedsZeroGeneration,
     /// Leave generation only: nothing is left to hand out or in flight, but
     /// accepted results are still staged, so whether the generation is complete
     /// is not yet known. The caller merges them, off the request; this job has
@@ -62,7 +71,7 @@ pub async fn acquire(
     // `claims_issued`), so taking the advisory lock first costs a little more
     // of the same wait and nothing new.
     if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
-        return Ok(Acquired::NoWork);
+        return Ok(Acquired::Busy);
     }
 
     // A task whose claim timed out drops back to `available`, and so does a
@@ -125,6 +134,21 @@ async fn generate_opening_rack(
 /// insert would fail every time, and the worker would get nothing at all until
 /// someone else filled the slot.
 ///
+/// And, except in leave generation, tasks this identity declined in the last
+/// hour. A declined task goes
+/// back to `available` and, the oldest, was handed straight back to whoever
+/// claimed next -- the worker that had just failed it included -- ahead of any
+/// new work: one task that fails everywhere was every claim of its job, and
+/// MAGPIE stops after five failures in a row, so it stopped each contributor
+/// claiming from the job (the audit's pass 8). Skipped by the one who
+/// declined it, it goes to the next worker; each fails it once and moves on.
+/// Not in leave generation: a declined leave task sits `available` with no
+/// claim, and skipping it sent the decliner to rack selection, which does
+/// not count an available task's racks as out -- it forced the same racks
+/// again, on a second open claim, and in the tail handed them to the same
+/// worker every time (the adversarial check of pass 8). There the task is
+/// reissued as it stands.
+///
 /// `leave_generation`, when set, restricts it to a leave job's tasks for that
 /// generation.
 async fn next_available(
@@ -139,7 +163,10 @@ async fn next_available(
            AND NOT EXISTS (
                SELECT 1 FROM task_claims c
                WHERE c.task_id = t.id
-                 AND c.state NOT IN ('abandoned', 'declined')
+                 AND (c.state NOT IN ('abandoned', 'declined')
+                      OR (c.state = 'declined' AND $4::int IS NULL
+                          AND COALESCE(c.last_heartbeat_at, c.claimed_at)
+                              > now() - interval '1 hour'))
                  AND (c.claimed_by_user_id = $2 OR c.claimed_by_anon_uuid = $3)
            )
            AND ($4::int IS NULL OR EXISTS (
@@ -285,6 +312,20 @@ async fn generate_leave_gen(
         return Ok(Acquired::NeedsUniverse { generation });
     }
 
+    // Without it every claim went on to fail in `next_step` -- logged and
+    // skipped, for good -- until an admin happened to activate the job again.
+    if generation == 1
+        && !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM leave_generation_artifacts
+                            WHERE job_id = $1 AND generation = 0)",
+        )
+        .bind(job.id)
+        .fetch_one(&mut *conn)
+        .await?
+    {
+        return Ok(Acquired::NeedsZeroGeneration);
+    }
+
     if let Some(task_id) = next_available(&mut *conn, job.id, identity, Some(generation)).await? {
         let request = load_request(conn, template, task_id).await?;
         return Ok(Acquired::Task { task_id, request, created: false });
@@ -332,7 +373,7 @@ async fn insert_on_demand_task(
     .await?)
 }
 
-/// Validate, normalize and store a worker submission.
+/// Store a worker submission [`decode_result`] has decoded and checked.
 ///
 /// `first_result` says whether this is the first accepted result for its task,
 /// which the caller reads from the task's `accepted_count` under the task's row
@@ -346,14 +387,77 @@ async fn insert_on_demand_task(
 pub async fn store_result(
     conn: &mut PgConnection,
     template: &JobTemplate,
-    job: &Job,
     task_id: Uuid,
     claim_id: Uuid,
     first_result: bool,
-    payload: serde_json::Value,
-) -> AppResult<()> {
-    fn decode<T: serde::de::DeserializeOwned>(payload: serde_json::Value) -> AppResult<T> {
-        serde_json::from_value(payload)
+    decoded: DecodedResult,
+) -> AppResult<ProgressDelta> {
+    match decoded {
+        DecodedResult::OpeningRack(record) => {
+            let racks: Vec<String> =
+                record.positions.iter().map(|p| p.rack.clone()).collect();
+            opening_rack::check_batch_against_task(conn, template, task_id, &racks).await?;
+            opening_rack::OpeningRackHandler::insert_record(conn, template, task_id, claim_id, &record)
+                .await?;
+            // One row per rack, and the unique index on (task_claim_id, rack)
+            // means the insert above would have failed on a duplicate, so the
+            // submission's length is its distinct-rack count. Racks never
+            // repeat across tasks either: each task analyses its own slice of
+            // the enumerated space.
+            Ok(ProgressDelta::first_result(first_result, 0, record.positions.len() as i64))
+        }
+        DecodedResult::Games(record) => {
+            game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
+            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
+        }
+        DecodedResult::GamePairs(record) => {
+            game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
+                .await?;
+            // Games, not pairs, for both job types: the pairs count is half of
+            // it and is derived where it is displayed.
+            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
+        }
+        DecodedResult::LeaveGeneration(record) => {
+            if first_result {
+                leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
+                    .await?;
+            } else {
+                leave_gen::credit_claim(conn, task_id, claim_id, &record).await?;
+            }
+            Ok(ProgressDelta::default())
+        }
+    }
+}
+
+/// A submission decoded into its job type's record and checked against
+/// everything the job alone decides.
+pub enum DecodedResult {
+    OpeningRack(<opening_rack::OpeningRackHandler as JobHandler>::Record),
+    Games(<game::GameHandler as JobHandler>::Record),
+    GamePairs(<game_pair::GamePairHandler as JobHandler>::Record),
+    LeaveGeneration(<leave_gen::LeaveGenHandler as JobHandler>::Record),
+}
+
+/// Decode and check a submission, before the submit path takes any lock.
+///
+/// Nothing here reads the database: the record is a function of the payload
+/// and the job's type, and the checks of the job's settings -- batch size,
+/// occurrence totals -- are the template's. Done inside the transaction, as it
+/// was, the claim and task rows stayed locked and a pool connection held for
+/// the decode -- tens of milliseconds for an ordinary result, a second at the
+/// 64 MiB ceiling. What needs the task's own row (an opening-rack batch's
+/// racks) is checked by [`store_result`].
+pub async fn decode_result(
+    template: &JobTemplate,
+    payload: Box<serde_json::value::RawValue>,
+) -> AppResult<DecodedResult> {
+    /// Straight from the submission's text into its typed response. It went
+    /// through a `serde_json::Value` first, which holds every object as a
+    /// B-tree node and every key as its own allocation -- ten to twenty times
+    /// the JSON's size, and a result may be 64 MiB. A few of those at once
+    /// were enough to have the one web task killed for memory.
+    fn decode<T: serde::de::DeserializeOwned>(payload: &serde_json::value::RawValue) -> AppResult<T> {
+        serde_json::from_str(payload.get())
             .map_err(|e| AppError::bad_request(format!("malformed task response: {e}")))
     }
 
@@ -365,40 +469,22 @@ pub async fn store_result(
     /// it is tens to hundreds of milliseconds of computation with no `await`
     /// in it, and an async worker thread that does not yield can hold up every
     /// other request the server has (see `exports::upload_rows`). The hop costs
-    /// microseconds, against a transaction of a dozen round trips.
-    async fn normalize<H>(payload: serde_json::Value) -> AppResult<H::Record>
+    /// microseconds.
+    async fn normalize<H>(payload: Box<serde_json::value::RawValue>) -> AppResult<H::Record>
     where
         H: JobHandler,
         H::Response: Send + 'static,
         H::Record: Send + 'static,
     {
-        tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(payload)?))
+        tokio::task::spawn_blocking(move || H::process_response(decode::<H::Response>(&payload)?))
             .await
-            .map_err(|e| AppError::internal(format!("validating a task response failed: {e}")))?
+            .map_err(|e| AppError::task_failed("validating a task response", e))?
     }
 
     match &template.kind {
-        JobKind::OpeningRack { .. } => {
-            let record = normalize::<opening_rack::OpeningRackHandler>(payload).await?;
-            let racks: Vec<String> =
-                record.positions.iter().map(|p| p.rack.clone()).collect();
-            opening_rack::check_batch_against_task(conn, template, task_id, &racks).await?;
-            opening_rack::OpeningRackHandler::insert_record(conn, template, task_id, claim_id, &record)
-                .await?;
-            // One row per rack, and the unique index on (task_claim_id, rack)
-            // means the insert above would have failed on a duplicate, so the
-            // submission's length is its distinct-rack count. Racks never
-            // repeat across tasks either: each task analyses its own slice of
-            // the enumerated space.
-            count_first_result(
-                conn,
-                job,
-                first_result,
-                "racks_analyzed",
-                record.positions.len() as i64,
-            )
-            .await
-        }
+        JobKind::OpeningRack { .. } => Ok(DecodedResult::OpeningRack(
+            normalize::<opening_rack::OpeningRackHandler>(payload).await?,
+        )),
         JobKind::Games { config, .. } => {
             let record = normalize::<game::GameHandler>(payload).await?;
             // The batch size was fixed when the task was handed out -- it is
@@ -408,9 +494,8 @@ pub async fn store_result(
                 record.all_games.games,
                 super::plausibility::games_dispatched(config.games_per_batch, false),
             )?;
-            game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
-            count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
-                .await
+            refuse_uncaptured_positions(config.capture_positions, &record.positions, record.all_games.games)?;
+            Ok(DecodedResult::Games(record))
         }
         JobKind::GamePairs { config, .. } => {
             let record = normalize::<game_pair::GamePairHandler>(payload).await?;
@@ -419,12 +504,8 @@ pub async fn store_result(
                 record.all_games.games,
                 super::plausibility::games_dispatched(config.pairs_per_batch, true),
             )?;
-            game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
-                .await?;
-            // Games, not pairs, for both job types: the pairs count is half of
-            // it and is derived where it is displayed.
-            count_first_result(conn, job, first_result, "games_completed", record.all_games.games as i64)
-                .await
+            refuse_uncaptured_positions(config.capture_positions, &record.positions, record.all_games.games)?;
+            Ok(DecodedResult::GamePairs(record))
         }
         JobKind::LeaveGeneration { config, .. } => {
             let record = normalize::<leave_gen::LeaveGenHandler>(payload).await?;
@@ -433,54 +514,111 @@ pub async fn store_result(
             // on receipt, and an impossible count does not only mislead, it
             // overflows the merge that sums it.
             super::plausibility::check_rack_occurrence_total(&record.racks, config.num_iterations)?;
-            if first_result {
-                leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
-                    .await
-            } else {
-                leave_gen::credit_claim(conn, task_id, claim_id, &record).await
-            }
+            Ok(DecodedResult::LeaveGeneration(record))
         }
     }
 }
 
-/// Add this submission's work to one of the job's running progress totals, but
-/// only if it is the first accepted result for its task.
+/// Positions from a job that did not ask for them: they were stored, and the
+/// job's export then carried a positions file nobody asked for. MAGPIE sends
+/// them only when the request says so.
 ///
-/// The reads these totals replace both selected one result per task -- the
-/// aggregates they summed describe the same deterministic work on every
-/// redundant claim, so counting all of them would multiply the total by the
-/// job's redundancy (PLAN.md, "What these reads cost"). "First" comes from the
-/// task's `accepted_count`, read by `submit_result` under the task's row lock
-/// before anything is stored: every accepted result increments it in the
-/// transaction that stores the result, and that transaction holds the same
-/// lock, so two submissions arriving together cannot both read zero. It used to
-/// be decided by counting the rows just written, which for an opening-rack
-/// batch was a read of up to 10,000 of them to learn one bit. Update and store
-/// share the submission's transaction, so a submission that later fails
-/// contributes neither.
-///
-/// The update takes a row lock on `jobs`, so two submissions for the same job
-/// serialize here for as long as the lock is held. A task is minutes of work, so
-/// that is a lock every few seconds at most on a busy job, and the alternative
-/// -- the count these totals exist to avoid -- was seconds of CPU per page view.
-async fn count_first_result(
-    conn: &mut PgConnection,
-    job: &Job,
-    first_result: bool,
-    column: &str,
-    amount: i64,
+/// And the other way round: a job that captures positions gets some from every
+/// game of the batch. A result with none was accepted and the task completed,
+/// a permanent hole in a corpus PLAN promises holds every position of every
+/// game -- what a MAGPIE build from before capture sends (the audit's pass
+/// 21).
+fn refuse_uncaptured_positions(
+    capture: bool,
+    positions: &[super::handler::PositionAnalysis],
+    games: i32,
 ) -> AppResult<()> {
-    if !first_result {
-        return Ok(());
+    if !capture && !positions.is_empty() {
+        return Err(AppError::bad_request(
+            "this job does not capture positions, and the result carries some",
+        ));
     }
-
-    // `column` is one of two literals chosen in this file, never worker input.
-    sqlx::query(&format!("UPDATE jobs SET {column} = {column} + $2 WHERE id = $1"))
-        .bind(job.id)
-        .bind(amount)
-        .execute(&mut *conn)
-        .await?;
+    if capture {
+        let covered: std::collections::HashSet<i16> =
+            positions.iter().filter_map(|p| p.game_index).collect();
+        if let Some(missing) = (0..games).find(|g| !i16::try_from(*g).is_ok_and(|g| covered.contains(&g))) {
+            return Err(AppError::bad_request(format!(
+                "this job captures positions, and the result has none from game {missing}"
+            )));
+        }
+    }
     Ok(())
+}
+
+/// A turn to store a large result, taken by the submit path *before* it opens
+/// its transaction and held until it commits; `None` for an ordinary result,
+/// which never waits.
+///
+/// At the 64 MiB ceiling one submission holds the body, its text, the typed
+/// response and the record -- a quarter of a gigabyte -- and nothing bounded
+/// how many ran at once on the one 2 GB task. The wait is outside the
+/// transaction because inside it, as it first was, each waiter held a pool
+/// connection and its claim and task rows for up to thirty seconds, and the
+/// permit ended before the insert that still held the record.
+pub async fn large_result_turn(
+    bytes: usize,
+) -> AppResult<Option<tokio::sync::SemaphorePermit<'static>>> {
+    if bytes < LARGE_RESULT_BYTES {
+        return Ok(None);
+    }
+    let permit = tokio::time::timeout(LARGE_RESULT_WAIT, LARGE_RESULT_DECODES.acquire())
+        .await
+        .map_err(|_| AppError {
+            retry_after: Some(30),
+            ..AppError::new(
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                "the server is storing other large results; try again shortly",
+            )
+        })?
+        .map_err(|e| AppError::internal(format!("large-result semaphore closed: {e}")))?;
+    Ok(Some(permit))
+}
+
+/// A result at least this large takes a [`large_result_turn`]: the size at
+/// which its body was reserved from `extract::LARGE_BODIES`, so every result
+/// the body budget counts is decoded three at a time. (At 8 MiB, results
+/// between the two decoded as many at once as the budget admitted, and their
+/// typed forms were counted nowhere.)
+const LARGE_RESULT_BYTES: usize = crate::extract::LARGE_BODY_BYTES;
+/// How many large results are decoded at once.
+static LARGE_RESULT_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(3);
+/// How long a large result waits for a turn before its worker is told to come
+/// back (`503`, which MAGPIE retries).
+const LARGE_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// What one accepted result adds to its job's running progress totals: games
+/// played, opening racks analysed. Returned rather than written, so the submit
+/// path can make every change to the job's row in one statement, last.
+///
+/// Only the first accepted result for its task counts. The reads these totals
+/// replace both selected one result per task -- the aggregates they summed
+/// describe the same deterministic work on every redundant claim, so counting
+/// all of them would multiply the total by the job's redundancy (PLAN.md,
+/// "What these reads cost"). "First" comes from the task's `accepted_count`,
+/// read by `submit_result` under the task's row lock before anything is
+/// stored: every accepted result increments it in the transaction that stores
+/// the result, and that transaction holds the same lock, so two submissions
+/// arriving together cannot both read zero.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressDelta {
+    pub games_completed: i64,
+    pub racks_analyzed: i64,
+}
+
+impl ProgressDelta {
+    fn first_result(first_result: bool, games: i64, racks: i64) -> Self {
+        if first_result {
+            ProgressDelta { games_completed: games, racks_analyzed: racks }
+        } else {
+            ProgressDelta::default()
+        }
+    }
 }
 
 /// The part of job initialization that cannot run inside the creating

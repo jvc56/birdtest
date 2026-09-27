@@ -8,8 +8,13 @@
 #
 # This is what keeps scripts/backup.sh honest as the schema moves: the dump
 # path, the manifest's row counts, and the verification queries the production
-# restore drill runs (PLAN.md, "Verifying a restore") all execute here, against a
-# database seeded with a row in every table a result touches.
+# restore drill runs (PLAN.md, "Verifying a restore") all execute here. An empty
+# database (a fresh schema, as nightly CI gives it) is first seeded with a row in
+# each of seven core tables (users, input_data, jobs, tasks, task_claims,
+# game_results, backups); any other is round-tripped as it is, and then proves
+# only as much as its own rows do. Run it against an idle stack: the source's
+# row counts are read after the dump, outside its snapshot, so a writer makes it
+# fail.
 #
 # It runs entirely inside the Postgres container, so the host needs no
 # Postgres client — Docker is the only dependency, as everywhere else.
@@ -51,13 +56,23 @@ fi
 # a job, a task, a claim, and a result hanging off that claim -- including the
 # bytea and jsonb columns, which are where a dump format goes wrong if it is
 # going to.
+#
+# Only into an empty database. Each insert used to guard on its own table
+# alone, so a developer's database with jobs but no tasks had a completed task,
+# a claim and a 6-4 result added to every job it held, and a backups row; one
+# with only users and input data gained an active job and an admin. Any other
+# database is round-tripped as it is: its own rows are the test.
+if [[ "$(psql_val "${SRC_DB}" "SELECT EXISTS (SELECT 1 FROM users) OR EXISTS (SELECT 1 FROM input_data)
+                                     OR EXISTS (SELECT 1 FROM jobs) OR EXISTS (SELECT 1 FROM backups)")" == t ]]; then
+  echo "${SRC_DB} is not empty: round-tripping it as it is, unseeded"
+else
 echo "seeding"
 psql_ -d "${SRC_DB}" <<'SQL'
 BEGIN;
 
 INSERT INTO users (username, email, password_hash, is_admin)
 VALUES ('roundtrip', 'roundtrip@example.invalid', 'x', true)
-ON CONFLICT (username) DO NOTHING;
+ON CONFLICT (lower(username)) DO NOTHING;
 
 INSERT INTO input_data (path, role, name, sha256, bytes, tarball_date, content)
 VALUES ('letterdistributions/roundtrip.csv', 'letterdist', 'roundtrip',
@@ -78,8 +93,8 @@ INSERT INTO tasks (job_id, seed, state, accepted_count)
 SELECT id, 42, 'completed', 1 FROM jobs
 WHERE NOT EXISTS (SELECT 1 FROM tasks);
 
-INSERT INTO task_claims (task_id, claim_token, state, claimed_by_user_id, completed_at)
-SELECT t.id, gen_random_uuid(), 'completed',
+INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+SELECT t.id, t.job_id, gen_random_uuid(), 'completed',
        (SELECT id FROM users WHERE username = 'roundtrip'), now()
 FROM tasks t
 WHERE NOT EXISTS (SELECT 1 FROM task_claims);
@@ -99,6 +114,7 @@ WHERE NOT EXISTS (SELECT 1 FROM backups);
 
 COMMIT;
 SQL
+fi
 
 # --- Dump ------------------------------------------------------------------
 echo "dumping"
@@ -157,12 +173,17 @@ BEGIN
 
     SELECT count(*) INTO bad
       FROM tasks t
-      JOIN LATERAL (
-        SELECT count(*) FILTER (WHERE c.state = 'completed') AS accepted,
+      LEFT JOIN (
+        -- One pass over the claims, grouped: a per-task probe (as a lateral
+        -- join) was a random index read per task, hours on the drill's disk
+        -- at tens of millions of tasks.
+        SELECT c.task_id,
+               count(*) FILTER (WHERE c.state = 'completed') AS accepted,
                count(*) FILTER (WHERE c.state = 'claimed')   AS active
-          FROM task_claims c WHERE c.task_id = t.id
-      ) actual ON true
-     WHERE t.accepted_count <> actual.accepted OR t.active_claim_count <> actual.active;
+          FROM task_claims c GROUP BY c.task_id
+      ) actual ON actual.task_id = t.id
+     WHERE t.accepted_count <> COALESCE(actual.accepted, 0)
+        OR t.active_claim_count <> COALESCE(actual.active, 0);
     IF bad > 0 THEN RAISE EXCEPTION 'tasks whose claim counters disagree with their claims: %', bad; END IF;
 END
 $$;
@@ -171,11 +192,11 @@ echo "referential and counter checks passed"
 
 # Bytea and floating point survive the round trip byte for byte, which a row
 # count would not notice.
-BEFORE_CONTENT="$(psql_val "${SRC_DB}" "SELECT encode(content, 'hex') FROM input_data ORDER BY path")"
-AFTER_CONTENT="$(psql_val "${DEST_DB}" "SELECT encode(content, 'hex') FROM input_data ORDER BY path")"
+BEFORE_CONTENT="$(psql_val "${SRC_DB}" "SELECT encode(content, 'hex') FROM input_data ORDER BY path, sha256")"
+AFTER_CONTENT="$(psql_val "${DEST_DB}" "SELECT encode(content, 'hex') FROM input_data ORDER BY path, sha256")"
 [[ "${BEFORE_CONTENT}" == "${AFTER_CONTENT}" ]] || { echo "input_data.content differs" >&2; exit 1; }
 
-BEFORE_SCORES="$(psql_val "${SRC_DB}" "SELECT p1_score_mean, p1_score_sd FROM game_results ORDER BY task_id")"
-AFTER_SCORES="$(psql_val "${DEST_DB}" "SELECT p1_score_mean, p1_score_sd FROM game_results ORDER BY task_id")"
+BEFORE_SCORES="$(psql_val "${SRC_DB}" "SELECT p1_score_mean, p1_score_sd FROM game_results ORDER BY task_id, task_claim_id")"
+AFTER_SCORES="$(psql_val "${DEST_DB}" "SELECT p1_score_mean, p1_score_sd FROM game_results ORDER BY task_id, task_claim_id")"
 [[ "${BEFORE_SCORES}" == "${AFTER_SCORES}" ]] || { echo "game_results scores differ" >&2; exit 1; }
 echo "bytea and double precision columns match"

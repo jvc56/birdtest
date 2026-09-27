@@ -13,16 +13,47 @@ output "database_endpoint" {
 }
 
 output "ssm_parameter_names" {
-  description = "Parameters whose values must be set out of band before the first deploy."
+  description = "Parameters to create out of band (put-parameter) before the service starts; Terraform never reads them."
   value = [
-    aws_ssm_parameter.database_url.name,
-    aws_ssm_parameter.session_signing_key.name,
+    local.ssm_database_url_name,
+    local.ssm_session_signing_key_name,
   ]
 }
 
-output "ses_dkim_tokens" {
-  description = "Add these as CNAME records to finish SES domain verification."
-  value       = aws_sesv2_email_identity.domain.dkim_signing_attributes[0].tokens
+# As records, not bare tokens: each is `<token>._domainkey.<ses_domain>`
+# CNAME `<token>.dkim.amazonses.com`, which the tokens alone did not say.
+output "ses_dkim_records" {
+  description = "Add these CNAME records (name => value) to finish SES domain verification."
+  value = {
+    for token in aws_sesv2_email_identity.domain.dkim_signing_attributes[0].tokens :
+    "${token}._domainkey.${var.ses_domain}" => "${token}.dkim.amazonses.com"
+  }
+}
+
+# Without a DMARC record anyone can send mail as `ses_domain` -- a "reset your
+# password" mail included -- and receivers have no policy to judge it by. This
+# is the first step: `p=none` enforces nothing. Add `rua=mailto:` a mailbox at
+# the domain to receive reports (one elsewhere needs that domain's consent),
+# and move to `p=quarantine` once they show birdtest's own mail passing (DKIM
+# above, SPF through the MAIL FROM records below).
+output "ses_dmarc_record" {
+  description = "Add this TXT record, unless the domain has a DMARC record already: a second one voids both."
+  value = {
+    name = "_dmarc.${var.ses_domain}"
+    TXT  = "\"v=DMARC1; p=none\""
+  }
+}
+
+# ses.tf sends from the custom MAIL FROM domain `mail.<ses_domain>`, which SES
+# uses only once these two records exist (until then it falls back to its own,
+# and SPF alignment for the domain fails).
+output "ses_mail_from_records" {
+  description = "Add these DNS records for the custom MAIL FROM domain."
+  value = {
+    name = "mail.${var.ses_domain}"
+    MX   = "10 feedback-smtp.${var.region}.amazonses.com"
+    TXT  = "\"v=spf1 include:amazonses.com ~all\""
+  }
 }
 
 output "backups_bucket" {
@@ -42,4 +73,46 @@ output "artifacts_dr_bucket" {
 output "backup_task_definition" {
   description = "Run a backup on demand: aws ecs run-task --task-definition <this>."
   value       = aws_ecs_task_definition.backup.family
+}
+
+# What a one-off task inside the VPC needs: `scripts/prod-sql.sh` runs SQL
+# against the database this way, and RUNBOOK.md's restores reach it the same
+# way. The database is not publicly accessible and nothing else can reach it.
+output "cluster_name" {
+  value = aws_ecs_cluster.main.name
+}
+
+output "service_subnet_ids" {
+  value = aws_subnet.public[*].id
+}
+
+output "service_security_group_id" {
+  description = "The only security group the database accepts connections from."
+  value       = aws_security_group.service.id
+}
+
+output "db_security_group_id" {
+  description = "The database's own security group, for an instance restored beside it (RUNBOOK.md §1)."
+  value       = aws_security_group.db.id
+}
+
+output "log_group_name" {
+  value = aws_cloudwatch_log_group.main.name
+}
+
+output "ops_task_definition" {
+  description = "The task scripts/prod-sql.sh and scripts/prod-shell.sh run: psql inside the VPC."
+  value       = aws_ecs_task_definition.ops.family
+}
+
+output "region" {
+  description = "The stack's region, which scripts/prod-sql.sh and prod-shell.sh run every AWS call in."
+  value       = var.region
+}
+
+# The availability zones the stack is in. Pin them into prod.tfvars as `azs`
+# after the first apply (README.md, "Deploying"), so that nothing about the
+# region's zones later can move a subnet.
+output "azs" {
+  value = local.azs
 }

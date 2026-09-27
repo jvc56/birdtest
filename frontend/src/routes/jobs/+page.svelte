@@ -7,18 +7,36 @@
 
   let result: Page<JobListItem> | null = null;
   let page = 0;
+  let loadError = '';
 
   async function load(next: number) {
     page = next;
-    result = await api.jobs(next);
+    loadError = '';
+    try {
+      result = await api.jobs(next);
+    } catch (e) {
+      loadError = e instanceof Error ? e.message : String(e);
+    }
   }
 
   onMount(() => load(0));
 
-  /** On-demand SPRT jobs count games or pairs; everything else counts tasks. */
+  /**
+   * Every job type counts its own units -- games or pairs, racks analysed,
+   * generations closed -- because tasks are made on demand and a task count is
+   * only what has been handed out so far. Tasks are the fallback.
+   */
   function progress(job: JobListItem): { value: number; max: number; unit: string } {
     if (job.units_completed !== null && job.max_units !== null) {
-      return { value: job.units_completed, max: job.max_units, unit: 'units' };
+      const unit =
+        job.job_type === 'opening_rack'
+          ? 'racks'
+          : job.job_type === 'leave_generation'
+            ? 'generations'
+            : job.job_type === 'game_pairs'
+              ? 'pairs'
+              : 'games';
+      return { value: job.units_completed, max: job.max_units, unit };
     }
     return { value: job.tasks_completed, max: job.tasks_total, unit: 'tasks' };
   }
@@ -26,7 +44,9 @@
 
 <h1 class="mb-6 text-2xl font-semibold">Jobs</h1>
 
-{#if !result}
+{#if loadError}
+  <p class="text-sm text-destructive">Could not load the jobs: {loadError}</p>
+{:else if !result}
   <p class="text-muted-foreground">Loading…</p>
 {:else}
   <div class="card overflow-x-auto p-0">

@@ -3,6 +3,7 @@
   import { page } from '$app/stores';
   import { api, type JobStats } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
+  import { session } from '$lib/auth';
   import { duration, datetime, jobTypeLabel, sprtLabel } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
@@ -25,10 +26,21 @@
     api
       .job(jobId)
       .then((value) => (stats = value))
-      .catch((e) => (error = e.message));
+      // Only while there is nothing to show: a late failure after the stream
+      // has delivered stats would otherwise hide them for good on a job no
+      // longer changing.
+      .catch((e) => {
+        if (stats === null) error = e.message;
+      });
     // The stream carries the same payload as the REST call, so an update is a
     // straight replacement rather than a merge.
-    return subscribeToJob<JobStats>(jobId, (value) => (stats = value));
+    // A live payload also clears an error the first load hit (a deploy's
+    // 503): the page otherwise stayed on the error with the stats arriving
+    // behind it.
+    return subscribeToJob<JobStats>(jobId, (value) => {
+      stats = value;
+      error = '';
+    });
   });
 
   async function lookupRack() {
@@ -56,6 +68,11 @@
       <span class="text-sm text-muted-foreground">
         {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}
       </span>
+      <!-- The admin page (activate, purge, export, artifacts) was reachable
+           only by the redirect after creating the job. -->
+      {#if $session?.is_admin}
+        <a href="/admin/jobs/{stats.job.id}" class="btn-secondary ml-auto no-underline">Manage</a>
+      {/if}
     </header>
 
     <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -87,6 +104,20 @@
           max={stats.games.max_units}
           label="{stats.games.unit}s completed (hard cap)"
         />
+      {:else if stats.opening_racks}
+        <!-- Tasks are made on demand, so a task count is only what has been
+             handed out so far: a job 1% through its racks read 99%. -->
+        <ProgressBar
+          value={stats.opening_racks.racks_analyzed}
+          max={stats.opening_racks.racks_total}
+          label="racks analysed"
+        />
+      {:else if stats.leave_generation}
+        <ProgressBar
+          value={stats.leave_generation.generations_closed}
+          max={stats.leave_generation.generation_count}
+          label="generations closed"
+        />
       {:else}
         <ProgressBar
           value={stats.tasks_completed}
@@ -101,7 +132,7 @@
         <div><dt class="text-muted-foreground">Created</dt><dd>{datetime(stats.job.created_at)}</dd></div>
       </dl>
       <p class="text-xs text-muted-foreground">
-        Created by {stats.job.created_by ?? 'unknown'}{#if stats.job.min_magpie_version}
+        Created by <span class="break-all">{stats.job.created_by ?? 'unknown'}</span>{#if stats.job.min_magpie_version}
           · requires MAGPIE ≥ {stats.job.min_magpie_version}{/if}
       </p>
     </div>
@@ -110,14 +141,32 @@
       <div class="card space-y-4">
         <div class="flex items-center justify-between">
           <h2 class="text-lg font-medium">SPRT</h2>
-          <JobStatusBadge status={stats.games.sprt.status} />
+          <JobStatusBadge status={stats.games.decided?.status ?? stats.games.sprt.status} />
         </div>
-        <p class="text-sm text-muted-foreground">
-          {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)} within
-          [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
-          SPRT is not acted on until {stats.games.min_units.toLocaleString()}
-          {stats.games.unit}s are complete.
-        </p>
+        {#if stats.games.decided}
+          <p class="text-sm text-muted-foreground">
+            Completed: {sprtLabel(stats.games.decided.status)}, LLR
+            {stats.games.decided.llr.toFixed(3)} after {stats.games.decided.units.toLocaleString()}
+            {stats.games.unit}{stats.games.decided.units === 1 ? '' : 's'}. With the {stats.games.unit}s that were in flight then, LLR
+            {stats.games.sprt.llr.toFixed(3)}, bounds [{stats.games.sprt.lower_bound.toFixed(2)},
+            {stats.games.sprt.upper_bound.toFixed(2)}].
+          </p>
+        {:else}
+          <p class="text-sm text-muted-foreground">
+            {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}, bounds
+            [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
+            {#if stats.games.min_units > 0 && stats.games.units_completed < stats.games.min_units}
+              SPRT is not acted on until {stats.games.min_units.toLocaleString()}
+              {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
+            {:else if stats.games.min_units > 0}
+              The minimum of {stats.games.min_units.toLocaleString()}
+              {stats.games.unit}{stats.games.min_units === 1 ? '' : 's'} is reached; SPRT is checked as
+              {stats.games.unit}s arrive.
+            {:else}
+              SPRT is checked as {stats.games.unit}s arrive, with no minimum number of them.
+            {/if}
+          </p>
+        {/if}
         <OutcomeChart
           wins={stats.games.wins}
           losses={stats.games.losses}
@@ -136,6 +185,7 @@
               ties — they stay in the sample, where they are what makes a paired run
               lower-variance than an unpaired one.
             </p>
+            <div class="overflow-x-auto">
             <table class="table text-xs">
               <thead>
                 <tr>
@@ -154,6 +204,7 @@
                 {/each}
               </tbody>
             </table>
+            </div>
             {#if stats.games.divergent_pairs !== undefined}
               <p class="text-xs text-muted-foreground">
                 {stats.games.divergent_pairs.toLocaleString()} of {stats.games.units_completed.toLocaleString()}
@@ -199,6 +250,7 @@
           </div>
           {#if rackError}<p class="field-error">{rackError}</p>{/if}
           {#if rackMoves?.length}
+            <div class="overflow-x-auto">
             <table class="table">
               <thead>
                 <tr><th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th></tr>
@@ -214,6 +266,7 @@
                 {/each}
               </tbody>
             </table>
+            </div>
           {/if}
         </div>
       </div>
@@ -229,8 +282,8 @@
         <p class="text-sm">
           <span class="tabular-nums">{lg.tasks_completed.toLocaleString()}</span> tasks and
           <span class="tabular-nums">{lg.games_played.toLocaleString()}</span> games played this
-          generation
-          <span class="text-muted-foreground">— live, on every accepted result.</span>
+          generation{#if stats.job.status === 'active'}
+            <span class="text-muted-foreground">— live.</span>{:else}.{/if}
         </p>
         <ProgressBar
           value={lg.racks_at_target}
