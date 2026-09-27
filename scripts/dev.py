@@ -25,6 +25,7 @@ before anything else), so N workers cost nothing but their own settings files.
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -189,6 +190,19 @@ def wait_for_health(url: str, timeout: int) -> None:
 
 
 UUID_LINE = re.compile(r"^uuid\s+(\S+)\s*$", re.MULTILINE)
+KEY_LINE = re.compile(r"^apikey\s+(\S+)\s*$", re.MULTILINE)
+
+# The contributor accounts --reset-db makes are run by these workers, under
+# their API keys; the others run anonymously.
+KEYED_WORKERS = (3, 4)
+
+
+def worker_key(settings: Path) -> Optional[str]:
+    """The API key a worker runs under, kept in its settings between runs."""
+    if not settings.is_file():
+        return None
+    match = KEY_LINE.search(settings.read_text())
+    return match.group(1) if match else None
 
 
 def issued_uuid(settings: Path) -> Optional[str]:
@@ -217,7 +231,8 @@ def uuids_the_database_knows(uuids: List[str]) -> Optional[set]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
-def write_contribute_settings(directory: Path, args, api_url: str, uuid: Optional[str]) -> Path:
+def write_contribute_settings(directory: Path, args, api_url: str, uuid: Optional[str],
+                              api_key: Optional[str] = None) -> Path:
     """One `contribute.txt` per worker, written from this run's flags.
 
     Settings live in a file rather than on the command line so an API key stays
@@ -230,16 +245,17 @@ def write_contribute_settings(directory: Path, args, api_url: str, uuid: Optiona
     """
     settings = directory / "contribute.txt"
     lines = [
-        "# Written by scripts/dev.py on every run; only the uuid MAGPIE appends",
-        "# is kept. Delete this file (or pass --reset-workers) to make this worker",
-        "# forget the identity the server assigned it.",
+        "# Written by scripts/dev.py on every run; only the uuid MAGPIE appends and",
+        "# the apikey --reset-db gives workers 3 and 4 are kept. Delete this file",
+        "# (or pass --reset-workers) to make this worker forget both.",
         f"server   {api_url}",
         f"threads  {args.threads}",
         f"maxtasks {args.max_tasks}",
         f"idlewait {args.idle_wait}",
     ]
-    if args.api_key:
-        lines.append(f"apikey   {args.api_key}")
+    key = args.api_key or api_key
+    if key:
+        lines.append(f"apikey   {key}")
     if uuid:
         lines.append(f"uuid {uuid}")
     # It may hold an API key: readable by its owner only, from the start --
@@ -253,8 +269,6 @@ def write_contribute_settings(directory: Path, args, api_url: str, uuid: Optiona
 
 def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[subprocess.Popen]:
     workdir = Path(args.workdir).expanduser().resolve()
-    if args.reset_workers and workdir.exists():
-        shutil.rmtree(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
     # Each worker's issued identity, kept only while the database still knows
@@ -280,7 +294,8 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[sub
             link.unlink()
         link.symlink_to(data)
 
-        settings = write_contribute_settings(directory, args, api_url, uuid)
+        key = worker_key(directory / "contribute.txt")
+        settings = write_contribute_settings(directory, args, api_url, uuid, key)
         log_path = directory / "contribute.log"
         handle = log_path.open("a", buffering=1)
         handle.write(f"\n--- started {time.strftime('%Y-%m-%d %H:%M:%S')} ---\n")
@@ -293,7 +308,8 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> List[sub
                 stderr=subprocess.STDOUT,
             )
         )
-        log(f"worker {index}: {directory} (log: {log_path})")
+        kind = "under an API key" if (args.api_key or key) else "anonymous"
+        log(f"worker {index} ({kind}): {directory} (log: {log_path})")
 
     return processes
 
@@ -333,8 +349,29 @@ def run_seed(args, api_url: str, magpie_root: Path, floor: str) -> None:
                         ("--lexicon", args.lexicon), ("--variant", args.variant)):
         if value:
             command += [flag, str(value)]
+    # A fresh database gets the whole set: a job of every type at equal
+    # shares, and contributor accounts whose keys the keyed workers run under.
+    keys_file = Path(args.workdir).expanduser().resolve() / ".contributor-keys.json"
+    if args.reset_db:
+        command += ["--all-job-types", "--allocation", str(100 // 4),
+                    "--contributors", str(len(KEYED_WORKERS)), "--keys-out", str(keys_file)]
     if subprocess.run(command, cwd=REPO_ROOT).returncode != 0:
         fail("seeding failed; the stack is still up, so fix and re-run with --no-up")
+    if args.reset_db:
+        give_workers_keys(args, api_url, keys_file)
+
+
+def give_workers_keys(args, api_url: str, keys_file: Path) -> None:
+    """Each keyed worker's settings get a contributor's new key; the file the
+    seed wrote them to is removed once they are in place."""
+    keys = json.loads(keys_file.read_text())
+    keys_file.unlink()
+    workdir = keys_file.parent
+    for index, entry in zip(KEYED_WORKERS, keys):
+        directory = workdir / f"worker-{index:02d}"
+        directory.mkdir(parents=True, exist_ok=True)
+        write_contribute_settings(directory, args, api_url, None, entry["key"])
+        log(f"worker {index} runs as {entry['username']}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -343,8 +380,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     contributors = parser.add_argument_group("contributors (always real MAGPIE)")
-    contributors.add_argument("-w", "--workers", type=int, default=2,
-                              help="MAGPIE contributor processes to run (default: %(default)s)")
+    contributors.add_argument("-w", "--workers", type=int, default=4,
+                              help="MAGPIE contributor processes to run (default: %(default)s). "
+                                   "Workers 1 and 2 are anonymous; 3 and 4 run as the contributor "
+                                   "accounts --reset-db makes, under their API keys (anonymous "
+                                   "until a reset has made them)")
     contributors.add_argument("--threads", type=int, default=4,
                               help="threads per contributor (default: %(default)s)")
     contributors.add_argument("--max-tasks", type=int, default=0,
@@ -368,7 +408,8 @@ def build_parser() -> argparse.ArgumentParser:
                               help="where per-worker directories live (default: %(default)s)")
     contributors.add_argument("--reset-workers", action="store_true",
                               help="delete worker directories first, so each starts as a "
-                                   "brand-new anonymous contributor")
+                                   "brand-new anonymous contributor (the keyed workers lose their "
+                                   "keys until the next --reset-db)")
 
     stack = parser.add_argument_group("the stack")
     stack.add_argument("--web-port", type=int, default=int(os.environ.get("WEB_PORT", 5173)))
@@ -382,7 +423,9 @@ def build_parser() -> argparse.ArgumentParser:
     stack.add_argument("--reset-db", action="store_true",
                        help="drop the database's schema first, and let the backend rebuild it: "
                             "needed after a schema change, since the one migration is edited "
-                            "in place until release (its data goes; the MinIO bucket is kept)")
+                            "in place until release (its data goes; the MinIO bucket is kept). "
+                            "The fresh database is seeded with a job of every type at 25%% each, "
+                            "and two contributor accounts whose keys workers 3 and 4 run under")
     stack.add_argument("--down", action="store_true",
                        help="stop the stack on exit instead of leaving it up")
     stack.add_argument("--health-timeout", type=int, default=180,
@@ -448,6 +491,10 @@ def main() -> int:
 
     if args.reset_db:
         reset_database()
+    # Before seeding, which may give workers keys to keep.
+    workdir = Path(args.workdir).expanduser().resolve()
+    if args.reset_workers and workdir.exists():
+        shutil.rmtree(workdir)
     if not args.no_up:
         # --remove-orphans: containers of services the compose file no longer
         # has (a `worker` service, once) are removed rather than warned about.

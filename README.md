@@ -100,9 +100,15 @@ drops the schema so the backend rebuilds it; the database's data goes, the
 MinIO bucket stays, and `scripts/dev-dump.sh` snapshots both first if you want
 them. Add `--rebuild` when the images predate the change.
 
+The fresh database is seeded with a full set: the `dev` admin; a job of every
+type (games, game pairs, opening racks, and a small leave generation) at 25%
+allocation each; and two contributor accounts, `dev-contributor-1` and `-2`,
+each with a new API key that workers 3 and 4 run under and keep in their
+`contribute.txt` for later runs. Workers 1 and 2 contribute anonymously.
+
 | Flag | Default | What it changes |
 |---|---|---|
-| `-w`, `--workers` | 2 | How many `magpie contribute` processes run |
+| `-w`, `--workers` | 4 | How many `magpie contribute` processes run. Workers 1 and 2 are anonymous; 3 and 4 run as `dev-contributor-1` and `-2` under the API keys `--reset-db` makes (anonymous until a reset has made them) |
 | `--threads` | 4 | Threads inside each contributor |
 | `--max-tasks` | 0 | Tasks each contributor runs before exiting; 0 runs until stopped |
 | `--idle-wait` | 5 | Seconds a contributor waits when there is no work |
@@ -113,9 +119,9 @@ them. Add `--rebuild` when the images predate the change.
 | `--min-magpie-version` | your build's version | The version floor, on the server and on the job |
 | `--web-port`, `--backend-port` | 5173, 8080 | Host ports |
 | `--workdir` | `.dev-workers` | Where per-worker directories live |
-| `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker |
+| `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker (the keyed workers lose their keys until the next `--reset-db`) |
 | `--rebuild` | off | Rebuild images before starting |
-| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change) |
+| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with a job of every type at 25% each and the two contributor accounts |
 | `--down` | off | Stop the stack on exit instead of leaving it up |
 | `--no-seed` | off | Skip seeding (the stack already has an active job) |
 | `--no-up` | off | Assume the stack is already running |

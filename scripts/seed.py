@@ -25,7 +25,7 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import requests
 
@@ -123,6 +123,26 @@ def log_confirmation_code(backend_service: str, email: str) -> str:
     return codes[-1]
 
 
+def log_codes(backend_service: str) -> List[str]:
+    """Every confirmation code in the backend's log, oldest first."""
+    result = subprocess.run(["docker", "compose", "logs", "--no-color", backend_service],
+                            cwd=REPO_ROOT, capture_output=True, text=True)
+    return re.findall(r"confirm-email\?code=([0-9a-f]+)", result.stdout)
+
+
+def new_log_code(backend_service: str, seen: set, timeout: float = 15.0) -> str:
+    """A code that was not in the log before: the mail is sent off the
+    registration's request, so the latest code can still be the last
+    account's when the registration answers."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        fresh = [code for code in log_codes(backend_service) if code not in seen]
+        if fresh:
+            return fresh[-1]
+        time.sleep(0.2)
+    raise SeedError(f"no new confirmation code in the {backend_service} log within {timeout:.0f}s")
+
+
 def promote_to_admin(compose_service: str, username: str) -> None:
     # A username may hold a quote; doubled, it is a literal. Matched as sign-in
     # matches it, whatever its case.
@@ -213,6 +233,47 @@ def sign_in(client: Client, args) -> None:
         response = login()
     client.json(response, "login")
     log(f"signed in as {args.username} (admin)")
+
+
+def make_contributors(args) -> None:
+    """Contributor accounts, not admins, each with a new API key, written to
+    --keys-out for dev.py to hand its keyed workers. A key is shown only when
+    it is made, so every call makes new ones; an account that exists already
+    is signed in, not registered again."""
+    if not args.keys_out:
+        raise SeedError("--contributors needs --keys-out, where the keys go")
+    keys = []
+    for index in range(1, args.contributors + 1):
+        username = f"dev-contributor-{index}"
+        email = f"{username}@example.invalid"
+        client = Client(args.api)
+        seen = set() if args.mail_outbox else set(log_codes(args.backend_service))
+        registered = client.session.post(
+            f"{client.api}/api/auth/register",
+            json={"username": username, "email": email, "password": args.password},
+            timeout=30,
+        )
+        if registered.status_code < 400:
+            log(f"registered {username}")
+            code = (outbox_confirmation_code(args.mail_outbox, email) if args.mail_outbox
+                    else new_log_code(args.backend_service, seen))
+            client.json(client.session.post(f"{client.api}/api/auth/confirm-email",
+                                            json={"code": code}, timeout=30),
+                        f"confirm {username}'s address")
+        login = client.session.post(
+            f"{client.api}/api/auth/login",
+            json={"username": username, "password": args.password}, timeout=30,
+        )
+        client.json(login, f"sign in as {username}")
+        created = client.json(client.post("/api/me/api-keys", {"label": "dev.py worker"}),
+                              f"make an API key for {username}")
+        keys.append({"username": username, "key": created["key"]})
+        log(f"made an API key for {username}")
+    args.keys_out.parent.mkdir(parents=True, exist_ok=True)
+    args.keys_out.unlink(missing_ok=True)
+    fd = os.open(args.keys_out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(keys, f)
 
 
 # --- input data -------------------------------------------------------------
@@ -325,11 +386,11 @@ def job_config(job_type: str, players: list, args) -> dict:
                 "pairs_per_batch": args.batch, "min_pairs": args.min_units,
                 "max_pairs": args.max_units}
     if job_type == "leave_generation":
-        raise SeedError(
-            "leave_generation enumerates every full rack at creation time — "
-            "3,199,724 rows per generation for real English — which is not something to do by default. "
-            "Create one from /admin/jobs/new when you actually want it."
-        )
+        # Small, as tier 6 runs it: one generation, a few iterations. A task
+        # still takes MAGPIE a couple of minutes; the rack universe is built by
+        # the first claim, not at creation.
+        return {"kwg_id": args.leave_kwg, "num_iterations": 20, "generation_count": 1,
+                "target_rack_count": 1, "racks_per_task": 50}
     raise SeedError(f"unknown job type {job_type!r}")
 
 
@@ -347,21 +408,24 @@ def existing_active_job(client: Client, job_type: str) -> Optional[str]:
     return None
 
 
-def create_job(client: Client, args, data: dict, players: list) -> str:
+def create_job(client: Client, args, data: dict, players: list,
+               job_type: Optional[str] = None, name: Optional[str] = None) -> str:
+    job_type = job_type or args.job_type
+    name = args.job_name if name is None else name
     if not args.new_job:
-        already = existing_active_job(client, args.job_type)
+        already = existing_active_job(client, job_type)
         if already:
-            log(f"an active {args.job_type} job already exists ({already}); reusing it")
+            log(f"an active {job_type} job already exists ({already}); reusing it")
             return already
 
     body = {
-        "name": args.job_name,
-        "job_type": args.job_type,
+        "name": name,
+        "job_type": job_type,
         "variant": args.variant,
         "letterdist_id": data["letterdist"],
         "layout_id": data["layout"],
         "redundancy": args.redundancy,
-        **job_config(args.job_type, players, args),
+        **job_config(job_type, players, args),
     }
     # A job records its own floor at creation, defaulting to the server-wide
     # one. Left implicit, a job created while the server had a higher floor
@@ -373,7 +437,7 @@ def create_job(client: Client, args, data: dict, players: list) -> str:
     # Creation answers with the job plus whatever state it had to build first
     # (leave generation seeds its rack universe here), not a bare id.
     job_id = created["job"]["id"]
-    log(f"created {args.job_type} job {job_id}")
+    log(f"created {job_type} job {job_id}")
 
     client.json(
         client.post(f"/api/admin/jobs/{job_id}/activate", {"allocation": args.allocation}),
@@ -460,6 +524,15 @@ def build_parser() -> argparse.ArgumentParser:
                         help="what to call the seeded job (shown first in the jobs list); "
                              "unnamed by default, so it is titled by its type")
     parser.add_argument("--allocation", type=int, default=100)
+    parser.add_argument("--all-job-types", action="store_true",
+                        help="create one job of every type (games, game pairs, opening racks, "
+                             "leave generation), each at --allocation, instead of --job-type")
+    parser.add_argument("--contributors", type=int, default=0,
+                        help="contributor accounts to make (dev-contributor-1, ...), each with a "
+                             "new API key written to --keys-out")
+    parser.add_argument("--keys-out", type=Path, default=None,
+                        help="where to write the contributors' API keys, as JSON (readable by "
+                             "its owner only)")
     return parser
 
 
@@ -476,16 +549,29 @@ def seed(args) -> None:
     sign_in(client, args)
     import_input_data(client, args)
     data = input_data_ids(client, args)
+    args.leave_kwg = data["kwg"]
 
-    if args.job_type == "opening_rack":
-        players = [player_config(client, "static-equity-all", "equity", data, recorder="all")]
-    else:
-        players = [
+    def players_for(job_type: str) -> list:
+        if job_type == "opening_rack":
+            return [player_config(client, "static-equity-all", "equity", data, recorder="all")]
+        if job_type == "leave_generation":
+            return []
+        return [
             player_config(client, "static-equity", "equity", data),
             player_config(client, "static-score", "score", data),
         ]
-    create_job(client, args, data, players)
-    log("seeded — the job is active and workers can claim")
+
+    if args.all_job_types:
+        for job_type in ("games", "game_pairs", "opening_rack", "leave_generation"):
+            create_job(client, args, data, players_for(job_type), job_type,
+                       f"dev {job_type.replace('_', ' ')}")
+        log(f"seeded — a job of every type, each at {args.allocation}%")
+    else:
+        create_job(client, args, data, players_for(args.job_type))
+        log("seeded — the job is active and workers can claim")
+
+    if args.contributors:
+        make_contributors(args)
 
 
 def main() -> int:
