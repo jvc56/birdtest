@@ -831,8 +831,8 @@ async fn an_opening_rack_result_must_answer_the_racks_it_was_given() {
 /// The next seed is `MAX(seed)`, which a concurrent claim's uncommitted task is
 /// invisible to, so overlapping claims all compute the same one. The
 /// `(job_id, seed)` unique index catches that, but only by failing the loser,
-/// and `scheduler::claim` gives up after three attempts -- so past three-way
-/// contention a worker was told there was nothing to do. Claims for one job
+/// and `scheduler::claim` gave up after three attempts (eight rounds now) -- so
+/// past three-way contention a worker was told there was nothing to do. Claims for one job
 /// already serialize on the `jobs` row (`claims_issued`), so taking the job's
 /// dispatch lock before reading the cursor costs nothing that was not already
 /// being paid and turns the lost race into a short wait.
@@ -2356,20 +2356,27 @@ async fn a_capturing_jobs_result_is_complete_and_no_result_holds_what_cannot_be_
     low_score["previous_move_score"] = json!(i32::MIN);
     let mut long_tile = captured(1, 0);
     long_tile["rack"] = json!(format!("[{}]", "Q".repeat(500_000)));
+    let mut long_position = captured(1, 0);
+    long_position["position"] = json!("1".repeat(5_000));
+    let mut long_play = captured(1, 0);
+    long_play["moves"][0]["move"] = json!("8D ".to_string() + &"Q".repeat(300));
     let cases = [
-        ("no positions", games_result(2, 1)),
-        ("none from game 1", with(vec![captured(0, 0)])),
-        ("a NUL in a move", with(vec![captured(0, 0), nul])),
-        ("a 100 KB previous play", with(vec![captured(0, 0), captured(1, 0), long_previous])),
-        ("a previous play scoring i32::MIN", with(vec![captured(0, 0), captured(1, 0), low_score])),
-        ("a 500 KB tile", with(vec![captured(0, 0), long_tile])),
+        ("no positions", games_result(2, 1), "has none from game 0"),
+        ("none from game 1", with(vec![captured(0, 0)]), "has none from game 1"),
+        ("a NUL in a move", with(vec![captured(0, 0), nul]), "NUL"),
+        ("a 100 KB previous play", with(vec![captured(0, 0), captured(1, 0), long_previous]), "is not a play"),
+        ("a previous play scoring i32::MIN", with(vec![captured(0, 0), captured(1, 0), low_score]), "which no play can score"),
+        ("a 500 KB tile", with(vec![captured(0, 0), long_tile]), "bracketed tile"),
+        ("a 5,000-character position", with(vec![captured(0, 0), long_position]), "is not a position"),
+        ("a 300-character play", with(vec![captured(0, 0), long_play]), "is not a play"),
     ];
     // A claim each: a worker's requests are rate limited (A-WORKER-14).
-    for (what, result) in cases {
+    for (what, result, says) in cases {
         let (assignment, uuid) = first_claim(&app).await;
         let token = assignment["claim_token"].as_str().unwrap();
         let (status, body) = submit_as(&app, &uuid, token, result).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+        assert!(body["message"].as_str().is_some_and(|m| m.contains(says)), "{what}: expected {says:?} in {body}");
     }
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_analysis_records WHERE job_id = $1")
         .bind(job)

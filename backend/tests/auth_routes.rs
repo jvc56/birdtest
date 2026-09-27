@@ -1088,3 +1088,34 @@ async fn a_name_differing_only_in_joiners_is_taken() {
     assert_eq!(selected.status, StatusCode::CONFLICT, "{selected:?}");
 }
 
+
+/// A-AUTH-12: a confirmed address and a reset password are on record. A reset
+/// ends every session as "sign out everywhere" does, and was the one of the
+/// two that left no row (the audit's pass 22).
+#[tokio::test]
+async fn a_confirmation_and_a_reset_are_on_record() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 0).await;
+    let app = birdtest::app(state);
+    let code = registered_code(&app, &outbox, "recorded").await;
+    assert_eq!(post(&app, "/api/auth/confirm-email", &[], json!({ "code": code })).await.status, StatusCode::OK);
+    let email = "recorded@example.invalid";
+    assert_eq!(reset_request(&app, email, "").await.status, StatusCode::OK);
+    let token = link_param(&outbox.wait_for(email, 2).await[1], "token");
+    assert_eq!(reset_confirm(&app, &token, NEW_PASSWORD).await.status, StatusCode::OK);
+
+    let user: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE username = 'recorded'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    let actions: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_log WHERE actor_user_id = $1 AND target_id = $2 ORDER BY id",
+    )
+    .bind(user)
+    .bind(user.to_string())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert!(actions.contains(&"user.email_confirmed".to_string()), "{actions:?}");
+    assert!(actions.contains(&"user.password_reset".to_string()), "{actions:?}");
+}

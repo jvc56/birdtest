@@ -195,6 +195,16 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   The adversarial check found 2 medium (a busy large job handing a small one
   its claims, `I-SCHED-3t`; the batch cap breaking the fixture capture), fixed.
   KL-20 closed; KL-89 updated. The loop continues.
+- **Pass 22 (follow-up: pass 21's diff, and the audit log and retention):** 0
+  high and 3 medium from the reviewers — credential changes (keys, a reset, a
+  confirmation) left no audit row; a full restore silently undid security
+  actions, with no RUNBOOK step to re-apply them; repeated busy spells let a
+  job's settling forgive leads — all fixed (`A-ACCOUNT-8`, `A-AUTH-12`, a new
+  RUNBOOK §1 step replayed, `I-SCHED-3u`). The adversarial check found 3
+  medium (that step copied the damage back; an unsettled busy newcomer took a
+  split fleet over; the key toggle grew the log at request rate), fixed — the
+  step redesigned around reviewed audit rows (`I-SCHED-3v`). KL-89 updated;
+  KL-90 added. The loop continues.
 
 ---
 
@@ -3246,7 +3256,7 @@ through the endpoint), `3p` (the data split, declined through
 `/api/worker/decline`), `3q` (the pause) — failing on the design before (317,
 0, 0) and passing (30; 81 in the adversary's form of 3p; 99). With each rule
 switched off in turn, its own tests fail: the settling 3j, 3k and 3l; the rejoin 3g and 3l; the pass-over
-lift 3c and 3n; the turn check 3o and 3i; the undoing on a decline 3p; the
+lift 3c and 3n; the turn check 3o (and 3i, in about one run in four); the undoing on a decline 3p; the
 lowest-other pace 3q. A 12-job stress with 2 capped jobs: 0 errors, 0
 deadlocks, the same share of tasks as the committed code. **Lows:** a
 minority-only newcomer beside an older job gets half its claims in its first
@@ -3337,8 +3347,9 @@ within 5 s).
 ### 21.3 Medium — through the compose proxy a cut results stream still read as complete (backend reviewer)
 
 Pass 20 cut a failing stream off without its closing chunk. The Nginx in front
-of the app (`frontend/docker/default.conf.template`, compose and the ECS
-task) had `chunked_transfer_encoding off`, so it answered without a length and
+of the app (`frontend/docker/default.conf.template`, in compose and local
+stacks; deployed, the load balancer sends `/api/` past it) had
+`chunked_transfer_encoding off`, so it answered without a length and
 closed the connection — a cut stream closed exactly like a finished one.
 **Shown:** through Nginx, curl exited 0 after 15,641 of 150,000 lines, the last
 line whole JSON (direct to the backend, exit 18); with the real template in
@@ -3433,4 +3444,159 @@ section sits with tier 1F; `check_moves` has its doc comment back.
   **tier 6, natively, every case**; the contract-fixture capture
   (`--cases capture`) completes, the heartbeat fixture included.
 - `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks.
+- MAGPIE unchanged this pass.
+
+## Pass 22 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`3839333..1555879`), one
+reviewer per part: the backend (the scheduler's busy handling and last round,
+the result checks); the frontend, proxy and scripts (tier 5 natively, the
+fixture capture); the docs. MAGPIE is unchanged. Plus one area not examined in
+this run: **the audit log and data retention** — what is recorded, whether it
+can be lost, what grows, what personal data it holds, and what the retention
+loops do.
+
+**Findings: 0 high, 3 medium** from the four reviewers (backend 1 medium, 3
+low, 2 unconfirmed; frontend, proxy and scripts none, 5 low, 1 unconfirmed;
+docs none, 17 low, 1 unconfirmed; audit log 2 medium, 7 low, 1 unconfirmed).
+All fixed.
+
+### 22.1 Medium — credential changes left no audit row, and a revoked key no trace (audit-log reviewer)
+
+PLAN promises every significant account action in the log. Issuing,
+suspending or revoking an API key, a password reset and an address
+confirmation wrote nothing, and revoking deletes the key's row — so after a
+takeover (KL-33's case: keys minted, then the owner resets and revokes)
+nothing said which keys had existed or when the password changed. **Shown:**
+a failed sign-in, a key issued, suspended and revoked, a reset: no audit rows
+for the account, and no key row. **Fix:** `api_key.created`,
+`api_key.deactivated`, `api_key.reactivated` and `api_key.revoked` (the label
+in `reason`), `user.password_reset` and `user.email_confirmed`, each in the
+change's transaction (`audit::log_account`); PLAN's table lists them, and says
+sign-in attempts stay unlogged by design — their number is the caller's.
+**Verified:** `A-ACCOUNT-8` and `A-AUTH-12` (the committed code wrote none, the
+reviewer's run).
+
+### 22.2 Medium — a full restore silently undid security actions, and RUNBOOK §1 did not re-apply them (audit-log reviewer)
+
+A point-in-time restore brings back every credential as it was: a revoked or
+suspended key authenticates again, a reset password is the old one, sessions
+ended by a reset or "sign out everywhere" are valid again, bans added or
+lifted are undone, a deleted account returns. The damaged instance is the only
+record, and §1 retired it without a step to carry them over. **Shown** (the
+restore simulated by putting the snapshot rows back): a stolen session, a
+revoked key and the old password went from `401` to `200`/`204`/`200`.
+**Fix:** a §1 block, before repointing, run from the ops shell: every session
+generation bumped, key state and bans copied from the damaged instance
+(identities the restored copy lacks skipped), the password of every account
+reset since the restore point copied, and the accounts deleted since listed
+for deletion again. It runs in a subshell, so a refusal stops it without
+ending the ops shell. PLAN's deletion text says the nightly dumps keep a
+deleted account for `backup_retention_days`, and that a restore brings it
+back. **Replayed:** against a "restored" and a "damaged" database from the
+template — keys, the reset, the bans and the deletion list all match the
+damaged instance, a newer identity's ban is skipped; pasted twice, the same
+state; with `RESTORE_TIME` or `DAMAGED_HOST` unset it refuses before touching
+anything, and an interactive shell survives the refusal.
+
+### 22.3 Medium — repeated busy spells on a settling job handed the job beside it that job's claims (backend reviewer)
+
+Pass 21 kept a busy job as a rival with a ratio unit of slack, which bounds one
+spell. But the busy job's next claim, inside its settling hour, settled it
+level with the job that had run ahead — forgiving the lead — and each further
+spell added another unit. **Shown:** a 10% job beside a settling 90% one took
+400 of 2,400 claims over twenty spells of ten (fair 240; 240 with settling
+off); 1% / 99%, 62 of 3,260 where 33 is fair. **Fix** (its second form,
+22.5): a job found busy is settled a ratio unit short for ten minutes
+(`BUSY_MEMORY`, an in-process map pruned on each entry) — a spell lets the
+jobs beside it run a unit ahead at most, and that lead is now paid back.
+**Verified:** `I-SCHED-3u` fails with the check switched off (116 of 1,109
+where 110 is fair) and passes; 3s and 3t still pass.
+
+### 22.4 Low findings
+
+**Fixed:**
+- Audit: a rating-pool removal of a config not in the pool is a `404`, not a
+  logged removal and a refit (test added); a ban's reason is at most 1,000
+  characters and holds no NUL (a `500` before; test added); a job the server
+  completes — its stopping rule, SPRT, its last generation — writes
+  `job.completed` with no actor (only the admin path did, and `jobs` keeps no
+  completion time; asserted in `I-STATS-9`); KL-32's costs are the measured
+  ones (a filtered page ~90 ms and the count ~70 ms at a million rows); PLAN
+  says `backups.row_counts` is the one JSONB column, and that a row's
+  `created_at` is its transaction's start.
+- Scheduler and validation: the `Busy`, rivals and three-attempts comments;
+  PLAN's claim steps (a 1% job beside a busy one takes one or two; when an
+  `Idle` can still come with work about; the `Busy` bullet); the too-long-tile
+  message; 32,768, not 32,767; PLAN's creation rules and KL-2 bound the games
+  and pairs batches, and KL-2 says the capturing cap ignores how many plays a
+  position records (a result passes 64 MiB at under 900 games recording 50);
+  `decode_result`'s list names the every-game rule; `fixture_tests` says what
+  it skips; the job form's batch field has a `max`; A-WORKER-21 checks the
+  CGP and in-move play caps, and which rule refused each case.
+- Proxy and scripts: `F-NGINX-1` refuses `chunked_transfer_encoding` off in any
+  case or quoting, and checks HTTP/1.1 and no buffering inside `/api/`; PLAN
+  says a cut is a failed transfer over HTTP/1.1 or later; 21.3 says the Nginx
+  is compose's and local stacks' (deployed, the load balancer sends `/api/`
+  past it); the capture job runs for hours, not minutes.
+- Docs: KL-89's gap count; 3i fails with the turn check off about one run in
+  four, not always; 3r's figure is 67 to 166; a stray blank line.
+
+**Recorded (KL-90):** the release of an expired unconfirmed account, an
+admin's recompute and leave-merge, and the bulk stream write no audit row;
+a ban's `target_type` does not say which kind of identity it names. **In
+KL-89:** a job whose lock stays held idles the workers behind it once they are
+a unit ahead (a synthetic 40 s holder, 187 idle claims; no ordinary holder).
+
+### 22.5 Adversarial check of the pass's fixes
+
+**3 medium, fixed.**
+
+- **RUNBOOK §1's block copied the damage back.** It copied the damaged
+  instance's `api_keys` and `worker_bans` whole, and those hold the damage
+  too: a bad migration's changes to keys or bans, or an admin account acting
+  for an attacker, were redone on the restored instance. **Shown:** with a
+  migration that suspended every key and dropped every ban, every key came
+  back suspended and every ban gone. **Fix:** redesigned — the block is driven
+  by the damaged instance's audit rows since the restore point (a migration
+  writes none), exported and printed for review first (a damaging line is
+  deleted before the apply), and applied from them: revoked keys removed, a
+  key's last suspend or resume, reset passwords, confirmations, each
+  identity's last ban or unban, and accounts deleted since shut (no password,
+  no keys, not an admin) and listed by name. Every unused reset token is spent.
+  Reasons travel base64, so a `\.` line cannot end a file early (it did). Both
+  blocks refuse unless `DATABASE_URL` holds nothing newer than the restore
+  point, which catches DNS still answering with the damaged instance. Key
+  labels are no longer logged: user text, and the log outlives a deletion.
+  **Replayed:** legitimate changes with a migration's damage on top (only the
+  legitimate ones applied), a pruned deletion (not applied), the `\.` reason,
+  `DATABASE_URL` at the damaged instance (both blocks refuse), no export
+  (refused), and both pasted twice (the same state).
+- **Unsettled, a newcomer found busy once took over a split fleet.** 22.3's
+  first form did not settle a recently busy job at all; a newcomer is the job
+  that needs settling, and one found busy once in the split of `I-SCHED-3j`
+  took the majority's claims (their job's first came 331st). **Fix:** settled
+  a ratio unit short instead (22.3). **Verified:** `I-SCHED-3v`, from the
+  adversary, fails on the first form and passes; `3u` still passes.
+- **One account could grow the audit log at request rate.** The key
+  suspend/resume route has no rate limit and logged every call, changes or
+  not: 8,000 rows in nine seconds. **Fix:** only a change is written and
+  logged; a request that changes nothing is answered `204` with no row.
+  **Verified:** in `A-ACCOUNT-8`.
+
+**Held:** no new foreign key or lock order for the audit writes; every server
+completion path logs; the busy map is bounded and safe across tests; the nginx
+test and the form's `max` are right.
+
+### 22.6 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **626 of 626** (`A-ACCOUNT-8`, `A-AUTH-12`, `I-SCHED-3u`, `3v`, a ratings
+  test; the ban bound, the server completion and more A-WORKER-21 cases
+  asserted in existing tests).
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 122 of 122.
+- **Tier 5, natively: 14 of 14**; **tier 6, natively, every case**.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 27 and 19 blocks; RUNBOOK
+  §1's new step replayed as in 22.5.
 - MAGPIE unchanged this pass.

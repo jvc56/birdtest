@@ -551,11 +551,18 @@ async fn remove_member(
     }
 
     let mut tx = state.pool.begin().await?;
-    sqlx::query("DELETE FROM rating_pool_members WHERE pool_id = $1 AND player_config_id = $2")
+    // A config that is not a member -- a second click -- removes nothing, and
+    // is answered so rather than logged and refitted as a removal (the audit's
+    // pass 22).
+    let removed = sqlx::query("DELETE FROM rating_pool_members WHERE pool_id = $1 AND player_config_id = $2")
         .bind(pool_id)
         .bind(config_id)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+    if removed == 0 {
+        return Err(AppError::not_found("that player config is not in this pool"));
+    }
     audit::log(
         &mut tx,
         "rating_pool.member_removed",

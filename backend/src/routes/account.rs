@@ -137,6 +137,7 @@ async fn create_key(
     .bind(&body.label)
     .fetch_one(&mut *tx)
     .await?;
+    crate::audit::log_account(&mut tx, "api_key.created", user.id, "api_key", id.to_string()).await?;
     tx.commit().await?;
 
     Ok((StatusCode::CREATED, Json(CreatedKey { id, label: body.label, key: raw })))
@@ -158,16 +159,39 @@ async fn set_key_active(
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
 
-    let updated = sqlx::query("UPDATE api_keys SET is_active = $1 WHERE id = $2 AND user_id = $3")
-        .bind(body.is_active)
-        .bind(id)
-        .bind(user.id)
-        .execute(&state.pool)
-        .await?;
-
-    if updated.rows_affected() == 0 {
-        return Err(AppError::not_found("no such API key"));
+    // Only a change is written and logged. This route has no rate limit of
+    // its own, and a row for every call let one account grow the audit log at
+    // request rate -- 8,000 rows in nine seconds (the audit's pass 22).
+    let mut tx = state.pool.begin().await?;
+    let changed = sqlx::query_scalar::<_, Uuid>(
+        "UPDATE api_keys SET is_active = $1 WHERE id = $2 AND user_id = $3 AND is_active <> $1
+         RETURNING id",
+    )
+    .bind(body.is_active)
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    match changed {
+        Some(_) => {
+            let action = if body.is_active { "api_key.reactivated" } else { "api_key.deactivated" };
+            crate::audit::log_account(&mut tx, action, user.id, "api_key", id.to_string()).await?;
+        }
+        None => {
+            // Already as asked, or not this account's key.
+            let exists: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM api_keys WHERE id = $1 AND user_id = $2)",
+            )
+            .bind(id)
+            .bind(user.id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !exists {
+                return Err(AppError::not_found("no such API key"));
+            }
+        }
     }
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -181,14 +205,16 @@ async fn revoke_key(
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
 
-    let deleted = sqlx::query("DELETE FROM api_keys WHERE id = $1 AND user_id = $2")
-        .bind(id)
-        .bind(user.id)
-        .execute(&state.pool)
-        .await?;
-
-    if deleted.rows_affected() == 0 {
-        return Err(AppError::not_found("no such API key"));
-    }
+    // The row goes; the audit row, in the same transaction, is the only record
+    // that the key existed and when it was revoked.
+    let mut tx = state.pool.begin().await?;
+    sqlx::query_scalar::<_, Uuid>("DELETE FROM api_keys WHERE id = $1 AND user_id = $2 RETURNING id")
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such API key"))?;
+    crate::audit::log_account(&mut tx, "api_key.revoked", user.id, "api_key", id.to_string()).await?;
+    tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }

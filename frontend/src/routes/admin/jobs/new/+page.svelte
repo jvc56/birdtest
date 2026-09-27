@@ -283,6 +283,7 @@
           id="batch"
           type="number"
           min={jobType === 'games' ? 2 : 1}
+          max={jobType === 'games' ? 10000 : 5000}
           step={jobType === 'games' ? 2 : 1}
           class="input"
           bind:value={batchSize}

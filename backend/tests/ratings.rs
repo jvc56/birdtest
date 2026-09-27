@@ -1146,6 +1146,33 @@ async fn adding_an_unknown_member_or_to_an_unknown_pool_says_which() {
     assert_eq!(run_count(&db, f.pool).await, runs);
 }
 
+/// A config that is not a member is not removed: a second click was logged
+/// as a removal and refitted the pool (the audit's pass 22).
+#[tokio::test]
+async fn removing_a_config_that_is_not_a_member_is_a_404() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let f = fixture(&db).await;
+    let stranger = Uuid::new_v4();
+    let (status, body) = send(
+        &app,
+        request(
+            "DELETE",
+            &format!("/api/admin/rating-pools/{}/members/{stranger}", f.pool),
+            &admin_headers(&state.cfg, f.admin),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    let logged: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action = 'rating_pool.member_removed'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(logged, 0);
+}
+
 /// A-RATE-5: removing the anchor is refused, with a message that says what to
 /// do instead, and changes nothing.
 #[tokio::test]

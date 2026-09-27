@@ -401,3 +401,39 @@ async fn a_scrubbed_dump_keeps_no_worker_credential() {
     .unwrap();
     assert_eq!(columns, ["uuid", "first_seen_at", "last_seen_at", "tasks_completed", "last_completed_at"]);
 }
+
+/// A-ACCOUNT-8: a key's whole life is on record. Issuing, suspending, resuming
+/// and revoking a key wrote no audit row, and a revoked key's row is deleted,
+/// so nothing said afterwards that it had existed -- the trail a takeover
+/// leaves, and what a restore undoes (the audit's pass 22). Each writes one,
+/// by the key's id -- not its label, the owner's free text, which would
+/// outlive the account's deletion.
+#[tokio::test]
+async fn a_keys_life_is_on_record() {
+    let db = TestDb::new().await;
+    let user = db.user("keyholder", false).await;
+    let headers = signed_in(&db, user);
+    let app = birdtest::app(db.state().await);
+    let key = create_key(&app, &headers, "laptop").await;
+    // A request that changes nothing is answered and not logged: the route has
+    // no rate limit, and a row a call let one account grow the log at will.
+    assert_eq!(set_active(&app, &headers, &key, true).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(set_active(&app, &headers, &key, false).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(set_active(&app, &headers, &key, false).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(set_active(&app, &headers, &key, true).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(revoke(&app, &headers, &key).await.0, StatusCode::NO_CONTENT);
+    let rows: Vec<(String, Option<Uuid>, String, Option<String>)> = sqlx::query_as(
+        "SELECT action, actor_user_id, target_type, reason FROM audit_log
+         WHERE target_id = $1 ORDER BY id",
+    )
+    .bind(key["id"].as_str().unwrap())
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    let expected: Vec<(String, Option<Uuid>, String, Option<String>)> =
+        ["api_key.created", "api_key.deactivated", "api_key.reactivated", "api_key.revoked"]
+            .iter()
+            .map(|a| (a.to_string(), Some(user), "api_key".to_string(), None))
+            .collect();
+    assert_eq!(rows, expected);
+}

@@ -1009,7 +1009,7 @@ def case_capture(ctx: Context) -> None:
         # A heartbeat goes out thirty seconds into a task, so the last one is a
         # batch far too big to finish: the contributor is stopped once the
         # heartbeat has been seen. The largest batch job creation allows
-        # (10,000 games), with a simming player so it runs for minutes -- ten
+        # (10,000 games), with a simming player so it runs for hours -- ten
         # million, as it was, is refused now.
         deactivate_everything(ctx)
         long_players = {"player1_config_id": simming_player(ctx),

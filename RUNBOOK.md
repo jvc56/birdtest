@@ -226,6 +226,139 @@ and `birdtest-restore-$STAMP` present and no `birdtest` means the second
 rename is next.
 Pasting the block again stops at its first check or rename.
 
+**Before repointing, re-apply what the restore undid for security.** The
+restored instance holds every credential as it was at the restore point: an API
+key revoked or suspended since authenticates again, a password reset since is
+back to the old one, a session ended since — by a reset or "sign out
+everywhere" — is valid again for up to seven days, a ban added or lifted since
+is undone, and an account deleted since is back with its name, address and
+keys. The damaged instance's audit log is the only record of them, so this runs
+while it still exists, and before the application points at the restored one.
+It is driven by those audit rows rather than by the damaged instance's tables,
+which hold the damage too — a bad migration writes no audit rows, but its
+changes to keys or bans would be copied back with everything else — and the
+rows are reviewed before anything is applied, since damage done through the
+application (an admin account acting for an attacker) is recorded like any
+other action. If the master password was rotated after the restore point, set
+it on the restored instance first (see "Rotating the database password"): the
+second block below connects to it.
+
+In an ops shell (`scripts/prod-shell.sh`), where `DATABASE_URL` now reaches
+the restored instance — the rename moved the endpoint — with the damaged
+instance's endpoint (`aws rds describe-db-instances --region "$REGION"
+--db-instance-identifier "birdtest-damaged-$STAMP" --query
+'DBInstances[0].Endpoint.Address' --output text`, from where the blocks above
+ran; the ops shell has none of their variables), first export the actions and
+read them:
+
+```bash
+RESTORE_TIME=''   # the restore point, as above, e.g. '2026-09-07T02:55:00Z'
+DAMAGED_HOST=''   # the damaged instance's endpoint address
+# In a subshell: a failure stops the block without ending the ops shell.
+(
+set -eo pipefail
+DAMAGED_URL=$(sed "s#@[^:/]*:#@${DAMAGED_HOST:?set DAMAGED_HOST to the damaged instance endpoint}:#" <<<"$DATABASE_URL")
+: "${RESTORE_TIME:?set RESTORE_TIME to the restore point}"
+# DATABASE_URL must reach the restored instance, which holds nothing newer
+# than the restore point: straight after the rename, DNS can still answer with
+# the damaged one.
+newer=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM audit_log WHERE created_at > '$RESTORE_TIME'")
+if [ "$newer" != 0 ]; then
+  echo "DATABASE_URL reaches an instance with $newer audit rows after the restore point: not the restored one. Wait for DNS and paste again." >&2
+  exit 1
+fi
+# Every security action since the restore point, oldest first. The reason is
+# base64, so no line in it can end the file early.
+psql "$DAMAGED_URL" -v ON_ERROR_STOP=1 -qc "COPY (
+  SELECT id, action, target_id, actor_user_id, created_at,
+         translate(encode(convert_to(coalesce(reason, ''), 'UTF8'), 'base64'), E'\n', '')
+    FROM audit_log
+   WHERE created_at > '$RESTORE_TIME'
+     AND action IN ('api_key.revoked', 'api_key.deactivated', 'api_key.reactivated',
+                    'user.password_reset', 'user.email_confirmed', 'user.deleted',
+                    'worker.banned', 'worker.unbanned')
+   ORDER BY id) TO STDOUT CSV" > /tmp/after-actions.csv
+psql "$DAMAGED_URL" -v ON_ERROR_STOP=1 -qc "COPY (
+  SELECT id, password_hash FROM users
+   WHERE id::text IN (SELECT target_id FROM audit_log
+                       WHERE action = 'user.password_reset' AND created_at > '$RESTORE_TIME')
+  ) TO STDOUT CSV" > /tmp/after-passwords.csv
+cut -d, -f1-5 /tmp/after-actions.csv
+)
+```
+
+Read the list. A line that is part of the damage — a run of unbans or
+deletions by an account acting for an attacker — is deleted from
+`/tmp/after-actions.csv` (with `sed -i '/^<id>,/d' /tmp/after-actions.csv`)
+before going on; what is left is applied. Then, in one transaction:
+
+```bash
+(
+set -eo pipefail
+# The same check as above: this must write to the restored instance.
+newer=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM audit_log WHERE created_at > '${RESTORE_TIME:?set RESTORE_TIME as above}'")
+if [ "$newer" != 0 ]; then
+  echo "DATABASE_URL reaches an instance with $newer audit rows after the restore point: not the restored one." >&2
+  exit 1
+fi
+if [ ! -e /tmp/after-actions.csv ] || [ ! -e /tmp/after-passwords.csv ]; then
+  echo "run the export above first" >&2
+  exit 1
+fi
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
+BEGIN;
+-- Every account signs in again, and no reset link sent before the restore
+-- point works: a session or link ended since cannot be told from one that was not.
+UPDATE users SET session_generation = session_generation + 1;
+UPDATE password_reset_tokens SET used_at = now() WHERE used_at IS NULL;
+CREATE TEMP TABLE after_actions (id bigint, action text, target_id text, actor uuid, at timestamptz, reason_b64 text);
+\copy after_actions FROM '/tmp/after-actions.csv' CSV
+CREATE TEMP TABLE after_passwords (id uuid, password_hash text);
+\copy after_passwords FROM '/tmp/after-passwords.csv' CSV
+-- Keys: revoked ones go; a suspended or resumed one takes its last state.
+DELETE FROM api_keys k USING after_actions a WHERE a.action = 'api_key.revoked' AND k.id::text = a.target_id;
+UPDATE api_keys k SET is_active = (l.action = 'api_key.reactivated')
+  FROM (SELECT DISTINCT ON (target_id) target_id, action FROM after_actions
+         WHERE action IN ('api_key.deactivated', 'api_key.reactivated') ORDER BY target_id, id DESC) l
+ WHERE k.id::text = l.target_id;
+-- Addresses confirmed since: unconfirmed, the account could not sign in.
+UPDATE users u SET email_confirmed_at = a.at FROM after_actions a
+ WHERE a.action = 'user.email_confirmed' AND a.target_id = u.id::text AND u.email_confirmed_at IS NULL;
+-- Passwords reset since, as the damaged instance has them.
+UPDATE users u SET password_hash = p.password_hash FROM after_passwords p
+ WHERE p.id = u.id
+   AND EXISTS (SELECT 1 FROM after_actions a WHERE a.action = 'user.password_reset' AND a.target_id = u.id::text);
+-- Bans: each identity's last ban or unban, for the identities this instance has.
+CREATE TEMP TABLE last_ban AS
+  SELECT DISTINCT ON (target_id) target_id, action, actor, at,
+         nullif(convert_from(decode(reason_b64, 'base64'), 'UTF8'), '') AS reason
+    FROM after_actions WHERE action IN ('worker.banned', 'worker.unbanned')
+   ORDER BY target_id, id DESC;
+DELETE FROM worker_bans b USING last_ban l WHERE l.target_id IN (b.user_id::text, b.anon_uuid::text);
+INSERT INTO worker_bans (user_id, reason, banned_by, created_at)
+SELECT u.id, l.reason, (SELECT id FROM users WHERE id = l.actor), l.at
+  FROM last_ban l JOIN users u ON u.id::text = l.target_id WHERE l.action = 'worker.banned';
+INSERT INTO worker_bans (anon_uuid, reason, banned_by, created_at)
+SELECT w.uuid, l.reason, (SELECT id FROM users WHERE id = l.actor), l.at
+  FROM last_ban l JOIN anonymous_workers w ON w.uuid::text = l.target_id WHERE l.action = 'worker.banned';
+-- Accounts deleted since: shut now (no password, no keys, not an admin), and
+-- listed to be deleted again, which anonymizes them.
+DELETE FROM api_keys WHERE user_id::text IN (SELECT target_id FROM after_actions WHERE action = 'user.deleted');
+UPDATE users SET password_hash = '!', is_admin = false
+ WHERE id::text IN (SELECT target_id FROM after_actions WHERE action = 'user.deleted') AND deleted_at IS NULL;
+\echo accounts deleted since the restore point, to delete again from the admin users page:
+SELECT id, username FROM users
+ WHERE id::text IN (SELECT target_id FROM after_actions WHERE action = 'user.deleted') AND deleted_at IS NULL;
+COMMIT;
+SQL
+)
+```
+
+Delete each listed account again from the admin users page once the
+application is back: the deletion anonymizes, and is the application's to do.
+Both blocks can be pasted again: the first rewrites its files, and the second
+sets state from them (a second run signs everyone out once more).
+
 Repoint the application. The master password is set by hand and lives only in
 the `DATABASE_URL` parameter, so keep it and swap the host. A PITR copy keeps
 the password the source had at the restore point; if it was rotated after that

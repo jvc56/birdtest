@@ -620,7 +620,9 @@ pub async fn claim(
             let busy_rivals: Vec<Uuid> = busy.iter().copied().filter(|id| *id != job.id).collect();
             let standing = Standing {
                 served_within: state.cfg.heartbeat_timeout,
-                pace: pace_for(&jobs, i),
+                // Settled a ratio unit short while it has been busy: see
+                // `was_recently_busy`.
+                pace: pace_for(&jobs, i).map(|pace| if was_recently_busy(job.id) { pace - 1.0 } else { pace }),
                 rivals,
                 busy_rivals,
             };
@@ -644,6 +646,7 @@ pub async fn claim(
                     continue;
                 }
                 Err(JobClaimError::Busy) => {
+                    mark_busy(job.id);
                     busy.push(job.id);
                     continue;
                 }
@@ -703,6 +706,38 @@ fn pace_for(jobs: &[Job], i: usize) -> Option<f64> {
 
 /// How many times a claim reads the candidate list before answering `Idle`.
 const CLAIM_ROUNDS: usize = 8;
+
+/// How long after a job was found busy it is settled a ratio unit short.
+const BUSY_MEMORY: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// When each job was last found busy, in this process.
+static RECENTLY_BUSY: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<Uuid, std::time::Instant>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn mark_busy(job_id: Uuid) {
+    if let Ok(mut busy) = RECENTLY_BUSY.lock() {
+        let now = std::time::Instant::now();
+        busy.retain(|_, at| now.duration_since(*at) < BUSY_MEMORY);
+        busy.insert(job_id, now);
+    }
+}
+
+/// Whether `job_id` was found busy within [`BUSY_MEMORY`]. Such a job is
+/// settled a ratio unit short of its pace: while it was busy the jobs beside it
+/// could run up to a unit ahead of it (its slack as a busy rival), a lead it is
+/// owed back -- settled all the way, it forgave the lead, and every further
+/// spell added another (a 10% job beside a settling 90% one took 400 claims of
+/// 2,400 over twenty spells, where 240 is fair; the audit's pass 22). Not
+/// settled at all, a newcomer found busy once in a split fleet took the
+/// majority's claims until it had caught theirs, as before settling existed
+/// (the majority job's first came 331st). A unit short, the spell's lead is
+/// paid back and a join's gap, far wider, is still closed.
+fn was_recently_busy(job_id: Uuid) -> bool {
+    RECENTLY_BUSY
+        .lock()
+        .map(|busy| busy.get(&job_id).is_some_and(|at| at.elapsed() < BUSY_MEMORY))
+        .unwrap_or(false)
+}
 
 /// A job's deficit ratio as the candidate list read it; `None` at 0%.
 fn ratio(job: &Job) -> Option<f64> {
@@ -915,11 +950,18 @@ async fn try_claim_from_job(
             // job cannot be reactivated. Guarded on `active` as well: an admin
             // may have deactivated the job between selection and here, and
             // that decision stands.
-            sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
+            let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
                 .bind(job.id)
                 .execute(&mut *tx)
                 .await
-                .map_err(|e| JobClaimError::Fatal(e.into()))?;
+                .map_err(|e| JobClaimError::Fatal(e.into()))?
+                .rows_affected()
+                > 0;
+            if completed {
+                crate::audit::log_server_completion(&mut tx, job.id, Some("last generation built"))
+                    .await
+                    .map_err(JobClaimError::Fatal)?;
+            }
             tx.commit().await.map_err(|e| JobClaimError::Fatal(e.into()))?;
             // No submission is coming to push this to open pages.
             crate::routes::worker::push_after_change(state, job.id);
@@ -1260,8 +1302,9 @@ struct Standing {
     /// after joining is lifted to.
     pace: Option<f64>,
     /// The worker's other candidates still in play -- all but the jobs it
-    /// passed over for want of a task -- none of which the job may have been
-    /// moved past by the time this claim holds its dispatch lock.
+    /// passed over for want of a task and those found busy (`busy_rivals`) --
+    /// none of which the job may have been moved past by the time this claim
+    /// holds its dispatch lock. Empty in the last round.
     rivals: Vec<Uuid>,
     /// Jobs found busy earlier in the request, which the job may run at most a
     /// ratio unit past.

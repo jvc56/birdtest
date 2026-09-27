@@ -1226,7 +1226,7 @@ const MAX_RACKS_PER_BATCH: i32 = 10_000;
 
 /// The most games one task may play (a pair counts two), and the most when
 /// the job captures positions. A captured position's game is an `i16`, so a
-/// batch past 32,767 games could never be submitted -- every result refused,
+/// batch past 32,768 games could never be submitted -- every result refused,
 /// the job stuck -- and about 4,000 captured games already pass the 64 MiB
 /// body limit (the audit's pass 21).
 const MAX_GAMES_PER_BATCH: i32 = 10_000;
@@ -3037,6 +3037,9 @@ async fn list_bans(State(state): State<AppState>, _admin: AdminUser) -> AppResul
     ))
 }
 
+/// The longest ban reason accepted.
+const MAX_BAN_REASON_CHARS: usize = 1_000;
+
 #[derive(Deserialize)]
 struct BanBody {
     user_id: Option<Uuid>,
@@ -3056,6 +3059,15 @@ async fn ban_worker(
 
     if body.user_id.is_some() == body.anon_uuid.is_some() {
         return Err(AppError::bad_request("supply exactly one of user_id or anon_uuid"));
+    }
+    // Stored twice (the ban and its audit row) and shown on the admin page: a
+    // sentence, not a document; and no NUL, which Postgres refuses as a `500`
+    // (the audit's pass 22).
+    if let Some(reason) = body.reason.as_deref() {
+        if reason.chars().count() > MAX_BAN_REASON_CHARS || reason.contains('\0') {
+            return Err(AppError::bad_request("the reason is too long or holds a NUL character")
+                .with_field("reason", format!("at most {MAX_BAN_REASON_CHARS} characters")));
+        }
     }
     // Said plainly rather than left to the foreign key, whose refusal read
     // "that is still referenced by other records" -- the usual sign of an
@@ -3341,7 +3353,7 @@ mod tests {
         assert!(validate_job_body(&games(serde_json::Value::Null)).is_ok());
     }
 
-    /// A batch no result could carry is refused at creation: past 32,767
+    /// A batch no result could carry is refused at creation: past 32,768
     /// captured games the game index overflows, and a thousand captured games
     /// is already a large body.
     #[test]

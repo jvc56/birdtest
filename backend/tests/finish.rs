@@ -185,6 +185,17 @@ async fn an_opening_rack_job_completes_once_its_racks_are_handed_out_and_all_acc
     assert_eq!(job_status(&db, job).await, "completed");
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
     assert_eq!(row.racks_analyzed, 6);
+    // The server completed it, and says so: only an admin's completion was on
+    // record, and `jobs` keeps no completion time (the audit's pass 22).
+    let logged: Vec<(Option<uuid::Uuid>, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT actor_user_id, old_status, new_status FROM audit_log
+         WHERE action = 'job.completed' AND job_id = $1",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(logged, vec![(None, Some("active".to_string()), Some("completed".to_string()))]);
 }
 
 /// I-STATS-9 (opening racks): a declined task goes back to `available`, and a

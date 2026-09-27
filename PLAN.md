@@ -1444,7 +1444,7 @@ what the workers are checked against.
 | Allocation-only job scheduling | One axis: every claim goes to the active job furthest behind its share. A priority tier was a second axis that expressed nothing allocation cannot — a job at 0% gets nothing, exactly as an inactive one does, and a job alone above 0% gets everything — while adding a rule (100% per tier) that had to be kept coherent with it |
 | Admin-only job management | Avoids abuse prevention and quota complexity in v1 |
 | Seed uniqueness for seed-based tasks | `(job_id, seed)` unique index prevents duplicate work at the DB level; uint64 seed stored as signed BIGINT, reinterpreted at the application layer |
-| No JSONB in schema | All `config` and audit `metadata` are expanded into typed columns and per-job-type config tables; avoids schema-less data and keeps queries typed |
+| No JSONB in configs or the audit log | All `config` and audit `metadata` are expanded into typed columns and per-job-type config tables; avoids schema-less data and keeps queries typed. (`backups.row_counts`, a per-table count the backup job records, is the one JSONB column: nothing queries into it.) |
 | Lazy timeout reclamation | No background process needed; simpler to operate |
 | Claim token for stale result rejection | Race-condition-free; no timestamp comparison needed |
 | Anonymous workers identified by UUID | Enables per-worker contribution tracking and result filtering without requiring account creation |
@@ -2227,7 +2227,7 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
    ORDER BY (j.claims_issued - j.claims_baseline)::float / j.allocation ASC, j.created_at ASC
    ```
 
-   **Each candidate is checked for its turn when its claim holds the job's dispatch lock** (`scheduler::try_claim_from_job`): its ratio, as committed then, must not be more than one of that job's claims past any of the worker's other candidates still in play. Claims arriving together read the same list and all land on its first job; for a job at 1% each is a whole ratio unit, and 32 concurrent claims put it 32 units ahead, paid back only slowly and forgiven by anything that lifts a job that lags. A claim that is not the job's turn goes on to the next candidate, and one that finds every job with work outrun reads the list again, up to eight times; the eighth takes the first job with work without checking it against jobs that are not busy, so an `Idle` while work exists is left only to a busy job and a last-round race (with equal jobs and 32 workers claiming together, eight checked rounds told 67 to 166 claims of 1,920 there was nothing). A job whose dispatch lock is busy past its two seconds is not tried again in the request — waited on every round, it held each claim 16 s and ended it `Idle` — but stays a rival in every round, with a ratio unit of slack rather than one of its claims: a 1% job's claim is a whole unit, the largest there is, so a 50% job beside a busy one can still take fifty claims, and a 1% job beside a busy 99% one takes one. Dropped as a rival, the busy 99% job let the 1% job take every claim of the spell, and its settling forgave them (49 where 30 is fair). The check is a lookup, but made holding the job's dispatch lock, so it queues behind the claims on it. The one claim of slack is what concurrency needs — with none only the lowest job could be claimed, and a fleet claiming together went idle a third of the time — and it is the rival's claim, so a 99% job can run a 1% claim ahead and the 1% job a hundredth.
+   **Each candidate is checked for its turn when its claim holds the job's dispatch lock** (`scheduler::try_claim_from_job`): its ratio, as committed then, must not be more than one of that job's claims past any of the worker's other candidates still in play. Claims arriving together read the same list and all land on its first job; for a job at 1% each is a whole ratio unit, and 32 concurrent claims put it 32 units ahead, paid back only slowly and forgiven by anything that lifts a job that lags. A claim that is not the job's turn goes on to the next candidate, and one that finds every job with work outrun reads the list again, up to eight times; the eighth takes the first job with work without checking it against jobs that are not busy, so an `Idle` while work exists is left only to a busy job and a last-round race (with equal jobs and 32 workers claiming together, eight checked rounds told 67 to 166 claims of 1,920 there was nothing). A job whose dispatch lock is busy past its two seconds is not tried again in the request — waited on every round, it held each claim 16 s and ended it `Idle` — but stays a rival in every round, with a ratio unit of slack rather than one of its claims: a 1% job's claim is a whole unit, the largest there is, so a 50% job beside a busy one can still take fifty claims, and a 1% job beside a busy 99% one takes one or two (the check is on the ratio before the claim). Dropped as a rival, the busy 99% job let the 1% job take every claim of the spell, and its settling forgave them (49 where 30 is fair). And a job found busy is settled a ratio unit short for ten minutes (`BUSY_MEMORY`): the lead the jobs beside it took while it was busy — a unit at most — is owed back, and settled all the way it was forgiven, a unit more each spell (a 10% job took 400 of 2,400 claims over twenty spells beside a settling 90% one, where 240 is fair); not settled at all, a newcomer found busy once took the majority's claims in a split fleet (their job's first came 331st). The check is a lookup, but made holding the job's dispatch lock, so it queues behind the claims on it. The one claim of slack is what concurrency needs — with none only the lowest job could be claimed, and a fleet claiming together went idle a third of the time — and it is the rival's claim, so a 99% job can run a 1% claim ahead and the 1% job a hundredth.
 
 3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: no index on `task_claims` leads with the job, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all. Skipped entirely while the process is younger than the heartbeat timeout — see [Task States](#task-states) for why a restarted server has to hear from the fleet before it judges it.
 
@@ -2266,8 +2266,9 @@ Then, up to **eight rounds** (`scheduler::CLAIM_ROUNDS`; a round is repeated whe
      job no longer active and hands out nothing.
    - **NoWork** — this job has nothing to hand out; try the next candidate.
    - **Busy** — another claim held the job's dispatch lock past the bounded
-     wait. The job has work, so it is not lifted as passed over; it is left
-     out of the rest of the request and the next candidate is tried.
+     wait. The job has work, so it is not lifted as passed over; it is not
+     tried again in the request, but stays a rival of the others with a ratio
+     unit of slack, and the next candidate is tried.
    - **NeedsZeroGeneration** — leave generation only: generation 1 is due but
      the zeroed KLV it plays with was never written. Built on its own task;
      nothing to hand out until then, and the next candidate is tried.
@@ -2299,7 +2300,7 @@ Then, up to **eight rounds** (`scheduler::CLAIM_ROUNDS`; a round is repeated whe
    with no generation-0 KLV — is logged and skipped rather than failing the claim.
    Otherwise one broken job at the head of the list answers every worker with a
    `500` for as long as it stays there, and every client retries those.
-3. If no candidate produced work and nothing asked for another round, return `Idle`. The eighth round skips the turn check against jobs that are not busy (see step 2), so a claim is told `Idle` while work exists only when the job with work is busy past its rival's slack, or a race on a created task falls in the last round.
+3. If no candidate produced work and nothing asked for another round, return `Idle`. The eighth round skips the turn check against jobs that are not busy (see step 2), so a claim is told `Idle` while work exists only when every job with work is busy, or more than a unit past a busy rival, or a race on a created task or a leave generation's transition falls in the last round.
 
 **Acquiring a task takes the job's dispatch lock first**, for re-dispatching
 an existing task as much as for generating a new one
@@ -2334,8 +2335,9 @@ again.
 
 **The wait for it is bounded** (`lock_timeout`, two seconds), and a claim that
 gives up tries the next candidate — without treating the job as having
-nothing to hand out: a busy job is not lifted as passed over. It is left out of
-the rest of that request, so a claim waits on it once (`registry::Acquired::Busy`). Ordinary contention is milliseconds, so this is never reached in
+nothing to hand out: a busy job is not lifted as passed over. It is not tried
+again in that request, so a claim waits on it once, and it stays a rival with a
+ratio unit of slack (`registry::Acquired::Busy`). Ordinary contention is milliseconds, so this is never reached in
 normal operation; it exists for the one holder that is not ordinary. Seeding a
 leave generation's rack universe is millions of rows and tens of seconds, and
 the task seeding it holds this lock throughout — so without a bound every
@@ -2463,7 +2465,7 @@ Validation is per job type, and is the server's only defence against a
 submission written straight into the largest tables in the schema. A body over
 64 MiB is refused before it is parsed (`413`); batch size is the admin's lever for
 staying under it, and job creation bounds it: at most 10,000 games a task (a
-pair is two), 1,000 when the job captures positions — past 32,767 captured
+pair is two), 1,000 when the job captures positions — past 32,768 captured
 games a result could not name its games at all.
 
 **Games and game pairs.** `wins + losses + ties == games`, all non-negative, on
@@ -2533,7 +2535,7 @@ reasoning and the full table.
 Some cannot run in the pure validation step, because they need the job's
 settings or the task's own row. They run in `decode_result`, from the job's
 template (the batch size, a leave result's occurrence total, positions only
-when the job captures them), and in `store_result`, from the task's row (an
+when the job captures them and then from every game), and in `store_result`, from the task's row (an
 opening-rack batch's racks). Three of them are the only submission-time checks
 that catch a worker reporting work it did not do:
 
@@ -4779,13 +4781,22 @@ its own; a refused one writes nothing. Claims
 and submissions are the deliberate exception: `task_claims` already records who
 claimed and completed which task and when, so a row per claim and per submission
 duplicated it, cost a write each on the path a worker waits on, and made up most
-of the log's growth.
+of the log's growth. Sign-in attempts are the other: their number is the
+caller's to choose, and a row each would let anyone with a list of usernames
+grow the log at the rate limiter's pace; the limiter's counters are what
+answers "is someone guessing". The credential changes an account makes to
+itself — keys, a reset, a confirmation — are logged (they were not until the
+audit's pass 22): they are the trail a takeover leaves, and what RUNBOOK §1
+re-applies after a restore undoes them. A row's `created_at` is its
+transaction's start: a multi-minute purge's rows sort before actions that
+committed while it ran (`restore-job.sh` picks by `max(id)`, assigned at
+insert).
 
 | Action | Written by |
 |---|---|
 | `user.registered` | Registration |
 | `task.declined` | A worker declining, with the reason in `reason` |
-| `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle |
+| `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle; `job.completed` also for a job the server completes (its stopping rule, SPRT, its last generation), with no actor and the verdict in `reason` |
 | `job.purged` / `job.purged.census` | Purge |
 | `job.deleted` / `job.deleted.census` | Delete |
 | `user.deleted` / `user.deleted.census` | Account deletion |
@@ -4796,6 +4807,8 @@ of the log's growth.
 | `worker.banned` | Ban, with the free-text reason |
 | `worker.unbanned` | Lifting a ban, naming the identity rather than the ban row, which is gone |
 | `user.signed_out_everywhere` | "Sign out everywhere" on the account page |
+| `user.password_reset` / `user.email_confirmed` | A password reset, which ends every session, and an address confirmed |
+| `api_key.created` / `api_key.deactivated` / `api_key.reactivated` / `api_key.revoked` | An account's own API keys, by id — not the label, the owner's free text, which would outlive a deletion; a revoked key's row is deleted, so this is the only record it existed. A suspend or resume that changes nothing writes no row (the route has no rate limit) |
 | `rating_pool.created` / `rating_pool.member_added` / `rating_pool.member_removed` | Rating pool membership, each of which refits the pool |
 | `derived_data.retried` | An admin re-queueing a failed wordmap or rack info table build |
 | `input_data.deleted` | An admin deleting an input data row (and the derived rows built from it) |
@@ -4879,7 +4892,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged, or the failure reason. |
 | `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged new and changed (collision) rows, in one transaction. |
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
-| `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. `?positions=true` (games and game-pairs jobs) streams the positions the job captured instead of its result rows. At most two run at once (a third gets `429`); a completed job with a ready export gets a `303` to it instead. A stream is complete exactly when it ends cleanly: what can fail before the first row (a connection, a leave job's settle) is a status, and a query that fails part-way cuts the body off with an error rather than ending it, which a client reports as a failed transfer. |
+| `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. `?positions=true` (games and game-pairs jobs) streams the positions the job captured instead of its result rows. At most two run at once (a third gets `429`); a completed job with a ready export gets a `303` to it instead. A stream is complete exactly when it ends cleanly: what can fail before the first row (a connection, a leave job's settle) is a status, and a query that fails part-way cuts the body off with an error rather than ending it, which a client over HTTP/1.1 or later reports as a failed transfer (HTTP/1.0 has no chunks, and a cut reads as an end there). |
 | `POST` | `/api/admin/jobs/:id/export` | Build a **completed** job's results into one gzipped NDJSON object in the artifact store. `202` with an id; the work runs on a background task. `409` for a job that is not completed, or whose last claims are still in flight. |
 | `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready — and, for a games or game-pairs job that captured positions, a `positions_download_url` for the second object holding them. |
 | `GET` | `/api/admin/workers` | The contributor list with anonymous workers' real UUIDs, which banning one needs; the public list carries pseudonyms only. |
@@ -4966,7 +4979,8 @@ Beyond role matching, creation enforces seven rules the schema cannot express:
 
 - **Settings a worker can run and a test can evaluate.** `redundancy` at least 1;
   `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
-  at most 10,000); `rack_size` 1–7; `max_*` at least 1 and
+  at most 10,000; `games_per_batch` at most 10,000 games, 1,000 when the job
+  captures positions, and `pairs_per_batch` half of that); `rack_size` 1–7; `max_*` at least 1 and
   `min_*` at least 0; `sprt_alpha` and `sprt_beta` at least 0.000001 and below 1
   with a sum below 1 (a subnormal alpha made the upper bound infinite; beta
   has the same floor for symmetry); `elo_low` below `elo_high`; `min_magpie_version`, when given, a
@@ -5047,7 +5061,13 @@ anyway. Open claims are left to time out; nothing can submit for them once the
 keys are gone. `jobs.created_by`, `player_configs.created_by` and
 `worker_bans.banned_by` keep pointing at the tombstone, and `audit_log` records
 the census taken before the change. Deleting an already-deleted account is a
-404, and an admin cannot delete their own account.
+404, and an admin cannot delete their own account. What deletion does not
+reach: the nightly dumps taken before it keep the account as it was for as
+long as they are kept (`backup_retention_days`, 365 by default; "Backups and
+Restore"), and a restore to a
+point before it brings the account back — RUNBOOK §1 shuts the accounts
+deleted since the restore point (from the damaged instance's `user.deleted`
+rows, reviewed first) and lists them to delete again (the audit's pass 22).
 
 **Rebuilding artifacts** recomputes each generation's KLV from
 `leave_rack_progress`, compares against the recorded digest, and reports per
@@ -7078,13 +7098,18 @@ says so in its implemented option, rather than being removed.
   went out again on a second claim. A claim has no maximum age: an
   executor that hangs while its process goes on heartbeating holds its task
   for good (reasoned, not reproduced).
-  Batch and generation sizes (`games_per_batch`, `pairs_per_batch`,
-  `num_iterations`, `max_iterations`, …) have no ceiling either, except
-  `racks_per_task` (10,000 since the thirty-second audit: every claim and
-  every `leave_requests` row carries a task's forced racks); a typo makes
-  tasks that outlast their lease rather than fail, and past 2^30 pairs a batch's
-  games overflow the dispatched count so every result is refused (reasoned, not
-  run).
+  Generation sizes (`num_iterations`, `max_iterations`, …) have no ceiling
+  either, except `racks_per_task` (10,000 since the thirty-second audit: every
+  claim and every `leave_requests` row carries a task's forced racks); a typo
+  makes tasks that outlast their lease rather than fail. Batch sizes have one
+  since the audit's pass 21: `racks_per_batch` 10,000, and `games_per_batch`
+  10,000 games (1,000 when capturing; `pairs_per_batch` half that) — past
+  32,768 captured games a result could not name its games at all. The
+  capturing cap does not count what each position records: a result is about
+  350 bytes a position and 70 a recorded play, some 22 positions a game, so a
+  job recording 50 plays passes 64 MiB at under 900 games, and its every
+  result is refused (`413`) and replayed (the audit's pass 22). Sizing a
+  capturing batch is the admin's, knowing its players' `num_plays_recorded`.
   And the checks run at creation only: a job or player config written before a
   ceiling tightens (none exists before launch) is not re-checked when it is
   reactivated, or when a new job names the config.
@@ -7588,10 +7613,15 @@ says so in its implemented option, rather than being removed.
   the corpus makes the backup window matter.
 
 **KL-32. `audit_log`'s filters and `task_claims.claimed_at` have no index.**
-- **Context:** A filtered audit query scans the log by `created_at`.
-  `GET /api/admin/fleet` scans a week of claims sequentially.
-- **Problem:** Hundreds of milliseconds to seconds at millions of claims, on
-  both admin pages.
+- **Context:** A filtered audit query (by action or target type) is a
+  sequential scan of the log and a sort, and every page view counts the whole
+  log (`COUNT(*)`, a sequential scan); the unfiltered first page and a `job_id`
+  filter use their indexes. `GET /api/admin/fleet` scans a week of claims
+  sequentially.
+- **Problem:** At a million audit rows, about 90 ms for a filtered page and 70
+  ms for the count (8 ms at 100,000; the audit's pass 22, PG16 defaults);
+  hundreds of milliseconds to seconds at millions of claims for the fleet
+  page.
 - **Options considered:** an index on `claimed_at`.
 - **Option implemented:** None.
 - **Justification:** An index would cost an entry per claim on the hottest write
@@ -8424,7 +8454,7 @@ says so in its implemented option, rather than being removed.
   `lift_passed_over` (thirty-second audit, pass 20).
 - **Problem:** A job joins at the lowest ratio among the jobs being served and
   is settled, claim by claim, level with each class of workers that runs
-  faster. Four gaps remain. A class that makes no claim of it within an hour
+  faster. Five gaps remain. A class that makes no claim of it within an hour
   of its joining -- a few workers on long tasks, a class that comes online
   later -- is not settled against, and when it does claim it finds the job
   below its pace and gives it every claim until it has caught up. A worker
@@ -8440,7 +8470,12 @@ says so in its implemented option, rather than being removed.
   job on the tie (119 of 200 in the hour, then 200). And a job passed over is
   lifted to where the job claimed stood in this request's list; if that job
   was purged or re-activated lower in the meantime, the lift overshoots it
-  (it needs an admin action to race the claim).
+  (it needs an admin action to race the claim). And a job whose dispatch lock
+  stays held — no ordinary holder does; seedings, purges and deletes are
+  skipped without a wait — lets the jobs beside it run a ratio unit ahead and
+  then answers their workers `Idle`, each waiting its two seconds on the lock
+  first: with a synthetic holder of 40 s and 100 workers, 187 claims idled
+  where none had (the audit's pass 22, not reproduced with a real holder).
 - **Options considered:** a longer settling window (it would settle, too, a
   job whose lag became structural while it lasted); recording which workers
   can run which job (the unsupported sets are the client's, and not stored);
@@ -8452,6 +8487,22 @@ says so in its implemented option, rather than being removed.
   declines it with a reason, which undoes its settling; and the per-worker
   lift needs a worker that repeatedly finds nothing it may take in a job
   others take from.
+
+**KL-90. A few actions still leave no audit row.**
+- **Context:** `audit_log` (thirty-second audit, pass 22).
+- **Problem:** The release of an expired, unconfirmed account when its name or
+  address is registered again deletes the row with no audit row (and, through
+  `worker_bans`' cascade, any ban on it). An admin's rating-pool recompute and
+  leave-merge, and the bulk results stream, write none either. And a ban's
+  row says `target_type = 'worker'` for an account and an anonymous UUID
+  alike: which it was is read from `worker_bans`, or from the id.
+- **Options considered:** a row for each; a `target_type` of `user` or
+  `anon_worker` on bans.
+- **Option implemented:** None; they are stated here.
+- **Justification:** None of them destroys or grants anything an admin would
+  need to reconstruct: an unconfirmed account never ran a task, a recompute
+  and a merge are repeatable, a stream only reads (an export is logged), and
+  the ban's identity kind is in the table beside it.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the

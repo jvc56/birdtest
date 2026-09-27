@@ -70,8 +70,8 @@ at tier 5 names a symptom.
 |---|---|---|
 | 1 Unit | 216 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 122 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 160 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 216 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (54), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 2 Integration | 161 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (27), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 220 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (24), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (9), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 621 backend tests (the per-tier counts above are
+--run-ignored all` runs 626 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -817,11 +817,13 @@ Test the pure functions; do not snapshot the SVG.
 
 ### `F-NGINX-*` — the proxy in front of the app
 
-- `F-NGINX-1` The Nginx template keeps chunked transfer on (and SSE
-  unbuffered): with it off, a results stream cut off part-way closed like a
-  finished download through the proxy — curl exited 0 after 15,641 of
-  150,000 lines, and with the line removed exited 18. *(Covered:
-  `nginxConfig.test.ts`.)* (Thirty-second audit, pass 21.)
+- `F-NGINX-1` The Nginx template (compose and local stacks; deployed, the load
+  balancer sends `/api/` past it) turns chunked transfer off nowhere, in any
+  case or quoting, and proxies `/api/` over HTTP/1.1, unbuffered for SSE: with
+  chunking off, a results stream cut off part-way closed like a finished
+  download through the proxy — curl exited 0 after 15,641 of 150,000 lines,
+  and with the line removed exited 18. *(Covered: `nginxConfig.test.ts`.)*
+  (Thirty-second audit, passes 21 and 22.)
 
 ## 2. Integration
 
@@ -832,7 +834,6 @@ than Rust.
 **The harness** (`backend/tests/common/mod.rs`) is the dependency for tiers 2
 and 3. Three decisions shaped it, settled below, because each has an
 obvious-looking answer that is wrong here.
-
 
 ### Isolation: `CREATE DATABASE … TEMPLATE`
 
@@ -1068,7 +1069,8 @@ The single most important group. Every entry is about a decision made in SQL.
   (Thirty-second audit, pass 20: the lag window removed, joining settled,
   claims checked for their turn. Each rule switched off fails its own tests:
   the settling 3j, 3k and 3l; the rejoin 3g and 3l; the pass-over lift 3c and
-  3n; the turn check 3o and 3i; the undoing on a decline 3p; the lowest-other
+  3n; the turn check 3o (and 3i, in about one run in four); the undoing on a
+  decline 3p; the lowest-other
   pace 3q. On pass 20's first design, 3j to 3m fail; on its second, 3o to 3q.)
 - `I-SCHED-3r` **No claim is told there is nothing while work exists.** Three
   jobs at equal shares, 32 workers claiming together: every one of 1,920
@@ -1085,6 +1087,15 @@ The single most important group. Every entry is about a decision made in SQL.
   claim of the spell and the settling forgave them (49 where 30 is fair).
   *(Covered: `admin_api::a_busy_large_job_does_not_hand_a_small_one_its_claims`.)*
   (Thirty-second audit, pass 21.)
+- `I-SCHED-3u` Repeated busy spells on a settling job are paid back: a job
+  found busy is settled a ratio unit short for ten minutes, so a 10% job
+  beside a busy 90% one gets its tenth over three spells (within 5), where
+  each spell's lead was forgiven. *(Covered:
+  `admin_api::repeated_busy_spells_on_a_settling_job_are_paid_back`.)* Short,
+  not unsettled: a newcomer found busy once in the split of 3j is still
+  settled, the majority job's first claim within sixteen, where it came
+  331st. *(Covered: `admin_api::a_newcomer_busy_once_is_still_settled`.)*
+  (Thirty-second audit, pass 22.)
 - `I-SCHED-4` Abandoned claims count toward a job's share. Abandon many claims
   on one job and confirm its share does **not** grow — excluding them would let
   a job with flaky workers accumulate more than its share. The counter is
@@ -2057,6 +2068,11 @@ below.
   the twenty-first in a minute is a 429. Both are unauthenticated writes on the
   main pool, and a reset scores a password first. *(Covered:
   `boundaries::redeeming_links_is_limited_per_address`.)* (Twenty-first audit.)
+- `A-AUTH-12` A confirmed address and a password reset are on record
+  (`user.email_confirmed`, `user.password_reset`); sign-in attempts are not,
+  by design (PLAN, "Audit actions"). *(Covered:
+  `auth_routes::a_confirmation_and_a_reset_are_on_record`.)* (Thirty-second
+  audit, pass 22.)
 
 ### `A-WORKER-*` — `routes/worker.rs`
 
@@ -2476,6 +2492,11 @@ below.
   burst, fifteenth.)
 - `A-ACCOUNT-7` A key's label is at most 100 characters. *(Covered:
   `account::a_key_label_is_bounded`.)* (Seventeenth audit.)
+- `A-ACCOUNT-8` A key's whole life is on record: issued, suspended, resumed
+  and revoked, each writes an audit row by the key's id (not its label, the
+  owner's free text), where none did and a revoked key left no trace at all;
+  a suspend or resume that changes nothing writes none. *(Covered:
+  `account::a_keys_life_is_on_record`.)* (Thirty-second audit, pass 22.)
 
 ### `A-BOUND-*` — boundaries (`backend/tests/boundaries.rs`)
 

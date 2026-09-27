@@ -33,9 +33,10 @@ const DISPATCH_LOCK_NAMESPACE: i32 = 1;
 /// - **Games, game pairs and opening racks** pick the next seed with
 ///   `MAX(seed)`, so two overlapping claims compute the same one. The
 ///   `(job_id, seed)` unique index catches that, but only by failing the loser,
-///   and `scheduler::claim` gives up after three attempts -- so past three-way
-///   contention on one job a worker is told `204` while work exists. The lock
-///   costs nothing that was not already being paid: `issue_claim` bumps
+///   and `scheduler::claim` gave up after three attempts (it has eight rounds
+///   now) -- so past three-way contention on one job a worker was told `204`
+///   while work existed. The lock costs nothing that was not already being
+///   paid: `issue_claim` bumps
 ///   `jobs.claims_issued`, which takes the job's row lock until commit, so
 ///   claims against one job already serialize. This only moves the start of
 ///   that window earlier, turning a lost race into a short wait.
@@ -329,6 +330,9 @@ pub async fn complete_unless_purged(
     if completed && purged_since() {
         tx.rollback().await?;
         return Ok(false);
+    }
+    if completed {
+        crate::audit::log_server_completion(&mut tx, job_id, status).await?;
     }
     tx.commit().await?;
     Ok(completed)

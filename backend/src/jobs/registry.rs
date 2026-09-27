@@ -25,8 +25,9 @@ pub enum Acquired {
     /// This job has nothing to hand out right now; try the next one.
     NoWork,
     /// Another claim held the job's dispatch lock past the bounded wait. Not
-    /// "no work": the scheduler neither lifts the job as passed over nor
-    /// gives up on it, and tries it again once the rest of the list is done.
+    /// "no work": the scheduler does not lift the job as passed over. It is not
+    /// tried again in the request, but stays a rival of the others, with a
+    /// ratio unit of slack.
     Busy,
     /// Leave generation only: the current generation is finished and must be
     /// aggregated before more tasks exist. Handled outside the transaction.

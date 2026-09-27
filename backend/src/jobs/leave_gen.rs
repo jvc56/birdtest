@@ -1541,10 +1541,15 @@ pub async fn close_generation(
     // and it stands. Reactivated, its first claim finds the last generation
     // closed and completes it then.
     if generation >= config.generation_count {
-        sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
+        let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
             .bind(job_id)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected()
+            > 0;
+        if completed {
+            crate::audit::log_server_completion(&mut tx, job_id, Some("last generation built")).await?;
+        }
     }
     tx.commit().await?;
     // The page's generation count and status moved without a submission.

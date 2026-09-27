@@ -725,6 +725,8 @@ async fn confirm_email(
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
+    crate::audit::log_account(&mut tx, "user.email_confirmed", user_id, "user", user_id.to_string())
+        .await?;
     tx.commit().await?;
 
     Ok(Json(MessageBody { message: "email confirmed" }))
@@ -916,6 +918,10 @@ async fn confirm_password_reset(
     .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    // A reset ends every session as "sign out everywhere" does, and is what
+    // an owner does after a takeover: on record, and in the transaction.
+    crate::audit::log_account(&mut tx, "user.password_reset", user_id, "user", user_id.to_string())
+        .await?;
     tx.commit().await?;
 
     // Every session was revoked above; dropping the cookie just tidies the

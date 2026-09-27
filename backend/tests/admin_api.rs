@@ -2832,7 +2832,7 @@ async fn concurrent_claims(state: &birdtest::state::AppState, per_worker: usize)
 /// I-SCHED-3r: a claim is not told there is nothing while work exists. With
 /// jobs at equal shares and 32 workers claiming together, each job kept being
 /// found a claim past the other, and a claim that found both so for eight
-/// rounds answered `204` -- 67 to 142 of 1,920 (the audit's pass 21). The last
+/// rounds answered `204` -- 67 to 166 of 1,920 (the audit's pass 21). The last
 /// round takes the first job with work without the turn check.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn equal_jobs_claimed_together_leave_no_worker_idle() {
@@ -2851,7 +2851,8 @@ async fn equal_jobs_claimed_together_leave_no_worker_idle() {
 /// claim that wait once. Waited on again every round, and outrunning every
 /// other job with its ratio frozen, it held each claim 16 s and ended it
 /// `204` while the other job had work (the audit's pass 21). A busy job is
-/// left out of the rest of the request.
+/// not tried again in the request (it stays a rival, with a ratio unit of
+/// slack: I-SCHED-3t).
 #[tokio::test]
 async fn a_busy_job_costs_a_claim_one_wait() {
     let db = TestDb::new().await;
@@ -2913,4 +2914,70 @@ async fn a_busy_large_job_does_not_hand_a_small_one_its_claims() {
     let got = before.get(&a).copied().unwrap_or(0) + during + after.get(&a).copied().unwrap_or(0);
     assert!(during <= 2, "the 1% job took {during} of the 5 claims while B was busy");
     assert!(got <= 33, "the 1% job got {got} claims where 30 is fair");
+}
+
+/// I-SCHED-3u: repeated busy spells on a settling job are paid back. Each spell
+/// let the job beside it run a ratio unit ahead, and the busy job's settling
+/// forgave the lead once the spell ended, so every spell added another: a 10%
+/// job beside a 90% one took 400 claims of 2,400 over twenty spells of ten,
+/// where 240 is fair (the audit's pass 22). A job found busy is not settled
+/// for ten minutes.
+#[tokio::test]
+async fn repeated_busy_spells_on_a_settling_job_are_paid_back() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let small = db.games_job(1, 2).await;
+    let large = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = ANY($1)")
+        .bind(vec![small, large]).execute(&db.pool).await.unwrap();
+    let state = db.state().await;
+    split_activate(&db, &state, admin, small, 10).await;
+    split_activate(&db, &state, admin, large, 90).await;
+    let mut got = split_run(&state, 200, |_| false).await.get(&small).copied().unwrap_or(0);
+    let mut total = 200;
+    for _ in 0..3 {
+        let mut holder = db.pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(1, hashtext($1::text))")
+            .bind(large).execute(&mut *holder).await.unwrap();
+        for _ in 0..3 {
+            let w = birdtest::auth::WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip: std::net::IpAddr::from([127, 0, 0, 1]) };
+            if let birdtest::scheduler::ClaimOutcome::Task(t) = birdtest::scheduler::claim(&state, &w, &split_caps("3.0.0")).await.unwrap() {
+                got += usize::from(t.job_id == small);
+                total += 1;
+            }
+        }
+        holder.rollback().await.unwrap();
+        got += split_run(&state, 300, |_| false).await.get(&small).copied().unwrap_or(0);
+        total += 300;
+    }
+    // Fair is a tenth; each spell's lead, forgiven, was about ten more.
+    let fair = total / 10;
+    assert!(got <= fair + 5, "the 10% job got {got} of {total} claims where {fair} is fair");
+}
+
+/// I-SCHED-3v: a newcomer found busy once is still settled. Not settled at all
+/// for ten minutes after it was found busy, a newcomer everyone can run, in the
+/// split of I-SCHED-3j, took the majority's claims until it had caught theirs:
+/// the majority job's first came 331st (the audit's pass 22). It is settled a
+/// ratio unit short instead -- ten claims of a 10% job.
+#[tokio::test]
+async fn a_newcomer_busy_once_is_still_settled() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let (state, a, _) = minority_split(&db).await;
+    let n = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1").bind(n).execute(&db.pool).await.unwrap();
+    split_activate(&db, &state, admin, n, 10).await;
+    // One claim while another holder keeps N's dispatch lock.
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(1, hashtext($1::text))")
+        .bind(n).execute(&mut *holder).await.unwrap();
+    let w = birdtest::auth::WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip: std::net::IpAddr::from([127, 0, 0, 1]) };
+    birdtest::scheduler::claim(&state, &w, &split_caps("1.0.0")).await.unwrap();
+    holder.rollback().await.unwrap();
+    let majority = majority_claims(&state, 1000).await;
+    let got = majority.iter().filter(|j| **j == a).count();
+    let first = majority.iter().position(|j| *j == a);
+    assert!(first.is_some_and(|i| i < 16), "A's first claim at {first:?}");
+    assert!((630..=690).contains(&got), "A got {got} of the majority's 800, not about 667");
 }
