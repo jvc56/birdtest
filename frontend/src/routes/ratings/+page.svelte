@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api, type RatingPoolListItem } from '$lib/api';
+  import { session } from '$lib/auth';
 
   let pools: RatingPoolListItem[] = [];
   let loaded = false;
@@ -14,11 +15,16 @@
       loadError = e instanceof Error ? e.message : String(e);
     }
   });
+
+  $: isAdmin = $session?.is_admin ?? false;
 </script>
 
 <section class="space-y-6">
   <div class="space-y-2">
-    <h1 class="text-2xl font-semibold">Ratings</h1>
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h1 class="text-2xl font-semibold">Ratings</h1>
+      {#if isAdmin}<a class="btn-primary no-underline hover:no-underline" href="/admin/rating-pools/new">New rating pool</a>{/if}
+    </div>
     <p class="max-w-3xl text-sm text-muted-foreground">
       A rating pool is a set of player configs whose ratings are comparable, plus the conditions
       that make them so. Every rating in a pool is solved for jointly from every game pair its
@@ -35,9 +41,9 @@
     <div class="card space-y-2">
       <h2 class="text-lg font-medium">No rating pools yet</h2>
       <p class="text-sm text-muted-foreground">
-        A pool is created through the admin API (<code>POST /api/admin/rating-pools</code>) by
-        naming its variant, letter distribution and board layout, then picking the anchor config
-        that fixes the scale; there is no form for it yet.
+        An admin creates a pool by naming its variant, letter distribution and board layout, then
+        picking the anchor config that fixes the scale{#if isAdmin}:
+          <a href="/admin/rating-pools/new">create one</a>{/if}.
       </p>
     </div>
   {:else}

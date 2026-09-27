@@ -2772,9 +2772,9 @@ admin in once and the admin journeys reuse its storage state.
   from `/account`. *(Covered: `e6-redirects.spec.ts`.)*
 - `E-7` The ratings page: an admin creates a pool, adds a config, sees the fit
   appear, removes it, and sees the ratings change. Covers the one flow where a
-  write is expected to move numbers elsewhere on the page. There is no form for
-  creating a pool, so the journey creates it over the API and starts at the
-  ratings list; membership, the fit and the moved ratings go through the page.
+  write is expected to move numbers elsewhere on the page. The pool is created
+  through its form, from the ratings list, with only its anchor; membership,
+  the fit and the moved ratings go through the pool's page.
   *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table with the five buckets
   labelled, and the SPRT status text. *(Covered: `e8-pentanomial.spec.ts`.)*

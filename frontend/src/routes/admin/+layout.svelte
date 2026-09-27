@@ -6,6 +6,7 @@
   const tabs = [
     { href: '/admin/jobs/new', label: 'New job' },
     { href: '/admin/player-configs', label: 'Player configs' },
+    { href: '/admin/rating-pools/new', label: 'New rating pool' },
     { href: '/admin/input-data', label: 'Input data' },
     { href: '/admin/fleet', label: 'Fleet' },
     { href: '/admin/users', label: 'Users' },

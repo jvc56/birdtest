@@ -5175,6 +5175,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | `/admin/jobs/[id]` | Admin job view — the job's progress, ETA, status, contributors and data gaps (what workers declined it for; the public page has the rest: pentanomial, W/L/D, SPRT bounds) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form. |
+| `/admin/rating-pools/new` | Create rating pool form — name, variant, letter distribution, board layout, anchor config and rating, and optionally the other members to add once it exists. Linked from `/ratings` for an admin; membership is managed on the pool's page after that. |
 | `/admin/users` | User account list — delete accounts. (Contribution stats are shown publicly at `/users`.) |
 | `/admin/workers` | Worker ban management — ban / unban workers by user ID or anonymous UUID. |
 | `/admin/audit-log` | Audit log viewer — filterable by action and target type; paginated. (Not by actor: the page has no actor filter.) |
@@ -5403,6 +5404,9 @@ birdtest/
 │               │   ├── +page.svelte                # /admin/player-configs
 │               │   └── new/
 │               │       └── +page.svelte            # /admin/player-configs/new
+│               ├── rating-pools/
+│               │   └── new/
+│               │       └── +page.svelte            # /admin/rating-pools/new
 │               ├── users/
 │               │   └── +page.svelte                # /admin/users
 │               ├── workers/
