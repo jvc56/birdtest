@@ -234,6 +234,41 @@ def uuids_the_database_knows(uuids: List[str]) -> Optional[set]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+# How often a running dev.py looks for queued derived files.
+DERIVED_CHECK_SECS = 15
+
+
+def queued_derived_files() -> Optional[int]:
+    """How many wordmaps and rack info tables are waiting to be built, or None
+    when the stack's database cannot be asked."""
+    result = subprocess.run(
+        ["docker", "compose", "exec", "-T", "postgres", "psql", "-U", "birdtest", "-d", "birdtest",
+         "-Atq", "-c", "SELECT COUNT(*) FROM derived_data WHERE state = 'pending'"],
+        cwd=REPO_ROOT, capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip())
+    except ValueError:
+        return None
+
+
+def build_derived_files(args) -> None:
+    """Builds what the derived-file queue holds, as production's scheduled
+    task does. Nothing else in the stack builds a wordmap, so without this a
+    job whose players use one -- the default -- is never dispatched."""
+    queued = queued_derived_files()
+    if not queued:
+        return
+    log(f"building {queued} queued wordmap / rack info table file(s)")
+    run = ["run", "--rm"]
+    if args.rebuild:
+        run.append("--build")
+    if compose([*run, "derived-builder"], check=False).returncode != 0:
+        log("the derived-file builder failed; jobs that need its files wait until "
+            "`docker compose run --rm derived-builder` succeeds (see /admin/derived-data)")
+
+
 def write_contribute_settings(directory: Path, args, api_url: str, uuid: Optional[str],
                               api_key: Optional[str] = None) -> Path:
     """One `contribute.txt` per worker, written from this run's flags.
@@ -524,6 +559,7 @@ def main() -> int:
         log("skipping seeding")
     else:
         run_seed(args, api_url, magpie_root, floor)
+    build_derived_files(args)
 
     processes = start_contributors(args, binary, data, api_url)
     # Keyed by the worker number shown at startup, so an exit report names the
@@ -559,8 +595,14 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    # A job activated from the admin pages while this runs queues its files
+    # too, so the queue is drained as long as the stack is being run.
+    next_derived_check = time.monotonic() + DERIVED_CHECK_SECS
     try:
         while not stopping:
+            if time.monotonic() >= next_derived_check:
+                build_derived_files(args)
+                next_derived_check = time.monotonic() + DERIVED_CHECK_SECS
             # A contributor that exits on its own (--max-tasks, or a fatal
             # error) is worth surfacing rather than silently leaving a smaller
             # fleet running.
