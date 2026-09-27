@@ -23,6 +23,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/jobs", get(list_jobs))
         .route("/jobs/:id", get(job_detail))
+        .route("/jobs/:id/config", get(job_config))
         .route("/jobs/:id/results", get(job_results))
         .route("/jobs/:id/stream", get(job_stream))
         .route("/users", get(list_users))
@@ -196,6 +197,230 @@ async fn job_detail(
         payload.to_string(),
     )
         .into_response())
+}
+
+/// Everything a job runs with, for anyone to read: the job's own settings,
+/// its type's, and every setting of each player config, with files by name.
+/// The job page showed a lexicon and a variant, and nothing said how deep
+/// each player searched.
+#[derive(Serialize)]
+struct JobConfigView {
+    job: JobSettings,
+    /// Games and game-pairs jobs: the test and its stopping rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    games: Option<GamesSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opening_racks: Option<crate::models::job::OpeningRackConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leave_generation: Option<LeaveSettings>,
+    /// Each player config, in role order ("player 1", "player 2"; "player"
+    /// for an opening-rack job).
+    players: Vec<PlayerSettings>,
+}
+
+#[derive(Serialize)]
+struct JobSettings {
+    id: Uuid,
+    name: String,
+    job_type: JobType,
+    variant: String,
+    letter_distribution: String,
+    layout: String,
+    bingo_bonus: i32,
+    sim_cutoff: f64,
+    redundancy: i32,
+    min_magpie_version: String,
+}
+
+#[derive(Serialize)]
+struct GamesSettings {
+    /// "game" or "pair": the unit every count here is in.
+    unit: &'static str,
+    per_batch: i32,
+    min_units: i32,
+    max_units: i32,
+    sprt_alpha: f64,
+    sprt_beta: f64,
+    elo_low: f64,
+    elo_high: f64,
+    capture_positions: bool,
+}
+
+#[derive(Serialize)]
+struct LeaveSettings {
+    lexicon: String,
+    num_iterations: i32,
+    generation_count: i32,
+    target_rack_count: i32,
+    racks_per_task: i32,
+    use_wordmap: bool,
+}
+
+/// A player config's settings, without who made it or when.
+#[derive(Serialize)]
+struct PlayerSettings {
+    role: &'static str,
+    name: String,
+    lexicon: String,
+    leaves: String,
+    win_pct: Option<String>,
+    recorder_type: String,
+    sort_strategy: String,
+    num_plies: i32,
+    num_plies_recorded: i32,
+    num_plays: i32,
+    num_plays_recorded: i32,
+    max_iterations: Option<i32>,
+    stopping_pct: Option<f64>,
+    use_inference: Option<bool>,
+    time_limit_secs: Option<i32>,
+    use_wordmap: bool,
+    use_rit: bool,
+    min_play_iterations: Option<i32>,
+    threshold: Option<String>,
+    sampling_rule: Option<String>,
+    inference_margin: Option<f64>,
+    utility_w_winpct: Option<f64>,
+    utility_w_spread: Option<f64>,
+    utility_spread_scale: Option<f64>,
+    movegen_margin: f64,
+}
+
+impl PlayerSettings {
+    fn new(role: &'static str, named: crate::models::job::NamedPlayerConfig) -> Self {
+        let c = named.config;
+        Self {
+            role,
+            name: c.name,
+            lexicon: named.kwg_name,
+            leaves: named.klv_name,
+            win_pct: named.winpct_name,
+            recorder_type: c.recorder_type,
+            sort_strategy: c.sort_strategy,
+            num_plies: c.num_plies,
+            num_plies_recorded: c.num_plies_recorded,
+            num_plays: c.num_plays,
+            num_plays_recorded: c.num_plays_recorded,
+            max_iterations: c.max_iterations,
+            stopping_pct: c.stopping_pct,
+            use_inference: c.use_inference,
+            time_limit_secs: c.time_limit_secs,
+            use_wordmap: c.use_wordmap,
+            use_rit: c.use_rit,
+            min_play_iterations: c.min_play_iterations,
+            threshold: c.threshold,
+            sampling_rule: c.sampling_rule,
+            inference_margin: c.inference_margin,
+            utility_w_winpct: c.utility_w_winpct,
+            utility_w_spread: c.utility_w_spread,
+            utility_spread_scale: c.utility_spread_scale,
+            movegen_margin: c.movegen_margin,
+        }
+    }
+}
+
+async fn job_config(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<JobConfigView>> {
+    use crate::models::job::{GameConfig, GamePairConfig, LeaveConfig, NamedPlayerConfig, OpeningRackConfig};
+    let job = load_job(&state, id).await?;
+    let pool = &state.read_pool;
+    let file = |id: Uuid| async move {
+        sqlx::query_scalar::<_, String>("SELECT name FROM input_data WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+    };
+    let player = |id: Uuid| async move {
+        sqlx::query_as::<_, NamedPlayerConfig>(&format!("{} WHERE pc.id = $1", NamedPlayerConfig::SELECT))
+            .bind(id)
+            .fetch_one(pool)
+            .await
+    };
+
+    let (mut games, mut opening_racks, mut leave_generation, mut players) = (None, None, None, Vec::new());
+    match job.job_type {
+        JobType::Games => {
+            let c: GameConfig = sqlx::query_as("SELECT * FROM job_game_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            players.push(PlayerSettings::new("player 1", player(c.player1_config_id).await?));
+            players.push(PlayerSettings::new("player 2", player(c.player2_config_id).await?));
+            games = Some(GamesSettings {
+                unit: "game",
+                per_batch: c.games_per_batch,
+                min_units: c.min_games,
+                max_units: c.max_games,
+                sprt_alpha: c.sprt_alpha,
+                sprt_beta: c.sprt_beta,
+                elo_low: c.elo_low,
+                elo_high: c.elo_high,
+                capture_positions: c.capture_positions,
+            });
+        }
+        JobType::GamePairs => {
+            let c: GamePairConfig = sqlx::query_as("SELECT * FROM job_game_pair_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            players.push(PlayerSettings::new("player 1", player(c.player1_config_id).await?));
+            players.push(PlayerSettings::new("player 2", player(c.player2_config_id).await?));
+            games = Some(GamesSettings {
+                unit: "pair",
+                per_batch: c.pairs_per_batch,
+                min_units: c.min_pairs,
+                max_units: c.max_pairs,
+                sprt_alpha: c.sprt_alpha,
+                sprt_beta: c.sprt_beta,
+                elo_low: c.elo_low,
+                elo_high: c.elo_high,
+                capture_positions: c.capture_positions,
+            });
+        }
+        JobType::OpeningRack => {
+            let c: OpeningRackConfig = sqlx::query_as("SELECT * FROM job_opening_rack_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            players.push(PlayerSettings::new("player", player(c.player_config_id).await?));
+            opening_racks = Some(c);
+        }
+        JobType::LeaveGeneration => {
+            let c: LeaveConfig = sqlx::query_as("SELECT * FROM job_leave_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            leave_generation = Some(LeaveSettings {
+                lexicon: file(c.kwg_id).await?,
+                num_iterations: c.num_iterations,
+                generation_count: c.generation_count,
+                target_rack_count: c.target_rack_count,
+                racks_per_task: c.racks_per_task,
+                use_wordmap: c.use_wordmap,
+            });
+        }
+    }
+
+    Ok(Json(JobConfigView {
+        job: JobSettings {
+            id: job.id,
+            name: job.name.clone(),
+            job_type: job.job_type,
+            variant: job.variant.clone(),
+            letter_distribution: file(job.letterdist_id).await?,
+            layout: file(job.layout_id).await?,
+            bingo_bonus: job.bingo_bonus,
+            sim_cutoff: job.sim_cutoff,
+            redundancy: job.redundancy,
+            min_magpie_version: job.min_magpie_version().to_string(),
+        },
+        games,
+        opening_racks,
+        leave_generation,
+        players,
+    }))
 }
 
 #[derive(Deserialize)]

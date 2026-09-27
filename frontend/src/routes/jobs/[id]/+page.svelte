@@ -10,6 +10,8 @@
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import OutcomeChart from '$lib/components/OutcomeChart.svelte';
+  import JobSettings from '$lib/components/JobSettings.svelte';
+  import { playersLine, type JobConfig } from '$lib/jobSettings';
   import { pentanomialRows } from '$lib/charts/pentanomial';
 
   // The [id] route only matches when the param is present.
@@ -17,6 +19,8 @@
 
   let stats: JobStats | null = null;
   let error = '';
+  // Fixed once the job exists: read once. Without it the page still shows.
+  let config: JobConfig | null = null;
 
   // Opening-rack search
   let rackQuery = '';
@@ -24,6 +28,10 @@
   let rackError = '';
 
   onMount(() => {
+    api
+      .jobConfig(jobId)
+      .then((value) => (config = value))
+      .catch(() => (config = null));
     api
       .job(jobId)
       .then((value) => (stats = value))
@@ -70,7 +78,8 @@
       {/if}
       <JobStatusBadge status={stats.job.status} />
       <span class="text-sm text-muted-foreground">
-        {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}
+        {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}{#if config?.players.length}
+          · {playersLine(config)}{/if}
       </span>
       <!-- The admin page (activate, purge, export, artifacts) was reachable
            only by the redirect after creating the job. -->
@@ -141,6 +150,10 @@
           · requires MAGPIE ≥ {stats.job.min_magpie_version}{/if}
       </p>
     </div>
+
+    {#if config}
+      <JobSettings {config} />
+    {/if}
 
     {#if stats.games}
       <div class="card space-y-4">

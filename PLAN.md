@@ -5103,6 +5103,7 @@ do not exist.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated; `?status=active` (or `inactive`, `completed`) lists only those, with a matching total. |
+| `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), its type's (a games or pairs job's batch, minimum, cap and SPRT parameters; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name. No creator, no user ids. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the SPRT verdict, `last generation built`, or none when an opening-rack job's racks ran out). |
 | `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
@@ -5135,7 +5136,7 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 |---|---|
 | `/` | Landing page — brief description of birdtest, links to the job list and the worker setup guide. |
 | `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
-| `/jobs/[id]` | Job detail — job-type-specific stats and per-worker contribution table. Live-updated via SSE. |
+| `/jobs/[id]` | Job detail — job-type-specific stats and per-worker contribution table. Live-updated via SSE. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Settings card repeats that per player and holds every setting behind "All settings" — the job's, its type's, and the players' side by side with those they differ in marked — and a JSON download (`GET /api/jobs/:id/config`). |
 | `/users` | Registered user list — all user accounts with contribution stats. |
 | `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by tasks completed. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |

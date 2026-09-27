@@ -516,6 +516,7 @@ export const api = {
   revokeApiKey: (id: string) => del<void>(`/api/me/api-keys/${id}`),
 
   // Public
+  jobConfig: (id: string) => get<import('$lib/jobSettings').JobConfig>(`/api/jobs/${id}/config`),
   jobs: (page = 0, status?: JobStatus) =>
     get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),

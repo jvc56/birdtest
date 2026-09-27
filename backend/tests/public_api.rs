@@ -166,6 +166,38 @@ async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
 // Jobs
 // ---------------------------------------------------------------------------
 
+/// A-PUBLIC-1c: a job's full configuration is public -- the job's settings,
+/// its type's (for a games job the test and its stopping rules) and every
+/// setting of each player config, with files by name -- and names no one: no
+/// creator, no user id. An unknown job is a 404.
+#[tokio::test]
+async fn a_jobs_full_configuration_is_public() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let job = db.games_job(1, 10).await;
+
+    let (status, config) = send(&app, get_request(&format!("/api/jobs/{job}/config"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["job"]["job_type"], "games");
+    assert_eq!(config["job"]["letter_distribution"], "english");
+    assert_eq!(config["job"]["layout"], "standard15");
+    assert_eq!(config["games"]["unit"], "game");
+    assert_eq!(config["games"]["max_units"], 1_000_000);
+    assert_eq!(config["games"]["per_batch"], 10);
+    let players = config["players"].as_array().unwrap();
+    assert_eq!(players.len(), 2, "{config}");
+    assert_eq!(players[0]["role"], "player 1");
+    assert_eq!(players[0]["num_plies"], 0);
+    assert_eq!(players[0]["recorder_type"], "best");
+    assert!(players[0]["lexicon"].as_str().unwrap().starts_with("NWL"), "{config}");
+    for player in players {
+        assert!(player.get("created_by").is_none() && player.get("id").is_none(), "{player}");
+    }
+
+    let (status, _) = send(&app, get_request(&format!("/api/jobs/{}/config", Uuid::new_v4()), &[])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// A-PUBLIC-1b: `?status=` filters the job list and its total by status --
 /// the home page's active jobs, which it once filtered from the newest page
 /// in the browser and so lost every active job older than it.
