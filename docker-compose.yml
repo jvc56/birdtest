@@ -116,6 +116,10 @@ services:
       # own from SSM.
       SESSION_SIGNING_KEY: 00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
       SECURE_COOKIES: "false"
+      # /api/dev/login: signs a browser in as any account by name, no
+      # password, so scripts/dev.py opens the site signed in. The local stack
+      # only; the backend refuses it beside SECURE_COOKIES=true.
+      DEV_LOGIN: "true"
       # Confirmation codes and reset links go to this container's stdout:
       #   docker compose logs -f backend
       # The third backend, `file`, writes one file per message into

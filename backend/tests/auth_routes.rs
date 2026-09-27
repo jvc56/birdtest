@@ -784,6 +784,51 @@ async fn a_reset_token_is_single_use_spent_by_any_reset_and_expires() {
     assert_eq!(login(&app, "resetter", NEW_PASSWORD).await.status, StatusCode::OK);
 }
 
+/// A-AUTH-13: with `DEV_LOGIN` -- the local compose stack's, and nowhere
+/// else's -- `GET /api/dev/login` signs the browser in as an account by name
+/// and sends it to a path on this site; an unknown name is a 404, and
+/// anything but a path goes to `/`. Without it the route does not exist.
+#[tokio::test]
+async fn the_dev_login_signs_a_browser_in_only_where_it_is_enabled() {
+    let db = TestDb::new().await;
+    let user = confirmed_user(&db, "tester", PASSWORD).await;
+
+    let closed = birdtest::app(db.state().await);
+    let response = send_raw(&closed, get_request("/api/dev/login?username=tester", &[])).await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "{response:?}");
+    assert!(response.headers.get(SET_COOKIE).is_none());
+
+    let mut cfg = db.config();
+    cfg.dev_login = true;
+    let app = birdtest::app(db.state_with(cfg).await);
+    let response = send_raw(&app, get_request("/api/dev/login?username=TESTER&next=/jobs", &[])).await;
+    assert_eq!(response.status, StatusCode::SEE_OTHER, "{response:?}");
+    assert_eq!(response.headers.get("location").unwrap(), "/jobs");
+    let cookies: Vec<String> = response
+        .headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .map(|c| c.to_str().unwrap().split(';').next().unwrap().to_string())
+        .collect();
+    assert!(cookies.iter().any(|c| c.starts_with("birdtest_csrf=")), "{cookies:?}");
+    let session = cookies.iter().find(|c| c.starts_with("birdtest_session=")).unwrap();
+    let (status, me) = send(&app, get_request("/api/me", &[("cookie".into(), session.clone())])).await;
+    assert_eq!(status, StatusCode::OK, "{me}");
+    assert_eq!(me["id"], serde_json::json!(user));
+
+    for next in ["//evil.example/", "/\\evil.example", "https://evil.example/"] {
+        let path = format!("/api/dev/login?username=tester&next={}", utf8(next));
+        let response = send_raw(&app, get_request(&path, &[])).await;
+        assert_eq!(response.headers.get("location").unwrap(), "/", "{next}");
+    }
+    let response = send_raw(&app, get_request("/api/dev/login?username=nobody", &[])).await;
+    assert_eq!(response.status, StatusCode::NOT_FOUND, "{response:?}");
+}
+
+fn utf8(s: &str) -> String {
+    percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
 /// A-AUTH-10: logging out removes the session cookie from the browser -- the
 /// removal names the path the cookie was set on, or a browser keeps the
 /// original -- and the browser is then no longer signed in.

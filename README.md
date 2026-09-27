@@ -86,7 +86,8 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 ./scripts/dev.py --workers 6                  # six contributors instead of two
 ./scripts/dev.py --workers 1 --threads 12     # one contributor, more threads each
 ./scripts/dev.py --job-type games             # seed a plain games job
-./scripts/dev.py --no-browser                 # SSH sessions and CI
+./scripts/dev.py --no-browser                 # SSH sessions and CI (prints the sign-in link)
+./scripts/dev.py --login-as alice             # open the site signed in as another account
 ./scripts/dev.py --hot-reload                 # add the Vite dev server on :5174
 ./scripts/dev.py --no-up --no-seed            # attach contributors to a stack already running
 ./scripts/dev.py --rebuild --reset-db         # after a schema change: new images, fresh database
@@ -118,6 +119,8 @@ them. Add `--rebuild` when the images predate the change.
 | `--down` | off | Stop the stack on exit instead of leaving it up |
 | `--no-seed` | off | Skip seeding (the stack already has an active job) |
 | `--no-up` | off | Assume the stack is already running |
+| `--login-as` | the seeded admin (`--username`) | Open the site signed in as this account |
+| `--no-login` | off | Open the site signed out |
 
 Each contributor gets its own directory under `--workdir`, holding its
 `contribute.txt`, a `contribute.log`, and a symlink to your data directory
@@ -129,6 +132,12 @@ that identity, and only while the database still has it: after `--reset-db`
 or a restore a worker is issued a new one instead of being refused. Watch one
 with `tail -f .dev-workers/worker-01/contribute.log`; when one exits, `dev.py`
 prints the last line of its log (MAGPIE exits 0 on errors too).
+
+The site opens signed in, as the seeded admin unless `--login-as` names
+another account: through `/api/dev/login`, a sign-in without a password that
+the local stack enables (`DEV_LOGIN` in `docker-compose.yml`) and the backend
+refuses anywhere cookies are secure. A stack built before it needs
+`--rebuild` once.
 
 Ctrl-C stops the contributors and leaves the stack up, so the site stays
 browsable; `--down` tears it down instead.

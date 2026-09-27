@@ -35,6 +35,7 @@ import time
 import webbrowser
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import quote
 
 import requests
 
@@ -400,6 +401,12 @@ def build_parser() -> argparse.ArgumentParser:
     seeding.add_argument("--password", default="devpassword123!")
     seeding.add_argument("--email", default="dev@example.invalid")
 
+    signin = parser.add_argument_group("signing in")
+    signin.add_argument("--login-as", default=None, metavar="USER",
+                        help="open the site signed in as this account (default: the seeded "
+                             "--username, the admin)")
+    signin.add_argument("--no-login", action="store_true",
+                        help="open the site signed out")
     parser.add_argument("--no-browser", action="store_true",
                         help="do not open a browser (for SSH sessions and CI)")
     return parser
@@ -469,8 +476,15 @@ def main() -> int:
         return lines[-1] if lines else "(no output)"
     log(f"{args.workers} MAGPIE contributor(s) running against {api_url}")
 
+    # Signed in through the stack's dev-only sign-in (DEV_LOGIN in
+    # docker-compose.yml), which sets the session and sends the browser on.
+    open_url = site_url
+    if not args.no_login:
+        user = args.login_as or args.username
+        open_url = f"{site_url}/api/dev/login?username={quote(user)}&next=/"
+        log(f"signed in as {user}: {open_url}")
     if not args.no_browser:
-        webbrowser.open(site_url)
+        webbrowser.open(open_url)
     log(f"birdtest is at {site_url} — Ctrl-C to stop the contributors")
 
     stopping = False

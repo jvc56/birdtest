@@ -36,7 +36,12 @@ use tower_http::trace::TraceLayer;
 
 /// Every route the server answers, with its state attached.
 pub fn app(state: state::AppState) -> Router {
-    Router::new()
+    let mut router = Router::new();
+    // The local stack's sign-in without a password; absent everywhere else.
+    if state.cfg.dev_login {
+        router = router.nest("/api/dev", routes::auth::dev_router());
+    }
+    router
         .route("/health", get(|| async { "ok" }))
         .nest("/api/worker", routes::worker::router())
         .nest("/api/auth", routes::auth::router())

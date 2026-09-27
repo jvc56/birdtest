@@ -1417,6 +1417,7 @@ start. The process has no SSM code path of its own.
 | `BIND_ADDR` | `0.0.0.0:8080` | An IP address and port; a host name fails startup. |
 | `SESSION_TTL_SECONDS` | `604800` (7 days) | 60 to 31,536,000 (a year); anything else fails startup. |
 | `SECURE_COOKIES` | `false` | `true` in any deployment served over TLS. |
+| `DEV_LOGIN` | `false` | `true` mounts `GET /api/dev/login?username=…[&next=/path]`, which signs a browser in as any account by name with no password; the local compose stack sets it, so `scripts/dev.py` opens the site signed in. Refused with `SECURE_COOKIES=true`, so no deployment can run with it. |
 | `MAIL_BACKEND` | `console` | `console`, `ses`, or `file` — the end-to-end suite's, never production: each mail written to `MAIL_OUTBOX_DIR`, which it requires. Anything else fails startup. |
 | `MAIL_OUTBOX_DIR` | unset | The `file` backend's directory. |
 | `MAIL_FROM` | `no-reply@birdtest.local` | Required under `ses`: the default is only for local use, and SES refuses it. |

@@ -4,9 +4,10 @@ use crate::extract::ApiJson;
 use crate::error::{AppError, AppResult};
 use crate::ratelimit;
 use crate::state::AppState;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::routing::post;
+use axum::response::Redirect;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use chrono::{Duration, Utc};
@@ -29,6 +30,51 @@ pub fn router() -> Router<AppState> {
         // Every body here is a few short strings; axum's default 2 MB let a
         // caller send a megabyte-long "username" to every limiter keyed on one.
         .layer(axum::extract::DefaultBodyLimit::max(SMALL_BODY_BYTES))
+}
+
+/// Mounted at `/api/dev` only when `DEV_LOGIN=true` (`crate::app`).
+pub fn dev_router() -> Router<AppState> {
+    Router::new().route("/login", get(dev_login))
+}
+
+#[derive(Deserialize)]
+struct DevLoginQuery {
+    username: String,
+    /// Where to go once signed in: a path on this site; anything else is `/`.
+    next: Option<String>,
+}
+
+/// `GET /api/dev/login?username=<name>[&next=/path]`, for the local stack
+/// only (`DEV_LOGIN`): signs the browser in as the account, with no password,
+/// exactly as a sign-in does -- a session and a CSRF cookie -- and sends it
+/// on. `scripts/dev.py` opens the site through it, so a developer starts
+/// signed in.
+async fn dev_login(
+    State(state): State<AppState>,
+    Query(query): Query<DevLoginQuery>,
+    jar: CookieJar,
+) -> AppResult<(CookieJar, Redirect)> {
+    let row: Option<(Uuid, String, bool, i32)> = sqlx::query_as(
+        "SELECT id, username, is_admin, session_generation
+         FROM users WHERE lower(username) = lower($1) AND deleted_at IS NULL",
+    )
+    .bind(query.username.trim())
+    .fetch_optional(&state.pool)
+    .await?;
+    let Some((id, username, is_admin, generation)) = row else {
+        return Err(AppError::not_found("no account by that name"));
+    };
+    let token = session::issue(&state.cfg, id, &username, is_admin, generation)?;
+    let jar = jar
+        .add(session_cookie(&state, token))
+        .add(csrf_cookie(&state, csrf::generate_token()));
+    // A path here, never another site: `//host` and `/\host` are other sites
+    // to a browser.
+    let next = query
+        .next
+        .filter(|n| n.starts_with('/') && !n.starts_with("//") && !n.contains('\\'))
+        .unwrap_or_else(|| "/".to_string());
+    Ok((jar, Redirect::to(&next)))
 }
 
 const MIN_PASSWORD_SCORE: u8 = 3;
