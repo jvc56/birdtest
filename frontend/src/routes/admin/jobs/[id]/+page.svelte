@@ -532,11 +532,17 @@
                 {#if jobExport.download_url}
                   · <a href={jobExport.download_url}>download</a>
                 {/if}
+                {#if jobExport.sha256}
+                  · SHA-256 <code class="break-all text-xs">{jobExport.sha256}</code>
+                {/if}
                 {#if jobExport.positions_row_count !== null}
                   · {jobExport.positions_row_count.toLocaleString()} captured positions ·
                   {megabytes(jobExport.positions_bytes)}
                   {#if jobExport.positions_download_url}
                     · <a href={jobExport.positions_download_url}>download positions</a>
+                  {/if}
+                  {#if jobExport.positions_sha256}
+                    · SHA-256 <code class="break-all text-xs">{jobExport.positions_sha256}</code>
                   {/if}
                 {/if}
                 {#if jobExport.download_url}(links valid for an hour){/if}

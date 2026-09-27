@@ -70,8 +70,8 @@ at tier 5 names a symptom.
 |---|---|---|
 | 1 Unit | 213 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (10), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 120 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 158 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (8), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 200 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (40), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 2 Integration | 160 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
+| 3 API | 211 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (51), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 600 backend tests (the per-tier counts above are
+--run-ignored all` runs 613 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -975,29 +975,92 @@ The single most important group. Every entry is about a decision made in SQL.
   taking all twelve; and issuing a claim stamps `jobs.last_claimed_at`, which
   is what "served" reads. *(Covered:
   `admin_api::a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity`.)*
-- `I-SCHED-3c` **Parity is with the leader.** A newcomer joins level with the
-  highest ratio among the jobs being served, not the lowest: beside a veteran
-  and a games job at its cap that reissued a task a minute ago (served, and
-  standing still), it splits the next 900 claims 2:1 with the veteran rather
-  than taking the first 500 in a row. *(Covered:
-  `admin_api::a_newcomer_joins_level_with_the_leader_not_a_job_that_has_stopped`.)*
-  (Thirty-second audit, pass 19.)
+- `I-SCHED-3c` **A job with nothing to hand out does not set parity.** A
+  games job at its cap, its one task in flight, is served and stands still;
+  each claim that passes it over lifts it level with the job claimed
+  (`scheduler::lift_passed_over`), so the newcomer, joining at the lowest
+  served ratio and settling against the lowest of each worker's other
+  candidates, splits the next 900 claims 2:1 with the veteran, the veteran's
+  first claim within twelve (without the lift, it fails). *(Covered:
+  `admin_api::a_newcomer_is_not_put_level_with_a_job_that_has_run_out_of_work`.)*
+  (Thirty-second audit, passes 19 and 20.)
 - `I-SCHED-3d` After a quiet spell (no job has claimed within the heartbeat
-  timeout), a newcomer still joins level with the leader, not a job nobody can
-  run: 6/6 with the veteran, where it took 12 of 12. *(Covered:
-  `admin_api::after_a_quiet_spell_a_newcomer_still_joins_level_with_the_leader`.)*
-- `I-SCHED-3e` **No job's lag grows without limit.** In a split fleet — 30%
-  of claims from workers that can run only an old-floor job at 10%, which then
-  leads — a newcomer at 40% beside the majority's lagging job gets its share
-  of the next 1,000 claims (200 to 350; with lags unbounded and joins at the
-  leader it got none). *(Covered:
+  timeout of now), "served" is measured from the latest claim, so a newcomer
+  still joins level with the veteran, not a job nobody can run: 6/6, where it
+  took 12 of 12. *(Covered:
+  `admin_api::after_a_quiet_spell_a_newcomer_still_joins_level_with_the_jobs_served`.)*
+- `I-SCHED-3e` **A newcomer is not starved behind a lagging job.** In a split
+  fleet — 30% of claims from workers that can run only an old-floor job at
+  10%, which then leads — a newcomer at 40% beside the majority's lagging job
+  gets its share of the next 1,000 claims (200 to 350; joined at the leader it
+  got none). *(Covered:
   `admin_api::in_a_split_fleet_a_newcomer_is_not_starved_behind_a_lagging_job`.)*
 - `I-SCHED-3f` A job only a minority can run lags while served; a newcomer the
   same minority can run gets its share (50 to 120 of that minority's 200
   claims; it got none). *(Covered:
   `admin_api::a_minority_newcomer_is_not_starved_behind_a_lagging_minority_job`.)*
-  (Thirty-second audit, pass 19: the join at the leader and the lag window
-  together — each alone failed one of I-SCHED-3c to 3f.)
+- `I-SCHED-3g` **A job nobody could run does not bank what it missed.** Unserved
+  for a heartbeat timeout (a MAGPIE floor nobody met for an hour), it rejoins
+  at parity on its first claim back (`scheduler::issue_claim`): the veteran
+  gets 19 to 21 of the next 40 claims, where it got none. *(Covered:
+  `admin_api::a_job_nobody_could_run_rejoins_at_parity_when_the_fleet_can`.)*
+- `I-SCHED-3h` **Jobs that lag together keep their shares.** Two jobs at 45%
+  that half the fleet runs, beside a 10% job the other half can only run,
+  split their half evenly (490 to 510 of 1,000 each), where bounding each lag
+  against the job just claimed gave 978 : 22. *(Covered:
+  `admin_api::jobs_lagging_together_keep_their_shares`.)*
+- `I-SCHED-3i` **A concurrent burst is paid back.** Thirty-two workers claiming
+  at once over a 1% and a 99% job: the 1% job gets at most 45 of about 3,000
+  claims (fair is 30; 31 or 32 in practice), where forgiving the lag made it
+  64 to 87. *(Covered:
+  `admin_api::a_concurrent_burst_to_a_small_job_is_paid_back`.)*
+- `I-SCHED-3j` **A newcomer is settled level with each class that runs it.** In
+  a fleet where a job at 40% only the 20% of claims from MAGPIE 2 can run lags
+  the job at 50% everyone runs, a newcomer everyone can run, joining at the
+  lowest served ratio — the minority job's — is lifted level with the
+  majority's job by the majority's first claim of it: the majority job gets
+  its first claim within twelve and 640 to 690 of the majority's 800, where
+  the newcomer took claims until the 331st. *(Covered:
+  `admin_api::a_newcomer_everyone_can_run_is_not_put_level_with_a_minority_job`.)*
+- `I-SCHED-3k` An allocation changed in the same split (20% to 19%) is a join
+  and settles the same way: 515 to 570 of 800 to the job at 40%, where its
+  first claim came 476th. *(Covered:
+  `admin_api::an_allocation_changed_in_a_split_fleet_takes_nothing_over`.)*
+- `I-SCHED-3l` A job nobody could run for an hour, returning in the same
+  split, rejoins and settles: 640 to 690 of 800 to the majority's job, where
+  its first came 331st. *(Covered:
+  `admin_api::a_returning_job_in_a_split_fleet_takes_nothing_over`.)*
+- `I-SCHED-3m` A job passed over for a moment is lifted to where the job
+  claimed stood before its claim: a 50% job passed over while a 1% job was
+  claimed takes its next turn at once and 140 to 160 of the next 300, where
+  it waited 49 claims. *(Covered:
+  `admin_api::a_job_passed_over_for_a_moment_waits_for_nothing`.)*
+- `I-SCHED-3n` **A job with nothing to hand out banks no debt.** Held for 200
+  claims beside a job at the same share, it does not take the claims after
+  the hold in a row: the other job's first comes within three. *(Covered:
+  `admin_api::a_job_with_nothing_to_hand_out_banks_no_debt`.)*
+- `I-SCHED-3o` **A burst is paid back in a job's first hour too.** The jobs of
+  3i activated through the endpoint, so both are settling: the 1% job gets at
+  most 40 (30 in practice), where settling forgave the payback of a burst —
+  307 to 324 — until each claim was checked for its turn under the job's
+  dispatch lock. *(Covered:
+  `admin_api::a_burst_in_the_first_hour_is_paid_back`.)*
+- `I-SCHED-3p` **A decline undoes the settling.** A newcomer only the minority
+  has the data for, declined `missing_data` through the endpoint by each
+  majority worker it is issued to, gets 60 to 100 of the minority's 400
+  claims (fair 80), where the majority's claims settled it past the
+  minority's own job and it got none. *(Covered:
+  `admin_api::a_newcomer_the_majority_declines_is_not_settled_at_its_pace`.)*
+- `I-SCHED-3q` A newcomer settles against the lowest of the worker's other
+  candidates, those just passed over included: with the minority's own job
+  paused for one claim it still gets 80 to 120 of the minority's 200, where
+  it was settled past the paused job and got none. *(Covered:
+  `admin_api::a_newcomer_is_not_settled_past_a_job_paused_for_a_moment`.)*
+  (Thirty-second audit, pass 20: the lag window removed, joining settled,
+  claims checked for their turn. Each rule switched off fails its own tests:
+  the settling 3j, 3k and 3l; the rejoin 3g and 3l; the pass-over lift 3c and
+  3n; the turn check 3o; the undoing on a decline 3p; the lowest-other pace
+  3q. On pass 20's first design, 3j to 3m fail; on its second, 3o to 3q.)
 - `I-SCHED-4` Abandoned claims count toward a job's share. Abandon many claims
   on one job and confirm its share does **not** grow — excluding them would let
   a job with flaky workers accumulate more than its share. The counter is
@@ -1706,6 +1769,21 @@ runs against a real MinIO.
   tested separately.)* (Thirty-first audit:
   each hang-up left Postgres building the whole corpus on a connection no cap
   counted; ten held a ten-connection pool, and every claim timed out.)
+- `I-EXPORT-10` A results stream is complete exactly when it ends cleanly: a
+  corpus query the database ends part-way (`pg_terminate_backend` after the
+  first frame) ends the body in an error, where it ended as a finished
+  download after 869 of 150,000 records. *(Covered:
+  `exports::a_stream_the_database_cuts_off_ends_in_an_error`. The connection
+  and a completed leave job's settle are taken before the response head, so
+  their failures are a status; not tested separately.)* (Thirty-second audit,
+  pass 20.)
+- `I-EXPORT-11` An export that fails after writing its objects removes them:
+  with marking the row ready made to fail (a trigger), the row says `failed`
+  and the store holds nothing, where both objects were left for the
+  thirty-day rule. *(Covered:
+  `exports::an_export_that_fails_after_uploading_removes_its_objects`. A
+  multipart upload that fails to complete is aborted, and a row that says
+  `ready` after all keeps its objects; not tested separately.)* (Thirty-second audit, pass 20.)
 
 ### `I-DATA-*` — the pinned-row invariant
 

@@ -79,7 +79,7 @@ Every job type generates its tasks **on demand**: the next task request is gener
 1. The worker sends a **task claim** to the server — a minimal message identifying itself and signaling it is ready for work.
 2. The system selects the active job **most behind its configured allocation share** — specifically, among active jobs with an allocation above 0%, the one with the lowest ratio of `(claims_issued - claims_baseline) / allocation`, where `jobs.claims_issued` counts every claim ever issued for that job, **including abandoned and declined ones** — a claim consumed real dispatch capacity at the moment it was issued regardless of what happened to it afterward, so the count only ever goes up (a purge, which deletes the claims it counts, resets it). It is a counter rather than a `COUNT(*)` over `task_claims` because selection runs on every claim request, and a count grows with each job's whole history. Excluding abandoned claims would let a job with flaky or slow workers accumulate a disproportionate share by having its timeouts discounted, and would make the count non-monotonic — the opposite of what the deficit-based scheduler needs. Ties are broken by job creation order (oldest first). This is a deterministic deficit-based selection; no randomness is involved.
 
-   **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on activation, which is also how an allocation is changed, and on a purge — so that the job's ratio equals the **highest ratio among the other jobs being served** (`scheduler::join_at_parity`): it joins level with the leader and takes its share from then on, never ahead of anyone being served. And **no job's lag is kept past a window** — 400 claims of the whole fleet, in ratio units the same for every job: each claim lifts any job lagging the one it is from by more than that to the window (`scheduler::bound_lag`, in the claim's transaction, skipping a row somebody holds). Both halves were needed (the thirty-second audit's pass 19): level with the job furthest *behind*, a newcomer took every claim until it had caught the leader whenever that job had stopped moving (a job at its cap reissuing one lapsed task is "served" and stands still: 500 claims in a row to the newcomer, the veteran none); level with the leader but with lags unbounded, a newcomer starved behind every job that lagged for as long as the fleet had been split — a job only the workers on an older MAGPIE can run leads, the job the rest run lags without limit, and a newcomer got none of the next 1,000 claims. A job still owed work it could not take is favoured until it has had its window, and then runs level; a window counted in each job's own claims instead pinned lagging jobs at different distances behind the leader, and the smallest allocation, pinned lowest, took every claim. *Being served* is narrower than *offering work*, and the difference matters: a job can be active and above 0% and still stand still — its derived files are building or failed, it is pinned to data the fleet does not have yet, its MAGPIE floor is above what the workers run, its generation is mid-transition — and its ratio does not move while the others' climb. Put level with *that* job, a newcomer was, for every worker that could not run the lagging one, first in the list until it had caught up with the jobs that were running: a veteran at 100,000 claims, a job nobody could run at zero, and a newcomer took twelve of the next twelve claims. So a job counts toward parity only if it issued a claim within the heartbeat timeout — `jobs.last_claimed_at`, which rides the `UPDATE jobs` every claim already makes — and when no job has (a quiet server, the first activation in a while) every job on offer counts — the leader among them, not a job nobody can run. A job only a *minority* of the fleet can run is served, recently, and still lags; joined at the leader, a newcomer is no longer ahead of the majority's jobs because of it. This is start-time fair queuing's rule, and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level); ratios never are. A job that stays a candidate but hands out nothing for a long stretch — waiting on a derived-file build, or on workers that can run it — returns behind its share by at most the window and is favoured until it has had it; re-activating it forgives even that if an admin would rather.
+   **A job's share is measured from when it joined, not from when it was created.** `jobs.claims_baseline` is reset — on activation, which is also how an allocation is changed, and on a purge — so that the job's ratio equals the **lowest ratio among the other jobs being served** (`scheduler::join_at_parity`), and it takes its share from then on. *Being served* means a claim issued within the heartbeat timeout of the most recent claim of any other job on offer — `jobs.last_claimed_at`, which rides the `UPDATE jobs` every claim already makes — measured from the latest claim rather than from now, so after a quiet spell (a deployment gap, a quiet night) the jobs that were being served when the fleet stopped still set the pace; with no other job ever claimed, the highest ratio on offer, or zero. Joining is then **settled**: for an hour after it joined (`scheduler::JOIN_SETTLE`, from `jobs.activated_at`, which every join sets), each claim of the job lifts it level with the lowest of the claiming worker's other candidates — the ones it just passed over included — less one claim of that job and one of this one, the slack the turn check allows (`scheduler::issue_claim`, `pace_for`). A worker that declines the job because it cannot run it at all (`missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`) undoes the settling its claim gave (`scheduler::unsettle`): the server cannot filter a data gap, so every worker without the job's data is issued one claim of it, and that claim had settled a job only a minority could run at the majority's pace — past the minority's own lagging job, where the minority never reached it (none of 400 claims). Two more rules keep a job with nothing to hand out from banking debt: **a job passed over for want of a task is lifted to where the job the worker claims stood before its claim** (`scheduler::lift_passed_over`, after the claim commits, skipping a row somebody holds) — a games job whose every game is in flight, a generation being built, a held dispatch lock — and **a job not served for a heartbeat timeout rejoins at parity on its first claim back, which starts its settling** (`scheduler::issue_claim`) — one whose MAGPIE floor was above the fleet's, whose data was not out. Every one of these only ever raises a job's ratio. The reason for the two steps is that a fleet split by capability — a release rolling out, data some workers lack — has no single pace: each class of workers runs its jobs at its own rate, and a job only some can run lags the rest for as long as the split lasts. That lag is the scheduler working (the minority's job gets all of the minority), but it means no one join point is right. What each single point did (the thirty-second audit, passes 19 and 20): level with the lowest of *every* job on offer, a newcomer was level with a job nobody could run and took twelve of the next twelve claims; level with the *leader*, a newcomer only the lagging class could run starved behind that class's job — none of the next 1,000 claims; bounding every job's lag behind the job just claimed to make up for that scrambled the jobs that lagged together (two at 45% split 978 : 22) and made a concurrent burst to a small job permanent (64 to 87 claims where 30 is fair); and level with the lowest *served*, a newcomer everyone could run was level with a job only a minority could run and took the majority's claims until it had caught theirs — the majority job's first claim came 331st, and an allocation changed from 20% to 19% did the same. Settled against the next candidate only, a job that paused for one claim let a newcomer be settled past it; and settling forgave the payback of a concurrent burst (307 to 324 claims where 30 is fair) until claims were checked for their turn. Joined at the lowest served, a job is below no class's pace, so it is never starved; settled, the first claim from each class that runs faster puts it level with that class's jobs, so it takes nothing over; and a structural lag is never lifted, because within the class that runs it a lagging job keeps pace. The limits of the hour and of the lift are KL-89. This is start-time fair queuing's rule — a flow that (re)joins starts at the current virtual time, of the workers that will serve it, and a flow with nothing to send earns no credit — and it is what makes "no starvation" true. Measured over a job's whole life, as it was, every change to the set of jobs was a takeover: a job activated beside one that had issued two million claims had a ratio of zero, so it was first in every candidate list until it had issued two million of its own, and the older job — at the same 50% — got *nothing* for as long as that took. A purge (which zeroes `claims_issued`), a reactivation after a week switched off, and an allocation raised from 10% to 50% (which cuts the ratio to a fifth) all did the same. With the baseline, the shares an admin sets are the shares the fleet sees from that moment, selection is still one deterministic statement, and the long-run ratios still converge on the allocations, because every job's numerator counts from the same point in the fleet's history. The baseline can be negative (a job with no claims joining a busy fleet is credited the claims that put it level).
 3. Expired claims for the candidate jobs are lazily reclaimed, in one statement: each timed-out `task_claims` row is flipped to `abandoned`, `active_claim_count` is decremented, and tasks that were at capacity return to `available`. A claim somebody holds locked — a submission, a decline, a purge — is skipped rather than waited on (`FOR UPDATE SKIP LOCKED`): it is not lapsed in any sense that matters, and the next claim request reclaims it if it still needs to be.
 4. The system acquires the next task (one being re-dispatched, or else one generated on demand), inserts a `task_claims` row, increments `active_claim_count`, and issues a claim token (UUID) to the worker.
 5. The server responds with the **task request** for that job type.
@@ -1453,7 +1453,7 @@ what the workers are checked against.
 | Batch Bradley-Terry instead of incremental Elo/Glicko | Player configs have fixed strength, so there is no drift for a sequential filter to track; a batch fit is order-independent and makes add/remove a refit rather than an unwind |
 | Named `player_configs` table | Reusable across jobs; maps directly to MAGPIE per-player arguments (`-r1`/`-r2`, `-s1`/`-s2`, etc.); **immutable once created** — no update endpoint exists; deletion only if no job references the config |
 | Frontend dark mode only | Single theme simplifies the component library configuration; no light/dark toggle in v1 |
-| Deficit-based job selection, measured from when a job joins | Deterministic; guarantees long-run allocation accuracy — as a share of claims, not of worker time (KL-88) — regardless of claim timing; no randomness means reproducible behavior. No starvation of any job above 0% — which holds because a job's deficit is measured from a baseline reset to parity on activation, allocation change and purge (`claims_baseline`), not over its lifetime: a lifetime deficit let a newly activated job take every claim until it had issued as many as the oldest job beside it |
+| Deficit-based job selection, measured from when a job joins | Deterministic; guarantees long-run allocation accuracy — as a share of claims, not of worker time (KL-88) — regardless of claim timing; no randomness means reproducible behavior. No starvation of any job above 0% — which holds because a job's deficit is measured from a baseline reset to parity on activation, allocation change and purge (`claims_baseline`), not over its lifetime, and a job with nothing to hand out is lifted to parity rather than banking debt (`scheduler::lift_passed_over`, `issue_claim`): a lifetime deficit let a newly activated job take every claim until it had issued as many as the oldest job beside it |
 | Seed gap of batch size | Keeps task seeds unique and ordered, `next_seed = MAX(seed) + batch_size`; a batch's games are drawn from a stream seeded with its task's seed, so no two tasks share them |
 | Ratings pooled across jobs, scoped by (variant, letterdist, layout) | A rating is only comparable under fixed conditions, but it is not a property of one job; pooling is what lets a config's whole record produce one number |
 | Only paired jobs feed ratings | `-gp` swaps seats on every seed, so a pair is side-balanced; unpaired games would need an explicit side-advantage term to avoid biasing every rating |
@@ -2227,6 +2227,8 @@ The core of birdtest is the task claim endpoint — the sequence that runs every
    ORDER BY (j.claims_issued - j.claims_baseline)::float / j.allocation ASC, j.created_at ASC
    ```
 
+   **Each candidate is checked for its turn when its claim holds the job's dispatch lock** (`scheduler::try_claim_from_job`): its ratio, as committed then, must not be more than one of that job's claims past any of the worker's other candidates still in play. Claims arriving together read the same list and all land on its first job; for a job at 1% each is a whole ratio unit, and 32 concurrent claims put it 32 units ahead, paid back only slowly and forgiven by anything that lifts a job that lags. A claim that is not the job's turn goes on to the next candidate, and one that finds every job with work outrun or busy reads the list again (up to eight times, then `Idle`). The one claim of slack is what concurrency needs — with none only the lowest job could be claimed, and a fleet claiming together went idle a third of the time — and it is the rival's claim, so a 99% job can run a 1% claim ahead and the 1% job a hundredth.
+
 3. **Lazy reclamation**: Before acquiring a task, any claimed tasks whose `last_heartbeat_at` (or `claimed_at`, if no heartbeat has been received yet) exceeds the heartbeat timeout are returned to `available`. One statement covers every candidate job rather than one per job: no index on `task_claims` leads with the job, so the planner reaches expired claims through the partial index on open claims — one entry per claim in flight across the fleet — and filters by job afterwards. Per job, a claim request paid that scan once per candidate for a set of rows that does not depend on the job at all. Skipped entirely while the process is younger than the heartbeat timeout — see [Task States](#task-states) for why a restarted server has to hear from the fleet before it judges it.
 
 4. **Task acquisition** — strategy-dependent:
@@ -2325,8 +2327,9 @@ the task's row lock, instead of reading the request row and the player config
 again.
 
 **The wait for it is bounded** (`lock_timeout`, two seconds), and a claim that
-gives up treats the job as having nothing right now and tries the next
-candidate. Ordinary contention is milliseconds, so this is never reached in
+gives up tries the next candidate — without treating the job as having
+nothing to hand out: a busy job is not lifted as passed over, and a claim that
+finds nothing else goes round again (`registry::Acquired::Busy`). Ordinary contention is milliseconds, so this is never reached in
 normal operation; it exists for the one holder that is not ordinary. Seeding a
 leave generation's rack universe is millions of rows and tens of seconds, and
 the task seeding it holds this lock throughout — so without a bound every
@@ -4853,7 +4856,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged, or the failure reason. |
 | `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged new and changed (collision) rows, in one transaction. |
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
-| `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. `?positions=true` (games and game-pairs jobs) streams the positions the job captured instead of its result rows. At most two run at once; a completed job with a ready export gets a `303` to it instead. |
+| `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. `?positions=true` (games and game-pairs jobs) streams the positions the job captured instead of its result rows. At most two run at once (a third gets `429`); a completed job with a ready export gets a `303` to it instead. A stream is complete exactly when it ends cleanly: what can fail before the first row (a connection, a leave job's settle) is a status, and a query that fails part-way cuts the body off with an error rather than ending it, which a client reports as a failed transfer. |
 | `POST` | `/api/admin/jobs/:id/export` | Build a **completed** job's results into one gzipped NDJSON object in the artifact store. `202` with an id; the work runs on a background task. `409` for a job that is not completed, or whose last claims are still in flight. |
 | `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready — and, for a games or game-pairs job that captured positions, a `positions_download_url` for the second object holding them. |
 | `GET` | `/api/admin/workers` | The contributor list with anonymous workers' real UUIDs, which banning one needs; the public list carries pseudonyms only. |
@@ -4995,7 +4998,7 @@ because the intermediate states an admin passes through while rebalancing would
 violate a constraint even when the end state is fine. The error names how much
 room is left. An allocation of 0 is accepted and means what inactive means: the
 job is offered to nobody until it is raised. Activation also resets the job's
-`claims_baseline`, so it joins level with the leader among the jobs being served rather than
+`claims_baseline`, so it joins level with the lowest among the jobs being served rather than
 with a lifetime deficit to work off at the others' expense — and since
 activating an active job is how its allocation is changed, a changed share
 takes effect from that moment rather than being applied retroactively to every
@@ -5788,11 +5791,14 @@ CREATE TABLE jobs (
     -- Where this job's share is measured *from*. The scheduler orders on
     -- `(claims_issued - claims_baseline) / allocation`, and the baseline is
     -- reset -- on activation, on an allocation change, on a purge -- so that
-    -- the job's ratio equals the highest ratio among the other jobs being
+    -- the job's ratio equals the lowest ratio among the other jobs being
     -- served (see `last_claimed_at` below): it joins at parity and takes its
-    -- share from then on. Every claim also lifts any job lagging the one it
-    -- is from by more than 400 claims of the whole fleet to that lag
-    -- (`scheduler::bound_lag`), so no job's debt grows without limit.
+    -- share from then on; for an hour after joining (`activated_at`), each
+    -- claim of it lifts it level with the claiming worker's next candidate.
+    -- A job a claim passes over for want of a task is lifted level with the
+    -- job claimed, and a job unserved for a heartbeat timeout rejoins at
+    -- parity on its next claim, so a job with nothing to hand out banks no
+    -- debt (`scheduler::lift_passed_over`, `issue_claim`).
     --
     -- Without it the deficit was measured over a job's whole life, so a job
     -- activated today beside one that had issued two million claims took
@@ -8366,8 +8372,7 @@ says so in its implemented option, rather than being removed.
   the job with the longer tasks holds nearly every worker: two jobs at 50/50
   with tasks of 30 and 1 time units split claims 750/750 and worker time
   96.8% / 3.2% (the real `scheduler::claim`, twenty workers in simulated time).
-  Also: a job that lags keeps its debt up to the lag window (400 claims of the
-  whole fleet), and is favoured until it has had it; and a leave job
+  Also: a leave job
   whose generation-0 KLV could not be built starts a new build on every claim
   that reaches it, with no backoff (the derived builds and templates have one).
   The decline skip covers MAGPIE's hand-back on `stop` (sent as
@@ -8389,6 +8394,37 @@ says so in its implemented option, rather than being removed.
 - **Justification:** A cost estimate per job type is a design of its own, and
   wrong estimates would bend shares as badly; comparable task sizes are in the
   admin's hands today.
+
+**KL-89. A job settles for an hour after joining, and a pass that is one worker's lifts it.**
+- **Context:** `scheduler::join_at_parity`, `issue_claim`, `unsettle`,
+  `lift_passed_over` (thirty-second audit, pass 20).
+- **Problem:** A job joins at the lowest ratio among the jobs being served and
+  is settled, claim by claim, level with each class of workers that runs
+  faster. Four gaps remain. A class that makes no claim of it within an hour
+  of its joining -- a few workers on long tasks, a class that comes online
+  later -- is not settled against, and when it does claim it finds the job
+  below its pace and gives it every claim until it has caught up. A worker
+  that cannot run the job but does not say so -- it fails the task
+  (`task_failed`) or vanishes -- leaves the settling its claim gave. And a job
+  is lifted when a worker passes it over for want of a task, which may be that
+  worker's alone -- a task it declined within the hour, a slot of a task it
+  already holds: a job only a minority can run, lagging by design, is lifted
+  each time such a worker passes it over, and loses the priority its lag gave
+  it. Settling also halves, for that hour, the claims of a newcomer only a
+  minority can run beside an older job everyone runs, when the minority's
+  claims come in pairs: the first of a pair goes to the older job on the tie
+  (119 of 200 in the hour, then 200).
+- **Options considered:** a longer settling window (it would settle, too, a
+  job whose lag became structural while it lasted); recording which workers
+  can run which job (the unsupported sets are the client's, and not stored);
+  telling apart, in the handlers, a job with no task for anyone from one with
+  none for this worker.
+- **Option implemented:** None; the rule and its gaps are stated.
+- **Justification:** Every class that can run a newly joined job below its
+  pace claims it at once, so an hour is long; a worker that cannot run a job
+  declines it with a reason, which undoes its settling; and the per-worker
+  lift needs a worker that repeatedly finds nothing it may take in a job
+  others take from.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the

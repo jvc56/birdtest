@@ -22,14 +22,14 @@
 # of code. What it cannot see: an indented (unfenced) code block, `<pre>` or
 # an HTML comment (and a fence inside one throws off how the fences after it
 # pair, so a later block can go unread), a shell block labelled `text`, code
-# after a ` #` inside quotes (read as a comment by the ASCII rule); and a
-# `\ #` anywhere -- in quotes, a word, a heredoc or a comment -- is refused
-# as a continuation it is not (fails safe), a block that turns the pager back on, and a `!`
-# inside double quotes, which an interactive shell expands as history and
-# `bash -n` does not. A fence indented four columns or more is read as one,
-# though a renderer outside a list shows it as indented code. And bash 3.2
-# (macOS's /bin/bash) does not warn of a heredoc never terminated; CI's bash
-# does.
+# after a ` #` inside quotes (read as a comment by the ASCII rule), a block
+# that turns the pager back on, and a `!` inside double quotes, which an
+# interactive shell expands as history and `bash -n` does not. A `\ #`
+# anywhere -- in quotes, a word, a heredoc or a comment -- is refused as a
+# continuation it is not (fails safe). A fence indented four columns or more
+# is read as one, though a renderer outside a list shows it as indented code.
+# And bash 3.2 (macOS's /bin/bash) does not warn of a heredoc never
+# terminated; CI's bash does.
 
 set -Eeuo pipefail
 

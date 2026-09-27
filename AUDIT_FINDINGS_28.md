@@ -170,7 +170,21 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   adversarial check found 1 medium (joining at the leader starved a newcomer
   in a split fleet), fixed by redesign: every claim bounds every job's lag to
   a window, so neither join point can take over or starve (`I-SCHED-3c` to
-  `3f`). KL-87 and KL-88 updated. The loop continues.
+  `3f`). KL-87 updated and KL-88 added. The loop continues.
+- **Pass 20 (follow-up: pass 19's diff, and exports and the results stream):**
+  2 high and 1 medium from the reviewers — pass 19's lag bound scrambled jobs
+  that lagged together (978 : 22) and made a concurrent burst to a small job
+  permanent (83 where 30 is fair); a results stream cut off by the database
+  read as a complete download — all fixed (the bound removed; a failed stream
+  ends in an error, and what can fail before its first row is a status). The
+  two adversarial checks found 3 high and 2 medium in what replaced the bound,
+  each fixed in the pass: a job now joins at the lowest ratio served and
+  settles, for an hour, against each class of workers that claims it; a
+  decline that says a worker cannot run a job undoes that; a job with nothing
+  to hand out is lifted as it is passed over; and each claim is checked for
+  its turn under the job's dispatch lock, so concurrency makes no bursts
+  (`I-SCHED-3c` to `3q`, `I-EXPORT-10`, `11`). KL-89 added. The loop
+  continues.
 
 ---
 
@@ -3064,3 +3078,208 @@ place in its list.
 - `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks.
 - MAGPIE unchanged this pass (8f2f5d75 checked by its reviewer in both build
   flavours, with birdtest's CI contract job replicated).
+
+## Pass 20 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`b569b6d..c95c7d7`), one
+reviewer per part: the scheduler and backend; the frontend, docs and scripts
+(tier 5 natively). MAGPIE is unchanged. Plus one area not examined in this run:
+**exports and the results stream** — the admin's bulk read of a job's corpus.
+
+**Findings: 2 high, 1 medium** from the three reviewers (scheduler and backend
+2 high, 5 low, 4 unconfirmed; frontend, docs and scripts none, 9 low, 1
+unconfirmed; exports 1 medium, 5 low, 1 unconfirmed). All fixed: the two highs
+by removing pass 19's lag bound, and the design that replaced it was redesigned
+after each of two adversarial checks (20.4, 20.5).
+
+### 20.1 High — the lag bound scrambled the jobs that lagged together (scheduler reviewer)
+
+Pass 19's `bound_lag` set every job lagging the claimed one by more than the
+window to exactly the window, which erased the jobs' positions relative to
+each other; ties then went by `created_at`. **Shown** with the real
+`scheduler::claim`: beside a job at 10% half the fleet can only run, two jobs
+at 45% the other half runs split that half **978 : 22** (alternating claims;
+654 : 347 random), and at 10% / 80%, 947 : 53 where 111 : 889 is fair. Without
+the bound, the same runs split exactly by allocation.
+
+### 20.2 High — the lag bound made a concurrent burst to a small job permanent (scheduler reviewer)
+
+Concurrent claims read the same candidate order and land on the lowest job;
+for a job at 1% each claim is a whole ratio unit, so a burst of five put it
+past the window, and the bound then forgave the other job the catching up that
+paid the burst back. **Shown:** 32 workers, 3,000 claims, a 1% and a 99% job:
+the 1% job got **83 and 87** where 30 is fair (31 and 30 without the bound).
+
+**Fix for 20.1 and 20.2 (first design):** `bound_lag` removed; a job joins at
+the *lowest* ratio among the jobs being served, measured within the heartbeat
+timeout of the latest claim rather than of now; a job passed over for want of
+a task is lifted level with the job claimed (`lift_passed_over`); a job
+unserved for a heartbeat timeout rejoins at parity on its first claim back.
+The adversarial check broke this (20.4); the design as committed is there.
+**Verified:** both reviewer cases added as tests, `I-SCHED-3h` (978 : 22 on
+the pass-19 code, 500 : 500 now) and `I-SCHED-3i` (64 to 68 on the
+pass-19 code in this pass's runs, 83 and 87 in the reviewer's; 31 or 32 now);
+`I-SCHED-3g` added (a job nobody could run for an hour came back and, under
+the bound, took all of the next 40 claims — the veteran none; 20 now); `I-SCHED-3c`
+rewritten so its state is reached by real claims (its planted state is not
+reachable once a capped job is lifted as it is passed over).
+
+### 20.3 Medium — a results stream cut off by the database looked complete (exports reviewer)
+
+`GET /api/admin/jobs/:id/results/stream` sends its `200` head before the first
+row. A corpus query the database ended part-way (a failover, an operator's
+`pg_terminate_backend`) was logged and the body ended normally, so curl and
+browsers reported a finished download of a short file; a pool that stayed full
+for the acquire timeout gave an empty one; a completed leave job whose settle
+failed was streamed without its unmerged results. **Shown:** 869 of 150,000
+records, then a clean end (over real HTTP, 3,928, then a clean end; an empty
+`200` after 30 s with the pool held). **Fix:** the settle and the connection
+are taken before the response head, so either failure is a status (`503` when
+busy); a query that fails part-way yields an error, which cuts the body off
+without its closing chunk. PLAN's endpoint table says a stream is complete
+exactly when it ends cleanly. **Verified:** `I-EXPORT-10` fails on the
+committed code and passes; over TCP, reqwest reports an unexpected EOF and
+curl exits 18 (the adversary's run).
+
+### 20.4 Adversarial check of the pass's fixes
+
+**1 high and 1 medium, fixed by a redesign.**
+
+- **Joining at the lowest served handed a newcomer the majority's claims.**
+  A job only a minority can run (a MAGPIE floor during a rollout) lags while
+  served, and is the lowest served; a newcomer everyone can run joined level
+  with it and took every claim of the majority until it had caught the
+  majority's job — the majority job's first claim came **331st** after 3,000
+  claims of history, 661st after 6,000, so without bound in production; an
+  allocation changed from 20% to 19% did the same (476th), and so did a job
+  returning after an hour nobody could run it (331st). With 3e and 3f, this
+  shows no single join point is right in a split fleet: each class of workers
+  has its own pace. **Fix:** joining is in two steps. A job still joins at the
+  lowest served ratio, below every class's pace, so it cannot be starved; and
+  for an hour after joining (`JOIN_SETTLE`, from `activated_at`, which every
+  join now sets — activation, purge, and a return from a spell unserved) each
+  claim of it lifts it level with the claiming worker's next candidate, less
+  one of that job's claims. The first claim from each faster class settles it
+  at that class's pace; a structural lag is never lifted, since within the
+  class that runs it a lagging job keeps pace. (Lifted to the next candidate
+  exactly, a newcomer lost every tie and got 4 of 12 at 50/50; hence one claim
+  short.)
+- **The pass-over lift overshot by a claim of the job chosen.** Lifted to the
+  chosen job's ratio after its claim, a 50% job passed over while a 1% job was
+  claimed was a whole ratio unit ahead and waited **49** claims when its work
+  came back. **Fix:** lifted to the chosen job's ratio before the claim, from
+  the candidate list — start-time fair queuing's virtual time.
+
+**Verified:** the adversary's cases added as tests — `I-SCHED-3j` (the
+newcomer), `3k` (the allocation change), `3l` (the return), `3m` (the
+overshoot) — each fails on the first design (331st, 476th, 331st, 49) and
+passes (the majority job's first claim within twelve; 666 of 800 where 667 is
+fair; 542 where 542 is fair; P's first at once). `I-SCHED-3n` added (a job
+held for 200 claims does not take the claims after in a row). Each rule
+switched off in turn: the settling fails 3j, 3k and 3l; the rejoin 3g and 3l;
+the pass-over lift 3n; the lift and the settling together 3c. PLAN's parity
+paragraph, the schema comment and the `claims_baseline` and `activated_at`
+docs say it; **KL-89** records the gaps left: a class that makes no claim
+within the hour, and a lift from a pass that is one worker's alone.
+
+**Lows fixed:** `I-SCHED-3i`'s bound tightened from 62 to 45 (the pass-19 code
+gave 64 and 65, too close); PLAN says "any *other* job". An export whose
+failure is ambiguous — the ready update committed and only its answer was lost
+— keeps its objects: cleanup checks the row first. **Checked and holding:**
+32 workers over 12 jobs, 2 capped, 1,920 claims in 4 s with no errors and no
+deadlocks; the new tests stable over three runs; RUNBOOK §2.3's statement
+equal to `join_at_parity` (also checked here with three fleets); the settle
+before the stream's head holds nothing it did not hold before.
+
+### 20.5 Second adversarial check
+
+**2 high and 1 medium, fixed; the design's fourth form.** Each was shown with
+the real `scheduler::claim`, and each went away with the settling switched off.
+
+- **Settling forgave a burst's payback again.** Every job is settling for an
+  hour after an activation, an allocation change or a return; a concurrent
+  burst to a 1% job left the 99% job more than a claim behind it, and each
+  claim of the 99% job lifted it level: the 1% job got **307 to 324** of
+  2,976 where 30 is fair (I-SCHED-3i missed it: its jobs are never
+  activated). The root is the burst: concurrent claims read the same list
+  and all land on its first job. **Fix:** each claim is checked for its turn
+  while it holds the job's dispatch lock, before the dispatch does any work —
+  its ratio must not be more than one of the rival's claims past any of the
+  worker's other candidates still in play; if it is, the worker goes on to
+  the next, and a claim that finds every job with work outrun or busy reads
+  the list again (up to eight times). A dispatch-lock timeout is now `Busy`,
+  not "no work": it is not lifted as passed over. On the way: checked at the
+  job's row after the dispatch, the losers held the lock for a whole dispatch
+  and 32 workers on two jobs got 1,396 tasks of 1,920 in 27 s; checked
+  against the next candidate only, a worker that found its first job outrun
+  went on to its last and checked nothing (188 to 196); falling back to an
+  outrun job unchecked, two jobs each outrun by the other handed one a claim
+  anyway (175); with no slack, 1,232 of 1,920. Now 30, and 1,919 or 1,920 of
+  1,920 on two jobs, as on the committed code.
+- **A data split starved a newcomer after one decline.** The server cannot
+  filter a data gap: each majority worker was issued one claim of a job only
+  the minority had the data for, and that claim settled it at the majority's
+  pace, past the minority's own lagging job: **none** of the minority's 400
+  claims. **Fix:** a decline that says the worker cannot run the job at all
+  (`missing_data`, `magpie_version`, `unknown_job_type`, `derived_mismatch`)
+  undoes the settling within the hour (`scheduler::unsettle`): 81 where 80 is
+  fair.
+- **Settling against the next candidate skipped a job that paused.** The pace
+  was the next job in the list, so with the minority's own job paused for one
+  claim, a newcomer beside it was settled against the majority's job: none of
+  the next 200. **Fix:** the pace is the lowest of the worker's other
+  candidates, those just passed over included, less one claim of it and one
+  of the job's own.
+
+**Verified:** the three cases added as tests — `I-SCHED-3o` (the burst,
+through the endpoint), `3p` (the data split, declined through
+`/api/worker/decline`), `3q` (the pause) — failing on the design before (317,
+0, 0) and passing (30; 81 in the adversary's form of 3p; 99). With each rule switched off in turn, its own
+tests fail: the settling 3j, 3k and 3l; the rejoin 3g and 3l; the pass-over
+lift 3c and 3n; the turn check 3o; the undoing on a decline 3p; the
+lowest-other pace 3q. A 12-job stress with 2 capped jobs: 0 errors, 0
+deadlocks, the same share of tasks as the committed code. **Lows:** a
+minority-only newcomer beside an older job gets half its claims in its first
+hour when the minority's claims come in pairs (119 of 200, then 200) —
+recorded in KL-89 with the gaps settling leaves: a class that makes no claim
+within the hour, a worker that cannot run a job and says nothing, and a lift
+from a pass that is one worker's alone.
+
+### 20.6 Low findings
+
+**Fixed:**
+- Scheduler: the lift takes `FOR NO KEY UPDATE` (not `FOR UPDATE`, which
+  conflicts with every in-flight claim's key-share lock) and writes only a
+  lift; the `claims_baseline` doc; a test's doc naming a constant that did not
+  exist. (The migration's schema comment says "lowest", which is true again.)
+- Exports: a multipart upload that fails to complete is aborted; an export
+  that fails after writing its objects removes them (`I-EXPORT-11`, failing
+  on the committed code with both objects left); the `429` past the
+  two-stream cap says so; the admin page shows each object's SHA-256.
+- Docs and scripts: RUNBOOK §2.3's baseline statement is the new rule;
+  `admin.rs`'s activation comment; `runbook-check.sh`'s header puts what it
+  refuses after what it cannot see; the design table credits the lift too;
+  `api.ts` calls allocation a share of claims; pass 19's summary says KL-88
+  was added; `split_run` lost its unused return.
+
+**Not changed:** export download links are fetched once and the page says
+they last an hour (a page left open offers dead links until reloaded; KL-72
+covers the credential lifetime); a long export or slow stream holds one
+snapshot throughout (admin-started, capped at two); a failed multipart
+completion that in fact succeeded server-side, and an export aborted at its
+six-hour limit, leave objects to the thirty-day rule.
+
+### 20.7 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **613 of 613** (fifteen new scheduling tests, `I-SCHED-3c` rewritten; two
+  new export tests).
+- **Tier 5, natively: 14 of 14**; **tier 6, natively, every case** (both run
+  the final scheduler).
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 120 of 120.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks; RUNBOOK
+  §2.3's statement run against `join_at_parity` in three fleets, equal.
+- Concurrency: 32 workers on two jobs and on twelve (two capped), 0 errors and
+  0 deadlocks, tasks handed out as on the committed code.
+- MAGPIE unchanged this pass.

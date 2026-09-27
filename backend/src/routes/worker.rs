@@ -462,6 +462,12 @@ async fn decline_task(
     let job_id: Uuid = row.get("job_id");
 
     scheduler::release_claim(&mut tx, claim_id, "declined").await?;
+    // A worker that cannot run the job at all did not show where its pace
+    // is: the settling its claim gave the job is undone (`scheduler::unsettle`).
+    // A task that failed was a task it could run.
+    if body.reason != "task_failed" {
+        scheduler::unsettle(&mut tx, job_id, state.cfg.heartbeat_timeout).await?;
+    }
 
     // One statement for all of them: this runs with the claim and its task
     // locked, and a round trip per file was up to thirty-two.

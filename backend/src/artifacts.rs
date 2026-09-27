@@ -267,20 +267,29 @@ impl MultipartUpload {
         Ok(())
     }
 
-    pub async fn finish(self) -> AppResult<String> {
+    /// Complete the upload; one that fails to complete is aborted, so its
+    /// parts are not left for the lifecycle rule.
+    pub async fn finish(mut self) -> AppResult<String> {
         let completed = aws_sdk_s3::types::CompletedMultipartUpload::builder()
-            .set_parts(Some(self.parts))
+            .set_parts(Some(std::mem::take(&mut self.parts)))
             .build();
-        self.client
+        let finished = self
+            .client
             .complete_multipart_upload()
             .bucket(&self.bucket)
             .key(&self.key)
             .upload_id(&self.upload_id)
             .multipart_upload(completed)
             .send()
-            .await
-            .map_err(|e| AppError::internal(format!("S3 multipart finish {} failed: {}", self.key, sdk(&e))))?;
-        Ok(self.key)
+            .await;
+        match finished {
+            Ok(_) => Ok(self.key),
+            Err(e) => {
+                let err = AppError::internal(format!("S3 multipart finish {} failed: {}", self.key, sdk(&e)));
+                self.abort().await;
+                Err(err)
+            }
+        }
     }
 
     /// Abandon the upload, so its parts do not sit in the bucket being billed.

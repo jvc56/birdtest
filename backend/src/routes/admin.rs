@@ -1841,11 +1841,12 @@ async fn activate_job(
         .bind(id)
         .execute(&mut *tx)
         .await?;
-    // The job joins the others level with the one furthest behind, rather
-    // than with a lifetime deficit to work off at their expense. Activation is
-    // also how an allocation is changed, and a new allocation rescales the
-    // ratio, so this runs every time. Under the activation lock, so two jobs
-    // activated together each see the other or neither.
+    // The job joins the others level with the lowest of the jobs being
+    // served, rather than with a lifetime deficit to work off at their
+    // expense. Activation is also how an allocation is changed, and a new
+    // allocation rescales the ratio, so this runs every time. Under the
+    // activation lock, so two jobs activated together each see the other or
+    // neither.
     crate::scheduler::join_at_parity(&mut tx, id, state.cfg.heartbeat_timeout).await?;
     let updated = sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = $1")
         .bind(id)

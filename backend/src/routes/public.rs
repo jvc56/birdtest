@@ -944,14 +944,40 @@ pub(super) async fn job_results_stream(
         .result_streams
         .clone()
         .try_acquire_owned()
-        .map_err(|_| AppError::rate_limited(30))?;
+        .map_err(|_| AppError {
+            message: format!(
+                "{} result streams are already running, the most at once; try again when one ends",
+                crate::state::MAX_CONCURRENT_RESULT_STREAMS
+            ),
+            ..AppError::rate_limited(30)
+        })?;
 
     // The main pool, not the display one: this cursor is held for as long as
     // the caller keeps reading, which the display pool's statement timeout
     // exists to forbid. The permit above is what bounds it instead.
-    let pool = state.pool.clone();
+    //
+    // A stream is complete exactly when it ends without an error (PLAN.md,
+    // "Exports"), so everything that can fail before the first row is done
+    // before the response head goes out, where a failure is still a status:
+    // settled here, a completed leave job's unmerged results failed to merge
+    // and the stream went on without them; connected inside the body, a busy
+    // pool answered `200` and an empty download (the audit's pass 20).
+    //
+    // A completed leave job may still hold accepted results that no merge
+    // has folded into the rows about to be read (`exports::settle`); an
+    // active one is a moving target either way, and is left to its sweep.
+    if job.status == crate::models::job::JobStatus::Completed {
+        crate::exports::settle(&state.pool, &job).await?;
+    }
+    // Closed rather than returned when the stream ends: a pool connection
+    // dropped mid-result is drained first, so a caller that hung up after
+    // a line left the whole corpus building on a connection the permit no
+    // longer counted (thirty-first audit). Closing it ends the query.
+    let mut conn = state.pool.acquire().await?;
+    conn.close_on_drop();
     let stream = async_stream::stream! {
         let _permit = permit;
+        let mut conn = conn;
         // The export's own queries, so the stream of an active job and the
         // export of a completed one are the same corpus -- an opening-rack
         // record with its ranked moves nested in it, not the record alone.
@@ -960,28 +986,6 @@ pub(super) async fn job_results_stream(
         } else {
             crate::exports::export_query(job.job_type)
         };
-
-        // A completed leave job may still hold accepted results that no merge
-        // has folded into the rows about to be read (`exports::settle`); an
-        // active one is a moving target either way, and is left to its sweep.
-        if job.status == crate::models::job::JobStatus::Completed {
-            if let Err(err) = crate::exports::settle(&pool, &job).await {
-                tracing::error!(job_id = %id, error = %err.message, "settling a job before streaming it failed");
-            }
-        }
-
-        // Closed rather than returned when the stream ends: a pool connection
-        // dropped mid-result is drained first, so a caller that hung up after
-        // a line left the whole corpus building on a connection the permit no
-        // longer counted (thirty-first audit). Closing it ends the query.
-        let mut conn = match pool.acquire().await {
-            Ok(conn) => conn,
-            Err(err) => {
-                tracing::error!(error = %err, "result stream could not get a connection");
-                return;
-            }
-        };
-        conn.close_on_drop();
         let mut rows = sqlx::query(query).bind(id).fetch(&mut *conn);
         while let Some(row) = rows.next().await {
             match row {
@@ -993,7 +997,12 @@ pub(super) async fn job_results_stream(
                     yield Ok::<_, std::io::Error>(line);
                 }
                 Err(err) => {
+                    // An error, not an end: the body is cut off without its
+                    // closing chunk, which a client reports as a failed
+                    // transfer. Ended quietly, the rows so far read as the
+                    // whole corpus (the audit's pass 20).
                     tracing::error!(error = %err, "result stream failed mid-flight");
+                    yield Err(std::io::Error::other("the results query failed part-way"));
                     break;
                 }
             }

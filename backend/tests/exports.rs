@@ -621,3 +621,109 @@ async fn a_reader_that_hangs_up_ends_its_corpus_query() {
     assert_eq!(running, 0, "a hung-up reader's corpus query is still running");
     assert_eq!(state.result_streams.available_permits(), birdtest::state::MAX_CONCURRENT_RESULT_STREAMS);
 }
+
+/// PLAN.md, "Exports": a stream is complete exactly when it ends cleanly. A
+/// corpus query the database ends part-way (a failover, an operator's
+/// `pg_terminate_backend`) ended the body as a finished download does, the
+/// rows so far reading as the whole corpus (the audit's pass 20); it now ends
+/// in an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stream_the_database_cuts_off_ends_in_an_error() {
+    use http_body_util::BodyExt;
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = db.bare_job("opening_rack", 1, admin).await;
+    let task: Uuid = sqlx::query_scalar("INSERT INTO tasks (job_id, seed, state) VALUES ($1, 0, 'completed') RETURNING id")
+        .bind(job).fetch_one(&db.pool).await.unwrap();
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+         VALUES ($1, $2, gen_random_uuid(), 'completed', $3, now()) RETURNING id",
+    )
+    .bind(task).bind(job).bind(admin).fetch_one(&db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves)
+         SELECT $1, $2, $3, 'R' || g, 5 FROM generate_series(1, 150000) g",
+    )
+    .bind(claim).bind(task).bind(job).execute(&db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_moves (record_id, rank, move, score, equity)
+         SELECT r.id, k, md5(random()::text), 10, random()
+         FROM position_analysis_records r, generate_series(1, 5) k WHERE r.job_id = $1",
+    )
+    .bind(job).execute(&db.pool).await.unwrap();
+    sqlx::query("ANALYZE").execute(&db.pool).await.unwrap();
+
+    let path = format!("/api/admin/jobs/{job}/results/stream");
+    let response = app.clone().oneshot(get_request(&path, &headers)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body();
+    let mut text = String::new();
+    let first = body.frame().await.unwrap().unwrap();
+    text.push_str(std::str::from_utf8(first.data_ref().unwrap()).unwrap());
+
+    // The database ends the query (a failover, an operator's
+    // pg_terminate_backend, a restart of the instance).
+    use sqlx::Connection;
+    let mut conn = sqlx::PgConnection::connect(&db.url).await.unwrap();
+    let killed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+          WHERE pid <> pg_backend_pid() AND datname = current_database()
+            AND query LIKE '%jsonb_build_object(''moves''%') k",
+    )
+    .fetch_one(&mut conn).await.unwrap();
+    assert_eq!(killed, 1, "the corpus query was not found running");
+
+    let mut errored = false;
+    while let Some(frame) = body.frame().await {
+        match frame {
+            Ok(frame) => {
+                if let Some(data) = frame.data_ref() {
+                    text.push_str(std::str::from_utf8(data).unwrap());
+                }
+            }
+            Err(_) => {
+                errored = true;
+                break;
+            }
+        }
+    }
+    let lines = text.lines().count();
+    assert!(errored, "the stream ended cleanly after {lines} of 150000 records: a truncated download looks complete");
+}
+
+/// PLAN.md, "Exports": an export that fails leaves no object behind. Failing
+/// after its objects were written -- here the row cannot be marked ready -- the
+/// row said `failed` and named neither, and both waited thirty days for the
+/// lifecycle rule (the audit's pass 20).
+#[tokio::test]
+async fn an_export_that_fails_after_uploading_removes_its_objects() {
+    let db = TestDb::new().await;
+    let (state, bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+    complete(&db, job).await;
+    // Marking the row ready fails, as a lost connection or a failover would.
+    sqlx::query(
+        "CREATE FUNCTION refuse_ready() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+             IF NEW.state = 'ready' THEN RAISE EXCEPTION 'refused for the test'; END IF;
+             RETURN NEW;
+         END $$",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    sqlx::query("CREATE TRIGGER refuse_ready BEFORE UPDATE ON job_exports FOR EACH ROW EXECUTE FUNCTION refuse_ready()")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let export = export_and_wait(&app, job, &headers).await;
+    assert_eq!(export["state"], "failed", "{export}");
+    assert_eq!(bucket.keys().await, Vec::<String>::new(), "a failed export's objects are left in the store");
+}

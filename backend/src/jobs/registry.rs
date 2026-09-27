@@ -24,6 +24,10 @@ pub enum Acquired {
     Task { task_id: Uuid, request: TaskRequest, created: bool },
     /// This job has nothing to hand out right now; try the next one.
     NoWork,
+    /// Another claim held the job's dispatch lock past the bounded wait. Not
+    /// "no work": the scheduler neither lifts the job as passed over nor
+    /// gives up on it, and tries it again once the rest of the list is done.
+    Busy,
     /// Leave generation only: the current generation is finished and must be
     /// aggregated before more tasks exist. Handled outside the transaction.
     NeedsGenerationTransition { generation: i32 },
@@ -66,7 +70,7 @@ pub async fn acquire(
     // `claims_issued`), so taking the advisory lock first costs a little more
     // of the same wait and nothing new.
     if !super::try_lock_job_dispatch(&mut *conn, job.id).await? {
-        return Ok(Acquired::NoWork);
+        return Ok(Acquired::Busy);
     }
 
     // A task whose claim timed out drops back to `available`, and so does a

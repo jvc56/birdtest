@@ -637,19 +637,22 @@ UPDATE jobs j
          WHERE t.job_id = :'job') cl
  WHERE j.id = :'job';
 
--- Level with the jobs being *served* -- those that issued a claim within the
--- heartbeat timeout (300 s unless HEARTBEAT_TIMEOUT_SECONDS says otherwise) --
--- or, when none has, with every job on offer: scheduler::join_at_parity's rule.
+-- Level with the lowest of the jobs being *served* -- those that issued a
+-- claim within the heartbeat timeout (300 s unless HEARTBEAT_TIMEOUT_SECONDS
+-- says otherwise) of the latest claim of any of them -- or, when none ever
+-- has, the highest on offer: scheduler::join_at_parity's rule.
 WITH others AS (
   SELECT (o.claims_issued - o.claims_baseline)::float8 / o.allocation AS ratio,
-         COALESCE(o.last_claimed_at > now() - interval '300 seconds', FALSE) AS served
+         o.last_claimed_at,
+         MAX(o.last_claimed_at) OVER () AS latest
     FROM jobs o
    WHERE o.status = 'active' AND o.allocation > 0 AND o.id <> :'job'
 )
 UPDATE jobs j
    SET claims_baseline = j.claims_issued - floor(
-         COALESCE((SELECT MIN(ratio) FROM others WHERE served),
-                  (SELECT MIN(ratio) FROM others), 0)
+         COALESCE((SELECT MIN(ratio) FROM others
+                    WHERE last_claimed_at > latest - interval '300 seconds'),
+                  (SELECT MAX(ratio) FROM others), 0)
          * COALESCE(j.allocation, 0))::bigint
  WHERE j.id = :'job';
 

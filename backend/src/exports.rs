@@ -465,6 +465,47 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
 
     let key = format!("exports/{}/{export_id}.ndjson.gz", job.id);
     let results = upload_rows(state, &key, export_query(job.job_type), job.id).await?;
+    let positions_key = format!("exports/{}/{export_id}.positions.ndjson.gz", job.id);
+    let finished = finish_build(state, job, export_id, &key, &positions_key, results).await;
+    // Failed after the results object was written -- the positions' upload, or
+    // marking the row -- and the row will say `failed`, naming neither object:
+    // removed now rather than left to the thirty-day lifecycle rule. (A
+    // positions object never written is a delete of nothing.) Unless the row
+    // says `ready` after all -- the update committed and only its answer was
+    // lost -- or cannot be read to say: a row naming a deleted object would
+    // redirect every download of the job to it.
+    if finished.is_err() && !named_ready(state, export_id).await {
+        for key in [&key, &positions_key] {
+            if let Err(err) = state.artifacts.delete(key).await {
+                tracing::warn!(%export_id, key, error = %err.message, "removing a failed export's object failed");
+            }
+        }
+    }
+    finished
+}
+
+/// Whether the export's row says `ready` -- or cannot be read to say it does
+/// not.
+async fn named_ready(state: &AppState, export_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT COALESCE((SELECT state = 'ready' FROM job_exports WHERE id = $1), FALSE)",
+    )
+    .bind(export_id)
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(true)
+}
+
+/// The rest of [`build`] once the results object is written: the positions'
+/// object, if the job captured any, and the row marked ready.
+async fn finish_build(
+    state: &AppState,
+    job: &Job,
+    export_id: Uuid,
+    key: &str,
+    positions_key: &str,
+    results: Uploaded,
+) -> AppResult<()> {
 
     // Asked of the rows rather than of the job's `capture_positions` setting:
     // what matters is whether there is anything to export, and a capture job
@@ -477,8 +518,7 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
         .fetch_one(&state.pool)
         .await?;
     let positions = if captured {
-        let positions_key = format!("exports/{}/{export_id}.positions.ndjson.gz", job.id);
-        let uploaded = upload_rows(state, &positions_key, positions_query(), job.id).await?;
+        let uploaded = upload_rows(state, positions_key, positions_query(), job.id).await?;
         Some((positions_key, uploaded))
     } else {
         None
@@ -497,11 +537,11 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
          WHERE id = $1 AND state = 'running'",
     )
     .bind(export_id)
-    .bind(&key)
+    .bind(key)
     .bind(results.bytes)
     .bind(&results.sha256)
     .bind(results.rows)
-    .bind(positions.as_ref().map(|(key, _)| key.as_str()))
+    .bind(positions.as_ref().map(|(key, _)| *key))
     .bind(positions.as_ref().map(|(_, p)| p.bytes))
     .bind(positions.as_ref().map(|(_, p)| p.sha256.as_str()))
     .bind(positions.as_ref().map(|(_, p)| p.rows))
@@ -512,7 +552,7 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
     // built, or a new process reaped it -- so nothing will ever name these
     // objects. Removed now rather than left to the thirty-day lifecycle rule.
     if marked == 0 {
-        for key in std::iter::once(&key).chain(positions.as_ref().map(|(key, _)| key)) {
+        for key in std::iter::once(key).chain(positions.as_ref().map(|(key, _)| *key)) {
             if let Err(err) = state.artifacts.delete(key).await {
                 tracing::warn!(%export_id, key, error = %err.message, "removing an unclaimed export failed");
             }
