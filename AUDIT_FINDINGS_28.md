@@ -240,8 +240,15 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   exclusions, and its check still missed faults — all fixed and verified. The
   adversarial checks found 2 medium (the mail pacer starved the oldest mail;
   labels shortened one at a time still collided), fixed: mail now goes
-  through one bounded queue in order. KL-75, KL-76, KL-91, KL-92 updated. The
-  loop continues.
+  through one bounded queue in order. KL-75, KL-76, KL-91, KL-92 updated.
+- **Stopped after pass 25, at the owner's request.** Pass 26 (pass 25's diff,
+  and the schema and its constraints) was begun and abandoned with no
+  findings recorded. The loop did not reach its end condition: every pass
+  from 1 to 25 found a medium or worse, so no clean follow-up pass and no
+  clean confirmation full pass was run. Pass 25's own verification was green
+  (636 backend tests, 126 frontend, tiers 5 and 6, Terraform, the procedure
+  checks); `restore-roundtrip.sh` and `backup-drill-check.sh` were not re-run
+  at the end.
 
 ---
 
