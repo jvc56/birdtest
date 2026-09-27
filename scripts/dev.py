@@ -136,8 +136,14 @@ SCHEMA_CHANGED = "was previously applied but has been modified"
 
 
 def reset_database() -> None:
-    """Drop the schema and let the backend rebuild it on its next start."""
+    """Drop the schema and let the backend rebuild it on its next start.
+
+    The backend is stopped first, so the `up` after this starts it afresh and
+    its migrations run on the empty schema. Left running -- as it was unless
+    --rebuild recreated it -- it went on serving a database with no tables,
+    and `up` saw nothing to change."""
     log("resetting the database (--reset-db)")
+    compose(["stop", "backend"], check=False)
     compose(["up", "-d", "--wait", "postgres"])
     compose(["exec", "-T", "postgres", "psql", "-U", "birdtest", "-d", "birdtest", "-q",
              "-v", "ON_ERROR_STOP=1", "-c", "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"])
