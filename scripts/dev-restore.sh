@@ -11,17 +11,23 @@
 # production dump needs it: it carries real email addresses and password
 # hashes, and the whole point of restoring it locally is the shape of the data,
 # not those (PLAN.md, "Local development"). Set SCRUB=0 to restore your own
-# snapshot as it was; any value but 0 or 1 is refused.
+# snapshot as it was; any value but 0 or 1 is refused, and so is SCRUB=0 for a
+# directory-format dump, which only production's backup.sh makes.
 #
-# The dump is restored, and scrubbed, into a database of its own
-# (birdtest_restore), which replaces the stack's only once both have
-# succeeded. Until then the stack's database is untouched, and anything that
-# stops the restore -- a dump cut short in its data, a signal, the scrub
-# failing -- drops the copy and leaves the stack as it was. Restored in place,
-# as it was, a dump that failed part-way had already emptied the database, and
-# one stopped by a signal went on restoring inside the container and was never
-# scrubbed (the audit's pass 23). A copy left by a process killed outright is
-# dropped by the next run.
+# The dump is restored, and scrubbed, into a database of this run's own
+# (birdtest_restore_<run>), which replaces the stack's in one transaction
+# once both have succeeded: both renames happen or neither does, so there is
+# always a `birdtest`. Until then the stack's database is untouched, and
+# anything that stops the restore -- a dump cut short in its data, a signal,
+# the scrub failing -- drops the copy and leaves the stack as it was. A signal
+# during the swap waits for it to finish in the container (a signal stops this
+# script, not the psql inside the container) and then says which it was.
+# Restored in place, as it was until the audit's pass 23, a dump that failed
+# part-way had already emptied the database; swapped by two renames, as it
+# was until pass 24, a failure between them lost it. Each run's names are its
+# own, so two at once cannot swap in each other's copy; the second may fail.
+# A copy left by a process killed outright (unscrubbed, if it was killed
+# before the scrub) is dropped by the next run.
 
 set -Eeuo pipefail
 
@@ -36,31 +42,87 @@ if [[ "${SCRUB}" != 0 && "${SCRUB}" != 1 ]]; then
   exit 2
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COPY=birdtest_restore
 
+if [[ "${SRC%/}" == *.partial ]]; then
+  echo "${SRC} is a snapshot dev-dump.sh did not finish; nothing was changed" >&2
+  exit 1
+fi
 if [[ -f "${SRC}/db.dump" ]]; then
   KIND=custom
 elif [[ -d "${SRC}" && -f "${SRC}/toc.dat" ]]; then
   KIND=directory
+  if [[ "${SCRUB}" == 0 ]]; then
+    echo "a directory-format dump is production's (scripts/backup.sh), and is always scrubbed: SCRUB=0 is refused; nothing was changed" >&2
+    exit 2
+  fi
 else
   echo "no db.dump and no directory-format dump at ${SRC}; nothing was changed" >&2
   exit 1
 fi
 
+RUN="$(date +%s)_$$"
+COPY="birdtest_restore_${RUN}"
+OLD="birdtest_replaced_${RUN}"
+DUMPDIR="/tmp/restore_${RUN}"
+MIRROR="birdtest-restore-mirror-${RUN}"
+# Held by the swap's transaction, and taken by a stopped run before it looks
+# at what the swap did.
+LOCK=4711001
+
 sql() { ${COMPOSE} exec -T postgres psql -U birdtest -d "$1" -q -v ON_ERROR_STOP=1 "${@:2}"; }
 
-discard() {
-  sql postgres -c "DROP DATABASE IF EXISTS ${COPY} WITH (FORCE)" >/dev/null 2>&1 || true
-  ${COMPOSE} exec -T postgres rm -rf /tmp/restore >/dev/null 2>&1 || true
+phase=copy
+stopped=0
+restart() {
+  if (( stopped )); then
+    echo "starting the backend"
+    ${COMPOSE} start backend >/dev/null 2>&1 || echo "the backend did not start: docker compose start backend" >&2
+  fi
 }
-failed() {
+stop() {
+  # Ignored, not reset: a second Ctrl-C while this waits for the swap killed
+  # it with the backend still stopped and nothing said.
+  trap - ERR
+  trap '' INT TERM HUP
+  if [[ "${phase}" == swap ]]; then
+    # The swap may still be running in the container, or have committed:
+    # wait for it, drop the copy if it is still there, and read which.
+    local by
+    if ! by=$(sql postgres -At -c "SELECT pg_advisory_lock(${LOCK})" \
+      -c "DROP DATABASE IF EXISTS ${COPY} WITH (FORCE)" \
+      -c "SELECT shobj_description(oid, 'pg_database') FROM pg_database WHERE datname = 'birdtest'" \
+      2>/dev/null | tail -n 1); then
+      echo "stopped during the swap, and whether it finished could not be read: the database named birdtest has the comment 'dev-restore ${RUN}' if it did" >&2
+      restart
+      return
+    fi
+    if [[ "${by}" == "dev-restore ${RUN}" ]]; then
+      echo "stopped, but the swap had finished: the stack runs the restored copy (${SRC}); the artifact bucket was not restored" >&2
+      sql postgres -c "DROP DATABASE IF EXISTS ${OLD} WITH (FORCE)" >/dev/null 2>&1 || true
+      restart
+      return
+    fi
+  else
+    sql postgres -c "DROP DATABASE IF EXISTS ${COPY} WITH (FORCE)" >/dev/null 2>&1 || true
+  fi
+  ${COMPOSE} exec -T postgres rm -rf "${DUMPDIR}" >/dev/null 2>&1 || true
   echo "the restore did not finish; the copy is dropped and the stack's database is as it was" >&2
-  discard
+  restart
 }
-trap failed ERR
-trap 'failed; exit 130' INT TERM HUP
+trap 'stop; exit 1' ERR
+trap 'stop; exit 130' INT TERM HUP
 
-discard
+# What earlier runs left: their copies (killed outright, or one running now,
+# which then fails harmlessly) and a replaced database whose drop was cut
+# short -- only while `birdtest` exists, so never the last copy there is.
+sql postgres <<'SQL'
+SELECT format('DROP DATABASE %I WITH (FORCE)', datname) FROM pg_database
+ WHERE datname LIKE 'birdtest\_restore%'
+    OR (datname LIKE 'birdtest\_replaced%'
+        AND EXISTS (SELECT 1 FROM pg_database WHERE datname = 'birdtest'))
+\gexec
+SQL
+${COMPOSE} exec -T postgres sh -c 'rm -rf /tmp/restore /tmp/restore_*' >/dev/null 2>&1 || true
 sql postgres -c "CREATE DATABASE ${COPY}"
 
 if [[ "${KIND}" == custom ]]; then
@@ -71,11 +133,11 @@ else
   # A directory-format dump, as scripts/backup.sh produces. Copied in rather
   # than piped: pg_restore -Fd needs a real directory to read.
   echo "restoring the directory-format dump at ${SRC} into a copy"
-  ${COMPOSE} cp "${SRC}" "$(${COMPOSE} ps -q postgres)":/tmp/restore >/dev/null 2>&1 \
-    || docker cp "${SRC}" "$(${COMPOSE} ps -q postgres)":/tmp/restore
+  ${COMPOSE} cp "${SRC}" "postgres:${DUMPDIR}" >/dev/null 2>&1 \
+    || docker cp "${SRC}" "$(${COMPOSE} ps -q postgres)":"${DUMPDIR}"
   ${COMPOSE} exec -T postgres pg_restore -U birdtest -d "${COPY}" --no-owner --no-privileges \
-    --exit-on-error -j4 /tmp/restore
-  ${COMPOSE} exec -T postgres rm -rf /tmp/restore
+    --exit-on-error -j4 "${DUMPDIR}"
+  ${COMPOSE} exec -T postgres rm -rf "${DUMPDIR}"
 fi
 
 if [[ "${SCRUB}" != 0 ]]; then
@@ -83,30 +145,63 @@ if [[ "${SCRUB}" != 0 ]]; then
   sql "${COPY}" -v dev_copy=1 < "${SCRIPT_DIR}/scrub.sql"
 fi
 
-# The copy is whole and scrubbed: it replaces the stack's database. Nothing may
-# hold a connection to either while they are renamed.
-echo "stopping the backend"
-${COMPOSE} stop backend >/dev/null 2>&1 || true
+# The copy is whole and scrubbed: it replaces the stack's database, in one
+# transaction. Nothing may hold a connection to either while they are renamed.
+if [[ -n "$(${COMPOSE} ps -q --status running backend 2>/dev/null || true)" ]]; then
+  echo "stopping the backend"
+  stopped=1
+  ${COMPOSE} stop backend >/dev/null 2>&1
+fi
 echo "swapping the copy in"
-sql postgres \
-  -c "DROP DATABASE IF EXISTS birdtest_replaced WITH (FORCE)" \
-  -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'birdtest' AND pid <> pg_backend_pid()" \
-  -c "ALTER DATABASE birdtest RENAME TO birdtest_replaced" \
-  -c "ALTER DATABASE ${COPY} RENAME TO birdtest" \
-  -c "DROP DATABASE birdtest_replaced WITH (FORCE)" >/dev/null
-trap - ERR INT TERM HUP
+phase=swap
+sql postgres >/dev/null <<SQL
+BEGIN;
+SELECT pg_advisory_xact_lock(${LOCK});
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+ WHERE datname IN ('birdtest', '${COPY}') AND pid <> pg_backend_pid();
+ALTER DATABASE birdtest RENAME TO ${OLD};
+ALTER DATABASE ${COPY} RENAME TO birdtest;
+COMMENT ON DATABASE birdtest IS 'dev-restore ${RUN}';
+COMMIT;
+SQL
+phase=done
+# From here the database is restored whatever happens: a stop says so and
+# brings the backend back (it used to leave it stopped, and say nothing).
+after() {
+  trap '' INT TERM HUP
+  docker rm -f "${MIRROR}" >/dev/null 2>&1 || true
+  echo "stopped after the swap: the database is restored from ${SRC}, the artifact bucket perhaps not" >&2
+  restart
+}
+trap - ERR
+trap 'after; exit 1' INT TERM HUP
+sql postgres -c "DROP DATABASE ${OLD} WITH (FORCE)" >/dev/null \
+  || echo "the replaced database ${OLD} was not dropped; the next restore drops it" >&2
 
-if [[ -d "${SRC}/artifacts" ]]; then
+status=0
+if [[ -d "${SRC}/artifacts" && -z "$(find "${SRC}/artifacts" -type f -print -quit)" ]]; then
+  # Mirrored with --remove, an empty directory empties the bucket: and before
+  # the audit's pass 24 every snapshot's was empty on Linux (dev-dump.sh).
+  echo "the snapshot holds no artifact objects: the bucket is left as it is" >&2
+elif [[ -d "${SRC}/artifacts" ]]; then
   echo "restoring the artifact bucket"
-  ${COMPOSE} run --rm --no-deps -T -v "$(cd "${SRC}/artifacts" && pwd):/in" \
-    --entrypoint /bin/sh minio-init -c '
-      mc alias set local http://minio:9000 birdtest birdtestbirdtest >/dev/null
+  ${COMPOSE} run --rm --no-deps -T --name "${MIRROR}" --user "$(id -u):$(id -g)" \
+    -e MC_CONFIG_DIR=/tmp/.mc -e MC_HOST_local=http://birdtest:birdtestbirdtest@minio:9000 \
+    -v "$(cd "${SRC}/artifacts" && pwd):/in" --entrypoint /bin/sh minio-init -c '
+      set -e
       mc mb --ignore-existing local/birdtest-artifacts >/dev/null
       mc mirror --overwrite --remove /in local/birdtest-artifacts
-    ' || echo "the artifact bucket was not restored (the database was): run this again once MinIO is up" >&2
+    ' || {
+    echo "the artifact bucket was not restored (the database was): once MinIO is up, run the restore again" >&2
+    status=1
+  }
 fi
 
-echo "starting the backend"
-${COMPOSE} start backend >/dev/null 2>&1 || ${COMPOSE} up -d backend
-
-echo "restored from ${SRC}"
+restart
+trap - INT TERM HUP
+if (( status )); then
+  echo "restored the database from ${SRC}, but not the artifact bucket" >&2
+else
+  echo "restored from ${SRC}"
+fi
+exit "${status}"

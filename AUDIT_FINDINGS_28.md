@@ -217,8 +217,20 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   third form, checked nightly by the new `scripts/reapply-check.sh`). The
   adversarial check found 3 medium (a stopped or truncated dev restore; a
   migration's admin damage copied back), fixed — the dev restore redesigned to
-  restore and scrub into a copy swapped in only when whole. KL-90 updated. The
-  loop continues.
+  restore and scrub into a copy swapped in only when whole. KL-2, KL-32,
+  KL-89 and KL-90 updated. The loop continues.
+- **Pass 24 (follow-up: pass 23's diff, and account mail):** 1 high and 7
+  medium from the reviewers: a full restore brought back sessions ended since
+  the restore point; the re-apply step's review was not enforced, an excluded
+  reset's password was installed, a late restore time skipped actions, and its
+  check missed most faults; dev-restore's swap could lose the stack's
+  database; a pasted scrub ran after its refusal; account mail could stop with
+  no alarm — all fixed, the re-apply step in a fourth form (sessions ended by a
+  new signing key, actions chosen by id, the review required) and the dev
+  restore's swap made one transaction. The adversarial checks found 6 medium
+  (anyone could raise the mail alarm; `ON_ERROR_ROLLBACK`; a quadratic apply;
+  a stop after the swap; a lost snapshot; empty artifact snapshots), fixed.
+  KL-91 and KL-92 added; KL-2, KL-35, KL-90 updated. The loop continues.
 
 ---
 
@@ -3793,4 +3805,243 @@ by host, the check's by database name).
   `scripts/runbook-check.sh RUNBOOK.md README.md`: 28 and 19 blocks; the dev
   restore replayed as in 23.10, the scrub's guard with `dev_copy` unset, 0,
   `abc` and 1.
+- MAGPIE unchanged this pass.
+
+## Pass 24 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`39d89ca..7175565`), one
+reviewer per part: the ops scripts, compose and CI (replayed against a real
+compose stack); RUNBOOK §1's re-apply step, replayed through the real backend;
+the backend, frontend and docs (tier 5 natively). MAGPIE is unchanged. Plus one
+area not examined in this run: **account mail** — `email.rs`, the mail the
+auth routes send, `infra/ses.tf`, and what happens when SES stops.
+
+### 24.1 High — a full restore brought back sessions ended after the restore point (RUNBOOK reviewer)
+
+The step bumped every account's `session_generation` once. A session minted on
+the damaged instance at generation r+1 and ended there by a second reset or
+"sign out everywhere" matches again once the restored account, at r, is
+bumped to r+1 — the takeover case the step exists for: the attacker resets the
+password and signs in, the owner resets it back, and after the restore the
+attacker's session works for up to seven days. **Shown** through the real
+backend: the attacker's session `401` on the damaged instance after the
+owner's reset, `200` on the restored one after the step. The fallback for an
+unreadable damaged instance had the same hole. **Fix:** the repoint block
+writes a new `/birdtest/SESSION_SIGNING_KEY` beside `DATABASE_URL`: tasks read
+it at start, and every session ends, whichever instance minted it. The bump is
+gone; both paths spend every reset link as before.
+
+### 24.2 Medium — the review was not enforced (RUNBOOK reviewer)
+
+**(a)** An exclusion that matched nothing — a username, or `<id> # alice` — was
+listed and the transaction committed anyway, applying what the operator meant
+to leave out, deletions included. **(b)** A new ops task (the shell dropped
+after twenty idle minutes) started with an empty `/tmp`: block 1 pasted again
+recreated everything but the exclusions, and block 2's `touch` supplied an
+empty list. **(c)** A second export rewrote `/tmp/after-demote.csv`, putting
+back lines the operator had deleted. **Shown:** each applied the rogue's
+deletions and unbans, or the deleted demotions. **Fix:** block 2 refuses
+without an `/tmp/after-exclude` the operator made (even empty), reads the first
+word of each line as an id (comments allowed), refuses a line that is not one,
+and aborts the transaction if any matches nothing; block 1 writes its
+demotion proposal beside the operator's file once one exists, and shows the
+difference; RUNBOOK says the review lives in the ops task and how to return to
+it (`--attach`).
+
+### 24.3 Medium — an excluded later reset still installed the attacker's password (RUNBOOK reviewer)
+
+Passwords are the one thing copied from the damaged instance's table, and the
+hash was copied if any reset survived the exclusions. With the owner's reset
+and then the attacker's, the attacker's excluded, the hash copied was the
+attacker's. **Fix:** the hash is taken only when the account's last reset is
+not left out; otherwise the restored hash stays and the account is listed for
+its owner to reset.
+
+### 24.4 Medium — a restore time typed late skipped actions silently (RUNBOOK reviewer)
+
+The operator typed `RESTORE_TIME` again in the ops shell; one too early was
+caught, one too late (an hour off, a local-time slip) passed every check, and
+what happened between was neither exported nor reported. **Shown:** a key
+revoked after the real restore point was live after the step. **Fix:** no
+time is typed: block 1 takes the damaged instance's rows from an hour before
+the restored instance's newest audit row, and keeps only those whose id the
+restored instance lacks — exact, whatever the clocks, and an action from
+before the restore point is not applied again (a reset's hash then changed by
+a migration is not copied). The two instances are told apart by the same
+check as before and by which holds the newer rows.
+
+### 24.5 Medium — `reapply-check.sh` missed faults its record said it caught (RUNBOOK reviewer)
+
+Eighteen of 33 faults put into the step passed the check, among them block 2's
+wrong-instance check removed, a deleted account keeping `is_admin`, and "last
+one wins" reversed for keys and bans. **Fix:** the check is rewritten for the
+fourth form with the cases the reviewer listed: block 2 against the damaged
+instance; a deleted admin; a key suspended then resumed, a ban added then
+lifted; an actor left out by id (upper case, with a comment) and one action by
+id; a later reset left out; an action whose transaction began before the
+restore point; one from before it that the hour takes in; an extra admin on
+the damaged side; a deleted demotion line kept by a second export; an
+unmatched exclusion and a non-id rolled back; no review. **Verified:**
+nineteen faults put into the fourth form, one at a time, each fail it.
+
+This is the step's fourth form — its third correction — and so a redesign:
+what it applies is decided by the data (ids the restored instance lacks), not
+by a typed time; the review is a required input, not an optional file; and
+sessions are ended by the key, not by arithmetic on a counter the damaged
+instance moved on.
+
+### 24.6 Medium — dev-restore's swap could lose the stack's database (ops reviewer)
+
+The swap was two renames, each committed on its own. When the second failed —
+a session on the copy, a Ctrl-C (which stops the script but not psql in the
+container), a second restore running at once — the trap dropped the copy and
+said the stack was as it was, with the only data in `birdtest_replaced`; the
+next run dropped that first. **Shown:** a session held on the copy, then a
+second run: `dbs:` — nothing left. **Fix** (the dev restore's fourth form, a
+redesign of the swap): each run's databases are named for it; the swap is one
+transaction — both renames or neither — under an advisory lock, and stamps the
+new `birdtest` with a comment naming the run; a signal during the swap takes
+that lock, so it waits for the swap in the container, and then reads the
+comment to say which way it went; a replaced database is dropped only while
+`birdtest` exists; the backend is restarted on every path, and only if it was
+running. **Replayed** against a real compose project: the held session
+(terminated, swapped), a copy that cannot be renamed (rolled back, the stack
+as it was, backend back), SIGINT one second into a held swap (waited nine
+seconds, reported "the swap had finished", correct), two restores at once in
+three trials (one swapped, one failed cleanly, `birdtest` scrubbed each time),
+a failed artifact mirror (database restored, exit 1), a directory-format dump
+through `compose cp`, a stopped backend left stopped.
+
+### 24.7 Medium — the scrub's refusal was bypassed by pasting (ops reviewer)
+
+In an interactive psql, `ON_ERROR_STOP` returns to the prompt and psql reads
+on: pasted into the ops shell — production — the refusal printed and the
+whole scrub ran and committed after it. **Shown:** `UPDATE 1`, the address
+rewritten. **Fix:** the transaction opens before the guard, so a refusal
+aborts it and every statement after fails. **Replayed:** pasted, `current
+transaction is aborted` fourteen times and the address kept; from a file
+without the variable, refused (exit 3); with `-v dev_copy=1`, scrubbed.
+
+### 24.8 Medium — account mail could stop for everyone, and nothing would notice (mail reviewer)
+
+Registration mails a confirmation to any address, ten an hour per client
+address, so made-up domains bounce; SES reviews an account at a 5% bounce rate
+and may pause it at 10%, after which no confirmation or reset goes out. Every
+send is off its request and answered the same either way, and the only record
+was `SES send failed: service error` — the same for a paused account, an
+unverified address and a missing permission. Nothing alarmed. **Shown:**
+against a local stand-in for SES answering `MessageRejected` and
+`SendingPausedException`, the log line for both. **Fix:** SES's `code:
+message` in the log (a test runs the real SDK against a local endpoint:
+failed first with `service error`); an alarm on any failed send (a metric
+filter on a field each failure line carries); alarms on SES's bounce and
+complaint rates at 4% and 0.08%; account-level suppression of hard bounces
+and complaints; `MAIL_BACKEND=ses` refuses to start without `MAIL_FROM` and
+`PUBLIC_URL`, whose defaults are a laptop's; the DKIM output as records and a
+DMARC record. What a visitor can still do to the rates is KL-91.
+
+### 24.9 Low findings
+
+**Fixed:**
+- Mail: a `PUBLIC_URL` trailing slash is dropped (links were `//confirm-email`);
+  the confirmation mail says it lasts 24 hours; tests for the per-address
+  notice limit (`A-AUTH-4h`, failing with the limit removed) and for links on
+  `PUBLIC_URL` whatever `Host` says (`A-AUTH-8b`); PLAN's "cannot bury a
+  mailbox", "SES credentials in SSM" and `email.rs`'s backends; TESTING's
+  "a mocked SDK tests the mock".
+- Scripts: `dev-dump.sh` leaves no `.partial` when it fails or is stopped, and
+  `dev-restore.sh` refuses one, and `SCRUB=0` for a production (directory)
+  dump; `compose cp` given the service, not a container id; `dev.py` creates
+  `contribute.txt` as `0600`; the native backend's example binds loopback;
+  the e2e stack's ports too; `.env.example` lists `BIND_HOST`.
+- Backend and frontend: the ban-reason test asserts the message and field;
+  "Force complete" is disabled on a completed job; a resume refused with `429`
+  says how long to wait; an `account.rs` comment.
+- Docs: PLAN's rate-limit table (resuming a key), the admin table's `409`,
+  §1's re-deletion wording, KL-2's history (the batch cap predates the first
+  audit), KL-90's log level, the file tree's `reapply-check.sh`; TESTING's
+  A-ACCOUNT-8/9 split, `I-SCHED-3v` as its own entry, `S-BACKUP-7` and the
+  nightly list; this record's pass 23 summary names every KL it updated.
+- RUNBOOK §1: the ban delete is two equi-joins (a nested loop took minutes at
+  tens of thousands of bans); the same-server refusal mentions DNS; the
+  summary is the 40 largest actor-action pairs and a total; the apply lists
+  the accounts whose actions were left out, to demote or reset; the damaged
+  instance is retired with a final snapshot.
+
+**Unconfirmed:** the damaged instance deleted without a snapshot loses the
+only record of what happened after the restore point (RUNBOOK now says to take
+one); SES's reaction to a sustained bounce stream (static reasoning from AWS's
+policy).
+
+### 24.10 Adversarial checks of the pass's fixes
+
+Two, one on the mail fixes and one on the rest. **6 medium, all fixed.**
+
+- **Anyone could raise the mail alarm, and hold it raised over a real
+  outage.** The filter was a phrase, and the frontend's nginx writes to the
+  same log group, its access lines carrying any User-Agent or Referer: `curl -A
+  'email failed to send'` counted as a failed send. **Fix:** each failure line
+  carries the field `alarm = "mail_failed"` and the filter is a JSON pattern
+  on it, which only the backend's JSON lines can meet; the test ties the two.
+  With it: SES's reason is now `code: message` (the SDK's full context was
+  1,300 characters with the recipient four times), the address check refuses
+  what SES's parser would (`a..b@x.com`, `a@exa_mple.com`: a failed send any
+  visitor could cause), the rate alarms keep their state when SES publishes
+  nothing, and the failure alarm sends no OK (five quiet minutes are not mail
+  working again).
+- **A psqlrc's `ON_ERROR_ROLLBACK` still let a pasted scrub commit.** Each
+  statement ran in a savepoint, so the refusal undid only itself. **Fix:** the
+  script turns it off before `BEGIN`. **Replayed:** pasted with none,
+  `interactive` and `on`, the pre-pass file scrubs every time and this one
+  never.
+- **The re-apply's `NOT IN` turned quadratic.** With no statistics on the
+  temporary tables, a few hundred thousand actions since the restore point —
+  one mass ban — made it a scan per row. **Shown:** 500,000 new actions, the
+  apply still running after 300 s. **Fix:** anti-joins, and every temporary
+  table analyzed: 4.6 s.
+- **A stop after the swap left the backend stopped, saying nothing**, and an
+  orphaned mirror container running. **Fix:** from the swap on, a stop says
+  the database is restored, removes the mirror's container (now named for the
+  run) and restarts the backend; a second Ctrl-C while the trap waits is
+  ignored; a trap that cannot read the outcome says so rather than "as it
+  was". **Replayed:** HUP during the mirror; TERM, HUP and INT at half-second
+  steps through 36 whole runs — each left one `birdtest` holding what the
+  message said, the backend running, no container.
+- **`FORCE=1` stopped while removing the old snapshot lost both.** **Fix:** the
+  old one is moved aside, the new one in, and the old removed last, with the
+  traps cleared. **Replayed:** INT the moment `.old` appeared (60,000 files):
+  the new snapshot whole beside it.
+- **On Linux every dev snapshot's artifacts were empty, and restoring one
+  emptied the bucket.** mc runs as uid 65532 in its image, could not write the
+  host directory, and exited 0. **Fix:** the mirror runs as the host's user,
+  with its credentials in the environment, and counts the objects; a snapshot
+  with none leaves the bucket alone. **Replayed** against the real mc image:
+  empty before, the object after; a stray object removed by a restore; an
+  empty snapshot left the bucket as it was.
+
+**Lows fixed:** the stub check asserts the scrub is the copy's (it fails with
+the scrub aimed at `birdtest`); `reapply-check.sh` excludes by an upper-case id
+and a Windows line end, so taking out either normalisation fails it; the apply
+lists every password hash it copies, and KL-92 says why; RUNBOOK gives a `sed`
+line for the demotion file (the ops image has no editor). **Unconfirmed:**
+whether SES refuses anything the stricter address check accepts; a backend
+left running when `docker compose ps --status` is unsupported (the swap still
+succeeds).
+
+### 24.11 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **631 of 631** (new: `a_refused_send_keeps_what_ses_said`,
+  `every_failed_send_is_logged_as_the_alarm_expects`, `A-AUTH-4h`, `A-AUTH-8b`;
+  more asserted in `U-CFG-4`, `A-AUTH-4i` and the ban-reason test).
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 122 of 122.
+- **Tier 5, natively: 14 of 14**; **tier 6, natively, every case**.
+- `terraform fmt -check` and `validate`: clean.
+- `scripts/reapply-check.sh` (rewritten): passes, and each of nineteen faults
+  put into the step fails it; `scripts/dev-restore-check.sh`: passes, and fails
+  with the scrub aimed at `birdtest`; `scripts/runbook-check.sh RUNBOOK.md
+  README.md`: 28 and 19 blocks; the dev restore, dump and scrub replayed as in
+  24.6, 24.7 and 24.10 against throwaway compose stacks; the re-apply timed
+  at 500,000 actions.
 - MAGPIE unchanged this pass.

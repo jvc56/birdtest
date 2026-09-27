@@ -75,9 +75,43 @@ impl Mailer {
                     .content(content)
                     .send()
                     .await
-                    .map_err(|e| AppError::internal(format!("SES send failed: {e}")))?;
+                    .map_err(|e| AppError::internal(format!("SES send failed: {}", ses_error(&e))))?;
                 Ok(())
             }
+        }
+    }
+}
+
+/// What SES said, as `code: message`: `{e}` alone reads "service error" for a
+/// paused account, an unverified address and a missing permission alike (the
+/// audit's pass 24). Not `DisplayErrorContext`, which appends the whole raw
+/// response -- a line of 1,300 characters, the recipient in it four times. An
+/// error with no answer from SES (a timeout, no route) has no code, and its
+/// chain of causes is the reason.
+fn ses_error(
+    e: &aws_sdk_sesv2::error::SdkError<
+        aws_sdk_sesv2::operation::send_email::SendEmailError,
+        aws_sdk_sesv2::config::http::HttpResponse,
+    >,
+) -> String {
+    use aws_sdk_sesv2::error::ProvideErrorMetadata;
+    match e {
+        aws_sdk_sesv2::error::SdkError::ServiceError(service) => {
+            let err = service.err();
+            match (err.code(), err.message()) {
+                (Some(code), Some(message)) => format!("{code}: {message}"),
+                (Some(code), None) => code.to_string(),
+                _ => format!("HTTP {}", service.raw().status().as_u16()),
+            }
+        }
+        other => {
+            let mut chain = other.to_string();
+            let mut source = std::error::Error::source(other);
+            while let Some(cause) = source {
+                chain.push_str(&format!(": {cause}"));
+                source = cause.source();
+            }
+            chain
         }
     }
 }
@@ -166,5 +200,105 @@ mod tests {
         let a = names.iter().find(|n| n.ends_with("-a-at-example-invalid.txt")).unwrap();
         let text = std::fs::read_to_string(dir.0.as_path().join(a)).unwrap();
         assert!(text.contains("Subject: Confirm") && text.contains("code: 123"), "{text}");
+    }
+
+    /// The alarm on failed mail (infra/ses.tf) matches a field in the log
+    /// line: every send's failure must carry it, and the filter must still
+    /// look for it.
+    #[test]
+    fn every_failed_send_is_logged_as_the_alarm_expects() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let infra = std::fs::read_to_string(root.join("../infra/ses.tf")).unwrap();
+        assert!(infra.contains(r#"pattern        = "{ $.fields.alarm = \"mail_failed\" }""#));
+        // Without whitespace, so that a call split across lines counts.
+        let auth: String = std::fs::read_to_string(root.join("src/routes/auth.rs"))
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        let sends = auth.matches("mailer.send(").count();
+        assert!(sends >= 3, "{sends}");
+        assert_eq!(auth.matches(r#"tracing::error!(alarm="mail_failed","#).count(), sends);
+    }
+
+    /// A send SES refuses is logged with SES's own code and message: what an
+    /// operator reads to tell a paused account from an unverified address or
+    /// a missing permission. It used to read `SES send failed: service error`,
+    /// the same for every one of them.
+    #[tokio::test]
+    async fn a_refused_send_keeps_what_ses_said() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                tokio::spawn(async move {
+                    // The whole request, headers and body, before answering.
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = socket.read(&mut buf).await else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&request);
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text[..end]
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse().ok())?
+                                })
+                                .unwrap_or(0usize);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    let body = r#"{"message":"Sending paused for this account."}"#;
+                    let response = format!(
+                        "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\n\
+                         x-amzn-ErrorType: SendingPausedException\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        let cfg = crate::config::Config::from_lookup(&|k: &str| match k {
+            "DATABASE_URL" => Some("postgres://a:b@c/d".into()),
+            "SESSION_SIGNING_KEY" => Some("00".repeat(32)),
+            "MAIL_BACKEND" => Some("ses".into()),
+            "MAIL_FROM" => Some("no-reply@example.com".into()),
+            "PUBLIC_URL" => Some("https://example.com".into()),
+            _ => None,
+        })
+        .unwrap();
+        let ses = |endpoint: String| {
+            aws_sdk_sesv2::Client::from_conf(
+                aws_sdk_sesv2::Config::builder()
+                    .behavior_version(aws_sdk_sesv2::config::BehaviorVersion::latest())
+                    .region(aws_sdk_sesv2::config::Region::new("us-east-1"))
+                    .credentials_provider(aws_sdk_sesv2::config::Credentials::new("a", "b", None, None, "test"))
+                    .endpoint_url(endpoint)
+                    .retry_config(aws_sdk_sesv2::config::retry::RetryConfig::disabled())
+                    .build(),
+            )
+        };
+        let cfg = Arc::new(cfg);
+        let mailer = Mailer { cfg: cfg.clone(), ses: Some(ses(endpoint)) };
+        let err = mailer.send("a@example.com", "Confirm", "code").await.unwrap_err();
+        assert_eq!(err.message, "SES send failed: SendingPausedException: Sending paused for this account.");
+
+        // No answer at all: the reason is in the causes.
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let nowhere = format!("http://{}", closed.local_addr().unwrap());
+        drop(closed);
+        let mailer = Mailer { cfg, ses: Some(ses(nowhere)) };
+        let err = mailer.send("a@example.com", "Confirm", "code").await.unwrap_err();
+        assert!(err.message.starts_with("SES send failed: dispatch failure: "), "{}", err.message);
+        assert!(err.message.to_lowercase().contains("connect"), "{}", err.message);
     }
 }

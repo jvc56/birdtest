@@ -5,8 +5,8 @@
 #
 #   ./scripts/dev-restore-check.sh
 #
-# Unset, empty and 1 scrub; 0 does not; anything else is refused before a
-# single compose call. `SCRUB=yes` used to skip the scrub, restoring a
+# Unset, empty and 1 scrub -- the copy the run restores into; 0 does not;
+# anything else is refused before a single compose call. `SCRUB=yes` used to skip the scrub, restoring a
 # production dump's real addresses and password hashes (thirty-second audit).
 
 set -Eeuo pipefail
@@ -38,7 +38,15 @@ check() {
   if (( status == 2 && calls == 0 )); then
     got=refused
   elif (( status == 0 && scrubs == 1 )); then
-    got=scrubbed
+    # The copy this run created, not the stack's database, which would have
+    # swapped an unscrubbed dump in.
+    local copy
+    copy=$(grep -o "CREATE DATABASE birdtest_restore_[0-9_]*" "${log}" | awk '{print $3}')
+    if [[ -n "${copy}" ]] && grep -q -- "-d ${copy} .*dev_copy=1" "${log}"; then
+      got=scrubbed
+    else
+      got="scrubbed, but not the copy (${copy:-none created})"
+    fi
   elif (( status == 0 && scrubs == 0 )); then
     got=kept
   else

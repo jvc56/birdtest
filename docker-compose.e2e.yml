@@ -27,12 +27,12 @@ name: birdtest-e2e
 services:
   postgres:
     ports: !override
-      - "5645:5432"
+      - "${BIND_HOST:-127.0.0.1}:5645:5432"
 
   minio:
     ports: !override
-      - "9302:9000"
-      - "9303:9001"
+      - "${BIND_HOST:-127.0.0.1}:9302:9000"
+      - "${BIND_HOST:-127.0.0.1}:9303:9001"
 
   # GitHub, for input-data import: `GET /api/repos/<repo>/git/ref/heads/main`
   # answers the fixture sha as JSON, and `/raw/<repo>/<sha>/versioned-tarballs/` holds the
@@ -67,12 +67,12 @@ services:
       # writable; the host reads the files and removes the directory on exit.
       - ${E2E_OUTBOX_DIR:?set E2E_OUTBOX_DIR, or run e2e/run.sh}:/outbox
     ports: !override
-      - "8280:8080"
+      - "${BIND_HOST:-127.0.0.1}:8280:8080"
 
   frontend:
     image: birdtest-e2e-frontend
     ports: !override
-      - "5280:80"
+      - "${BIND_HOST:-127.0.0.1}:5280:80"
 
   # Four workers, so the per-identity rate limit (one request a second) still
   # leaves a dashboard visibly moving. Player 1 wins 60% of divergent games,

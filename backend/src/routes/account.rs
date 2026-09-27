@@ -166,9 +166,9 @@ async fn set_key_active(
         crate::ratelimit::check(&state.limits.key_changes, &format!("u:{}", user.id))?;
     }
 
-    // Only a change is written and logged. This route has no rate limit of
-    // its own, and a row for every call let one account grow the audit log at
-    // request rate -- 8,000 rows in nine seconds (the audit's pass 22).
+    // Only a change is written and logged. A row for every call let one
+    // account grow the audit log at request rate -- 8,000 rows in nine seconds
+    // (the audit's pass 22) -- and suspending is still not limited.
     let mut tx = state.pool.begin().await?;
     let changed = sqlx::query_scalar::<_, Uuid>(
         "UPDATE api_keys SET is_active = $1 WHERE id = $2 AND user_id = $3 AND is_active <> $1

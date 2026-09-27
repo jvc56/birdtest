@@ -143,9 +143,12 @@ def write_contribute_settings(directory: Path, args, api_url: str) -> Path:
     ]
     if args.api_key:
         lines.append(f"apikey   {args.api_key}")
-    settings.write_text("\n".join(lines) + "\n")
-    # It may hold an API key: readable by its owner only.
-    settings.chmod(0o600)
+    # It may hold an API key: readable by its owner only, from the start --
+    # written first and chmod'd after, it was world-readable in between.
+    settings.unlink(missing_ok=True)
+    fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write("\n".join(lines) + "\n")
     return settings
 
 

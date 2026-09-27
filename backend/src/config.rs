@@ -195,6 +195,24 @@ impl Config {
         if mail_backend == MailBackend::File && mail_outbox_dir.is_none() {
             anyhow::bail!("MAIL_BACKEND=file needs MAIL_OUTBOX_DIR, the directory to write to");
         }
+        // Real mail goes out from a real address with links to the real site.
+        // The defaults are a laptop's: under `ses` they sent from
+        // `birdtest.local`, which SES refuses, with links to localhost.
+        let (mail_from, public_url) = (var("MAIL_FROM"), var("PUBLIC_URL"));
+        if mail_backend == MailBackend::Ses {
+            for (key, value) in [("MAIL_FROM", &mail_from), ("PUBLIC_URL", &public_url)] {
+                if value.is_none() {
+                    anyhow::bail!("MAIL_BACKEND=ses needs {key}; its default is only for local use");
+                }
+            }
+        }
+        // Links are built as `{PUBLIC_URL}/confirm-email?...`: a trailing
+        // slash made them `//confirm-email`.
+        let public_url = public_url
+            .as_deref()
+            .unwrap_or("http://localhost:5173")
+            .trim_end_matches('/')
+            .to_string();
 
         let secure_cookies = match var_or("SECURE_COOKIES", "false").as_str() {
             "true" => true,
@@ -227,8 +245,8 @@ impl Config {
             secure_cookies,
             mail_backend,
             mail_outbox_dir,
-            mail_from: var_or("MAIL_FROM", "no-reply@birdtest.local"),
-            public_url: var_or("PUBLIC_URL", "http://localhost:5173"),
+            mail_from: mail_from.unwrap_or_else(|| "no-reply@birdtest.local".into()),
+            public_url,
             // At least 180 s. Below MAGPIE's thirty-second cadence a live claim
             // lapsed, and each claim request handed the fleet's running tasks
             // to someone else (the audit's pass 12). 180 is six heartbeats. It
@@ -343,7 +361,14 @@ mod tests {
             // An empty value is unset, not an empty setting.
             let empty = config(&[(key, "")]).unwrap();
             assert_eq!(read(&empty), *default, "{key} empty");
-            let given = config(&[(key, set)]).unwrap();
+            let given = match *key {
+                // Which needs a sender and a site of its own (U-CFG-2).
+                "MAIL_BACKEND" => {
+                    config(&[(key, set), ("MAIL_FROM", "a@b.c"), ("PUBLIC_URL", "https://x.y")])
+                }
+                _ => config(&[(key, set)]),
+            }
+            .unwrap();
             let expected = if *key == "MAIL_BACKEND" { "Ses" } else { set };
             assert_eq!(read(&given), expected, "{key} set");
         }
@@ -384,12 +409,22 @@ mod tests {
             ("MAIL_BACKEND", "smtp"),
             // The file backend with nowhere to write.
             ("MAIL_BACKEND", "file"),
+            // SES with the local sender and site.
+            ("MAIL_BACKEND", "ses"),
         ] {
             let err = config(&[(key, value)]).unwrap_err();
             assert!(err.to_string().contains(key), "{key}={value}: {err}");
         }
         let file = config(&[("MAIL_BACKEND", "file"), ("MAIL_OUTBOX_DIR", "/outbox")]).unwrap();
         assert_eq!(file.mail_backend, MailBackend::File);
+        let ses = [("MAIL_BACKEND", "ses"), ("MAIL_FROM", "a@b.c"), ("PUBLIC_URL", "https://x.y")];
+        for missing in ["MAIL_FROM", "PUBLIC_URL"] {
+            let pairs: Vec<_> = ses.into_iter().filter(|(k, _)| *k != missing).collect();
+            let err = config(&pairs).unwrap_err();
+            assert!(err.to_string().contains(missing), "{err}");
+        }
+        let slash = config(&[("PUBLIC_URL", "https://x.y//")]).unwrap();
+        assert_eq!(slash.public_url, "https://x.y");
     }
 
     /// U-CFG-3: `MIN_MAGPIE_VERSION` goes through `Version`, so a malformed

@@ -352,6 +352,63 @@ async fn the_owner_of_a_taken_address_is_told_their_username() {
     assert!(mail[0].contains("/login as forgetful"), "{}", mail[0]);
 }
 
+/// A-AUTH-4h: the notice to a taken address's owner is limited per address,
+/// whatever client address asks, and one past the limit is skipped rather
+/// than refused: the caller gets the same `201`, the owner no sixth mail.
+#[tokio::test]
+async fn a_taken_address_is_sent_five_notices_an_hour_at_most() {
+    let db = TestDb::new().await;
+    let (state, outbox) = mail_state(&db, 1).await;
+    let app = birdtest::app(state);
+    confirmed_user(&db, "buried", PASSWORD).await;
+
+    let mut answers = Vec::new();
+    for i in 0..6 {
+        let ip = format!("203.0.113.{i}");
+        let response = register(&app, &format!("digger{i}"), "buried@example.invalid", PASSWORD, &ip).await;
+        assert_eq!(response.status, StatusCode::CREATED, "#{i}: {response:?}");
+        answers.push(response.bytes);
+    }
+    assert!(answers.windows(2).all(|pair| pair[0] == pair[1]), "the sixth answered differently");
+    outbox.wait_for("buried@example.invalid", 5).await;
+    // Sent off the request path, a sixth would land after its answer.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(outbox.messages_to("buried@example.invalid").len(), 5);
+}
+
+/// A-AUTH-8b: every link in mail is on `PUBLIC_URL`, whatever host the request
+/// names: a link built from `Host` or `X-Forwarded-Host` would send a reset
+/// token to whoever asked for it to be mailed.
+#[tokio::test]
+async fn mailed_links_are_on_the_public_url_whatever_the_request_names() {
+    let db = TestDb::new().await;
+    let outbox = Outbox::new();
+    let mut cfg = db.config();
+    cfg.mail_backend = MailBackend::File;
+    cfg.mail_outbox_dir = Some(outbox.0.clone());
+    cfg.public_url = "https://birdtest.example".into();
+    let app = birdtest::app(db.state_with(cfg).await);
+    confirmed_user(&db, "linked", PASSWORD).await;
+
+    let forged = [("host", "evil.example"), ("x-forwarded-host", "evil.example")];
+    let body = |username: &str, email: &str| json!({ "username": username, "email": email, "password": PASSWORD });
+    let fresh = post(&app, "/api/auth/register", &forged, body("newcomer", "newcomer@example.invalid")).await;
+    assert_eq!(fresh.status, StatusCode::CREATED, "{fresh:?}");
+    let taken = post(&app, "/api/auth/register", &forged, body("othercomer", "linked@example.invalid")).await;
+    assert_eq!(taken.status, StatusCode::CREATED, "{taken:?}");
+    let reset = post(&app, "/api/auth/reset-password/request", &forged, json!({ "email": "linked@example.invalid" })).await;
+    assert_eq!(reset.status, StatusCode::OK, "{reset:?}");
+
+    let mut mail = outbox.wait_for("newcomer@example.invalid", 1).await;
+    mail.extend(outbox.wait_for("linked@example.invalid", 2).await);
+    let links: Vec<&str> = mail.iter().flat_map(|m| m.split_whitespace()).filter(|w| w.contains("://")).collect();
+    // The confirmation, the notice's sign-in and reset pages, the reset link.
+    assert_eq!(links.len(), 4, "{mail:?}");
+    for link in links {
+        assert!(link.starts_with("https://birdtest.example/"), "{link} in {mail:?}");
+    }
+}
+
 /// A-AUTH-4f: a username goes into mail to an address's owner, and a stranger
 /// can register anyone's address under a name of their choosing (KL-34), so a
 /// name with a line break or an invisible character is refused; an account

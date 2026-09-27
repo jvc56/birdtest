@@ -754,7 +754,9 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
    it, at the confirmation link already sent). A real person who has forgotten
    they signed up still finds out; someone probing the address learns nothing.
    The notice is limited per address as well as per IP, and skipped rather than
-   refused when limited, so it cannot be used to bury a mailbox.
+   refused when limited: five an hour at most, which slows a flood but does not
+   stop one -- with reset mail, one address can still be sent some 240 a day
+   (KL-91).
 
    **An account that never confirmed gives up its username and address once its
    confirmation has expired.** The next registration naming either deletes it
@@ -1393,7 +1395,7 @@ Until birdtest is deployed there is only ever **one migration**. Schema changes 
 
 Two different hashes, for two different threat models. **Passwords** get Argon2 with a per-user salt: they are low entropy and are only ever verified against one known row. **API keys, email confirmation codes and reset tokens** get SHA-256: they are 24–32 bytes of randomness with no low-entropy secret to protect against offline guessing, and a worker request looks a key up by exact hash match on every call — a per-key Argon2 salt would force a full table scan and a verify per row. Raw API keys are `bt_` followed by 64 hex characters.
 
-**Secrets**: Database credentials, signing keys, and SES credentials are stored in AWS SSM Parameter Store and injected into the ECS task at runtime.
+**Secrets**: Database credentials and the session signing key are stored in AWS SSM Parameter Store and injected into the ECS task at runtime. SES needs none: the backend sends as the task's role (`infra/ecs.tf`).
 
 **Configuration** is read entirely from environment variables — `.env` locally,
 task-definition values in ECS, with the secret ones pulled from SSM at task
@@ -1408,8 +1410,8 @@ start. The process has no SSM code path of its own.
 | `SECURE_COOKIES` | `false` | `true` in any deployment served over TLS. |
 | `MAIL_BACKEND` | `console` | `console`, `ses`, or `file` — the end-to-end suite's, never production: each mail written to `MAIL_OUTBOX_DIR`, which it requires. Anything else fails startup. |
 | `MAIL_OUTBOX_DIR` | unset | The `file` backend's directory. |
-| `MAIL_FROM` | `no-reply@birdtest.local` | |
-| `PUBLIC_URL` | `http://localhost:5173` | The base for links in emails. |
+| `MAIL_FROM` | `no-reply@birdtest.local` | Required under `ses`: the default is only for local use, and SES refuses it. |
+| `PUBLIC_URL` | `http://localhost:5173` | The base for links in emails; a trailing slash is dropped. Required under `ses`, whose links must reach the real site. |
 | `HEARTBEAT_TIMEOUT_SECONDS` | `300` | How long a claim survives without a heartbeat. 180 to 86,400; anything else fails startup: below MAGPIE's thirty-second cadence a live worker's claim lapses and is handed to the next claimant. 180 is six heartbeats and no more: one heartbeat stalled until MAGPIE gives up on it (about 127 s) leaves some 187 s between recorded ones, and one that crawls lapses its claim at any setting (KL-83). |
 | `JOB_STATS_CACHE_SECONDS` | `10` | How old a job's stats payload (`GET /api/jobs/:id`, the stream's first event) may be, and the least spacing of its live pushes. The payload reads the job's whole history; rebuilt on every view and every second a busy job was watched, it cost about a second of database time per second on a large job. Built one at a time per job; dropped by every admin action on the job, by its completion and by a leave generation closing, so the admin page reloading after an action reads the change. `0` builds it on every request (the tests). |
 | `S3_BUCKET` | `birdtest-artifacts` | |
@@ -4688,6 +4690,7 @@ In-memory token buckets, per process, reset on restart.
 | `POST /api/auth/reset-password/request` | 5 / hour | Client IP **and**, separately, the address asked for |
 | `POST /api/worker/task` | 1 / second, **burst 5** | Per credential: the API key (`k:<the key's SHA-256>`) or the anonymous UUID (`a:<uuid>`). Claims only. |
 | `POST /api/worker/{result,heartbeat,decline}`, `GET /api/worker/artifact` | 1 / second, **burst 5** | Per credential again, in a second bucket (`…#work`): work in hand never waits behind claims — idle machines sharing a key or a copied `uuid` took every token, and a busy one's heartbeats, sent once and never retried, were refused until its claim lapsed (thirty-first audit). So one credential makes up to two requests a second, five and five in a burst. Per key, not per account: keyed on the account, every machine a contributor ran under it shared one request a second, and six idle machines used it all. (An account-wide bucket beside it, 10 / second, was too tight for the hundred keys an account may hold: fifty idle machines filled it, and heartbeats, which are not retried, lapsed. Key churn is bounded at creation instead, below) |
+| `PATCH /api/me/api-keys/:id` resuming a key (`is_active: true`) | 60 / hour, **burst 100** | The account (`key_changes`). Suspending is not limited: an owner shutting keys after a takeover is never held back by a thief who drained the bucket, and a back-and-forth needs both. Only a change writes an audit row |
 | `POST /api/me/api-keys` | 10 / hour, **burst 100** | The account. Each key is a worker bucket of its own and revoking one frees a slot under the hundred-key cap, so unmetered churn was unmetered new capacity. The burst is the cap, so a contributor setting up a machine per key is not held back (at ten an hour from the start, fifty machines took five hours); what refills slowly is revoke-and-recreate |
 | `POST /api/worker/task` with no identity | 5 / second, **burst 30** | Client IP, shared by every new contributor behind one address until each is issued a UUID |
 | Any worker request with an API key or `X-Worker-UUID` that has not resolved in the last ten minutes | 5 / second, **burst 100**, charged **before the lookup**, match or not | Client IP. The identity lookup is a main-pool query; a credential that resolved recently skips this, so a bad neighbour behind a shared address does not lock out working machines (`ratelimit::CredentialGate`). The worker's own bucket (above) is charged before the lookup too, on the credential as presented |
@@ -4881,7 +4884,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `POST` | `/api/admin/jobs` | Create a new job. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (every MAGPIE build the fleet runs has `BOARD_DIM` 15, so every worker would fail every task) and an SPRT `alpha` below 0.000001 (an infinite upper bound; `beta` has the same floor for symmetry). |
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
-| `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. |
+| `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. Refused (`409`) for a job that is already completed. |
 | `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. `409` while a purge or delete of the job is already running: each runs to completion on a task of its own, so a second click stacked a second behind the first's locks. |
 | `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. `409` while a purge or delete of it is running, as above. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account: anonymize it in place, keeping its claims and records so no donated compute is lost (see Admin API semantics). |
@@ -5069,9 +5072,10 @@ reach: the nightly dumps taken before it keep the account as it was for as
 long as they are kept (`backup_retention_days`, 365 by default, and up to 90
 days more as a noncurrent version, in the replica too; "Backups and
 Restore"), and a restore to a
-point before it brings the account back — RUNBOOK §1 shuts the accounts
-deleted since the restore point (from the damaged instance's `user.deleted`
-rows, reviewed first) and lists them to delete again (the audit's pass 22).
+point before it brings the account back — RUNBOOK §1 deletes again, as the
+admin route does, the accounts deleted since the restore point (from the
+damaged instance's `user.deleted` rows, reviewed first; the audit's passes 22
+and 23).
 
 **Rebuilding artifacts** recomputes each generation's KLV from
 `leave_rack_progress`, compares against the recorded digest, and reports per
@@ -5236,6 +5240,7 @@ birdtest/
 │   ├── restore-job.sh              # copy one purged or deleted job back from a scratch restore
 │   │                               # (RUNBOOK §2.2; also embedded in the ops task, infra/ops.tf)
 │   ├── restore-job-check.sh        # restore-job.sh through its failure and re-run cases (nightly)
+│   ├── reapply-check.sh            # RUNBOOK §1's security re-apply step against a restored copy (nightly)
 │   ├── backup-drill-check.sh       # backup.sh and restore-drill.sh against a local stack (nightly)
 │   ├── e2e_magpie_native.sh        # tier 6 natively: real MAGPIE, throwaway Postgres and MinIO
 │   ├── capture_contract.py         # capture the worker API's contract fixtures
@@ -5278,7 +5283,7 @@ birdtest/
 │       │   ├── session.rs          # Paseto token creation / validation
 │       │   ├── api_key.rs          # API key, password and code hashing
 │       │   └── csrf.rs             # CSRF double-submit verification
-│       ├── email.rs                # SES / console mail backends
+│       ├── email.rs                # SES, console and file mail backends
 │       ├── artifacts.rs            # S3 (MinIO in dev) artifact store; multipart upload and presigned reads
 │       ├── exports.rs              # a completed job's results as one gzipped NDJSON artifact
 │       ├── ratelimit.rs            # in-memory governor token buckets
@@ -7106,7 +7111,7 @@ says so in its implemented option, rather than being removed.
   either, except `racks_per_task` (10,000 since the thirty-second audit: every
   claim and every `leave_requests` row carries a task's forced racks); a typo
   makes tasks that outlast their lease rather than fail. Batch sizes have one:
-  `racks_per_batch` 10,000 (earlier in the thirty-second audit), and since its
+  `racks_per_batch` 10,000 (since before the first audit), and since the thirty-second audit's
   pass 21 `games_per_batch`
   10,000 games (1,000 when capturing; `pairs_per_batch` half that) — past
   32,768 captured games a result could not name its games at all. The
@@ -7678,9 +7683,11 @@ says so in its implemented option, rather than being removed.
 - **Option implemented:** Confirm on open. *(Sixteenth audit.)*
 - **Justification:** A button would cost every registrant a click.
 
-**KL-35. Only ASCII addresses register (`is_bare_address`).**
-- **Context:** SES does not send to SMTPUTF8 addresses.
-- **Problem:** Internationalized addresses cannot register.
+**KL-35. Only ASCII addresses register (`is_bare_address`), and only ones SES parses.**
+- **Context:** SES does not send to SMTPUTF8 addresses, and refuses one that is
+  not a dot-atom at a host name (pass 24 holds registration to that).
+- **Problem:** Internationalized addresses cannot register, nor quoted local
+  parts or address literals (`"a b"@x.com`, `a@[192.0.2.1]`).
 - **Options considered:** have the form send an internationalized domain as
   punycode.
 - **Option implemented:** None. *(Sixteenth audit.)*
@@ -8503,7 +8510,7 @@ says so in its implemented option, rather than being removed.
   row says `target_type = 'worker'` for an account and an anonymous UUID
   alike: which it was is read from `worker_bans`, or from the id. And nothing
   records a sign-in attempt: not the audit log (by design, "Audit actions"),
-  not the service's logs at their deployed level (`RUST_LOG=birdtest=info`,
+  not the service's logs at their deployed level (`RUST_LOG=birdtest=info,tower_http=info`,
   where the HTTP trace is at debug), not the load balancer (no access logs) —
   the limiter refuses a guesser and nobody can see that it did.
 - **Options considered:** a row for each; a `target_type` of `user` or
@@ -8515,6 +8522,61 @@ says so in its implemented option, rather than being removed.
   the ban's identity kind is in the table beside it. A line per refused
   sign-in, or per bucket that trips, is a small change when an operator wants
   to watch for guessing; the limiter bounds it either way.
+
+**KL-91. A visitor can still drive the bounce rate, and flood one mailbox slowly.**
+- **Context:** Registration and password reset mail (`routes/auth.rs`),
+  `infra/ses.tf` (thirty-second audit, pass 24).
+- **Problem:** Registration mails a confirmation to any address it is given, at
+  ten an hour per client address: one address sends some 240 a day to made-up
+  domains, every one a bounce, and many addresses more. SES reviews an account
+  at a 5% bounce rate and may pause its sending at 10%, which stops every
+  confirmation and reset. Suppression makes each address bounce once, not
+  once per mail, and the bounce-rate alarm fires at 4%; nothing stops the
+  stream. Separately, one address can be sent five "already has an account"
+  notices and five reset mails an hour, from any client addresses: some 240 a
+  day to one person, indefinitely. The mail itself carries no per-message
+  feedback: which addresses bounced is in SES's suppression list, not in
+  birdtest. And the outbox file name that the end-to-end suite reads mail by
+  maps `a.b@x` and `a-b@x` to one suffix (tests only; their addresses are
+  unique).
+- **Options considered:** a daily cap per address as well as the hourly one; a
+  site-wide cap on confirmation mail; refusing reserved domains (`.invalid`,
+  `.test`) at registration; a configuration set with bounce and complaint
+  events to SNS, marking an account's address as bouncing; a CAPTCHA.
+- **Option implemented:** Only the alarms (bounce and complaint rates, any
+  failed send), account-level suppression, and SES's reason in the log.
+- **Justification:** A pause is loud now, and caught before SES acts; birdtest's
+  registration volume is small enough that an operator reading the alarm can
+  close registration or ask SES for a review. A site-wide cap or a CAPTCHA
+  would turn the same attacker into one who blocks real registrations instead.
+  Reserved domains are the few an attacker would not use.
+
+**KL-92. What RUNBOOK §1's re-apply step does not handle.**
+- **Context:** The step that re-applies, after a full restore, the security
+  actions since the restore point (thirty-second audit, passes 22–24, and its
+  check `scripts/reapply-check.sh`).
+- **Problem:** It re-applies what the damaged instance's audit log records, so
+  an action whose row is gone — deleted by someone with database access, or an
+  action that writes none (KL-90) — is not re-applied; admin flags, which are
+  not audited, are compared instead. It takes the damaged rows from an hour
+  before the restored instance's newest one, so an action in a transaction
+  that ran for more than an hour across the restore point is missed. The
+  review lives in the ops task's `/tmp` and is lost with the task. A password
+  reset since the restore point is applied by copying the damaged instance's
+  current hash, which a later change with no audit row (a migration) would
+  have altered too: the apply lists every hash it copies. Every session ends,
+  not only those that should.
+- **Options considered:** exporting the whole audit log by id; writing the
+  review to the restored database; ending only the sessions of accounts with
+  actions since the restore point.
+- **Option implemented:** None; they are stated here and in RUNBOOK §1.
+- **Justification:** Each action it re-applies is one request's short
+  transaction; to miss one, that request would have had to wait on a lock for
+  an hour. An attacker who can delete audit rows can do anything the
+  step would undo, and the damaged instance is kept, with a final snapshot,
+  for exactly that investigation. The apply refuses without the review, so a
+  lost one is redone rather than skipped. Signing everyone in again once is
+  the price of not having to tell which sessions are safe.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
@@ -9276,6 +9338,21 @@ it does, once: it creates the alarms before the task is healthy, and with no
 data yet they start in ALARM, then clear (README's first deploy says to expect
 it).
 
+And it carries mail's (`infra/ses.tf`, the audit's pass 24). Every account mail
+is sent off its request and answered the same whether it went or not, so a
+failed send reached no one but the log -- as `SES send failed: service error`,
+the same for a paused account, an unverified address and a missing
+permission. Now the log carries SES's code and message, a metric filter on
+the failure line's `alarm = "mail_failed"` field alarms on the first one (the
+SDK has retried by then; a JSON field, because the frontend's access lines in
+the same log group carry whatever a visitor puts in a header), and two alarms
+watch SES's own bounce and complaint rates at 4% and 0.08%, below the 5% and
+0.1% at which SES reviews an account (it may pause one at 10% and 0.5%).
+Addresses that hard-bounced or complained are suppressed account-wide, and an
+address is refused at registration unless SES would parse it (a dot-atom and
+host-name labels), so a visitor cannot make a send fail. What a visitor can
+still do to the rates is KL-91.
+
 Layer 3 had a design choice of its own. Having the backend list the backup bucket
 directly would require giving the task role `ListBucket` / `GetObject` on it,
 weakening the isolation the separate bucket exists to create. Instead **the backup
@@ -9316,7 +9393,10 @@ those submissions are silently discarded. Restore to a new instance, point
 start, so no image rebuild is needed), verify, and only then retire the old
 instance. Before scaling up, re-apply what the restore undid for security —
 revocations, resets, bans, deletions and demotions since the restore point —
-from the old instance's audit rows (RUNBOOK §1): the restore brings every
+from the old instance's audit rows, those the restored instance lacks by id,
+reviewed and with what the review leaves out enforced (RUNBOOK §1); and end
+every session with a new signing key, since a session ended after the restore
+point matches the restored instance again: the restore brings every
 credential back as it was. Confirm `deletion_protection` and `backup_retention_period` carried over:
 a restored instance does **not** inherit automated-backup settings by default, and a
 restore that leaves the new instance unbacked is a trap. The alternative shape —
@@ -9433,13 +9513,25 @@ development rather than recovery:
   admin's free text about a person (the audit's pass 23). Usernames stay:
   they are public on the site. It refuses to run unless asked for by name
   (`-v dev_copy=1`, which `dev-restore.sh` passes): its usage line once pointed
-  it at `$DATABASE_URL`, which in the ops shell is production. A dump is
-  restored, and scrubbed, into a database of its own that replaces the
-  stack's only once both have succeeded: a dump cut short, a signal or a
-  failing scrub drops the copy and leaves the stack as it was (restored in
-  place, one that failed part-way was left unscrubbed, and one stopped by a
-  signal went on restoring inside the container). A snapshot is written aside
-  and moved into place only when complete.
+  it at `$DATABASE_URL`, which in the ops shell is production; its transaction
+  opens before that refusal, with `ON_ERROR_ROLLBACK` off, so the script
+  pasted into an interactive psql, which goes on reading past an error, runs
+  nothing after it (it ran the whole scrub, pass 24, and a psqlrc's
+  `ON_ERROR_ROLLBACK` let it still). A dump is
+  restored, and scrubbed, into a database of the run's own that replaces the
+  stack's, in one transaction, only once both have succeeded: a dump cut
+  short, a signal or a failing scrub drops the copy and leaves the stack as it
+  was (restored in place, one that failed part-way was left unscrubbed, and one
+  stopped by a signal went on restoring inside the container; swapped by two
+  renames, a failure between them, or two restores at once, lost the stack's
+  database, pass 24). A signal during the swap waits for it and says which way
+  it went, and a stop after it brings the backend back. A snapshot is written
+  aside and moved into place only when complete, the old one moved aside
+  before and removed after, and nothing is left of one that fails. The
+  artifact bucket is mirrored as the host's user and its objects counted: as
+  the image's own user, mc wrote nothing on Linux and said nothing, so every
+  snapshot's bucket was empty, and restoring one emptied the dev bucket; a
+  snapshot with no objects now leaves the bucket alone.
   Restoring production data locally without the scrub is documented as
   something not to do.
 

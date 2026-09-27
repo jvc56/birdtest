@@ -20,7 +20,16 @@
 -- matters, because the failure mode to protect against is forgetting whether
 -- it was run at all.
 
+-- The transaction opens before the guard, so that a refusal aborts it: psql
+-- run on a file stops at the error, but pasted into an interactive psql it
+-- only returns to the prompt and goes on reading, and with the refusal before
+-- `BEGIN` the pasted scrub ran, and committed, after it (the audit's pass 24).
+-- Now every statement after a refusal fails in the aborted transaction --
+-- unless a psqlrc sets ON_ERROR_ROLLBACK, which wraps each statement in a
+-- savepoint so that the refusal undoes only itself: turned off here.
 \set ON_ERROR_STOP on
+\set ON_ERROR_ROLLBACK off
+BEGIN;
 \if :{?dev_copy}
 \else
 \set dev_copy false
@@ -30,8 +39,6 @@
 \echo 'scrub.sql refused: it rewrites every password, key and identity. Run it through scripts/dev-restore.sh, or with -v dev_copy=1 on a copy you are sure of -- never production.'
 DO $$ BEGIN RAISE EXCEPTION 'scrub.sql refused: -v dev_copy=1 not given'; END $$;
 \endif
-
-BEGIN;
 
 -- Emails become derivable-from-id placeholders in a domain that can never
 -- resolve, so a stray mail send in a dev stack cannot reach a real person.

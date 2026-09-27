@@ -20,9 +20,28 @@ output "ssm_parameter_names" {
   ]
 }
 
-output "ses_dkim_tokens" {
-  description = "Add these as CNAME records to finish SES domain verification."
-  value       = aws_sesv2_email_identity.domain.dkim_signing_attributes[0].tokens
+# As records, not bare tokens: each is `<token>._domainkey.<ses_domain>`
+# CNAME `<token>.dkim.amazonses.com`, which the tokens alone did not say.
+output "ses_dkim_records" {
+  description = "Add these CNAME records (name => value) to finish SES domain verification."
+  value = {
+    for token in aws_sesv2_email_identity.domain.dkim_signing_attributes[0].tokens :
+    "${token}._domainkey.${var.ses_domain}" => "${token}.dkim.amazonses.com"
+  }
+}
+
+# Without a DMARC record anyone can send mail as `ses_domain` -- a "reset your
+# password" mail included -- and receivers have no policy to judge it by. This
+# is the first step: `p=none` enforces nothing. Add `rua=mailto:` a mailbox at
+# the domain to receive reports (one elsewhere needs that domain's consent),
+# and move to `p=quarantine` once they show birdtest's own mail passing (DKIM
+# above, SPF through the MAIL FROM records below).
+output "ses_dmarc_record" {
+  description = "Add this TXT record, unless the domain has a DMARC record already: a second one voids both."
+  value = {
+    name = "_dmarc.${var.ses_domain}"
+    TXT  = "\"v=DMARC1; p=none\""
+  }
 }
 
 # ses.tf sends from the custom MAIL FROM domain `mail.<ses_domain>`, which SES

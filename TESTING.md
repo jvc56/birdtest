@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 216 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1 Unit | 218 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (4), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 122 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 161 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (27), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 221 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (24), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 223 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (26), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 627 backend tests (the per-tier counts above are
+--run-ignored all` runs 631 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -159,9 +159,9 @@ incidentally by higher tiers.
 | `worker/fake_worker.py` output shapes | 1 | Covered — a captured submission for every job type and every `--mode` (`U-FAKE-*`) |
 | `scripts/seed.py` | 5, 6 (used by both) | Covered by use: `e2e/run.sh` and `e2e_magpie.py` both seed through it |
 | `scripts/dev.py` | Manual | Deliberate — see [Not tested](#what-is-deliberately-not-tested) |
-| `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh` | Nightly | Covered (`S-BACKUP-*`) |
+| `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh`, RUNBOOK §1's re-apply step | Nightly | Covered (`S-BACKUP-*`) |
 | `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`, `-2`) |
-| `scripts/dev-restore.sh` | CI (`scripts`) | Covered (`S-BACKUP-6`: its `SCRUB` rule against a stub `COMPOSE`) |
+| `scripts/dev-restore.sh` | CI (`scripts`) | Covered (`S-BACKUP-6`: its `SCRUB` rule against a stub `COMPOSE`, and that the scrub is the copy's) |
 | birdtest ↔ MAGPIE wire | 4 + 6 | Covered — `C-1`..`C-9` on both sides, and tier 6 |
 
 ---
@@ -376,7 +376,9 @@ process environment, so no test mutates `std::env` under another.
   `config::tests::a_malformed_version_floor_fails_startup`.)*
 - `U-CFG-4` A value that is present but malformed — a duration, a count, a
   boolean, an unknown `MAIL_BACKEND`, `MAIL_BACKEND=file` with no
-  `MAIL_OUTBOX_DIR`, a heartbeat timeout outside 180 s to a day (below
+  `MAIL_OUTBOX_DIR`, `MAIL_BACKEND=ses` with no `MAIL_FROM` or `PUBLIC_URL`
+  (whose defaults are a laptop's; pass 24, which also drops a `PUBLIC_URL`'s
+  trailing slash, that made links `//confirm-email`), a heartbeat timeout outside 180 s to a day (below
   MAGPIE's cadence a live claim lapsed and was handed on, thirty-second audit),
   a session TTL outside a minute to a year, a `BIND_ADDR` that is not an
   address — fails startup naming the setting
@@ -1091,10 +1093,11 @@ The single most important group. Every entry is about a decision made in SQL.
   found busy is settled a ratio unit short for ten minutes, so a 10% job
   beside a busy 90% one gets its tenth over three spells (within 5), where
   each spell's lead was forgiven. *(Covered:
-  `admin_api::repeated_busy_spells_on_a_settling_job_are_paid_back`.)* Short,
-  not unsettled: a newcomer found busy once in the split of 3j is still
-  settled, the majority job's first claim within sixteen, where it came
-  331st (`I-SCHED-3v`). *(Covered:
+  `admin_api::repeated_busy_spells_on_a_settling_job_are_paid_back`.)*
+  (Thirty-second audit, pass 22.)
+- `I-SCHED-3v` Short, not unsettled: a newcomer found busy once in the split of
+  3j is still settled, the majority job's first claim within sixteen, where it
+  came 331st. *(Covered:
   `admin_api::a_newcomer_busy_once_is_still_settled`.)*
   (Thirty-second audit, pass 22.)
 - `I-SCHED-4` Abandoned claims count toward a job's share. Abandon many claims
@@ -2015,6 +2018,18 @@ below.
   does. *(Covered:
   `auth_routes::a_name_differing_only_in_joiners_is_taken`.)* (Thirty-second
   audit.)
+- `A-AUTH-4h` The notice to a taken address's owner is limited to five an hour
+  per address, whatever client address asks, and one past it is skipped: the
+  sixth registration is answered with the same bytes and sends nothing.
+  *(Covered: `auth_routes::a_taken_address_is_sent_five_notices_an_hour_at_most`;
+  with the limit removed, a sixth notice lands.)* (Thirty-second audit, pass 24.)
+- `A-AUTH-4i` An address registers only bare (`x <victim@…>` and lists are
+  refused) and only as SES would parse it: a dot-atom local part and host-name
+  labels, so `a..b@x.com`, `.a@x.com` and `a@exa_mple.com` are refused rather
+  than failing to send — which any visitor could have used to raise the
+  mail-failed alarm. *(Covered:
+  `routes::auth::tests::only_a_bare_address_is_an_email`.)* (Thirty-second
+  audit; the SES syntax, pass 24.)
 - `A-AUTH-5` Registration validates password strength, and rejects a password
   containing the username or email — and so does a password reset, which
   scored the new password without the account's context. *(Covered:
@@ -2034,6 +2049,12 @@ below.
   disclose either. *(Covered:
   `auth_routes::a_reset_request_answers_the_same_for_known_and_unknown_addresses`,
   `auth_routes::a_reset_request_does_not_wait_on_the_mail_it_sends`.)*
+- `A-AUTH-8b` Every link in mail — a confirmation, a notice's sign-in and reset
+  pages, a reset link — is on `PUBLIC_URL`, whatever `Host` or
+  `X-Forwarded-Host` the request names: a link built from either would mail a
+  reset token to a host the requester chose. *(Covered:
+  `auth_routes::mailed_links_are_on_the_public_url_whatever_the_request_names`.)*
+  (Thirty-second audit, pass 24.)
 - `A-AUTH-9` A reset token is single-use, expires, and is invalidated by a
   successful reset. *(Covered:
   `auth_routes::a_reset_token_is_single_use_spent_by_any_reset_and_expires`.)*
@@ -2497,13 +2518,13 @@ below.
 - `A-ACCOUNT-8` A key's whole life is on record: issued, suspended, resumed
   and revoked, each writes an audit row by the key's id (not its label, the
   owner's free text), where none did and a revoked key left no trace at all;
-  a suspend or resume that changes nothing writes none.
+  a suspend or resume that changes nothing writes none. *(Covered:
+  `account::a_keys_life_is_on_record`.)* (Thirty-second audit, pass 22.)
 - `A-ACCOUNT-9` Resuming an account's keys is rate limited (`key_changes`):
   toggling a key 300 times, the last 50 resumes are `429`s with no row, and
   the owner can still suspend and revoke; unlimited, one account wrote 4,000
   audit rows in ten seconds. *(Covered: `account::key_changes_are_rate_limited_per_account`.)*
-  (Thirty-second audit, pass 23.) *(Covered:
-  `account::a_keys_life_is_on_record`.)* (Thirty-second audit, pass 22.)
+  (Thirty-second audit, pass 23.)
 
 ### `A-BOUND-*` — boundaries (`backend/tests/boundaries.rs`)
 
@@ -3008,7 +3029,7 @@ CloudWatch metrics when `AWS_S3_ENDPOINT` points at a stand-in object store
   million progress rows: the queue peaked at 18.9 MB in one statement and at
   3.2 MB, whatever the job's size, in batches.)
 
-All three run nightly (`restore-roundtrip`, which runs `S-BACKUP-5` too, and
+All three run nightly (`restore-roundtrip`, which runs `S-BACKUP-5` and `-7` too, and
 `backup-drill` in `.github/workflows/nightly.yml`), each against the schema applied to an empty
 database — which is also the migration replay the nightly list asks for. The
 monthly production drill (`restore-drill.sh` on the newest real dump) remains
@@ -3017,8 +3038,26 @@ the real check of the backups themselves.
 - `S-BACKUP-6` `dev-restore.sh` scrubs a restore unless `SCRUB=0`, and refuses
   any other value (`yes`, `true`, `2`, padded spaces) before a single compose
   call — `SCRUB=yes` used to skip the scrub, restoring a production dump's real
-  addresses and password hashes. *(Covered: `scripts/dev-restore-check.sh`,
-  a stub compose, in CI's `scripts` job.)* (Thirty-second audit.)
+  addresses and password hashes. The scrub is of the copy the run created,
+  not the stack's database. *(Covered: `scripts/dev-restore-check.sh`, a stub
+  compose, in CI's `scripts` job; it fails with the scrub aimed at
+  `birdtest`.)* (Thirty-second audit; the copy, pass 24.)
+- `S-BACKUP-7` RUNBOOK §1's step that re-applies what a restore undid for
+  security, its two blocks read from RUNBOOK.md as written, against a restored
+  and a damaged database. It refuses URLs that reach the wrong instance either
+  way; an apply before a whole export, without a reviewed `/tmp/after-exclude`,
+  against another server than the export's, or with an exclusion that matches
+  nothing (rolled back) or is not an id. It applies the audited actions the
+  restored instance lacks (revocations, suspensions, resets, confirmations,
+  bans and lifts, deletions — each target's last, an admin deleted, one whose
+  transaction began before the restore point), and not a bad migration's
+  unaudited changes nor an action from before the point; it leaves out an
+  actor or one action by id, keeps the restored password when the last reset
+  is left out, demotes only from the reviewed list and keeps an edit to it;
+  pasted again, it changes nothing; and it asks only for actions the backend
+  writes. Nineteen faults put into the step, one at a time, each fail it.
+  *(Covered: `scripts/reapply-check.sh`, nightly in `restore-roundtrip`.)*
+  (Thirty-second audit, pass 23; the fourth form, pass 24.)
 - `S-RUNBOOK-1` Every bash block in RUNBOOK.md parses: an operator pastes them
   during an incident, and one that does not leaves a continuation prompt that
   swallows what is pasted next — an apostrophe in a `${STAMP:?…}` message did
@@ -3047,11 +3086,21 @@ the real check of the backups themselves.
   person), in the ban or its audit row; and the script refuses to run unless
   asked for by name (`-v dev_copy=1`), since its old usage line pointed it at
   production; `dev_copy` must be true, not merely set. *(Covered: the reasons
-  in `account::a_scrubbed_dump_keeps_no_worker_credential`; the refusal,
-  `dev-restore.sh`'s restoring into a copy swapped in only when whole and
-  scrubbed — a dump cut in its data, one missing a file, SIGTERM and SIGHUP
-  part-way each leave the stack as it was — and `dev-dump.sh`'s writing aside,
-  by hand: the audit's pass 23 replayed each in a throwaway container.)*
+  in `account::a_scrubbed_dump_keeps_no_worker_credential`; the refusal —
+  run from a file, and pasted into an interactive psql, where it aborts the
+  transaction so nothing after it runs, whatever `ON_ERROR_ROLLBACK` a
+  psqlrc sets — and
+  `dev-restore.sh`'s restoring into a copy swapped in, in one transaction,
+  only when whole and scrubbed — a dump cut in its data, one missing a file,
+  SIGTERM and SIGHUP part-way, a copy that cannot be renamed, SIGINT during a
+  held swap (which it waits out and reports), two restores at once, a failed
+  artifact mirror (exit 1), TERM, HUP and INT at half-second steps through a
+  whole run (36 runs) each leave a `birdtest`, a message that says which,
+  the backend running and no mirror container — and `dev-dump.sh`'s writing
+  aside, leaving nothing when it fails or is stopped and the old snapshot
+  when stopped replacing it, and its artifact mirror, by hand against the real
+  mc image: the audit's passes 23 and 24 replayed each against a throwaway
+  compose stack.)*
 
 ---
 
@@ -3076,11 +3125,17 @@ Unit-testing HCL tests the plan, not the deployment, and the failure mode that
 matters — an apply that breaks production — is not reachable from a test suite.
 Backup *restores* are covered by the monthly drill, which is the real check.
 
-**The SES mail backend.** Every tier runs `console` or `file`; `ses` is
-exercised by production and by the first confirmation email after a deploy.
-Testing it would mean a mocked SDK, which tests the mock. What is shared —
-composing the message, sending off the request path (`A-AUTH-8`) — runs under
-the other two.
+**The SES mail backend, against SES.** Every tier runs `console` or `file`;
+what they share — composing the message, sending off the request path
+(`A-AUTH-8`) — runs under both. The real SDK is run against a local endpoint
+(`email::tests::a_refused_send_keeps_what_ses_said`: a refusal is logged
+as SES's `code: message`, where it read `service error`, and a send with no
+answer as its causes), and
+`email::tests::every_failed_send_is_logged_as_the_alarm_expects` ties each
+failure line's `alarm = "mail_failed"` field to the alarm's JSON filter in
+`infra/ses.tf`. What SES itself accepts,
+delivers and counts as a bounce is exercised by production, and by the first
+confirmation email after a deploy.
 
 **Generated and vendored code.** Vendored cJSON in MAGPIE, SvelteKit's
 `.svelte-kit` output.
@@ -3345,8 +3400,9 @@ GitHub Actions.
   every other check, twenty-third audit) and against the branch head.
   Dispatchable by hand against another MAGPIE ref (the head leg).
 - **restore-roundtrip** — the schema applied to an empty database (the
-  migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`) and
-  `scripts/restore-job-check.sh` (`S-BACKUP-5`).
+  migration replay), then `scripts/restore-roundtrip.sh` (`S-BACKUP-4`),
+  `scripts/restore-job-check.sh` (`S-BACKUP-5`) and
+  `scripts/reapply-check.sh` (`S-BACKUP-7`).
 - **backup-drill** — Postgres and MinIO up, the schema applied, then
   `scripts/backup-drill-check.sh` (`S-BACKUP-1`..`3`, and `S-BACKUP-2b`).
 

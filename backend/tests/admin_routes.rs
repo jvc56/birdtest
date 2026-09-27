@@ -625,9 +625,12 @@ async fn a_ban_by_either_identity_refuses_the_next_claim_and_unban_restores_it()
     }
     // A reason is a sentence, and holds no NUL, which was a `500` (the audit's
     // pass 22).
-    for reason in ["x".repeat(1_001), "spam\u{0}".to_string()] {
+    // Each refusal says which, on the field.
+    for (reason, said) in [("x".repeat(1_001), "too long"), ("spam\u{0}".to_string(), "NUL")] {
         let (status, refusal) = admin.post("/api/admin/workers/ban", json!({ "user_id": user, "reason": reason })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{refusal}");
+        assert!(message(&refusal).contains(said), "{refusal}");
+        assert_eq!(refusal["fields"][0]["field"], "reason", "{refusal}");
     }
     let (status, _) = admin.delete(&format!("/api/admin/workers/ban/{}", Uuid::new_v4())).await;
     assert_eq!(status, StatusCode::NOT_FOUND);

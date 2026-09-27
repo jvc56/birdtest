@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type ApiKey } from '$lib/api';
+  import { api, ApiError, type ApiKey } from '$lib/api';
   import { goto } from '$app/navigation';
   import { session } from '$lib/auth';
   import { datetime } from '$lib/format';
@@ -38,7 +38,13 @@
     try {
       await api.setApiKeyActive(key.id, !key.is_active);
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      // Resuming is limited per account; say how long to wait.
+      const minutes =
+        e instanceof ApiError && e.status === 429 && e.retryAfter !== null
+          ? Math.max(1, Math.ceil(e.retryAfter / 60))
+          : null;
+      const wait = minutes === null ? '' : ` — try again in ${minutes} minute${minutes === 1 ? '' : 's'}.`;
+      error = (e instanceof Error ? e.message : String(e)) + wait;
     }
     await load();
   }

@@ -424,7 +424,13 @@
         >
           Deactivate
         </button>
-        <button class="btn-secondary" disabled={busy || gone} on:click={forceComplete}>Force complete</button>
+        <button
+          class="btn-secondary"
+          disabled={busy || gone || stats.job.status === 'completed'}
+          on:click={forceComplete}
+        >
+          Force complete
+        </button>
         <button class="btn-secondary" disabled={busy || gone} on:click={purge}>Purge results</button>
         {#if stats.job.job_type === 'leave_generation'}
           <button class="btn-secondary" disabled={busy || gone} on:click={() => rebuildArtifacts()}>Check artifacts</button>

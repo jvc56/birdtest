@@ -232,73 +232,82 @@ key revoked or suspended since authenticates again, a password reset since is
 back to the old one, a session ended since — by a reset or "sign out
 everywhere" — is valid again for up to seven days, a ban added or lifted since
 is undone, an account deleted since is back with its name, address and keys,
-and an admin demoted since is an admin again. The damaged instance is the only
-record of them, so this runs while it still exists, and before the application
-points at the restored one. It is driven by the damaged instance's audit rows
-rather than its tables, which hold the damage too — a bad migration writes no
-audit rows, but its changes to keys or bans would be copied back with
-everything else — and the rows are reviewed before anything is applied, since
-damage done through the application (an admin account acting for an attacker)
-is recorded like any other action. Admin flags are the exception: they are set
-by hand (`scripts/prod-sql.sh`) and not audited, so they are compared instead —
-a restored admin the damaged instance no longer has is demoted, and the
-reverse is listed for a person to decide.
+and an admin demoted since is an admin again. Sessions are ended by a new
+signing key when the application is repointed (below): a session minted on the
+damaged instance and ended there matches the restored instance's session
+generation again, and nothing in the database can tell it from one that was
+not (the audit's pass 24). The rest: the damaged instance is the only record of
+them, so this runs while it still exists, and before the application points at
+the restored one. It is driven by the damaged instance's audit rows rather than
+its tables, which hold the damage too — a bad migration writes no audit rows,
+but its changes to keys or bans would be copied back with everything else —
+and the rows are reviewed before anything is applied, since damage done through
+the application (an admin account acting for an attacker) is recorded like any
+other action. Admin flags are the exception: they are set by hand
+(`scripts/prod-sql.sh`) and not audited, so they are compared instead — a
+restored admin the damaged instance no longer has is demoted, and the reverse is
+listed for a person to decide.
+
+Which rows are "since the restore point" is read from the data, not typed: the
+damaged instance's rows from an hour before the restored instance's newest one,
+less every row the restored instance also has, by id. A restore time typed a
+little late used to skip what happened in between with no word, and one in local
+time was refused only if it lacked a `Z`.
 
 In an ops shell (`scripts/prod-shell.sh`), where `DATABASE_URL` now reaches
 the restored instance — the rename moved the endpoint — with the damaged
 instance's endpoint (`aws rds describe-db-instances --region "$REGION"
 --db-instance-identifier "birdtest-damaged-$STAMP" --query
 'DBInstances[0].Endpoint.Address' --output text`, from where the blocks above
-ran; the ops shell has none of their variables). If the master password was
-rotated after the restore point, set it on the restored instance first (see
-"Rotating the database password"): both blocks connect to it. First export
-the actions and review them:
+ran; the ops shell has none of their variables). The export and the review
+live in the ops task's `/tmp`: if the shell drops (ECS Exec ends after twenty
+idle minutes), return to the same task with `scripts/prod-shell.sh --attach
+<task-arn>`, which it prints — a new task starts with an empty `/tmp`, and the
+apply then refuses. If the master password was rotated after the restore point,
+set it on the restored instance first (see "Rotating the database password"):
+both blocks connect to it. First export the actions and review them:
 
 ```bash
-RESTORE_TIME=''   # the restore point, as above, in UTC ending in Z, e.g. '2026-09-07T02:55:00Z'
 DAMAGED_HOST=''   # the damaged instance's endpoint address
 # In a subshell: a failure stops the block without ending the ops shell.
 (
 set -eo pipefail
 # First: a refused paste must not leave an earlier export for the apply.
 rm -f /tmp/after.done
-case "${RESTORE_TIME:?set RESTORE_TIME to the restore point}" in
-  *Z) ;;
-  *) echo "RESTORE_TIME must be UTC, ending in Z, as the restore took it" >&2; exit 1 ;;
-esac
 DAMAGED_URL=$(sed "s#@[^:/]*:#@${DAMAGED_HOST:?set DAMAGED_HOST to the damaged instance endpoint}:#" <<<"$DATABASE_URL")
 q() { psql "$1" -v ON_ERROR_STOP=1 -Atqc "$2"; }
 where="SELECT coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()"
-if [ "$(q "$DATABASE_URL" "$where")" = "$(q "$DAMAGED_URL" "$where")" ]; then
-  echo "DATABASE_URL and the damaged endpoint reach the same server: check DAMAGED_HOST" >&2
+restored_at=$(q "$DATABASE_URL" "$where")
+if [ "$restored_at" = "$(q "$DAMAGED_URL" "$where")" ]; then
+  echo "DATABASE_URL and the damaged endpoint reach the same server: check DAMAGED_HOST, or wait for DNS to follow the rename and paste again" >&2
   exit 1
 fi
-# DATABASE_URL must reach the restored instance, which holds nothing newer
-# than the restore point: straight after the rename, DNS can still answer with
-# the damaged one.
-newer=$(q "$DATABASE_URL" "SELECT count(*) FROM audit_log WHERE created_at > '$RESTORE_TIME'")
-if [ "$newer" != 0 ]; then
-  echo "DATABASE_URL reaches an instance with $newer audit rows after the restore point: not the restored one. Wait for DNS and paste again." >&2
+# The restored instance's audit log is the damaged one's up to the restore
+# point, so newer rows on the DATABASE_URL side mean the two are swapped.
+if [ "$(q "$DATABASE_URL" "SELECT coalesce(max(id), 0) FROM audit_log")" -gt \
+     "$(q "$DAMAGED_URL" "SELECT coalesce(max(id), 0) FROM audit_log")" ]; then
+  echo "DATABASE_URL reaches the instance with the newer audit rows: not the restored one. Wait for DNS and paste again." >&2
   exit 1
 fi
-# Every security action from ten minutes before the restore point, oldest
-# first: a row's time is its transaction's start, so one that committed after
-# the point may be stamped before it, and repeating an older action changes
-# nothing (the last one for each target wins). The reason is base64, so no
-# line in it can end the file early.
+# From an hour before the restored instance's newest row: a row's time is its
+# transaction's start, so one that committed after the restore point may be
+# stamped before it. The rows the restored instance has are dropped below.
+since=$(q "$DATABASE_URL" "SELECT coalesce(max(created_at), '-infinity') - interval '1 hour' FROM audit_log")
+actions="'api_key.revoked', 'api_key.deactivated', 'api_key.reactivated',
+         'user.password_reset', 'user.email_confirmed', 'user.deleted',
+         'worker.banned', 'worker.unbanned'"
+# The reason is base64, so no line in it can end the file early.
 q "$DAMAGED_URL" "COPY (
-  SELECT id, action, target_id, actor_user_id, created_at,
-         translate(encode(convert_to(coalesce(reason, ''), 'UTF8'), 'base64'), E'\n', '')
-    FROM audit_log
-   WHERE created_at > timestamptz '$RESTORE_TIME' - interval '10 minutes'
-     AND action IN ('api_key.revoked', 'api_key.deactivated', 'api_key.reactivated',
-                    'user.password_reset', 'user.email_confirmed', 'user.deleted',
-                    'worker.banned', 'worker.unbanned')
-   ORDER BY id) TO STDOUT CSV" > /tmp/after-actions.tmp
+  SELECT a.id, a.action, a.target_id, a.actor_user_id, a.created_at,
+         translate(encode(convert_to(coalesce(a.reason, ''), 'UTF8'), 'base64'), E'\n', ''),
+         u.username
+    FROM audit_log a LEFT JOIN users u ON u.id = a.actor_user_id
+   WHERE a.created_at > timestamptz '$since' AND a.action IN ($actions)
+   ORDER BY a.id) TO STDOUT CSV" > /tmp/after-raw.tmp
 q "$DAMAGED_URL" "COPY (
   SELECT id, password_hash FROM users
    WHERE id::text IN (SELECT target_id FROM audit_log WHERE action = 'user.password_reset'
-                       AND created_at > timestamptz '$RESTORE_TIME' - interval '10 minutes')
+                       AND created_at > timestamptz '$since')
   ) TO STDOUT CSV" > /tmp/after-passwords.tmp
 q "$DAMAGED_URL" "COPY (SELECT id FROM users WHERE is_admin) TO STDOUT CSV" > /tmp/after-admins.tmp
 # Admin flags are set by hand and not audited, so they are compared: the
@@ -308,70 +317,111 @@ q "$DAMAGED_URL" "COPY (SELECT id FROM users WHERE is_admin) TO STDOUT CSV" > /t
 # the damaged instance has no admins.
 q "$DATABASE_URL" "COPY (SELECT id, username FROM users WHERE is_admin) TO STDOUT CSV" > /tmp/after-restored-admins.tmp
 if [ -s /tmp/after-admins.tmp ]; then
-  grep -v -F -f <(cut -d, -f1 /tmp/after-admins.tmp) /tmp/after-restored-admins.tmp > /tmp/after-demote.tmp || true
+  grep -v -F -f <(cut -d, -f1 /tmp/after-admins.tmp) /tmp/after-restored-admins.tmp > /tmp/after-demote.proposed || true
 else
   echo "the damaged instance has no admins at all: its flags look damaged, so no demotion is proposed" >&2
-  : > /tmp/after-demote.tmp
+  : > /tmp/after-demote.proposed
 fi
 rm -f /tmp/after-restored-admins.tmp
+# Only the actions the restored instance lacks, and what they add up to.
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
+CREATE TEMP TABLE raw (id bigint, action text, target_id text, actor uuid, at timestamptz, reason_b64 text, actor_name text);
+\copy raw FROM '/tmp/after-raw.tmp' CSV
+ANALYZE raw;
+CREATE TEMP TABLE fresh AS SELECT * FROM raw r WHERE NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.id = r.id);
+\copy (SELECT * FROM fresh ORDER BY id) TO '/tmp/after-actions.tmp' CSV
+\echo security actions since the restore point, by who and what (the 40 largest):
+SELECT coalesce(actor_name, actor::text, 'the server') AS actor, actor AS actor_id, action, count(*)
+  FROM fresh GROUP BY 1, 2, 3 ORDER BY 4 DESC, 1 LIMIT 40;
+SELECT count(*) AS actions, count(DISTINCT (actor, action)) AS "actor and action pairs" FROM fresh;
+SQL
+rm -f /tmp/after-raw.tmp
 mv /tmp/after-actions.tmp /tmp/after-actions.csv
 mv /tmp/after-passwords.tmp /tmp/after-passwords.csv
 mv /tmp/after-admins.tmp /tmp/after-admins.csv
-mv /tmp/after-demote.tmp /tmp/after-demote.csv
-echo "security actions since the restore point, by who and what:"
-q "$DAMAGED_URL" "SELECT coalesce(u.username, a.actor_user_id::text, 'the server') AS actor,
-                         a.actor_user_id, a.action, count(*)
-                    FROM audit_log a LEFT JOIN users u ON u.id = a.actor_user_id
-                   WHERE a.created_at > timestamptz '$RESTORE_TIME' - interval '10 minutes'
-                     AND a.action IN ('api_key.revoked', 'api_key.deactivated', 'api_key.reactivated',
-                                      'user.password_reset', 'user.email_confirmed', 'user.deleted',
-                                      'worker.banned', 'worker.unbanned')
-                   GROUP BY 1, 2, 3 ORDER BY 4 DESC"
-echo "each one is a line of /tmp/after-actions.csv: id, action, target, actor, time"
+echo "$restored_at" > /tmp/after-restored-at
+echo "each one is a line of /tmp/after-actions.csv: id, action, target, actor, time, reason, actor's name"
+# The demotions under review are the operator's once written: a second export
+# proposes again beside them, and says if the two differ.
+if [ ! -e /tmp/after-demote.csv ]; then
+  cp /tmp/after-demote.proposed /tmp/after-demote.csv
+elif ! cmp -s /tmp/after-demote.proposed /tmp/after-demote.csv; then
+  echo "/tmp/after-demote.csv is kept as edited; this export proposes /tmp/after-demote.proposed:" >&2
+  diff /tmp/after-demote.csv /tmp/after-demote.proposed >&2 || true
+fi
 echo "admins here that the damaged instance no longer has, to be demoted (/tmp/after-demote.csv):"
 cat /tmp/after-demote.csv
 touch /tmp/after.done
 )
 ```
 
-Read the summary and the demotions. An action that is part of the damage — a
-run of unbans or deletions by an account acting for an attacker — is left out
-by putting its id, or its actor's id (not the username the summary shows
-first) to leave out everything that account did, on a line of
-`/tmp/after-exclude` (`echo <id> >> /tmp/after-exclude`); a second export
-keeps that file, and the apply lists any line that matched nothing. A
-demotion that is part of the damage is deleted from `/tmp/after-demote.csv`.
-Then apply the rest, in one transaction:
+Read the summary and the demotions, then record the review in
+`/tmp/after-exclude`, which the apply refuses to run without: one id to leave
+out per line — an action's id, or an account's to leave out everything it did
+(the id beside the name in the summary; a name matches nothing) — with anything
+after it on the line a comment, `echo '<id> # why' >> /tmp/after-exclude`, and
+`touch /tmp/after-exclude` when nothing is left out. An action that is part of
+the damage — a run of unbans or deletions by an account acting for an attacker
+— is left out so. A demotion that is part of the damage is deleted from
+`/tmp/after-demote.csv` (`sed -i '/<account id>/d' /tmp/after-demote.csv`: the
+ops task has no editor); a second export keeps both files. Then apply the rest,
+in one transaction:
 
 ```bash
 (
 set -eo pipefail
-# The same check as above: this must write to the restored instance.
-newer=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "SELECT count(*) FROM audit_log WHERE created_at > '${RESTORE_TIME:?set RESTORE_TIME as above}'")
-if [ "$newer" != 0 ]; then
-  echo "DATABASE_URL reaches an instance with $newer audit rows after the restore point: not the restored one." >&2
-  exit 1
-fi
-if [ ! -e /tmp/after.done ] || [ ! -e /tmp/after-demote.csv ]; then
+if [ ! -e /tmp/after.done ]; then
   echo "the export above has not finished: paste it again" >&2
   exit 1
 fi
-touch /tmp/after-exclude
+if [ ! -e /tmp/after-exclude ]; then
+  echo "no /tmp/after-exclude: review the export, then list what to leave out in it (touch it if nothing)" >&2
+  exit 1
+fi
+# The same server the export took as the restored one: this writes to it.
+where="SELECT coalesce(host(inet_server_addr()), 'local') || ':' || coalesce(inet_server_port(), 0) || '/' || current_database()"
+if [ "$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -Atqc "$where")" != "$(cat /tmp/after-restored-at)" ]; then
+  echo "DATABASE_URL reaches another server than the export took as the restored one: paste the export again" >&2
+  exit 1
+fi
+# The first word of each line, which must be an id; lower case, as Postgres
+# writes a uuid.
+tr -d '\r' < /tmp/after-exclude | { grep -v '^[[:space:]]*\(#.*\)\{0,1\}$' || true; } \
+  | awk '{print tolower($1)}' > /tmp/after-exclude.ids
+id='^([0-9]+|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'
+if grep -qvE "$id" /tmp/after-exclude.ids; then
+  echo "these lines of /tmp/after-exclude do not start with an action's or an account's id:" >&2
+  grep -vE "$id" /tmp/after-exclude.ids >&2
+  exit 1
+fi
+echo "leaving out: $(tr '\n' ' ' < /tmp/after-exclude.ids)"
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -q <<'SQL'
 BEGIN;
--- Every account signs in again, and no reset link sent before the restore
--- point works: a session or link ended since cannot be told from one that was not.
-UPDATE users SET session_generation = session_generation + 1;
+-- No reset link sent before the restore point works: one spent since cannot
+-- be told from one that was not. (Sessions end with the signing key, below.)
 UPDATE password_reset_tokens SET used_at = now() WHERE used_at IS NULL;
-CREATE TEMP TABLE after_actions (id bigint, action text, target_id text, actor uuid, at timestamptz, reason_b64 text);
-\copy after_actions FROM '/tmp/after-actions.csv' CSV
+CREATE TEMP TABLE all_actions (id bigint, action text, target_id text, actor uuid, at timestamptz, reason_b64 text, actor_name text);
+\copy all_actions FROM '/tmp/after-actions.csv' CSV
+-- Every temporary table is analyzed and every "not in" is an anti-join: with
+-- no statistics, a few hundred thousand actions -- one mass ban since the
+-- restore point -- turned a `NOT IN` into a scan per row, for hours.
+ANALYZE all_actions;
 CREATE TEMP TABLE after_exclude (v text);
-\copy after_exclude FROM '/tmp/after-exclude' CSV
-\echo exclusions that match no action or actor (an id is wanted, not a name):
-SELECT v FROM after_exclude e
- WHERE trim(e.v) <> ''
-   AND NOT EXISTS (SELECT 1 FROM after_actions a WHERE trim(e.v) IN (a.id::text, a.actor::text));
-DELETE FROM after_actions a USING after_exclude e WHERE trim(e.v) IN (a.id::text, a.actor::text);
+\copy after_exclude FROM '/tmp/after-exclude.ids' CSV
+-- A left-out id that matches nothing was meant for something: nothing is
+-- applied until it is corrected.
+DO $$ BEGIN
+  IF EXISTS (SELECT 1 FROM after_exclude e
+              WHERE NOT EXISTS (SELECT 1 FROM all_actions a WHERE e.v IN (a.id::text, a.actor::text))) THEN
+    RAISE EXCEPTION 'these exclusions match no action or actor, so nothing was applied: %',
+      (SELECT string_agg(v, ', ') FROM after_exclude e
+        WHERE NOT EXISTS (SELECT 1 FROM all_actions a WHERE e.v IN (a.id::text, a.actor::text)));
+  END IF;
+END $$;
+CREATE TEMP TABLE after_actions AS
+  SELECT * FROM all_actions a
+   WHERE NOT EXISTS (SELECT 1 FROM after_exclude e WHERE e.v IN (a.id::text, a.actor::text));
+ANALYZE after_actions;
 CREATE TEMP TABLE after_passwords (id uuid, password_hash text);
 \copy after_passwords FROM '/tmp/after-passwords.csv' CSV
 CREATE TEMP TABLE after_admins (id uuid);
@@ -387,17 +437,29 @@ UPDATE api_keys k SET is_active = (l.action = 'api_key.reactivated')
 -- Addresses confirmed since: unconfirmed, the account could not sign in.
 UPDATE users u SET email_confirmed_at = a.at FROM after_actions a
  WHERE a.action = 'user.email_confirmed' AND a.target_id = u.id::text AND u.email_confirmed_at IS NULL;
--- Passwords reset since, as the damaged instance has them.
-UPDATE users u SET password_hash = p.password_hash FROM after_passwords p
- WHERE p.id = u.id
-   AND EXISTS (SELECT 1 FROM after_actions a WHERE a.action = 'user.password_reset' AND a.target_id = u.id::text);
+-- Passwords reset since, as the damaged instance has them: its current hash,
+-- which is the last reset's unless something changed it without an audit row
+-- since, so it is taken only when that reset is not left out, and each one
+-- taken is listed.
+CREATE TEMP TABLE last_reset AS
+  SELECT DISTINCT ON (target_id) target_id, id FROM all_actions
+   WHERE action = 'user.password_reset' ORDER BY target_id, id DESC;
+\echo passwords taken from the damaged instance (a reset since the restore point): check none is part of the damage
+UPDATE users u SET password_hash = p.password_hash FROM after_passwords p, last_reset r
+ WHERE p.id = u.id AND r.target_id = u.id::text
+   AND EXISTS (SELECT 1 FROM after_actions x WHERE x.id = r.id)
+RETURNING u.username;
+\echo accounts whose last password reset was left out, so their password is the restored one: have each reset it
+SELECT u.id, u.username FROM last_reset r JOIN users u ON u.id::text = r.target_id
+ WHERE NOT EXISTS (SELECT 1 FROM after_actions x WHERE x.id = r.id);
 -- Bans: each identity's last ban or unban, for the identities this instance has.
 CREATE TEMP TABLE last_ban AS
   SELECT DISTINCT ON (target_id) target_id, action, actor, at,
          nullif(convert_from(decode(reason_b64, 'base64'), 'UTF8'), '') AS reason
     FROM after_actions WHERE action IN ('worker.banned', 'worker.unbanned')
    ORDER BY target_id, id DESC;
-DELETE FROM worker_bans b USING last_ban l WHERE l.target_id IN (b.user_id::text, b.anon_uuid::text);
+DELETE FROM worker_bans b USING last_ban l WHERE b.user_id::text = l.target_id;
+DELETE FROM worker_bans b USING last_ban l WHERE b.anon_uuid::text = l.target_id;
 INSERT INTO worker_bans (user_id, reason, banned_by, created_at)
 SELECT u.id, l.reason, (SELECT id FROM users WHERE id = l.actor), l.at
   FROM last_ban l JOIN users u ON u.id::text = l.target_id WHERE l.action = 'worker.banned';
@@ -420,6 +482,9 @@ UPDATE users u SET username = 'deleted-' || u.id::text,
 UPDATE users SET is_admin = false WHERE is_admin AND id IN (SELECT id FROM after_demote) RETURNING username;
 \echo admins on the damaged instance but not here: promote again by hand only if that was legitimate
 SELECT u.id, u.username FROM users u JOIN after_admins a ON a.id = u.id WHERE NOT u.is_admin;
+\echo accounts whose actions were left out, as they were at the restore point: demote or reset any that acted for an attacker
+SELECT DISTINCT u.id, u.username, u.is_admin FROM all_actions a JOIN users u ON u.id = a.actor
+ WHERE NOT EXISTS (SELECT 1 FROM after_actions x WHERE x.id = a.id);
 \echo identities banned on the damaged instance that are newer than the restore point: watch for them
 SELECT target_id FROM last_ban l
  WHERE action = 'worker.banned'
@@ -430,20 +495,19 @@ SQL
 )
 ```
 
-Both blocks can be pasted again: the first rewrites its files and keeps the
-exclusions, and the second sets state from them (a second run signs everyone
-out once more). `scripts/reapply-check.sh` runs both against two databases,
-through these cases (§6).
+Both blocks can be pasted again: the first rewrites its export and keeps the
+review (the exclusions and the demotions as edited), and the second sets state
+from them. `scripts/reapply-check.sh` runs both against two databases, through
+these cases (§6).
 
 If the damaged instance cannot be read at all — the instance failed, the schema
-is gone — there is nothing to re-apply from: end every session and spend every
-reset link, and say in the incident notes that revocations, resets, bans,
-deletions and demotions since the restore point must be redone by hand from
-what people remember and report.
+is gone — there is nothing to re-apply from: spend every reset link (sessions
+end with the signing key, below), and say in the incident notes that
+revocations, resets, bans, deletions and demotions since the restore point must
+be redone by hand from what people remember and report.
 
 ```bash
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'UPDATE users SET session_generation = session_generation + 1' \
-  -c 'UPDATE password_reset_tokens SET used_at = now() WHERE used_at IS NULL'
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'UPDATE password_reset_tokens SET used_at = now() WHERE used_at IS NULL'
 ```
 
 Repoint the application. The master password is set by hand and lives only in
@@ -466,6 +530,11 @@ print(p._replace(netloc=p.netloc.rsplit("@", 1)[0] + "@" + sys.argv[2] + ":5432"
 
 aws ssm put-parameter --region "$REGION" --name /birdtest/DATABASE_URL --type SecureString --overwrite \
   --value "$NEW_URL"
+# A new signing key ends every session: one ended on the damaged instance
+# after the restore point matches the restored instance's session generation
+# again, and only the key tells it from one that was not.
+aws ssm put-parameter --region "$REGION" --name /birdtest/SESSION_SIGNING_KEY --type SecureString --overwrite \
+  --value "$(openssl rand -hex 32)"
 
 # Tasks read SSM at start, so this is the whole deploy.
 aws ecs update-service --cluster "$CLUSTER" --service birdtest --desired-count 1 --region "$REGION"
@@ -482,7 +551,13 @@ Then run §4 (verification), **Check artifacts** on every leave-generation job
 and the button makes what workers are sent match what the bucket holds), and
 `terraform apply -var-file=prod.tfvars`: the restore set none of
 Multi-AZ, the backup window or tag copying, and the apply puts them back. Only
-once §4 passes, retire `birdtest-damaged-$STAMP` — never before.
+once §4 passes, retire `birdtest-damaged-$STAMP` — never before, and with a
+final snapshot (`aws rds delete-db-instance --region "$REGION"
+--db-instance-identifier "birdtest-damaged-$STAMP" --final-db-snapshot-identifier
+"birdtest-damaged-$STAMP-final"`, after `modify-db-instance
+--no-deletion-protection`): its audit rows since the restore point are the only
+record of what happened then, which the re-apply above applied but did not
+copy.
 
 **What the fleet does meanwhile.** Workers go on playing the tasks they hold.
 A worker asking for a task keeps asking, once a minute, for as long as the
@@ -1436,10 +1511,13 @@ so the copy is named apart with `name_suffix`, and kept in state of its own.
   at any Postgres 16 container. Nightly CI runs it.
 - `./scripts/reapply-check.sh` — runs §1's two blocks that re-apply the
   security actions a full restore undoes, as written here, against a
-  restored and a damaged database of its own: their refusals (a restore time
-  not in UTC, the wrong instance either way, an export unfinished or failed),
-  the actions applied and a bad migration's damage not, an excluded actor, a
-  demoted admin, and both blocks pasted again. Nightly CI runs it.
+  restored and a damaged database of its own: their refusals (the wrong
+  instance either way, an export unfinished or failed, no review, an
+  exclusion that matches nothing or is not an id), the actions applied — each
+  target's last, one begun before the restore point — and a bad migration's
+  damage not, an actor and an action left out, a later reset left out, a
+  demoted admin and an edited demotion list, and both blocks pasted again.
+  Nightly CI runs it.
 - `./scripts/backup-drill-check.sh` — runs `backup.sh` and `restore-drill.sh`
   exactly as their Fargate tasks do (the `postgres:16` image, the script as
   `bash -c`) against the local stack's Postgres and MinIO: a backup taken while

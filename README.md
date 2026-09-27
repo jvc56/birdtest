@@ -371,9 +371,11 @@ A first deployment, in order (each step is described below):
    `AZS=$(terraform -chdir=infra output -json azs) && ! grep -q '^azs' infra/prod.tfvars && printf '\nazs = %s\n' "$AZS" >> infra/prod.tfvars`. Left to
    the default, the pair is recomputed on every plan, and a change to what the
    region reports would plan to replace the subnets the database sits in.
-5. Add the SES DNS records straight away (the `ses_dkim_tokens` and
-   `ses_mail_from_records` outputs; SES looks for them for about 72 hours) and
-   request SES production access, which can take a day.
+5. Add the SES DNS records straight away (the `ses_dkim_records`,
+   `ses_mail_from_records` outputs, and `ses_dmarc_record`'s unless the
+   domain has a DMARC record already -- a second one voids both; SES looks for
+   the first two for about 72 hours) and request SES production access, which
+   can take a day.
 6. Confirm the SNS subscription mail, set the database password and the two
    SSM parameters (below), then
    `terraform -chdir=infra apply -var-file=prod.tfvars` (one task, and the
@@ -516,10 +518,25 @@ its `FailedInvocations` 0. (RUNBOOK §5 runs the same checks with `SUFFIX=-dr`.)
 
 **SES starts in the sandbox.** A new account's SES sends only to verified
 addresses, so until [production access](https://docs.aws.amazon.com/ses/latest/dg/request-production-access.html)
-is granted every registration and password reset to anyone else fails. Request
-it, and add the `ses_dkim_tokens` output as CNAME records and the
-`ses_mail_from_records` output's MX and TXT records, before opening
+is granted every registration and password reset to anyone else fails -- and
+answers the caller as if it had not, so the `-mail-failed` alarm fires instead.
+Request it, and add the `ses_dkim_records` output's CNAME records (each
+`<token>._domainkey.<domain>` to `<token>.dkim.amazonses.com`), the
+`ses_mail_from_records` output's MX and TXT records and, if the domain has no
+DMARC record, the `ses_dmarc_record` output's TXT record, before opening
 registration.
+
+**Mail has three alarms** (`infra/ses.tf`), to the same topic as the rest:
+`-mail-failed` on any account mail that failed to send (the backend's log says
+why, with SES's own code; search it for `mail_failed`), and `-ses-bounce-rate`
+and `-ses-complaint-rate` at 4% and 0.08%, below the 5% and 0.1% at which SES
+reviews an account (it may pause one at 10% and 0.5%, which would stop every
+confirmation and reset). `-mail-failed` sends no OK: it clears itself after
+five minutes with no failed send, which is not mail working again. Addresses
+that hard-bounced or complained are suppressed account-wide, so a made-up
+address bounces once. Registration mails any address it is given, so the bounce
+rate is one a visitor can push (KL-91): on the bounce alarm, look for a burst
+of new unconfirmed accounts (`users` rows with no `email_confirmed_at`).
 
 **The database is reachable only from inside the VPC** — no public address, no
 bastion, and its security group admits only the service's. SQL runs through
@@ -591,9 +608,15 @@ every password becomes `birdtest-local`, credentials and tokens are truncated,
 every anonymous worker's UUID -- its whole credential -- is replaced, and ban
 reasons are blanked). Restoring production data locally without that is a
 disclosure risk, not a shortcut. A restore goes into a copy, is scrubbed
-there, and replaces the stack's database only when both have succeeded, so one
-that fails or is stopped leaves the stack as it was; `dev-dump.sh` refuses a
-name that exists unless `FORCE=1`.
+there, and replaces the stack's database in one transaction only when both
+have succeeded, so one that fails or is stopped leaves the stack as it was (a
+stop during the swap waits for it and says which way it went). A process
+killed outright (`kill -9`) leaves its copy, unscrubbed if the scrub had not
+run, in the dev Postgres until the next restore drops it. `dev-dump.sh` refuses
+a name that exists unless `FORCE=1`, and leaves nothing behind when it fails.
+Snapshots taken before the audit's pass 24 hold no artifacts on Linux (the
+mirror could not write them, and said nothing): a restore of one leaves the
+bucket as it is.
 
 The stack's ports are published on loopback only: with the repo's fixed
 passwords and signing key, a stack holding a restored dump was open to anyone

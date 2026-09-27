@@ -150,22 +150,30 @@ async fn score_in_turn(
 /// string is, so the check is on what a mail API would do with it rather than
 /// on RFC 5322: `x <victim@example.com>` and `victim@example.com,x@y` were
 /// accepted, each a different string -- past the taken-address check and the
-/// per-address notice limit -- that mailed the same inbox.
+/// per-address notice limit -- that mailed the same inbox. And strictly, as
+/// SES parses one: a dot-atom before the `@` (no leading, trailing or doubled
+/// dot) and host-name labels after it. `a..b@x.com` or `a@exa_mple.com` passed
+/// here and would be refused by SES -- a failed send, and the mail-failed alarm
+/// (`infra/ses.tf`), that any visitor could raise (the audit's pass 24).
 fn is_bare_address(email: &str) -> bool {
     let Some((local, domain)) = email.split_once('@') else {
         return false;
     };
+    let atext = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-/=?^_`{|}~".contains(c);
+    let label = |l: &str| {
+        (1..=63).contains(&l.len())
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let labels: Vec<&str> = domain.split('.').collect();
     email.len() <= 254
-        && !local.is_empty()
         && local.len() <= 64
-        && !domain.contains('@')
-        && domain.contains('.')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
-        && !domain.contains("..")
-        && email.chars().all(|c| {
-            c.is_ascii_graphic() && !matches!(c, '<' | '>' | ',' | ';' | ':' | '"' | '(' | ')' | '[' | ']' | '\\')
-        })
+        && local.split('.').all(|part| !part.is_empty() && part.chars().all(atext))
+        && labels.len() >= 2
+        && labels.iter().all(|l| label(l))
+        // A top-level domain is never all digits: `1.2.3.4` is an address.
+        && !labels[labels.len() - 1].chars().all(|c| c.is_ascii_digit())
 }
 
 /// A character a username may not hold: a control character, a line or
@@ -453,7 +461,7 @@ async fn register(
                 if let Err(err) =
                     mailer.send(&to, "Someone tried to register with your email address", &body).await
                 {
-                    tracing::error!(error = %err.message, "registration email failed to send");
+                    tracing::error!(alarm = "mail_failed", error = %err.message, "registration email failed to send");
                 }
             });
         }
@@ -523,7 +531,8 @@ async fn register(
         // goes to any address they type, so naming it made birdtest carry
         // their words to strangers (the audit's adversarial check).
         format!(
-            "Welcome to birdtest.\n\nConfirm your account:\n{link}\n\n\
+            "Welcome to birdtest.\n\nConfirm your account (valid for \
+             {CONFIRMATION_TTL_HOURS} hours):\n{link}\n\n\
              If you did not register, ignore this mail.\n"
         ),
     );
@@ -542,7 +551,7 @@ fn send_in_background(state: &AppState, to: String, subject: &'static str, body:
     let mailer = state.mailer.clone();
     tokio::spawn(async move {
         if let Err(err) = mailer.send(&to, subject, &body).await {
-            tracing::error!(error = %err.message, subject, "registration email failed to send");
+            tracing::error!(alarm = "mail_failed", error = %err.message, subject, "registration email failed to send");
         }
     });
 }
@@ -810,7 +819,7 @@ async fn request_password_reset(
                 // Nothing to report to the caller -- they were told the same
                 // thing either way -- so this is the only record that the mail
                 // did not go out.
-                tracing::error!(error = %err.message, "password reset email failed to send");
+                tracing::error!(alarm = "mail_failed", error = %err.message, "password reset email failed to send");
             }
         });
     }
@@ -982,13 +991,16 @@ mod tests {
 
     #[test]
     fn only_a_bare_address_is_an_email() {
-        for good in ["a@example.com", "first.last+tag@mail.example.co.uk", "x_y-z@b.io"] {
+        for good in ["a@example.com", "first.last+tag@mail.example.co.uk", "x_y-z@b.io", "o'neil@x-y.example", "1@123.example"] {
             assert!(super::is_bare_address(good), "{good}");
         }
         for bad in [
             "x <victim@example.com>", "victim@example.com,other@x.com", "a@b", "@example.com",
             "a@@example.com", "a@example..com", "a b@example.com", "a@example.com.", "\"a\"@example.com",
             "a@.example.com", "a;b@example.com", "é@example.com",
+            // What SES refuses to parse.
+            ".a@example.com", "a.@example.com", "a..b@example.com", "a@exa_mple.com", "a@ex!ample.com",
+            "a@-example.com", "a@example-.com", "a@1.2.3.4", "a@example.com\u{0}",
         ] {
             assert!(!super::is_bare_address(bad), "{bad}");
         }
