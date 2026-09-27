@@ -116,7 +116,7 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | Flag | Default | What it changes |
 |---|---|---|
 | `-w`, `--workers` | 4 | How many `magpie contribute` processes run. Workers 1 and 2 are anonymous; 3 and 4 run as `dev-contributor-1` and `-2` under the API keys `--reset-db` makes (anonymous until a reset has made them) |
-| `--threads` | 4 | Threads inside each contributor |
+| `--threads` | 2 | Threads inside each contributor |
 | `--max-tasks` | 0 | Tasks each contributor runs before exiting; 0 runs until stopped |
 | `--idle-wait` | 5 | Seconds a contributor waits when there is no work |
 | `--api-key` | anonymous | Contribute under an account instead of anonymously |

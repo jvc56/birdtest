@@ -387,7 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
                                    "Workers 1 and 2 are anonymous; 3 and 4 run as the contributor "
                                    "accounts --reset-db makes, under their API keys (anonymous "
                                    "until a reset has made them)")
-    contributors.add_argument("--threads", type=int, default=4,
+    contributors.add_argument("--threads", type=int, default=2,
                               help="threads per contributor (default: %(default)s)")
     contributors.add_argument("--max-tasks", type=int, default=0,
                               help="tasks each contributor runs before exiting; "
