@@ -2,8 +2,9 @@
 """Bring up birdtest locally with real MAGPIE contributors, and open a browser.
 
 One command: start the stack, wait for it, seed it, launch N `magpie
-contribute` processes -- each in its own terminal window when there is a
-display, so one can be stopped and restarted by hand -- and open the site. It is tier 6's setup with the
+contribute` processes -- in the background, or with --worker-windows each in
+its own terminal window, so one can be stopped and restarted by hand -- and
+open the site. It is tier 6's setup with the
 assertions and the teardown removed, and it calls the same `scripts/seed.py`,
 so the development environment cannot drift from what the tests exercise.
 
@@ -467,8 +468,8 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> list:
     issued = {d: issued_uuid(d / "contribute.txt") for d in directories}
     known = uuids_the_database_knows([u for u in issued.values() if u])
 
-    terminal = None if args.no_worker_windows else find_terminal()
-    if not args.no_worker_windows and terminal is None:
+    terminal = find_terminal() if args.worker_windows else None
+    if args.worker_windows and terminal is None:
         log("no display or terminal emulator found: workers run in the background "
             "(their output goes to each contribute.log)")
 
@@ -497,7 +498,7 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> list:
                                         f"birdtest worker {index} ({kind})")
             if not window.started(timeout=15):
                 fail(f"worker {index}'s window did not start ({terminal[0]}); "
-                     "re-run with --no-worker-windows")
+                     "re-run without --worker-windows")
             processes.append(window)
             log(f"worker {index} ({kind}): its own window, in {directory}")
             continue
@@ -590,11 +591,10 @@ def build_parser() -> argparse.ArgumentParser:
                                    "Workers 1 and 2 are anonymous; 3 and 4 run as the contributor "
                                    "accounts --reset-db makes, under their API keys (anonymous "
                                    "until a reset has made them)")
-    contributors.add_argument("--no-worker-windows", action="store_true",
-                              help="run the workers in the background, logging to their "
-                                   "contribute.log, instead of each in its own terminal window "
-                                   "(where Ctrl-C stops one and Enter restarts it); the "
-                                   "default when there is no display")
+    contributors.add_argument("--worker-windows", action="store_true",
+                              help="run each worker in its own terminal window, where Ctrl-C "
+                                   "stops it and Enter restarts it, instead of in the background "
+                                   "logging to its contribute.log (ignored with no display)")
     contributors.add_argument("--threads", type=int, default=2,
                               help="threads per contributor (default: %(default)s)")
     contributors.add_argument("--max-tasks", type=int, default=0,

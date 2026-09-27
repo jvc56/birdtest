@@ -47,13 +47,13 @@ tarball your own checkout installed, creates two player configs and an active
 game-pairs job, launches four `magpie contribute` workers, and opens
 **http://localhost:5173** signed in as the seeded admin.
 
-Each worker runs in its own terminal window (gnome-terminal, konsole,
-xfce4-terminal, kitty, alacritty or xterm, whichever is found first). Ctrl-C in
-a window stops that worker and Enter starts it again under the same identity;
-a second Ctrl-C, or closing the window, leaves it stopped. Ctrl-C in dev.py
-stops every worker. With no display (an SSH session), or with
-`--no-worker-windows`, they run in the background and write to
-`.dev-workers/worker-NN/contribute.log`.
+The workers run in the background and write to
+`.dev-workers/worker-NN/contribute.log`. With `--worker-windows` each runs in
+its own terminal window instead (gnome-terminal, konsole, xfce4-terminal,
+kitty, alacritty or xterm, whichever is found first; ignored with no display):
+Ctrl-C in a window stops that worker and Enter starts it again under the same
+identity, and a second Ctrl-C, or closing the window, leaves it stopped.
+Either way, Ctrl-C in dev.py stops every worker.
 
 **Contributors are always real MAGPIE.** There is no fake-worker mode here.
 `worker/fake_worker.py` belongs to the end-to-end suite, where a browser
@@ -134,6 +134,7 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | `--tarball-date` | your `DATA_VERSION` | Which MAGPIE-DATA version to import |
 | `--min-magpie-version` | your build's version | The version floor, on the server and on the job |
 | `--web-port`, `--backend-port` | 5173, 8080 | Host ports |
+| `--worker-windows` | off | Run each worker in its own terminal window, to stop and restart by hand |
 | `--workdir` | `.dev-workers` | Where per-worker directories live |
 | `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker (the keyed workers lose their keys until the next `--reset-db`) |
 | `--rebuild` | off | Rebuild images before starting |
