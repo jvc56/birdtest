@@ -50,6 +50,18 @@ const MAX_SCORE_MEAN: f64 = 3000.0;
 /// points, and a pass or exchange scores exactly zero.
 const MAX_MOVE_SCORE: i32 = 100_000;
 
+/// The longest play MAGPIE could write (a 21-tile word with multi-letter
+/// tiles, its coordinate, an exchange's tiles) is well under this; a play
+/// string past it is not a play (a 100 KB `previous_move` was stored, the
+/// audit's pass 21).
+const MAX_PLAY_CHARS: usize = 256;
+/// A position in CGP: a 21x21 board row by row, the racks, the scores, the
+/// options -- under a kilobyte.
+const MAX_POSITION_CHARS: usize = 4096;
+/// The letters inside one bracketed tile: `[CH]`, `[L·L]`. A 500 KB
+/// "tile" counted as one and was stored (pass 21).
+const MAX_TILE_CHARS: usize = 8;
+
 /// Equity is a score-scale quantity, so it lives in the same order of
 /// magnitude as a score plus a leave adjustment.
 const MAX_ABS_EQUITY: f64 = 200_000.0;
@@ -127,7 +139,7 @@ pub fn rack_tiles(rack: &str) -> Option<usize> {
                         _ => letter_chars += 1,
                     }
                 }
-                if letter_chars == 0 {
+                if letter_chars == 0 || letter_chars > MAX_TILE_CHARS {
                     return None;
                 }
             }
@@ -158,6 +170,61 @@ pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// A play as written: bounded in length.
+pub fn check_play_text(play: &str, context: &str) -> AppResult<()> {
+    if play.chars().count() > MAX_PLAY_CHARS {
+        return Err(AppError::bad_request(format!(
+            "{context}: a play of more than {MAX_PLAY_CHARS} characters is not a play"
+        )));
+    }
+    Ok(())
+}
+
+/// A captured position's own fields: its CGP bounded in length, the play that
+/// led to it bounded too, and that play's score a score.
+pub fn check_position_text(
+    position: &str,
+    previous_move: Option<&str>,
+    previous_move_score: Option<i32>,
+    context: &str,
+) -> AppResult<()> {
+    if position.chars().count() > MAX_POSITION_CHARS {
+        return Err(AppError::bad_request(format!(
+            "{context}: a position of more than {MAX_POSITION_CHARS} characters is not a position"
+        )));
+    }
+    if let Some(play) = previous_move {
+        check_play_text(play, context)?;
+    }
+    if let Some(score) = previous_move_score {
+        if !(0..=MAX_MOVE_SCORE).contains(&score) {
+            return Err(AppError::bad_request(format!(
+                "{context}: the previous play scores {score}, which no play can score"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// A result's JSON text holds no NUL character. Postgres refuses one in a
+/// string, and the insert failed as a `500` -- which MAGPIE retries until it
+/// gives up, leaving the claim open (the audit's pass 21). JSON can carry one
+/// only escaped, as `\u0000` after an odd run of backslashes.
+pub fn refuse_nul(json: &str) -> AppResult<()> {
+    let bytes = json.as_bytes();
+    let mut from = 0;
+    while let Some(at) = json[from..].find("u0000").map(|i| from + i) {
+        let backslashes = bytes[..at].iter().rev().take_while(|b| **b == b'\\').count();
+        if backslashes % 2 == 1 {
+            return Err(AppError::bad_request(
+                "a string in the result holds a NUL character, which cannot be stored",
+            ));
+        }
+        from = at + 5;
+    }
+    Ok(())
+}
+
 /// One ranked move.
 ///
 /// `num_moves` is what the worker says it ranked *before* truncating to the
@@ -176,6 +243,7 @@ pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -
     }
 
     for entry in moves {
+        check_play_text(&entry.play, context)?;
         if entry.score < 0 || entry.score > MAX_MOVE_SCORE {
             return Err(AppError::bad_request(format!(
                 "{context}: play {:?} scores {}, which no play can score",
@@ -316,7 +384,7 @@ const MAX_RACK_OCCURRENCES_PER_GAME: i64 = 1000;
 /// subtracted back out.
 ///
 /// Like the batch-size rule it needs the task -- the games it was dispatched
-/// with -- so it runs from `registry::store_result`. The bound is on the total,
+/// with -- so it runs from `registry::decode_result`. The bound is on the total,
 /// which bounds every count in it.
 pub fn check_rack_occurrence_total(racks: &[RackOccurrence], num_games: i32) -> AppResult<()> {
     let ceiling = i64::from(num_games.max(0)).saturating_mul(MAX_RACK_OCCURRENCES_PER_GAME);
@@ -333,16 +401,6 @@ pub fn check_rack_occurrence_total(racks: &[RackOccurrence], num_games: i32) -> 
     Ok(())
 }
 
-/// Checks a game batch against the size the task was dispatched with.
-///
-/// The size rule needs the job, which `process_response` does not have, so it
-/// runs from `registry::store_result` instead. It is the strongest check
-/// available at submission time and the only one that catches a worker
-/// reporting work it did not do: the batch size was fixed when the task was
-/// dispatched, so a result of any other size is answering a question nobody
-/// asked. `expected_games` is the job's batch size -- doubled for pairs, which
-/// play two games each -- which every request of the job denormalizes and
-/// which the job's template carries, so no request row is read for it.
 /// The games a game task was dispatched to play, which is what
 /// [`check_batch_size`] holds its result to: the job's batch size, which counts
 /// pairs -- two games each -- when `game_pairs` is set, as on the request.
@@ -354,6 +412,16 @@ pub fn games_dispatched(batch_size: i32, game_pairs: bool) -> i32 {
     }
 }
 
+/// Checks a game batch against the size the task was dispatched with.
+///
+/// The size rule needs the job, which `process_response` does not have, so it
+/// runs from `registry::decode_result` instead. It is the strongest check
+/// available at submission time and the only one that catches a worker
+/// reporting work it did not do: the batch size was fixed when the task was
+/// dispatched, so a result of any other size is answering a question nobody
+/// asked. `expected_games` is the job's batch size -- doubled for pairs, which
+/// play two games each -- which every request of the job denormalizes and
+/// which the job's template carries, so no request row is read for it.
 pub fn check_batch_size(reported_games: i32, expected_games: i32) -> AppResult<()> {
     if reported_games != expected_games {
         return Err(AppError::bad_request(format!(
@@ -550,9 +618,9 @@ mod tests {
     /// U-PLAUS-1: a pairs job's batch size counts pairs, so the games it
     /// dispatched are twice that; a games job's batch is already games. The
     /// confusion the `min_pairs`/`max_pairs` naming exists to prevent.
-    /// (TESTING.md calls this `check_against_task`; the rule is
-    /// `check_batch_size` against `games_dispatched`, which `registry::
-    /// store_result` runs for both job types.)
+    /// (TESTING.md once called this `check_against_task`; the rule is
+    /// `check_batch_size` against `games_dispatched`, which
+    /// `registry::decode_result` runs for both job types.)
     #[test]
     fn a_pairs_batch_dispatches_two_games_a_pair_and_a_games_batch_does_not() {
         assert_eq!(games_dispatched(10, true), 20);
@@ -588,6 +656,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A NUL reaches the text only escaped, after an odd run of backslashes;
+    /// an escaped backslash before `u0000` is the text "\u0000", not a NUL.
+    #[test]
+    fn a_nul_is_found_only_where_json_escapes_one() {
+        assert!(refuse_nul(r#"{"a":"x\u0000y"}"#).is_err());
+        assert!(refuse_nul(r#"{"a":"x\\\u0000"}"#).is_err());
+        assert!(refuse_nul(r#"{"a":"x\\u0000"}"#).is_ok());
+        assert!(refuse_nul(r#"{"a":"u0000"}"#).is_ok());
+        assert!(refuse_nul(r#"{"a":"plain"}"#).is_ok());
+    }
+
+    #[test]
+    fn a_bracketed_tile_is_a_few_letters() {
+        assert_eq!(rack_tiles("[CH]AB"), Some(3));
+        assert_eq!(rack_tiles("[L·L]"), Some(1));
+        assert_eq!(rack_tiles(&format!("[{}]", "Q".repeat(9))), None);
     }
 }
 
@@ -634,7 +720,7 @@ mod fixture_tests {
 
     /// The batch every fixture was captured against: the contract
     /// assignments' `num_games` (10 games, or 10 pairs, and 10,000 games for
-    /// leave generation), which is the job setting `store_result` reads.
+    /// leave generation), which is the job setting `decode_result` reads.
     const BATCH: i32 = 10;
     const LEAVE_GAMES: i32 = 10_000;
 
@@ -643,7 +729,7 @@ mod fixture_tests {
             .map_err(|e| AppError::bad_request(format!("malformed task response: {e}")))
     }
 
-    // What `registry::store_result` runs on a submission before it stores it,
+    // What `registry::decode_result` runs on a submission before it is stored,
     // one job type each, in its order: decode, `process_response`, then the
     // checks against the task. Everything short of the database -- which for
     // an opening-rack batch is also `check_batch_against_task`, comparing the

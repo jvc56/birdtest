@@ -1008,10 +1008,13 @@ def case_capture(ctx: Context) -> None:
 
         # A heartbeat goes out thirty seconds into a task, so the last one is a
         # batch far too big to finish: the contributor is stopped once the
-        # heartbeat has been seen.
+        # heartbeat has been seen. The largest batch job creation allows
+        # (10,000 games), with a simming player so it runs for minutes -- ten
+        # million, as it was, is refused now.
         deactivate_everything(ctx)
-        jobs.append(create_and_activate(ctx, ctx.data, games_body(static_players(ctx),
-                                                                  10_000_000)))
+        long_players = {"player1_config_id": simming_player(ctx),
+                        "player2_config_id": static_players(ctx)["player1_config_id"]}
+        jobs.append(create_and_activate(ctx, ctx.data, games_body(long_players, 10_000)))
         process = worker.start(1, server=proxy.url)
         deadline = time.time() + min(120, ctx.remaining())
         while "heartbeat.json" not in recorder.captured and time.time() < deadline:

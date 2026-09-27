@@ -616,6 +616,10 @@ async fn games_history(app: &Router) -> String {
               "plies": [{ "ply": 1, "bingo_percentage": 10.0, "average_score": 30.0 }] },
             { "move": "8D STAINER", "score": 70, "equity": 79.0 },
         ],
+    }, {
+        // A capturing job's result has positions from every game of its batch.
+        "game_index": 1, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);
     let (status, body) = send(
         app,
@@ -863,7 +867,7 @@ async fn a_purge_writes_its_census_before_it_destroys_anything() {
     let census = rows[0].2.as_deref().unwrap();
     assert_eq!(
         census,
-        "tasks=1 claims=1 game_results=1 leave_records=0 positions=1 rack_progress=0 \
+        "tasks=1 claims=1 game_results=1 leave_records=0 positions=2 rack_progress=0 \
          staged_results=0 artifacts=0",
         "the census counts what the purge was about to destroy"
     );

@@ -54,6 +54,12 @@ pub(super) fn validate_positions(
             ));
         }
         super::plausibility::check_rack(&position.rack, "captured position")?;
+        super::plausibility::check_position_text(
+            &position.position,
+            position.previous_move.as_deref(),
+            position.previous_move_score,
+            "captured position",
+        )?;
         super::plausibility::check_moves(
             &position.moves,
             Some(position.num_moves),

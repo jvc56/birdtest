@@ -1224,6 +1224,24 @@ async fn create_job(
 /// bounds both; 500 is the default.
 const MAX_RACKS_PER_BATCH: i32 = 10_000;
 
+/// The most games one task may play (a pair counts two), and the most when
+/// the job captures positions. A captured position's game is an `i16`, so a
+/// batch past 32,767 games could never be submitted -- every result refused,
+/// the job stuck -- and about 4,000 captured games already pass the 64 MiB
+/// body limit (the audit's pass 21).
+const MAX_GAMES_PER_BATCH: i32 = 10_000;
+const MAX_CAPTURED_GAMES_PER_BATCH: i32 = 1_000;
+
+/// The batch-size bound for a games or game-pairs job, in its own unit.
+fn games_batch_field(mut err: AppError, unit: &str, games_per_unit: i32, batch: i32, capture: bool) -> AppError {
+    let cap = if capture { MAX_CAPTURED_GAMES_PER_BATCH } else { MAX_GAMES_PER_BATCH } / games_per_unit;
+    if batch > cap {
+        let when = if capture { " when capturing positions" } else { "" };
+        err = err.with_field(format!("{unit}s_per_batch"), format!("must be at most {cap}{when}"));
+    }
+    err
+}
+
 /// Settings the schema cannot express and no worker or test could run with.
 ///
 /// Each of these used to be accepted and fail later, far from the admin who
@@ -1312,12 +1330,14 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::Game {
-            games_per_batch, min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high, ..
+            games_per_batch, min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
+            capture_positions, ..
         } => {
             let mut err = sprt(
                 err, "game", *games_per_batch, *min_games, *max_games, *sprt_alpha, *sprt_beta,
                 *elo_low, *elo_high,
             );
+            err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
             // MAGPIE alternates the first mover within one run, from player 1,
             // and every task is a run of its own: at a batch of 1 player 1
             // moved first in every game of the job, and SPRT passed two
@@ -1333,11 +1353,15 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::GamePair {
-            pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high, ..
-        } => sprt(
-            err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, *sprt_alpha, *sprt_beta,
-            *elo_low, *elo_high,
-        ),
+            pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
+            capture_positions, ..
+        } => {
+            let err = sprt(
+                err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, *sprt_alpha, *sprt_beta,
+                *elo_low, *elo_high,
+            );
+            games_batch_field(err, "pair", 2, *pairs_per_batch, *capture_positions)
+        }
         JobTypeConfig::Leave {
             num_iterations, generation_count, target_rack_count, racks_per_task, ..
         } => {
@@ -3315,6 +3339,36 @@ mod tests {
         assert!(validate_job_body(&games(serde_json::json!(10))).is_ok());
         // The default is even.
         assert!(validate_job_body(&games(serde_json::Value::Null)).is_ok());
+    }
+
+    /// A batch no result could carry is refused at creation: past 32,767
+    /// captured games the game index overflows, and a thousand captured games
+    /// is already a large body.
+    #[test]
+    fn a_games_batch_is_bounded() {
+        let games = |batch: i32, capture: bool| {
+            body(serde_json::json!({
+                "job_type": "games",
+                "player1_config_id": Uuid::nil(),
+                "player2_config_id": Uuid::nil(),
+                "min_games": 100,
+                "max_games": 100_000,
+                "games_per_batch": batch,
+                "capture_positions": capture,
+            }))
+        };
+        assert!(validate_job_body(&games(10_000, false)).is_ok());
+        assert_eq!(fields(validate_job_body(&games(10_002, false))), ["games_per_batch"]);
+        assert!(validate_job_body(&games(1_000, true)).is_ok());
+        assert_eq!(fields(validate_job_body(&games(1_002, true))), ["games_per_batch"]);
+        assert_eq!(fields(validate_job_body(&games(40_000, true))), ["games_per_batch"]);
+        let pairs = |batch: i32, capture: bool| {
+            game_pairs(serde_json::json!({ "pairs_per_batch": batch, "capture_positions": capture }))
+        };
+        assert!(validate_job_body(&pairs(500, true)).is_ok());
+        assert_eq!(fields(validate_job_body(&pairs(501, true))), ["pairs_per_batch"]);
+        assert!(validate_job_body(&pairs(5_000, false)).is_ok());
+        assert_eq!(fields(validate_job_body(&pairs(5_001, false))), ["pairs_per_batch"]);
     }
 
     /// Past a thousand Elo both hypotheses are an expected score of 1: the

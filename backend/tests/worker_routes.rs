@@ -584,6 +584,11 @@ fn games_with_position(_: &Value) -> Value {
         "num_moves": 5,
         "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                     "win_percentage": 61.5, "blended_utility": 0.6 }],
+    }, {
+        // A capturing job's result has positions from every game of its batch.
+        "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "num_moves": 5,
+        "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);
     result
 }

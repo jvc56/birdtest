@@ -142,6 +142,9 @@ async fn purging_a_job_removes_its_captured_positions_through_the_record() {
           "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                       "win_percentage": 55.0, "blended_utility": 0.6,
                       "plies": [{ "ply": 0, "bingo_percentage": 0.0, "average_score": 24.0 }] }] },
+        // A capturing job's result has positions from every game of its batch.
+        { "game_index": 1, "turn_number": 0, "rack": "AEINRST", "position": "cgp-1",
+          "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
     ]);
     let (_, body) = send(
         &app,
@@ -164,7 +167,7 @@ async fn purging_a_job_removes_its_captured_positions_through_the_record() {
         .await
         .unwrap()
     };
-    assert_eq!(counts().await, (1, 1, 1));
+    assert_eq!(counts().await, (2, 2, 1));
 
     let admin = db.user("root", true).await;
     let headers = admin_headers(&state.cfg, admin);
@@ -2508,7 +2511,7 @@ async fn minority_split(db: &TestDb) -> (birdtest::state::AppState, Uuid, Uuid) 
 /// until it had caught the majority's job: A's first at the 331st, 391 of 800
 /// where 667 is fair, and worse the longer the split had lasted (the audit's
 /// pass 20). Each claim within an hour of joining settles it level with the
-/// claiming worker's next candidate.
+/// lowest of the claiming worker's other candidates.
 #[tokio::test]
 async fn a_newcomer_everyone_can_run_is_not_put_level_with_a_minority_job() {
     let db = TestDb::new().await;
@@ -2793,4 +2796,121 @@ async fn a_newcomer_is_not_settled_past_a_job_paused_for_a_moment() {
     // Fair among the minority's 200: L 30 : N 30.
     let got = minority_claims(&state, 1000).await.get(&n).copied().unwrap_or(0);
     assert!((80..=120).contains(&got), "the newcomer got {got} of the minority's 200 claims");
+}
+
+/// Thirty-two workers claiming at once, `per_worker` claims each, over
+/// `state`'s jobs: who got what, and how many claims were answered without a
+/// task.
+async fn concurrent_claims(state: &birdtest::state::AppState, per_worker: usize) -> (std::collections::HashMap<Uuid, usize>, usize) {
+    let mut workers = Vec::new();
+    for _ in 0..32 {
+        let state = state.clone();
+        workers.push(tokio::spawn(async move {
+            let mut got = std::collections::HashMap::<Uuid, usize>::new();
+            let mut idle = 0;
+            for _ in 0..per_worker {
+                let w = birdtest::auth::WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip: std::net::IpAddr::from([127, 0, 0, 1]) };
+                match birdtest::scheduler::claim(&state, &w, &split_caps("3.0.0")).await.unwrap() {
+                    birdtest::scheduler::ClaimOutcome::Task(t) => *got.entry(t.job_id).or_default() += 1,
+                    _ => idle += 1,
+                }
+            }
+            (got, idle)
+        }));
+    }
+    let (mut total, mut idle) = (std::collections::HashMap::new(), 0);
+    for w in workers {
+        let (got, i) = w.await.unwrap();
+        idle += i;
+        for (k, v) in got {
+            *total.entry(k).or_default() += v;
+        }
+    }
+    (total, idle)
+}
+
+/// I-SCHED-3r: a claim is not told there is nothing while work exists. With
+/// jobs at equal shares and 32 workers claiming together, each job kept being
+/// found a claim past the other, and a claim that found both so for eight
+/// rounds answered `204` -- 67 to 142 of 1,920 (the audit's pass 21). The last
+/// round takes the first job with work without the turn check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn equal_jobs_claimed_together_leave_no_worker_idle() {
+    let db = TestDb::new().await;
+    for _ in 0..3 {
+        db.games_job(1, 2).await;
+    }
+    sqlx::query("UPDATE jobs SET allocation = 33").execute(&db.pool).await.unwrap();
+    let state = db.state().await;
+    let (got, idle) = concurrent_claims(&state, 60).await;
+    assert_eq!(idle, 0, "{idle} of 1,920 claims got no task; shares {got:?}");
+    assert!(got.values().all(|n| (600..=680).contains(n)), "shares {got:?}, not about 640 each");
+}
+
+/// I-SCHED-3s: a job whose dispatch lock is held past the bounded wait costs a
+/// claim that wait once. Waited on again every round, and outrunning every
+/// other job with its ratio frozen, it held each claim 16 s and ended it
+/// `204` while the other job had work (the audit's pass 21). A busy job is
+/// left out of the rest of the request.
+#[tokio::test]
+async fn a_busy_job_costs_a_claim_one_wait() {
+    let db = TestDb::new().await;
+    let a = db.games_job(1, 2).await;
+    let b = db.games_job(1, 2).await;
+    let state = db.state().await;
+    split_run(&state, 20, |_| false).await;
+    // Another holder keeps A's dispatch lock.
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(1, hashtext($1::text))")
+        .bind(a)
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    for i in 0..3 {
+        let started = std::time::Instant::now();
+        let w = birdtest::auth::WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip: std::net::IpAddr::from([127, 0, 0, 1]) };
+        match birdtest::scheduler::claim(&state, &w, &split_caps("3.0.0")).await.unwrap() {
+            birdtest::scheduler::ClaimOutcome::Task(t) => assert_eq!(t.job_id, b, "claim {i}"),
+            _ => panic!("claim {i} got no task while B had work"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "claim {i} took {:?}", started.elapsed());
+    }
+    holder.rollback().await.unwrap();
+}
+
+/// I-SCHED-3t: a small job beside a busy large one is not handed the large
+/// job's claims. Left out as a rival while its lock was held, the 99% job let
+/// the 1% job take every claim of the spell -- each worth 99 of its own -- and
+/// its settling forgave them: 49 claims of 3,000 where 30 is fair, after a
+/// spell of twenty (the audit's pass 21). A busy job stays a rival, with a ratio unit of slack.
+#[tokio::test]
+async fn a_busy_large_job_does_not_hand_a_small_one_its_claims() {
+    let db = TestDb::new().await;
+    let admin = db.user("root", true).await;
+    let a = db.games_job(1, 2).await;
+    let b = db.games_job(1, 2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = ANY($1)")
+        .bind(vec![a, b]).execute(&db.pool).await.unwrap();
+    let state = db.state().await;
+    // Activated as an admin does, so both are settling.
+    split_activate(&db, &state, admin, a, 1).await;
+    split_activate(&db, &state, admin, b, 99).await;
+    let before = split_run(&state, 500, |_| false).await;
+    // Another holder keeps B's dispatch lock for five claims.
+    let mut holder = db.pool.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(1, hashtext($1::text))")
+        .bind(b).execute(&mut *holder).await.unwrap();
+    let mut during = 0;
+    for _ in 0..5 {
+        let w = birdtest::auth::WorkerIdentity::Unregistered { uuid: Uuid::new_v4(), client_ip: std::net::IpAddr::from([127, 0, 0, 1]) };
+        if let birdtest::scheduler::ClaimOutcome::Task(t) = birdtest::scheduler::claim(&state, &w, &split_caps("3.0.0")).await.unwrap() {
+            assert_eq!(t.job_id, a, "B's lock is held");
+            during += 1;
+        }
+    }
+    holder.rollback().await.unwrap();
+    let after = split_run(&state, 2500, |_| false).await;
+    let got = before.get(&a).copied().unwrap_or(0) + during + after.get(&a).copied().unwrap_or(0);
+    assert!(during <= 2, "the 1% job took {during} of the 5 claims while B was busy");
+    assert!(got <= 33, "the 1% job got {got} claims where 30 is fair");
 }

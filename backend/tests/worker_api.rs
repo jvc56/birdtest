@@ -2317,3 +2317,89 @@ async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
     assert_eq!(stored, 0);
 }
 
+
+fn captured(game: i32, turn: i32) -> serde_json::Value {
+    json!({ "game_index": game, "turn_number": turn, "rack": "AEINRST",
+            "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
+            "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }] })
+}
+
+/// A-WORKER-21: what a result for a capturing job must carry, and what no
+/// result may. A capturing job's result with no positions, or none from one of
+/// its games, was accepted and its task completed -- a hole in the corpus for
+/// good; a NUL in a string failed at the insert as a `500`, which MAGPIE
+/// retries until it gives up; and a 100 KB previous play, a score of
+/// `i32::MIN` and a 500 KB bracketed "tile" were stored (the audit's pass 21).
+/// Each is now a `400`, and nothing is stored.
+#[tokio::test]
+async fn a_capturing_jobs_result_is_complete_and_no_result_holds_what_cannot_be_stored() {
+    let db = TestDb::new().await;
+    let job = db.games_job(1, 2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let with = |positions: Vec<serde_json::Value>| {
+        let mut result = games_result(2, 1);
+        result["positions"] = json!(positions);
+        result
+    };
+    let mut nul = captured(1, 0);
+    nul["moves"][0]["move"] = json!("8D RET\u{0000}AINS");
+    let mut long_previous = captured(1, 1);
+    long_previous["previous_move"] = json!("x".repeat(100_000));
+    let mut low_score = captured(1, 1);
+    low_score["previous_move"] = json!("8D DOG");
+    low_score["previous_move_score"] = json!(i32::MIN);
+    let mut long_tile = captured(1, 0);
+    long_tile["rack"] = json!(format!("[{}]", "Q".repeat(500_000)));
+    let cases = [
+        ("no positions", games_result(2, 1)),
+        ("none from game 1", with(vec![captured(0, 0)])),
+        ("a NUL in a move", with(vec![captured(0, 0), nul])),
+        ("a 100 KB previous play", with(vec![captured(0, 0), captured(1, 0), long_previous])),
+        ("a previous play scoring i32::MIN", with(vec![captured(0, 0), captured(1, 0), low_score])),
+        ("a 500 KB tile", with(vec![captured(0, 0), long_tile])),
+    ];
+    // A claim each: a worker's requests are rate limited (A-WORKER-14).
+    for (what, result) in cases {
+        let (assignment, uuid) = first_claim(&app).await;
+        let token = assignment["claim_token"].as_str().unwrap();
+        let (status, body) = submit_as(&app, &uuid, token, result).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {body}");
+    }
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM position_analysis_records WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+
+    // The complete result is accepted.
+    let (assignment, uuid) = first_claim(&app).await;
+    let token = assignment["claim_token"].as_str().unwrap();
+    let (status, body) = submit_as(&app, &uuid, token, with(vec![captured(0, 0), captured(1, 0)])).await;
+    assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })), "{body}");
+}
+
+/// A-WORKER-21 (declines): a decline naming a missing file with a NUL in it
+/// failed at the insert as a `500` and left the claim open (the audit's pass
+/// 21). It is a `400`, and the claim can still be declined properly.
+#[tokio::test]
+async fn a_decline_holding_a_nul_is_refused_and_the_claim_stays_declinable() {
+    let db = TestDb::new().await;
+    db.games_job(1, 2).await;
+    let app = birdtest::app(db.state().await);
+    let (assignment, uuid) = first_claim(&app).await;
+    let decline = |name: &str| {
+        json!({ "claim_token": assignment["claim_token"], "reason": "missing_data",
+                "missing": [{ "role": "kwg", "name": name, "expected": "abc" }] })
+    };
+    let (status, body) = send(&app, post_json("/api/worker/decline", &[("x-worker-uuid", &uuid)], decline("NWL\u{0000}23"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, body) = send(&app, post_json("/api/worker/decline", &[("x-worker-uuid", &uuid)], decline("NWL23"))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}

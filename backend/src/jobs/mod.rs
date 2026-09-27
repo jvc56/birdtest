@@ -62,8 +62,8 @@ pub(crate) async fn lock_job_dispatch(conn: &mut PgConnection, job_id: Uuid) -> 
 /// A claim for such a job skips it without asking the database. The bounded
 /// wait of [`try_lock_job_dispatch`] alone was not enough: each waiter holds a
 /// pool connection for the whole [`DISPATCH_LOCK_WAIT_MS`], and a job that
-/// hands out nothing falls behind its share and so heads every worker's
-/// candidate list -- a fleet of idle workers polling every five seconds held
+/// handed out nothing fell behind its share and so headed every worker's
+/// candidate list (it is lifted as it is passed over now) -- a fleet of idle workers polling every five seconds held
 /// the twenty-connection pool on it, and submissions for every other job
 /// queued. In-process is enough because the service is a single instance
 /// (`desired_count` is validated to at most one); the advisory lock is still
@@ -216,13 +216,14 @@ impl Drop for DispatchHold {
 /// every other claim for that job blocks for the duration *while holding a
 /// pool connection*, and the pool is twenty -- so one slow claim on one job
 /// stalls submissions and the dashboard for the whole server. With it, the
-/// waiting workers are told there is nothing here right now and go elsewhere.
+/// waiting workers go elsewhere (`Acquired::Busy`).
 const DISPATCH_LOCK_WAIT_MS: u32 = 2_000;
 
 /// Take the job's dispatch lock, giving up after [`DISPATCH_LOCK_WAIT_MS`].
 ///
-/// `false` means another claim holds it: this job has nothing to offer *right
-/// now*, which is exactly what `Acquired::NoWork` says. The caller must not
+/// `false` means another claim holds it: `Acquired::Busy`, which the scheduler
+/// does not read as "no work" -- the job is not lifted as passed over, only left
+/// out of the rest of that request. The caller must not
 /// issue further statements on this connection, since the timed-out statement
 /// aborted the transaction; every caller returns straight away and the claim
 /// path rolls back.

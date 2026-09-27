@@ -185,6 +185,16 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   its turn under the job's dispatch lock, so concurrency makes no bursts
   (`I-SCHED-3c` to `3q`, `I-EXPORT-10`, `11`). KL-89 added. The loop
   continues.
+- **Pass 21 (follow-up: pass 20's diff, and result validation):** 0 high and 3
+  medium from the reviewers — equal jobs claimed together left workers idle
+  while work existed; a busy job cost every claim 16 s and a `204`; through
+  the compose Nginx a cut results stream still read as complete — all fixed
+  (`I-SCHED-3r`, `3s`, `F-NGINX-1`). Result validation found no way past it
+  and nine lows, fixed: a capturing job's result must cover every game, and no
+  result may hold a NUL or an unbounded play, tile or position (`A-WORKER-21`).
+  The adversarial check found 2 medium (a busy large job handing a small one
+  its claims, `I-SCHED-3t`; the batch cap breaking the fixture capture), fixed.
+  KL-20 closed; KL-89 updated. The loop continues.
 
 ---
 
@@ -3173,8 +3183,8 @@ curl exits 18 (the adversary's run).
 **Verified:** the adversary's cases added as tests — `I-SCHED-3j` (the
 newcomer), `3k` (the allocation change), `3l` (the return), `3m` (the
 overshoot) — each fails on the first design (331st, 476th, 331st, 49) and
-passes (the majority job's first claim within twelve; 666 of 800 where 667 is
-fair; 542 where 542 is fair; P's first at once). `I-SCHED-3n` added (a job
+passes (3j and 3l: the majority job's first claim within twelve, and 666 of
+800 where 667 is fair; 3k: 542 where 542 is fair; 3m: P's first at once). `I-SCHED-3n` added (a job
 held for 200 claims does not take the claims after in a row). Each rule
 switched off in turn: the settling fails 3j, 3k and 3l; the rejoin 3g and 3l;
 the pass-over lift 3n; the lift and the settling together 3c. PLAN's parity
@@ -3234,9 +3244,9 @@ the real `scheduler::claim`, and each went away with the settling switched off.
 **Verified:** the three cases added as tests — `I-SCHED-3o` (the burst,
 through the endpoint), `3p` (the data split, declined through
 `/api/worker/decline`), `3q` (the pause) — failing on the design before (317,
-0, 0) and passing (30; 81 in the adversary's form of 3p; 99). With each rule switched off in turn, its own
-tests fail: the settling 3j, 3k and 3l; the rejoin 3g and 3l; the pass-over
-lift 3c and 3n; the turn check 3o; the undoing on a decline 3p; the
+0, 0) and passing (30; 81 in the adversary's form of 3p; 99). With each rule
+switched off in turn, its own tests fail: the settling 3j, 3k and 3l; the rejoin 3g and 3l; the pass-over
+lift 3c and 3n; the turn check 3o and 3i; the undoing on a decline 3p; the
 lowest-other pace 3q. A 12-job stress with 2 capped jobs: 0 errors, 0
 deadlocks, the same share of tasks as the committed code. **Lows:** a
 minority-only newcomer beside an older job gets half its claims in its first
@@ -3273,8 +3283,8 @@ six-hour limit, leave objects to the thirty-day rule.
 
 - `cargo clippy --all-targets -- -D warnings`: clean.
 - Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
-  **613 of 613** (fifteen new scheduling tests, `I-SCHED-3c` rewritten; two
-  new export tests).
+  **613 of 613** (eleven new scheduling tests, `I-SCHED-3g` to `3q`, with `3c`
+  and `3d` rewritten; two new export tests).
 - **Tier 5, natively: 14 of 14**; **tier 6, natively, every case** (both run
   the final scheduler).
 - `npm run check`: 0 errors, 0 warnings; `npm test`: 120 of 120.
@@ -3282,4 +3292,145 @@ six-hour limit, leave objects to the thirty-day rule.
   §2.3's statement run against `join_at_parity` in three fleets, equal.
 - Concurrency: 32 workers on two jobs and on twelve (two capped), 0 errors and
   0 deadlocks, tasks handed out as on the committed code.
+- MAGPIE unchanged this pass.
+
+## Pass 21 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`c95c7d7..3839333`), one
+reviewer per part: the scheduler as redesigned; the rest of the backend and the
+frontend (tier 5 natively); docs and scripts. MAGPIE is unchanged. Plus one
+area not examined in this run: **result validation** — everything between a
+worker's result and the rows it leaves, seen as a dishonest or buggy
+contributor would.
+
+**Findings: 0 high, 3 medium** from the four reviewers (scheduler 2 medium, 4
+low, 2 unconfirmed; backend and frontend 1 medium, 2 low, 2 unconfirmed; docs
+and scripts none, 8 low, 1 unconfirmed; result validation none, 9 low, 1
+unconfirmed). All fixed.
+
+### 21.1 Medium — equal jobs claimed together left workers idle while work existed (scheduler reviewer)
+
+Pass 20's turn check lets a job run one of its rival's claims ahead. At equal
+shares that is one claim, and claims made together kept finding each job a
+claim past another; a claim that did for eight rounds answered `204`, and
+MAGPIE slept five seconds. **Shown:** three jobs at 33%, 32 workers, 1,920
+claims: **166** answered `204` (67 to 142 in the reviewer's runs at 50/50;
+none on the pass-19 code). **Fix:** the eighth round takes the first job with
+work without the check — a claim reaching it has lost seven rounds, so what
+it can add to a burst is bounded. **Verified:** `I-SCHED-3r` fails on the
+committed code and passes (0 of 1,920 idle, 600 to 680 each); `3i` and `3o`
+still give 30.
+
+### 21.2 Medium — a busy job cost every claim sixteen seconds and a `204` (scheduler reviewer)
+
+A dispatch-lock timeout became `Busy` in pass 20, which sent the claim round
+again, and every round waited the full two seconds on the busy job once more;
+its ratio frozen, it also outran every other job, so nothing else could be
+claimed. **Shown:** another holder keeping job A's lock, the third claim
+waited 16 s and got nothing while job B had work (25 concurrent claims all
+`Idle`, the slowest 46 s; on the pass-19 code, each gets B after one wait).
+**Fix:** a busy job is left out of the rest of the request, as a candidate and
+as a rival, and does not by itself send the claim round again. **Verified:**
+`I-SCHED-3s` fails on the committed code and passes (three claims, each B
+within 5 s).
+
+### 21.3 Medium — through the compose proxy a cut results stream still read as complete (backend reviewer)
+
+Pass 20 cut a failing stream off without its closing chunk. The Nginx in front
+of the app (`frontend/docker/default.conf.template`, compose and the ECS
+task) had `chunked_transfer_encoding off`, so it answered without a length and
+closed the connection — a cut stream closed exactly like a finished one.
+**Shown:** through Nginx, curl exited 0 after 15,641 of 150,000 lines, the last
+line whole JSON (direct to the backend, exit 18); with the real template in
+front of a server that aborts a chunked body, exit 0, and with the line
+removed, exit 18. **Fix:** the line removed (`proxy_buffering off` is what the
+SSE comment needed); tier 5 with it removed passes, E-4's live dashboard
+included. **Verified:** `F-NGINX-1` pins the template and fails on the
+committed one.
+
+### 21.4 Low findings
+
+**Fixed:**
+- Result validation (`A-WORKER-21`, failing on the committed code): a
+  capturing job's result must carry positions from every game of its batch
+  (none were required); a NUL anywhere in a result's strings is a `400`, not a
+  `500` MAGPIE retries; a play, and a captured position's previous play, at
+  most 256 characters, a CGP at most 4,096, a bracketed tile at most 8, a
+  previous play's score 0 to 100,000; job creation bounds a games batch at
+  10,000 games (1,000 when capturing; pairs count two). Four tests' fixtures
+  sent capture results no MAGPIE would, and now send one position a game.
+- PLAN's submission steps say the result is decoded before the claim is
+  locked, and KL-20 is closed; `plausibility.rs`'s comments and TESTING name
+  `decode_result`; `check_batch_size`'s doc is its own again.
+- The export panel's digest label does not break at its hyphen and says it is
+  of the `.gz`.
+- Docs of the scheduler: the schema comment, `JOIN_SETTLE`'s doc and a test's
+  say the lowest of the worker's other candidates, not the next; a dispatch
+  *hold*, not a held lock, is what is lifted as passed over; `jobs/mod.rs` says
+  a lock timeout is `Busy`; PLAN's acquisition list names `Busy` and
+  `NeedsZeroGeneration`; past tense where the lift changed things; the turn
+  check's lookup is said to queue behind the job's claims; TESTING's 3i
+  figure, the turn check failing 3i as well as 3o, and pass 20's record's test
+  count and 3k/3l figures corrected.
+
+**Recorded (KL-89):** the lift after a claim uses the chosen job's ratio from
+the request's list, and overshoots if an admin purged or re-activated it
+lower in between; settling costs a paired minority newcomer about 40% of its
+first hour, not half.
+
+**Not changed:** a stream waiting on a leave job's merge holds its permit
+without a head, as it held it before (only the head is later); a result that
+mentions none of a leave task's forced racks is not refused (today's MAGPIE
+forces them; unconfirmed); an export row left `running` when marking it
+`failed` also fails waits for a restart (unconfirmed).
+
+### 21.5 Adversarial check of the pass's fixes
+
+**2 medium, fixed.**
+
+- **A busy large job handed a small one its claims, and settling forgave
+  them.** 21.2's fix dropped a busy job as a rival, so with a 99% job's lock
+  held the 1% job beside it took every claim of the spell unchecked — each
+  worth 99 of the other's — and the 99% job's settling forgave the lead: 20 of
+  20 claims during the hold, **49** of about 3,000 where 30 is fair (31 on the
+  committed code). Kept as an ordinary rival, a busy job stalls the job beside
+  it, 21.2 again. **Fix:** a busy job is not tried again in the request but
+  stays a rival in every round, the last included, with a ratio unit of slack
+  instead of one of its claims — the largest a claim can be, so a 50% job
+  beside a busy one takes up to fifty claims and a 1% job one. **Verified:**
+  `I-SCHED-3t` fails on the fix before it (5 of 5 during the hold) and passes
+  (at most two of five, 33 at most in all); `I-SCHED-3s` still passes.
+- **The new batch cap broke the contract-fixture capture.** Its heartbeat
+  fixture came from a games job of ten million games, too big to finish; the
+  cap refused it, and `scripts/e2e_magpie_native.sh --cases capture` failed
+  before capturing it. **Fix:** the largest batch allowed, 10,000 games, with
+  a simming player, so it still runs past the thirty-second heartbeat.
+  **Verified:** the capture run completes (21.6).
+
+**Held:** the unchecked last round reopened no burst in any shape tried (1%
+jobs at exactly 30 with 32 to 128 workers; 1/99, 1/1/98, 1/9/90, 1/33/33/33,
+equal thirds, halves and tenths; no claim idle); real MAGPIE results pass the
+new checks (tier 6 with capture on games of 20 and pairs of 3: games 0..5
+covered, the longest CGP 182 characters, the longest previous play 17, the
+longest shipped tile `L·L`, 3); `refuse_nul` right on escapes; SSE through the
+changed Nginx arrives live, and complete streams and fixed-length responses
+are unchanged. **Lows fixed:** a decline naming a missing file with a NUL was
+a `500` that left the claim open (now a `400`,
+`a_decline_holding_a_nul_is_refused_and_the_claim_stays_declinable`); PLAN's
+claim steps say eight rounds, not three, and when an `Idle` can still come
+with work about; the idle figure is 67 to 166 everywhere; the `F-NGINX`
+section sits with tier 1F; `check_moves` has its doc comment back.
+
+### 21.6 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **621 of 621** (`I-SCHED-3r`, `3s`, `3t`; `A-WORKER-21` and its decline
+  test; three unit tests; four fixtures completed).
+- `npm run check`: 0 errors, 0 warnings; `npm test`: **122 of 122**
+  (`F-NGINX-1`).
+- **Tier 5, natively: 14 of 14** (its Nginx without the chunking line);
+  **tier 6, natively, every case**; the contract-fixture capture
+  (`--cases capture`) completes, the heartbeat fixture included.
+- `scripts/runbook-check.sh RUNBOOK.md README.md`: 25 and 19 blocks.
 - MAGPIE unchanged this pass.

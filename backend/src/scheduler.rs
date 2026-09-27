@@ -110,8 +110,8 @@ async fn candidate_jobs(pool: &PgPool, caps: &WorkerCapabilities) -> AppResult<V
     .await?)
 }
 
-/// How long after joining a job is settled against each worker's next
-/// candidate (see [`join_at_parity`]). Every class of workers that could run
+/// How long after joining a job is settled against the lowest of each
+/// claiming worker's other candidates (see [`join_at_parity`]). Every class of workers that could run
 /// it claims it at once if it sits below that class's pace, so an hour is
 /// long; a class of a few workers on long tasks is still seen.
 pub const JOIN_SETTLE: std::time::Duration = std::time::Duration::from_secs(3600);
@@ -262,12 +262,12 @@ pub async fn unsettle(
 ///
 /// Start-time fair queuing credits only a flow with something to send. A job
 /// with no task to hand out -- a games job whose every game is in flight, a
-/// generation being built, a dispatch lock held -- sits ahead of the job
-/// claimed in the list because its ratio stood still, and banked that as debt:
-/// the moment it had work again it took every claim until it had caught up,
-/// and a newcomer put level with it did the same. Lifted each time a worker
-/// that could have run it takes something else, it stays level with the jobs
-/// those workers are running.
+/// generation being built, a dispatch hold (a seeding, a purge) -- sits ahead
+/// of the job claimed in the list because its ratio stood still, and banked
+/// that as debt: the moment it had work again it took every claim until it had
+/// caught up, and a newcomer put level with it did the same. Lifted each time
+/// a worker that could have run it takes something else, it stays level with
+/// the jobs those workers are running.
 ///
 /// Before the claim, not after: start-time fair queuing's virtual time is the
 /// start of the claim in service. Lifted past it, a job with a moment's gap
@@ -559,11 +559,19 @@ pub async fn claim(
     // The outer retry exists for three cases: a leave-gen generation
     // transition (which creates new work mid-request), a lost race on the
     // `(job_id, seed)` unique index when two workers generate the same
-    // on-demand task, and a claim that found every job with work outrun or
-    // busy (`JobClaimError::LostRace`, `Busy`). The last is common when many
-    // workers claim at once, and costs a candidate read and a lookup per job,
-    // so it has more rounds before the worker is told to come back later.
-    for _attempt in 0..CLAIM_ROUNDS {
+    // on-demand task, and a claim that found every job with work outrun
+    // (`JobClaimError::LostRace`). The last is common when many workers claim
+    // at once, so it has more rounds; and the last round takes the first job
+    // with work without the turn check, since an `Idle` while work exists sends
+    // a worker to sleep for seconds -- with equal jobs and 32 workers claiming
+    // together, 67 to 166 claims of 1,920 did (the audit's pass 21).
+    //
+    // A job found busy (`JobClaimError::Busy`) is not tried again in the
+    // request: waiting on it again cost 2 s a round, and a claim waited 16 s
+    // and was told there was nothing (pass 21). It stays a rival (below).
+    let mut busy: Vec<Uuid> = Vec::new();
+    for attempt in 0..CLAIM_ROUNDS {
+        let last_round = attempt + 1 == CLAIM_ROUNDS;
         let jobs = candidate_jobs(&state.pool, caps).await?;
         if jobs.is_empty() {
             return shutdown_or_idle(state, caps).await;
@@ -583,21 +591,38 @@ pub async fn claim(
 
         let mut retry_outer = false;
         let mut passed_over = Vec::new();
-        // Whether a job lost a race (`JobClaimError::LostRace`) or was busy
-        // (`JobClaimError::Busy`): either has work, so a claim that found
-        // nothing else goes round again.
+        // Whether a job lost a race (`JobClaimError::LostRace`): it has work,
+        // so a claim that found nothing else goes round again.
         let mut outrun = false;
-        let mut busy = false;
         for (i, job) in jobs.iter().enumerate() {
+            if busy.contains(&job.id) {
+                continue;
+            }
+            let rivals = if last_round {
+                Vec::new()
+            } else {
+                jobs.iter()
+                    .enumerate()
+                    .filter(|(j, other)| {
+                        *j != i && !passed_over.contains(&other.id) && !busy.contains(&other.id)
+                    })
+                    .map(|(_, other)| other.id)
+                    .collect()
+            };
+            // A busy job stays a rival, in every round, with a ratio unit of
+            // slack rather than one of its claims: a 1% job's claim is a whole
+            // unit, the largest any claim can be. Dropped as a rival, the 1%
+            // job beside a busy 99% one took every claim for as long as the
+            // lock was held, and the 99% job's settling forgave the lot (49
+            // claims where 30 is fair, the audit's pass 21); kept with one of
+            // its own claims of slack, the job beside it could not be claimed
+            // at all.
+            let busy_rivals: Vec<Uuid> = busy.iter().copied().filter(|id| *id != job.id).collect();
             let standing = Standing {
                 served_within: state.cfg.heartbeat_timeout,
                 pace: pace_for(&jobs, i),
-                rivals: jobs
-                    .iter()
-                    .enumerate()
-                    .filter(|(j, other)| *j != i && !passed_over.contains(&other.id))
-                    .map(|(_, other)| other.id)
-                    .collect(),
+                rivals,
+                busy_rivals,
             };
             // One job that cannot dispatch -- a leave-generation job whose
             // generation-0 artifact never got written, a config row a bad
@@ -619,7 +644,7 @@ pub async fn claim(
                     continue;
                 }
                 Err(JobClaimError::Busy) => {
-                    busy = true;
+                    busy.push(job.id);
                     continue;
                 }
                 Err(JobClaimError::Retry) => {
@@ -633,11 +658,11 @@ pub async fn claim(
                 }
             }
         }
-        // A job that lost a race, or was busy, has work: the claim goes round
-        // again rather than take it unchecked -- two jobs can each be outrun
-        // by the other, and taking one anyway was the burst the check exists
-        // to prevent.
-        if !retry_outer && (busy || outrun) {
+        // A job that lost a race has work: the claim goes round again rather
+        // than take it unchecked at once -- two jobs can each be outrun by the
+        // other, and taking one anyway was the burst the check exists to
+        // prevent (175 claims where 30 is fair, pass 20).
+        if !retry_outer && outrun {
             retry_outer = true;
         }
         if !retry_outer {
@@ -694,11 +719,9 @@ enum JobClaimError {
     /// next; if none has a task, the claim goes round again.
     LostRace,
     /// Another claim held the job's dispatch lock past the bounded wait. Not
-    /// a pass-over -- a job that is merely busy has work, and lifting it
-    /// forgave the claims it was owed -- and not a reason to fall back to a
-    /// job that lost a race: that handed a 1% job a claim past its turn while
-    /// the 99% job beside it was busy, and settling then forgave the 99% job
-    /// the difference (195 claims where 30 is fair, the audit's pass 20).
+    /// a pass-over -- a job that is merely busy has work, and lifting it would
+    /// forgive the claims it is owed. The job is left out of the rest of the
+    /// request.
     Busy,
     Fatal(AppError),
 }
@@ -792,9 +815,10 @@ async fn try_claim_from_job(
     // third of the time -- and it is the rival's claim, so a job at 99% can
     // run a whole 1% claim ahead while the job at 1% can run a hundredth
     // ahead: no burst. Checked before the dispatch does any work, so a claim
-    // that is not the job's turn costs a lookup. (`registry::acquire` takes
-    // the same lock again, at once.)
-    if !standing.rivals.is_empty() {
+    // that is not the job's turn costs a lookup -- made holding the job's
+    // dispatch lock, so queued behind the claims on it. (`registry::acquire`
+    // takes the same lock again, at once.)
+    if !standing.rivals.is_empty() || !standing.busy_rivals.is_empty() {
         match crate::jobs::try_lock_job_dispatch(&mut tx, job.id).await {
             Ok(true) => {}
             Ok(false) => {
@@ -808,13 +832,18 @@ async fn try_claim_from_job(
         }
         let outrun = sqlx::query_scalar::<_, bool>(
             "SELECT (j.claims_issued - j.claims_baseline)::float8 / j.allocation
-                    > COALESCE((SELECT MIN((o.claims_issued - o.claims_baseline + 1)::float8 / o.allocation)
-                                FROM jobs o WHERE o.id = ANY($2) AND o.allocation > 0),
-                               'Infinity'::float8)
+                    > LEAST(
+                        COALESCE((SELECT MIN((o.claims_issued - o.claims_baseline + 1)::float8 / o.allocation)
+                                  FROM jobs o WHERE o.id = ANY($2) AND o.allocation > 0),
+                                 'Infinity'::float8),
+                        COALESCE((SELECT MIN((o.claims_issued - o.claims_baseline)::float8 / o.allocation + 1)
+                                  FROM jobs o WHERE o.id = ANY($3) AND o.allocation > 0),
+                                 'Infinity'::float8))
              FROM jobs j WHERE j.id = $1 AND j.allocation > 0",
         )
         .bind(job.id)
         .bind(&standing.rivals)
+        .bind(&standing.busy_rivals)
         .fetch_optional(&mut *tx)
         .await;
         match outrun {
@@ -1234,6 +1263,9 @@ struct Standing {
     /// passed over for want of a task -- none of which the job may have been
     /// moved past by the time this claim holds its dispatch lock.
     rivals: Vec<Uuid>,
+    /// Jobs found busy earlier in the request, which the job may run at most a
+    /// ratio unit past.
+    busy_rivals: Vec<Uuid>,
 }
 
 /// A job unserved for `$2` seconds before the latest claim of any other job

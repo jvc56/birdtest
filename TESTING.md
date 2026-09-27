@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 213 | `#[cfg(test)]` in `jobs::plausibility` (23), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (10), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 120 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1 Unit | 216 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 122 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 160 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (26), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 211 | `backend/tests/`: `worker_api.rs` (46), `admin_api.rs` (51), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 216 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (54), `auth_routes.rs` (23), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (8), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 613 backend tests (the per-tier counts above are
+--run-ignored all` runs 621 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -438,7 +438,7 @@ The two that were missing:
   `game_pairs` and does not for `games` — the pairs-versus-games unit confusion
   that the `min_pairs`/`max_pairs` naming exists to keep straight. The rule is
   `plausibility::check_batch_size` against `games_dispatched`, which
-  `registry::store_result` runs for both job types; there is no
+  `registry::decode_result` runs for both job types; there is no
   `check_against_task`, as this entry first named it. *(Covered:
   `plausibility::tests::a_pairs_batch_dispatches_two_games_a_pair_and_a_games_batch_does_not`.)*
 - `U-PLAUS-2` A batch reporting one game more, and one fewer, than dispatched is
@@ -815,6 +815,14 @@ Test the pure functions; do not snapshot the SVG.
 
 ---
 
+### `F-NGINX-*` — the proxy in front of the app
+
+- `F-NGINX-1` The Nginx template keeps chunked transfer on (and SSE
+  unbuffered): with it off, a results stream cut off part-way closed like a
+  finished download through the proxy — curl exited 0 after 15,641 of
+  150,000 lines, and with the line removed exited 18. *(Covered:
+  `nginxConfig.test.ts`.)* (Thirty-second audit, pass 21.)
+
 ## 2. Integration
 
 Real Postgres, migrations applied, **no HTTP layer**. This is where birdtest's
@@ -824,6 +832,7 @@ than Rust.
 **The harness** (`backend/tests/common/mod.rs`) is the dependency for tiers 2
 and 3. Three decisions shaped it, settled below, because each has an
 obvious-looking answer that is wrong here.
+
 
 ### Isolation: `CREATE DATABASE … TEMPLATE`
 
@@ -1011,7 +1020,7 @@ The single most important group. Every entry is about a decision made in SQL.
   `admin_api::jobs_lagging_together_keep_their_shares`.)*
 - `I-SCHED-3i` **A concurrent burst is paid back.** Thirty-two workers claiming
   at once over a 1% and a 99% job: the 1% job gets at most 45 of about 3,000
-  claims (fair is 30; 31 or 32 in practice), where forgiving the lag made it
+  claims (fair is 30, and 30 in practice), where forgiving the lag made it
   64 to 87. *(Covered:
   `admin_api::a_concurrent_burst_to_a_small_job_is_paid_back`.)*
 - `I-SCHED-3j` **A newcomer is settled level with each class that runs it.** In
@@ -1059,8 +1068,23 @@ The single most important group. Every entry is about a decision made in SQL.
   (Thirty-second audit, pass 20: the lag window removed, joining settled,
   claims checked for their turn. Each rule switched off fails its own tests:
   the settling 3j, 3k and 3l; the rejoin 3g and 3l; the pass-over lift 3c and
-  3n; the turn check 3o; the undoing on a decline 3p; the lowest-other pace
-  3q. On pass 20's first design, 3j to 3m fail; on its second, 3o to 3q.)
+  3n; the turn check 3o and 3i; the undoing on a decline 3p; the lowest-other
+  pace 3q. On pass 20's first design, 3j to 3m fail; on its second, 3o to 3q.)
+- `I-SCHED-3r` **No claim is told there is nothing while work exists.** Three
+  jobs at equal shares, 32 workers claiming together: every one of 1,920
+  claims gets a task, 600 to 680 each, where a claim that found each job a
+  claim past another for eight rounds answered `204` (67 to 166 of 1,920 across runs). *(Covered:
+  `admin_api::equal_jobs_claimed_together_leave_no_worker_idle`.)*
+- `I-SCHED-3s` A job whose dispatch lock another holder keeps costs a claim
+  one wait: three claims each get the other job within 5 s, where the third
+  waited 16 s and got nothing. *(Covered:
+  `admin_api::a_busy_job_costs_a_claim_one_wait`.)*
+- `I-SCHED-3t` A busy job stays a rival, with a ratio unit of slack: the 1%
+  job beside a busy 99% one (both settling) takes at most two of five claims
+  while the lock is held and 33 of about 3,000 in all, where it took every
+  claim of the spell and the settling forgave them (49 where 30 is fair).
+  *(Covered: `admin_api::a_busy_large_job_does_not_hand_a_small_one_its_claims`.)*
+  (Thirty-second audit, pass 21.)
 - `I-SCHED-4` Abandoned claims count toward a job's share. Abandon many claims
   on one job and confirm its share does **not** grow — excluding them would let
   a job with flaky workers accumulate more than its share. The counter is
@@ -2161,6 +2185,18 @@ below.
   with two positions for one turn of one game is refused too. *(Covered:
   `worker_api::positions_from_a_job_that_does_not_capture_them_are_refused`,
   `jobs::game::tests::one_captured_position_a_turn`.)* (Thirty-second audit.)
+- `A-WORKER-21` A capturing job's result must carry positions from every game
+  of its batch, and no result may hold a NUL in a string, a play over 256
+  characters, a previous play scoring outside 0 to 100,000 or a bracketed tile
+  over 8 characters, nor a decline a NUL in a missing file: each is a `400`,
+  where a result with no positions was accepted and completed its task, a NUL
+  was a `500` that left the claim open, and the rest were stored. *(Covered:
+  `worker_api::a_capturing_jobs_result_is_complete_and_no_result_holds_what_cannot_be_stored`,
+  `worker_api::a_decline_holding_a_nul_is_refused_and_the_claim_stays_declinable`,
+  `plausibility::tests::a_nul_is_found_only_where_json_escapes_one`,
+  `plausibility::tests::a_bracketed_tile_is_a_few_letters`; job creation's
+  bound on a games batch, `routes::admin::tests::a_games_batch_is_bounded`.)*
+  (Thirty-second audit, pass 21.)
 - `A-WORKER-15` `client-version` reports the configured floor and a download
   URL. *(Covered:
   `worker_routes::client_version_reports_the_configured_floor_and_download_url`.)*

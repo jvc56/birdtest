@@ -432,6 +432,16 @@ async fn decline_task(
         ));
     }
 
+    // Postgres cannot store a NUL in a string: named in a missing file, it
+    // failed at the insert as a `500` and left the claim open (the audit's
+    // pass 21).
+    let has_nul = |text: &str| text.contains('\0');
+    if body.missing.iter().any(|f| {
+        has_nul(&f.role) || has_nul(&f.name) || has_nul(&f.expected) || f.actual.as_deref().is_some_and(has_nul)
+    }) {
+        return Err(AppError::bad_request("a missing file's description holds a NUL character"));
+    }
+
     refuse_if_claims_held(&state, body.claim_token).await?;
     let mut tx = state.pool.begin().await?;
     // Locked, so a timeout reclaiming this claim concurrently cannot release
@@ -686,6 +696,7 @@ async fn submit_result(
             state.templates.get_or_load(&mut conn, &job).await?
         }
     };
+    crate::jobs::plausibility::refuse_nul(body.result.get())?;
     let decoded = crate::jobs::registry::decode_result(&template, body.result).await?;
 
     let mut tx = state.pool.begin().await?;

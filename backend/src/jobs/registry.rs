@@ -486,7 +486,6 @@ pub async fn decode_result(
         )),
         JobKind::Games { config, .. } => {
             let record = normalize::<game::GameHandler>(payload).await?;
-            refuse_uncaptured_positions(config.capture_positions, &record.positions)?;
             // The batch size was fixed when the task was handed out -- it is
             // the job's, denormalized onto every request -- so a result of any
             // other size is answering a question nobody asked.
@@ -494,16 +493,17 @@ pub async fn decode_result(
                 record.all_games.games,
                 super::plausibility::games_dispatched(config.games_per_batch, false),
             )?;
+            refuse_uncaptured_positions(config.capture_positions, &record.positions, record.all_games.games)?;
             Ok(DecodedResult::Games(record))
         }
         JobKind::GamePairs { config, .. } => {
             let record = normalize::<game_pair::GamePairHandler>(payload).await?;
-            refuse_uncaptured_positions(config.capture_positions, &record.positions)?;
             // A pairs request counts pairs; each is two games.
             super::plausibility::check_batch_size(
                 record.all_games.games,
                 super::plausibility::games_dispatched(config.pairs_per_batch, true),
             )?;
+            refuse_uncaptured_positions(config.capture_positions, &record.positions, record.all_games.games)?;
             Ok(DecodedResult::GamePairs(record))
         }
         JobKind::LeaveGeneration { config, .. } => {
@@ -521,11 +521,30 @@ pub async fn decode_result(
 /// Positions from a job that did not ask for them: they were stored, and the
 /// job's export then carried a positions file nobody asked for. MAGPIE sends
 /// them only when the request says so.
-fn refuse_uncaptured_positions<T>(capture: bool, positions: &[T]) -> AppResult<()> {
+///
+/// And the other way round: a job that captures positions gets some from every
+/// game of the batch. A result with none was accepted and the task completed,
+/// a permanent hole in a corpus PLAN promises holds every position of every
+/// game -- what a MAGPIE build from before capture sends (the audit's pass
+/// 21).
+fn refuse_uncaptured_positions(
+    capture: bool,
+    positions: &[super::handler::PositionAnalysis],
+    games: i32,
+) -> AppResult<()> {
     if !capture && !positions.is_empty() {
         return Err(AppError::bad_request(
             "this job does not capture positions, and the result carries some",
         ));
+    }
+    if capture {
+        let covered: std::collections::HashSet<i16> =
+            positions.iter().filter_map(|p| p.game_index).collect();
+        if let Some(missing) = (0..games).find(|g| !i16::try_from(*g).is_ok_and(|g| covered.contains(&g))) {
+            return Err(AppError::bad_request(format!(
+                "this job captures positions, and the result has none from game {missing}"
+            )));
+        }
     }
     Ok(())
 }

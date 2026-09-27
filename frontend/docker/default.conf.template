@@ -38,7 +38,11 @@ server {
         proxy_buffering off;
         proxy_cache off;
         proxy_read_timeout 24h;
-        chunked_transfer_encoding off;
+        # Chunked transfer stays on. A results stream that fails part-way is
+        # cut off without its closing chunk, which is how a client knows the
+        # download is short; with chunking off, Nginx answered without a
+        # length and closed the connection, and a cut stream read as a
+        # complete one (the audit's pass 21).
     }
 
     location /health {
