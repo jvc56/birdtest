@@ -124,7 +124,10 @@ def log_confirmation_code(backend_service: str, email: str) -> str:
 
 
 def promote_to_admin(compose_service: str, username: str) -> None:
-    psql(compose_service, f"UPDATE users SET is_admin = true WHERE username = '{username}'")
+    # A username may hold a quote; doubled, it is a literal. Matched as sign-in
+    # matches it, whatever its case.
+    literal = username.replace("'", "''")
+    psql(compose_service, f"UPDATE users SET is_admin = true WHERE lower(username) = lower('{literal}')")
 
 
 # --- an authenticated session ----------------------------------------------

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run SQL against the production database, from inside the VPC.
 #
-#   scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE username = 'alice'"
+#   scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lower('alice') RETURNING username"
 #   scripts/prod-sql.sh < fix.sql
 #
 # The database is not publicly accessible and its security group admits only
@@ -16,13 +16,16 @@
 #
 # Statements run with ON_ERROR_STOP, in one transaction (--single-transaction):
 # anything that fails rolls the whole script back. The SQL travels as an
-# environment override, which ECS caps at about 8 KB in total.
+# environment override, which ECS caps at about 8 KB in total -- and which AWS
+# keeps in its records of the task, as CloudWatch keeps what psql prints for
+# thirty days: never put a secret in the SQL, and never select personal
+# columns (addresses, hashes) through it. scripts/prod-shell.sh is for that.
 set -euo pipefail
 
 sql=${1:-$(cat)}
 [[ -n "$sql" ]] || { echo "usage: $0 'SQL' (or SQL on stdin)" >&2; exit 2; }
 
-tf() { terraform -chdir="${INFRA_DIR:-infra}" output "$@"; }
+tf() { terraform -chdir="${INFRA_DIR:-$(cd "$(dirname "$0")/.." && pwd)/infra}" output "$@"; }
 # Every AWS call in the stack's own region, not the CLI's default -- which,
 # during a region loss, is usually the region that was lost.
 export AWS_REGION AWS_DEFAULT_REGION
@@ -30,7 +33,7 @@ AWS_REGION=$(tf -raw region)
 AWS_DEFAULT_REGION=$AWS_REGION
 cluster=$(tf -raw cluster_name)
 # After a region-loss drill the workspace may still be the DR stack's.
-echo "workspace $(terraform -chdir="${INFRA_DIR:-infra}" workspace show), region $AWS_REGION, cluster $cluster" >&2
+echo "workspace $(terraform -chdir="${INFRA_DIR:-$(cd "$(dirname "$0")/.." && pwd)/infra}" workspace show), region $AWS_REGION, cluster $cluster" >&2
 task_definition=$(tf -raw ops_task_definition)
 subnets=$(tf -json service_subnet_ids | jq -r 'join(",")')
 security_group=$(tf -raw service_security_group_id)

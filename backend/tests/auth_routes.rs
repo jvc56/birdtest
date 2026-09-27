@@ -1090,8 +1090,8 @@ async fn a_name_differing_only_in_joiners_is_taken() {
 
 
 /// A-AUTH-12: a confirmed address and a reset password are on record. A reset
-/// ends every session as "sign out everywhere" does, and was the one of the
-/// two that left no row (the audit's pass 22).
+/// ends every session as "sign out everywhere" does, which was logged; the
+/// reset and the confirmation left no row (the audit's pass 22).
 #[tokio::test]
 async fn a_confirmation_and_a_reset_are_on_record() {
     let db = TestDb::new().await;

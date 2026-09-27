@@ -162,6 +162,10 @@ jobs:
       # three databases of its own.
       - name: Selective restore of a purged job
         run: timeout 600 ./scripts/restore-job-check.sh
+      # RUNBOOK.md §1's re-application of the security actions a full restore
+      # undoes, its two blocks as written, through their refusals and re-runs.
+      - name: Security actions re-applied after a full restore
+        run: timeout 300 ./scripts/reapply-check.sh
       - if: always()
         run: docker compose down -v
 

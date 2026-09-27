@@ -9,7 +9,10 @@ export default defineConfig({
     // configuration of its own: it always talks to same-origin /api.
     proxy: {
       '/api': {
-        target: process.env.BIRDTEST_API ?? 'http://localhost:8080',
+        // 127.0.0.1, not localhost: the stack publishes its ports on IPv4
+        // loopback only, and where localhost resolves to ::1 first Node 18
+        // does not fall back.
+        target: process.env.BIRDTEST_API ?? 'http://127.0.0.1:8080',
         changeOrigin: true
       }
     }

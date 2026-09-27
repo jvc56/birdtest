@@ -54,6 +54,12 @@ pub struct RateLimiters {
     /// was too tight for the hundred keys an account may hold: fifty idle
     /// machines filled it, and heartbeats, which are not retried, lapsed.)
     pub key_creation: Arc<Keyed>,
+    /// Resuming an account's keys: a burst of 100 (every key at once), then 60
+    /// an hour. Each change writes an audit row, and unlimited, one account
+    /// toggling a key back and forth wrote 4,000 in ten seconds (the audit's
+    /// pass 23); a back-and-forth needs a resume, so this bounds it, while
+    /// suspending and revoking stay free for an owner after a takeover.
+    pub key_changes: Arc<Keyed>,
     /// Worker credentials, before their lookup: see [`CredentialGate`].
     pub worker_credentials: Arc<CredentialGate>,
     /// Confirmation and reset links redeemed, per client address: 20 a
@@ -185,6 +191,9 @@ impl RateLimiters {
             login: Arc::new(RateLimiter::keyed(logins_per_minute)),
             login_account: Arc::new(RateLimiter::keyed(account_logins_per_minute)),
             key_creation: Arc::new(RateLimiter::keyed(keys_per_hour)),
+            key_changes: Arc::new(RateLimiter::keyed(
+                Quota::per_hour(NonZeroU32::new(60).unwrap()).allow_burst(NonZeroU32::new(100).unwrap()),
+            )),
             worker_credentials: Arc::new(CredentialGate::new()),
             redeem: Arc::new(RateLimiter::keyed(Quota::per_minute(NonZeroU32::new(20).unwrap()))),
         }
@@ -210,6 +219,7 @@ impl RateLimiters {
             &self.login,
             &self.login_account,
             &self.key_creation,
+            &self.key_changes,
             &self.redeem,
         ] {
             limiter.retain_recent();

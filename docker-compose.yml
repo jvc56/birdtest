@@ -39,8 +39,12 @@ services:
       POSTGRES_USER: birdtest
       POSTGRES_PASSWORD: birdtest
       POSTGRES_DB: birdtest
+    # Every published port is bound to loopback unless BIND_HOST says
+    # otherwise: with the repo's fixed credentials and signing key, a stack
+    # holding a restored dump was open to anyone on the same network, and
+    # Docker's published ports bypass a host firewall (the audit's pass 23).
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${BIND_HOST:-127.0.0.1}:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -63,8 +67,8 @@ services:
       MINIO_ROOT_USER: birdtest
       MINIO_ROOT_PASSWORD: birdtestbirdtest
     ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${BIND_HOST:-127.0.0.1}:${MINIO_PORT:-9000}:9000"
+      - "${BIND_HOST:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - miniodata:/data
 
@@ -170,7 +174,7 @@ services:
       # as well as in production.
       - ${MAGPIE_ROOT:-../MAGPIE}:/magpie:ro
     ports:
-      - "${BACKEND_PORT:-8080}:8080"
+      - "${BIND_HOST:-127.0.0.1}:${BACKEND_PORT:-8080}:8080"
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
       interval: 5s
@@ -184,7 +188,7 @@ services:
       backend:
         condition: service_healthy
     ports:
-      - "${WEB_PORT:-5173}:80"
+      - "${BIND_HOST:-127.0.0.1}:${WEB_PORT:-5173}:80"
 
   # --- profile: dev ---------------------------------------------------------
   # Hot reload without Node on the host. node_modules lives in a named volume
@@ -206,7 +210,7 @@ services:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
     ports:
-      - "${DEV_PORT:-5174}:5173"
+      - "${BIND_HOST:-127.0.0.1}:${DEV_PORT:-5174}:5173"
 
   # --- on demand: derived-builder -------------------------------------------
   # The derived-file builder, as production runs it in a scheduled ECS task

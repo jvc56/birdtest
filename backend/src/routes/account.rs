@@ -158,6 +158,13 @@ async fn set_key_active(
     ApiJson(body): ApiJson<SetActiveBody>,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
+    // Resuming a key is limited, suspending it is not: a back-and-forth needs
+    // both, so this bounds the audit rows it writes, and an owner suspending
+    // keys after a takeover is never held back by a thief who drained the
+    // bucket (the audit's pass 23).
+    if body.is_active {
+        crate::ratelimit::check(&state.limits.key_changes, &format!("u:{}", user.id))?;
+    }
 
     // Only a change is written and logged. This route has no rate limit of
     // its own, and a row for every call let one account grow the audit log at
@@ -204,6 +211,8 @@ async fn revoke_key(
     jar: CookieJar,
 ) -> AppResult<StatusCode> {
     csrf::verify(&method, &headers, &jar)?;
+    // Not rate limited: every revoke needs a key made first, which
+    // `key_creation` limits, and an owner revoking a thief's keys must not wait.
 
     // The row goes; the audit row, in the same transaction, is the only record
     // that the key existed and when it was revoked.

@@ -144,6 +144,8 @@ def write_contribute_settings(directory: Path, args, api_url: str) -> Path:
     if args.api_key:
         lines.append(f"apikey   {args.api_key}")
     settings.write_text("\n".join(lines) + "\n")
+    # It may hold an API key: readable by its owner only.
+    settings.chmod(0o600)
     return settings
 
 
@@ -245,7 +247,10 @@ def build_parser() -> argparse.ArgumentParser:
                               default=os.environ.get("MAGPIE_DATA_PATH", "../MAGPIE/data"),
                               help="MAGPIE data directory (default: %(default)s, "
                                    "or $MAGPIE_DATA_PATH)")
-    contributors.add_argument("--workdir", default=".dev-workers",
+    # Under the repo root whatever the working directory: `.gitignore` covers
+    # only the root's `.dev-workers/`, and a contribute.txt holding an API key
+    # written under frontend/ was not ignored (the audit's pass 23).
+    contributors.add_argument("--workdir", default=str(REPO_ROOT / ".dev-workers"),
                               help="where per-worker directories live (default: %(default)s)")
     contributors.add_argument("--reset-workers", action="store_true",
                               help="delete worker directories first, so each starts as a "

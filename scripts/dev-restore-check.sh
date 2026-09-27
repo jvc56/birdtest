@@ -33,7 +33,7 @@ check() {
   env "$@" STUBLOG="${log}" COMPOSE="${WORK}/compose" \
     bash "${HERE}/dev-restore.sh" "${WORK}/dump" < /dev/null > /dev/null 2>&1 || status=$?
   local scrubs calls got
-  scrubs=$(grep -c "ON_ERROR_STOP=1" "${log}" || true)
+  scrubs=$(grep -c "dev_copy=1" "${log}" || true)
   calls=$(wc -l < "${log}")
   if (( status == 2 && calls == 0 )); then
     got=refused

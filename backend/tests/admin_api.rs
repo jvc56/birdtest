@@ -2920,8 +2920,8 @@ async fn a_busy_large_job_does_not_hand_a_small_one_its_claims() {
 /// let the job beside it run a ratio unit ahead, and the busy job's settling
 /// forgave the lead once the spell ended, so every spell added another: a 10%
 /// job beside a 90% one took 400 claims of 2,400 over twenty spells of ten,
-/// where 240 is fair (the audit's pass 22). A job found busy is not settled
-/// for ten minutes.
+/// where 240 is fair (the audit's pass 22). A job found busy is settled a
+/// ratio unit short for ten minutes.
 #[tokio::test]
 async fn repeated_busy_spells_on_a_settling_job_are_paid_back() {
     let db = TestDb::new().await;

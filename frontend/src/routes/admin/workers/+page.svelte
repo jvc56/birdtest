@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { api, type Page, type WorkerBan } from '$lib/api';
+  import { api, errorText, type Page, type WorkerBan } from '$lib/api';
   import { workerLabel } from '$lib/format';
   import Pagination from '$lib/components/Pagination.svelte';
 
@@ -60,7 +60,8 @@
       reason = '';
       await loadBans();
     } catch (e) {
-      error = message(e);
+      // With the field the server named: "reason at most 1000 characters".
+      error = errorText(e);
     } finally {
       banning = false;
     }
@@ -100,7 +101,7 @@
   </div>
   <div>
     <label class="label" for="reason">Reason</label>
-    <input id="reason" class="input" bind:value={reason} placeholder="optional" />
+    <input id="reason" class="input" bind:value={reason} placeholder="optional" maxlength="1000" />
   </div>
   {#if error}<p class="field-error">{error}</p>{/if}
   {#if notice}<p class="text-sm text-success [overflow-wrap:anywhere]">{notice}</p>{/if}

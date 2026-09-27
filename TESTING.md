@@ -71,7 +71,7 @@ at tier 5 names a symptom.
 | 1 Unit | 216 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (2), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 122 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (18), `ratingHistory.test.ts` (14), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 161 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (27), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 220 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (24), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (9), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 221 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (24), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 626 backend tests (the per-tier counts above are
+--run-ignored all` runs 627 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -160,7 +160,7 @@ incidentally by higher tiers.
 | `scripts/seed.py` | 5, 6 (used by both) | Covered by use: `e2e/run.sh` and `e2e_magpie.py` both seed through it |
 | `scripts/dev.py` | Manual | Deliberate — see [Not tested](#what-is-deliberately-not-tested) |
 | `scripts/backup.sh`, `restore-drill.sh`, `restore-roundtrip.sh`, `restore-job.sh` | Nightly | Covered (`S-BACKUP-*`) |
-| `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`) |
+| `scripts/scrub.sql` | 3 | Covered (`S-SCRUB-1`, `-2`) |
 | `scripts/dev-restore.sh` | CI (`scripts`) | Covered (`S-BACKUP-6`: its `SCRUB` rule against a stub `COMPOSE`) |
 | birdtest ↔ MAGPIE wire | 4 + 6 | Covered — `C-1`..`C-9` on both sides, and tier 6 |
 
@@ -1094,7 +1094,8 @@ The single most important group. Every entry is about a decision made in SQL.
   `admin_api::repeated_busy_spells_on_a_settling_job_are_paid_back`.)* Short,
   not unsettled: a newcomer found busy once in the split of 3j is still
   settled, the majority job's first claim within sixteen, where it came
-  331st. *(Covered: `admin_api::a_newcomer_busy_once_is_still_settled`.)*
+  331st (`I-SCHED-3v`). *(Covered:
+  `admin_api::a_newcomer_busy_once_is_still_settled`.)*
   (Thirty-second audit, pass 22.)
 - `I-SCHED-4` Abandoned claims count toward a job's share. Abandon many claims
   on one job and confirm its share does **not** grow — excluding them would let
@@ -2204,7 +2205,8 @@ below.
 - `A-WORKER-21` A capturing job's result must carry positions from every game
   of its batch, and no result may hold a NUL in a string, a play over 256
   characters, a previous play scoring outside 0 to 100,000 or a bracketed tile
-  over 8 characters, nor a decline a NUL in a missing file: each is a `400`,
+  over 8 characters, nor a position over 4,096, nor a decline a NUL in a
+  missing file: each is a `400`,
   where a result with no positions was accepted and completed its task, a NUL
   was a `500` that left the claim open, and the rest were stored. *(Covered:
   `worker_api::a_capturing_jobs_result_is_complete_and_no_result_holds_what_cannot_be_stored`,
@@ -2495,7 +2497,12 @@ below.
 - `A-ACCOUNT-8` A key's whole life is on record: issued, suspended, resumed
   and revoked, each writes an audit row by the key's id (not its label, the
   owner's free text), where none did and a revoked key left no trace at all;
-  a suspend or resume that changes nothing writes none. *(Covered:
+  a suspend or resume that changes nothing writes none.
+- `A-ACCOUNT-9` Resuming an account's keys is rate limited (`key_changes`):
+  toggling a key 300 times, the last 50 resumes are `429`s with no row, and
+  the owner can still suspend and revoke; unlimited, one account wrote 4,000
+  audit rows in ten seconds. *(Covered: `account::key_changes_are_rate_limited_per_account`.)*
+  (Thirty-second audit, pass 23.) *(Covered:
   `account::a_keys_life_is_on_record`.)* (Thirty-second audit, pass 22.)
 
 ### `A-BOUND-*` — boundaries (`backend/tests/boundaries.rs`)
@@ -3036,6 +3043,15 @@ the real check of the backups themselves.
   allows. *(Covered: `account::a_scrubbed_dump_keeps_no_worker_credential`,
   which also pins `anonymous_workers`' columns to the ones the script copies.)*
   (Thirty-first audit: the UUIDs, each a whole credential, survived scrubbing.)
+- `S-SCRUB-2` A scrubbed dump holds no ban reason (an admin's free text about a
+  person), in the ban or its audit row; and the script refuses to run unless
+  asked for by name (`-v dev_copy=1`), since its old usage line pointed it at
+  production; `dev_copy` must be true, not merely set. *(Covered: the reasons
+  in `account::a_scrubbed_dump_keeps_no_worker_credential`; the refusal,
+  `dev-restore.sh`'s restoring into a copy swapped in only when whole and
+  scrubbed — a dump cut in its data, one missing a file, SIGTERM and SIGHUP
+  part-way each leave the stack as it was — and `dev-dump.sh`'s writing aside,
+  by hand: the audit's pass 23 replayed each in a throwaway container.)*
 
 ---
 

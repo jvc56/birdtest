@@ -313,11 +313,24 @@ async fn one_user_cannot_see_or_change_anothers_keys() {
     assert_eq!(claim_with(&app, key["key"].as_str().unwrap()).await.0, StatusCode::NO_CONTENT);
 }
 
-/// `scripts/scrub.sql` as `dev-restore.sh` applies it, psql's own commands
-/// left out.
+/// `scripts/scrub.sql` as `dev-restore.sh` applies it (with `-v dev_copy=1`):
+/// psql's own commands left out, and with them the refusal psql runs only
+/// when that variable is missing.
 async fn scrub(db: &TestDb) {
     let script = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/scrub.sql")).unwrap();
-    let sql: String = script.lines().filter(|line| !line.starts_with('\\')).collect::<Vec<_>>().join("\n");
+    let mut refusal = false;
+    let sql: String = script
+        .lines()
+        .filter(|line| {
+            if line.starts_with("\\else") {
+                refusal = true;
+            } else if line.starts_with("\\endif") {
+                refusal = false;
+            }
+            !refusal && !line.starts_with('\\')
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     sqlx::raw_sql(&sql).execute(&db.pool).await.unwrap();
 }
 
@@ -362,8 +375,8 @@ async fn a_scrubbed_dump_keeps_no_worker_credential() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO audit_log (action, actor_user_id, actor_anon_uuid, target_type, target_id)
-         VALUES ('worker.banned', $1, $2, 'worker', $3)",
+        "INSERT INTO audit_log (action, actor_user_id, actor_anon_uuid, target_type, target_id, reason)
+         VALUES ('worker.banned', $1, $2, 'worker', $3, 'Bob at 203.0.113.7')",
     )
     .bind(admin)
     .bind(worker)
@@ -386,6 +399,17 @@ async fn a_scrubbed_dump_keeps_no_worker_credential() {
     assert_ne!(claim_token, token, "an open claim's token is replaced");
     let banned: Uuid = sqlx::query_scalar("SELECT anon_uuid FROM worker_bans").fetch_one(&db.pool).await.unwrap();
     assert_eq!(banned, uuid, "so does its ban");
+    // A ban's reason is an admin's free text about a person: blanked, in the
+    // ban and in its audit row (the audit's pass 23).
+    let reasons: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT reason FROM worker_bans UNION ALL
+         SELECT reason FROM audit_log WHERE action = 'worker.banned' AND reason IS NOT NULL",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(reasons.len(), 2, "the ban and its audit row: {reasons:?}");
+    assert!(reasons.iter().all(|r| r.as_deref() == Some("[scrubbed]")), "{reasons:?}");
     let (actor, target): (Uuid, String) =
         sqlx::query_as("SELECT actor_anon_uuid, target_id FROM audit_log").fetch_one(&db.pool).await.unwrap();
     assert_eq!((actor, target), (uuid, uuid.to_string()), "and its audit rows");
@@ -415,8 +439,8 @@ async fn a_keys_life_is_on_record() {
     let headers = signed_in(&db, user);
     let app = birdtest::app(db.state().await);
     let key = create_key(&app, &headers, "laptop").await;
-    // A request that changes nothing is answered and not logged: the route has
-    // no rate limit, and a row a call let one account grow the log at will.
+    // A request that changes nothing is answered and not logged: a row per
+    // call let one account grow the log at will (A-ACCOUNT-9 limits changes).
     assert_eq!(set_active(&app, &headers, &key, true).await.0, StatusCode::NO_CONTENT);
     assert_eq!(set_active(&app, &headers, &key, false).await.0, StatusCode::NO_CONTENT);
     assert_eq!(set_active(&app, &headers, &key, false).await.0, StatusCode::NO_CONTENT);
@@ -436,4 +460,37 @@ async fn a_keys_life_is_on_record() {
             .map(|a| (a.to_string(), Some(user), "api_key".to_string(), None))
             .collect();
     assert_eq!(rows, expected);
+}
+
+/// A-ACCOUNT-9: toggling a key is rate limited. Each change writes an audit
+/// row, and a key toggled back and forth -- a change every time -- wrote 4,000
+/// in ten seconds (the audit's pass 23). Resuming is limited (a burst of 100),
+/// suspending and revoking are not: an owner suspending or revoking after a
+/// takeover must not find the bucket drained by the thief.
+#[tokio::test]
+async fn key_changes_are_rate_limited_per_account() {
+    let db = TestDb::new().await;
+    let user = db.user("toggler", false).await;
+    let headers = signed_in(&db, user);
+    let app = birdtest::app(db.state().await);
+    let key = create_key(&app, &headers, "laptop").await;
+    let mut limited = 0;
+    for i in 0..300 {
+        let (status, _) = set_active(&app, &headers, &key, i % 2 == 1).await;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            limited += 1;
+            assert!(i % 2 == 1, "a suspend was refused at {i}");
+        } else {
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+    }
+    assert_eq!(limited, 50, "the burst is 100 resumes");
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE action LIKE 'api_key.%activated'")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(rows, 201, "a suspend and a resume each for 100 resumes, and the last suspend");
+    // The owner can still suspend and revoke.
+    assert_eq!(set_active(&app, &headers, &key, false).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(revoke(&app, &headers, &key).await.0, StatusCode::NO_CONTENT);
 }

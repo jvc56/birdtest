@@ -559,6 +559,11 @@ async fn a_job_moves_through_its_lifecycle_and_completion_is_final() {
     let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/deactivate"), None).await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["message"], "a completed job cannot be deactivated");
+    // Completed again -- from a stale page, after the server's own finish
+    // check -- is a conflict, not a second completion on record (pass 23).
+    let (status, body) = admin.call("POST", &format!("/api/admin/jobs/{job}/complete"), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["message"], "this job is already completed");
     assert_eq!(lifecycle(&db, job).await.0, "completed", "completion is terminal");
     assert_eq!(claim(&admin.app).await, StatusCode::NO_CONTENT, "a completed job is not offered");
     assert_eq!(task_count(&db, job).await, 1);

@@ -533,7 +533,7 @@ after registering and confirming the account through the site — there is no
 endpoint for it, by design:
 
 ```bash
-scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE username = 'alice'"
+scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lower('alice') RETURNING username"
 ```
 
 `alert_email` has no default: `terraform apply` refuses to run without
@@ -588,8 +588,16 @@ admin's included), API keys, worker identities and backup history it would
 reset, hence the `SCRUB=0` above. It also takes a production dump directory, which must be
 scrubbed on the way in (`scripts/scrub.sql`: emails become `@example.invalid`,
 every password becomes `birdtest-local`, credentials and tokens are truncated,
-and every anonymous worker's UUID -- its whole credential -- is replaced). Restoring
-production data locally without that is a disclosure risk, not a shortcut.
+every anonymous worker's UUID -- its whole credential -- is replaced, and ban
+reasons are blanked). Restoring production data locally without that is a
+disclosure risk, not a shortcut. A restore goes into a copy, is scrubbed
+there, and replaces the stack's database only when both have succeeded, so one
+that fails or is stopped leaves the stack as it was; `dev-dump.sh` refuses a
+name that exists unless `FORCE=1`.
+
+The stack's ports are published on loopback only: with the repo's fixed
+passwords and signing key, a stack holding a restored dump was open to anyone
+on the same network. `BIND_HOST=0.0.0.0` opens them when that is wanted.
 
 After any schema change, prove a dump still round-trips:
 

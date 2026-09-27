@@ -158,7 +158,7 @@ pub fn rack_tiles(rack: &str) -> Option<usize> {
 pub fn check_rack(rack: &str, context: &str) -> AppResult<()> {
     let tiles = rack_tiles(rack).ok_or_else(|| {
         AppError::bad_request(format!(
-            "{context}: rack {rack:?} has a bracketed tile that is unclosed, empty or over {MAX_TILE_CHARS} characters"
+            "{context}: rack {rack:?} has a malformed bracketed tile (unclosed, stray, nested, empty or over {MAX_TILE_CHARS} characters)"
         ))
     })?;
     if tiles == 0 {
@@ -733,8 +733,9 @@ mod fixture_tests {
 
     // What `registry::decode_result` runs on a submission before it is stored,
     // one job type each, in its order: decode, `process_response`, then the
-    // checks against the task -- all but `refuse_uncaptured_positions` (the
-    // fixtures' jobs do not capture) and the route's `refuse_nul`. Everything short of the database -- which for
+    // checks against the task -- all but `refuse_uncaptured_positions`, which
+    // needs the job's capture setting (the fixture tests have no job), and the
+    // route's `refuse_nul`. Everything short of the database -- which for
     // an opening-rack batch is also `check_batch_against_task`, comparing the
     // racks with the task's range.
 

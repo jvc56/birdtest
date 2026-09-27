@@ -7,11 +7,29 @@
 -- of that is needed to reproduce a bug, and all of it is a disclosure risk
 -- sitting in a dev database.
 --
---   psql "$DATABASE_URL" -f scripts/scrub.sql
+-- NEVER against production: it sets every password to a public one, deletes
+-- every API key and replaces every anonymous contributor's identity. It
+-- refuses unless asked for by name, which `scripts/dev-restore.sh` does:
+--
+--   psql -v dev_copy=1 -v ON_ERROR_STOP=1 -d <a local copy> -f scripts/scrub.sql
+--
+-- Its usage line was once `psql "$DATABASE_URL" -f scripts/scrub.sql`, which in
+-- the ops shell is production (the audit's pass 23).
 --
 -- Everything here is idempotent, so running it twice is harmless — which
 -- matters, because the failure mode to protect against is forgetting whether
 -- it was run at all.
+
+\set ON_ERROR_STOP on
+\if :{?dev_copy}
+\else
+\set dev_copy false
+\endif
+\if :dev_copy
+\else
+\echo 'scrub.sql refused: it rewrites every password, key and identity. Run it through scripts/dev-restore.sh, or with -v dev_copy=1 on a copy you are sure of -- never production.'
+DO $$ BEGIN RAISE EXCEPTION 'scrub.sql refused: -v dev_copy=1 not given'; END $$;
+\endif
 
 BEGIN;
 
@@ -59,6 +77,12 @@ DELETE FROM anonymous_workers a USING scrub_anon_remap m WHERE a.uuid = m.old_uu
 -- A claim still open when the dump was taken is live in production for a few
 -- minutes more, and its token is what a submission names.
 UPDATE task_claims SET claim_token = gen_random_uuid() WHERE state = 'claimed';
+
+-- Ban reasons are an admin's free text about a person -- names, addresses,
+-- IPs -- kept in the ban and in its audit row (the audit's pass 23).
+UPDATE worker_bans SET reason = '[scrubbed]' WHERE reason IS NOT NULL;
+UPDATE audit_log SET reason = '[scrubbed]'
+ WHERE action IN ('worker.banned', 'worker.unbanned') AND reason IS NOT NULL;
 
 COMMIT;
 

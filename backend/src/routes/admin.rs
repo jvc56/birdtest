@@ -1947,6 +1947,12 @@ async fn complete_job(
     let mut tx = state.pool.begin().await?;
     let before = load_job_for_update(&mut tx, id).await?;
     refuse_if_purged_since(&state, id, purges)?;
+    // Already completed -- by the server's own finish check, say, while the
+    // admin's page was stale -- is a conflict, not a second completion on
+    // record (the audit's pass 23).
+    if before.status == JobStatus::Completed {
+        return Err(AppError::conflict("this job is already completed"));
+    }
     let job =
         sqlx::query_as::<_, Job>("UPDATE jobs SET status = 'completed' WHERE id = $1 RETURNING *")
             .bind(id)
@@ -3064,9 +3070,13 @@ async fn ban_worker(
     // sentence, not a document; and no NUL, which Postgres refuses as a `500`
     // (the audit's pass 22).
     if let Some(reason) = body.reason.as_deref() {
-        if reason.chars().count() > MAX_BAN_REASON_CHARS || reason.contains('\0') {
-            return Err(AppError::bad_request("the reason is too long or holds a NUL character")
+        if reason.chars().count() > MAX_BAN_REASON_CHARS {
+            return Err(AppError::bad_request("the reason is too long")
                 .with_field("reason", format!("at most {MAX_BAN_REASON_CHARS} characters")));
+        }
+        if reason.contains('\0') {
+            return Err(AppError::bad_request("the reason holds a NUL character")
+                .with_field("reason", "no NUL characters"));
         }
     }
     // Said plainly rather than left to the foreign key, whose refusal read

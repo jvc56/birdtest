@@ -203,8 +203,22 @@ on a clean confirmation full pass that follows a clean follow-up pass.
   RUNBOOK §1 step replayed, `I-SCHED-3u`). The adversarial check found 3
   medium (that step copied the damage back; an unsettled busy newcomer took a
   split fleet over; the key toggle grew the log at request rate), fixed — the
-  step redesigned around reviewed audit rows (`I-SCHED-3v`). KL-89 updated;
+  step redesigned around reviewed audit rows; `I-SCHED-3v` for the busy
+  newcomer). KL-89 updated;
   KL-90 added. The loop continues.
+- **Pass 23 (follow-up: pass 22's diff, and the ops and dev scripts):** 0 high
+  and 8 medium from the reviewers — the scrub had no guard and its usage line
+  ran it against production; a failed dev restore left a production dump
+  unscrubbed; ban reasons survived the scrub; the dev snapshot scripts
+  destroyed the good copy first; the dev stack's ports were open to the
+  network; the key toggle still grew the audit log; PLAN claimed the limiter
+  showed password guessing; RUNBOOK §1's step reopened deleted accounts,
+  undid demotions and applied a failed export as empty — all fixed (the step's
+  third form, checked nightly by the new `scripts/reapply-check.sh`). The
+  adversarial check found 3 medium (a stopped or truncated dev restore; a
+  migration's admin damage copied back), fixed — the dev restore redesigned to
+  restore and scrub into a copy swapped in only when whole. KL-90 updated. The
+  loop continues.
 
 ---
 
@@ -3470,8 +3484,9 @@ takeover (KL-33's case: keys minted, then the owner resets and revokes)
 nothing said which keys had existed or when the password changed. **Shown:**
 a failed sign-in, a key issued, suspended and revoked, a reset: no audit rows
 for the account, and no key row. **Fix:** `api_key.created`,
-`api_key.deactivated`, `api_key.reactivated` and `api_key.revoked` (the label
-in `reason`), `user.password_reset` and `user.email_confirmed`, each in the
+`api_key.deactivated`, `api_key.reactivated` and `api_key.revoked` (by the
+key's id; the label, logged at first, was dropped in 22.5),
+`user.password_reset` and `user.email_confirmed`, each in the
 change's transaction (`audit::log_account`); PLAN's table lists them, and says
 sign-in attempts stay unlogged by design — their number is the caller's.
 **Verified:** `A-ACCOUNT-8` and `A-AUTH-12` (the committed code wrote none, the
@@ -3486,7 +3501,7 @@ lifted are undone, a deleted account returns. The damaged instance is the only
 record, and §1 retired it without a step to carry them over. **Shown** (the
 restore simulated by putting the snapshot rows back): a stolen session, a
 revoked key and the old password went from `401` to `200`/`204`/`200`.
-**Fix:** a §1 block, before repointing, run from the ops shell: every session
+**Fix** (its first form, redesigned in 22.5 and again in pass 23): a §1 block, before repointing, run from the ops shell: every session
 generation bumped, key state and bans copied from the damaged instance
 (identities the restored copy lacks skipped), the password of every account
 reset since the restore point copied, and the accounts deleted since listed
@@ -3599,4 +3614,183 @@ test and the form's `max` are right.
 - **Tier 5, natively: 14 of 14**; **tier 6, natively, every case**.
 - `scripts/runbook-check.sh RUNBOOK.md README.md`: 27 and 19 blocks; RUNBOOK
   §1's new step replayed as in 22.5.
+- MAGPIE unchanged this pass.
+
+## Pass 23 — follow-up pass
+
+**Plan.** The diff since the previous pass's base (`1555879..39d89ca`), one
+reviewer per part: the backend (the audit writes, the busy settling); RUNBOOK
+§1's new step, replayed; docs and the frontend (tier 5 natively). MAGPIE is
+unchanged. Plus one area not examined in this run: **the ops and dev scripts**
+— `prod-shell.sh`, `prod-sql.sh`, `dev-dump.sh`, `dev-restore.sh`,
+`scrub.sql`, `seed.py`, `dev.py`.
+
+### 23.1 Medium — the scrub had no guard, and its usage line ran it against production (ops reviewer)
+
+`scrub.sql`'s header said `psql "$DATABASE_URL" -f scripts/scrub.sql`, and in
+the ops shell that is production: every password becomes a public one, every
+key goes, every anonymous contributor's identity is replaced. **Shown:** run
+as written against a live stack, the admin signs in with `birdtest-local` and
+an anonymous worker is refused. **Fix:** it refuses unless asked for by name
+(`-v dev_copy=1`, which `dev-restore.sh` passes), and its header says never
+against production. **Replayed:** without the variable it stops with an error
+and changes nothing.
+
+### 23.2 Medium — a restore that failed part-way left production data unscrubbed (ops reviewer)
+
+`dev-restore.sh` dropped the schema, restored, then scrubbed; a restore that
+failed after some tables loaded exited with them there, real addresses and
+hashes included, and the dump copied into the container. **Shown:** a dump
+missing one data file left five accounts' real addresses and argon2 hashes.
+**Fix** (its final form, 23.10): the dump is restored and scrubbed into a
+database of its own, which replaces the stack's only when both have
+succeeded.
+
+### 23.3 Medium — ban reasons survived the scrub (ops reviewer)
+
+A ban's reason is an admin's free text about a person, kept in the ban and in
+its audit row, and the scrub touched neither. **Fix:** both blanked. **Verified:**
+`S-SCRUB-1` now checks them; replayed through `dev-restore.sh`.
+
+### 23.4 Medium — the dev snapshot scripts destroyed the good copy first (ops reviewer)
+
+`dev-restore.sh` dropped the schema before checking its source: a mistyped
+path or a truncated dump emptied the database. `dev-dump.sh` wrote over an
+existing snapshot before `pg_dump` ran: postgres down, the snapshot became 0
+bytes. **Fix:** a restore touches the stack's database only by swapping a
+whole, scrubbed copy in (23.10); a snapshot is written aside and moved into
+place when complete, and an existing name is refused unless `FORCE=1`.
+
+### 23.5 Medium — the dev stack was open to the network (ops reviewer)
+
+Every published port — Postgres, MinIO, the backend, the frontend — bound all
+interfaces, with the repo's fixed passwords and signing key, on a stack the
+docs have holding a restored production dump; Docker's ports bypass a host
+firewall. **Fix:** loopback by default, `BIND_HOST` to open them.
+
+### 23.6 Medium — the key toggle still grew the audit log at request rate (docs reviewer)
+
+Pass 22 wrote no row for a toggle that changes nothing; one that alternates
+changes the key every time. **Shown:** 4,000 rows in ten seconds from one
+account. **Fix:** resuming a key is limited per account (`key_changes`, a
+burst of 100, then 60 an hour); a back-and-forth needs a resume, and suspending
+and revoking stay free — limited too, as first written, a thief could drain
+the bucket and hold the owner's revocations back (the backend reviewer).
+**Verified:** `A-ACCOUNT-9`.
+
+### 23.7 Medium — PLAN said the limiter showed password guessing; nothing did (docs reviewer)
+
+Sign-in attempts are unlogged by design, and PLAN said the limiter's counters
+answered "is someone guessing". They are in-process and read by nothing, and
+at the deployed log level neither the `401`s nor the `429`s are logged; the
+load balancer keeps no access log. **Fix:** stated — PLAN says nothing records
+an attempt, and KL-90 records it with the change that would.
+
+### 23.8 Medium — RUNBOOK §1's step: a deleted account reopened, a demotion undone, a failed export applied as empty (RUNBOOK reviewer)
+
+Three gaps in pass 22's step. **(a)** An account deleted since the restore
+point was only shut — password and keys, not its address — so a reset reopened
+it (shown: reset, sign-in, `/api/me`). **(b)** An admin demoted since was an
+admin again: `is_admin` is set by hand and not audited. **(c)** Block 2 checked
+only that its files existed, so a second export that failed part-way left an
+empty file and block 2 applied nothing and exited 0. **Fix:** the step's third
+form — an account deleted since is deleted again as the admin route deletes
+it (name, address, keys, codes, tokens, `deleted_at`); admin flags are
+compared with the damaged instance's, a restored admin it lacks demoted and the
+reverse listed; block 1 writes aside and marks completion last, and block 2
+requires the mark; exclusions live in their own file, by action or by actor,
+and survive a second export; the export reaches back ten minutes before the
+restore point (a row's time is its transaction's start; repeating an older
+action changes nothing); `RESTORE_TIME` must be UTC; the two URLs must reach
+different databases; the review is a per-actor summary with usernames; and
+the case where the damaged instance cannot be read at all has its own step.
+**Verified:** `scripts/reapply-check.sh`, new and run nightly: the step's two
+blocks as written, against a restored and a damaged database, through every
+refusal, a failed re-export, the actions applied and a bad migration's damage
+not, an excluded rogue admin, a demoted admin, and both pasted again; it fails
+if the exclusion or the completion check is taken out.
+
+### 23.9 Low findings
+
+**Fixed:**
+- Ops scripts: `dev.py`'s worker directory is under the repo root whatever the
+  working directory (a `contribute.txt` with an API key was written, unignored,
+  under `frontend/`), and the file is `0600`; `seed.py` quotes the username it
+  promotes and matches it as sign-in does; README's first-admin example does
+  too, and returns the row; `prod-shell.sh` and `prod-sql.sh` find `infra/`
+  from where they live; a dev restore mirrors the artifact bucket with
+  `--remove`; the scrub's list in PLAN says usernames stay.
+- Backend: an admin completing a job already completed is a `409`, not a
+  second `job.completed` row beside the server's; the ban reason's length and
+  NUL refusals say which; the ban form has a `maxlength` and shows the field
+  the server names.
+- Docs: the record's 22.1 and 22.2 say what 22.5 changed, and its summary
+  names `I-SCHED-3v` rightly; TESTING files 3v under its own id; three test
+  comments; the plausibility test's reason for skipping the capture rule and
+  the tile message; PLAN's round cap (eight, not three), KL-89's gap count,
+  KL-2's history, KL-32's filters and figures, the noncurrent 90 days a
+  deleted account's dump outlives, the full-restore plan's re-apply step, the
+  admin API table's new `400` and `404`, and that a key made since a restore
+  point comes back only by its owner making it again.
+
+**Unconfirmed:** a restore time given as a zone abbreviation could be read two
+ways (now refused: UTC only); `prod-sql.sh`'s SQL may be kept in AWS's records
+of the task (its header should say never to pass a secret — noted).
+
+### 23.10 Adversarial check of the pass's fixes
+
+**3 medium, fixed; the dev restore redesigned.**
+
+- **A stopped restore still left a production dump unscrubbed.** The trap was
+  on errors only: SIGTERM or SIGHUP — a closed terminal, a `timeout` — skipped
+  it, and a directory dump's `pg_restore` went on inside the container and
+  finished, real addresses and hashes and no scrub.
+- **The source check read only the table of contents.** A dump cut in its
+  data, or missing a data file, passed it, and the database was emptied — the
+  copy 23.4 meant to protect.
+
+  **Fix for both** (the restore's third form, so a redesign): the dump is
+  restored and scrubbed into `birdtest_restore`, which is renamed into place
+  only when both have succeeded; until then the stack's database is not
+  touched, and any error or signal drops the copy (`DROP DATABASE … WITH
+  (FORCE)` ends a restore still running in it). The artifact mirror runs after
+  the swap and cannot undo it. **Replayed** in a throwaway `postgres:16`: a
+  good dump (swapped in, scrubbed), a dump cut 2 KB short, a directory dump
+  missing its largest data file, a mistyped path, and SIGTERM and SIGHUP at
+  0.6 s and 1.2 s into a directory restore — each leaves the stack's database
+  as it was, no copy, no directory, no restore running.
+- **The re-apply step copied a migration's damage to admin flags.** Demotions
+  came straight from the damaged instance's table: a migration that cleared
+  `is_admin` demoted every admin, silently. **Fix:** the demotions are listed
+  by username in block 1 and written to `/tmp/after-demote.csv` for review;
+  none is proposed when the damaged instance has no admins at all; block 2
+  demotes only what is left there, and says whom. **Verified:** in
+  `reapply-check.sh`, which also now checks the re-deleted account's address,
+  hash, flag and codes and every session ended — each fails the check when
+  taken out of the RUNBOOK.
+
+**Lows fixed:** the scrub's guard wants `dev_copy` true, not merely set (`0`
+and `abc` refused); block 1 clears its completion mark first, so a refused
+paste cannot leave an older export to apply; the apply lists exclusions that
+matched nothing; the scrub test's audit row has a reason, so the check covers
+it; the dev proxy targets `127.0.0.1`, which the stack's loopback binding
+serves where `localhost` is `::1` first. **Not changed:** the ban form's
+`maxlength` counts UTF-16 units (astral text stops near 500 characters); the
+check replaces the step's `DAMAGED_URL` line (production's instances differ
+by host, the check's by database name).
+
+### 23.11 Tests
+
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- Full backend suite with `TEST_DATABASE_URL`, tier 6's opt-in tests included:
+  **627 of 627** (`A-ACCOUNT-9`; the ban-reason scrub, a second completion's
+  `409` and more asserted in existing tests).
+- `npm run check`: 0 errors, 0 warnings; `npm test`: 122 of 122.
+- **Tier 5, natively: 14 of 14**; **tier 6, natively, every case**.
+- `scripts/reapply-check.sh` (new, nightly): passes, and fails with any of the
+  exclusion, the completion mark, the re-deletion's hash, the session bump or
+  the no-admins guard taken out; `scripts/dev-restore-check.sh`: passes;
+  `scripts/runbook-check.sh RUNBOOK.md README.md`: 28 and 19 blocks; the dev
+  restore replayed as in 23.10, the scrub's guard with `dev_copy` unset, 0,
+  `abc` and 1.
 - MAGPIE unchanged this pass.

@@ -2370,8 +2370,8 @@ exceptional:
   this worker already holds a slot here — so it re-runs selection and lands
   somewhere else.
 
-The three-attempt cap bounds the loop; exhausting it returns `Idle`, and the
-worker simply asks again.
+The round cap (`CLAIM_ROUNDS`, eight) bounds the loop; exhausting it returns
+`Idle`, and the worker simply asks again.
 
 **Every claim records the MAGPIE version** the worker reported, on the
 `task_claims` row. That is what makes "what is the fleet running" a single query,
@@ -4783,11 +4783,14 @@ claimed and completed which task and when, so a row per claim and per submission
 duplicated it, cost a write each on the path a worker waits on, and made up most
 of the log's growth. Sign-in attempts are the other: their number is the
 caller's to choose, and a row each would let anyone with a list of usernames
-grow the log at the rate limiter's pace; the limiter's counters are what
-answers "is someone guessing". The credential changes an account makes to
-itself — keys, a reset, a confirmation — are logged (they were not until the
-audit's pass 22): they are the trail a takeover leaves, and what RUNBOOK §1
-re-applies after a restore undoes them. A row's `created_at` is its
+grow the log at the rate limiter's pace. The limiter refuses a guesser, but
+nothing records that one tried — not the log, not the service's own logs at
+their deployed level, not the load balancer (KL-90). The credential changes an
+account makes to itself — keys, a reset, a confirmation — are logged (they
+were not until the audit's pass 22): they are the trail a takeover leaves, and
+what RUNBOOK §1 re-applies after a restore undoes them — revocations,
+suspensions, resets, confirmations; a key made since the restore point is
+recorded by its id only, and its owner makes it again. A row's `created_at` is its
 transaction's start: a multi-minute purge's rows sort before actions that
 committed while it ran (`restore-job.sh` picks by `max(id)`, assigned at
 insert).
@@ -4808,7 +4811,7 @@ insert).
 | `worker.unbanned` | Lifting a ban, naming the identity rather than the ban row, which is gone |
 | `user.signed_out_everywhere` | "Sign out everywhere" on the account page |
 | `user.password_reset` / `user.email_confirmed` | A password reset, which ends every session, and an address confirmed |
-| `api_key.created` / `api_key.deactivated` / `api_key.reactivated` / `api_key.revoked` | An account's own API keys, by id — not the label, the owner's free text, which would outlive a deletion; a revoked key's row is deleted, so this is the only record it existed. A suspend or resume that changes nothing writes no row (the route has no rate limit) |
+| `api_key.created` / `api_key.deactivated` / `api_key.reactivated` / `api_key.revoked` | An account's own API keys, by id — not the label, the owner's free text, which would outlive a deletion; a revoked key's row is deleted, so this is the only record it existed. A suspend or resume that changes nothing writes no row, and resuming is limited per account (`key_changes`: a burst of 100, then 60 an hour) — a back-and-forth needs a resume, while suspending and revoking stay free for an owner after a takeover |
 | `rating_pool.created` / `rating_pool.member_added` / `rating_pool.member_removed` | Rating pool membership, each of which refits the pool |
 | `derived_data.retried` | An admin re-queueing a failed wordmap or rack info table build |
 | `input_data.deleted` | An admin deleting an input data row (and the derived rows built from it) |
@@ -4882,7 +4885,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `POST` | `/api/admin/jobs/:id/purge` | Delete every claim, result, leave-gen progress and staged-result row, selection cursor, artifact row and task for a job, reset its dispatch counter and rejoin it at parity with the other jobs (`claims_baseline`), then re-seed its initial state. Ratings are untouched: they belong to rating pools, and the sweep refits a pool whose evidence changed. Returns `{ tasks_reset }`. Writes a census of what it destroyed to the audit log first. `409` while a purge or delete of the job is already running: each runs to completion on a task of its own, so a second click stacked a second behind the first's locks. |
 | `DELETE` | `/api/admin/jobs/:id` | Delete a job and all its tasks. `409` while a purge or delete of it is running, as above. |
 | `DELETE` | `/api/admin/users/:id` | Delete a user account: anonymize it in place, keeping its claims and records so no donated compute is lost (see Admin API semantics). |
-| `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. One ban per identity: a second is `409`, so that unban means what it says. |
+| `POST` | `/api/admin/workers/ban` | Ban a worker by user ID or anonymous UUID. One ban per identity: a second is `409`, so that unban means what it says. The reason is at most 1,000 characters and holds no NUL (`400`). |
 | `GET` | `/api/admin/workers/bans` | Every ban in force, newest first, with the id lifting it takes. (Nothing listed them before the thirteenth audit; a mistaken ban needed SQL.) |
 | `DELETE` | `/api/admin/workers/ban/:id` | Remove a ban, and with it the identity's only ban. |
 | `GET` | `/api/admin/audit-log` | Query the audit log with filtering and pagination. |
@@ -4902,7 +4905,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name, scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
 | `POST` | `/api/admin/rating-pools/:id/members` | Add a player config to the pool and refit it. Returns the new run id. |
-| `DELETE` | `/api/admin/rating-pools/:id/members/:config_id` | Remove a config and refit. Refused for the pool's anchor, which every other rating is measured against. |
+| `DELETE` | `/api/admin/rating-pools/:id/members/:config_id` | Remove a config and refit. Refused for the pool's anchor, which every other rating is measured against; `404` for a config not in the pool, which is neither logged nor refitted. |
 | `POST` | `/api/admin/rating-pools/:id/recompute` | Force a refit without changing membership. |
 | `POST` | `/api/admin/jobs/:id/merge-progress` | Leave-generation jobs only. Fold the job's staged results into its per-rack totals now rather than at the next half-hourly merge, waiting for a merge already running. Returns `{ folds_merged, racks_updated }`. Nothing needs it — claims ask for a merge near a generation's end and a transition drains before it reads — so it is for an admin who wants the page's rack figures current, and for the end-to-end suite. |
 | `POST` | `/api/admin/jobs/:id/rebuild-artifacts` | Leave-generation jobs only. Recompute each generation's KLV from `leave_rack_progress` and report whether the stored object is still present and still matches its recorded hash. Rewrites only missing objects unless `?force=true`. |
@@ -5063,7 +5066,8 @@ keys are gone. `jobs.created_by`, `player_configs.created_by` and
 the census taken before the change. Deleting an already-deleted account is a
 404, and an admin cannot delete their own account. What deletion does not
 reach: the nightly dumps taken before it keep the account as it was for as
-long as they are kept (`backup_retention_days`, 365 by default; "Backups and
+long as they are kept (`backup_retention_days`, 365 by default, and up to 90
+days more as a noncurrent version, in the replica too; "Backups and
 Restore"), and a restore to a
 point before it brings the account back — RUNBOOK §1 shuts the accounts
 deleted since the restore point (from the damaged instance's `user.deleted`
@@ -7101,8 +7105,9 @@ says so in its implemented option, rather than being removed.
   Generation sizes (`num_iterations`, `max_iterations`, …) have no ceiling
   either, except `racks_per_task` (10,000 since the thirty-second audit: every
   claim and every `leave_requests` row carries a task's forced racks); a typo
-  makes tasks that outlast their lease rather than fail. Batch sizes have one
-  since the audit's pass 21: `racks_per_batch` 10,000, and `games_per_batch`
+  makes tasks that outlast their lease rather than fail. Batch sizes have one:
+  `racks_per_batch` 10,000 (earlier in the thirty-second audit), and since its
+  pass 21 `games_per_batch`
   10,000 games (1,000 when capturing; `pairs_per_batch` half that) — past
   32,768 captured games a result could not name its games at all. The
   capturing cap does not count what each position records: a result is about
@@ -7613,13 +7618,14 @@ says so in its implemented option, rather than being removed.
   the corpus makes the backup window matter.
 
 **KL-32. `audit_log`'s filters and `task_claims.claimed_at` have no index.**
-- **Context:** A filtered audit query (by action or target type) is a
-  sequential scan of the log and a sort, and every page view counts the whole
-  log (`COUNT(*)`, a sequential scan); the unfiltered first page and a `job_id`
-  filter use their indexes. `GET /api/admin/fleet` scans a week of claims
+- **Context:** A filtered audit query (by action, target type or actor) is a
+  sequential scan of the log and a sort, and a page view without a `job_id`
+  filter counts the whole log (`COUNT(*)`, a sequential scan); the unfiltered
+  first page and a `job_id` filter, count included, use their indexes. `GET /api/admin/fleet` scans a week of claims
   sequentially.
-- **Problem:** At a million audit rows, about 90 ms for a filtered page and 70
-  ms for the count (8 ms at 100,000; the audit's pass 22, PG16 defaults);
+- **Problem:** At a million audit rows, 35 to 90 ms for a filtered page and 25
+  to 70 ms for the count (8 ms at 100,000; the audit's passes 22 and 23, PG16
+  defaults);
   hundreds of milliseconds to seconds at millions of claims for the fleet
   page.
 - **Options considered:** an index on `claimed_at`.
@@ -8454,7 +8460,7 @@ says so in its implemented option, rather than being removed.
   `lift_passed_over` (thirty-second audit, pass 20).
 - **Problem:** A job joins at the lowest ratio among the jobs being served and
   is settled, claim by claim, level with each class of workers that runs
-  faster. Five gaps remain. A class that makes no claim of it within an hour
+  faster. Six gaps remain. A class that makes no claim of it within an hour
   of its joining -- a few workers on long tasks, a class that comes online
   later -- is not settled against, and when it does claim it finds the job
   below its pace and gives it every claim until it has caught up. A worker
@@ -8488,21 +8494,27 @@ says so in its implemented option, rather than being removed.
   lift needs a worker that repeatedly finds nothing it may take in a job
   others take from.
 
-**KL-90. A few actions still leave no audit row.**
+**KL-90. A few actions still leave no audit row, and sign-in attempts no record at all.**
 - **Context:** `audit_log` (thirty-second audit, pass 22).
 - **Problem:** The release of an expired, unconfirmed account when its name or
   address is registered again deletes the row with no audit row (and, through
   `worker_bans`' cascade, any ban on it). An admin's rating-pool recompute and
   leave-merge, and the bulk results stream, write none either. And a ban's
   row says `target_type = 'worker'` for an account and an anonymous UUID
-  alike: which it was is read from `worker_bans`, or from the id.
+  alike: which it was is read from `worker_bans`, or from the id. And nothing
+  records a sign-in attempt: not the audit log (by design, "Audit actions"),
+  not the service's logs at their deployed level (`RUST_LOG=birdtest=info`,
+  where the HTTP trace is at debug), not the load balancer (no access logs) —
+  the limiter refuses a guesser and nobody can see that it did.
 - **Options considered:** a row for each; a `target_type` of `user` or
   `anon_worker` on bans.
 - **Option implemented:** None; they are stated here.
 - **Justification:** None of them destroys or grants anything an admin would
   need to reconstruct: an unconfirmed account never ran a task, a recompute
   and a merge are repeatable, a stream only reads (an export is logged), and
-  the ban's identity kind is in the table beside it.
+  the ban's identity kind is in the table beside it. A line per refused
+  sign-in, or per bucket that trips, is a small change when an operator wants
+  to watch for guessing; the limiter bounds it either way.
 
 **KL-59. A failed sign-out leaves the session live.**
 - **Context:** `lib/auth.ts` sets the store to `null` in a `finally`, and the
@@ -9302,7 +9314,10 @@ workers keep submitting results into a database that is about to be replaced, an
 those submissions are silently discarded. Restore to a new instance, point
 `/birdtest/DATABASE_URL` at the new endpoint, scale back up (new tasks read SSM at
 start, so no image rebuild is needed), verify, and only then retire the old
-instance. Confirm `deletion_protection` and `backup_retention_period` carried over:
+instance. Before scaling up, re-apply what the restore undid for security —
+revocations, resets, bans, deletions and demotions since the restore point —
+from the old instance's audit rows (RUNBOOK §1): the restore brings every
+credential back as it was. Confirm `deletion_protection` and `backup_retention_period` carried over:
 a restored instance does **not** inherit automated-backup settings by default, and a
 restore that leaves the new instance unbacked is a trap. The alternative shape —
 restore and *swap identifiers* so the endpoint is unchanged — avoids touching SSM but
@@ -9414,7 +9429,18 @@ development rather than recovery:
   anonymous worker's UUID, which `X-Worker-UUID` alone authenticates, with its
   claims, ban and audit rows following it, and every open claim's token
   (thirty-first audit; until then a scrubbed dump could submit as any anonymous
-  contributor). Restoring production data locally without it is documented as
+  contributor), and every ban's reason, in the ban and its audit row — an
+  admin's free text about a person (the audit's pass 23). Usernames stay:
+  they are public on the site. It refuses to run unless asked for by name
+  (`-v dev_copy=1`, which `dev-restore.sh` passes): its usage line once pointed
+  it at `$DATABASE_URL`, which in the ops shell is production. A dump is
+  restored, and scrubbed, into a database of its own that replaces the
+  stack's only once both have succeeded: a dump cut short, a signal or a
+  failing scrub drops the copy and leaves the stack as it was (restored in
+  place, one that failed part-way was left unscrubbed, and one stopped by a
+  signal went on restoring inside the container). A snapshot is written aside
+  and moved into place only when complete.
+  Restoring production data locally without the scrub is documented as
   something not to do.
 
 The `scrub.sql` step is also what makes a public "sample database" possible later, if
