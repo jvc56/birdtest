@@ -557,9 +557,8 @@ def run_seed(args, api_url: str, magpie_root: Path, floor: str) -> None:
     # shares, and contributor accounts whose keys the keyed workers run under.
     keys_file = Path(args.workdir).expanduser().resolve() / ".contributor-keys.json"
     if args.reset_db:
-        # Six jobs at equal shares; a cap every pairs job reaches in a dev
-        # session, so all three finish and their players can be rated.
-        command += ["--all-job-types", "--allocation", str(100 // 6), "--max-units", "2000",
+        # Six jobs at equal shares, on seed.py's caps and SPRT minimums.
+        command += ["--all-job-types", "--allocation", str(100 // 6),
                     "--contributors", str(len(KEYED_WORKERS)), "--keys-out", str(keys_file)]
     if subprocess.run(command, cwd=REPO_ROOT).returncode != 0:
         fail("seeding failed; the stack is still up, so fix and re-run with --no-up")
@@ -636,8 +635,8 @@ def build_parser() -> argparse.ArgumentParser:
                             "in place until release (its data goes; the MinIO bucket is kept). "
                             "The fresh database is seeded, on --lexicon, with six jobs at equal "
                             "shares -- games, opening racks, leave generation and three game-pairs "
-                            "jobs among three players, which a rating pool can rate once they are "
-                            "done -- and two contributor accounts whose keys workers 3 and 4 run "
+                            "jobs among three players, which a rating pool can rate -- and two "
+                            "contributor accounts whose keys workers 3 and 4 run "
                             "under")
     stack.add_argument("--keep-up", action="store_true",
                        help="leave the stack running on exit instead of stopping it (a stack "

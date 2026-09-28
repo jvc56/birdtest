@@ -115,9 +115,10 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 - six jobs at equal allocation: games, opening racks, a small leave
   generation, and three game-pairs jobs among three players — `static-equity`,
   `static-score` and `sim-1ply` (a 1-ply sim, 100 iterations) — one for each
-  pair of them. Games and pairs jobs stop at 2,000, if their test has not
-  decided first, so all three pairs jobs finish, and an admin can then make a
-  rating pool of the three players;
+  pair of them. Games jobs stop at 100,000 games and pairs jobs at 100,000
+  pairs, if their test has not decided first; a pairs job's test is not acted
+  on before 50,000 pairs (a games job's before 100 games). A rating pool of the
+  three players rates them from whatever pairs have been played so far;
 - two contributor accounts, `dev-contributor-1` and `-2`, each with a new API
   key that workers 3 and 4 run under and keep in their `contribute.txt` for
   later runs. Workers 1 and 2 contribute anonymously.

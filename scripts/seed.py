@@ -385,11 +385,13 @@ def job_config(job_type: str, players: list, args) -> dict:
                 "rack_size": args.rack_size}
     if job_type == "games":
         return {"player1_config_id": players[0], "player2_config_id": players[1],
-                "games_per_batch": args.batch, "min_games": args.min_units,
+                "games_per_batch": args.batch,
+                "min_games": 100 if args.min_units is None else args.min_units,
                 "max_games": args.max_units}
     if job_type == "game_pairs":
         return {"player1_config_id": players[0], "player2_config_id": players[1],
-                "pairs_per_batch": args.batch, "min_pairs": args.min_units,
+                "pairs_per_batch": args.batch,
+                "min_pairs": 50000 if args.min_units is None else args.min_units,
                 "max_pairs": args.max_units}
     if job_type == "leave_generation":
         # Small, as tier 6 runs it: one generation, a few iterations. A task
@@ -511,8 +513,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="job to create and activate (default: %(default)s)")
     parser.add_argument("--batch", type=int, default=10,
                         help="games or pairs per task (default: %(default)s)")
-    parser.add_argument("--min-units", type=int, default=100,
-                        help="games/pairs before SPRT is acted on (default: %(default)s)")
+    parser.add_argument("--min-units", type=int, default=None,
+                        help="games/pairs before SPRT is acted on (default: 100 games, "
+                             "50000 pairs)")
     parser.add_argument("--max-units", type=int, default=100000,
                         help="hard cap on games/pairs (default: %(default)s)")
     parser.add_argument("--racks-per-batch", type=int, default=500,
