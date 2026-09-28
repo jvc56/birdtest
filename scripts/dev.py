@@ -298,6 +298,12 @@ def start_data_standin(magpie_root: Path) -> None:
         f"branch {e2e_magpie.SMALL_REF} (Input data, while dev.py runs)")
 
 
+# Every worker maps its rack info table rather than reading it in: the workers
+# share one data directory, so mapped they share one ~1.9 GB copy in the page
+# cache instead of holding one each. (Newer MAGPIE does this unasked; named
+# here for a checkout that predates that.)
+CONTRIBUTE_FLAGS = ["-ritmmap", "true"]
+
 # In the worker directory; see lock_workdir.
 LOCK_FILE = ".dev.lock"
 
@@ -401,7 +407,7 @@ printf '\\033]0;%s\\007' "$title"
 while true; do
     echo "--- started $(date '+%Y-%m-%d %H:%M:%S') ---" >> contribute.log
     echo "$title: Ctrl-C stops it"
-    {binary} contribute contribute.txt 2>&1 | tee -a contribute.log
+    {binary} contribute contribute.txt {flags} 2>&1 | tee -a contribute.log
     status=${{PIPESTATUS[0]}}
     echo
     trap 'exit 0' INT
@@ -506,7 +512,8 @@ class WorkerWindow:
 def open_worker_window(terminal: tuple, directory: Path, binary: Path, title: str) -> WorkerWindow:
     script = directory / "run.sh"
     script.write_text(WORKER_SCRIPT.format(title=shlex.quote(title),
-                                           binary=shlex.quote(str(binary))))
+                                           binary=shlex.quote(str(binary)),
+                                           flags=shlex.join(CONTRIBUTE_FLAGS)))
     script.chmod(0o755)
     pid_file = directory / "window.pid"
     pid_file.unlink(missing_ok=True)
@@ -567,7 +574,7 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> list:
 
         processes.append(
             subprocess.Popen(
-                [str(binary), "contribute", str(settings.name)],
+                [str(binary), "contribute", str(settings.name), *CONTRIBUTE_FLAGS],
                 cwd=directory,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -689,6 +696,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="assume the stack is already running")
     stack.add_argument("--rebuild", action="store_true",
                        help="rebuild images before starting")
+    stack.add_argument("--build-threads", type=int,
+                       default=int(os.environ.get("MAGPIE_THREADS") or os.cpu_count() or 1),
+                       help="threads the server's wordmap / rack info table builder gives "
+                            "MAGPIE (default: $MAGPIE_THREADS, or every core: %(default)s)")
     stack.add_argument("--hot-reload", action="store_true",
                        help="also run the Vite dev server (compose profile 'dev')")
     stack.add_argument("--reset-db", action="store_true",
@@ -726,8 +737,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="lexicon for the seeded jobs and their players (default: %(default)s)")
     seeding.add_argument("--variant", default=None, choices=["classic", "wordsmog"])
     seeding.add_argument("--no-rit", action="store_true",
-                         help="seed players without a rack info table: each worker otherwise "
-                              "holds its own ~1.9 GB copy in memory")
+                         help="seed players without a rack info table (~1.9 GB, which the "
+                              "workers map and share, and a few minutes' build per worker "
+                              "data directory)")
     seeding.add_argument("--tarball-date", default=None,
                          help="MAGPIE-DATA tarball YYYYMMDD (default: the DATA_VERSION your "
                               "MAGPIE checkout installed, so the server's digests match "
@@ -817,6 +829,10 @@ def main() -> int:
         # a hash built by one and checked by the other has to come from the
         # same build.
         "MAGPIE_ROOT": str(magpie_root),
+        # MAGPIE's conversions run on as many threads as they are given, and
+        # the builder runs alone before any job that needs its files is handed
+        # out: every core finishes it soonest. (Compose's default is 2.)
+        "MAGPIE_THREADS": str(max(1, args.build_threads)),
     })
     log(f"version floor {floor} (your MAGPIE build reports "
         f"{magpie_version(magpie_root) or 'an unknown version'})")

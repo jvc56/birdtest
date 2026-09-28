@@ -128,8 +128,9 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
   `static-score` and `sim-1ply` (a 1-ply sim, 100 iterations) — one for each
   pair of them. The static-equity vs sim-1ply job saves the positions its
   games analyse (`capture_positions`). Every player uses a wordmap and a rack
-  info table; each worker holds its own ~1.9 GB copy of the table in memory,
-  so `--no-rit` seeds players without one. Games jobs stop at 100,000 games
+  info table. The workers share one ~1.9 GB copy of the table (dev.py runs
+  them with `-ritmmap true`, so it is mapped rather than read into each), and
+  `--no-rit` seeds players without one. Games jobs stop at 100,000 games
   and pairs jobs at 100,000 pairs, if their test has not decided first; a
   pairs job's test is not acted on before 50,000 pairs (a games job's before
   100 games). A rating pool of the
@@ -144,6 +145,7 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | `--threads` | 2 | Threads inside each contributor |
 | `--max-tasks` | 0 | Tasks each contributor runs before exiting; 0 runs until stopped |
 | `--idle-wait` | 5 | Seconds a contributor waits when there is no work |
+| `--build-threads` | `$MAGPIE_THREADS`, or every core | Threads the server's wordmap / rack info table builder gives MAGPIE |
 | `--api-key` | anonymous | Contribute under an account instead of anonymously |
 | `--job-type` | `game_pairs` | `game_pairs`, `games` or `opening_rack` |
 | `--lexicon`, `--variant` | NWL23, classic | What the seeded job plays |
@@ -294,7 +296,10 @@ default, since they make game play much faster. MAGPIE builds each from files
 it already has the first time a job asks (a wordmap in a couple of seconds, a
 table in one to three minutes and about 2.4 GB of memory, 1.9 GB on disk and
 in memory after), checks it against the hash the server published, and never
-transmits either; see [MAGPIE on the server](#magpie-on-the-server). See
+transmits either. Workers sharing a data directory build each file once
+between them -- the others wait, saying so -- and map the table
+(`-ritmmap`, on unless `magpie contribute ... -ritmmap false`), so they share
+one copy of it in memory; see [MAGPIE on the server](#magpie-on-the-server). See
 [Worker Client](PLAN.md#worker-client-1) for the full protocol.
 
 ### Running the tests
