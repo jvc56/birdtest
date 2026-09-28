@@ -850,6 +850,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 - SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `stopped at its cap`.
 - The pentanomial (game pairs only): the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
 - Running result counts and percentages: wins / losses / draws for player 1.
+- **Saved positions**, for a job with `capture_positions` set: the latest captured positions, ten at a time, each with its board (CGP), the rack of the player to move, the move before it and the ranked moves; and a search for the positions played from one rack. Signed-in users only (`GET /api/jobs/:id/positions`); a signed-out visitor is told to sign in. The public has the results feed, and a job that captures holds millions of positions.
 
 **Opening rack analysis**
 
@@ -5104,6 +5105,7 @@ do not exist.
 | `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), its type's (a games or pairs job's batch, minimum, cap and SPRT parameters; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name. No creator, no user ids. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the SPRT verdict, `last generation built`, or none when an opening-rack job's racks ran out). |
 | `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
+| `GET` | `/api/jobs/:id/positions` | **Signed in.** A games or game-pairs job's captured positions, newest first, at most 20 a page by cursor, each with its CGP, game, turn, rack, previous move and ranked moves. `?rack=` keeps those whose player to move held that rack, however it is typed. Another job type is a `400`. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
@@ -6552,6 +6554,12 @@ CREATE INDEX position_analysis_records_feed_idx
 -- incidentally-captured in-game position is not an opening-rack analysis.
 CREATE INDEX position_analysis_records_job_rack_idx
     ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
+
+-- The positions search (`/api/jobs/:id/positions?rack=`): a game's positions
+-- with one rack, newest first. In-game positions only, so the index costs a
+-- job nothing unless it captures.
+CREATE INDEX position_analysis_records_game_rack_idx
+    ON position_analysis_records (job_id, rack, id) WHERE game_index IS NOT NULL;
 
 -- The cascade from a claim (`task_claim_id ... ON DELETE CASCADE`). The
 -- partial unique index on (task_claim_id, rack) above cannot serve it: a plain

@@ -114,6 +114,28 @@ export interface Page<T> {
  * for. Pass `next_cursor` back as `cursor` for the next page; its absence is
  * the end. This is the only endpoint that pages this way.
  */
+/** A position a games or pairs job captured, with its ranked moves. */
+export interface SavedPosition {
+  task_id: string;
+  game_index: number;
+  turn_number: number;
+  rack: string;
+  /** CGP. */
+  position: string | null;
+  previous_move: string | null;
+  previous_move_score: number | null;
+  num_moves: number;
+  submitted_at: string;
+  moves: {
+    rank: number;
+    move: string;
+    score: number;
+    equity: number;
+    /** Null for a static player. */
+    win_percentage: number | null;
+  }[];
+}
+
 export interface CursorPage<T> {
   items: T[];
   /** Always -1: an exact count costs more than it is worth to the caller. */
@@ -524,6 +546,13 @@ export const api = {
   jobResults: (id: string, params: Record<string, string | number> = {}) =>
     get<CursorPage<Record<string, unknown>>>(
       `/api/jobs/${id}/results?${new URLSearchParams(
+        Object.entries(params).map(([k, v]) => [k, String(v)])
+      )}`
+    ),
+  /** Signed-in users only: a games or pairs job's captured positions. */
+  jobPositions: (id: string, params: Record<string, string | number> = {}) =>
+    get<CursorPage<SavedPosition>>(
+      `/api/jobs/${id}/positions?${new URLSearchParams(
         Object.entries(params).map(([k, v]) => [k, String(v)])
       )}`
     ),

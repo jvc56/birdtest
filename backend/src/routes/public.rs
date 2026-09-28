@@ -25,6 +25,7 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id", get(job_detail))
         .route("/jobs/:id/config", get(job_config))
         .route("/jobs/:id/results", get(job_results))
+        .route("/jobs/:id/positions", get(job_positions))
         .route("/jobs/:id/stream", get(job_stream))
         .route("/users", get(list_users))
         .route("/workers", get(list_workers))
@@ -992,6 +993,150 @@ async fn rack_lookup(
     // page to.
     let total = items.len() as i64;
     Ok(super::CursorPage { items, total, per_page: total.max(1), next_cursor: None })
+}
+
+#[derive(Deserialize)]
+struct PositionsQuery {
+    per_page: Option<i64>,
+    cursor: Option<String>,
+    /// Only positions where the player to move held this rack, however it is
+    /// typed (canonicalised as the opening-rack lookup does).
+    rack: Option<String>,
+}
+
+/// The most positions one page returns: each carries its whole ranked list.
+const MAX_POSITIONS_PER_PAGE: i64 = 20;
+
+/// The positions a games or game-pairs job captured (`capture_positions`),
+/// newest first, each with its ranked moves: for signed-in users, since a job
+/// that captures holds millions of them and the public already has the
+/// results feed. A job that captured nothing is an empty page.
+async fn job_positions(
+    State(state): State<AppState>,
+    _user: crate::auth::CurrentUser,
+    Path(id): Path<Uuid>,
+    Query(query): Query<PositionsQuery>,
+) -> AppResult<Json<super::CursorPage<serde_json::Value>>> {
+    let job = load_job(&state, id).await?;
+    if !crate::exports::may_capture_positions(job.job_type) {
+        return Err(AppError::bad_request(
+            "only games and game-pairs jobs save the positions they play",
+        ));
+    }
+    let limit = query.per_page.unwrap_or(MAX_POSITIONS_PER_PAGE).clamp(1, MAX_POSITIONS_PER_PAGE);
+    let cursor = query.cursor.as_deref().and_then(super::decode_cursor);
+    let rack = query
+        .rack
+        .as_deref()
+        .map(str::trim)
+        .filter(|rack| !rack.is_empty())
+        .map(|rack| {
+            let mut chars: Vec<char> = rack.to_uppercase().chars().collect();
+            chars.sort_unstable();
+            chars.into_iter().collect::<String>()
+        });
+
+    const COLUMNS: &str = "r.id, r.task_id, r.rack, r.position, r.game_index, r.turn_number,
+                           r.previous_move, r.previous_move_score, r.num_moves, r.submitted_at";
+    // One rack: a seek into `position_analysis_records_game_rack_idx`, newest
+    // (highest id) first. Every position: the feed index, as the results feed
+    // reads it.
+    let rows = match &rack {
+        Some(rack) => {
+            let after = match cursor.as_deref() {
+                Some([id]) => id.parse::<i64>().ok(),
+                _ => None,
+            };
+            sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM position_analysis_records r
+                 WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NOT NULL
+                   AND ($3::bigint IS NULL OR r.id < $3)
+                 ORDER BY r.id DESC
+                 LIMIT $4"
+            ))
+            .bind(id)
+            .bind(rack)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&state.read_pool)
+            .await?
+        }
+        None => {
+            let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
+            sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM position_analysis_records r
+                 WHERE r.job_id = $1 AND r.game_index IS NOT NULL
+                   AND ($2::timestamptz IS NULL OR (r.submitted_at, r.id) < ($2, $3))
+                 ORDER BY r.submitted_at DESC, r.id DESC
+                 LIMIT $4"
+            ))
+            .bind(id)
+            .bind(after_time)
+            .bind(after_id)
+            .bind(limit)
+            .fetch_all(&state.read_pool)
+            .await?
+        }
+    };
+
+    let next_cursor = (rows.len() as i64 == limit)
+        .then(|| rows.last())
+        .flatten()
+        .map(|last| {
+            let id = last.get::<i64, _>("id").to_string();
+            match rack {
+                Some(_) => super::encode_cursor(&[id]),
+                None => super::encode_cursor(&[
+                    last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
+                        .timestamp_micros()
+                        .to_string(),
+                    id,
+                ]),
+            }
+        });
+
+    // The page's moves in one read of `(record_id, rank)`.
+    let ids: Vec<i64> = rows.iter().map(|r| r.get("id")).collect();
+    let mut moves: HashMap<i64, Vec<serde_json::Value>> = HashMap::new();
+    for m in sqlx::query(
+        "SELECT record_id, rank, move, score, equity, win_percentage
+         FROM position_analysis_moves
+         WHERE record_id = ANY($1)
+         ORDER BY record_id, rank",
+    )
+    .bind(&ids)
+    .fetch_all(&state.read_pool)
+    .await?
+    {
+        moves.entry(m.get("record_id")).or_default().push(serde_json::json!({
+            "rank": m.get::<i16, _>("rank"),
+            "move": m.get::<String, _>("move"),
+            "score": m.get::<i32, _>("score"),
+            "equity": m.get::<f64, _>("equity"),
+            "win_percentage": m.get::<Option<f64>, _>("win_percentage"),
+        }));
+    }
+
+    let items = rows
+        .into_iter()
+        .map(|r| {
+            let record: i64 = r.get("id");
+            serde_json::json!({
+                "task_id": r.get::<Uuid, _>("task_id"),
+                "game_index": r.get::<Option<i16>, _>("game_index"),
+                "turn_number": r.get::<Option<i16>, _>("turn_number"),
+                "rack": r.get::<String, _>("rack"),
+                "position": r.get::<Option<String>, _>("position"),
+                "previous_move": r.get::<Option<String>, _>("previous_move"),
+                "previous_move_score": r.get::<Option<i32>, _>("previous_move_score"),
+                "num_moves": r.get::<i32, _>("num_moves"),
+                "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
+                "moves": moves.remove(&record).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Ok(Json(super::CursorPage { items, total: -1, per_page: limit, next_cursor }))
 }
 
 /// How many live job streams are open at once, across every job.

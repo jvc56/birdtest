@@ -11,6 +11,7 @@
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import OutcomeChart from '$lib/components/OutcomeChart.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
+  import SavedPositions from '$lib/components/SavedPositions.svelte';
   import { playersLine, type JobConfig } from '$lib/jobSettings';
   import { pentanomialRows } from '$lib/charts/pentanomial';
 
@@ -242,6 +243,20 @@
           </div>
         {/if}
       </div>
+    {/if}
+
+    {#if config?.games?.capture_positions}
+      {#if $session}
+        <SavedPositions {jobId} />
+      {:else if $session === null}
+        <div class="card space-y-1">
+          <h2 class="text-lg font-medium">Saved positions</h2>
+          <p class="text-sm text-muted-foreground">
+            This job keeps the position analysed on every turn of its games.
+            <a href="/login?next={encodeURIComponent(`/jobs/${jobId}`)}">Sign in</a> to search them.
+          </p>
+        </div>
+      {/if}
     {/if}
 
     <!-- Ratings are pool-scoped and live on /ratings: a rating is a statement

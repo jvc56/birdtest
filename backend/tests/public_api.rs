@@ -644,6 +644,90 @@ async fn rack_lookup_finds_an_analysed_rack() {
     assert_eq!(body["message"], "no such job");
 }
 
+/// A-PUBLIC-4b: a games job's captured positions are searchable by a signed-in
+/// user -- newest first, a page at a time, each with its ranked moves, and by
+/// rack however it is typed -- and by nobody signed out. A job type that
+/// captures nothing is refused.
+#[tokio::test]
+async fn captured_positions_are_searchable_when_signed_in() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let cfg = state.cfg.clone();
+    let app = birdtest::app(state);
+    let job = db.games_job(1, 2).await;
+    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    for batch in 0..2 {
+        let mut result = games_result(2, 1);
+        result["positions"] = json!([
+            { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": format!("cgp-{batch}-0"),
+              "num_moves": 40, "moves": [
+                  { "move": "8D RETAINS", "score": 74, "equity": 81.2 },
+                  { "move": "8D STAINER", "score": 72, "equity": 79.0 } ] },
+            { "game_index": 1, "turn_number": 3, "rack": "AEINRSU", "position": format!("cgp-{batch}-1"),
+              "previous_move": "8D DOG", "previous_move_score": 10,
+              "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
+        ]);
+        let (assignment, uuid) = first_claim(&app).await;
+        submit(&app, &assignment, &uuid, result).await;
+    }
+
+    let path = format!("/api/jobs/{job}/positions");
+    let (status, _) = send(&app, get_request(&path, &[])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "signed out");
+
+    let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
+    let headers = admin_headers(&cfg, user);
+
+    // Every position, newest first, two to a page.
+    let (status, first) = send(&app, get_request(&format!("{path}?per_page=2"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let positions: Vec<&str> =
+        first["items"].as_array().unwrap().iter().map(|p| p["position"].as_str().unwrap()).collect();
+    assert_eq!(positions, ["cgp-1-1", "cgp-1-0"], "{first}");
+    let cursor = first["next_cursor"].as_str().expect("a full page has a next");
+    let (_, second) =
+        send(&app, get_request(&format!("{path}?per_page=2&cursor={cursor}"), &headers)).await;
+    let positions: Vec<&str> =
+        second["items"].as_array().unwrap().iter().map(|p| p["position"].as_str().unwrap()).collect();
+    assert_eq!(positions, ["cgp-0-1", "cgp-0-0"], "{second}");
+
+    let later = &first["items"][0];
+    assert_eq!(later["game_index"], 1);
+    assert_eq!(later["turn_number"], 3);
+    assert_eq!(later["previous_move"], "8D DOG");
+    assert_eq!(later["previous_move_score"], 10);
+    assert_eq!(later["num_moves"], 30);
+
+    // One rack, typed in lower case and out of order.
+    let (status, found) = send(&app, get_request(&format!("{path}?rack=tsrniea"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let items = found["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2, "{found}");
+    assert!(items.iter().all(|p| p["rack"] == "AEINRST"), "{found}");
+    assert_eq!(
+        items[0]["moves"],
+        json!([
+            { "rank": 1, "move": "8D RETAINS", "score": 74, "equity": 81.2, "win_percentage": null },
+            { "rank": 2, "move": "8D STAINER", "score": 72, "equity": 79.0, "win_percentage": null },
+        ])
+    );
+    assert!(found["next_cursor"].is_null(), "{found}");
+    let (_, none) = send(&app, get_request(&format!("{path}?rack=QQQQQQQ"), &headers)).await;
+    assert_eq!(none["items"], json!([]));
+
+    let racks = opening_rack_job(&db, 3).await;
+    let (status, body) =
+        send(&app, get_request(&format!("/api/jobs/{racks}/positions"), &headers)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _) =
+        send(&app, get_request(&format!("/api/jobs/{}/positions", Uuid::new_v4()), &headers)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 // ---------------------------------------------------------------------------
 // The live stream
 // ---------------------------------------------------------------------------

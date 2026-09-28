@@ -1103,6 +1103,12 @@ CREATE INDEX position_analysis_records_feed_idx
 CREATE INDEX position_analysis_records_job_rack_idx
     ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
 
+-- The positions search (`/api/jobs/:id/positions?rack=`): a game's positions
+-- with one rack, newest first. In-game positions only, so the index costs a
+-- job nothing unless it captures.
+CREATE INDEX position_analysis_records_game_rack_idx
+    ON position_analysis_records (job_id, rack, id) WHERE game_index IS NOT NULL;
+
 -- The cascade from a claim (`task_claim_id ... ON DELETE CASCADE`). The
 -- partial unique index on (task_claim_id, rack) above cannot serve it: a plain
 -- equality on task_claim_id does not imply `game_index IS NULL`, so the

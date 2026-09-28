@@ -290,6 +290,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("GET", "/api/rating-pools/:id", Public, ""),
     ("GET", "/api/rating-pools/:id/history", Public, ""),
     ("GET", "/api/jobs/:id/config", Public, ""),
+    ("GET", "/api/jobs/:id/positions", Session, ""),
 ];
 
 fn routes_with(access: &[Access]) -> impl Iterator<Item = &'static (&'static str, &'static str, Access, &'static str)> + '_ {
