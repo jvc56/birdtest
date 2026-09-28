@@ -46,7 +46,7 @@ test('E-12: a signed-in user pages through and searches a job\'s saved positions
   await signedOut.close();
 
   await page.goto(`/jobs/${jobId}`);
-  await expect(page.getByRole('heading', { name: 'Saved positions' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Saved positions', exact: true })).toBeVisible();
   const entries = page.locator('p', { hasText: 'moves ranked' });
   await expect(entries).toHaveCount(10);
   await page.getByRole('button', { name: 'Load more' }).click();
