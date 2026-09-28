@@ -124,6 +124,26 @@ struct MessageBody {
     message: &'static str,
 }
 
+/// Registration's answer. `mail_in_server_log` is there only when mail goes to
+/// the backend's stdout (`MAIL_BACKEND=console`), so the page can point a
+/// developer at the log without the live site ever mentioning it. It depends
+/// on the configuration alone, so a taken address still gets the same body.
+#[derive(Serialize)]
+struct RegisteredBody {
+    message: &'static str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    mail_in_server_log: bool,
+}
+
+impl RegisteredBody {
+    fn new(state: &AppState) -> Self {
+        RegisteredBody {
+            message: "check your email to confirm",
+            mail_in_server_log: state.cfg.mail_backend == crate::config::MailBackend::Console,
+        }
+    }
+}
+
 /// Whether `password` scores below the minimum, given the account's username
 /// and address as context. The address's local part is context of its own:
 /// zxcvbn matches each input whole, so the address alone let `jsmith` through
@@ -367,7 +387,7 @@ async fn register(
     State(state): State<AppState>,
     ClientIp(ip): ClientIp,
     ApiJson(body): ApiJson<RegisterBody>,
-) -> AppResult<(StatusCode, Json<MessageBody>)> {
+) -> AppResult<(StatusCode, Json<RegisteredBody>)> {
     ratelimit::check(&state.limits.register, &ip.to_string())?;
 
     let username = body.username.trim().to_string();
@@ -511,10 +531,7 @@ async fn register(
                 }
             });
         }
-        return Ok((
-            StatusCode::CREATED,
-            Json(MessageBody { message: "check your email to confirm" }),
-        ));
+        return Ok((StatusCode::CREATED, Json(RegisteredBody::new(&state))));
     }
     let raw_code = api_key::generate_code();
 
@@ -584,7 +601,7 @@ async fn register(
     );
 
     // No session is created yet — email is confirmed before the first login.
-    Ok((StatusCode::CREATED, Json(MessageBody { message: "check your email to confirm" })))
+    Ok((StatusCode::CREATED, Json(RegisteredBody::new(&state))))
 }
 
 /// Registration's mail, sent off the request as password reset's is. Both

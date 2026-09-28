@@ -399,6 +399,17 @@ export interface BackupStatus {
   recent: BackupRun[];
 }
 
+/** One wordmap or rack info table a job needs, and where its build stands. */
+export interface JobDerivedFile {
+  /** `wmp` or `rit`. */
+  role: string;
+  name: string;
+  /** `pending` | `building` | `built` | `failed`. */
+  state: string;
+  error: string | null;
+  attempts: number;
+}
+
 /**
  * A wordmap or rack info table the server builds a reference copy of.
  *
@@ -517,7 +528,7 @@ export interface Me {
 export const api = {
   // Auth
   register: (body: { username: string; email: string; password: string }) =>
-    post<{ message: string }>('/api/auth/register', body),
+    post<{ message: string; mail_in_server_log?: boolean }>('/api/auth/register', body),
   login: (body: { username: string; password: string }) =>
     post<{ username: string; is_admin: boolean }>('/api/auth/login', body),
   logout: () => post<void>('/api/auth/logout'),
@@ -597,6 +608,8 @@ export const api = {
   confirmImport: (id: string) =>
     post<{ inserted: number }>(`/api/admin/input-data/imports/${id}/confirm`),
   jobDataGaps: (id: string) => get<DataGap[]>(`/api/admin/jobs/${id}/data-gaps`),
+  jobDerivedData: (id: string) =>
+    get<JobDerivedFile[]>(`/api/admin/jobs/${id}/derived-data`),
   fleet: () => get<FleetVersion[]>('/api/admin/fleet'),
   backups: () => get<BackupStatus>('/api/admin/backups'),
   derivedData: () => get<DerivedData[]>('/api/admin/derived-data'),

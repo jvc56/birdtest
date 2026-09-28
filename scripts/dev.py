@@ -298,6 +298,12 @@ def start_data_standin(magpie_root: Path) -> None:
         f"branch {e2e_magpie.SMALL_REF} (Input data, while dev.py runs)")
 
 
+# Every worker maps its rack info table rather than reading it in: the workers
+# share one data directory, so mapped they share one ~1.9 GB copy in the page
+# cache instead of holding one each. (Newer MAGPIE does this unasked; named
+# here for a checkout that predates that.)
+CONTRIBUTE_FLAGS = ["-ritmmap", "true"]
+
 # In the worker directory; see lock_workdir.
 LOCK_FILE = ".dev.lock"
 
@@ -401,7 +407,7 @@ printf '\\033]0;%s\\007' "$title"
 while true; do
     echo "--- started $(date '+%Y-%m-%d %H:%M:%S') ---" >> contribute.log
     echo "$title: Ctrl-C stops it"
-    {binary} contribute contribute.txt 2>&1 | tee -a contribute.log
+    {binary} contribute contribute.txt {flags} 2>&1 | tee -a contribute.log
     status=${{PIPESTATUS[0]}}
     echo
     trap 'exit 0' INT
@@ -506,7 +512,8 @@ class WorkerWindow:
 def open_worker_window(terminal: tuple, directory: Path, binary: Path, title: str) -> WorkerWindow:
     script = directory / "run.sh"
     script.write_text(WORKER_SCRIPT.format(title=shlex.quote(title),
-                                           binary=shlex.quote(str(binary))))
+                                           binary=shlex.quote(str(binary)),
+                                           flags=shlex.join(CONTRIBUTE_FLAGS)))
     script.chmod(0o755)
     pid_file = directory / "window.pid"
     pid_file.unlink(missing_ok=True)
@@ -567,7 +574,7 @@ def start_contributors(args, binary: Path, data: Path, api_url: str) -> list:
 
         processes.append(
             subprocess.Popen(
-                [str(binary), "contribute", str(settings.name)],
+                [str(binary), "contribute", str(settings.name), *CONTRIBUTE_FLAGS],
                 cwd=directory,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
@@ -689,6 +696,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="assume the stack is already running")
     stack.add_argument("--rebuild", action="store_true",
                        help="rebuild images before starting")
+    stack.add_argument("--build-threads", type=int,
+                       default=int(os.environ.get("MAGPIE_THREADS") or os.cpu_count() or 1),
+                       help="threads the server's wordmap / rack info table builder gives "
+                            "MAGPIE (default: $MAGPIE_THREADS, or every core: %(default)s)")
     stack.add_argument("--hot-reload", action="store_true",
                        help="also run the Vite dev server (compose profile 'dev')")
     stack.add_argument("--reset-db", action="store_true",
@@ -726,8 +737,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="lexicon for the seeded jobs and their players (default: %(default)s)")
     seeding.add_argument("--variant", default=None, choices=["classic", "wordsmog"])
     seeding.add_argument("--no-rit", action="store_true",
-                         help="seed players without a rack info table: each worker otherwise "
-                              "holds its own ~1.9 GB copy in memory")
+                         help="seed players without a rack info table (~1.9 GB, which the "
+                              "workers map and share, and a few minutes' build per worker "
+                              "data directory)")
     seeding.add_argument("--tarball-date", default=None,
                          help="MAGPIE-DATA tarball YYYYMMDD (default: the DATA_VERSION your "
                               "MAGPIE checkout installed, so the server's digests match "
@@ -746,6 +758,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-browser", action="store_true",
                         help="do not open a browser (for SSH sessions and CI)")
     return parser
+
+
+def first_admin_steps(site_url: str) -> str:
+    """How to make the first admin on a --fresh site, and how the live site
+    differs. There is deliberately no page or endpoint for it."""
+    confirm = f"{site_url}/confirm-email?code="
+    return f"""
+============================================================================
+A fresh site has no accounts. To make yourself its first admin:
+
+ 1. In the browser, register at {site_url}/register
+    Any username; the email can be made up, since nothing is sent locally.
+
+ Leave dev.py running in this terminal: Ctrl-C here stops the whole site.
+ For steps 2 and 3, open a NEW terminal window, in the birdtest folder:
+
+      cd {REPO_ROOT}
+
+ 2. Confirm the email. Locally it is written to the backend's log instead of
+    being sent, and this prints the link it holds; open that in the browser:
+
+      docker compose logs backend | grep -o '{confirm}[A-Za-z0-9%]*' | tail -1
+
+ 3. Make the account an admin, with YOUR_NAME replaced by your username
+    (keep the quotes):
+
+      docker compose exec postgres psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE lower(username) = lower('YOUR_NAME')"
+
+    It prints UPDATE 1 (UPDATE 0: no account has that name). Sign in, or
+    reload if you already have: an Admin link appears in the header.
+
+ On the live site:
+  - Step 1 is the same, at the site's own address.
+  - Step 2: the email really arrives; open the link in it.
+  - Step 3 runs from the machine you deploy from, with the stack's AWS
+    credentials and Terraform state (README, "Deploying", step 7):
+
+      scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lower('YOUR_NAME') RETURNING username"
+============================================================================"""
 
 
 def main() -> int:
@@ -778,6 +829,10 @@ def main() -> int:
         # a hash built by one and checked by the other has to come from the
         # same build.
         "MAGPIE_ROOT": str(magpie_root),
+        # MAGPIE's conversions run on as many threads as they are given, and
+        # the builder runs alone before any job that needs its files is handed
+        # out: every core finishes it soonest. (Compose's default is 2.)
+        "MAGPIE_THREADS": str(max(1, args.build_threads)),
     })
     log(f"version floor {floor} (your MAGPIE build reports "
         f"{magpie_version(magpie_root) or 'an unknown version'})")
@@ -851,16 +906,14 @@ def main() -> int:
         user = args.login_as or args.username
         open_url = f"{site_url}/api/dev/login?username={quote(user)}&next=/"
         log(f"signed in as {user}: {open_url}")
-    if args.fresh:
-        log(f"to become the first admin: register at {site_url}/register, open the confirmation "
-            "link from `docker compose logs backend`, then run\n"
-            "      docker compose exec postgres psql -U birdtest -d birdtest -c "
-            "\"UPDATE users SET is_admin = true WHERE username = 'YOU'\"\n"
-            "    and reload the page")
     if not args.no_browser:
         webbrowser.open(open_url)
     log(f"birdtest is at {site_url} — Ctrl-C to stop the contributors"
         + ("" if args.keep_up or args.no_up else " and the stack"))
+    if args.fresh:
+        # Last, so it is what the terminal is left showing.
+        # Unprefixed, so a command copied whole is only the command.
+        print(first_admin_steps(site_url), flush=True)
 
     stopping = False
 

@@ -221,6 +221,8 @@ async fn register_confirm_and_login_gives_a_working_session() {
     let response = register(&app, "newcomer", "Newcomer@Example.invalid ", PASSWORD, "").await;
     assert_eq!(response.status, StatusCode::CREATED, "{response:?}");
     assert_eq!(response.json()["message"], "check your email to confirm");
+    // Real mail: the page is not told to point at the server's log.
+    assert!(response.json().get("mail_in_server_log").is_none(), "{response:?}");
 
     // The address is stored trimmed and lowercased, and mailed there.
     let mail = outbox.wait_for("newcomer@example.invalid", 1).await;
@@ -302,6 +304,21 @@ async fn a_wrong_password_and_an_unknown_username_answer_identically() {
 
     // And the account is real: its own password signs in.
     assert_eq!(login(&app, "existing", PASSWORD).await.status, StatusCode::OK);
+}
+
+/// Mail printed to the backend's stdout is the one case the check-email page
+/// mentions the log: the registration's answer says so, so the live site,
+/// which sends real mail, never shows that hint.
+#[tokio::test]
+async fn registration_says_when_its_mail_is_in_the_server_log() {
+    let db = TestDb::new().await;
+    let mut cfg = db.config();
+    cfg.mail_backend = MailBackend::Console;
+    let app = birdtest::app(db.state_with(cfg).await);
+
+    let response = register(&app, "consoleuser", "console@example.invalid", PASSWORD, "").await;
+    assert_eq!(response.status, StatusCode::CREATED, "{response:?}");
+    assert_eq!(response.json()["mail_in_server_log"], true);
 }
 
 /// A-AUTH-4: registering with an address that already has an account gets

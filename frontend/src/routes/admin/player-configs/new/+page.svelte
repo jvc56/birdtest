@@ -252,7 +252,8 @@
           The server builds this player's table from its lexicon and leaves before any
           job using it can dispatch — a few minutes, once per pair. Watch it at
           <a class="underline" href="/admin/derived-data">derived data</a>. Contributors
-          build their own copy, which costs about 1.9&nbsp;GB of disk and of memory.
+          build their own copy, which costs about 1.9&nbsp;GB of disk and of memory (shared by
+          workers on one machine).
         </p>
       {/if}
       <div>

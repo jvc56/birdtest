@@ -30,8 +30,10 @@
     error = '';
     fields = {};
     try {
-      await api.register({ username, email, password });
-      goto('/register/check-email');
+      const registered = await api.register({ username, email, password });
+      goto('/register/check-email', {
+        state: { mailInServerLog: registered.mail_in_server_log === true }
+      });
     } catch (e) {
       if (e instanceof ApiError) {
         fields = e.fields;

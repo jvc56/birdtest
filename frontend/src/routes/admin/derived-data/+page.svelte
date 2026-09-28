@@ -1,22 +1,38 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onDestroy, onMount } from 'svelte';
   import { api, type DerivedData } from '$lib/api';
   import { datetime } from '$lib/format';
 
   let rows: DerivedData[] = [];
   let error = '';
   let busy = '';
+  let poll: number | undefined;
+  let destroyed = false;
+
+  // While anything is queued or building the page reads again every few
+  // seconds, so a build is seen to finish; nothing pushes these rows.
+  const POLL_MS = 3000;
 
   async function load() {
+    window.clearTimeout(poll);
     try {
       rows = await api.derivedData();
       error = '';
     } catch (e) {
       error = e instanceof Error ? e.message : 'could not load derived data';
     }
+    if (destroyed) return;
+    const inProgress = rows.some(
+      (r) => r.buildable && (r.state === 'pending' || r.state === 'building')
+    );
+    if (inProgress || error) poll = window.setTimeout(load, POLL_MS);
   }
 
   onMount(load);
+  onDestroy(() => {
+    destroyed = true;
+    window.clearTimeout(poll);
+  });
 
   // Two rows can share a role, a name and a builder (a lexicon re-released
   // under its name), so a row is keyed by the files it is built from too.
@@ -63,7 +79,9 @@
   <strong>A job that needs one of these is not dispatched until it says “built”.</strong>
   That is the usual reason an active job is handing out no work. Builds run in a scheduled
   task (<code>birdtest-derived-builder</code>); a wordmap takes a couple of seconds and a rack
-  info table one to three minutes.
+  info table one to three minutes. Once the job is handed out, each contributor builds its own
+  copy the first time it gets a task that needs one, which costs it the same minutes and about
+  2.4&nbsp;GB of memory while it builds.
 </p>
 
 {#if error}
