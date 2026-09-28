@@ -238,6 +238,66 @@ def uuids_the_database_knows(uuids: List[str]) -> Optional[set]:
     return {line.strip() for line in result.stdout.splitlines() if line.strip()}
 
 
+# Where dev.py serves MAGPIE's two-letter test data from (start_data_standin).
+DATA_STANDIN_PORT = 8482
+
+
+def docker_bridge_address() -> Optional[str]:
+    """The host's address on Docker's default bridge: what a container reaches
+    as `host.docker.internal` (docker-compose.yml's `host-gateway`), and not
+    reachable from the rest of the network the way 0.0.0.0 would be."""
+    result = subprocess.run(
+        ["docker", "network", "inspect", "bridge", "--format",
+         "{{(index .IPAM.Config 0).Gateway}}"],
+        capture_output=True, text=True)
+    address = result.stdout.strip()
+    return address if result.returncode == 0 and address else None
+
+
+def install_small_data(magpie_root: Path, data: Path) -> None:
+    """Copies the two-letter test files into the data directory every worker
+    shares, where MAGPIE looks for a job's lexicon and distribution by name.
+    Three files of a few kilobytes, under names no MAGPIE-DATA release uses;
+    an existing file is left alone."""
+    import e2e_magpie
+    for inside, source in e2e_magpie.SMALL_FILES:
+        target = data / inside
+        if not target.exists():
+            shutil.copyfile(magpie_root / source, target)
+            log(f"copied {source} into {target.parent} for the two-letter test data")
+
+
+def start_data_standin(magpie_root: Path) -> None:
+    """Serves MAGPIE's two-letter test data (`english_ab`, `CSW21_ab`: 8 full
+    racks) as a MAGPIE-DATA version the admin import can fetch, by standing in
+    for GitHub: the one version and branch below are answered here, and every
+    other request goes on to GitHub, so the real import still works. It is
+    tier 6's stand-in (`e2e_magpie.GitHubStandIn`), and it is what makes a
+    leave-generation job that finishes in minutes possible locally --
+    JOURNEYS.md walks through one. Lives as long as this process."""
+    import e2e_magpie
+    try:
+        tarball = e2e_magpie.small_tarball(magpie_root)
+    except e2e_magpie.Failure as err:
+        log(f"no two-letter test data to serve ({err}); imports go straight to GitHub")
+        return
+    address = docker_bridge_address()
+    if not address:
+        log("could not find Docker's bridge address; imports go straight to GitHub")
+        return
+    try:
+        e2e_magpie.GitHubStandIn((address, DATA_STANDIN_PORT), tarball)
+    except OSError as err:
+        log(f"could not serve the two-letter test data on {address}:{DATA_STANDIN_PORT} "
+            f"({err}); imports go straight to GitHub")
+        return
+    base = f"http://host.docker.internal:{DATA_STANDIN_PORT}"
+    os.environ["BIRDTEST_GITHUB_API_URL"] = f"{base}/api"
+    os.environ["BIRDTEST_GITHUB_RAW_URL"] = f"{base}/raw"
+    log(f"MAGPIE's two-letter test data can be imported as version {e2e_magpie.SMALL_DATE}, "
+        f"branch {e2e_magpie.SMALL_REF} (Input data, while dev.py runs)")
+
+
 # In the worker directory; see lock_workdir.
 LOCK_FILE = ".dev.lock"
 
@@ -727,6 +787,13 @@ def main() -> int:
     workdir = Path(args.workdir).expanduser().resolve()
     lock = lock_workdir(workdir)  # noqa: F841 -- held until exit
 
+    # Before the stack starts: the backend is pointed at it through the
+    # environment compose reads.
+    if not args.no_up:
+        start_data_standin(magpie_root)
+    if os.environ.get("BIRDTEST_GITHUB_API_URL"):
+        install_small_data(magpie_root, data)
+
     if args.reset_db:
         reset_database()
     # Before seeding, which may give workers keys to keep. Everything but the
@@ -836,6 +903,9 @@ def main() -> int:
         # run picks up where this one left off.
         if args.keep_up or args.no_up:
             log(f"the stack is still up ({site_url}); `docker compose down` when you are done")
+            if os.environ.get("BIRDTEST_GITHUB_API_URL") and not args.no_up:
+                log("its data imports went through this dev.py, which has stopped: they fail "
+                    "until the stack is restarted")
         else:
             log("stopping the stack (its data is kept; --keep-up leaves it running)")
             compose(["down"], check=False)

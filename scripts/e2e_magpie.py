@@ -91,7 +91,7 @@ CASE_TIMEOUT = 600
 # own two-letter test lexicon and distribution. Served from a tarball under a
 # date no real MAGPIE-DATA release has, at a ref only the stand-in resolves.
 SMALL_DATE = "20000101"
-SMALL_REF = "tier6-small"
+SMALL_REF = "two-letter"
 SMALL_SHA = "7133e6a2b0c0ffee00000000000000000000ab01"
 SMALL_FILES = (
     ("lexica/CSW21_ab.kwg", "testdata/lexica/CSW21_ab.kwg"),

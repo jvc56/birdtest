@@ -55,6 +55,16 @@ Ctrl-C in a window stops that worker and Enter starts it again under the same
 identity, and a second Ctrl-C, or closing the window, leaves it stopped.
 Either way, Ctrl-C in dev.py stops every worker.
 
+**A small data set to import.** While it runs, `dev.py` also serves MAGPIE's
+two-letter test data — the `english_ab` distribution and the `CSW21_ab`
+lexicon, eight possible racks — as MAGPIE-DATA version `20000101` on branch
+`two-letter`, which the **Input data** page imports like any other. It stands in
+for GitHub on Docker's bridge address (port 8482) and passes every other
+request through, so real imports still work; and it copies those three files
+into the MAGPIE data directory the workers share. A leave-generation job on it
+finishes a generation in seconds, where English has 3,199,724 racks to cover;
+[JOURNEYS.md](JOURNEYS.md) walks through one.
+
 **Contributors are always real MAGPIE.** There is no fake-worker mode here.
 `worker/fake_worker.py` belongs to the end-to-end suite, where a browser
 journey needs contributions to arrive on cue at predictable values without a C
