@@ -2811,7 +2811,8 @@ admin in once and the admin journeys reuse its storage state.
   the held read carried the old status; and a delete through the API.)* The reads ran one after another: the page said
   "No worker has declined this job", showed 100, and Activate sent it
   (thirty-second audit, pass 16).
-- `E-12` A games job that saves its positions shows a signed-out visitor a
+- `E-12` A games job made through the form with "Save the positions played"
+  ticked shows a signed-out visitor a
   prompt to sign in, and a signed-in user its positions ten at a time with
   "Load more", and a rack search whose every result holds that rack.
   *(Covered: `e12-saved-positions.spec.ts`.)*
