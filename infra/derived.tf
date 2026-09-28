@@ -1,7 +1,7 @@
 # The derived-file builder: a scheduled ECS task that drains `derived_data`.
 #
-# See MAGPIE_DEPENDENCY.md. A wordmap and a rack info table are built on every
-# contributor's own machine and are far too large to ship, so birdtest checks
+# See README.md's "MAGPIE on the server". A wordmap and a rack info table are
+# built on every contributor's own machine and are far too large to ship, so birdtest checks
 # them by building its own reference copy with a pinned MAGPIE and publishing
 # the hash. This is where those builds run.
 #

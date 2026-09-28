@@ -253,7 +253,7 @@ CREATE TABLE input_data_import_rows (
 -- machine that needs one builds it from files it already has. What travels
 -- instead is the SHA-256 the server's own pinned MAGPIE got from the same
 -- inputs: a worker builds its own copy and uses it only if the bytes agree,
--- and declines the task otherwise. See MAGPIE_DEPENDENCY.md.
+-- and declines the task otherwise. See README.md, "MAGPIE on the server".
 --
 -- The key is the whole identity of the file rather than a surrogate, because
 -- what makes two derived files the same file is that they were built from the

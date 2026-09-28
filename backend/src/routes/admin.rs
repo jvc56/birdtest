@@ -885,7 +885,7 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     // hash with every claim, and the file is named for the pair rather than
     // the lexicon, so two jobs on one lexicon with different leaves cannot
     // share one. A job that asks for a table waits until it is built; see
-    // `derived` and MAGPIE_DEPENDENCY.md.
+    // `derived` and README.md's "MAGPIE on the server".
     if err.fields.is_empty() {
         Ok(())
     } else {

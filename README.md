@@ -278,12 +278,14 @@ to that file. (A directory of its own does not work unless it also holds
 MAGPIE's `data/`, or a link to it: MAGPIE loads its default board from
 `./data` before it reads anything else.) Settings never
 go on the command line, so an API
-key stays out of shell history and `ps` output. Wordmaps (`.wmp`) make game
-play dramatically faster, so MAGPIE always wants one for a lexicon it's
-contributing with; it derives the word list and the wordmap from the `.kwg` it
-already has on first use, in about 1.3 seconds per lexicon, and never
-transmits either. See [Worker Client](PLAN.md#worker-client-1) for the full
-protocol.
+key stays out of shell history and `ps` output. A job's players decide whether
+a wordmap (`.wmp`) and a rack info table (`.rit`) are used — both are on by
+default, since they make game play much faster. MAGPIE builds each from files
+it already has the first time a job asks (a wordmap in a couple of seconds, a
+table in one to three minutes and about 2.4 GB of memory, 1.9 GB on disk and
+in memory after), checks it against the hash the server published, and never
+transmits either; see [MAGPIE on the server](#magpie-on-the-server). See
+[Worker Client](PLAN.md#worker-client-1) for the full protocol.
 
 ### Running the tests
 
@@ -350,6 +352,264 @@ You need a Postgres to point `DATABASE_URL` at — `docker compose up -d postgre
 minio minio-init` gives you one without the rest of the stack.
 
 `scripts/dev.py` and `scripts/seed.py` need only `requests`.
+
+## MAGPIE on the server
+
+The backend runs MAGPIE itself: a pinned binary in its image in production,
+your checkout (mounted) locally. It uses it for two things, and only on the
+path where a worker's results are mixed into everyone else's — a wrong answer
+there passes every plausibility check and lands in a job's totals.
+
+1. **Wordmaps and rack info tables are checked, not trusted.** For every
+   wordmap (`.wmp`) and rack info table (`.rit`) a job needs, the server builds
+   its own copy from the exact `.kwg` and `.klv2` bytes the job pins, keeps the
+   SHA-256, and throws the file away. Workers build their own copy from inputs
+   they have already verified and use it only if the hashes match.
+2. **Leave-generation KLVs are MAGPIE's.** The zeroed generation-0 KLV and
+   every generation's KLV are built by MAGPIE, so a change to how leave values
+   are derived happens in one place. (Until 2026-09 the server built them with
+   `backend/src/jobs/klv.rs`, a hand port of MAGPIE's code whose bytes differed
+   from MAGPIE's.)
+
+[Wordmap and rack info table provenance](PLAN.md#wordmap-and-rack-info-table-provenance)
+in PLAN.md is the specification; this section is what it rests on and what it
+costs.
+
+### Why hash the output
+
+A derived file records nothing reliable about how it was built, and MAGPIE's
+CLI finds both by lexicon name alone. Recording the input digests — the
+wordmap's `.wmp.src` sidecar does that for the `.kwg` — shows a file was built
+*from* the right inputs and still trusts the builder, which is not a
+theoretical gap: a CSW24 wordmap built in December 2025 and one built in
+September 2026 differ in 72,852,152 bytes (and 60 bytes of size) with the same
+inputs and the same format version 3. A builder change altered the output
+without touching the format. Hashing the output checks what the worker will
+actually load, and the server's own copy is a known-good answer.
+
+That depends on MAGPIE's builders being deterministic, and they are, as far as
+has been measured (MAGPIE `c2daa027`, GCC 10.5, Intel i7-10750H, x86-64
+Linux):
+
+| File | 1 thread | 8 threads | Same bytes? | Size | Peak memory |
+|---|---|---|---|---|---|
+| `CSW24.wmp` (`convert dawg2wordmap`) | 2.4 s | 1.7 s | **yes** | 179 MB | 710 MB |
+| `CSW24.rit` (`convert klvwmp2rit`) | 169 s | 59 s | **yes** | 1.9 GB | 2.4 GB |
+
+| Comparison | `CSW21_ab.wmp` | `NWL23.wmp` | `CSW21_ab.rit` |
+|---|---|---|---|
+| `-march=native` vs `-march=nehalem` | identical | identical | identical |
+| `dawg2wordmap` vs `dawg2text` + `text2wordmap` | — | identical | — |
+
+A rack info table built by an earlier MAGPIE commit eight days before also
+matched. **Not measured:** another compiler (Ubuntu 20.04's clang 10 cannot
+build the tree — it rejects `-march=x86-64-v2`, which is why the portable
+target is spelled `nehalem`) and another architecture (no ARM machine was to
+hand). Nothing waits on either: see "The build target is reported, not
+compared" below.
+
+### What happens, end to end
+
+1. **Import keeps lexica and leaves.** The tarball import stores every `.kwg`
+   and `.klv2` in the object store, keyed by SHA-256, so the server holds the
+   exact inputs a job pins.
+2. **A job that needs a derived file queues a build** in `derived_data`: a
+   wordmap for a `.kwg` when a player (or a leave job) uses one, a table for a
+   `(.kwg, .klv2)` pair when a player uses one. Files are queued when the job
+   is created, when it is activated, and by the first claim that finds one with
+   no row under the running binary's builder — which is what rebuilds
+   everything after a deploy that bumps a builder version. Not at player-config
+   creation: a config has no letter distribution until a job gives it one.
+3. **A builder task runs MAGPIE**: it writes the inputs and the job's letter
+   distribution into a scratch data directory, runs `convert dawg2wordmap` or
+   `convert klvwmp2rit`, records the hash, and deletes the directory (in a
+   `Drop`, deliberately blocking, so an early return cannot leak 1.9 GB).
+4. **Dispatch waits for the hash**, the same way a leave-generation job waits
+   for its rack universe. `/admin/derived-data` shows what is waiting, what
+   failed and why, and retries a failure.
+5. **The claim carries the hashes** in `expected_data.derived`, beside the
+   input digests in `expected_data.files`:
+
+   ```json
+   "derived": [
+     { "role": "wmp", "name": "CSW24", "sha256": "1830…", "bytes": 178929167,
+       "builder": "wmp-1", "build_target": "nehalem" },
+     { "role": "rit", "name": "CSW24.CSW_quackle_leaves", "sha256": "6da8…",
+       "bytes": 1885416048, "builder": "rit-1", "build_target": "nehalem" }
+   ]
+   ```
+
+6. **The worker builds and checks.** After verifying its inputs it hashes what
+   is on its disk (through its stat-keyed digest cache, so once per file, not
+   per task), builds the file if that does not match, hashes it again, and uses
+   it only if the bytes agree. Otherwise it declines with `derived_mismatch`,
+   carrying both hashes, so a disagreement between builders shows up in the
+   admin view rather than being worked around silently.
+
+### Decisions worth knowing
+
+- **Every hash is tied to its builder.** MAGPIE's `src/def/builder_defs.h`
+  carries `WMP_BUILDER_VERSION`, `RIT_BUILDER_VERSION` and
+  `KLV_BUILDER_VERSION`, separate from `MAGPIE_VERSION` and bumped whenever a
+  change alters that builder's output, even with an unchanged file format.
+  `test/builder_hash_test.c` pins the output for `CSW21_ab` and fails until a
+  change that alters it bumps the version *and* the hash; CI runs it on every
+  birdtest pull request. A deploy with a newer builder records new hashes under
+  the new version, and old ones stay for workers still on the old builder until
+  the version floor passes them.
+- **The server asks the binary, not its configuration.** `magpie builders`
+  prints the three versions and the build target as JSON; the backend reads it
+  at startup and refuses to start if it cannot. A configured value would drift
+  the first time an image changed without the variable.
+- **A worker declines on a hash, not a builder version.** Declining as soon as
+  the versions differ would save one build, and would be wrong whenever the two
+  builders in fact agree. The wasted build happens once: the job is remembered
+  as unsupported.
+- **The build target is reported, not compared**, for the same reason: a
+  worker whose target differs builds and compares. Refusing on the field would
+  lock out every contributor who builds from source for nothing measured; if
+  targets ever do differ, the answer is a `derived_mismatch` in the admin view.
+- **A table is named for its pair**, `CSW24.CSW_quackle_leaves`, not `CSW24`,
+  and the claim names it (`rit_name`): two jobs on one lexicon with different
+  leaves need different tables, and a table found by lexicon name would rank
+  moves on leaves the job never pinned. That needed `klvwmp2rit` to take the
+  KLV's and the wordmap's names separately — `convert klvwmp2rit <output> <ld>
+  <klv_name> <wmp_name>`, both optional, so the CLI's `convert klvwmp2rit
+  CSW24` is unchanged. Wordmaps depend only on the `.kwg` and keep its name.
+- **The server runs a binary, not a library.** `libmagpie.so` exists, but its
+  API is the CLI's command strings, and in-process MAGPIE would put a 2.4 GB
+  build and any crash inside the web server.
+- **Builds are scheduled, not triggered.** The web task could call
+  `ecs:RunTask` the moment a job is created; that would start a minutes-long
+  build seconds sooner, at the price of an AWS control-plane call on the
+  job-creation path, permission to run tasks and pass roles, and a retry story
+  of its own. The builder task runs every five minutes.
+- **The server keeps no derived file.** A copy would cost 1.9 GB per table for
+  inspections nobody has needed, and the bytes are reproducible from inputs
+  the object store holds.
+- **No input digests in file headers.** They would still help CLI users, who
+  have no server, but it is a format change to both `.wmp` and `.rit` —
+  invalidating every one in existence — for a check weaker than the one the
+  fleet now has. The `.wmp.src` sidecar stays, for the CLI and for a server
+  that pins nothing.
+- **Leave generation keeps tables off**: its KLV changes every generation, and
+  a 1.9 GB table per generation on every worker would cost far more than it
+  saves.
+
+### Where builds run
+
+| Build | Where | Why |
+|---|---|---|
+| Wordmap (about 2 s, 710 MB peak) and rack info table (1 to 3 min, 2.4 GB peak, 1.9 GB file) | the `birdtest-derived-builder` scheduled task ([infra/derived.tf](infra/derived.tf)): 4 vCPU, 8 GB, 30 GB of ephemeral storage, every five minutes, up to eight files a run under a lease | neither fits the web task's 1 vCPU and 2 GB |
+| A generation's KLV (`convert rackequity2klv`) | the web task, off the claim path | the same derivation the Rust port did in about 13 s for English; the transition already runs on its own task |
+| The generation-0 KLV (`createdata klv`) | the web task, at job creation | built from the letter distribution alone |
+
+Locally, `docker compose run --rm derived-builder` is the scheduled task, and
+`scripts/dev.py` runs it for you (see [Running locally](#running-locally)).
+
+### Leave-generation KLVs
+
+`leave_rack_progress` holds, per full rack, an occurrence count and an equity
+sum. `convert rackequity2klv <name> <ld>` reads them from
+`lexica/<name>.csv` (one `rack,count,equity_sum` row per full rack) and writes
+the KLV through MAGPIE's own `rack_list_write_to_klv`, through a `RackList`
+setter that takes a rack's count and mean directly. Every rack is marked unset
+first, and a file that leaves any unset is refused: a rack observed zero times
+and a rack the file forgot are different things, and valuing the second at
+zero would be a real-looking leave value nobody measured. The server streams a
+generation's rows (about 3.2 million for English) to that CSV and reads the KLV
+back, holding neither in memory. The zeroed generation-0 KLV is `magpie
+createdata klv <name> <ld>`, which already built exactly that; the `convert
+zero2klv` once proposed for it was not added.
+
+The server writes the job's pinned letter distribution into each scratch
+directory, so nothing server-side reads a data file off its own disk.
+`rebuild-artifacts` compares a rebuilt KLV's hash with the stored one, and
+`leave_generation_artifacts.builder` records which builder wrote each: a
+rebuild by a different builder reports that rather than "differs", or the
+first upgrade after a restore drill would read as data loss.
+
+Before `klv.rs` was deleted the two were run against each other over the
+whole 149-rack test distribution: `rackequity2klv` and the Rust port agreed on
+every one of the 431 leave values.
+
+### The pinned binary
+
+- `docker/Dockerfile` has a stage that checks out MAGPIE's
+  `birdtest-contribute` at a pinned commit (`MAGPIE_COMMIT`, recorded as the
+  image label `org.birdtest.magpie-commit`) and builds it; the backend and `derived-builder` targets both carry
+  it. Push MAGPIE first — the image fetches the commit.
+- It is built `BUILD=portable_release`, which targets `-march=nehalem` rather
+  than the `-march=native` every other optimised MAGPIE build uses: a binary
+  built on a CI runner could otherwise use instructions a Fargate CPU lacks.
+  `nehalem` names the same instruction set as `x86-64-v2`, which only GCC 11
+  and Clang 12 know. `PORTABLE_MARCH` overrides it on a non-x86 host, and the
+  object directory is keyed by it, so changing it recompiles. Released
+  contributor binaries use the same target.
+- The binary is about 1 MB, and the builder task needs no MAGPIE-DATA install:
+  it fetches only the files a build uses.
+- birdtest is AGPL-3.0 and MAGPIE GPL-3.0; shipping the GPL binary in an AGPL
+  service image is compatible.
+- `MAGPIE_VERSION` (0.1.1 at the time of writing) moves with every change that
+  can alter what a task computes or submits, and birdtest's version floor moves
+  with it.
+
+### What it costs a contributor
+
+- **Time, once per file and builder version:** about 2 s to build a wordmap and
+  0.8 s to hash it; one to three minutes and about 2.4 GB of memory to build a
+  rack info table, and about 9 s to hash it. The heartbeat is already running,
+  so a long build does not lose the claim.
+- **Memory:** a process that plays with a rack info table holds it — about
+  1.9 GB for CSW24 — so several `magpie contribute` processes on one machine
+  hold one copy each.
+- **Disk, still unbounded:** 179 MB per wordmap and 1.9 GB per `(.kwg, .klv2)`
+  pair with a table, and nothing evicts them. Player configs use both by
+  default, so a contributor on many lexicons accumulates tables; one who runs
+  out of disk gets a failed build and a declined task, not a wrong result. The
+  fix is a size cap with least-recently-used eviction in `contribute.txt`,
+  which is a change to MAGPIE's `contribute.c` and to no protocol.
+
+### What is not covered
+
+- **The CLI.** `magpie` outside `contribute` still finds a table by lexicon
+  name and checks nothing about it, and reads the `.wmp.src` sidecar only on
+  the contribute path. A CLI user is analysing their own positions on their
+  own data.
+- **Data updates.** A tarball that changes a `.kwg` makes a new `input_data`
+  row, so a job pinning the old one keeps its old derived files, correctly.
+  Nothing prompts a rebuild — an admin creates a new job against the new row —
+  and old `derived_data` rows (a row and a hash each) are never collected.
+- **A full-size table end to end.** Tier 6's `M-10` runs a `use_rit` job
+  through a real server and a real `magpie contribute` on MAGPIE's two-letter
+  test data (`CSW21_ab`, `english_ab`), so its table is tiny; nothing tests a
+  real 1.9 GB one. `M-11` forces a `derived_mismatch` by altering the recorded
+  hash, standing in for a server whose builder differs.
+
+### Alternatives considered
+
+| Alternative | Why not |
+|---|---|
+| Input digests in file headers only | Trusts the builder, which is the failure measured above |
+| The server distributes the files | Removes the determinism question, at 1.9 GB per table and 179 MB per wordmap to every worker |
+| Link `libmagpie` | The same command-string API as the CLI, with MAGPIE's memory and crashes inside the web server |
+| Keep `klv.rs` and add MAGPIE only for derived files | Two implementations of leave derivation that must agree by hand, beside a MAGPIE that can do it |
+
+### Where it lives
+
+- **birdtest:** `backend/src/magpie.rs` (the binary and its scratch
+  directories), `backend/src/derived.rs` (what a job needs, the queue, the
+  build), `backend/src/bin/build-derived.rs` (the builder task),
+  `backend/src/jobs/leave_gen.rs` (KLVs), the `derived_data` table,
+  `input_data.object_key`, `leave_generation_artifacts.builder`,
+  `/admin/derived-data`, `docker/Dockerfile`, `infra/derived.tf`, and the
+  contract fixtures for `expected_data.derived`, `rit_name` and
+  `derived_mismatch`.
+- **MAGPIE (`birdtest-contribute`):** `src/def/builder_defs.h` and `magpie
+  builders`, `test/builder_hash_test.c`, contribute's derived-file check and
+  build (`config_contribute_ensure_wordmap`,
+  `config_contribute_ensure_rack_info_table`), `convert rackequity2klv`,
+  `klvwmp2rit`'s separate input names, and `BUILD=portable_release`.
 
 ## Deploying
 
@@ -621,7 +881,7 @@ The backend image carries a pinned MAGPIE, built from a commit the image
 records. The server runs it to build the reference copy of every wordmap, rack
 info table and leave-generation KLV, publishes the SHA-256 for workers to
 reproduce, and throws the file away — see
-[MAGPIE_DEPENDENCY.md](MAGPIE_DEPENDENCY.md). It still carries no data
+[MAGPIE on the server](#magpie-on-the-server). It still carries no data
 directory: every conversion runs against a throwaway directory written from the
 bytes a job pins, so nothing server-side reads a data file off its own disk.
 

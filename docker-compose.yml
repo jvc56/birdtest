@@ -2,8 +2,8 @@
 #
 # The backend needs a MAGPIE build. It runs one for every wordmap, rack info
 # table and leave-generation KLV, reads the builder versions out of the binary
-# at startup, and refuses to bind without it — see MAGPIE_DEPENDENCY.md. Set
-# MAGPIE_BIN to a local checkout's bin/magpie (`make magpie
+# at startup, and refuses to bind without it — see README.md's "MAGPIE on the
+# server". Set MAGPIE_BIN to a local checkout's bin/magpie (`make magpie
 # BUILD=portable_release`) and MAGPIE_ROOT to the checkout, which is mounted so
 # the container can run it.
 #

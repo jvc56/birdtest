@@ -2796,7 +2796,7 @@ So the transfer is a CSV instead: `generation_klv` streams the generation's roug
 
 `rackequity2klv` is new on the MAGPIE side, along with a `RackList` setter that takes a rack's count and mean outright: `rack_list_add_rack` folds one game's equity at a time, which is what a `leavegen` run has and not what a whole generation's aggregate is. Every full rack must appear exactly once in the CSV — a rack the file omits would contribute a mean of zero at full weight to every leave it contains, which is a real leave value and indistinguishable from a measured one — so MAGPIE marks every rack unset before reading and refuses a file that leaves any of them that way.
 
-The generation-0 zeroed KLV is `magpie createdata klv`, which builds exactly that from the letter distribution alone. MAGPIE_DEPENDENCY.md proposed a `convert zero2klv` for it; `createdata klv` already is it, through the same `klv_create_empty`, and one spelling is better than two.
+The generation-0 zeroed KLV is `magpie createdata klv`, which builds exactly that from the letter distribution alone. The original design proposed a `convert zero2klv` for it; `createdata klv` already is it, through the same `klv_create_empty`, and one spelling is better than two.
 
 
 **Dashboard progress**: two kinds of figure, and the page says which is which. *Live*, pushed as results land through the per-job SSE stream: tasks completed and games played in the in-progress generation, from the counters the submit transaction bumps. *As of the last merge*, shown with its time: racks at target and the rack with the fewest occurrences, from the summary each merge writes. Both are one row read (`leave_generation_progress`); counted from `leave_rack_progress` on read, as they were, the rack figures were a pass over 3.2 million rows on every detail view and every live push (210 ms measured). No heartbeat payload is needed for either. An admin who wants the rack figures current can merge on demand (`POST /api/admin/jobs/:id/merge-progress`, "Merge progress now" on the admin job page).
@@ -3215,7 +3215,7 @@ never run against anything but a disposable test stack.
 
 birdtest's backend runs a pinned MAGPIE, built into its image from a recorded
 commit. It has two jobs, and the second is the reason the first became worth
-doing (see [MAGPIE_DEPENDENCY.md](MAGPIE_DEPENDENCY.md)):
+doing (see [MAGPIE on the server](README.md#magpie-on-the-server) in the README):
 
 - **Reference copies of derived files.** A wordmap and a rack info table are
   built on each contributor's own machine and are far too large to ship. The
@@ -5283,7 +5283,7 @@ birdtest/
 │       │                           # rules, ported to Rust — see Input Data
 │       ├── inputdata.rs            # tarball fetch, untar, per-file digest, diff against input_data
 │       ├── magpie.rs               # the pinned MAGPIE binary as a subprocess, and its scratch
-│       │                           # data directories — see MAGPIE_DEPENDENCY.md
+│       │                           # data directories — see README.md, "MAGPIE on the server"
 │       ├── magpie_standard15.txt   # the board layout every scratch directory carries so MAGPIE starts
 │       ├── magpie_defaults.rs      # MAGPIE's defaults, written into player configs and jobs at creation
 │       ├── derived.rs              # wordmaps and rack info tables: what a job needs, the build
@@ -5702,7 +5702,7 @@ CREATE TABLE input_data_import_rows (
 -- machine that needs one builds it from files it already has. What travels
 -- instead is the SHA-256 the server's own pinned MAGPIE got from the same
 -- inputs: a worker builds its own copy and uses it only if the bytes agree,
--- and declines the task otherwise. See MAGPIE_DEPENDENCY.md.
+-- and declines the task otherwise. See README.md, "MAGPIE on the server".
 --
 -- The key is the whole identity of the file rather than a surrogate, because
 -- what makes two derived files the same file is that they were built from the

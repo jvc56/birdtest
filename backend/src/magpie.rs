@@ -184,7 +184,7 @@ impl Magpie {
     /// leave is worth zero, which is the generation-0 artifact a
     /// leave-generation job starts from.
     ///
-    /// MAGPIE_DEPENDENCY.md proposed a `convert zero2klv` for this. It is not
+    /// The original design proposed a `convert zero2klv` for this. It is not
     /// needed: `createdata klv` already builds exactly that file from the
     /// distribution alone, through the same `klv_create_empty` the proposal
     /// named, and adding a second spelling of it would be one more thing to
@@ -279,8 +279,8 @@ fn first_lines(text: &str) -> String {
 ///
 /// Removed when dropped, including whatever MAGPIE wrote into it -- which for
 /// a rack info table is 1.9 GB, so leaking one of these fills a disk in a
-/// handful of builds. The hash is taken before the drop; MAGPIE_DEPENDENCY.md
-/// asked whether the server should keep its copies, and this is the answer:
+/// handful of builds. The hash is taken before the drop; whether the server
+/// should keep its copies was an open design question, and this is the answer:
 /// hash and discard. Keeping them would cost 1.9 GB per table for the sake of
 /// an inspection nobody has needed yet, and the bytes are reproducible from
 /// the inputs, which are what the object store holds.
