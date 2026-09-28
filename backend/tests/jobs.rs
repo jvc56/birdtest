@@ -61,8 +61,8 @@ impl Admin {
             "name": name, "recorder_type": "all", "kwg_id": kwg, "klv_id": klv,
             "num_plays_recorded": 3,
             // The test lexicons are not real KWGs, so no reference wordmap
-            // exists for a worker to be asked to reproduce.
-            "use_wordmap": false,
+            // or rack info table exists for a worker to be asked to reproduce.
+            "use_wordmap": false, "use_rit": false,
         });
         for (key, value) in extra.as_object().unwrap() {
             body[key] = value.clone();

@@ -117,9 +117,12 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
   generation, and three game-pairs jobs among three players — `static-equity`,
   `static-score` and `sim-1ply` (a 1-ply sim, 100 iterations) — one for each
   pair of them. The static-equity vs sim-1ply job saves the positions its
-  games analyse (`capture_positions`). Games jobs stop at 100,000 games and pairs jobs at 100,000
-  pairs, if their test has not decided first; a pairs job's test is not acted
-  on before 50,000 pairs (a games job's before 100 games). A rating pool of the
+  games analyse (`capture_positions`). Every player uses a wordmap and a rack
+  info table; each worker holds its own ~1.9 GB copy of the table in memory,
+  so `--no-rit` seeds players without one. Games jobs stop at 100,000 games
+  and pairs jobs at 100,000 pairs, if their test has not decided first; a
+  pairs job's test is not acted on before 50,000 pairs (a games job's before
+  100 games). A rating pool of the
   three players rates them from whatever pairs have been played so far;
 - two contributor accounts, `dev-contributor-1` and `-2`, each with a new API
   key that workers 3 and 4 run under and keep in their `contribute.txt` for

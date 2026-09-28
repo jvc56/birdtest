@@ -701,10 +701,12 @@ async fn create_player_config(
     // On unless the config says otherwise, as the form has it: a wordmap is a
     // large speedup in move generation, and workers build one on demand.
     .bind(body.use_wordmap.unwrap_or(true))
-    // Absent means no: a rack info table is a large, slow thing to provision,
-    // and a config that did not ask for one must not get one because a
-    // default said so.
-    .bind(body.use_rit.unwrap_or(false))
+    // On unless the config says otherwise, as the form has it: a rack info
+    // table speeds up move generation further still. It is large -- about
+    // 1.9 GB on a contributor's disk and in its memory -- and the server
+    // builds it before any job using it dispatches, once per (lexicon,
+    // leaves) pair.
+    .bind(body.use_rit.unwrap_or(true))
     .bind(min_play_iterations)
     .bind(&threshold)
     .bind(&sampling_rule)

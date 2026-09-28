@@ -475,19 +475,22 @@ def static_players(ctx: Context) -> dict:
     return {
         # No wordmap: these jobs are dispatched at once, without the builder.
         "player1_config_id": create_player(ctx, data, "e2e-static-equity",
-                                           {"use_wordmap": False}),
+                                           {"use_wordmap": False, "use_rit": False}),
         "player2_config_id": create_player(ctx, data, "e2e-static-score",
-                                           {"sort_strategy": "score", "use_wordmap": False}),
+                                           {"sort_strategy": "score", "use_wordmap": False,
+                                            "use_rit": False}),
     }
 
 
 def wordmap_players(ctx: Context) -> dict:
     data = ctx.data
     return {
+        # A wordmap and no table: M-10 is the rack info table's case.
         "player1_config_id": create_player(ctx, data, "e2e-wordmap-equity",
-                                           {"use_wordmap": True}),
+                                           {"use_wordmap": True, "use_rit": False}),
         "player2_config_id": create_player(ctx, data, "e2e-wordmap-score",
-                                           {"sort_strategy": "score", "use_wordmap": True}),
+                                           {"sort_strategy": "score", "use_wordmap": True,
+                                            "use_rit": False}),
     }
 
 
@@ -500,6 +503,7 @@ def simming_player(ctx: Context) -> str:
         "recorder_type": "all",
         "winpct_id": ctx.winpct, "num_plies": 2, "num_plays": 5, "num_plies_recorded": 2,
         "max_iterations": 60, "stopping_pct": 99, "time_limit_secs": 0, "use_wordmap": False,
+        "use_rit": False,
     })
 
 
@@ -509,7 +513,7 @@ def static_best_player(ctx: Context) -> str:
     # through the derived-file path: the server builds and hashes one, and
     # MAGPIE builds its own and compares.
     return create_player(ctx, ctx.data, "e2e-static-best",
-                         {"num_plays_recorded": 1, "use_wordmap": True})
+                         {"num_plays_recorded": 1, "use_wordmap": True, "use_rit": False})
 
 
 def games_body(players: dict, batch: int, **extra) -> dict:

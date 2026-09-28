@@ -1090,7 +1090,7 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
         ("num_plies_recorded", json!(2)),
         ("movegen_margin", json!(5.0)),
         ("use_wordmap", json!(true)),
-        ("use_rit", json!(false)),
+        ("use_rit", json!(true)),
         ("max_iterations", json!(null)),
         ("threshold", json!(null)),
         ("utility_w_spread", json!(null)),
@@ -1386,15 +1386,15 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
         assert_eq!(response["use_rit"], use_rit, "{response}");
     }
 
-    // Absent still means no. A table is 1.9 GB on every contributor's disk and
-    // minutes of server time; nothing should get one by default.
+    // Absent means yes, as the form has it: a config that does not say gets a
+    // table, and says so in what is stored.
     let (status, response) = player_config(&app, &headers, json!({
         "name": "static-rit-absent", "recorder_type": "best",
         "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1,
     }))
     .await;
     assert_eq!(status, StatusCode::CREATED, "{response}");
-    assert_eq!(response["use_rit"], json!(false), "{response}");
+    assert_eq!(response["use_rit"], json!(true), "{response}");
 
     // The table travels under the pair's name, not the lexicon's. That is what
     // keeps NWL23-with-CSW21-leaves -- a configuration birdtest accepts on
@@ -2104,7 +2104,8 @@ async fn a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused() {
     for (name, use_wordmap) in [("with-wordmap", true), ("without", false)] {
         let (status, player) = player_config(&app, &headers, json!({
             "name": name, "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
-            "use_wordmap": use_wordmap, "num_plays_recorded": 1,
+            // A table is built from a wordmap, so "without" goes without both.
+            "use_wordmap": use_wordmap, "use_rit": use_wordmap, "num_plays_recorded": 1,
         })).await;
         assert_eq!(status, StatusCode::CREATED, "{player}");
         players.push(player["id"].clone());

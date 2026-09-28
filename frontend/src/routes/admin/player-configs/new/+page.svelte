@@ -29,7 +29,7 @@
   // whatever a worker's own process happens to have, which can differ across
   // workers.
   let useWordmap = true;
-  let useRit = false;
+  let useRit = true;
   // Blank means "MAGPIE's default" (see optionalNumber).
   const optional = optionalNumber;
   let minPlayIterations: number | '' = '';
@@ -245,7 +245,7 @@
           The server builds this player's table from its lexicon and leaves before any
           job using it can dispatch — a few minutes, once per pair. Watch it at
           <a class="underline" href="/admin/derived-data">derived data</a>. Contributors
-          build their own copy and it costs about 1.9&nbsp;GB on their disk.
+          build their own copy, which costs about 1.9&nbsp;GB of disk and of memory.
         </p>
       {/if}
       <div>

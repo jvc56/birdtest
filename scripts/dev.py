@@ -560,6 +560,8 @@ def run_seed(args, api_url: str, magpie_root: Path, floor: str) -> None:
         # Six jobs at equal shares, on seed.py's caps and SPRT minimums.
         command += ["--all-job-types", "--allocation", str(100 // 6),
                     "--contributors", str(len(KEYED_WORKERS)), "--keys-out", str(keys_file)]
+    if args.no_rit:
+        command.append("--no-rit")
     if subprocess.run(command, cwd=REPO_ROOT).returncode != 0:
         fail("seeding failed; the stack is still up, so fix and re-run with --no-up")
     if args.reset_db:
@@ -663,6 +665,9 @@ def build_parser() -> argparse.ArgumentParser:
     seeding.add_argument("--lexicon", default="CSW24",
                          help="lexicon for the seeded jobs and their players (default: %(default)s)")
     seeding.add_argument("--variant", default=None, choices=["classic", "wordsmog"])
+    seeding.add_argument("--no-rit", action="store_true",
+                         help="seed players without a rack info table: each worker otherwise "
+                              "holds its own ~1.9 GB copy in memory")
     seeding.add_argument("--tarball-date", default=None,
                          help="MAGPIE-DATA tarball YYYYMMDD (default: the DATA_VERSION your "
                               "MAGPIE checkout installed, so the server's digests match "

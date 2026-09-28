@@ -343,7 +343,7 @@ def input_data_ids(client: Client, args) -> dict:
 
 def player_config(
     client: Client, name: str, sort_strategy: str, data: dict, recorder: str = "best",
-    sim: Optional[dict] = None, wordmap: bool = True,
+    sim: Optional[dict] = None, wordmap: bool = True, rit: bool = True,
 ) -> str:
     """A static player: no simulation parameters, and so no win% model either.
 
@@ -370,6 +370,8 @@ def player_config(
                 "klv_id": data["klv"],
                 "num_plays_recorded": 10,
                 "use_wordmap": wordmap,
+                # A table is built from the wordmap, so no wordmap is no table.
+                "use_rit": rit and wordmap,
                 **(sim or {}),
             },
         ),
@@ -537,8 +539,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allocation", type=int, default=100)
     parser.add_argument("--no-wordmap", dest="wordmap", action="store_false",
                         help="players (and the leave-generation bot) play without a wordmap, "
-                             "so no job waits on the derived-file builder; a player config "
-                             "that already exists by name is reused as it is")
+                             "or the rack info table built from one, so no job waits on the "
+                             "derived-file builder; a player config that already exists by "
+                             "name is reused as it is")
+    parser.add_argument("--no-rit", dest="rit", action="store_false",
+                        help="players play without a rack info table (about 1.9 GB of disk "
+                             "and of memory per worker process)")
     parser.add_argument("--all-job-types", action="store_true",
                         help="create a job of every type -- games, opening racks, leave "
                              "generation, and three game-pairs jobs among two static players "
@@ -571,12 +577,12 @@ def seed(args) -> None:
     def players_for(job_type: str) -> list:
         if job_type == "opening_rack":
             return [player_config(client, "static-equity-all", "equity", data, recorder="all",
-                                  wordmap=args.wordmap)]
+                                  wordmap=args.wordmap, rit=args.rit)]
         if job_type == "leave_generation":
             return []
         return [
-            player_config(client, "static-equity", "equity", data, wordmap=args.wordmap),
-            player_config(client, "static-score", "score", data, wordmap=args.wordmap),
+            player_config(client, "static-equity", "equity", data, wordmap=args.wordmap, rit=args.rit),
+            player_config(client, "static-score", "score", data, wordmap=args.wordmap, rit=args.rit),
         ]
 
     if args.all_job_types:
@@ -591,7 +597,7 @@ def seed(args) -> None:
         sim = player_config(client, "sim-1ply", "equity", data, sim={
             "winpct_id": data["winpct"], "num_plies": 1, "max_iterations": 100,
             "time_limit_secs": 0, "num_plays": 10, "use_inference": False,
-        }, wordmap=args.wordmap)
+        }, wordmap=args.wordmap, rit=args.rit)
         create_job(client, args, data, [equity, score], "games", "dev games")
         for (p1, n1), (p2, n2), capture in (
                 ((equity, "static equity"), (score, "static score"), False),
