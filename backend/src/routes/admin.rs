@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/input-data/imports/:id", get(get_import))
         .route("/input-data/imports/:id/confirm", post(confirm_import))
         .route("/jobs/:id/data-gaps", get(job_data_gaps))
+        .route("/jobs/:id/derived-data", get(job_derived_data))
         // Bulk reads of a job's results are admin operations: the public gets
         // the paginated `/api/jobs/:id/results`. The stream scans from a cursor
         // and holds a pool connection while it does; the export is that scan
@@ -416,6 +417,25 @@ async fn job_data_gaps(
         .fetch_all(&state.pool)
         .await?,
     ))
+}
+
+/// The wordmaps and rack info tables a job needs and how their builds stand.
+/// A job is not dispatched until every one is built, so this is what an
+/// active job that nothing claims from is waiting for.
+async fn job_derived_data(
+    State(state): State<AppState>,
+    _admin: AdminUser,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<Vec<crate::derived::JobDerivedFile>>> {
+    let mut conn = state.pool.acquire().await?;
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM jobs WHERE id = $1)")
+        .bind(id)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !exists {
+        return Err(AppError::not_found("no such job"));
+    }
+    Ok(Json(crate::derived::files_for_job(&mut conn, id, &state.builders).await?))
 }
 
 #[derive(Serialize, sqlx::FromRow)]

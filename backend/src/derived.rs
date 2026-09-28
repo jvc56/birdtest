@@ -316,6 +316,48 @@ pub async fn status_for_job(
     Ok(status)
 }
 
+/// One derived file a job needs, as an admin's job page shows it.
+#[derive(Debug, serde::Serialize, sqlx::FromRow)]
+pub struct JobDerivedFile {
+    pub role: String,
+    pub name: String,
+    /// `pending`, `building`, `built` or `failed`. A file nothing has
+    /// requested under this binary's builder yet is `pending`: a claim
+    /// requests it, and to the job it is the same wait.
+    pub state: String,
+    pub error: Option<String>,
+    pub attempts: i32,
+}
+
+/// Each derived file the job needs and where its build stands: what
+/// `status_for_job` decides dispatch from, file by file, with `pending` and
+/// `building` told apart, so a job page can say what it is waiting for.
+pub async fn files_for_job(
+    conn: &mut PgConnection,
+    job_id: Uuid,
+    builders: &Builders,
+) -> AppResult<Vec<JobDerivedFile>> {
+    Ok(sqlx::query_as::<_, JobDerivedFile>(&format!(
+        "{NEEDS_CTE}
+         SELECT n.role, n.name, COALESCE(d.state, 'pending') AS state, d.error,
+                COALESCE(d.attempts, 0) AS attempts
+         FROM needs n
+         JOIN jobs j ON j.id = $1
+         LEFT JOIN derived_data d
+           ON d.role = n.role AND d.name = n.name
+          AND d.builder = CASE n.role WHEN 'wmp' THEN $2 ELSE $3 END
+          AND d.kwg_id = n.kwg_id
+          AND d.klv_id IS NOT DISTINCT FROM n.klv_id
+          AND d.letterdist_id = j.letterdist_id
+         ORDER BY n.role DESC, n.name"
+    ))
+    .bind(job_id)
+    .bind(builders.wmp())
+    .bind(builders.rit())
+    .fetch_all(&mut *conn)
+    .await?)
+}
+
 /// The built hashes of every job this process has found dispatchable, by job.
 ///
 /// `status_for_job` used to run on every claim, for every candidate job,

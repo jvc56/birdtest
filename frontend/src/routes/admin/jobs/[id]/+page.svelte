@@ -14,6 +14,7 @@
   import { jobTitle, jobTypeLabel, sprtLabel, sprtState, duration } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import CompletionNote from '$lib/components/CompletionNote.svelte';
+  import DerivedDataStatus from '$lib/components/DerivedDataStatus.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
 
@@ -387,6 +388,7 @@
       <a href="/jobs/{jobId}" class="text-sm">public view</a>
     </header>
     <CompletionNote {stats} />
+    <DerivedDataStatus {jobId} />
 
     <div class="card space-y-4">
       <h2 class="text-lg font-medium">Controls</h2>

@@ -497,6 +497,48 @@ async fn data_gaps_report_what_workers_declined_for() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
+/// A job's derived-data view lists each wordmap and rack info table the job
+/// waits on and how its build stands, so the job page can say why an active
+/// job hands out nothing; once each is built it says so.
+#[tokio::test]
+async fn a_jobs_derived_data_says_what_it_waits_for() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db).await;
+    let job = db.games_job(1, 2).await;
+    sqlx::query(
+        "UPDATE player_configs SET use_rit = true
+         WHERE id IN (SELECT player1_config_id FROM job_game_config WHERE job_id = $1)",
+    )
+    .bind(job)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    let states = |files: &Value| -> Vec<(String, String)> {
+        files
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| (f["role"].as_str().unwrap().into(), f["state"].as_str().unwrap().into()))
+            .collect()
+    };
+    // Nothing requested yet reads as pending: the same wait.
+    let (status, files) = admin.get(&format!("/api/admin/jobs/{job}/derived-data")).await;
+    assert_eq!(status, StatusCode::OK, "{files}");
+    assert_eq!(states(&files), vec![("wmp".into(), "pending".into()), ("rit".into(), "pending".into())]);
+
+    assert_eq!(db.derived_ready(job).await, 2);
+    let (_, files) = admin.get(&format!("/api/admin/jobs/{job}/derived-data")).await;
+    assert_eq!(states(&files), vec![("wmp".into(), "built".into()), ("rit".into(), "built".into())]);
+
+    // A job that needs none lists none; a job that does not exist is a 404.
+    let plain = db.games_job(1, 2).await;
+    let (status, files) = admin.get(&format!("/api/admin/jobs/{plain}/derived-data")).await;
+    assert_eq!((status, files), (StatusCode::OK, json!([])));
+    let (status, _) = admin.get(&format!("/api/admin/jobs/{}/derived-data", Uuid::new_v4())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 /// A-ADMIN-9: the fleet view counts the workers -- and the claims -- behind
 /// each MAGPIE version the field has claimed with in the last week, most
 /// widely run first. A worker last seen longer ago than that is not part of
