@@ -638,6 +638,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "jobs among three players, which a rating pool can rate -- and two "
                             "contributor accounts whose keys workers 3 and 4 run "
                             "under")
+    stack.add_argument("--fresh", action="store_true",
+                       help="start birdtest as a new deployment does: --reset-db and "
+                            "--reset-workers, then no seeding -- no accounts, no data imports, "
+                            "no jobs -- and the site opened signed out. The workers run "
+                            "anonymously, waiting for a job; how to register and make yourself "
+                            "the first admin is printed")
     stack.add_argument("--keep-up", action="store_true",
                        help="leave the stack running on exit instead of stopping it (a stack "
                             "attached to with --no-up is always left running). The database "
@@ -679,7 +685,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     load_env_file()
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.fresh:
+        if args.login_as:
+            parser.error("--fresh makes no accounts, so there is nobody to --login-as")
+        # Everything a new deployment has not got: its database, the
+        # identities and keys workers kept from earlier runs, and the seed.
+        args.reset_db = args.reset_workers = args.no_seed = args.no_login = True
     binary, data = resolve_magpie(args)
     magpie_root = binary.parent.parent
 
@@ -737,7 +750,9 @@ def main() -> int:
     log(f"waiting for {api_url}/health")
     wait_for_health(f"{api_url}/health", args.health_timeout)
 
-    if args.no_seed:
+    if args.fresh:
+        log("fresh start: no accounts, data imports or jobs")
+    elif args.no_seed:
         log("skipping seeding")
     else:
         run_seed(args, api_url, magpie_root, floor)
@@ -764,6 +779,12 @@ def main() -> int:
         user = args.login_as or args.username
         open_url = f"{site_url}/api/dev/login?username={quote(user)}&next=/"
         log(f"signed in as {user}: {open_url}")
+    if args.fresh:
+        log(f"to become the first admin: register at {site_url}/register, open the confirmation "
+            "link from `docker compose logs backend`, then run\n"
+            "      docker compose exec postgres psql -U birdtest -d birdtest -c "
+            "\"UPDATE users SET is_admin = true WHERE username = 'YOU'\"\n"
+            "    and reload the page")
     if not args.no_browser:
         webbrowser.open(open_url)
     log(f"birdtest is at {site_url} — Ctrl-C to stop the contributors"

@@ -100,6 +100,7 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 ./scripts/dev.py --hot-reload                 # add the Vite dev server on :5174
 ./scripts/dev.py --no-up --no-seed            # attach contributors to a stack already running
 ./scripts/dev.py --rebuild --reset-db         # after a schema change: new images, fresh database
+./scripts/dev.py --fresh                      # as a new deployment: no accounts, data or jobs
 ```
 
 After a schema change the backend refuses a database made by the migration's
@@ -141,6 +142,7 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker (the keyed workers lose their keys until the next `--reset-db`) |
 | `--rebuild` | off | Rebuild images before starting |
 | `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with six jobs (three of them game pairs among three players) and the two contributor accounts: see below |
+| `--fresh` | off | Start as a new deployment does: `--reset-db` and `--reset-workers` without the seed, so no accounts, data imports or jobs; opens signed out and prints how to become the first admin |
 | `--keep-up` | off | Leave the stack running on exit instead of stopping it |
 | `--no-seed` | off | Skip seeding (the stack already has an active job) |
 | `--no-up` | off | Assume the stack is already running |
