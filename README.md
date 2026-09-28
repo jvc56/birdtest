@@ -440,7 +440,7 @@ compared" below.
 5. **The claim carries the hashes** in `expected_data.derived`, beside the
    input digests in `expected_data.files`:
 
-   ```json
+   ```text
    "derived": [
      { "role": "wmp", "name": "CSW24", "sha256": "1830…", "bytes": 178929167,
        "builder": "wmp-1", "build_target": "nehalem" },
