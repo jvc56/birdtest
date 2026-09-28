@@ -115,7 +115,8 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 - six jobs at equal allocation: games, opening racks, a small leave
   generation, and three game-pairs jobs among three players — `static-equity`,
   `static-score` and `sim-1ply` (a 1-ply sim, 100 iterations) — one for each
-  pair of them. Games jobs stop at 100,000 games and pairs jobs at 100,000
+  pair of them. The static-equity vs sim-1ply job saves the positions its
+  games analyse (`capture_positions`). Games jobs stop at 100,000 games and pairs jobs at 100,000
   pairs, if their test has not decided first; a pairs job's test is not acted
   on before 50,000 pairs (a games job's before 100 games). A rating pool of the
   three players rates them from whatever pairs have been played so far;

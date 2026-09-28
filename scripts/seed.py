@@ -417,7 +417,8 @@ def existing_active_job(client: Client, job_type: str) -> Optional[str]:
 
 
 def create_job(client: Client, args, data: dict, players: list,
-               job_type: Optional[str] = None, name: Optional[str] = None) -> str:
+               job_type: Optional[str] = None, name: Optional[str] = None,
+               extra: Optional[dict] = None) -> str:
     job_type = job_type or args.job_type
     name = args.job_name if name is None else name
     if not args.new_job:
@@ -434,6 +435,7 @@ def create_job(client: Client, args, data: dict, players: list,
         "layout_id": data["layout"],
         "redundancy": args.redundancy,
         **job_config(job_type, players, args),
+        **(extra or {}),
     }
     # A job records its own floor at creation, defaulting to the server-wide
     # one. Left implicit, a job created while the server had a higher floor
@@ -591,10 +593,17 @@ def seed(args) -> None:
             "time_limit_secs": 0, "num_plays": 10, "use_inference": False,
         }, wordmap=args.wordmap)
         create_job(client, args, data, [equity, score], "games", "dev games")
-        for (p1, n1), (p2, n2) in (((equity, "static equity"), (score, "static score")),
-                                   ((equity, "static equity"), (sim, "1-ply sim")),
-                                   ((score, "static score"), (sim, "1-ply sim"))):
-            create_job(client, args, data, [p1, p2], "game_pairs", f"dev game pairs: {n1} vs {n2}")
+        for (p1, n1), (p2, n2), capture in (
+                ((equity, "static equity"), (score, "static score"), False),
+                # One job keeps the positions its games analyse, so the job
+                # page's position search has something to find. The one with
+                # the simmer: its ranked list costs nothing extra to keep,
+                # where a static player records only its best move.
+                ((equity, "static equity"), (sim, "1-ply sim"), True),
+                ((score, "static score"), (sim, "1-ply sim"), False)):
+            create_job(client, args, data, [p1, p2], "game_pairs",
+                       f"dev game pairs: {n1} vs {n2}" + (" (positions saved)" if capture else ""),
+                       extra={"capture_positions": True} if capture else None)
         create_job(client, args, data, players_for("opening_rack"), "opening_rack", "dev opening racks")
         create_job(client, args, data, [], "leave_generation", "dev leave generation")
         log(f"seeded — six jobs, each at {args.allocation}%")
