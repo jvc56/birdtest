@@ -73,7 +73,7 @@ at tier 5 names a symptom.
 | 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 228 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (16), `admin_routes.rs` (11), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (6), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 14 | Playwright journeys `E-1`..`E-12` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 5 End-to-end | 15 | Playwright journeys `E-1`..`E-13` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
@@ -2809,6 +2809,9 @@ admin in once and the admin journeys reuse its storage state.
   prompt to sign in, and a signed-in user its positions ten at a time with
   "Load more", and a rack search whose every result holds that rack.
   *(Covered: `e12-saved-positions.spec.ts`.)*
+- `E-13` An opening-rack job's page offers ten racks it has analysed under the
+  search, and clicking one looks it up. *(Covered:
+  `e13-opening-rack-samples.spec.ts`.)*
 
 ### Reading confirmation codes
 

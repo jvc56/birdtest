@@ -27,6 +27,18 @@
   let rackQuery = '';
   let rackMoves: Record<string, unknown>[] | null = null;
   let rackError = '';
+  // A few racks the job has analysed, to try the search on: the newest, from
+  // the results feed. Read once, when the page knows it is an opening-rack job.
+  let sampleRacks: string[] = [];
+  let samplesRequested = false;
+  $: if (stats?.opening_racks && !samplesRequested) {
+    samplesRequested = true;
+    api
+      .jobResults(jobId, { per_page: 50 })
+      // One record per rack per accepted claim, so a rack can repeat.
+      .then((page) => (sampleRacks = [...new Set(page.items.map((r) => String(r.rack)))].slice(0, 10)))
+      .catch(() => (sampleRacks = []));
+  }
 
   onMount(() => {
     api
@@ -290,6 +302,20 @@
             />
             <button class="btn-primary" on:click={lookupRack}>Search</button>
           </div>
+          {#if sampleRacks.length}
+            <div class="flex flex-wrap items-center gap-2 text-sm">
+              <span class="text-muted-foreground">Analysed racks to try:</span>
+              {#each sampleRacks as rack}
+                <button
+                  class="rounded border border-border px-2 py-0.5 font-mono text-xs hover:bg-muted"
+                  on:click={() => {
+                    rackQuery = rack;
+                    lookupRack();
+                  }}>{rack}</button
+                >
+              {/each}
+            </div>
+          {/if}
           {#if rackError}<p class="field-error">{rackError}</p>{/if}
           {#if rackMoves?.length}
             <div class="overflow-x-auto">

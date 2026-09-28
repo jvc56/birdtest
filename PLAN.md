@@ -856,6 +856,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 - Progress: racks analyzed against the size of the rack space, and nothing else.
 - Search input: enter a rack string to look up its analysis. Returns the full ranked move list (all N plays that were evaluated) for that rack, sourced from `position_analysis_moves`.
+- Below it, up to ten racks the job has analysed -- the newest, from the first page of the results feed -- each a button that looks it up, so a visitor has something to try.
 
   The panel used to carry the average best equity and a breakdown of what the
   best opening play was — placement, exchange or pass — and both are gone.
