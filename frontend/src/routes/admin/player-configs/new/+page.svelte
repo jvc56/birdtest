@@ -23,6 +23,13 @@
   let numPlaysRecorded = 10;
   let numPliesRecorded = 2;
   let stoppingPct = 99;
+  // The server takes a stopping percentage strictly between 0 and 100, which
+  // `min` and `max` cannot say: they let both ends through. The browser
+  // holds the form back with this instead.
+  let stoppingInput: HTMLInputElement | undefined;
+  $: stoppingInput?.setCustomValidity(
+    stoppingPct > 0 && stoppingPct < 100 ? '' : 'Stopping % must be above 0 and below 100.'
+  );
   let useInference = false;
   let showAdvanced = false;
   // Exhaustive on purpose: any MAGPIE option not stated here falls back to
@@ -209,7 +216,7 @@
       <div><label class="label" for="num_plies">Plies (-pl)</label><input id="num_plies" type="number" class="input" bind:value={numPlies} /></div>
       <div><label class="label" for="np">Plays to simulate (-np)</label><input id="np" type="number" class="input" bind:value={numPlays} /></div>
       <div><label class="label" for="npr">Plies to report (shplies)</label><input id="npr" type="number" class="input" bind:value={numPliesRecorded} /></div>
-      <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="any" min="0" max="100" class="input" bind:value={stoppingPct} /></div>
+      <div><label class="label" for="sc">Stopping % (-sc)</label><input id="sc" type="number" step="any" min="0" max="100" class="input" bind:this={stoppingInput} bind:value={stoppingPct} /></div>
       <p class="text-sm">No time limit: a simulation stops at its iteration budget, so what it finds does not depend on the contributor's hardware.</p>
       <label class="flex items-end gap-2 text-sm">
         <input type="checkbox" bind:checked={useInference} />
