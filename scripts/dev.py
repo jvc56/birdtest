@@ -748,6 +748,45 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def first_admin_steps(site_url: str) -> str:
+    """How to make the first admin on a --fresh site, and how the live site
+    differs. There is deliberately no page or endpoint for it."""
+    confirm = f"{site_url}/confirm-email?code="
+    return f"""
+============================================================================
+A fresh site has no accounts. To make yourself its first admin:
+
+ 1. In the browser, register at {site_url}/register
+    Any username; the email can be made up, since nothing is sent locally.
+
+ Leave dev.py running in this terminal: Ctrl-C here stops the whole site.
+ For steps 2 and 3, open a NEW terminal window, in the birdtest folder:
+
+      cd {REPO_ROOT}
+
+ 2. Confirm the email. Locally it is written to the backend's log instead of
+    being sent, and this prints the link it holds; open that in the browser:
+
+      docker compose logs backend | grep -o '{confirm}[A-Za-z0-9%]*' | tail -1
+
+ 3. Make the account an admin, with YOUR_NAME replaced by your username
+    (keep the quotes):
+
+      docker compose exec postgres psql -U birdtest -d birdtest -c "UPDATE users SET is_admin = true WHERE lower(username) = lower('YOUR_NAME')"
+
+    It prints UPDATE 1 (UPDATE 0: no account has that name). Sign in, or
+    reload if you already have: an Admin link appears in the header.
+
+ On the live site:
+  - Step 1 is the same, at the site's own address.
+  - Step 2: the email really arrives; open the link in it.
+  - Step 3 runs from the machine you deploy from, with the stack's AWS
+    credentials and Terraform state (README, "Deploying", step 7):
+
+      scripts/prod-sql.sh "UPDATE users SET is_admin = true WHERE lower(username) = lower('YOUR_NAME') RETURNING username"
+============================================================================"""
+
+
 def main() -> int:
     load_env_file()
     parser = build_parser()
@@ -851,16 +890,14 @@ def main() -> int:
         user = args.login_as or args.username
         open_url = f"{site_url}/api/dev/login?username={quote(user)}&next=/"
         log(f"signed in as {user}: {open_url}")
-    if args.fresh:
-        log(f"to become the first admin: register at {site_url}/register, open the confirmation "
-            "link from `docker compose logs backend`, then run\n"
-            "      docker compose exec postgres psql -U birdtest -d birdtest -c "
-            "\"UPDATE users SET is_admin = true WHERE username = 'YOU'\"\n"
-            "    and reload the page")
     if not args.no_browser:
         webbrowser.open(open_url)
     log(f"birdtest is at {site_url} — Ctrl-C to stop the contributors"
         + ("" if args.keep_up or args.no_up else " and the stack"))
+    if args.fresh:
+        # Last, so it is what the terminal is left showing.
+        # Unprefixed, so a command copied whole is only the command.
+        print(first_admin_steps(site_url), flush=True)
 
     stopping = False
 

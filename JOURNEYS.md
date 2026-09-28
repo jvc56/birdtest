@@ -389,10 +389,13 @@ Do this last: it empties the database.
 - [ ] **Do** stop dev.py and run `./scripts/dev.py --fresh`. **Expect** the site
   signed out, with no jobs, no player configs, no data and no accounts, and
   dev.py printing how to become the first admin.
-- [ ] **Do** register and confirm an account (U-1, U-2), then run the `psql`
-  command dev.py printed, with that username. **Expect**, on a reload, an
-  **Admin** link and "admin" on **Account**. There is no page or endpoint for
-  this, by design.
+- [ ] **Do** follow the three steps dev.py prints last: register in the
+  browser; then, in a new terminal in the birdtest folder (dev.py keeps the
+  first one), print the confirmation link from the backend's log and open it,
+  and run the `psql` command with your username. **Expect** `UPDATE 1`, and on
+  a reload an **Admin** link and "admin" on **Account**. There is no page or
+  endpoint for this, by design; dev.py's steps end with how the live site
+  differs.
 - [ ] **Do** import the data as in A-3, from nothing: **expect** every file
   "new".
 
