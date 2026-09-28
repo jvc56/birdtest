@@ -529,7 +529,6 @@ export const api = {
     ),
   ratingPools: () => get<RatingPoolListItem[]>('/api/rating-pools'),
   ratingPool: (id: string) => get<RatingPoolDetail>(`/api/rating-pools/${id}`),
-  ratingHistory: (id: string) => get<RatingHistoryPoint[]>(`/api/rating-pools/${id}/history`),
 
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
   workers: (page = 0) => get<Page<Record<string, unknown>>>(`/api/workers?page=${page}`),
@@ -679,10 +678,3 @@ export interface RatingPoolDetail {
   residuals: RatingResidual[];
 }
 
-export interface RatingHistoryPoint {
-  computed_at: string;
-  player_config_id: string;
-  name: string;
-  rating: number;
-  stderr: number;
-}

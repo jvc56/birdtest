@@ -479,18 +479,13 @@ Ratings are **displayed on the ratings pages and nowhere else**:
   the residual table showing where the fit disagrees with the games. A config
   with no path of games to the anchor is listed as unrated rather than drawn.
   Admin membership controls appear inline here for admins.
-- The **history chart** on the same page (`GET /api/rating-pools/:id/history`)
-  — one line for each of the six current members rated highest in the newest
-  run, across the stored runs, thinned to at most 500 evenly spaced points
-  with the first and newest always kept. Only those six are sent: every
-  member's every point went out on each view of this public page, and a
-  burst of views at a hundred members answered other readers `503` (the
-  audit's pass 25). Each line is labelled at its end, the labels moved apart
-  where lines end close together, and long names are shortened together —
-  the segments a family of configs shares dropped, the rest shortened in the
-  middle, and labels still alike widened where they differ — so no two drawn
-  labels read the same (the full name is each one's title); the dot plot's
-  names likewise.
+- **No history chart.** The page once drew each config's rating across the
+  stored runs; it was removed as more noise than signal on a page read for the
+  latest fit. `GET /api/rating-pools/:id/history` still serves those series to
+  API callers. Long config names on the dot plot are shortened together -- the
+  segments a family of configs shares dropped, the rest shortened in the
+  middle, and labels still alike widened where they differ -- so no two read
+  the same (the full name is each one's title).
 
 A job's own pages (`/jobs/[id]`) show its SPRT verdict, win rate and
 pentanomial, and **no rating**: a rating belongs to a pool, not to a job, and a
@@ -706,8 +701,8 @@ pool of twenty, for the life of the pool. Inside the month the run-by-run diff
 is what answers "why did this rating change?". Past it, an hourly sweep
 (`ratings::thin_old_runs`) keeps each UTC day's last run and the pool's first
 and deletes the rest, their ratings and residuals cascading. A day is the
-resolution the history chart draws at anyway — it thins to 500 points over the
-pool's whole life — so the chart keeps its shape and its ends; deleting
+resolution the history endpoint serves at anyway — it thins to 500 points over
+the pool's whole life — so the history keeps its shape and its ends; deleting
 everything past the window would have started its past at the window's edge.
 The newest run, the one the page shows, is the last of its day and so always
 survives, however long the pool has been quiet. Runs go in batches of a
@@ -5115,7 +5110,7 @@ do not exist.
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated), paginated. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
 | `GET` | `/api/rating-pools/:id` | Latest fit for one pool: run provenance, every member's rating with uncertainty, and the residuals. |
-| `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run — the history chart's series. |
+| `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
 
 **Rack lookup** canonicalizes the query before matching: uppercased, whitespace
 trimmed, letters sorted. A rack is a multiset of tiles, so `AEINRST` and
@@ -5202,14 +5197,6 @@ anchor is listed beneath the chart as **unrated** rather than drawn at a number.
 
 **A table of every config**, since the chart caps what it draws and the table
 must not. This is also the accessible view of the same data.
-
-**Rating history**, one line per config, from the run snapshots — thinned to at
-most 500 runs spaced evenly over the pool's life, the first and the newest always
-kept, since a pool with an active job is refit every two minutes. The categorical
-palette is a fixed list rather than a generator, so past six configs the page
-shows the top six by rating and says how many it left out — inventing a seventh
-hue nobody can distinguish would be worse than omitting it. Every line is
-directly labelled at its right end, so identity never depends on colour alone.
 
 **Where the model disagrees with the games.** The residual table: actual score
 versus predicted, per head-to-head, largest disagreement first. This is the panel
@@ -5358,7 +5345,6 @@ birdtest/
 │       │       ├── ProgressBar.svelte
 │       │       ├── OutcomeChart.svelte   # LayerCake: win/loss/draw over time
 │       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: Elo has no zero)
-│       │       ├── RatingHistoryChart.svelte  # rating over time, one line per config
 │       │       ├── ResidualMatrix.svelte # actual vs predicted per head-to-head
 │       │       ├── Bars.svelte           # LayerCake mark layer
 │       │       └── AxisY.svelte          # LayerCake axis layer

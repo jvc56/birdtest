@@ -1,20 +1,13 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
-  import {
-    api,
-    type PlayerConfig,
-    type RatingHistoryPoint,
-    type RatingPoolDetail
-  } from '$lib/api';
+  import { api, type PlayerConfig, type RatingPoolDetail } from '$lib/api';
   import { session } from '$lib/auth';
   import RatingDotPlot from '$lib/components/RatingDotPlot.svelte';
-  import RatingHistoryChart from '$lib/components/RatingHistoryChart.svelte';
   import ResidualMatrix from '$lib/components/ResidualMatrix.svelte';
   import { ratingCell, stderrCell } from '$lib/charts/ratingDotPlot';
 
   let pool: RatingPoolDetail | null = null;
-  let history: RatingHistoryPoint[] = [];
   let configs: PlayerConfig[] = [];
   let error = '';
   let loadError = '';
@@ -27,15 +20,8 @@
     (c) => !pool?.ratings.some((r) => r.player_config_id === c.id)
   );
 
-  // Both before either is shown: assigned one at a time, a failed history
-  // left the pool on screen with an empty chart and the error nowhere.
   async function load() {
-    const [loadedPool, loadedHistory] = await Promise.all([
-      api.ratingPool(poolId),
-      api.ratingHistory(poolId)
-    ]);
-    pool = loadedPool;
-    history = loadedHistory;
+    pool = await api.ratingPool(poolId);
   }
 
   onMount(async () => {
@@ -196,14 +182,6 @@
           and it is why this is not a per-row edit.
         </p>
       {/if}
-    </div>
-
-    <div class="card space-y-3">
-      <h2 class="text-lg font-medium">Rating history</h2>
-      <RatingHistoryChart
-        {history}
-        rated={pool.ratings.filter((r) => r.connected_to_anchor).length}
-      />
     </div>
 
     <div class="card space-y-3">

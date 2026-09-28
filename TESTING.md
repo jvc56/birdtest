@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 137 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (4), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `ratingHistory.test.ts` (17), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1F Frontend unit | 122 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (4), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 227 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (15), `admin_routes.rs` (11), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (6), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -660,7 +660,7 @@ Pure TypeScript, no browser, no network. Vitest, run by `npm test` (`vitest
 run`) in `frontend/`, and by CI after `npm run check`. `fetch` and
 `EventSource` are stubbed per test; nothing renders a component. Instead the
 chart arithmetic was moved out of the `.svelte` files into plain modules under
-`lib/charts/` (`ratingDotPlot.ts`, `ratingHistory.ts`, `residuals.ts`,
+`lib/charts/` (`ratingDotPlot.ts`, `labels.ts`, `residuals.ts`,
 `pentanomial.ts`), which the components import and the tests call directly —
 so `@testing-library/svelte`, once planned here, was never needed.
 
@@ -668,7 +668,7 @@ This tier exists because the charts contain real arithmetic — a scale, a bucke
 index, a threshold — and getting those wrong produces a plausible-looking
 picture rather than an error. Writing it found three: `duration` chose its unit
 before rounding (59.6 s read "60s"), `api.ts` rejected a non-JSON body with a
-`SyntaxError`, and `RatingHistoryChart` coloured by rank, so two lines swapped
+`SyntaxError`, and `RatingHistoryChart` (since removed) coloured by rank, so two lines swapped
 colours whenever their ratings crossed.
 
 ### `F-FMT-*` — `lib/format.ts`
@@ -769,18 +769,9 @@ Test the pure functions; do not snapshot the SVG.
   tooltip), not `±1.8e308`. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-3` A config with `connected_to_anchor: false` is listed as unrated
   and **not** drawn at a position. *(Covered: `charts/ratingDotPlot.test.ts`.)*
-- `F-CHART-4` `RatingHistoryChart` caps at six series, picks them by latest
-  rating, and reports how many it omitted. *(Covered:
-  `charts/ratingHistory.test.ts`.)*
-- `F-CHART-5` It assigns colour by config identity: a config keeps its colour
-  when ratings cross between fits, drawn colours are always distinct, and a
-  config that holds its own palette slot (the one its id hashes to) keeps it
-  under any filtering. That is narrower than "filtering never repaints a
-  survivor": with six colours and ids that can hash to one slot, a config that
-  lost a clash sits in a free slot, and a different set of survivors can free
-  or take that slot. Every survivor keeping its colour under every filter would
-  need a palette as large as the set of configs ever drawn. *(Covered:
-  `charts/ratingHistory.test.ts`; it used to colour by rank.)*
+- `F-CHART-4`, `F-CHART-5` Retired with the rating history chart they covered
+  (its series cap and colour by config identity). The label shortening it
+  shared with the dot plot is covered by `charts/labels.test.ts`.
 - `F-CHART-6` `ResidualMatrix` sorts by absolute residual descending, and flags
   the non-transitive case only when at least three head-to-heads exceed the
   threshold on enough pairs to be at least three standard errors out — the
