@@ -1896,7 +1896,7 @@ async fn generation_klv(
 /// The zeroed KLV a leave-generation job's first generation plays with.
 ///
 /// `createdata klv` builds it from the letter distribution alone, with every
-/// leave worth zero. MAGPIE_DEPENDENCY.md proposed a `convert zero2klv` for
+/// leave worth zero. The original design proposed a `convert zero2klv` for
 /// this; `createdata klv` already is it, through the same `klv_create_empty`,
 /// so there is one spelling rather than two to keep in step.
 async fn zero_klv(magpie: &Magpie, distribution: &LetterDistribution) -> AppResult<Vec<u8>> {

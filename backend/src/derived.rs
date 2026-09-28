@@ -1,9 +1,9 @@
 //! Wordmaps and rack info tables: what a job needs, and the reference copies
 //! the server builds so a worker's can be checked.
 //!
-//! See MAGPIE_DEPENDENCY.md. A worker derives both files locally from data the
-//! job pins, because a wordmap is 179 MB and a rack info table 1.9 GB and
-//! neither can be shipped. Nothing checked them: a rack info table was refused
+//! See README.md's "MAGPIE on the server". A worker derives both files
+//! locally from data the job pins, because a wordmap is 179 MB and a rack
+//! info table 1.9 GB and neither can be shipped. Nothing checked them: a rack info table was refused
 //! outright, and a wordmap was covered only by a sidecar naming the `.kwg` it
 //! was built from -- which says a file was built from the right things and
 //! still trusts the builder. A CSW24 wordmap built in December 2025 and one

@@ -5,7 +5,7 @@ import { ADMIN_STATE, env } from '../lib/env';
 test.use({ storageState: ADMIN_STATE });
 
 /**
- * E-7: the ratings page. An admin creates a pool, adds a config, sees the fit
+ * E-7: the ratings page. An admin creates a pool through its form, adds a config, sees the fit
  * appear, removes it, and sees the ratings change -- the one flow where a
  * write is meant to move numbers elsewhere on the page.
  *
@@ -25,6 +25,8 @@ const RATED = 'static-score';
 let api: AdminApi;
 let third: string;
 let poolName: string;
+let letterdistId: string;
+let layoutId: string;
 
 test.beforeAll(async ({ playwright }) => {
   const request = await playwright.request.newContext({ baseURL: env.baseURL });
@@ -46,14 +48,8 @@ test.beforeAll(async ({ playwright }) => {
   await request.dispose();
 
   const data = await api.seededData();
-  await api.post('/api/admin/rating-pools', {
-    name: poolName,
-    variant: 'classic',
-    letterdist_id: data.letterdist,
-    layout_id: data.layout,
-    anchor_player_config_id: anchorId,
-    anchor_rating: 1500
-  });
+  letterdistId = data.letterdist;
+  layoutId = data.layout;
 });
 
 test.afterAll(async () => {
@@ -91,8 +87,18 @@ async function addMember(page: Page, name: string) {
 }
 
 test('E-7: an admin builds a rating pool and watches membership move the ratings', async ({ page }) => {
-  // There is no form for creating a pool yet, so the pool is created over
-  // the API (beforeAll) and the journey starts at the ratings list.
+  await page.goto('/ratings');
+  await page.getByRole('link', { name: 'New rating pool' }).click();
+  await page.getByLabel('Pool name').fill(poolName);
+  await page.getByLabel('Variant').selectOption('classic');
+  await page.getByLabel('Letter distribution').selectOption(letterdistId);
+  await page.getByLabel('Board layout').selectOption(layoutId);
+  await page.getByLabel('Anchor player config').selectOption({ label: ANCHOR });
+  await page.getByLabel('Anchor rating').fill('1500');
+  await page.getByRole('button', { name: 'Create rating pool' }).click();
+  // Created with only its anchor: the rest are added on the pool's page, below.
+  await expect(page.getByRole('heading', { name: poolName })).toBeVisible();
+
   await page.goto('/ratings');
   const listed = page.locator('tbody tr', { hasText: poolName });
   await expect(listed).toContainText('classic · english_fixture · standard15');

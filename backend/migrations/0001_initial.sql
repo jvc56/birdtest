@@ -253,7 +253,7 @@ CREATE TABLE input_data_import_rows (
 -- machine that needs one builds it from files it already has. What travels
 -- instead is the SHA-256 the server's own pinned MAGPIE got from the same
 -- inputs: a worker builds its own copy and uses it only if the bytes agree,
--- and declines the task otherwise. See MAGPIE_DEPENDENCY.md.
+-- and declines the task otherwise. See README.md, "MAGPIE on the server".
 --
 -- The key is the whole identity of the file rather than a surrogate, because
 -- what makes two derived files the same file is that they were built from the
@@ -350,6 +350,9 @@ CREATE TYPE job_status AS ENUM (
 
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- What the admin called it, shown first wherever jobs are listed. '' for
+    -- a job created without one (through the API; the form asks for it).
+    name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
     job_type   job_type NOT NULL,
     -- NULL until the job is first activated; set by the admin at activation
     -- time. Every active job's share of the fleet: the scheduler hands each
@@ -1099,6 +1102,12 @@ CREATE INDEX position_analysis_records_feed_idx
 -- incidentally-captured in-game position is not an opening-rack analysis.
 CREATE INDEX position_analysis_records_job_rack_idx
     ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
+
+-- The positions search (`/api/jobs/:id/positions?rack=`): a game's positions
+-- with one rack, newest first. In-game positions only, so the index costs a
+-- job nothing unless it captures.
+CREATE INDEX position_analysis_records_game_rack_idx
+    ON position_analysis_records (job_id, rack, id) WHERE game_index IS NOT NULL;
 
 -- The cascade from a claim (`task_claim_id ... ON DELETE CASCADE`). The
 -- partial unique index on (task_claim_id, rack) above cannot serve it: a plain

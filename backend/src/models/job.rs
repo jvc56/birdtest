@@ -24,6 +24,8 @@ pub enum JobStatus {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct Job {
     pub id: Uuid,
+    /// What the admin called it; empty for a job created without one.
+    pub name: String,
     pub job_type: JobType,
     /// The job's share of the fleet while active; `None` until first
     /// activated. There is no priority: 0% is what `inactive` means.

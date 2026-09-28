@@ -255,6 +255,8 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     // --- Auth API -----------------------------------------------------------
     ("POST", "/api/auth/register", PreSession, ""),
     ("POST", "/api/auth/login", PreSession, ""),
+    // Mounted only with DEV_LOGIN (the local stack), and served here all the same.
+    ("GET", "/api/dev/login", PreSession, ""),
     ("POST", "/api/auth/logout", Cookie, ""),
     ("POST", "/api/auth/sign-out-everywhere", Session, ""),
     ("POST", "/api/auth/confirm-email", PreSession, ""),
@@ -287,6 +289,10 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
     ("GET", "/api/rating-pools", Public, ""),
     ("GET", "/api/rating-pools/:id", Public, ""),
     ("GET", "/api/rating-pools/:id/history", Public, ""),
+    ("GET", "/api/jobs/:id/config", Public, ""),
+    ("GET", "/api/jobs/:id/positions", Session, ""),
+    ("GET", "/api/player-configs", Public, ""),
+    ("GET", "/api/player-configs/:id", Public, ""),
 ];
 
 fn routes_with(access: &[Access]) -> impl Iterator<Item = &'static (&'static str, &'static str, Access, &'static str)> + '_ {

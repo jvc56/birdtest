@@ -69,17 +69,17 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 126 | Vitest, `frontend/src/lib/`: `format.test.ts` (20), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `ratingHistory.test.ts` (17), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1F Frontend unit | 123 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (5), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 223 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (26), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (14), `admin_routes.rs` (10), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (5), `fake_worker.rs` (1) |
+| 3 API | 229 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (11), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (6), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 13 | Playwright journeys `E-1`..`E-11` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 5 End-to-end | 17 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 636 backend tests (the per-tier counts above are
+--run-ignored all` runs 640 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -660,7 +660,7 @@ Pure TypeScript, no browser, no network. Vitest, run by `npm test` (`vitest
 run`) in `frontend/`, and by CI after `npm run check`. `fetch` and
 `EventSource` are stubbed per test; nothing renders a component. Instead the
 chart arithmetic was moved out of the `.svelte` files into plain modules under
-`lib/charts/` (`ratingDotPlot.ts`, `ratingHistory.ts`, `residuals.ts`,
+`lib/charts/` (`ratingDotPlot.ts`, `labels.ts`, `residuals.ts`,
 `pentanomial.ts`), which the components import and the tests call directly —
 so `@testing-library/svelte`, once planned here, was never needed.
 
@@ -668,7 +668,7 @@ This tier exists because the charts contain real arithmetic — a scale, a bucke
 index, a threshold — and getting those wrong produces a plausible-looking
 picture rather than an error. Writing it found three: `duration` chose its unit
 before rounding (59.6 s read "60s"), `api.ts` rejected a non-JSON body with a
-`SyntaxError`, and `RatingHistoryChart` coloured by rank, so two lines swapped
+`SyntaxError`, and `RatingHistoryChart` (since removed) coloured by rank, so two lines swapped
 colours whenever their ratings crossed.
 
 ### `F-FMT-*` — `lib/format.ts`
@@ -689,6 +689,10 @@ Each entry's tests are the `describe` block named for its id.
 - `F-FMT-4` `jobTypeLabel` covers all four job types, and an unknown type falls
   back to the raw string rather than "undefined" — including a name like
   `toString` that an object literal answers. *(Covered: `format.test.ts`.)*
+- `F-FMT-5b` `sprtState`: a games or pairs job's test reads `paused` while the
+  job is inactive and `undecided` when it was completed without a decision,
+  never `running` with nothing being played; a completed job shows the
+  decision it stopped on. *(Covered: `format.test.ts`, `F-FMT-5b sprtState`.)*
 - `F-FMT-5` `sprtLabel` covers all four statuses. *(Covered:
   `format.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
@@ -765,18 +769,9 @@ Test the pure functions; do not snapshot the SVG.
   tooltip), not `±1.8e308`. *(Covered: `charts/ratingDotPlot.test.ts`.)*
 - `F-CHART-3` A config with `connected_to_anchor: false` is listed as unrated
   and **not** drawn at a position. *(Covered: `charts/ratingDotPlot.test.ts`.)*
-- `F-CHART-4` `RatingHistoryChart` caps at six series, picks them by latest
-  rating, and reports how many it omitted. *(Covered:
-  `charts/ratingHistory.test.ts`.)*
-- `F-CHART-5` It assigns colour by config identity: a config keeps its colour
-  when ratings cross between fits, drawn colours are always distinct, and a
-  config that holds its own palette slot (the one its id hashes to) keeps it
-  under any filtering. That is narrower than "filtering never repaints a
-  survivor": with six colours and ids that can hash to one slot, a config that
-  lost a clash sits in a free slot, and a different set of survivors can free
-  or take that slot. Every survivor keeping its colour under every filter would
-  need a palette as large as the set of configs ever drawn. *(Covered:
-  `charts/ratingHistory.test.ts`; it used to colour by rank.)*
+- `F-CHART-4`, `F-CHART-5` Retired with the rating history chart they covered
+  (its series cap and colour by config identity). The label shortening it
+  shared with the dot plot is covered by `charts/labels.test.ts`.
 - `F-CHART-6` `ResidualMatrix` sorts by absolute residual descending, and flags
   the non-transitive case only when at least three head-to-heads exceed the
   threshold on enough pairs to be at least three standard errors out — the
@@ -1631,6 +1626,15 @@ permanent.
   `stats::a_job_driven_to_h0_completes_with_its_sprt_failed`,
   `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`.)*
   (Eleventh audit; the in-flight half, twelfth.)
+- `I-STATS-9f` A completed job's stats say how it was completed (`completion`:
+  when, whether an admin forced it, and the server's reason — the SPRT verdict,
+  `last generation built`, or none when an opening-rack job's racks ran out),
+  from its `job.completed` audit row; a job not completed has none. The job
+  pages turn it into "Finished …: …" under the title. *(Covered:
+  `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`,
+  `finish::an_opening_rack_job_completes_once_its_racks_are_handed_out_and_all_accepted`,
+  `finish::a_forced_completion_is_reported_as_forced`; the sentences,
+  `format.test.ts` `F-FMT-12`.)*
 - `I-STATS-9a` **Debounced under load.** With a claim held open the whole time,
   so the job is never idle, the check runs on the `SPRT_CHECK_EVERY`th
   submission and not before, and the open claim's result is still accepted
@@ -2095,6 +2099,12 @@ below.
   by design (PLAN, "Audit actions"). *(Covered:
   `auth_routes::a_confirmation_and_a_reset_are_on_record`.)* (Thirty-second
   audit, pass 22.)
+- `A-AUTH-13` With `DEV_LOGIN` — the local stack's, and refused beside
+  `SECURE_COOKIES=true` (`U-CFG-4`) — `GET /api/dev/login` signs a browser in
+  as an account by name, and sends it to a path on this site (anything else
+  goes to `/`); an unknown name is a `404`; without it the route does not
+  exist. *(Covered:
+  `auth_routes::the_dev_login_signs_a_browser_in_only_where_it_is_enabled`.)*
 
 ### `A-WORKER-*` — `routes/worker.rs`
 
@@ -2245,6 +2255,12 @@ below.
 - `A-ADMIN-1` Player config create/get/list/delete round-trips, and a config in
   use cannot be deleted. *(Covered:
   `admin_routes::a_player_config_round_trips_and_one_in_use_cannot_be_deleted`.)*
+- `A-ADMIN-2b` A job keeps the name it was created with, trimmed, and the jobs
+  list and the job's page return it; one created without a name has an empty
+  one (titled by its type, `F-FMT-13`); a name past 100 characters or of more
+  than one line is refused on the field. *(Covered:
+  `admin_routes::a_job_keeps_the_name_it_was_created_with`; E-4 creates one
+  through the form and finds it as the title.)*
 - `A-ADMIN-2` Creating a job of each type returns `{job}` and the
   job is inactive with no allocation. *(Covered:
   `admin_routes::creating_each_job_type_answers_it_inactive_and_unallocated`;
@@ -2423,6 +2439,18 @@ below.
   decline and no accepted result in a day, and cleared by a result.
   *(Covered: `public_api::the_job_list_flags_a_stalled_job`.)* (Nineteenth
   audit: nothing tested it.)
+- `A-PUBLIC-1c` A job's full configuration is public (`GET /api/jobs/:id/config`):
+  the job's settings with files by name, its type's (a games job's batch, cap
+  and test), and every setting of each player config, in role order, with the
+  config's id to link to; it names no creator and carries no user id; an
+  unknown job is a `404`. *(Covered:
+  `public_api::a_jobs_full_configuration_is_public`; the page's summary and
+  side-by-side table by `jobSettings.test.ts`, `F-SET-1`.)*
+- `A-PUBLIC-1d` Player configs are public (`GET /api/player-configs`, newest
+  first, and `/:id`): every setting with files by name, and the config it was
+  cloned from, but not who made it; an unknown config is a `404`. *(Covered:
+  `public_api::player_configs_are_public`; the page's key settings by
+  `jobSettings.test.ts`, `F-SET-1`.)*
 - `A-PUBLIC-1b` `?status=` filters the job list and its total. *(Covered:
   `public_api::the_job_list_filters_by_status`.)* (Eighteenth audit.) Deleting
   a job ends its open streams (`sse::tests::closing_a_job_ends_its_streams`).
@@ -2454,6 +2482,11 @@ below.
   list, not a 404 as this entry first said — the rack is a valid question
   about a job that exists, and "nothing yet" is its answer; only an unknown job
   is a 404. *(Covered: `public_api::rack_lookup_finds_an_analysed_rack`.)*
+- `A-PUBLIC-4b` A games job's captured positions (`/api/jobs/:id/positions`)
+  page newest first with their ranked moves, and `?rack=` finds a rack however
+  it is typed; signed out is a `401`, an opening-rack job a `400`, an unknown
+  job a `404`. *(Covered:
+  `public_api::captured_positions_are_searchable_when_signed_in`.)*
 - `A-PUBLIC-5` The SSE stream emits an event after a result is accepted, and the
   event body is byte-identical to what a page reload would fetch. *(Covered:
   `public_api::the_stream_sends_what_a_reload_would_fetch_after_each_result`,
@@ -2741,9 +2774,9 @@ admin in once and the admin journeys reuse its storage state.
   from `/account`. *(Covered: `e6-redirects.spec.ts`.)*
 - `E-7` The ratings page: an admin creates a pool, adds a config, sees the fit
   appear, removes it, and sees the ratings change. Covers the one flow where a
-  write is expected to move numbers elsewhere on the page. There is no form for
-  creating a pool, so the journey creates it over the API and starts at the
-  ratings list; membership, the fit and the moved ratings go through the page.
+  write is expected to move numbers elsewhere on the page. The pool is created
+  through its form, from the ratings list, with only its anchor; membership,
+  the fit and the moved ratings go through the pool's page.
   *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table with the five buckets
   labelled, and the SPRT status text. *(Covered: `e8-pentanomial.spec.ts`.)*
@@ -2778,6 +2811,20 @@ admin in once and the admin journeys reuse its storage state.
   the held read carried the old status; and a delete through the API.)* The reads ran one after another: the page said
   "No worker has declined this job", showed 100, and Activate sent it
   (thirty-second audit, pass 16).
+- `E-12` A games job made through the form with "Save the positions played"
+  ticked shows a signed-out visitor a
+  prompt to sign in, and a signed-in user its positions ten at a time with
+  "Load more", and a rack search whose every result holds that rack.
+  *(Covered: `e12-saved-positions.spec.ts`.)*
+- `E-13` An opening-rack job's page offers ten racks it has analysed under the
+  search, and clicking one looks it up. *(Covered:
+  `e13-opening-rack-samples.spec.ts`.)*
+- `E-14` A signed-out visitor reaches the player configs from the nav, opens
+  one, reads its key settings, and opens every setting. *(Covered:
+  `e14-player-configs.spec.ts`.)*
+- `E-15` The player-config form will not submit a stopping percentage of 0 or
+  100, which the server refuses; 99.5 is accepted. *(Covered:
+  `e15-player-config-form.spec.ts`.)*
 
 ### Reading confirmation codes
 

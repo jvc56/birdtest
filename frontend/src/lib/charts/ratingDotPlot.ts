@@ -4,7 +4,7 @@
  * wrong, draws a plausible picture rather than failing.
  */
 import type { RatingRow } from '$lib/api';
-import { fitLabel, fitLabels } from './ratingHistory';
+import { fitLabel, fitLabels } from './labels';
 
 export const ROW_HEIGHT = 28;
 export const PAD = { top: 8, right: 24, bottom: 28, left: 180 };

@@ -91,7 +91,7 @@ CASE_TIMEOUT = 600
 # own two-letter test lexicon and distribution. Served from a tarball under a
 # date no real MAGPIE-DATA release has, at a ref only the stand-in resolves.
 SMALL_DATE = "20000101"
-SMALL_REF = "tier6-small"
+SMALL_REF = "two-letter"
 SMALL_SHA = "7133e6a2b0c0ffee00000000000000000000ab01"
 SMALL_FILES = (
     ("lexica/CSW21_ab.kwg", "testdata/lexica/CSW21_ab.kwg"),
@@ -266,8 +266,8 @@ def create_and_activate(ctx: Context, data: dict, body: dict) -> str:
     started = time.time()
     response = ctx.client.session.post(
         f"{ctx.client.api}/api/admin/jobs",
-        json={"variant": "classic", "letterdist_id": data["letterdist"],
-              "layout_id": data["layout"], **body},
+        json={"name": f"tier 6 {body['job_type'].replace('_', ' ')}", "variant": "classic",
+              "letterdist_id": data["letterdist"], "layout_id": data["layout"], **body},
         headers=ctx.client._headers(), timeout=1800,
     )
     job_id = ctx.client.json(response, f"create {body['job_type']} job")["job"]["id"]
@@ -473,19 +473,24 @@ def run_job(ctx: Context, data: dict, body: dict, check, needs_build: bool = Fal
 def static_players(ctx: Context) -> dict:
     data = ctx.data
     return {
-        "player1_config_id": create_player(ctx, data, "e2e-static-equity", {}),
+        # No wordmap: these jobs are dispatched at once, without the builder.
+        "player1_config_id": create_player(ctx, data, "e2e-static-equity",
+                                           {"use_wordmap": False, "use_rit": False}),
         "player2_config_id": create_player(ctx, data, "e2e-static-score",
-                                           {"sort_strategy": "score"}),
+                                           {"sort_strategy": "score", "use_wordmap": False,
+                                            "use_rit": False}),
     }
 
 
 def wordmap_players(ctx: Context) -> dict:
     data = ctx.data
     return {
+        # A wordmap and no table: M-10 is the rack info table's case.
         "player1_config_id": create_player(ctx, data, "e2e-wordmap-equity",
-                                           {"use_wordmap": True}),
+                                           {"use_wordmap": True, "use_rit": False}),
         "player2_config_id": create_player(ctx, data, "e2e-wordmap-score",
-                                           {"sort_strategy": "score", "use_wordmap": True}),
+                                           {"sort_strategy": "score", "use_wordmap": True,
+                                            "use_rit": False}),
     }
 
 
@@ -497,7 +502,8 @@ def simming_player(ctx: Context) -> str:
     return create_player(ctx, ctx.data, "e2e-simming", {
         "recorder_type": "all",
         "winpct_id": ctx.winpct, "num_plies": 2, "num_plays": 5, "num_plies_recorded": 2,
-        "max_iterations": 60, "stopping_pct": 99, "time_limit_secs": 0,
+        "max_iterations": 60, "stopping_pct": 99, "time_limit_secs": 0, "use_wordmap": False,
+        "use_rit": False,
     })
 
 
@@ -507,7 +513,7 @@ def static_best_player(ctx: Context) -> str:
     # through the derived-file path: the server builds and hashes one, and
     # MAGPIE builds its own and compares.
     return create_player(ctx, ctx.data, "e2e-static-best",
-                         {"num_plays_recorded": 1, "use_wordmap": True})
+                         {"num_plays_recorded": 1, "use_wordmap": True, "use_rit": False})
 
 
 def games_body(players: dict, batch: int, **extra) -> dict:

@@ -78,6 +78,9 @@ fn static_config(name: &str, files: &Files) -> Value {
     json!({
         "name": name, "recorder_type": "all", "sort_strategy": "equity",
         "kwg_id": files.kwg, "klv_id": files.klv, "num_plays_recorded": 3,
+        // The test lexicons are not real KWGs, so no reference wordmap or rack
+        // info table exists for a worker to be asked to reproduce.
+        "use_wordmap": false, "use_rit": false,
     })
 }
 
@@ -251,6 +254,42 @@ async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
 
     let (status, body) = claim(&admin.app, &[], "1.0.0", &[]).await;
     assert_eq!((status, body), (StatusCode::NO_CONTENT, Value::Null), "an inactive job is offered to nobody");
+}
+
+/// A-ADMIN-2b: a job keeps the name it was created with -- trimmed, and shown
+/// by the jobs list and the job's own page -- and one created without a name
+/// has an empty one; a name past 100 characters or of more than one line is
+/// refused, on the field.
+#[tokio::test]
+async fn a_job_keeps_the_name_it_was_created_with() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db).await;
+    let files = files(&db).await;
+    let player = created_config(&admin, static_config("namer", &files)).await;
+    let body = |name: Value| {
+        let mut body = games_job_body(&files, &player["id"], &player["id"]);
+        body["name"] = name;
+        body
+    };
+
+    let (status, created) = admin.post("/api/admin/jobs", body(json!("  equity vs static  "))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["job"]["name"], "equity vs static");
+    let id = created["job"]["id"].as_str().unwrap();
+    let (_, list) = admin.get("/api/jobs").await;
+    assert_eq!(list["items"][0]["name"], "equity vs static", "{list}");
+    let (_, detail) = admin.get(&format!("/api/jobs/{id}")).await;
+    assert_eq!(detail["job"]["name"], "equity vs static", "{detail}");
+
+    let (status, unnamed) = admin.post("/api/admin/jobs", games_job_body(&files, &player["id"], &player["id"])).await;
+    assert_eq!(status, StatusCode::CREATED, "{unnamed}");
+    assert_eq!(unnamed["job"]["name"], "");
+
+    for name in [json!("x".repeat(101)), json!("two\nlines")] {
+        let (status, refused) = admin.post("/api/admin/jobs", body(name)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+        assert_eq!(refused["fields"][0]["field"], "name", "{refused}");
+    }
 }
 
 /// A-ADMIN-3: job creation refuses every combination MAGPIE could not run, and

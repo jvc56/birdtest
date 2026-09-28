@@ -193,6 +193,7 @@ impl TestDb {
             session_signing_key: [7u8; 32],
             session_ttl: Duration::from_secs(3600),
             secure_cookies: false,
+            dev_login: false,
             mail_backend: MailBackend::Console,
             mail_outbox_dir: None,
             mail_from: "test@birdtest.local".into(),

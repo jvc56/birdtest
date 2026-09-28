@@ -6,6 +6,9 @@ import {
   jobTypeLabel,
   optionalNumber,
   sprtLabel,
+  sprtState,
+  completionText,
+  jobTitle,
   workerLabel
 } from './format';
 
@@ -116,6 +119,26 @@ describe('F-FMT-4 jobTypeLabel', () => {
   });
 });
 
+describe('F-FMT-5b sprtState', () => {
+  const running = { sprt: { status: 'running' } };
+  it("says paused, not running, while the job is inactive", () => {
+    expect(sprtState('inactive', running)).toBe('paused');
+    expect(sprtLabel(sprtState('inactive', running))).toBe('paused while the job is inactive');
+  });
+  it('is the test while the job is active', () => {
+    expect(sprtState('active', running)).toBe('running');
+    expect(sprtState('active', { sprt: { status: 'passed' } })).toBe('passed');
+  });
+  it('is the decision a completed job stopped on, or undecided without one', () => {
+    expect(sprtState('completed', { ...running, decided: { status: 'terminated_at_max' } })).toBe(
+      'terminated_at_max'
+    );
+    expect(sprtState('completed', running)).toBe('undecided');
+    // A purged job that had a decision keeps none: the purge clears it.
+    expect(sprtState('inactive', { sprt: { status: 'failed' } })).toBe('paused');
+  });
+});
+
 describe('F-FMT-5 sprtLabel', () => {
   it('covers all four statuses', () => {
     expect(sprtLabel('running')).toBe('running');
@@ -126,7 +149,7 @@ describe('F-FMT-5 sprtLabel', () => {
   });
 
   it('falls back to the raw status for an unknown one', () => {
-    expect(sprtLabel('paused')).toBe('paused');
+    expect(sprtLabel('abandoned')).toBe('abandoned');
     expect(sprtLabel('constructor')).toBe('constructor');
   });
 });
@@ -146,5 +169,55 @@ describe('F-FMT-6 form numbers', () => {
   it('names the fields a request would send blank', () => {
     expect(blankFields({ a: 1, b: null, c: Number.NaN, d: 'x', e: 0 })).toEqual(['b', 'c']);
     expect(blankFields({ a: 1 })).toEqual([]);
+  });
+});
+
+describe('F-FMT-12 completionText', () => {
+  const games = (decided?: { status: string; llr: number; units: number }) => ({
+    unit: 'pair',
+    max_units: 5000,
+    sprt: { lower_bound: -2.94, upper_bound: 2.94 },
+    decided
+  });
+  const pairs = { job_type: 'game_pairs' };
+  it('tells a test that decided from a cap that was reached', () => {
+    expect(
+      completionText({
+        job: pairs,
+        completion: { forced: false, reason: 'passed' },
+        games: games({ status: 'passed', llr: 2.95, units: 1200 })
+      })
+    ).toBe('the SPRT passed (H1 accepted) after 1,200 pairs: LLR 2.950 reached the upper bound 2.94');
+    expect(
+      completionText({
+        job: pairs,
+        completion: { forced: false, reason: 'terminated_at_max' },
+        games: games({ status: 'terminated_at_max', llr: 0.5, units: 5000 })
+      })
+    ).toBe('it reached its cap of 5,000 pairs before the SPRT decided (LLR 0.500, bounds [-2.94, 2.94])');
+  });
+  it('says when an admin forced it', () => {
+    expect(completionText({ job: pairs, completion: { forced: true, reason: null }, games: games() })).toBe(
+      'an admin force-completed it before its test decided'
+    );
+  });
+  it('names the other job types\' own ends', () => {
+    expect(
+      completionText({ job: { job_type: 'opening_rack' }, completion: { forced: false, reason: null } })
+    ).toBe('every rack was analysed');
+    expect(
+      completionText({
+        job: { job_type: 'leave_generation' },
+        completion: { forced: false, reason: 'last generation built' }
+      })
+    ).toBe('its last generation was built');
+  });
+});
+
+describe('F-FMT-13 jobTitle', () => {
+  it("is the job's name, or its type for one given none", () => {
+    expect(jobTitle({ name: 'equity vs static', job_type: 'game_pairs' })).toBe('equity vs static');
+    expect(jobTitle({ name: '', job_type: 'game_pairs' })).toBe('Game pairs');
+    expect(jobTitle({ name: '   ', job_type: 'games' })).toBe(jobTitle({ name: '', job_type: 'games' }));
   });
 });

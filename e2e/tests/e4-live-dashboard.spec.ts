@@ -3,8 +3,9 @@ import { ADMIN_STATE, SEEDED_DATA } from '../lib/env';
 
 test.use({ storageState: ADMIN_STATE });
 
-/** A static player through the form, with the wordmap turned off: nothing
- *  below tier 6 builds one, and a job waiting on one would never dispatch. */
+/** A static player through the form, with the wordmap and rack info table
+ *  turned off: nothing below tier 6 builds either, and a job waiting on one
+ *  would never dispatch. */
 async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'score') {
   await page.goto('/admin/player-configs/new');
   await page.getByLabel('Name').fill(name);
@@ -13,6 +14,7 @@ async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'sc
   await page.getByLabel('Sort strategy (-s)').selectOption(sort);
   await page.getByRole('button', { name: 'Show advanced options' }).click();
   await page.getByLabel('Use wordmap (-w)').uncheck();
+  await page.getByLabel('Use rack info table (-rit)').uncheck();
   await page.getByRole('button', { name: 'Create' }).click();
   await expect(page).toHaveURL(/\/admin\/player-configs$/);
   await expect(page.locator('tbody tr', { hasText: name })).toContainText(sort);
@@ -41,6 +43,8 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await createStaticConfig(page, p2, 'score');
 
   await page.goto('/admin/jobs/new');
+  const jobName = `e2e pairs ${suffix}`;
+  await page.getByLabel('Job name').fill(jobName);
   await page.getByLabel('Job type').selectOption({ label: 'Game pairs' });
   const letterdist = page.getByLabel('Letter distribution');
   const fixtureBag = letterdist.locator('option', { hasText: `english_fixture (${SEEDED_DATA},` });
@@ -54,7 +58,9 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await expect(page).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
   const jobId = page.url().split('/').pop()!;
   const header = page.locator('main header');
-  await expect(header.getByRole('heading', { name: 'Game pairs' })).toBeVisible();
+  // Titled by the name it was given, its type beside it.
+  await expect(header.getByRole('heading', { name: jobName })).toBeVisible();
+  await expect(header.getByText('Game pairs', { exact: true })).toBeVisible();
   await expect(header.getByText('inactive', { exact: true })).toBeVisible();
 
   // Activating refetches the job once, after the action; wait that out.

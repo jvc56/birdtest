@@ -23,8 +23,12 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/jobs", get(list_jobs))
         .route("/jobs/:id", get(job_detail))
+        .route("/jobs/:id/config", get(job_config))
         .route("/jobs/:id/results", get(job_results))
+        .route("/jobs/:id/positions", get(job_positions))
         .route("/jobs/:id/stream", get(job_stream))
+        .route("/player-configs", get(list_player_configs))
+        .route("/player-configs/:id", get(player_config))
         .route("/users", get(list_users))
         .route("/workers", get(list_workers))
 }
@@ -50,6 +54,7 @@ struct JobListQuery {
 #[derive(Serialize)]
 struct JobListItem {
     id: Uuid,
+    name: String,
     job_type: JobType,
     status: String,
     allocation: Option<i32>,
@@ -78,7 +83,7 @@ async fn list_jobs(
     let (limit, offset) = super::paginate(query.page, query.per_page);
 
     let rows = sqlx::query(
-        "SELECT j.id, j.job_type, j.status::text AS status, j.allocation,
+        "SELECT j.id, j.name, j.job_type, j.status::text AS status, j.allocation,
                 j.redundancy, j.created_at,
                 -- Running totals, like games_completed below. Counted, these
                 -- were two scans of a job's whole task history for every job on
@@ -156,6 +161,7 @@ async fn list_jobs(
             };
             JobListItem {
                 id: row.get("id"),
+                name: row.get("name"),
                 job_type,
                 status: row.get("status"),
                 allocation: row.get("allocation"),
@@ -194,6 +200,286 @@ async fn job_detail(
         payload.to_string(),
     )
         .into_response())
+}
+
+/// Everything a job runs with, for anyone to read: the job's own settings,
+/// its type's, and every setting of each player config, with files by name.
+/// The job page showed a lexicon and a variant, and nothing said how deep
+/// each player searched.
+#[derive(Serialize)]
+struct JobConfigView {
+    job: JobSettings,
+    /// Games and game-pairs jobs: the test and its stopping rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    games: Option<GamesSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opening_racks: Option<crate::models::job::OpeningRackConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leave_generation: Option<LeaveSettings>,
+    /// Each player config, in role order ("player 1", "player 2"; "player"
+    /// for an opening-rack job).
+    players: Vec<PlayerSettings>,
+}
+
+#[derive(Serialize)]
+struct JobSettings {
+    id: Uuid,
+    name: String,
+    job_type: JobType,
+    variant: String,
+    letter_distribution: String,
+    layout: String,
+    bingo_bonus: i32,
+    sim_cutoff: f64,
+    redundancy: i32,
+    min_magpie_version: String,
+}
+
+#[derive(Serialize)]
+struct GamesSettings {
+    /// "game" or "pair": the unit every count here is in.
+    unit: &'static str,
+    per_batch: i32,
+    min_units: i32,
+    max_units: i32,
+    sprt_alpha: f64,
+    sprt_beta: f64,
+    elo_low: f64,
+    elo_high: f64,
+    capture_positions: bool,
+}
+
+#[derive(Serialize)]
+struct LeaveSettings {
+    lexicon: String,
+    num_iterations: i32,
+    generation_count: i32,
+    target_rack_count: i32,
+    racks_per_task: i32,
+    use_wordmap: bool,
+}
+
+/// A player config's settings, without who made it or when.
+#[derive(Serialize)]
+struct PlayerSettings {
+    /// Its part in a job ("player 1"); absent where the config stands alone.
+    #[serde(skip_serializing_if = "no_role")]
+    role: &'static str,
+    id: Uuid,
+    name: String,
+    lexicon: String,
+    leaves: String,
+    win_pct: Option<String>,
+    recorder_type: String,
+    sort_strategy: String,
+    num_plies: i32,
+    num_plies_recorded: i32,
+    num_plays: i32,
+    num_plays_recorded: i32,
+    max_iterations: Option<i32>,
+    stopping_pct: Option<f64>,
+    use_inference: Option<bool>,
+    time_limit_secs: Option<i32>,
+    use_wordmap: bool,
+    use_rit: bool,
+    min_play_iterations: Option<i32>,
+    threshold: Option<String>,
+    sampling_rule: Option<String>,
+    inference_margin: Option<f64>,
+    utility_w_winpct: Option<f64>,
+    utility_w_spread: Option<f64>,
+    utility_spread_scale: Option<f64>,
+    movegen_margin: f64,
+}
+
+fn no_role(role: &&'static str) -> bool {
+    role.is_empty()
+}
+
+impl PlayerSettings {
+    fn new(role: &'static str, named: crate::models::job::NamedPlayerConfig) -> Self {
+        let c = named.config;
+        Self {
+            role,
+            id: c.id,
+            name: c.name,
+            lexicon: named.kwg_name,
+            leaves: named.klv_name,
+            win_pct: named.winpct_name,
+            recorder_type: c.recorder_type,
+            sort_strategy: c.sort_strategy,
+            num_plies: c.num_plies,
+            num_plies_recorded: c.num_plies_recorded,
+            num_plays: c.num_plays,
+            num_plays_recorded: c.num_plays_recorded,
+            max_iterations: c.max_iterations,
+            stopping_pct: c.stopping_pct,
+            use_inference: c.use_inference,
+            time_limit_secs: c.time_limit_secs,
+            use_wordmap: c.use_wordmap,
+            use_rit: c.use_rit,
+            min_play_iterations: c.min_play_iterations,
+            threshold: c.threshold,
+            sampling_rule: c.sampling_rule,
+            inference_margin: c.inference_margin,
+            utility_w_winpct: c.utility_w_winpct,
+            utility_w_spread: c.utility_w_spread,
+            utility_spread_scale: c.utility_spread_scale,
+            movegen_margin: c.movegen_margin,
+        }
+    }
+}
+
+/// A player config as anyone may read it: every setting it plays with, and
+/// its lineage, but not which admin made it.
+#[derive(Serialize)]
+struct PublicPlayerConfig {
+    #[serde(flatten)]
+    settings: PlayerSettings,
+    cloned_from_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::models::job::NamedPlayerConfig> for PublicPlayerConfig {
+    fn from(named: crate::models::job::NamedPlayerConfig) -> Self {
+        let (cloned_from_id, created_at) = (named.config.cloned_from_id, named.config.created_at);
+        Self { settings: PlayerSettings::new("", named), cloned_from_id, created_at }
+    }
+}
+
+/// Every player config, newest first. Public: the job pages already show the
+/// players' settings, and a config is what a rating is about.
+async fn list_player_configs(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<PublicPlayerConfig>>> {
+    use crate::models::job::NamedPlayerConfig;
+    let configs = sqlx::query_as::<_, NamedPlayerConfig>(&format!(
+        "{} ORDER BY pc.created_at DESC, pc.id",
+        NamedPlayerConfig::SELECT
+    ))
+    .fetch_all(&state.read_pool)
+    .await?;
+    Ok(Json(configs.into_iter().map(Into::into).collect()))
+}
+
+async fn player_config(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<PublicPlayerConfig>> {
+    use crate::models::job::NamedPlayerConfig;
+    let config = sqlx::query_as::<_, NamedPlayerConfig>(&format!(
+        "{} WHERE pc.id = $1",
+        NamedPlayerConfig::SELECT
+    ))
+    .bind(id)
+    .fetch_optional(&state.read_pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such player config"))?;
+    Ok(Json(config.into()))
+}
+
+async fn job_config(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<JobConfigView>> {
+    use crate::models::job::{GameConfig, GamePairConfig, LeaveConfig, NamedPlayerConfig, OpeningRackConfig};
+    let job = load_job(&state, id).await?;
+    let pool = &state.read_pool;
+    let file = |id: Uuid| async move {
+        sqlx::query_scalar::<_, String>("SELECT name FROM input_data WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+    };
+    let player = |id: Uuid| async move {
+        sqlx::query_as::<_, NamedPlayerConfig>(&format!("{} WHERE pc.id = $1", NamedPlayerConfig::SELECT))
+            .bind(id)
+            .fetch_one(pool)
+            .await
+    };
+
+    let (mut games, mut opening_racks, mut leave_generation, mut players) = (None, None, None, Vec::new());
+    match job.job_type {
+        JobType::Games => {
+            let c: GameConfig = sqlx::query_as("SELECT * FROM job_game_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            players.push(PlayerSettings::new("player 1", player(c.player1_config_id).await?));
+            players.push(PlayerSettings::new("player 2", player(c.player2_config_id).await?));
+            games = Some(GamesSettings {
+                unit: "game",
+                per_batch: c.games_per_batch,
+                min_units: c.min_games,
+                max_units: c.max_games,
+                sprt_alpha: c.sprt_alpha,
+                sprt_beta: c.sprt_beta,
+                elo_low: c.elo_low,
+                elo_high: c.elo_high,
+                capture_positions: c.capture_positions,
+            });
+        }
+        JobType::GamePairs => {
+            let c: GamePairConfig = sqlx::query_as("SELECT * FROM job_game_pair_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            players.push(PlayerSettings::new("player 1", player(c.player1_config_id).await?));
+            players.push(PlayerSettings::new("player 2", player(c.player2_config_id).await?));
+            games = Some(GamesSettings {
+                unit: "pair",
+                per_batch: c.pairs_per_batch,
+                min_units: c.min_pairs,
+                max_units: c.max_pairs,
+                sprt_alpha: c.sprt_alpha,
+                sprt_beta: c.sprt_beta,
+                elo_low: c.elo_low,
+                elo_high: c.elo_high,
+                capture_positions: c.capture_positions,
+            });
+        }
+        JobType::OpeningRack => {
+            let c: OpeningRackConfig = sqlx::query_as("SELECT * FROM job_opening_rack_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            players.push(PlayerSettings::new("player", player(c.player_config_id).await?));
+            opening_racks = Some(c);
+        }
+        JobType::LeaveGeneration => {
+            let c: LeaveConfig = sqlx::query_as("SELECT * FROM job_leave_config WHERE job_id = $1")
+                .bind(id)
+                .fetch_one(pool)
+                .await?;
+            leave_generation = Some(LeaveSettings {
+                lexicon: file(c.kwg_id).await?,
+                num_iterations: c.num_iterations,
+                generation_count: c.generation_count,
+                target_rack_count: c.target_rack_count,
+                racks_per_task: c.racks_per_task,
+                use_wordmap: c.use_wordmap,
+            });
+        }
+    }
+
+    Ok(Json(JobConfigView {
+        job: JobSettings {
+            id: job.id,
+            name: job.name.clone(),
+            job_type: job.job_type,
+            variant: job.variant.clone(),
+            letter_distribution: file(job.letterdist_id).await?,
+            layout: file(job.layout_id).await?,
+            bingo_bonus: job.bingo_bonus,
+            sim_cutoff: job.sim_cutoff,
+            redundancy: job.redundancy,
+            min_magpie_version: job.min_magpie_version().to_string(),
+        },
+        games,
+        opening_racks,
+        leave_generation,
+        players,
+    }))
 }
 
 #[derive(Deserialize)]
@@ -765,6 +1051,150 @@ async fn rack_lookup(
     // page to.
     let total = items.len() as i64;
     Ok(super::CursorPage { items, total, per_page: total.max(1), next_cursor: None })
+}
+
+#[derive(Deserialize)]
+struct PositionsQuery {
+    per_page: Option<i64>,
+    cursor: Option<String>,
+    /// Only positions where the player to move held this rack, however it is
+    /// typed (canonicalised as the opening-rack lookup does).
+    rack: Option<String>,
+}
+
+/// The most positions one page returns: each carries its whole ranked list.
+const MAX_POSITIONS_PER_PAGE: i64 = 20;
+
+/// The positions a games or game-pairs job captured (`capture_positions`),
+/// newest first, each with its ranked moves: for signed-in users, since a job
+/// that captures holds millions of them and the public already has the
+/// results feed. A job that captured nothing is an empty page.
+async fn job_positions(
+    State(state): State<AppState>,
+    _user: crate::auth::CurrentUser,
+    Path(id): Path<Uuid>,
+    Query(query): Query<PositionsQuery>,
+) -> AppResult<Json<super::CursorPage<serde_json::Value>>> {
+    let job = load_job(&state, id).await?;
+    if !crate::exports::may_capture_positions(job.job_type) {
+        return Err(AppError::bad_request(
+            "only games and game-pairs jobs save the positions they play",
+        ));
+    }
+    let limit = query.per_page.unwrap_or(MAX_POSITIONS_PER_PAGE).clamp(1, MAX_POSITIONS_PER_PAGE);
+    let cursor = query.cursor.as_deref().and_then(super::decode_cursor);
+    let rack = query
+        .rack
+        .as_deref()
+        .map(str::trim)
+        .filter(|rack| !rack.is_empty())
+        .map(|rack| {
+            let mut chars: Vec<char> = rack.to_uppercase().chars().collect();
+            chars.sort_unstable();
+            chars.into_iter().collect::<String>()
+        });
+
+    const COLUMNS: &str = "r.id, r.task_id, r.rack, r.position, r.game_index, r.turn_number,
+                           r.previous_move, r.previous_move_score, r.num_moves, r.submitted_at";
+    // One rack: a seek into `position_analysis_records_game_rack_idx`, newest
+    // (highest id) first. Every position: the feed index, as the results feed
+    // reads it.
+    let rows = match &rack {
+        Some(rack) => {
+            let after = match cursor.as_deref() {
+                Some([id]) => id.parse::<i64>().ok(),
+                _ => None,
+            };
+            sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM position_analysis_records r
+                 WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NOT NULL
+                   AND ($3::bigint IS NULL OR r.id < $3)
+                 ORDER BY r.id DESC
+                 LIMIT $4"
+            ))
+            .bind(id)
+            .bind(rack)
+            .bind(after)
+            .bind(limit)
+            .fetch_all(&state.read_pool)
+            .await?
+        }
+        None => {
+            let (after_time, after_id) = opening_rack_cursor(cursor.as_deref());
+            sqlx::query(&format!(
+                "SELECT {COLUMNS} FROM position_analysis_records r
+                 WHERE r.job_id = $1 AND r.game_index IS NOT NULL
+                   AND ($2::timestamptz IS NULL OR (r.submitted_at, r.id) < ($2, $3))
+                 ORDER BY r.submitted_at DESC, r.id DESC
+                 LIMIT $4"
+            ))
+            .bind(id)
+            .bind(after_time)
+            .bind(after_id)
+            .bind(limit)
+            .fetch_all(&state.read_pool)
+            .await?
+        }
+    };
+
+    let next_cursor = (rows.len() as i64 == limit)
+        .then(|| rows.last())
+        .flatten()
+        .map(|last| {
+            let id = last.get::<i64, _>("id").to_string();
+            match rack {
+                Some(_) => super::encode_cursor(&[id]),
+                None => super::encode_cursor(&[
+                    last.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at")
+                        .timestamp_micros()
+                        .to_string(),
+                    id,
+                ]),
+            }
+        });
+
+    // The page's moves in one read of `(record_id, rank)`.
+    let ids: Vec<i64> = rows.iter().map(|r| r.get("id")).collect();
+    let mut moves: HashMap<i64, Vec<serde_json::Value>> = HashMap::new();
+    for m in sqlx::query(
+        "SELECT record_id, rank, move, score, equity, win_percentage
+         FROM position_analysis_moves
+         WHERE record_id = ANY($1)
+         ORDER BY record_id, rank",
+    )
+    .bind(&ids)
+    .fetch_all(&state.read_pool)
+    .await?
+    {
+        moves.entry(m.get("record_id")).or_default().push(serde_json::json!({
+            "rank": m.get::<i16, _>("rank"),
+            "move": m.get::<String, _>("move"),
+            "score": m.get::<i32, _>("score"),
+            "equity": m.get::<f64, _>("equity"),
+            "win_percentage": m.get::<Option<f64>, _>("win_percentage"),
+        }));
+    }
+
+    let items = rows
+        .into_iter()
+        .map(|r| {
+            let record: i64 = r.get("id");
+            serde_json::json!({
+                "task_id": r.get::<Uuid, _>("task_id"),
+                "game_index": r.get::<Option<i16>, _>("game_index"),
+                "turn_number": r.get::<Option<i16>, _>("turn_number"),
+                "rack": r.get::<String, _>("rack"),
+                "position": r.get::<Option<String>, _>("position"),
+                "previous_move": r.get::<Option<String>, _>("previous_move"),
+                "previous_move_score": r.get::<Option<i32>, _>("previous_move_score"),
+                "num_moves": r.get::<i32, _>("num_moves"),
+                "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
+                "moves": moves.remove(&record).unwrap_or_default(),
+            })
+        })
+        .collect();
+
+    Ok(Json(super::CursorPage { items, total: -1, per_page: limit, next_cursor }))
 }
 
 /// How many live job streams are open at once, across every job.

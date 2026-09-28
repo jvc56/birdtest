@@ -13,6 +13,8 @@
   let busy = false;
 
   let jobType: JobType = 'game_pairs';
+  // Shown first wherever jobs are listed, and as the job page's title.
+  let name = '';
   let redundancy = 1;
   // Pre-filled from the server-wide floor rather than left blank: a default
   // nobody sees is how every new job quietly inherits a floor that is too low.
@@ -42,6 +44,8 @@
   let sprtBeta = 0.05;
   let eloLow = -10;
   let eloHigh = 10;
+  // Keep every position the games analyse, searchable on the job's page.
+  let capturePositions = false;
   let numIterations = 10000;
   let generationCount = 1;
   let targetRackCount = 500;
@@ -99,6 +103,7 @@
 
   function body(): Record<string, unknown> {
     const common = {
+      name: name.trim(),
       job_type: jobType,
       // Leave generation runs at redundancy 1 only: the server refuses more.
       redundancy: jobType === 'leave_generation' ? 1 : redundancy,
@@ -120,13 +125,15 @@
         return {
           ...common,
           player1_config_id: player1, player2_config_id: player2,
-          games_per_batch: batchSize, min_games: minUnits, max_games: maxUnits, ...sprt
+          games_per_batch: batchSize, min_games: minUnits, max_games: maxUnits, ...sprt,
+          capture_positions: capturePositions
         };
       case 'game_pairs':
         return {
           ...common,
           player1_config_id: player1, player2_config_id: player2,
-          pairs_per_batch: batchSize, min_pairs: minUnits, max_pairs: maxUnits, ...sprt
+          pairs_per_batch: batchSize, min_pairs: minUnits, max_pairs: maxUnits, ...sprt,
+          capture_positions: capturePositions
         };
       case 'leave_generation':
         return {
@@ -175,6 +182,17 @@
 <!-- Any edit clears the last server error: a submit the browser blocks never
      reaches submit(), which is where it was cleared, so it lingered. -->
 <form class="card max-w-2xl space-y-4" on:submit|preventDefault={submit} on:input={() => { if (fromSubmit) { error = ''; fromSubmit = false; } }}>
+  <div>
+    <label class="label" for="name">Job name</label>
+    <input
+      id="name"
+      class="input"
+      bind:value={name}
+      required
+      maxlength="100"
+      placeholder="e.g. simmer 4-ply vs static, NWL23"
+    />
+  </div>
   <div>
     <label class="label" for="type">Job type</label>
     <select
@@ -283,7 +301,7 @@
           id="batch"
           type="number"
           min={jobType === 'games' ? 2 : 1}
-          max={jobType === 'games' ? 10000 : 5000}
+          max={(jobType === 'games' ? 10000 : 5000) / (capturePositions ? 10 : 1)}
           step={jobType === 'games' ? 2 : 1}
           class="input"
           bind:value={batchSize}
@@ -309,6 +327,18 @@
       <div><label class="label" for="beta">β</label><input id="beta" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtBeta} /></div>
       <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloLow} /></div>
       <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloHigh} /></div>
+    </div>
+    <div>
+      <label class="flex items-center gap-2">
+        <input type="checkbox" bind:checked={capturePositions} />
+        <span class="label mb-0">Save the positions played</span>
+      </label>
+      <p class="mt-1 text-xs text-muted-foreground">
+        Keeps the position analysed on every turn of every game, with its ranked moves, for
+        signed-in users to search on the job's page. It roughly doubles the rows a job produces,
+        and a batch is at most {jobType === 'games' ? '1,000 games' : '500 pairs'} while saving.
+        A static player records only the move it played; a simming player, its whole ranking.
+      </p>
     </div>
   {:else}
     <div>

@@ -4,11 +4,15 @@
   import { api, type JobStats } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { duration, datetime, jobTypeLabel, sprtLabel } from '$lib/format';
+  import { duration, datetime, jobTypeLabel, sprtLabel, sprtState, jobTitle } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
+  import CompletionNote from '$lib/components/CompletionNote.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import OutcomeChart from '$lib/components/OutcomeChart.svelte';
+  import JobSettings from '$lib/components/JobSettings.svelte';
+  import SavedPositions from '$lib/components/SavedPositions.svelte';
+  import { playersLine, type JobConfig } from '$lib/jobSettings';
   import { pentanomialRows } from '$lib/charts/pentanomial';
 
   // The [id] route only matches when the param is present.
@@ -16,13 +20,31 @@
 
   let stats: JobStats | null = null;
   let error = '';
+  // Fixed once the job exists: read once. Without it the page still shows.
+  let config: JobConfig | null = null;
 
   // Opening-rack search
   let rackQuery = '';
   let rackMoves: Record<string, unknown>[] | null = null;
   let rackError = '';
+  // A few racks the job has analysed, to try the search on: the newest, from
+  // the results feed. Read once, when the page knows it is an opening-rack job.
+  let sampleRacks: string[] = [];
+  let samplesRequested = false;
+  $: if (stats?.opening_racks && !samplesRequested) {
+    samplesRequested = true;
+    api
+      .jobResults(jobId, { per_page: 50 })
+      // One record per rack per accepted claim, so a rack can repeat.
+      .then((page) => (sampleRacks = [...new Set(page.items.map((r) => String(r.rack)))].slice(0, 10)))
+      .catch(() => (sampleRacks = []));
+  }
 
   onMount(() => {
+    api
+      .jobConfig(jobId)
+      .then((value) => (config = value))
+      .catch(() => (config = null));
     api
       .job(jobId)
       .then((value) => (stats = value))
@@ -63,10 +85,14 @@
 {:else}
   <div class="space-y-6">
     <header class="flex flex-wrap items-center gap-3">
-      <h1 class="text-2xl font-semibold">{jobTypeLabel(stats.job.job_type)}</h1>
+      <h1 class="text-2xl font-semibold">{jobTitle(stats.job)}</h1>
+      {#if stats.job.name}
+        <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
+      {/if}
       <JobStatusBadge status={stats.job.status} />
       <span class="text-sm text-muted-foreground">
-        {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}
+        {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}{#if config?.players.length}
+          · {playersLine(config)}{/if}
       </span>
       <!-- The admin page (activate, purge, export, artifacts) was reachable
            only by the redirect after creating the job. -->
@@ -74,6 +100,7 @@
         <a href="/admin/jobs/{stats.job.id}" class="btn-secondary ml-auto no-underline">Manage</a>
       {/if}
     </header>
+    <CompletionNote {stats} />
 
     <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
       <div class="card">
@@ -137,11 +164,15 @@
       </p>
     </div>
 
+    {#if config}
+      <JobSettings {config} />
+    {/if}
+
     {#if stats.games}
       <div class="card space-y-4">
         <div class="flex items-center justify-between">
           <h2 class="text-lg font-medium">SPRT</h2>
-          <JobStatusBadge status={stats.games.decided?.status ?? stats.games.sprt.status} />
+          <JobStatusBadge status={sprtState(stats.job.status, stats.games)} />
         </div>
         {#if stats.games.decided}
           <p class="text-sm text-muted-foreground">
@@ -150,6 +181,15 @@
             {stats.games.unit}{stats.games.decided.units === 1 ? '' : 's'}. With the {stats.games.unit}s that were in flight then, LLR
             {stats.games.sprt.llr.toFixed(3)}, bounds [{stats.games.sprt.lower_bound.toFixed(2)},
             {stats.games.sprt.upper_bound.toFixed(2)}].
+          </p>
+        {:else if stats.job.status !== 'active'}
+          <!-- Nothing is being played: the test is where it stopped, and said
+               "running" as if it were not. -->
+          <p class="text-sm text-muted-foreground">
+            {sprtLabel(sprtState(stats.job.status, stats.games))}{stats.job.status === 'inactive'
+              ? `: no ${stats.games.unit}s are being played, so the test is not moving`
+              : ''}. LLR {stats.games.sprt.llr.toFixed(3)}, bounds
+            [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
           </p>
         {:else}
           <p class="text-sm text-muted-foreground">
@@ -217,6 +257,20 @@
       </div>
     {/if}
 
+    {#if config?.games?.capture_positions}
+      {#if $session}
+        <SavedPositions {jobId} />
+      {:else if $session === null}
+        <div class="card space-y-1">
+          <h2 class="text-lg font-medium">Saved positions</h2>
+          <p class="text-sm text-muted-foreground">
+            This job keeps the position analysed on every turn of its games.
+            <a href="/login?next={encodeURIComponent(`/jobs/${jobId}`)}">Sign in</a> to search them.
+          </p>
+        </div>
+      {/if}
+    {/if}
+
     <!-- Ratings are pool-scoped and live on /ratings: a rating is a statement
          about a player config across every pair it has played, not something
          one job owns. -->
@@ -248,6 +302,20 @@
             />
             <button class="btn-primary" on:click={lookupRack}>Search</button>
           </div>
+          {#if sampleRacks.length}
+            <div class="flex flex-wrap items-center gap-2 text-sm">
+              <span class="text-muted-foreground">Analysed racks to try:</span>
+              {#each sampleRacks as rack}
+                <button
+                  class="rounded border border-border px-2 py-0.5 font-mono text-xs hover:bg-muted"
+                  on:click={() => {
+                    rackQuery = rack;
+                    lookupRack();
+                  }}>{rack}</button
+                >
+              {/each}
+            </div>
+          {/if}
           {#if rackError}<p class="field-error">{rackError}</p>{/if}
           {#if rackMoves?.length}
             <div class="overflow-x-auto">

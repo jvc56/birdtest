@@ -698,11 +698,15 @@ async fn create_player_config(
     .bind(stopping_pct)
     .bind(use_inference)
     .bind(body.time_limit_secs)
-    .bind(body.use_wordmap.unwrap_or(false))
-    // Absent means no, for both: a rack info table is a large, slow thing to
-    // provision, and a config that did not ask for one must not get one
-    // because a default said so.
-    .bind(body.use_rit.unwrap_or(false))
+    // On unless the config says otherwise, as the form has it: a wordmap is a
+    // large speedup in move generation, and workers build one on demand.
+    .bind(body.use_wordmap.unwrap_or(true))
+    // On unless the config says otherwise, as the form has it: a rack info
+    // table speeds up move generation further still. It is large -- about
+    // 1.9 GB on a contributor's disk and in its memory -- and the server
+    // builds it before any job using it dispatches, once per (lexicon,
+    // leaves) pair.
+    .bind(body.use_rit.unwrap_or(true))
     .bind(min_play_iterations)
     .bind(&threshold)
     .bind(&sampling_rule)
@@ -881,7 +885,7 @@ fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
     // hash with every claim, and the file is named for the pair rather than
     // the lexicon, so two jobs on one lexicon with different leaves cannot
     // share one. A job that asks for a table waits until it is built; see
-    // `derived` and MAGPIE_DEPENDENCY.md.
+    // `derived` and README.md's "MAGPIE on the server".
     if err.fields.is_empty() {
         Ok(())
     } else {
@@ -976,6 +980,10 @@ pub(crate) async fn require_role(
 
 #[derive(Deserialize)]
 struct CreateJobBody {
+    /// What to call the job: shown first wherever jobs are listed. Optional
+    /// here, for scripts; the creation form asks for it.
+    #[serde(default)]
+    name: Option<String>,
     job_type: JobType,
     #[serde(default = "one")]
     redundancy: i32,
@@ -1150,8 +1158,8 @@ async fn create_job(
         "INSERT INTO jobs
              (job_type, redundancy, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
-              sim_cutoff, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
+              sim_cutoff, created_by, name)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *",
     )
     .bind(body.job_type)
     .bind(body.redundancy)
@@ -1167,6 +1175,7 @@ async fn create_job(
     .bind(crate::magpie_defaults::BINGO_BONUS)
     .bind(crate::magpie_defaults::SIM_CUTOFF)
     .bind(admin.0.id)
+    .bind(job_name(&body))
     .fetch_one(&mut *tx)
     .await?;
 
@@ -1251,8 +1260,24 @@ fn games_batch_field(mut err: AppError, unit: &str, games_per_unit: i32, batch: 
 /// LLR's sign, so SPRT confidently accepts the wrong hypothesis; an `alpha` of
 /// 0 or 1 puts a logarithm of zero or infinity in the bounds. Every problem is
 /// reported at once, like registration does.
+/// The longest job name, in characters (the column's check).
+const MAX_JOB_NAME_CHARS: usize = 100;
+
+/// The job's name as stored: trimmed, empty when none was given.
+fn job_name(body: &CreateJobBody) -> String {
+    body.name.as_deref().unwrap_or("").trim().to_string()
+}
+
 fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let mut err = AppError::bad_request("job settings are invalid");
+    let name = job_name(body);
+    // Shown in every job list and as the job page's title: a line, not a
+    // document, and nothing that breaks or hides in one.
+    if name.chars().count() > MAX_JOB_NAME_CHARS {
+        err = err.with_field("name", format!("at most {MAX_JOB_NAME_CHARS} characters"));
+    } else if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+        err = err.with_field("name", "one line, with no control characters");
+    }
     if body.redundancy < 1 {
         err = err.with_field("redundancy", "must be at least 1");
     }

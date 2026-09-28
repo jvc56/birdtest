@@ -16,6 +16,11 @@ pub struct Config {
     pub session_signing_key: [u8; 32],
     pub session_ttl: Duration,
     pub secure_cookies: bool,
+    /// `GET /api/dev/login`: sign a browser in as any account by name, with
+    /// no password, so `scripts/dev.py` opens the site signed in. For the
+    /// local compose stack only, which sets it; refused beside
+    /// `SECURE_COOKIES=true`, which production sets.
+    pub dev_login: bool,
     pub mail_backend: MailBackend,
     /// Where `MAIL_BACKEND=file` writes one file per message. Required by that
     /// backend and read by nothing else.
@@ -225,6 +230,16 @@ impl Config {
             "false" => false,
             other => anyhow::bail!("SECURE_COOKIES must be 'true' or 'false', got {other:?}"),
         };
+        let dev_login = match var_or("DEV_LOGIN", "false").as_str() {
+            "true" => true,
+            "false" => false,
+            other => anyhow::bail!("DEV_LOGIN must be 'true' or 'false', got {other:?}"),
+        };
+        // A login with no password has no place behind TLS: a deployment
+        // that set it by mistake would hand every account to anyone.
+        if dev_login && secure_cookies {
+            anyhow::bail!("DEV_LOGIN=true is for a local stack, and refused with SECURE_COOKIES=true");
+        }
 
         let min_magpie_version = var_or("MIN_MAGPIE_VERSION", "0.1.1");
         // Strictly, as a job's floor is: the new-job form offers this value,
@@ -249,6 +264,7 @@ impl Config {
             // TTL past what a date can hold panicked every sign-in.
             session_ttl: seconds_in(lookup, "SESSION_TTL_SECONDS", 604_800, 60, 31_536_000)?,
             secure_cookies,
+            dev_login,
             mail_backend,
             mail_outbox_dir,
             mail_from: mail_from.unwrap_or_else(|| "no-reply@birdtest.local".into()),
@@ -332,6 +348,7 @@ mod tests {
             ("BIND_ADDR", "0.0.0.0:8080", "127.0.0.1:9", |c| c.bind_addr.clone()),
             ("SESSION_TTL_SECONDS", "604800", "60", |c| c.session_ttl.as_secs().to_string()),
             ("SECURE_COOKIES", "false", "true", |c| c.secure_cookies.to_string()),
+            ("DEV_LOGIN", "false", "true", |c| c.dev_login.to_string()),
             ("MAIL_BACKEND", "Console", "ses", |c| format!("{:?}", c.mail_backend)),
             ("MAIL_FROM", "no-reply@birdtest.local", "a@b.c", |c| c.mail_from.clone()),
             ("PUBLIC_URL", "http://localhost:5173", "https://x.y", |c| c.public_url.clone()),
@@ -420,6 +437,7 @@ mod tests {
             ("MAIL_MAX_PER_SECOND", "0"),
             ("MAIL_MAX_PER_SECOND", "2000000000"),
             ("SECURE_COOKIES", "yes"),
+            ("DEV_LOGIN", "yes"),
             ("MAIL_BACKEND", "smtp"),
             // The file backend with nowhere to write.
             ("MAIL_BACKEND", "file"),
@@ -431,6 +449,9 @@ mod tests {
         }
         let file = config(&[("MAIL_BACKEND", "file"), ("MAIL_OUTBOX_DIR", "/outbox")]).unwrap();
         assert_eq!(file.mail_backend, MailBackend::File);
+        // The local stack's password-free sign-in, never beside TLS.
+        let err = config(&[("DEV_LOGIN", "true"), ("SECURE_COOKIES", "true")]).unwrap_err();
+        assert!(err.to_string().contains("DEV_LOGIN"), "{err}");
         let ses = [("MAIL_BACKEND", "ses"), ("MAIL_FROM", "a@b.c"), ("PUBLIC_URL", "https://x.y")];
         for missing in ["MAIL_FROM", "PUBLIC_URL"] {
             let pairs: Vec<_> = ses.into_iter().filter(|(k, _)| *k != missing).collect();

@@ -114,6 +114,28 @@ export interface Page<T> {
  * for. Pass `next_cursor` back as `cursor` for the next page; its absence is
  * the end. This is the only endpoint that pages this way.
  */
+/** A position a games or pairs job captured, with its ranked moves. */
+export interface SavedPosition {
+  task_id: string;
+  game_index: number;
+  turn_number: number;
+  rack: string;
+  /** CGP. */
+  position: string | null;
+  previous_move: string | null;
+  previous_move_score: number | null;
+  num_moves: number;
+  submitted_at: string;
+  moves: {
+    rank: number;
+    move: string;
+    score: number;
+    equity: number;
+    /** Null for a static player. */
+    win_percentage: number | null;
+  }[];
+}
+
 export interface CursorPage<T> {
   items: T[];
   /** Always -1: an exact count costs more than it is worth to the caller. */
@@ -124,6 +146,8 @@ export interface CursorPage<T> {
 
 export interface JobListItem {
   id: string;
+  /** What the admin called it; empty for a job created without one. */
+  name: string;
   job_type: JobType;
   status: JobStatus;
   /** The job's share of claims while active (not of worker time: PLAN's KL-88); null until first activated. 0% means what inactive means. */
@@ -144,6 +168,7 @@ export interface JobListItem {
  */
 export interface JobRow {
   id: string;
+  name: string;
   job_type: JobType;
   status: JobStatus;
   allocation: number | null;
@@ -192,9 +217,23 @@ export interface GameStats {
   decided?: { status: SprtResult['status']; llr: number; units: number };
 }
 
+/**
+ * How a job was completed. `forced` is an admin's force-complete; otherwise
+ * `reason` is the server's: the SPRT verdict (`passed`, `failed`,
+ * `terminated_at_max`), `last generation built`, or none for an opening-rack
+ * job whose racks were all analysed.
+ */
+export interface Completion {
+  at: string;
+  forced: boolean;
+  reason: string | null;
+}
+
 export interface JobStats {
   job: {
     id: string;
+    /** What the admin called it; empty for a job created without one. */
+    name: string;
     job_type: JobType;
     status: JobStatus;
     allocation: number | null;
@@ -243,6 +282,8 @@ export interface JobStats {
   /** Contributors beyond the ones listed; the list is capped. */
   other_workers: number;
   eta_seconds: number | null;
+  /** How a completed job came to be completed; absent while it is not. */
+  completion?: Completion;
 }
 
 export interface PlayerConfig {
@@ -497,6 +538,7 @@ export const api = {
   revokeApiKey: (id: string) => del<void>(`/api/me/api-keys/${id}`),
 
   // Public
+  jobConfig: (id: string) => get<import('$lib/jobSettings').JobConfig>(`/api/jobs/${id}/config`),
   jobs: (page = 0, status?: JobStatus) =>
     get<Page<JobListItem>>(`/api/jobs?page=${page}${status ? `&status=${status}` : ''}`),
   job: (id: string) => get<JobStats>(`/api/jobs/${id}`),
@@ -507,9 +549,17 @@ export const api = {
         Object.entries(params).map(([k, v]) => [k, String(v)])
       )}`
     ),
+  /** Signed-in users only: a games or pairs job's captured positions. */
+  jobPositions: (id: string, params: Record<string, string | number> = {}) =>
+    get<CursorPage<SavedPosition>>(
+      `/api/jobs/${id}/positions?${new URLSearchParams(
+        Object.entries(params).map(([k, v]) => [k, String(v)])
+      )}`
+    ),
+  publicPlayerConfigs: () => get<import('$lib/jobSettings').PublicPlayerConfig[]>('/api/player-configs'),
+  publicPlayerConfig: (id: string) => get<import('$lib/jobSettings').PublicPlayerConfig>(`/api/player-configs/${id}`),
   ratingPools: () => get<RatingPoolListItem[]>('/api/rating-pools'),
   ratingPool: (id: string) => get<RatingPoolDetail>(`/api/rating-pools/${id}`),
-  ratingHistory: (id: string) => get<RatingHistoryPoint[]>(`/api/rating-pools/${id}/history`),
 
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
   workers: (page = 0) => get<Page<Record<string, unknown>>>(`/api/workers?page=${page}`),
@@ -659,10 +709,3 @@ export interface RatingPoolDetail {
   residuals: RatingResidual[];
 }
 
-export interface RatingHistoryPoint {
-  computed_at: string;
-  player_config_id: string;
-  name: string;
-  rating: number;
-  stderr: number;
-}

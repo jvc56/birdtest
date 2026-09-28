@@ -10,8 +10,8 @@ ARG MAGPIE_COMMIT=8f2f5d7515237972ca792e21314d1de3a9b005d2
 #
 # The backend image carries a pinned MAGPIE. The server builds the reference
 # copy of every wordmap, rack info table and leave-generation KLV with it, and
-# publishes the hash for workers to reproduce — see MAGPIE_DEPENDENCY.md. It is
-# built here from a pinned commit rather than downloaded, so the image records
+# publishes the hash for workers to reproduce — see README.md's "MAGPIE on the
+# server". It is built here from a pinned commit rather than downloaded, so the image records
 # exactly which MAGPIE produced the hashes it hands out.
 #
 # It is built `portable_release`, not the usual `-march=native`: a binary built

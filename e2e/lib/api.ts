@@ -82,7 +82,9 @@ export class AdminApi {
       sort_strategy: sortStrategy,
       kwg_id: data.kwg,
       klv_id: data.klv,
-      num_plays_recorded: plays
+      num_plays_recorded: plays,
+      use_wordmap: false,
+      use_rit: false
     });
     return created.id;
   }

@@ -479,18 +479,13 @@ Ratings are **displayed on the ratings pages and nowhere else**:
   the residual table showing where the fit disagrees with the games. A config
   with no path of games to the anchor is listed as unrated rather than drawn.
   Admin membership controls appear inline here for admins.
-- The **history chart** on the same page (`GET /api/rating-pools/:id/history`)
-  — one line for each of the six current members rated highest in the newest
-  run, across the stored runs, thinned to at most 500 evenly spaced points
-  with the first and newest always kept. Only those six are sent: every
-  member's every point went out on each view of this public page, and a
-  burst of views at a hundred members answered other readers `503` (the
-  audit's pass 25). Each line is labelled at its end, the labels moved apart
-  where lines end close together, and long names are shortened together —
-  the segments a family of configs shares dropped, the rest shortened in the
-  middle, and labels still alike widened where they differ — so no two drawn
-  labels read the same (the full name is each one's title); the dot plot's
-  names likewise.
+- **No history chart.** The page once drew each config's rating across the
+  stored runs; it was removed as more noise than signal on a page read for the
+  latest fit. `GET /api/rating-pools/:id/history` still serves those series to
+  API callers. Long config names on the dot plot are shortened together -- the
+  segments a family of configs shares dropped, the rest shortened in the
+  middle, and labels still alike widened where they differ -- so no two read
+  the same (the full name is each one's title).
 
 A job's own pages (`/jobs/[id]`) show its SPRT verdict, win rate and
 pentanomial, and **no rating**: a rating belongs to a pool, not to a job, and a
@@ -706,8 +701,8 @@ pool of twenty, for the life of the pool. Inside the month the run-by-run diff
 is what answers "why did this rating change?". Past it, an hourly sweep
 (`ratings::thin_old_runs`) keeps each UTC day's last run and the pool's first
 and deletes the rest, their ratings and residuals cascading. A day is the
-resolution the history chart draws at anyway — it thins to 500 points over the
-pool's whole life — so the chart keeps its shape and its ends; deleting
+resolution the history endpoint serves at anyway — it thins to 500 points over
+the pool's whole life — so the history keeps its shape and its ends; deleting
 everything past the window would have started its past at the window's edge.
 The newest run, the one the page shows, is the last of its day and so always
 survives, however long the pool has been quiet. Runs go in batches of a
@@ -855,11 +850,13 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 - SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `stopped at its cap`.
 - The pentanomial (game pairs only): the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
 - Running result counts and percentages: wins / losses / draws for player 1.
+- **Saved positions**, for a job with `capture_positions` set: the latest captured positions, ten at a time, each with its board (CGP), the rack of the player to move, the move before it and the ranked moves; and a search for the positions played from one rack. Signed-in users only (`GET /api/jobs/:id/positions`); a signed-out visitor is told to sign in. The public has the results feed, and a job that captures holds millions of positions.
 
 **Opening rack analysis**
 
 - Progress: racks analyzed against the size of the rack space, and nothing else.
 - Search input: enter a rack string to look up its analysis. Returns the full ranked move list (all N plays that were evaluated) for that rack, sourced from `position_analysis_moves`.
+- Below it, up to ten racks the job has analysed -- the newest, from the first page of the results feed -- each a button that looks it up, so a visitor has something to try.
 
   The panel used to carry the average best equity and a breakdown of what the
   best opening play was — placement, exchange or pass — and both are gone.
@@ -1417,6 +1414,7 @@ start. The process has no SSM code path of its own.
 | `BIND_ADDR` | `0.0.0.0:8080` | An IP address and port; a host name fails startup. |
 | `SESSION_TTL_SECONDS` | `604800` (7 days) | 60 to 31,536,000 (a year); anything else fails startup. |
 | `SECURE_COOKIES` | `false` | `true` in any deployment served over TLS. |
+| `DEV_LOGIN` | `false` | `true` mounts `GET /api/dev/login?username=…[&next=/path]`, which signs a browser in as any account by name with no password; the local compose stack sets it, so `scripts/dev.py` opens the site signed in. Refused with `SECURE_COOKIES=true`, so no deployment can run with it. |
 | `MAIL_BACKEND` | `console` | `console`, `ses`, or `file` — the end-to-end suite's, never production: each mail written to `MAIL_OUTBOX_DIR`, which it requires. Anything else fails startup. |
 | `MAIL_OUTBOX_DIR` | unset | The `file` backend's directory. |
 | `MAIL_FROM` | `no-reply@birdtest.local` | Required under `ses`: the default is only for local use, and SES refuses it. |
@@ -2798,7 +2796,7 @@ So the transfer is a CSV instead: `generation_klv` streams the generation's roug
 
 `rackequity2klv` is new on the MAGPIE side, along with a `RackList` setter that takes a rack's count and mean outright: `rack_list_add_rack` folds one game's equity at a time, which is what a `leavegen` run has and not what a whole generation's aggregate is. Every full rack must appear exactly once in the CSV — a rack the file omits would contribute a mean of zero at full weight to every leave it contains, which is a real leave value and indistinguishable from a measured one — so MAGPIE marks every rack unset before reading and refuses a file that leaves any of them that way.
 
-The generation-0 zeroed KLV is `magpie createdata klv`, which builds exactly that from the letter distribution alone. MAGPIE_DEPENDENCY.md proposed a `convert zero2klv` for it; `createdata klv` already is it, through the same `klv_create_empty`, and one spelling is better than two.
+The generation-0 zeroed KLV is `magpie createdata klv`, which builds exactly that from the letter distribution alone. The original design proposed a `convert zero2klv` for it; `createdata klv` already is it, through the same `klv_create_empty`, and one spelling is better than two.
 
 
 **Dashboard progress**: two kinds of figure, and the page says which is which. *Live*, pushed as results land through the per-job SSE stream: tasks completed and games played in the in-progress generation, from the counters the submit transaction bumps. *As of the last merge*, shown with its time: racks at target and the rack with the fewest occurrences, from the summary each merge writes. Both are one row read (`leave_generation_progress`); counted from `leave_rack_progress` on read, as they were, the rack figures were a pass over 3.2 million rows on every detail view and every live push (210 ms measured). No heartbeat payload is needed for either. An admin who wants the rack figures current can merge on demand (`POST /api/admin/jobs/:id/merge-progress`, "Merge progress now" on the admin job page).
@@ -3217,7 +3215,7 @@ never run against anything but a disposable test stack.
 
 birdtest's backend runs a pinned MAGPIE, built into its image from a recorded
 commit. It has two jobs, and the second is the reason the first became worth
-doing (see [MAGPIE_DEPENDENCY.md](MAGPIE_DEPENDENCY.md)):
+doing (see [MAGPIE on the server](README.md#magpie-on-the-server) in the README):
 
 - **Reference copies of derived files.** A wordmap and a rack info table are
   built on each contributor's own machine and are far too large to ship. The
@@ -3847,8 +3845,9 @@ pentanomial and the divergent counts kept only as a diagnostic.
 Whether either file is used is the **job's** decision, not the client's: both
 are player settings like any other, sent as `use_wordmap` and `use_rit` on each
 player object (and, for `leave_generation`, which has one bot rather than a
-player pair, `use_wordmap` on the request itself). A job that omits them runs
-without them. Games run dramatically faster with a wordmap, so most jobs will
+player pair, `use_wordmap` on the request itself). The config decides; a
+config created without saying gets a wordmap and a rack info table (see
+"Creating a player config"). Games run dramatically faster with a wordmap, so most jobs will
 ask for it — but the client neither assumes it nor builds one it was not asked
 for, and a file already sitting in `./data` from an earlier job is not switched
 on by its mere presence.
@@ -4887,11 +4886,11 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/admin/player-configs` | List all player configurations. |
+| `GET` | `/api/admin/player-configs` | List all player configurations, as stored (file ids, creator). The public `GET /api/player-configs` and `/:id` serve every setting with files by name, and not who made it. |
 | `POST` | `/api/admin/player-configs` | Create a new player configuration. Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), more than 200,000 plays generated (MAGPIE allocates every one up front, and a static player ranking every opening play needs up to some 64,000) or 32,767 recorded (a stored rank is a `SMALLINT`), a margin that is negative, not finite or past MAGPIE's largest equity (2,147,483.645), as well as non-positive counts. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
-| `POST` | `/api/admin/jobs` | Create a new job. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (every MAGPIE build the fleet runs has `BOARD_DIM` 15, so every worker would fail every task) and an SPRT `alpha` below 0.000001 (an infinite upper bound; `beta` has the same floor for symmetry). |
+| `POST` | `/api/admin/jobs` | Create a new job, with an optional `name` (at most 100 characters, one line; the form asks for it) shown first wherever jobs are listed and as the job page's title. Created in the `inactive` state — see `.../activate` to set its allocation and start dispatching work. Refuses a board layout that is not 15×15 (every MAGPIE build the fleet runs has `BOARD_DIM` 15, so every worker would fail every task) and an SPRT `alpha` below 0.000001 (an infinite upper bound; `beta` has the same floor for symmetry). |
 | `POST` | `/api/admin/jobs/:id/deactivate` | Set a job to inactive. Workers will no longer be assigned tasks from it. Refused (`409`) for a completed job. |
 | `POST` | `/api/admin/jobs/:id/activate` | Activate an inactive job. Body: `{ "allocation": int }`. Sets allocation and transitions status to active. |
 | `POST` | `/api/admin/jobs/:id/complete` | Force-complete a job immediately, regardless of task progress. Refused (`409`) for a job that is already completed. |
@@ -4957,7 +4956,10 @@ Whatever the body leaves out is filled from MAGPIE's defaults
 (`backend/src/magpie_defaults.rs`) before the row is written, so the stored config
 is exactly what every request built from it states: `sort_strategy` (`equity`),
 `num_plies` (0, static), `num_plays` (100), `num_plies_recorded` (2),
-`movegen_margin` (5), `use_wordmap` (false), and for a simmer every simulation
+`movegen_margin` (5), `use_wordmap` and `use_rit` (both true -- the two
+defaults that are birdtest's rather than MAGPIE's: each is a large speedup,
+workers build their own on demand, and the admin form has both checked; a rack
+info table costs a contributor about 1.9 GB of disk and of memory), and for a simmer every simulation
 setting. A static player may not set a simulation setting at all — nothing would
 read it — and a CHECK on the table holds the two sets apart. `num_plays` is not a
 simulation setting: an opening-rack analysis sizes its move list from it,
@@ -5102,15 +5104,19 @@ do not exist.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated; `?status=active` (or `inactive`, `completed`) lists only those, with a matching total. |
-| `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics. |
+| `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), its type's (a games or pairs job's batch, minimum, cap and SPRT parameters; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name and its id. No creator, no user ids. |
+| `GET` | `/api/player-configs` | Every player config, newest first, public: every setting with files by name, the config it was cloned from and when it was made. No creator. |
+| `GET` | `/api/player-configs/:id` | One player config, in the same shape. |
+| `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the SPRT verdict, `last generation built`, or none when an opening-rack job's racks ran out). |
 | `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
+| `GET` | `/api/jobs/:id/positions` | **Signed in.** A games or game-pairs job's captured positions, newest first, at most 20 a page by cursor, each with its CGP, game, turn, rack, previous move and ranked moves. `?rack=` keeps those whose player to move held that rack, however it is typed. Another job type is a `400`. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
 | `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated), paginated. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
 | `GET` | `/api/rating-pools/:id` | Latest fit for one pool: run provenance, every member's rating with uncertainty, and the residuals. |
-| `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run — the history chart's series. |
+| `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
 
 **Rack lookup** canonicalizes the query before matching: uppercased, whitespace
 trimmed, letters sorted. A rack is a multiset of tiles, so `AEINRST` and
@@ -5134,10 +5140,12 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 |---|---|
 | `/` | Landing page — brief description of birdtest, links to the job list and the worker setup guide. |
 | `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
-| `/jobs/[id]` | Job detail — job-type-specific stats and per-worker contribution table. Live-updated via SSE. |
+| `/jobs/[id]` | Job detail — job-type-specific stats and per-worker contribution table. Live-updated via SSE. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Settings card repeats that per player and holds every setting behind "All settings" — the job's, its type's, and the players' side by side with those they differ in marked — and a JSON download (`GET /api/jobs/:id/config`). |
 | `/users` | Registered user list — all user accounts with contribution stats. |
 | `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by tasks completed. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
+| `/player-configs` | Every player config, newest first: its name, how it searches, its lexicon and leaves. Public, like the job pages that already show players' settings. |
+| `/player-configs/[id]` | One config: its key settings (search, files, plays considered, what is kept, wordmap and rack info table), every setting behind "All settings", a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
 | `/ratings/[id]` | [The ratings page](#the-ratings-page) — ratings with uncertainty, history, and residuals. Admin controls for membership appear inline for admins. |
 
 ### Auth Routes
@@ -5166,10 +5174,11 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | Route | Page |
 |---|---|
 | `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
-| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields. |
+| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs. |
 | `/admin/jobs/[id]` | Admin job view — the job's progress, ETA, status, contributors and data gaps (what workers declined it for; the public page has the rest: pentanomial, W/L/D, SPRT bounds) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form. |
+| `/admin/rating-pools/new` | Create rating pool form — name, variant, letter distribution, board layout, anchor config and rating, and optionally the other members to add once it exists. Linked from `/ratings` for an admin; membership is managed on the pool's page after that. |
 | `/admin/users` | User account list — delete accounts. (Contribution stats are shown publicly at `/users`.) |
 | `/admin/workers` | Worker ban management — ban / unban workers by user ID or anonymous UUID. |
 | `/admin/audit-log` | Audit log viewer — filterable by action and target type; paginated. (Not by actor: the page has no actor filter.) |
@@ -5196,14 +5205,6 @@ anchor is listed beneath the chart as **unrated** rather than drawn at a number.
 
 **A table of every config**, since the chart caps what it draws and the table
 must not. This is also the accessible view of the same data.
-
-**Rating history**, one line per config, from the run snapshots — thinned to at
-most 500 runs spaced evenly over the pool's life, the first and the newest always
-kept, since a pool with an active job is refit every two minutes. The categorical
-palette is a fixed list rather than a generator, so past six configs the page
-shows the top six by rating and says how many it left out — inventing a seventh
-hue nobody can distinguish would be worse than omitting it. Every line is
-directly labelled at its right end, so identity never depends on colour alone.
 
 **Where the model disagrees with the games.** The residual table: actual score
 versus predicted, per head-to-head, largest disagreement first. This is the panel
@@ -5282,7 +5283,7 @@ birdtest/
 │       │                           # rules, ported to Rust — see Input Data
 │       ├── inputdata.rs            # tarball fetch, untar, per-file digest, diff against input_data
 │       ├── magpie.rs               # the pinned MAGPIE binary as a subprocess, and its scratch
-│       │                           # data directories — see MAGPIE_DEPENDENCY.md
+│       │                           # data directories — see README.md, "MAGPIE on the server"
 │       ├── magpie_standard15.txt   # the board layout every scratch directory carries so MAGPIE starts
 │       ├── magpie_defaults.rs      # MAGPIE's defaults, written into player configs and jobs at creation
 │       ├── derived.rs              # wordmaps and rack info tables: what a job needs, the build
@@ -5352,7 +5353,6 @@ birdtest/
 │       │       ├── ProgressBar.svelte
 │       │       ├── OutcomeChart.svelte   # LayerCake: win/loss/draw over time
 │       │       ├── RatingDotPlot.svelte  # ratings with error bars (not a bar chart: Elo has no zero)
-│       │       ├── RatingHistoryChart.svelte  # rating over time, one line per config
 │       │       ├── ResidualMatrix.svelte # actual vs predicted per head-to-head
 │       │       ├── Bars.svelte           # LayerCake mark layer
 │       │       └── AxisY.svelte          # LayerCake axis layer
@@ -5398,6 +5398,9 @@ birdtest/
 │               │   ├── +page.svelte                # /admin/player-configs
 │               │   └── new/
 │               │       └── +page.svelte            # /admin/player-configs/new
+│               ├── rating-pools/
+│               │   └── new/
+│               │       └── +page.svelte            # /admin/rating-pools/new
 │               ├── users/
 │               │   └── +page.svelte                # /admin/users
 │               ├── workers/
@@ -5699,7 +5702,7 @@ CREATE TABLE input_data_import_rows (
 -- machine that needs one builds it from files it already has. What travels
 -- instead is the SHA-256 the server's own pinned MAGPIE got from the same
 -- inputs: a worker builds its own copy and uses it only if the bytes agree,
--- and declines the task otherwise. See MAGPIE_DEPENDENCY.md.
+-- and declines the task otherwise. See README.md, "MAGPIE on the server".
 --
 -- The key is the whole identity of the file rather than a surrogate, because
 -- what makes two derived files the same file is that they were built from the
@@ -5796,6 +5799,9 @@ CREATE TYPE job_status AS ENUM (
 
 CREATE TABLE jobs (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    -- What the admin called it, shown first wherever jobs are listed. '' for
+    -- a job created without one (through the API; the form asks for it).
+    name       TEXT NOT NULL DEFAULT '' CHECK (char_length(name) <= 100),
     job_type   job_type NOT NULL,
     -- NULL until the job is first activated; set by the admin at activation
     -- time. Every active job's share of the *claims* (not of worker time, KL-88):
@@ -6554,6 +6560,12 @@ CREATE INDEX position_analysis_records_feed_idx
 -- incidentally-captured in-game position is not an opening-rack analysis.
 CREATE INDEX position_analysis_records_job_rack_idx
     ON position_analysis_records (job_id, rack) WHERE game_index IS NULL;
+
+-- The positions search (`/api/jobs/:id/positions?rack=`): a game's positions
+-- with one rack, newest first. In-game positions only, so the index costs a
+-- job nothing unless it captures.
+CREATE INDEX position_analysis_records_game_rack_idx
+    ON position_analysis_records (job_id, rack, id) WHERE game_index IS NOT NULL;
 
 -- The cascade from a claim (`task_claim_id ... ON DELETE CASCADE`). The
 -- partial unique index on (task_claim_id, rack) above cannot serve it: a plain

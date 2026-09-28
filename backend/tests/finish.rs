@@ -112,6 +112,11 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
     assert!(games.sprt.llr < decided_llr, "the live LLR moved: {} vs {decided_llr}", games.sprt.llr);
     let stored = games.decided.expect("the stored verdict is reported");
     assert_eq!((stored.status.as_str(), stored.llr), ("passed", decided_llr));
+    // I-STATS-9f: and the page is told why it finished -- its test, not an
+    // admin and not its cap.
+    let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
+    assert!(!completion.forced);
+    assert_eq!(completion.reason.as_deref(), Some("passed"));
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +201,29 @@ async fn an_opening_rack_job_completes_once_its_racks_are_handed_out_and_all_acc
     .await
     .unwrap();
     assert_eq!(logged, vec![(None, Some("active".to_string()), Some("completed".to_string()))]);
+    // I-STATS-9f: its racks ran out -- no verdict, no admin.
+    let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
+    assert_eq!((completion.forced, completion.reason), (false, None));
+}
+
+/// I-STATS-9f: an admin's force-complete is reported as one, and a job that
+/// is not completed reports no completion.
+#[tokio::test]
+async fn a_forced_completion_is_reported_as_forced() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let admin = db.user("root", true).await;
+    let job = db.games_job(1, 10).await;
+    let row = jobstats::load_job(&db.pool, job).await.unwrap();
+    assert!(jobstats::compute(&db.pool, &row).await.unwrap().completion.is_none());
+
+    let headers = admin_headers(&db.config(), admin);
+    let (status, body) = send(&app, post_json(&format!("/api/admin/jobs/{job}/complete"), &headers
+        .iter().map(|(k, v)| (k.as_str(), v.as_str())).collect::<Vec<_>>(), json!({}))).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = jobstats::load_job(&db.pool, job).await.unwrap();
+    let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
+    assert_eq!((completion.forced, completion.reason), (true, None));
 }
 
 /// I-STATS-9 (opening racks): a declined task goes back to `available`, and a

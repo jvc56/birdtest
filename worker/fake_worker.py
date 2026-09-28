@@ -123,7 +123,9 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
             position = {
                 "game_index": game_index,
                 "turn_number": turn,
-                "rack": "".join(rng.choice("AEINRSTLOU") for _ in range(7)),
+                # Sorted, as MAGPIE writes a rack: the positions search
+                # canonicalises what it is asked for the same way.
+                "rack": "".join(sorted(rng.choice("AEINRSTLOU") for _ in range(7))),
                 "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
                 "num_moves": ranked,
                 "moves": [
