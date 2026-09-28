@@ -4886,7 +4886,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/admin/player-configs` | List all player configurations. |
+| `GET` | `/api/admin/player-configs` | List all player configurations, as stored (file ids, creator). The public `GET /api/player-configs` and `/:id` serve every setting with files by name, and not who made it. |
 | `POST` | `/api/admin/player-configs` | Create a new player configuration. Refuses what MAGPIE would refuse or cut short: more than 25 plies (`MAX_PLIES`), more than 10 recorded plies (what a captured position keeps), more than 200,000 plays generated (MAGPIE allocates every one up front, and a static player ranking every opening play needs up to some 64,000) or 32,767 recorded (a stored rank is a `SMALLINT`), a margin that is negative, not finite or past MAGPIE's largest equity (2,147,483.645), as well as non-positive counts. |
 | `GET` | `/api/admin/player-configs/:id` | Get a single player configuration. |
 | `DELETE` | `/api/admin/player-configs/:id` | Delete a player configuration. Rejected if any job, rating pool, rating history or clone references it. |
@@ -5104,7 +5104,9 @@ do not exist.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated; `?status=active` (or `inactive`, `completed`) lists only those, with a matching total. |
-| `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), its type's (a games or pairs job's batch, minimum, cap and SPRT parameters; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name. No creator, no user ids. |
+| `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), its type's (a games or pairs job's batch, minimum, cap and SPRT parameters; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name and its id. No creator, no user ids. |
+| `GET` | `/api/player-configs` | Every player config, newest first, public: every setting with files by name, the config it was cloned from and when it was made. No creator. |
+| `GET` | `/api/player-configs/:id` | One player config, in the same shape. |
 | `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the SPRT verdict, `last generation built`, or none when an opening-rack job's racks ran out). |
 | `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
 | `GET` | `/api/jobs/:id/positions` | **Signed in.** A games or game-pairs job's captured positions, newest first, at most 20 a page by cursor, each with its CGP, game, turn, rack, previous move and ranked moves. `?rack=` keeps those whose player to move held that rack, however it is typed. Another job type is a `400`. |
@@ -5142,6 +5144,8 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 | `/users` | Registered user list — all user accounts with contribution stats. |
 | `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by tasks completed. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
+| `/player-configs` | Every player config, newest first: its name, how it searches, its lexicon and leaves. Public, like the job pages that already show players' settings. |
+| `/player-configs/[id]` | One config: its key settings (search, files, plays considered, what is kept, wordmap and rack info table), every setting behind "All settings", a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
 | `/ratings/[id]` | [The ratings page](#the-ratings-page) — ratings with uncertainty, history, and residuals. Admin controls for membership appear inline for admins. |
 
 ### Auth Routes

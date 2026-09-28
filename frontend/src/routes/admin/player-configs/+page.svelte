@@ -59,7 +59,7 @@
     <tbody>
       {#each configs as config}
         <tr>
-          <td>{config.name}</td>
+          <td><a href="/player-configs/{config.id}">{config.name}</a></td>
           <td>{config.recorder_type}</td>
           <td>{config.sort_strategy ?? '—'}</td>
           <td>{fileName(config.kwg_id)}</td>

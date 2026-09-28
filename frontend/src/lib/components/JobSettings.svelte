@@ -20,7 +20,7 @@
       {#each config.players as player}
         <li>
           <span class="text-muted-foreground capitalize">{player.role}:</span>
-          <span class="font-medium break-all">{player.name}</span>
+          <a class="font-medium break-all" href="/player-configs/{player.id}">{player.name}</a>
           — {playerSummary(player)}
         </li>
       {/each}

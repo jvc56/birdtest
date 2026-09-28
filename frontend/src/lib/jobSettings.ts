@@ -6,7 +6,9 @@
 import type { JobType } from '$lib/api';
 
 export interface PlayerSettings {
-  role: string;
+  /** Its part in a job ("player 1"); absent for a config read on its own. */
+  role?: string;
+  id: string;
   name: string;
   lexicon: string;
   leaves: string;
@@ -31,6 +33,12 @@ export interface PlayerSettings {
   utility_w_spread: number | null;
   utility_spread_scale: number | null;
   movegen_margin: number;
+}
+
+/** A player config as anyone may read it (`GET /api/player-configs`). */
+export interface PublicPlayerConfig extends PlayerSettings {
+  cloned_from_id: string | null;
+  created_at: string;
 }
 
 export interface JobConfig {
@@ -180,6 +188,26 @@ const PLAYER_ROWS: [keyof PlayerSettings, string][] = [
   ['use_wordmap', 'Wordmap'],
   ['use_rit', 'Rack info table']
 ];
+
+/**
+ * What a reader compares two configs by first -- the files, the search and
+ * what is kept -- as label and value. `playerRows` has every setting.
+ */
+export function keySettings(p: PlayerSettings): [string, string][] {
+  const rows: [string, string][] = [
+    ['Search', playerSummary(p)],
+    ['Lexicon', show(p.lexicon)],
+    ['Leaves', show(p.leaves)]
+  ];
+  if (p.win_pct) rows.push(['Win %', p.win_pct]);
+  rows.push(
+    ['Plays considered', show(p.num_plays)],
+    ['Recorder', `${p.recorder_type}, ${show(p.num_plays_recorded)} play${p.num_plays_recorded === 1 ? '' : 's'} kept`],
+    ['Wordmap', show(p.use_wordmap)],
+    ['Rack info table', show(p.use_rit)]
+  );
+  return rows;
+}
 
 /**
  * The players' settings side by side: one row per setting, one value per

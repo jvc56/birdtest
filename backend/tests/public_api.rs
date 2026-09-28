@@ -168,8 +168,8 @@ async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
 
 /// A-PUBLIC-1c: a job's full configuration is public -- the job's settings,
 /// its type's (for a games job the test and its stopping rules) and every
-/// setting of each player config, with files by name -- and names no one: no
-/// creator, no user id. An unknown job is a 404.
+/// setting of each player config, with files by name and its own id to link
+/// to -- and names no one: no creator, no user id. An unknown job is a 404.
 #[tokio::test]
 async fn a_jobs_full_configuration_is_public() {
     let db = TestDb::new().await;
@@ -190,11 +190,67 @@ async fn a_jobs_full_configuration_is_public() {
     assert_eq!(players[0]["num_plies"], 0);
     assert_eq!(players[0]["recorder_type"], "best");
     assert!(players[0]["lexicon"].as_str().unwrap().starts_with("NWL"), "{config}");
+    let (p1, p2): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT player1_config_id, player2_config_id FROM job_game_config WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(players[0]["id"], p1.to_string());
+    assert_eq!(players[1]["id"], p2.to_string());
     for player in players {
-        assert!(player.get("created_by").is_none() && player.get("id").is_none(), "{player}");
+        assert!(player.get("created_by").is_none(), "{player}");
     }
 
     let (status, _) = send(&app, get_request(&format!("/api/jobs/{}/config", Uuid::new_v4()), &[])).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A-PUBLIC-1d: player configs are public, listed newest first and read one
+/// at a time, with every setting, files by name and its lineage -- but not
+/// which admin made it. An unknown config is a 404.
+#[tokio::test]
+async fn player_configs_are_public() {
+    let db = TestDb::new().await;
+    let app = birdtest::app(db.state().await);
+    let job = db.games_job(1, 10).await;
+    let (p1, p2): (Uuid, Uuid) = sqlx::query_as(
+        "SELECT player1_config_id, player2_config_id FROM job_game_config WHERE job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    // The second config a clone of the first, so its lineage has something to say.
+    sqlx::query("UPDATE player_configs SET cloned_from_id = $1 WHERE id = $2")
+        .bind(p1)
+        .bind(p2)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (status, list) = send(&app, get_request("/api/player-configs", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let ids: Vec<&str> = list.as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [p2.to_string(), p1.to_string()], "newest first: {list}");
+
+    let (status, config) = send(&app, get_request(&format!("/api/player-configs/{p2}"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["id"], p2.to_string());
+    assert_eq!(config["cloned_from_id"], p1.to_string());
+    assert_eq!(config["recorder_type"], "best");
+    assert_eq!(config["num_plies"], 0);
+    assert!(config["lexicon"].as_str().unwrap().starts_with("NWL"), "{config}");
+    assert!(config["created_at"].is_string(), "{config}");
+    // Every setting a job's config shows is here, and nothing about who made it.
+    for key in ["use_wordmap", "use_rit", "movegen_margin", "num_plays", "sort_strategy", "leaves"] {
+        assert!(config.get(key).is_some(), "{key} missing: {config}");
+    }
+    assert!(config.get("created_by").is_none() && config.get("role").is_none(), "{config}");
+
+    let (status, _) =
+        send(&app, get_request(&format!("/api/player-configs/{}", Uuid::new_v4()), &[])).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 

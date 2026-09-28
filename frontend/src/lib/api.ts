@@ -556,6 +556,8 @@ export const api = {
         Object.entries(params).map(([k, v]) => [k, String(v)])
       )}`
     ),
+  publicPlayerConfigs: () => get<import('$lib/jobSettings').PublicPlayerConfig[]>('/api/player-configs'),
+  publicPlayerConfig: (id: string) => get<import('$lib/jobSettings').PublicPlayerConfig>(`/api/player-configs/${id}`),
   ratingPools: () => get<RatingPoolListItem[]>('/api/rating-pools'),
   ratingPool: (id: string) => get<RatingPoolDetail>(`/api/rating-pools/${id}`),
 

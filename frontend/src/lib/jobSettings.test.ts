@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { jobGroups, playerRows, playersLine, playerSummary, show, type JobConfig, type PlayerSettings } from './jobSettings';
+import { jobGroups, keySettings, playerRows, playersLine, playerSummary, show, type JobConfig, type PlayerSettings } from './jobSettings';
 
 const staticPlayer: PlayerSettings = {
-  role: 'player 1', name: 'static-NWL23', lexicon: 'NWL23', leaves: 'NWL23', win_pct: null,
+  role: 'player 1', id: 'p1', name: 'static-NWL23', lexicon: 'NWL23', leaves: 'NWL23', win_pct: null,
   recorder_type: 'best', sort_strategy: 'equity', num_plies: 0, num_plies_recorded: 2,
   num_plays: 100, num_plays_recorded: 10, max_iterations: null, stopping_pct: null,
   use_inference: null, time_limit_secs: null, use_wordmap: true, use_rit: true,
@@ -10,7 +10,7 @@ const staticPlayer: PlayerSettings = {
   utility_w_winpct: null, utility_w_spread: null, utility_spread_scale: null, movegen_margin: 5
 };
 const simPlayer: PlayerSettings = {
-  ...staticPlayer, role: 'player 2', name: 'simmer-NWL23-4ply', win_pct: 'winpct',
+  ...staticPlayer, role: 'player 2', id: 'p2', name: 'simmer-NWL23-4ply', win_pct: 'winpct',
   num_plies: 4, max_iterations: 1000, stopping_pct: 99, use_inference: true,
   time_limit_secs: 30, min_play_iterations: 100, threshold: 'gk16', sampling_rule: 'round_robin',
   inference_margin: 0, utility_w_winpct: 1, utility_w_spread: 0, utility_spread_scale: 1
@@ -53,5 +53,16 @@ describe('F-SET-1 job settings', () => {
     expect(rows.find((r) => r.label === 'Lexicon')!.differs).toBe(false);
     // Every setting a player config has is shown.
     expect(rows).toHaveLength(23);
+  });
+
+  it("leads a config's own page with what tells configs apart", () => {
+    const labels = (rows: [string, string][]) => rows.map(([label]) => label);
+    // A static player has no win% model to name.
+    expect(labels(keySettings(staticPlayer))).not.toContain('Win %');
+    const sim = keySettings(simPlayer);
+    expect(sim[0]).toEqual(['Search', playerSummary(simPlayer)]);
+    expect(sim).toContainEqual(['Win %', 'winpct']);
+    expect(sim).toContainEqual(['Recorder', 'best, 10 plays kept']);
+    expect(sim).toContainEqual(['Rack info table', 'yes']);
   });
 });

@@ -27,6 +27,8 @@ pub fn router() -> Router<AppState> {
         .route("/jobs/:id/results", get(job_results))
         .route("/jobs/:id/positions", get(job_positions))
         .route("/jobs/:id/stream", get(job_stream))
+        .route("/player-configs", get(list_player_configs))
+        .route("/player-configs/:id", get(player_config))
         .route("/users", get(list_users))
         .route("/workers", get(list_workers))
 }
@@ -260,7 +262,10 @@ struct LeaveSettings {
 /// A player config's settings, without who made it or when.
 #[derive(Serialize)]
 struct PlayerSettings {
+    /// Its part in a job ("player 1"); absent where the config stands alone.
+    #[serde(skip_serializing_if = "no_role")]
     role: &'static str,
+    id: Uuid,
     name: String,
     lexicon: String,
     leaves: String,
@@ -287,11 +292,16 @@ struct PlayerSettings {
     movegen_margin: f64,
 }
 
+fn no_role(role: &&'static str) -> bool {
+    role.is_empty()
+}
+
 impl PlayerSettings {
     fn new(role: &'static str, named: crate::models::job::NamedPlayerConfig) -> Self {
         let c = named.config;
         Self {
             role,
+            id: c.id,
             name: c.name,
             lexicon: named.kwg_name,
             leaves: named.klv_name,
@@ -318,6 +328,54 @@ impl PlayerSettings {
             movegen_margin: c.movegen_margin,
         }
     }
+}
+
+/// A player config as anyone may read it: every setting it plays with, and
+/// its lineage, but not which admin made it.
+#[derive(Serialize)]
+struct PublicPlayerConfig {
+    #[serde(flatten)]
+    settings: PlayerSettings,
+    cloned_from_id: Option<Uuid>,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<crate::models::job::NamedPlayerConfig> for PublicPlayerConfig {
+    fn from(named: crate::models::job::NamedPlayerConfig) -> Self {
+        let (cloned_from_id, created_at) = (named.config.cloned_from_id, named.config.created_at);
+        Self { settings: PlayerSettings::new("", named), cloned_from_id, created_at }
+    }
+}
+
+/// Every player config, newest first. Public: the job pages already show the
+/// players' settings, and a config is what a rating is about.
+async fn list_player_configs(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<PublicPlayerConfig>>> {
+    use crate::models::job::NamedPlayerConfig;
+    let configs = sqlx::query_as::<_, NamedPlayerConfig>(&format!(
+        "{} ORDER BY pc.created_at DESC, pc.id",
+        NamedPlayerConfig::SELECT
+    ))
+    .fetch_all(&state.read_pool)
+    .await?;
+    Ok(Json(configs.into_iter().map(Into::into).collect()))
+}
+
+async fn player_config(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> AppResult<Json<PublicPlayerConfig>> {
+    use crate::models::job::NamedPlayerConfig;
+    let config = sqlx::query_as::<_, NamedPlayerConfig>(&format!(
+        "{} WHERE pc.id = $1",
+        NamedPlayerConfig::SELECT
+    ))
+    .bind(id)
+    .fetch_optional(&state.read_pool)
+    .await?
+    .ok_or_else(|| AppError::not_found("no such player config"))?;
+    Ok(Json(config.into()))
 }
 
 async fn job_config(
