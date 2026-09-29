@@ -2,37 +2,35 @@
   import { onDestroy, onMount } from 'svelte';
   import { api, type DerivedData } from '$lib/api';
   import { datetime } from '$lib/format';
+  import { BUSY_POLL_MS, IDLE_POLL_MS, createPoller } from '$lib/poller';
 
   let rows: DerivedData[] = [];
   let error = '';
   let busy = '';
-  let poll: number | undefined;
-  let destroyed = false;
 
-  // While anything is queued or building the page reads again every few
-  // seconds, so a build is seen to finish; nothing pushes these rows.
-  const POLL_MS = 3000;
+  const inProgress = (rows: DerivedData[]) =>
+    rows.some((r) => r.buildable && (r.state === 'pending' || r.state === 'building'));
 
-  async function load() {
-    window.clearTimeout(poll);
-    try {
-      rows = await api.derivedData();
-      error = '';
-    } catch (e) {
-      error = e instanceof Error ? e.message : 'could not load derived data';
-    }
-    if (destroyed) return;
-    const inProgress = rows.some(
-      (r) => r.buildable && (r.state === 'pending' || r.state === 'building')
-    );
-    if (inProgress || error) poll = window.setTimeout(load, POLL_MS);
-  }
+  // Nothing pushes these rows, so the page reads them again for as long as it
+  // is open: every few seconds while anything is queued or building, so a
+  // build is seen to finish, and less often while idle, so a build queued
+  // later shows up (it once stopped at idle, and never saw one).
+  const poller = createPoller(
+    {
+      read: () => api.derivedData(),
+      onValue: (read) => {
+        rows = read;
+        error = '';
+      },
+      onError: (e) => (error = e instanceof Error ? e.message : 'could not load derived data'),
+      delay: (read, failure) => (failure || inProgress(read ?? []) ? BUSY_POLL_MS : IDLE_POLL_MS)
+    },
+    document
+  );
+  const load = () => poller.refresh();
 
-  onMount(load);
-  onDestroy(() => {
-    destroyed = true;
-    window.clearTimeout(poll);
-  });
+  onMount(() => poller.start());
+  onDestroy(() => poller.stop());
 
   // Two rows can share a role, a name and a builder (a lexicon re-released
   // under its name), so a row is keyed by the files it is built from too.

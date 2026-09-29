@@ -5196,7 +5196,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | `/admin/audit-log` | Audit log viewer — filterable by action and target type; paginated. (Not by actor: the page has no actor filter.) |
 | `/admin/input-data` | Input data browser and import wizard — pick a tarball date, watch the import, review the staged diff, confirm. |
 | `/admin/fleet` | What MAGPIE versions have claimed work recently, from `task_claims.magpie_version`. |
-| `/admin/derived-data` | The wordmap and rack info table build queue: what is built, pending or failed, and a retry for the failures. |
+| `/admin/derived-data` | The wordmap and rack info table build queue: what is built, pending or failed, and a retry for the failures. It reads the queue again for as long as it is open — every 3 s while anything is pending or building, every 10 s otherwise, not while the tab is hidden (`lib/poller.ts`) — so a build queued later shows up by itself; the admin job page's list of the files a job waits on does the same. Polled rather than pushed: the builder is a separate process on a five-minute schedule, and a push would need Postgres `LISTEN`/`NOTIFY` for little gain. |
 | `/admin/backups` | Recent backup runs and the staleness of the newest successful one. |
 
 ---

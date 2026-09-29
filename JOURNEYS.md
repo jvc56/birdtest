@@ -473,6 +473,9 @@ Do this last: it empties the database.
 - [ ] After making a job on a new lexicon (A-12), **expect** its wordmap
   "pending", then "built" within about fifteen seconds, and the job handing
   out work only then.
+- [ ] **Do** keep **Derived data** open, with nothing building, while you make
+  that job in another tab. **Expect** its new rows to appear within about ten
+  seconds, without a reload.
 
 ### A-7 Create jobs
 

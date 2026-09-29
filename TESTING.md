@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 133 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (5), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1F Frontend unit | 140 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (5), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 229 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (11), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (6), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -150,6 +150,7 @@ incidentally by higher tiers.
 | `lib/sse.ts` | 1F | Covered (`F-SSE-*`) |
 | `lib/auth.ts` | 1F | Covered (`F-AUTH-*`) |
 | `lib/accountRules.ts` | 1F | Covered (`F-ACCOUNT-*`) |
+| `lib/importWatch.ts`, `lib/poller.ts` | 1F | Covered (`F-IMPORT-*`, `F-POLL-*`) |
 | Chart maths | 1F | Covered (`F-CHART-*`). The arithmetic moved out of the components into `lib/charts/*.ts` so it could be tested; the `.svelte` files that draw it are exercised only by tier 5 |
 | Every page under `routes/` | 5 | Partial — the eleven journeys (E-10 visits `/users`). `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them; their endpoints are tier 3 |
 
@@ -755,6 +756,18 @@ Each entry's tests are the `describe` block named for its id.
   nothing could clear). *(Covered:
   `importWatch.test.ts`.)* (Twenty-fourth audit: this logic was wrong three
   audits running.)
+
+### `F-POLL-*` — `lib/poller.ts`
+
+- `F-POLL-1` The derived data pages' polling: it reads at once, then fast while
+  a build is queued or running and slower while idle, and never stops by
+  itself, so a build queued later is seen (it stopped once idle, and the page
+  never showed one); a failed read keeps it polling, and the caller can stop it
+  (a 404: the job is gone); it pauses while the tab is hidden, reads at once
+  when shown, and a read in flight at hiding reports but schedules nothing; a
+  refresh (after a retry) overtakes a read in flight, whose late answer is
+  dropped, leaving one chain of reads; stopping ignores answers in flight,
+  stops listening, and cannot be undone. *(Covered: `poller.test.ts`.)*
 
 ### `F-CHART-*` — chart maths
 
