@@ -178,3 +178,41 @@ export function jobTitle(job: { name?: string | null; job_type: string }): strin
   const name = job.name?.trim();
   return name ? name : jobTypeLabel(job.job_type);
 }
+
+/**
+ * What the admin job page's Export card says about the job's newest export, and
+ * what its button offers.
+ *
+ * A job can be exported at any time. A **snapshot** -- read while the job was
+ * still taking results -- is downloadable but is not the job's corpus, and is
+ * labelled with its time; a completed job whose newest export is one is offered
+ * its final export. A leave job's snapshot is as of its last merge, which runs
+ * every half hour while it runs, and says so.
+ */
+export function exportSummary(
+  jobExport: { state: string; is_final: boolean; snapshot_at: string | null } | null,
+  job: { status: string; job_type: string }
+): { label: string | null; note: string | null; button: string } {
+  const completed = job.status === 'completed';
+  const built = jobExport !== null && jobExport.state !== 'running' && jobExport.state !== 'failed';
+  const snapshot = built && !jobExport.is_final;
+  let label: string | null = null;
+  if (snapshot) {
+    label = completed
+      ? `Snapshot as of ${datetime(jobExport.snapshot_at)}, taken while the job was still running — not its final results`
+      : `Snapshot as of ${datetime(jobExport.snapshot_at)} — job still running`;
+  } else if (built) {
+    label = 'Final results';
+  }
+  const note =
+    snapshot && job.job_type === 'leave_generation'
+      ? 'Rack totals as of the last merge, which runs every half hour while the job runs.'
+      : null;
+  let button: string;
+  if (!completed) button = jobExport === null ? 'Export a snapshot' : 'Export a new snapshot';
+  else if (jobExport === null) button = 'Export results';
+  // A failed build is retried as what it was for: the completed job's corpus.
+  else if (snapshot || jobExport.state === 'failed') button = 'Build the final export';
+  else button = 'Export again';
+  return { label, note, button };
+}

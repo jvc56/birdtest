@@ -9,6 +9,7 @@ import {
   sprtLabel,
   sprtState,
   completionText,
+  exportSummary,
   jobTitle,
   workerLabel
 } from './format';
@@ -246,5 +247,57 @@ describe('F-FMT-13 jobTitle', () => {
     expect(jobTitle({ name: 'equity vs static', job_type: 'game_pairs' })).toBe('equity vs static');
     expect(jobTitle({ name: '', job_type: 'game_pairs' })).toBe('Game pairs');
     expect(jobTitle({ name: '   ', job_type: 'games' })).toBe(jobTitle({ name: '', job_type: 'games' }));
+  });
+});
+
+describe('F-FMT-14 exportSummary', () => {
+  const at = '2026-09-29T12:00:00Z';
+  const running = { status: 'active', job_type: 'games' };
+  const done = { status: 'completed', job_type: 'games' };
+  const snapshot = { state: 'ready', is_final: false, snapshot_at: at };
+  const final = { state: 'ready', is_final: true, snapshot_at: at };
+
+  it('labels a snapshot of a running job with its time', () => {
+    const summary = exportSummary(snapshot, running);
+    expect(summary.label).toBe(`Snapshot as of ${datetime(at)} — job still running`);
+    expect(summary.button).toBe('Export a new snapshot');
+    expect(summary.note).toBeNull();
+    expect(exportSummary(null, running).button).toBe('Export a snapshot');
+    expect(exportSummary(null, { status: 'inactive', job_type: 'games' }).button).toBe(
+      'Export a snapshot'
+    );
+  });
+
+  it("offers a completed job whose newest export is a snapshot its final one", () => {
+    const summary = exportSummary(snapshot, done);
+    expect(summary.label).toContain('not its final results');
+    expect(summary.button).toBe('Build the final export');
+    expect(exportSummary({ ...snapshot, state: 'expired' }, done).button).toBe(
+      'Build the final export'
+    );
+  });
+
+  it("labels a completed job's final export, and offers it again", () => {
+    expect(exportSummary(final, done)).toEqual({
+      label: 'Final results',
+      note: null,
+      button: 'Export again'
+    });
+    expect(exportSummary(null, done).button).toBe('Export results');
+    // A failed attempt at the final export is retried as one.
+    const failed = { state: 'failed', is_final: false, snapshot_at: null };
+    expect(exportSummary(failed, done)).toEqual({
+      label: null,
+      note: null,
+      button: 'Build the final export'
+    });
+    // Nothing is labelled while it builds.
+    expect(exportSummary({ state: 'running', is_final: false, snapshot_at: null }, done).label).toBeNull();
+  });
+
+  it("says a running leave job's snapshot is as of its last merge", () => {
+    const leave = { status: 'active', job_type: 'leave_generation' };
+    expect(exportSummary(snapshot, leave).note).toContain('last merge');
+    expect(exportSummary(final, { ...leave, status: 'completed' }).note).toBeNull();
   });
 });

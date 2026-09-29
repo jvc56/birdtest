@@ -1,4 +1,4 @@
-//! Building a completed job's results into one downloadable artifact.
+//! Building a job's results into one downloadable artifact.
 //!
 //! The live results stream (`/api/admin/jobs/:id/results/stream`) scans the
 //! job's result tables from a cursor and holds a pool connection for as long as
@@ -6,11 +6,23 @@
 //! corpus: a full English opening-rack job is tens of millions of rows, and one
 //! caller per scan is one connection per scan against a pool of twenty.
 //!
-//! An export is that read done **once**. It is restricted to completed jobs,
-//! and that restriction is what makes it worth building: a completed job's
-//! results are immutable, so the artifact is built once and reused by every
-//! later download, where an export of an active job would be stale as it was
-//! written.
+//! An export is that read done **once**, at any point in a job's life. What it
+//! is depends on when it was read, and the row says which:
+//!
+//! - **Final** (`is_final`): read from a job that was completed, with no claim
+//!   still open and nothing staged, at the moment its snapshot was taken. A
+//!   completed job's results are immutable, so this artifact is built once and
+//!   reused by every later download -- the results stream redirects to it.
+//! - **Snapshot**: anything else -- a job still running, or one that completed
+//!   while results were still landing. It is the corpus as of `snapshot_at`,
+//!   consistent in itself, and never served as the finished job's corpus: that
+//!   was a real bug, when "the newest ready export" was whatever had been
+//!   built, and an export taken mid-run became the completed job's download.
+//!
+//! The marker is decided **inside** the snapshot, by the snapshot's first
+//! statement, not when the export is requested: a job can complete between the
+//! two, and an export marked final on the strength of a status read before its
+//! rows were would be exactly the stale corpus the marker exists to rule out.
 //!
 //! Shaped like [`crate::inputdata`]'s import: an admin starts it, a spawned
 //! task does the work, the admin polls. birdtest runs as a single instance, so
@@ -127,7 +139,9 @@ pub fn export_query(job_type: JobType) -> &'static str {
 /// applies to claims still in flight: a completed job is exported once its
 /// results have settled, and for a leave job settled includes merged.
 ///
-/// Waits for a merge already running. Nothing for any other job type.
+/// Called for a completed job only: a running one's export and stream reflect
+/// its last merge, as its page does. Waits for a merge already running.
+/// Nothing for any other job type.
 pub async fn settle(pool: &sqlx::PgPool, job: &Job) -> AppResult<()> {
     if job.job_type == JobType::LeaveGeneration {
         crate::jobs::leave_gen::merge_staged_for_job(pool, job.id, true).await?;
@@ -137,67 +151,30 @@ pub async fn settle(pool: &sqlx::PgPool, job: &Job) -> AppResult<()> {
 
 /// Start an export, returning its id. The work happens on a spawned task.
 ///
-/// Refuses a job that is not completed: an export of a job still taking results
-/// would be obsolete before anyone downloaded it, and nothing would say so.
+/// Any job can be exported, active, inactive or completed: one still taking
+/// results is exported as a snapshot, labelled so (see the module docs), and
+/// an active job always has claims in flight, so nothing waits on them.
+///
+/// A completed job still refuses while claims are in flight: the admin asking
+/// for a completed job's export wants the final corpus, and what they would be
+/// handed meanwhile is a snapshot that looks like it.
 pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult<Uuid> {
-    if job.status != JobStatus::Completed {
-        return Err(AppError::conflict(
-            "only a completed job can be exported: an export of a job still \
-             taking results would be stale before it finished",
-        ));
+    if job.status == JobStatus::Completed {
+        refuse_unsettled(state, job).await?;
     }
 
-    // Completed is not yet settled. A job flips to completed the moment its
-    // stopping rule is met or an admin forces it, but every claim already out
-    // is still played and still accepted -- the submit path checks the claim,
-    // not the job's status. An export built in that window missed those
-    // results, and the stream redirects every later download to it, so the
-    // corpus a completed job hands out would be short for good. No claim can be
-    // issued against a completed job, so once none is open the results really
-    // are fixed.
-    //
-    // Reclamation is lazy: a lapsed claim is flipped to `abandoned` when a
-    // worker next asks for work and the job is a candidate, and nothing ever
-    // asks for work from a completed job. So a claim whose worker died stayed
-    // `claimed` for good, and refused every export of the job for good --
-    // where the design says a claim lapses at the heartbeat timeout. Reclaimed
-    // here first, through the same statement dispatch uses, so "open" below
-    // means live.
-    crate::scheduler::reclaim_lapsed(state, &[job.id]).await?;
-    let settling = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
-                        WHERE t.job_id = $1 AND c.state = 'claimed')",
-    )
-    .bind(job.id)
-    .fetch_one(&state.pool)
-    .await?;
-    if settling {
-        return Err(AppError::conflict(
-            "this job completed with claims still in flight, and their results are still \
-             arriving; export it once they have landed or lapsed, which is at most the \
-             heartbeat timeout (counted from the server's last start, if that is more recent \
-             than the claim's last heartbeat)",
-        ));
-    }
-
-    // Inserted only while the job is still completed, read under a share lock
-    // on its row: a purge committing meanwhile holds that row, so this waits
-    // for it and then finds the job inactive. Checked once above without a
-    // lock, an export started beside a purge built the emptied job, and the
-    // re-run's completed job then redirected its downloads to that export.
+    // Under a share lock on the job's row, so a purge committing meanwhile --
+    // it holds that row -- is waited for. Inserted beside one instead, the row
+    // survived the purge's delete of the job's exports, its snapshot could
+    // still read the job as completed and full, and the re-run's completed job
+    // then redirected its downloads to that export. Waited for, the export
+    // reads the purged job, which is inactive, and is a snapshot of it.
     let mut tx = state.pool.begin().await?;
-    let still_completed = sqlx::query_scalar::<_, bool>(
-        "SELECT status = 'completed' FROM jobs WHERE id = $1 FOR SHARE",
-    )
-    .bind(job.id)
-    .fetch_optional(&mut *tx)
-    .await?
-    .unwrap_or(false);
-    if !still_completed {
-        return Err(AppError::conflict(
-            "the job is no longer completed (purged or reactivated meanwhile)",
-        ));
-    }
+    sqlx::query("SELECT 1 FROM jobs WHERE id = $1 FOR SHARE")
+        .bind(job.id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::not_found("no such job"))?;
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO job_exports (job_id, requested_by) VALUES ($1, $2) RETURNING id",
     )
@@ -232,6 +209,45 @@ pub async fn start(state: &AppState, job: &Job, requested_by: Uuid) -> AppResult
     let (state, job) = (state.clone(), job.clone());
     tokio::spawn(async move { run(state, job, id).await });
     Ok(id)
+}
+
+/// Refuses a completed job whose claims are still in flight.
+async fn refuse_unsettled(state: &AppState, job: &Job) -> AppResult<()> {
+    // Completed is not yet settled. A job flips to completed the moment its
+    // stopping rule is met or an admin forces it, but every claim already out
+    // is still played and still accepted -- the submit path checks the claim,
+    // not the job's status. An export built in that window misses those
+    // results; its snapshot sees the open claims and it is marked a snapshot,
+    // never the final corpus the stream redirects to, but it is not what an
+    // admin exporting a completed job asked for either. No claim can be issued
+    // against a completed job, so once none is open the results really are
+    // fixed.
+    //
+    // Reclamation is lazy: a lapsed claim is flipped to `abandoned` when a
+    // worker next asks for work and the job is a candidate, and nothing ever
+    // asks for work from a completed job. So a claim whose worker died stayed
+    // `claimed` for good, and refused every export of the job for good --
+    // where the design says a claim lapses at the heartbeat timeout. Reclaimed
+    // here first, through the same statement dispatch uses, so "open" below
+    // means live.
+    crate::scheduler::reclaim_lapsed(state, &[job.id]).await?;
+    let settling = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
+                        WHERE t.job_id = $1 AND c.state = 'claimed')",
+    )
+    .bind(job.id)
+    .fetch_one(&state.pool)
+    .await?;
+    if settling {
+        return Err(AppError::conflict(
+            "this job completed with claims still in flight, and their results are still \
+             arriving; export it once they have landed or lapsed, which is at most the \
+             heartbeat timeout (counted from the server's last start, if that is more recent \
+             than the claim's last heartbeat)",
+        ));
+    }
+
+    Ok(())
 }
 
 /// How many exports build at once. Each holds a main-pool connection for the
@@ -378,7 +394,15 @@ async fn off_the_executor<T: Send + 'static>(
 /// running: every other worker thread parked, one at 100%, and `/health`
 /// unanswered for as long as the export ran. What is left on the executor is a
 /// copy of each row's text into the next batch.
-async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> AppResult<Uploaded> {
+///
+/// Read on the caller's connection, inside its snapshot ([`read_snapshot`]).
+async fn upload_rows(
+    state: &AppState,
+    conn: &mut sqlx::PgConnection,
+    key: &str,
+    sql: &str,
+    job_id: Uuid,
+) -> AppResult<Uploaded> {
     let mut upload = state.artifacts.start_multipart(key).await?;
     let mut rows_written: i64 = 0;
 
@@ -390,13 +414,6 @@ async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> Ap
         };
         let mut batch: Vec<u8> = Vec::with_capacity(COMPRESS_BATCH_BYTES + 64 * 1024);
 
-        // Closed rather than returned when this ends: a pool connection
-        // dropped mid-result is drained before it is reused, so an upload that
-        // failed part way left Postgres building the rest of the corpus on a
-        // connection nothing counted (thirty-first audit). Closing it ends the
-        // query at the server's next write.
-        let mut conn = state.pool.acquire().await?;
-        conn.close_on_drop();
         let mut rows = sqlx::query(sql).bind(job_id).fetch(&mut *conn);
         while let Some(row) = rows.try_next().await? {
             let line: String = row.get("row");
@@ -417,8 +434,6 @@ async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> Ap
             }
         }
         drop(rows);
-        // Done with the database: the tail below compresses and uploads.
-        drop(conn);
 
         let (tail, bytes, sha256) = off_the_executor(move || {
             let (compressor, part) = compressor.push(batch)?;
@@ -460,20 +475,34 @@ async fn upload_rows(state: &AppState, key: &str, sql: &str, job_id: Uuid) -> Ap
 /// without the other.
 async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
     // Here rather than in `start`: a full-size merge is the best part of a
-    // minute, and this is the background task.
-    settle(&state.pool, job).await?;
+    // minute, and this is the background task. Read afresh, since a job
+    // exported mid-run may have completed while this waited its turn. A
+    // running leave job is not merged: its export reflects the last merge,
+    // as its page does, and forcing one per export would put a merge's write
+    // volume in an admin's hands (`leave_gen::MERGE_INTERVAL`).
+    let completed = sqlx::query_scalar::<_, bool>("SELECT status = 'completed' FROM jobs WHERE id = $1")
+        .bind(job.id)
+        .fetch_optional(&state.pool)
+        .await?
+        .unwrap_or(false);
+    if completed {
+        settle(&state.pool, job).await?;
+    }
 
     let key = format!("exports/{}/{export_id}.ndjson.gz", job.id);
-    let results = upload_rows(state, &key, export_query(job.job_type), job.id).await?;
     let positions_key = format!("exports/{}/{export_id}.positions.ndjson.gz", job.id);
-    let finished = finish_build(state, job, export_id, &key, &positions_key, results).await;
-    // Failed after the results object was written -- the positions' upload, or
-    // marking the row -- and the row will say `failed`, naming neither object:
-    // removed now rather than left to the thirty-day lifecycle rule. (A
-    // positions object never written is a delete of nothing.) Unless the row
-    // says `ready` after all -- the update committed and only its answer was
-    // lost -- or cannot be read to say: a row naming a deleted object would
-    // redirect every download of the job to it.
+    let read = read_snapshot(state, job, export_id, &key, &positions_key).await;
+    let finished = match read {
+        Ok(snapshot) => mark_ready(state, export_id, &key, &positions_key, snapshot).await,
+        Err(err) => Err(err),
+    };
+    // Failed after an object was written -- the positions' upload, or marking
+    // the row -- and the row will say `failed`, naming neither object: removed
+    // now rather than left to the thirty-day lifecycle rule. (An object never
+    // written is a delete of nothing.) Unless the row says `ready` after all --
+    // the update committed and only its answer was lost -- or cannot be read to
+    // say: a row naming a deleted object would redirect every download of the
+    // job to it.
     if finished.is_err() && !named_ready(state, export_id).await {
         for key in [&key, &positions_key] {
             if let Err(err) = state.artifacts.delete(key).await {
@@ -482,6 +511,83 @@ async fn build(state: &AppState, job: &Job, export_id: Uuid) -> AppResult<()> {
         }
     }
     finished
+}
+
+/// What one snapshot read produced: the artifacts, and what the job was when
+/// the snapshot was taken.
+struct Snapshot {
+    results: Uploaded,
+    positions: Option<Uploaded>,
+    is_final: bool,
+    taken_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Reads the corpus -- the results, then the captured positions -- in **one**
+/// `REPEATABLE READ` transaction on one connection, and uploads each as it
+/// goes.
+///
+/// One snapshot, because a job being exported may be taking results: read on
+/// two connections, each scan saw its own moment, and the positions file
+/// could name results the results file does not hold. Read-only, since
+/// nothing here writes. The connection is held for both scans, as the scans
+/// each held one before; `EXPORT_BUILDS` bounds how many do.
+///
+/// The first statement takes the snapshot and asks, of the state it sees,
+/// whether this is the job's final corpus: completed, with no claim still open
+/// and, for a leave job, nothing staged that a merge has not folded in. What
+/// `start` saw does not count -- a job exported while active can complete
+/// before this runs, with its last claims still landing.
+async fn read_snapshot(
+    state: &AppState,
+    job: &Job,
+    export_id: Uuid,
+    key: &str,
+    positions_key: &str,
+) -> AppResult<Snapshot> {
+    // Closed rather than returned when this ends: a pool connection dropped
+    // mid-result is drained before it is reused, so an upload that failed
+    // part way left Postgres building the rest of the corpus on a connection
+    // nothing counted (thirty-first audit). Closing it ends the query at the
+    // server's next write -- and, here, the transaction with it.
+    let mut conn = state.pool.acquire().await?;
+    conn.close_on_drop();
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let (is_final, taken_at): (bool, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "SELECT CASE WHEN j.status <> 'completed' THEN FALSE
+                     ELSE NOT EXISTS (SELECT 1 FROM task_claims c JOIN tasks t ON t.id = c.task_id
+                                      WHERE t.job_id = j.id AND c.state = 'claimed')
+                      AND NOT EXISTS (SELECT 1 FROM leave_rack_staging s WHERE s.job_id = j.id)
+                END,
+                clock_timestamp()
+         FROM jobs j WHERE j.id = $1",
+    )
+    .bind(job.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| AppError::not_found("the job was deleted while its export waited"))?;
+
+    let results = upload_rows(state, &mut tx, key, export_query(job.job_type), job.id).await?;
+    // Asked of the rows rather than of the job's `capture_positions` setting:
+    // what matters is whether there is anything to export, and a capture job
+    // nobody contributed positions to should not grow an empty artifact.
+    let captured = may_capture_positions(job.job_type)
+        && sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM position_analysis_records WHERE job_id = $1)",
+        )
+        .bind(job.id)
+        .fetch_one(&mut *tx)
+        .await?;
+    let positions = if captured {
+        Some(upload_rows(state, &mut tx, positions_key, positions_query(), job.id).await?)
+    } else {
+        None
+    };
+    tx.commit().await?;
+    tracing::debug!(%export_id, is_final, "export snapshot read");
+    Ok(Snapshot { results, positions, is_final, taken_at })
 }
 
 /// Whether the export's row says `ready` -- or cannot be read to say it does
@@ -496,33 +602,16 @@ async fn named_ready(state: &AppState, export_id: Uuid) -> bool {
     .unwrap_or(true)
 }
 
-/// The rest of [`build`] once the results object is written: the positions'
-/// object, if the job captured any, and the row marked ready.
-async fn finish_build(
+/// Marks the export ready, naming the objects its snapshot wrote.
+async fn mark_ready(
     state: &AppState,
-    job: &Job,
     export_id: Uuid,
     key: &str,
     positions_key: &str,
-    results: Uploaded,
+    snapshot: Snapshot,
 ) -> AppResult<()> {
-
-    // Asked of the rows rather than of the job's `capture_positions` setting:
-    // what matters is whether there is anything to export, and a capture job
-    // nobody contributed positions to should not grow an empty artifact.
-    let captured = may_capture_positions(job.job_type)
-        && sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS (SELECT 1 FROM position_analysis_records WHERE job_id = $1)",
-        )
-        .bind(job.id)
-        .fetch_one(&state.pool)
-        .await?;
-    let positions = if captured {
-        let uploaded = upload_rows(state, positions_key, positions_query(), job.id).await?;
-        Some((positions_key, uploaded))
-    } else {
-        None
-    };
+    let Snapshot { results, positions, is_final, taken_at } = snapshot;
+    let positions = positions.map(|uploaded| (positions_key, uploaded));
 
     // Guarded on `running`, like the import's: a process starting while this
     // one works reaps rows left `running` as failed, and a rolling deployment
@@ -533,7 +622,8 @@ async fn finish_build(
         "UPDATE job_exports
          SET state = 'ready', artifact_key = $2, bytes = $3, sha256 = $4,
              row_count = $5, positions_artifact_key = $6, positions_bytes = $7,
-             positions_sha256 = $8, positions_row_count = $9, completed_at = now()
+             positions_sha256 = $8, positions_row_count = $9, is_final = $10,
+             snapshot_at = $11, completed_at = now()
          WHERE id = $1 AND state = 'running'",
     )
     .bind(export_id)
@@ -545,6 +635,8 @@ async fn finish_build(
     .bind(positions.as_ref().map(|(_, p)| p.bytes))
     .bind(positions.as_ref().map(|(_, p)| p.sha256.as_str()))
     .bind(positions.as_ref().map(|(_, p)| p.rows))
+    .bind(is_final)
+    .bind(taken_at)
     .execute(&state.pool)
     .await?
     .rows_affected();
@@ -582,16 +674,38 @@ pub struct ReadyExport {
 /// a download.
 pub const EXPORT_LIFETIME_DAYS: i32 = 29;
 
-/// The newest ready export for a job whose objects are still in the store, if
-/// there is one.
+/// The newest **final** ready export for a job whose objects are still in the
+/// store, if there is one: the completed job's corpus, which the results
+/// stream redirects to. A snapshot is never this, however new -- it was read
+/// while the job was still taking results.
 pub async fn newest_ready(pool: &sqlx::PgPool, job_id: Uuid) -> AppResult<Option<ReadyExport>> {
     Ok(sqlx::query_as::<_, (Uuid, String, Option<String>)>(
         "SELECT id, artifact_key, positions_artifact_key FROM job_exports
-         WHERE job_id = $1 AND state = 'ready' AND artifact_key IS NOT NULL
+         WHERE job_id = $1 AND state = 'ready' AND is_final AND artifact_key IS NOT NULL
            AND completed_at > now() - make_interval(days => $2)
          ORDER BY requested_at DESC LIMIT 1",
     )
     .bind(job_id)
+    .bind(EXPORT_LIFETIME_DAYS)
+    .fetch_optional(pool)
+    .await?
+    .map(|(id, artifact_key, positions_artifact_key)| ReadyExport {
+        id,
+        artifact_key,
+        positions_artifact_key,
+    }))
+}
+
+/// One export's objects, if it is ready and they are still in the store --
+/// final or snapshot. What the admin page offers as the download of the export
+/// it shows.
+pub async fn ready_objects(pool: &sqlx::PgPool, export_id: Uuid) -> AppResult<Option<ReadyExport>> {
+    Ok(sqlx::query_as::<_, (Uuid, String, Option<String>)>(
+        "SELECT id, artifact_key, positions_artifact_key FROM job_exports
+         WHERE id = $1 AND state = 'ready' AND artifact_key IS NOT NULL
+           AND completed_at > now() - make_interval(days => $2)",
+    )
+    .bind(export_id)
     .bind(EXPORT_LIFETIME_DAYS)
     .fetch_optional(pool)
     .await?

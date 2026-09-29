@@ -686,11 +686,12 @@ CREATE TABLE job_leave_config (
 
 -- Exports
 --
--- A completed job's results, as one gzipped NDJSON object in the artifact
--- store. Only completed jobs can be exported, and that is what makes the
--- artifact worth having: a completed job's results are immutable, so an export
--- is built once and reused, where an export of an active job would be stale as
--- it was written.
+-- A job's results, as one gzipped NDJSON object in the artifact store. Any job
+-- can be exported; is_final says whether this is the completed job's corpus,
+-- which is immutable and so built once and reused (the results stream
+-- redirects to it), or a snapshot of a job still taking results, which is
+-- offered as a download labelled with its time and never served in the
+-- finished job's place.
 --
 -- Shaped like input_data_imports, and for the same reason: a long operation an
 -- admin starts, polls, and then acts on. birdtest runs as a single instance, so
@@ -718,13 +719,23 @@ CREATE TABLE job_exports (
     positions_bytes        BIGINT,
     positions_sha256       TEXT,
     positions_row_count    BIGINT,
+    -- TRUE when the snapshot the export was read in saw the job completed,
+    -- with no claim still open and nothing staged: its final corpus. Decided
+    -- inside that snapshot (exports::read_snapshot), not when the export was
+    -- requested -- a job exported mid-run can complete before its rows are
+    -- read, with its last results still landing. FALSE until built, so an
+    -- unfinished or unmarked row is never taken for the final one.
+    is_final      BOOLEAN NOT NULL DEFAULT FALSE,
+    -- When that snapshot was taken, for the page's "Snapshot as of …".
+    snapshot_at   TIMESTAMPTZ,
     error         TEXT,
     requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
     requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at  TIMESTAMPTZ
 );
 
--- The newest ready export for a job, which is what a download resolves to.
+-- The newest ready export for a job, which is what a download resolves to
+-- (the newest final one, for the results stream).
 CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
 
 -- One export of a job at a time. Only the page's disabled button stopped a

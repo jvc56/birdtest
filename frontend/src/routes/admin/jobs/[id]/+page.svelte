@@ -11,7 +11,7 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { jobTitle, jobTypeLabel } from '$lib/format';
+  import { exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
   import type { JobConfig } from '$lib/jobSettings';
   import CompletionNote from '$lib/components/CompletionNote.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
@@ -208,6 +208,10 @@
       busy = false;
     }
   }
+
+  $: exportView = stats
+    ? exportSummary(jobExport, stats.job)
+    : { label: null, note: null, button: 'Export results' };
 
   function megabytes(bytes: number | null): string {
     return bytes === null ? '—' : `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
@@ -541,59 +545,64 @@
       {/if}
     </div>
 
-    {#if stats.job.status === 'completed'}
-      <div class="card space-y-3">
-        <h2 class="text-lg font-medium">Export</h2>
-        <p class="text-xs text-muted-foreground">
-          A completed job's whole corpus as one gzipped NDJSON file, built once on a background
-          task and downloaded straight from the artifact store. An opening-rack line is a rack
-          with its ranked moves; a games job that captured positions gets those as a second
-          file. Refused while the job's last claims are still in flight.
-        </p>
-        <div class="flex flex-wrap items-center gap-3">
-          <button
-            class="btn-secondary"
-            on:click={startExport}
-            disabled={busy || gone || exportStarted || jobExport?.state === 'running'}
-          >
-            {jobExport ? 'Export again' : 'Export results'}
-          </button>
-          {#if jobExport}
-            <span class="text-sm">
-              {#if jobExport.state === 'running'}
-                Building…
-              {:else if jobExport.state === 'ready'}
-                {(jobExport.row_count ?? 0).toLocaleString()} rows ·
-                {megabytes(jobExport.bytes)}
-                {#if jobExport.download_url}
-                  · <a href={jobExport.download_url}>download</a>
-                {/if}
-                {#if jobExport.sha256}
-                  · <span class="whitespace-nowrap">SHA-256 of the .gz</span>
-                  <code class="break-all text-xs">{jobExport.sha256}</code>
-                {/if}
-                {#if jobExport.positions_row_count !== null}
-                  · {jobExport.positions_row_count.toLocaleString()} captured positions ·
-                  {megabytes(jobExport.positions_bytes)}
-                  {#if jobExport.positions_download_url}
-                    · <a href={jobExport.positions_download_url}>download positions</a>
-                  {/if}
-                  {#if jobExport.positions_sha256}
-                    · <span class="whitespace-nowrap">SHA-256 of the .gz</span>
-                    <code class="break-all text-xs">{jobExport.positions_sha256}</code>
-                  {/if}
-                {/if}
-                {#if jobExport.download_url}(links valid for an hour){/if}
-              {:else if jobExport.state === 'expired'}
-                Expired: the store keeps an export for thirty days. Export again to rebuild it.
-              {:else}
-                <span class="text-destructive">Failed: {jobExport.error ?? 'unknown error'}</span>
+    <div class="card space-y-3">
+      <h2 class="text-lg font-medium">Export</h2>
+      <p class="text-xs text-muted-foreground">
+        The job's whole corpus as one gzipped NDJSON file, built on a background task and
+        downloaded straight from the artifact store. An opening-rack line is a rack with its
+        ranked moves; a games job that captured positions gets those as a second file. A job
+        still taking results exports a snapshot as of when it was read; a completed job's final
+        export is refused while its last claims are still in flight.
+      </p>
+      <div class="flex flex-wrap items-center gap-3">
+        <button
+          class="btn-secondary"
+          on:click={startExport}
+          disabled={busy || gone || exportStarted || jobExport?.state === 'running'}
+        >
+          {exportView.button}
+        </button>
+        {#if jobExport}
+          <span class="text-sm">
+            {#if jobExport.state === 'running'}
+              Building…
+            {:else if jobExport.state === 'ready'}
+              {#if exportView.label}
+                <span class:text-warning={!jobExport.is_final}>{exportView.label}</span> ·
               {/if}
-            </span>
-          {/if}
-        </div>
+              {(jobExport.row_count ?? 0).toLocaleString()} rows ·
+              {megabytes(jobExport.bytes)}
+              {#if jobExport.download_url}
+                · <a href={jobExport.download_url}>download</a>
+              {/if}
+              {#if jobExport.sha256}
+                · <span class="whitespace-nowrap">SHA-256 of the .gz</span>
+                <code class="break-all text-xs">{jobExport.sha256}</code>
+              {/if}
+              {#if jobExport.positions_row_count !== null}
+                · {jobExport.positions_row_count.toLocaleString()} captured positions ·
+                {megabytes(jobExport.positions_bytes)}
+                {#if jobExport.positions_download_url}
+                  · <a href={jobExport.positions_download_url}>download positions</a>
+                {/if}
+                {#if jobExport.positions_sha256}
+                  · <span class="whitespace-nowrap">SHA-256 of the .gz</span>
+                  <code class="break-all text-xs">{jobExport.positions_sha256}</code>
+                {/if}
+              {/if}
+              {#if jobExport.download_url}(links valid for an hour){/if}
+            {:else if jobExport.state === 'expired'}
+              Expired: the store keeps an export for thirty days. Export again to rebuild it.
+            {:else}
+              <span class="text-destructive">Failed: {jobExport.error ?? 'unknown error'}</span>
+            {/if}
+          </span>
+        {/if}
       </div>
-    {/if}
+      {#if exportView.note}
+        <p class="text-xs text-muted-foreground">{exportView.note}</p>
+      {/if}
+    </div>
 
     <div class="card space-y-3">
       <h2 class="text-lg font-medium">Progress</h2>

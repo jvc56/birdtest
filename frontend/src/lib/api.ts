@@ -502,6 +502,13 @@ export interface JobExport {
   positions_bytes: number | null;
   positions_sha256: string | null;
   positions_row_count: number | null;
+  /**
+   * True for a completed job's final corpus; false for a snapshot read while
+   * the job was still taking results (and for an export not yet built).
+   */
+  is_final: boolean;
+  /** When the snapshot it was read in was taken; null until built. */
+  snapshot_at: string | null;
   error: string | null;
   requested_at: string;
   completed_at: string | null;

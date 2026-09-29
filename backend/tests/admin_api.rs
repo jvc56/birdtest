@@ -392,12 +392,14 @@ async fn the_results_stream_is_admin_only_and_the_paginated_one_is_not() {
     assert_eq!(status, StatusCode::OK);
 }
 
-/// Only a completed job can be exported: an export of a job still taking
-/// results would be stale before anyone downloaded it, and nothing would say so.
+/// A running job exports a snapshot: it has claims in flight -- an active job
+/// always does -- and is exported all the same, where it was refused while it
+/// was not completed. A completed job with a claim still out is refused (the
+/// admin wants its final corpus, which is not yet fixed).
 /// A-ADMIN-15b: the audit row is written with the export's own row, so a
 /// refused one logs nothing (logged before it, every refusal read as a start).
 #[tokio::test]
-async fn only_a_completed_job_can_be_exported() {
+async fn a_running_job_exports_a_snapshot() {
     let db = TestDb::new().await;
     let job = db.games_job(1, 10).await;
     let cfg = db.config();
@@ -410,15 +412,11 @@ async fn only_a_completed_job_can_be_exported() {
         send(&app, get_request(&format!("/api/admin/jobs/{job}/export"), &headers)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let start = |headers: Vec<(String, String)>| {
+    let start = || {
         let borrowed: Vec<(&str, &str)> =
             headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         post_json(&format!("/api/admin/jobs/{job}/export"), &borrowed, serde_json::json!({}))
     };
-
-    let (status, body) = send(&app, start(headers.clone())).await;
-    assert_eq!(status, StatusCode::CONFLICT, "{body}");
-    assert!(body["message"].as_str().unwrap().contains("completed"), "{body}");
     let logged = || async {
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM audit_log WHERE job_id = $1 AND action = 'job.export_started'",
@@ -428,24 +426,20 @@ async fn only_a_completed_job_can_be_exported() {
         .await
         .unwrap()
     };
-    // A refused export is not logged as started (A-ADMIN-15b).
-    assert_eq!(logged().await, 0);
 
-    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-
-    let headers_again = || headers.clone();
-    let (status, body) = send(&app, start(headers.clone())).await;
+    // Active, with a claim out.
+    let (status, claim) =
+        send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
+    assert_eq!(status, StatusCode::OK, "{claim}");
+    let (status, body) = send(&app, start()).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     assert!(body["id"].is_string(), "{body}");
 
     // The row exists from the moment the task is spawned. Its outcome depends
     // on an object store the test config points at a closed port, so the state
     // is whatever the spawned task reached; what is pinned here is that the
-    // export was accepted and recorded, not that the upload succeeded.
+    // export was accepted and recorded, not that the upload succeeded
+    // (`exports.rs` builds one against a real store).
     let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_exports WHERE job_id = $1")
         .bind(job)
         .fetch_one(&db.pool)
@@ -454,16 +448,16 @@ async fn only_a_completed_job_can_be_exported() {
     assert_eq!(recorded, 1);
     assert_eq!(logged().await, 1, "one begun export, one row");
 
-    // A second while it runs -- or, if the first has finished, another
-    // begun -- never a row without its export.
-    let (status, body) = send(&app, start(headers_again())).await;
-    assert!(matches!(status, StatusCode::CONFLICT | StatusCode::ACCEPTED), "{status} {body}");
-    let exports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM job_exports WHERE job_id = $1")
+    // Completed with that claim still out: refused, and not logged.
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
         .bind(job)
-        .fetch_one(&db.pool)
+        .execute(&db.pool)
         .await
         .unwrap();
-    assert_eq!(logged().await, exports, "one row per export begun");
+    let (status, body) = send(&app, start()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("in flight"), "{body}");
+    assert_eq!(logged().await, 1, "a refused export is not logged as started");
 }
 
 /// An opening-rack job whose static player records only the best move cannot
@@ -692,7 +686,9 @@ async fn a_purge_waits_for_a_submission_in_flight_before_counting_contributions(
 ///
 /// Completion does not stop results arriving: a job that met its stopping rule
 /// still accepts every claim already issued. An export built in that window
-/// was short, and every later download of the job was redirected to it.
+/// was short, and every later download of the job was redirected to it; it
+/// would now be a snapshot, but the admin exporting a completed job wants the
+/// final corpus.
 #[tokio::test]
 async fn a_completed_job_is_not_exported_until_its_claims_have_landed() {
     let db = TestDb::new().await;

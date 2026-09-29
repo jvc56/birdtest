@@ -69,8 +69,8 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 227 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 160 | Vitest, `frontend/src/lib/`: `format.test.ts` (30), `jobSettings.test.ts` (7), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 165 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
+| 1F Frontend unit | 164 | Vitest, `frontend/src/lib/`: `format.test.ts` (34), `jobSettings.test.ts` (7), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 172 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 234 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 18 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 655 backend tests (the per-tier counts above are
+--run-ignored all` runs 662 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -730,6 +730,12 @@ Each entry's tests are the `describe` block named for its id.
   distribution or board left on its empty "Choose…" (the job and rating-pool
   forms, which no longer pick the first imported for the admin). *(Covered:
   `format.test.ts`.)* (Twenty-second audit.)
+- `F-FMT-14` `exportSummary`: a snapshot export is labelled "Snapshot as of
+  <time> — job still running" (and, once the job has completed, as not its
+  final results); a completed job whose newest export is a snapshot, or a
+  failed build, is offered **Build the final export**; a running job's button
+  exports a snapshot; a leave job's snapshot notes it is as of the last merge.
+  *(Covered: `format.test.ts`.)*
 
 ### `F-CGP-*` — `lib/cgp.ts`
 
@@ -1892,8 +1898,8 @@ Against a real MinIO (`TEST_S3_ENDPOINT`), one bucket per test.
 
 ### `I-EXPORT-*` — exports (`exports.rs`)
 
-A completed job's corpus, written once to the object store (PLAN.md,
-"Exports"). The refusals were tested before; the success path — the objects,
+A job's corpus, written once to the object store: a completed job's final
+corpus, or a snapshot of one still running (PLAN.md, "Exports"). The refusals were tested before; the success path — the objects,
 their digests, the redirect, the purge — ran nowhere until `exports.rs`, which
 runs against a real MinIO.
 
@@ -1903,7 +1909,7 @@ runs against a real MinIO.
   URL, both under `exports/`. *(Covered:
   `exports::a_completed_jobs_export_is_its_stream_and_its_positions_behind_presigned_urls`.)*
 - `I-EXPORT-2` A completed job's stream answers `303` to its newest ready
-  export, and with `?positions=true` to the positions object — until the
+  final export, and with `?positions=true` to the positions object — until the
   export is older than the bucket keeps it (`EXPORT_LIFETIME_DAYS`), when the
   stream goes back to the database and the admin detail says `expired`.
   *(Covered:
@@ -1920,16 +1926,18 @@ runs against a real MinIO.
   rule). *(Covered:
   `exports::startup_fails_exports_left_running_and_leaves_the_rest_alone`,
   `exports::an_export_reaped_while_it_ran_is_not_brought_back_ready`.)*
-- `I-EXPORT-6` Only a completed job can be exported, not until its last claims
-  have landed, and a claim whose worker vanished does not block it for ever.
-  *(Covered: `admin_api::only_a_completed_job_can_be_exported`,
+- `I-EXPORT-6` Any job can be exported, an active one with claims in flight
+  included (it was "completed only"); a completed job not until its last
+  claims have landed, and a claim whose worker vanished does not block it for
+  ever. *(Covered: `admin_api::a_running_job_exports_a_snapshot`,
   `admin_api::a_completed_job_is_not_exported_until_its_claims_have_landed`,
   `admin_api::an_export_is_not_blocked_by_a_claim_whose_worker_vanished`.)*
 - `I-EXPORT-7` The uploaded parts are one gzip stream of exactly the lines
   pushed, and the recorded digest and size describe those bytes. *(Covered:
   `exports::tests::the_parts_are_one_gzip_stream_of_what_was_pushed`.)*
-- `I-EXPORT-8` One export of a job runs at a time: a second request while one
-  is `running` is a 409. *(Covered:
+- `I-EXPORT-8` One export of a job runs at a time, a running job's snapshot
+  as much as a final export: a second request while one is `running` is a
+  409. *(Covered:
   `exports::a_job_has_one_export_running_at_a_time`.)* (Thirteenth audit.)
 - `I-EXPORT-9` A reader that stops early ends its corpus query: the connection
   is closed, not drained back into the pool. *(Covered for the results stream:
@@ -1953,6 +1961,21 @@ runs against a real MinIO.
   `exports::an_export_that_fails_after_uploading_removes_its_objects`. A
   multipart upload that fails to complete is aborted, and a row that says
   `ready` after all keeps its objects; not tested separately.)* (Thirty-second audit, pass 20.)
+- `I-EXPORT-12` A running job's export is a snapshot: ready and downloadable,
+  `is_final` false with its `snapshot_at`, and never what the results stream
+  serves — not while the job runs, and not once it has completed, when the
+  stream reads the database until a final export is built and then redirects
+  to that. The newest ready export was served whatever it was built from, so
+  one taken mid-run became the completed job's corpus. *(Covered:
+  `exports::a_running_jobs_export_is_a_snapshot_the_stream_never_serves`.)*
+- `I-EXPORT-13` Whether an export is final is the job's state when its
+  snapshot was taken: a job active then and completed while the export reads
+  gives a snapshot, never redirected to. *(Covered:
+  `exports::the_final_marker_is_the_jobs_state_when_its_snapshot_was_taken`.)*
+- `I-EXPORT-14` The results and the captured positions are read in one
+  snapshot: a result and its position committed between the two scans are in
+  neither file. *(Covered:
+  `exports::results_and_positions_are_read_in_one_snapshot`.)*
 
 ### `I-DATA-*` — the pinned-row invariant
 
@@ -2455,9 +2478,10 @@ below.
   `admin_api::purging_a_completed_job_returns_it_to_inactive`.)* (Eleventh
   audit's fix, twelfth audit's test.)
 - `A-ADMIN-15b` An export's `job.export_started` row is written in the
-  transaction that records the export: a refused one (the job not completed,
-  one already running) writes none, and a begun one exactly one. *(Covered:
-  `admin_api::only_a_completed_job_can_be_exported`.)* (Thirty-second audit.)
+  transaction that records the export: a refused one (a completed job's claims
+  still in flight, one already running) writes none, and a begun one exactly
+  one. *(Covered: `admin_api::a_running_job_exports_a_snapshot`.)*
+  (Thirty-second audit.)
 - `A-ADMIN-16` While a purge or delete holds a job's claims, a submission for
   one is answered `503` at once; and a hold that ends without committing spares
   the job's claims from reclamation, so the submission lands afterwards.

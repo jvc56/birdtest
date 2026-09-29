@@ -1,6 +1,6 @@
-//! A completed job's export, end to end against a real object store
-//! (`TEST_S3_ENDPOINT`): PLAN.md, "Exports". TESTING.md names no id for these;
-//! each test cites the design sentence it proves.
+//! A job's export, final or snapshot, end to end against a real object store
+//! (`TEST_S3_ENDPOINT`): PLAN.md, "Exports". Each test cites the design
+//! sentence it proves, and TESTING.md's `I-EXPORT-*` names them.
 //!
 //! Every other test of the export either stops at the refusal or points the
 //! state at a closed object store, so the success path -- the artifacts'
@@ -90,14 +90,7 @@ async fn completed_capture_job(db: &TestDb, app: &axum::Router, results: usize) 
         .await
         .unwrap();
     for i in 0..results {
-        let mut result = games_result(2, 1);
-        result["positions"] = json!([
-            { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": format!("cgp-{i}-0"),
-              "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-            { "game_index": 1, "turn_number": 3, "rack": "AEINRSU", "position": format!("cgp-{i}-1"),
-              "previous_move": "8D DOG", "previous_move_score": 10,
-              "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
-        ]);
+        let result = captured_result(i);
         let (claim, uuid) = first_claim(app).await;
         let (status, body) =
             submit_as(app, &uuid, claim["claim_token"].as_str().unwrap(), result).await;
@@ -105,6 +98,19 @@ async fn completed_capture_job(db: &TestDb, app: &axum::Router, results: usize) 
         assert_eq!(body, json!({ "accepted": true }));
     }
     job
+}
+
+/// One accepted games result with its two captured positions, `cgp-<i>-*`.
+fn captured_result(i: usize) -> serde_json::Value {
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([
+        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": format!("cgp-{i}-0"),
+          "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
+        { "game_index": 1, "turn_number": 3, "rack": "AEINRSU", "position": format!("cgp-{i}-1"),
+          "previous_move": "8D DOG", "previous_move_score": 10,
+          "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
+    ]);
+    result
 }
 
 async fn complete(db: &TestDb, job: Uuid) {
@@ -366,9 +372,10 @@ async fn export_state(db: &TestDb, id: Uuid) -> (String, Option<String>, bool) {
     .unwrap()
 }
 
-/// I-EXPORT-8: one export of a job runs at a time. Only the page's disabled
-/// button stopped a second, and each holds a pool connection for its whole
-/// corpus read.
+/// I-EXPORT-8: one export of a job runs at a time -- a running job's snapshot
+/// as much as a completed job's final export. Only the page's disabled button
+/// stopped a second, and each holds a pool connection for its whole corpus
+/// read.
 #[tokio::test]
 async fn a_job_has_one_export_running_at_a_time() {
     let db = TestDb::new().await;
@@ -377,7 +384,6 @@ async fn a_job_has_one_export_running_at_a_time() {
     let admin = db.user("root", true).await;
     let headers = admin_headers(&state.cfg, admin);
     let job = completed_capture_job(&db, &app, 1).await;
-    complete(&db, job).await;
     export_row(&db, job, "running").await;
 
     let borrowed: Vec<(&str, &str)> =
@@ -726,4 +732,186 @@ async fn an_export_that_fails_after_uploading_removes_its_objects() {
     let export = export_and_wait(&app, job, &headers).await;
     assert_eq!(export["state"], "failed", "{export}");
     assert_eq!(bucket.keys().await, Vec::<String>::new(), "a failed export's objects are left in the store");
+}
+
+/// I-EXPORT-12: a running job's export is a snapshot -- ready, downloadable,
+/// marked `is_final: false` with the time its snapshot was taken -- and the
+/// results stream never serves it, not while the job runs and not once it has
+/// completed: the completed job streams from the database until a final export
+/// of it is built, and then redirects to that one. Bug: the newest ready export
+/// was served whatever the job was when it was built, so an export taken
+/// mid-run became the completed job's corpus.
+#[tokio::test]
+async fn a_running_jobs_export_is_a_snapshot_the_stream_never_serves() {
+    let db = TestDb::new().await;
+    let (state, _bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+    let stream = format!("/api/admin/jobs/{job}/results/stream");
+
+    let snapshot = export_and_wait(&app, job, &headers).await;
+    assert_eq!(snapshot["state"], "ready", "{snapshot}");
+    assert_eq!(snapshot["is_final"], false, "{snapshot}");
+    assert!(snapshot["snapshot_at"].is_string(), "{snapshot}");
+    assert_eq!((snapshot["row_count"].as_i64(), snapshot["positions_row_count"].as_i64()), (Some(1), Some(2)));
+    let bytes = download(snapshot["download_url"].as_str().expect("a snapshot is downloadable")).await;
+    assert_eq!(gunzip(&bytes).lines().count(), 1);
+
+    // A second result lands, and the job completes.
+    let (claim, uuid) = first_claim(&app).await;
+    let (status, body) =
+        submit_as(&app, &uuid, claim["claim_token"].as_str().unwrap(), captured_result(1)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    complete(&db, job).await;
+
+    let (status, _, body) = send_raw(&app, get_request(&stream, &headers)).await;
+    assert_eq!(status, StatusCode::OK, "the snapshot is not the completed job's corpus");
+    assert_eq!(body.lines().count(), 2);
+    let (_, detail) = send(&app, get_request(&format!("/api/admin/jobs/{job}/export"), &headers)).await;
+    assert_eq!((detail["id"].clone(), detail["is_final"].clone()), (snapshot["id"].clone(), json!(false)));
+
+    // A final export of the completed job, which the stream then serves.
+    let last = export_and_wait(&app, job, &headers).await;
+    assert_eq!((last["state"].as_str(), last["is_final"].as_bool()), (Some("ready"), Some(true)), "{last}");
+    assert_eq!((last["row_count"].as_i64(), last["positions_row_count"].as_i64()), (Some(2), Some(4)));
+    let (status, response_headers, _) = send_raw(&app, get_request(&stream, &headers)).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    let location = response_headers["location"].to_str().unwrap();
+    assert!(location.contains(last["id"].as_str().unwrap()), "{location}");
+}
+
+/// I-EXPORT-13: whether an export is final is the job's state when the export's
+/// snapshot was taken, not when the export was asked for or when it finished.
+/// Here the job is active when the snapshot is taken and completes while the
+/// export reads: marked final on the state it finishes in, the export would be
+/// served as the completed job's corpus while short of it.
+#[tokio::test]
+async fn the_final_marker_is_the_jobs_state_when_its_snapshot_was_taken() {
+    let db = TestDb::new().await;
+    let (state, _bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+
+    // Hold the export at its results scan, after its snapshot was taken.
+    let mut reads = db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE game_results IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *reads)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{job}/export"), &borrowed(&headers), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_lock_waiter(&db, "SELECT to_jsonb(r)::text AS row FROM game_results").await;
+    complete(&db, job).await;
+    reads.commit().await.unwrap();
+
+    let path = format!("/api/admin/jobs/{job}/export");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let export = loop {
+        let (_, body) = send(&app, get_request(&path, &headers)).await;
+        if body["state"] != "running" {
+            break body;
+        }
+        assert!(Instant::now() < deadline, "the export never finished: {body}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(export["state"], "ready", "{export}");
+    assert_eq!(export["is_final"], false, "read while the job was active: {export}");
+    let (status, _, _) = send_raw(&app, get_request(&format!("/api/admin/jobs/{job}/results/stream"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "and so never redirected to");
+}
+
+/// I-EXPORT-14: the results and the captured positions are read in one
+/// snapshot. A result and its position committed between the two scans are
+/// in neither file; read on two connections, as they were, the positions file
+/// held a position whose result the results file did not.
+#[tokio::test]
+async fn results_and_positions_are_read_in_one_snapshot() {
+    let db = TestDb::new().await;
+    let (state, _bucket) = db.state_with_object_store().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let job = completed_capture_job(&db, &app, 1).await;
+
+    // Held at the positions, after the results were read; the late result is
+    // written by the session holding them.
+    let mut late = db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE position_analysis_records IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *late)
+        .await
+        .unwrap();
+    let (status, body) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{job}/export"), &borrowed(&headers), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    wait_for_lock_waiter(&db, "SELECT EXISTS (SELECT 1 FROM position_analysis_records").await;
+    let task: Uuid = sqlx::query_scalar(
+        "INSERT INTO tasks (job_id, seed, state) VALUES ($1, 999, 'completed') RETURNING id",
+    )
+    .bind(job)
+    .fetch_one(&mut *late)
+    .await
+    .unwrap();
+    let claim: Uuid = sqlx::query_scalar(
+        "INSERT INTO task_claims (task_id, job_id, claim_token, state, claimed_by_user_id, completed_at)
+         VALUES ($1, $2, gen_random_uuid(), 'completed', $3, now()) RETURNING id",
+    )
+    .bind(task)
+    .bind(job)
+    .bind(admin)
+    .fetch_one(&mut *late)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO game_results (task_claim_id, task_id, job_id, games, wins, losses, ties,
+                                   p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd)
+         VALUES ($1, $2, $3, 2, 1, 1, 0, 400, 30, 400, 30)",
+    )
+    .bind(claim)
+    .bind(task)
+    .bind(job)
+    .execute(&mut *late)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO position_analysis_records
+             (task_claim_id, task_id, job_id, rack, position, game_index, turn_number, num_moves)
+         VALUES ($1, $2, $3, 'AEINRST', 'late', 0, 0, 1)",
+    )
+    .bind(claim)
+    .bind(task)
+    .bind(job)
+    .execute(&mut *late)
+    .await
+    .unwrap();
+    late.commit().await.unwrap();
+
+    let path = format!("/api/admin/jobs/{job}/export");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let export = loop {
+        let (_, body) = send(&app, get_request(&path, &headers)).await;
+        if body["state"] != "running" {
+            break body;
+        }
+        assert!(Instant::now() < deadline, "the export never finished: {body}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert_eq!(export["state"], "ready", "{export}");
+    assert_eq!(
+        (export["row_count"].as_i64(), export["positions_row_count"].as_i64()),
+        (Some(1), Some(2)),
+        "neither file has the late result: {export}"
+    );
+    let positions = gunzip(&download(export["positions_download_url"].as_str().unwrap()).await);
+    assert!(!positions.contains("\"late\""), "{positions}");
 }

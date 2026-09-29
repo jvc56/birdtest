@@ -2595,6 +2595,11 @@ struct ExportRow {
     positions_bytes: Option<i64>,
     positions_sha256: Option<String>,
     positions_row_count: Option<i64>,
+    /// Whether this is the completed job's final corpus, rather than a
+    /// snapshot of a job still taking results (`exports`). False until built.
+    is_final: bool,
+    /// When the snapshot it was read in was taken; `None` until built.
+    snapshot_at: Option<chrono::DateTime<chrono::Utc>>,
     error: Option<String>,
     requested_at: chrono::DateTime<chrono::Utc>,
     completed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -2613,10 +2618,11 @@ struct ExportDetail {
     positions_download_url: Option<String>,
 }
 
-/// Build a completed job's results into one downloadable artifact.
+/// Build a job's results into one downloadable artifact: the final corpus of a
+/// completed job, or a snapshot of one still running.
 ///
 /// Returns immediately with an id; the work runs on a spawned task and the
-/// admin polls `GET`. Only completed jobs qualify — see `exports::start`.
+/// admin polls `GET`. See `exports::start`.
 async fn start_export(
     State(state): State<AppState>,
     admin: AdminUser,
@@ -2638,7 +2644,8 @@ async fn start_export(
     ))
 }
 
-/// The newest export for a job, with a download URL once it is ready.
+/// The newest export for a job, with a download URL once it is ready, and
+/// whether it is the final corpus or a snapshot.
 async fn get_export(
     State(state): State<AppState>,
     _admin: AdminUser,
@@ -2646,7 +2653,7 @@ async fn get_export(
 ) -> AppResult<Json<ExportDetail>> {
     let mut export = sqlx::query_as::<_, ExportRow>(
         "SELECT id, state, bytes, sha256, row_count, positions_bytes, positions_sha256,
-                positions_row_count, error, requested_at, completed_at
+                positions_row_count, is_final, snapshot_at, error, requested_at, completed_at
          FROM job_exports WHERE job_id = $1
          ORDER BY requested_at DESC LIMIT 1",
     )
@@ -2655,9 +2662,11 @@ async fn get_export(
     .await?
     .ok_or_else(|| AppError::not_found("this job has never been exported"))?;
 
+    // This export's own objects, snapshot or final: the stream serves only a
+    // final one, but the admin page offers whichever it shows, labelled.
     let (download_url, positions_download_url) =
-        match crate::exports::newest_ready(&state.pool, id).await? {
-            Some(ready) if ready.id == export.id => {
+        match crate::exports::ready_objects(&state.pool, export.id).await? {
+            Some(ready) => {
                 let ttl = crate::exports::DOWNLOAD_URL_TTL;
                 let results = state.artifacts.presigned_get(&ready.artifact_key, ttl).await?;
                 let positions = match &ready.positions_artifact_key {

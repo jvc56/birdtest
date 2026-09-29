@@ -1054,7 +1054,9 @@ denominator.
 
 #### Exports
 
-A completed job's whole corpus is read **once**, not once per caller.
+A job's whole corpus is read **once**, not once per caller — at any point in the
+job's life, as a snapshot while it runs and as its final corpus once it has
+completed.
 
 The results stream scans from a cursor and holds a pool connection for as long
 as its caller keeps reading. That is fine for a spot check and wrong for a
@@ -1146,18 +1148,48 @@ corpus capture exists to build had no way out of the database at all. Both
 objects are written before the row says `ready`, a purge deletes both, and both
 live under `exports/` and expire with it.
 
-**Only completed jobs can be exported**, and that restriction is what makes the
-artifact worth having: a completed job's results are immutable, so an export is
-built once and reused by every later download, where an export of an active job
-would be stale as it was written. It is also why the stream can safely redirect
-to one.
+**Any job can be exported, and the export says what it is.** A job still taking
+results — active, or inactive between runs — exports a **snapshot**: the corpus
+as of the moment its snapshot was taken, consistent in itself, downloadable,
+and labelled on the admin page "Snapshot as of <time> — job still running". A
+completed job exports its **final** corpus, which is what makes that artifact
+worth keeping: a completed job's results are immutable, so it is built once and
+reused by every later download, and the results stream redirects to it. Only a
+final export is ever served in the completed job's place — `newest_ready`, the
+redirect, reads `is_final` exports only — so a completed job whose only exports
+are snapshots streams from the database, and the page offers to build its final
+export. (Before exports could be taken mid-run the rule was "completed only",
+and the redirect served the newest ready export whatever it was built from:
+an export taken mid-run would have become the completed job's corpus.)
 
-**And only once its results have settled.** A job is marked completed the
-moment its stopping rule is met or an admin forces it, but the claims already
-out are still played and still accepted, so its results keep arriving for up to
-the heartbeat timeout. An export started in that window missed them, and every
-later download was redirected to it. So an export is refused (`409`) while any
-claim of the job is still open; no claim can be issued against a completed job,
+**Final is decided inside the snapshot.** An export reads its results and its
+captured positions in **one** `REPEATABLE READ`, read-only transaction on one
+connection — read on two, as they were, the positions file of a running job
+could name results the results file did not hold. The transaction's first
+statement takes the snapshot and asks of the state it sees whether this is the
+final corpus: the job completed, no claim still open, and (a leave job) nothing
+staged. Not what `start` saw: a job exported while active can complete before
+its build begins its read, with its last claims still landing, and one marked
+final on a status read before its rows were would be the short corpus the
+marker exists to rule out. The transaction holds one connection and one
+snapshot for both scans, as the two scans each held one before; the two-builds
+cap, the six-hour limit and the closed-not-drained connection bound it the same
+way.
+
+**A running leave-generation job's export reflects its last merge.** Its corpus
+is `leave_rack_progress`, which a merge updates at most every half hour; the
+export does not force one (only a completed job's is merged first, below), and
+the admin page says so beside a snapshot of a leave job.
+
+**A completed job's export waits until its results have settled.** A job is
+marked completed the moment its stopping rule is met or an admin forces it, but
+the claims already out are still played and still accepted, so its results keep
+arriving for up to the heartbeat timeout. An export started in that window
+missed them, and every later download was redirected to it (it would now be a
+snapshot, never redirected to, but it is still not what an admin exporting a
+completed job asked for). So a completed job's export is refused (`409`) while
+any claim of the job is still open — a running job's is not, since an active
+job always has claims out; no claim can be issued against a completed job,
 so once none is open the results are fixed. The job's lapsed claims are
 reclaimed first, through the same statement dispatch uses: reclamation is
 otherwise lazy, running only when a worker asks for work and the job is a
@@ -4937,8 +4969,8 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged new and changed (collision) rows, in one transaction. |
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
 | `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. `?positions=true` (games and game-pairs jobs) streams the positions the job captured instead of its result rows. At most two run at once (a third gets `429`); a completed job with a ready export gets a `303` to it instead. A stream is complete exactly when it ends cleanly: what can fail before the first row (a connection, a leave job's settle) is a status, and a query that fails part-way cuts the body off with an error rather than ending it, which a client over HTTP/1.1 or later reports as a failed transfer (HTTP/1.0 has no chunks, and a cut reads as an end there). |
-| `POST` | `/api/admin/jobs/:id/export` | Build a **completed** job's results into one gzipped NDJSON object in the artifact store. `202` with an id; the work runs on a background task. `409` for a job that is not completed, or whose last claims are still in flight. |
-| `GET` | `/api/admin/jobs/:id/export` | The newest export for the job, with a presigned `download_url` once it is ready — and, for a games or game-pairs job that captured positions, a `positions_download_url` for the second object holding them. |
+| `POST` | `/api/admin/jobs/:id/export` | Build a job's results into one gzipped NDJSON object in the artifact store: a completed job's final corpus, or a snapshot of one still running. `202` with an id; the work runs on a background task. `409` while an export of the job is running, or for a completed job whose last claims are still in flight. |
+| `GET` | `/api/admin/jobs/:id/export` | The newest export for the job — `is_final`, or a snapshot as of `snapshot_at` — with a presigned `download_url` once it is ready, and, for a games or game-pairs job that captured positions, a `positions_download_url` for the second object holding them. |
 | `GET` | `/api/admin/workers` | The contributor list with anonymous workers' real UUIDs, which banning one needs; the public list carries pseudonyms only. |
 | `GET` | `/api/admin/derived-data` | Every wordmap and rack info table the server has been asked to build: state, builder, hash, attempts and the last error. A job whose files are not `built` is not dispatched, and this is where that wait — or the failure behind it — is visible. |
 | `POST` | `/api/admin/derived-data/retry` | Put one `failed` build back in the queue: `{ role, name, builder, kwg_id, klv_id, letterdist_id }`, as `GET /api/admin/derived-data` lists them (`klv_id` null for a wordmap); without the builder, `kwg_id` or `letterdist_id` it is a `400`, since rows can share a role and name, and a row that matches no failed build of this version's builders — a rack info table sent without its `klv_id` among them — is a `404`. Explicit rather than automatic: a failed attempt is tried again after 5 and then 15 minutes, which a passing outage survives, so a build that has failed three times failed for a reason a fourth attempt does not change — a missing or damaged input, a broken binary. |
@@ -6175,11 +6207,12 @@ CREATE TABLE job_leave_config (
 
 -- Exports
 --
--- A completed job's results, as one gzipped NDJSON object in the artifact
--- store. Only completed jobs can be exported, and that is what makes the
--- artifact worth having: a completed job's results are immutable, so an export
--- is built once and reused, where an export of an active job would be stale as
--- it was written.
+-- A job's results, as one gzipped NDJSON object in the artifact store. Any job
+-- can be exported; is_final says whether this is the completed job's corpus,
+-- which is immutable and so built once and reused (the results stream
+-- redirects to it), or a snapshot of a job still taking results, which is
+-- offered as a download labelled with its time and never served in the
+-- finished job's place.
 --
 -- Shaped like input_data_imports, and for the same reason: a long operation an
 -- admin starts, polls, and then acts on. birdtest runs as a single instance, so
@@ -6207,13 +6240,23 @@ CREATE TABLE job_exports (
     positions_bytes        BIGINT,
     positions_sha256       TEXT,
     positions_row_count    BIGINT,
+    -- TRUE when the snapshot the export was read in saw the job completed,
+    -- with no claim still open and nothing staged: its final corpus. Decided
+    -- inside that snapshot (exports::read_snapshot), not when the export was
+    -- requested -- a job exported mid-run can complete before its rows are
+    -- read, with its last results still landing. FALSE until built, so an
+    -- unfinished or unmarked row is never taken for the final one.
+    is_final      BOOLEAN NOT NULL DEFAULT FALSE,
+    -- When that snapshot was taken, for the page's "Snapshot as of …".
+    snapshot_at   TIMESTAMPTZ,
     error         TEXT,
     requested_by  UUID REFERENCES users(id) ON DELETE SET NULL,
     requested_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at  TIMESTAMPTZ
 );
 
--- The newest ready export for a job, which is what a download resolves to.
+-- The newest ready export for a job, which is what a download resolves to
+-- (the newest final one, for the results stream).
 CREATE INDEX job_exports_job_idx ON job_exports (job_id, requested_at DESC);
 
 -- One export of a job at a time. Only the page's disabled button stopped a

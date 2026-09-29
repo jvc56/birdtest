@@ -577,15 +577,21 @@ The six seeded jobs hold 96% between them.
   **Expect** that tab on the jobs list, without the job, and the other saying
   "This job no longer exists." with every action disabled.
 
-### A-10 Export a finished job
+### A-10 Export a job
 
 - [ ] **Do** **Export results** on "tester cap". **Expect** "Building…", then
-  "N rows · N MB · download · SHA-256 of the .gz …", with links valid for an
-  hour.
+  "Final results · N rows · N MB · download · SHA-256 of the .gz …", with links
+  valid for an hour.
 - [ ] **Do** download. **Expect** a gzipped file of one JSON object per line.
-- [ ] **Do** export "tester positions" once it has completed. **Expect** a
-  second download, of its positions.
-- [ ] **Expect** no export card on an active or inactive job.
+- [ ] **Do** **Export a snapshot** on an active job. **Expect** "Snapshot as of
+  <time> — job still running" in amber, with a download. **Do** it again a
+  minute later. **Expect** a later time and more rows.
+- [ ] **Do** export "tester positions" while it runs, then again once it has
+  completed. **Expect** the first a snapshot with its positions as a second
+  download, and the button on the completed job to read **Build the final
+  export** until the final one is built, then "Final results".
+- [ ] **Do** **Export a snapshot** on an active leave-generation job. **Expect**
+  the note that rack totals are as of the last merge.
 
 ### A-11 Data gaps
 
@@ -619,7 +625,7 @@ closes in seconds rather than never.
 - [ ] **Do** **Force rebuild** and confirm. **Expect** every generation
   rewritten. (On an active job it is refused: "deactivate the job before
   forcing a rebuild …".)
-- [ ] **Do** export it (A-10). **Expect** a download.
+- [ ] **Do** export it ([A-10](#a-10-export-a-job)). **Expect** a download.
 
 ### A-13 Rating pools
 

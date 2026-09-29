@@ -1433,8 +1433,8 @@ async fn job_stream(
 /// and the resource it consumes is not CPU but a pool connection, held for as
 /// long as the caller keeps reading, out of twenty. Bulk reads are an admin
 /// operation now; the public gets `GET /api/jobs/:id/results`, which is
-/// paginated. For a completed job this defers to the export, which is the same
-/// corpus read once rather than once per caller.
+/// paginated. For a completed job this defers to its final export, which is the
+/// same corpus read once rather than once per caller.
 #[derive(Deserialize)]
 pub(super) struct StreamQuery {
     /// Games and game-pairs jobs only: stream the positions the job captured
@@ -1460,6 +1460,8 @@ pub(super) async fn job_results_stream(
     // A completed job's results are immutable, so an export of them is a stable
     // artifact: read it instead of re-scanning. The redirect is what puts the
     // cheap path in front of a caller without them having to know about it.
+    // Only a final export: a snapshot taken while the job ran is short of the
+    // corpus, and was once served as it.
     if job.status == crate::models::job::JobStatus::Completed {
         if let Some(ready) = crate::exports::newest_ready(&state.pool, id).await? {
             // The positions' own artifact when that is what was asked for. An
