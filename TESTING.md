@@ -3043,7 +3043,8 @@ admin in once and the admin journeys reuse its storage state.
   lists with a 32-character username and a tombstone (and the contributors'
   list a pseudonym), which the seed does not register; the contributors'
   list shows only its ranked column beside the name — compute time, then
-  games once ranked by games.)* The screen is the device's width:
+  games once ranked by games through its "Rank by" row, since the other
+  columns' headers are not on a phone's screen.)* The screen is the device's width:
   compared with `innerWidth`, as it was, the check could not fail, because a
   phone's browser widens its layout viewport to fit what overflows — and the
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and

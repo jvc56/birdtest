@@ -312,8 +312,9 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
   hover), games, racks, tasks and last result.
 - [ ] **Do** click **Games**, then **Racks**, then **Tasks**. **Expect** the
   list re-ranked by each, most first, the arrow moving with it; still all four.
-- [ ] At phone width, **expect** only the ranked column beside the name — games
-  when ranked by games — and no sideways scroll.
+- [ ] At phone width, **expect** a "Rank by" row of the four columns above the
+  list and only the ranked column beside the name. **Do** choose **Games**.
+  **Expect** the games column in its place, and no sideways scroll.
 
 ### U-1 Register
 

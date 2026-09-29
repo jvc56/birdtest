@@ -72,6 +72,18 @@
 {:else if !result}
   <p class="text-muted-foreground">Loading…</p>
 {:else}
+  <!-- A phone shows only the ranked column, so its header is the only one on
+       screen to choose from: the choice is made here instead. -->
+  <div class="mb-3 flex flex-wrap items-center gap-2 text-sm sm:hidden">
+    <span class="text-muted-foreground">Rank by</span>
+    {#each columns as column}
+      <button
+        class={column.sort === sort ? 'btn-primary' : 'btn-secondary'}
+        aria-pressed={column.sort === sort}
+        on:click={() => rankBy(column.sort)}>{column.label}</button
+      >
+    {/each}
+  </div>
   <div class="card overflow-x-auto p-0">
     <table class="table">
       <thead>
