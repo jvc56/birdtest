@@ -582,15 +582,35 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
         let admin = db.user("root", true).await;
         let headers = admin_headers(&state.cfg, admin);
 
+        // As if the claim had been held a minute: its contributor credited
+        // with the time, which is what the give-back reads off the claim.
+        sqlx::query(
+            "WITH held AS (
+                 UPDATE task_claims SET claimed_at = claimed_at - interval '1 minute'
+                 WHERE job_id = $1 RETURNING claimed_by_anon_uuid
+             )
+             UPDATE anonymous_workers SET compute_ms = compute_ms + 60000
+             WHERE uuid IN (SELECT claimed_by_anon_uuid FROM held)",
+        )
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
         let contributed = || async {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(SUM(tasks_completed), 0)::bigint FROM anonymous_workers",
+            sqlx::query_as::<_, (i64, i64, i64, i64)>(
+                "SELECT COALESCE(SUM(tasks_completed), 0)::bigint,
+                        COALESCE(SUM(compute_ms), 0)::bigint,
+                        COALESCE(SUM(games_played), 0)::bigint,
+                        COALESCE(SUM(racks_analyzed), 0)::bigint
+                 FROM anonymous_workers",
             )
             .fetch_one(&db.pool)
             .await
             .unwrap()
         };
-        assert_eq!(contributed().await, 1, "the worker's task is on its counter");
+        let (tasks, compute_ms, games, racks) = contributed().await;
+        assert_eq!((tasks, games, racks), (1, 2, 0), "the worker's task is on its counters");
+        assert!(compute_ms >= 60_000, "and the minute it was held: {compute_ms} ms");
 
         let (status, body) = match destroy {
             "purge" => {
@@ -606,8 +626,8 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
         assert!(status.is_success(), "{destroy}: {body}");
         assert_eq!(
             contributed().await,
-            0,
-            "{destroy}: the claims are gone, so the contribution must be too"
+            (0, 0, 0, 0),
+            "{destroy}: the claims are gone, so every counter of the contribution must be too"
         );
     }
 }

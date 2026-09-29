@@ -642,6 +642,13 @@ struct ResultAck {
     accepted: bool,
 }
 
+/// A completed claim `c`'s compute, as its contributor is credited with it:
+/// the whole milliseconds it was held, claim to submission. One expression for
+/// the submission that adds it and the purge that gives it back, so the two
+/// agree to the millisecond.
+pub(crate) const CLAIM_COMPUTE_MS: &str =
+    "GREATEST((EXTRACT(EPOCH FROM c.completed_at - c.claimed_at) * 1000)::bigint, 0)";
+
 async fn submit_result(
     State(state): State<AppState>,
     RegisteredWorker(identity): RegisteredWorker,
@@ -768,7 +775,7 @@ async fn submit_result(
         return Err(AppError::internal("a claim's task changed job"));
     }
 
-    let progress = crate::jobs::registry::store_result(
+    let (progress, units) = crate::jobs::registry::store_result(
         &mut tx,
         &template,
         task_id,
@@ -778,11 +785,21 @@ async fn submit_result(
     )
     .await?;
 
-    sqlx::query(
-        "UPDATE task_claims SET state = 'completed', completed_at = now() WHERE id = $1",
-    )
+    // The claim keeps what it did, which is what a purge gives back to its
+    // contributor (`Contributions` in routes/admin.rs), and says how long it
+    // was held: the compute its contributor is credited with. Whole
+    // milliseconds, and never negative (`now()` is this transaction's start,
+    // which follows the claim's).
+    let compute_ms: i64 = sqlx::query_scalar(&format!(
+        "UPDATE task_claims c
+         SET state = 'completed', completed_at = now(), games_played = $2, racks_analyzed = $3
+         WHERE c.id = $1
+         RETURNING {CLAIM_COMPUTE_MS}"
+    ))
     .bind(claim_id)
-    .execute(&mut *tx)
+    .bind(i32::try_from(units.games).map_err(|_| AppError::internal("a claim's games overflow"))?)
+    .bind(i32::try_from(units.racks).map_err(|_| AppError::internal("a claim's racks overflow"))?)
+    .fetch_one(&mut *tx)
     .await?;
 
     // `RETURNING` the new state is what tells the job's `tasks_completed`
@@ -813,36 +830,34 @@ async fn submit_result(
     .fetch_one(&mut *tx)
     .await?;
 
-    // The contributor's own running total, which is what the leaderboards read
-    // instead of counting this identity's claims. One statement, on the row the
-    // identity already owns. Deliberately not rolled back by account deletion:
-    // the account is anonymized in place and keeps its claims, so no donated
-    // compute is lost. `purge_job` and `delete_job` *do* decrement it, because
-    // unlike the counters on `jobs` this one spans every job the identity ever
-    // worked on.
-    match (identity.user_id(), identity.anon_uuid()) {
-        (Some(user_id), _) => {
-            sqlx::query(
-                "UPDATE users SET tasks_completed = tasks_completed + 1,
-                                  last_completed_at = now()
-                 WHERE id = $1",
-            )
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-        (None, Some(uuid)) => {
-            sqlx::query(
-                "UPDATE anonymous_workers SET tasks_completed = tasks_completed + 1,
-                                              last_completed_at = now()
-                 WHERE uuid = $1",
-            )
-            .bind(uuid)
-            .execute(&mut *tx)
-            .await?;
-        }
-        (None, None) => {}
-    }
+    // The contributor's own running totals, which are what the leaderboards
+    // read instead of summing this identity's claims: this claim, the time it
+    // was held, and the games and racks it played -- this claim's own, not the
+    // task's first result's (`units`, not `progress`). One statement, on the
+    // row the identity already owns. Deliberately not rolled back by account
+    // deletion: the account is anonymized in place and keeps its claims, so no
+    // donated compute is lost. `purge_job` and `delete_job` *do* decrement
+    // them, because unlike the counters on `jobs` these span every job the
+    // identity ever worked on.
+    let (table, key, id) = match (identity.user_id(), identity.anon_uuid()) {
+        (Some(user_id), _) => ("users", "id", user_id),
+        (None, Some(uuid)) => ("anonymous_workers", "uuid", uuid),
+        (None, None) => return Err(AppError::internal("a submission with no identity")),
+    };
+    sqlx::query(&format!(
+        "UPDATE {table} SET tasks_completed = tasks_completed + 1,
+                            compute_ms = compute_ms + $2,
+                            games_played = games_played + $3,
+                            racks_analyzed = racks_analyzed + $4,
+                            last_completed_at = now()
+         WHERE {key} = $1"
+    ))
+    .bind(id)
+    .bind(compute_ms)
+    .bind(units.games)
+    .bind(units.racks)
+    .execute(&mut *tx)
+    .await?;
 
     // The job's running progress totals, in one statement and last: it takes
     // the job's row lock, which every claim for the job also takes (last, in

@@ -154,8 +154,8 @@ Open "dev game pairs: static equity vs static score".
 - [ ] **Do** **Download every setting as JSON**. **Expect** the same settings,
   with no user ids and no creator.
 - [ ] **Expect** a Contributors table: `dev-contributor-1`,
-  `dev-contributor-2` and "Anonymous · <16 characters>" rows, with tasks
-  completed.
+  `dev-contributor-2` and "Anonymous · <16 characters>" rows, with compute time
+  (on a wide screen) and tasks completed.
 - [ ] **Expect** a link to the results as **paginated JSON**.
 - [ ] **Do** open `/jobs/00000000-0000-4000-8000-000000000000`. **Expect** "no
   such job".
@@ -297,9 +297,15 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
 - [ ] **Do** open **Users**. **Expect** "Registered users": `dev` with an
   **admin** tag and the two contributor accounts, with tasks completed and when
   they joined — and no email addresses anywhere.
-- [ ] **Do** open **Contributors**. **Expect** all four workers ranked by tasks:
-  the two accounts by name, the two anonymous ones as "Anonymous · <16
-  characters>", never as their UUID.
+- [ ] **Do** open **Contributors**. **Expect** all four workers ranked by
+  compute time, most first, the column marked ↓: the two accounts by name, the
+  two anonymous ones as "Anonymous · <16 characters>", never as their UUID;
+  each with its compute time read as "5h 20m" or "3d 4h" (the exact hours on
+  hover), games, racks, tasks and last result.
+- [ ] **Do** click **Games**, then **Racks**, then **Tasks**. **Expect** the
+  list re-ranked by each, most first, the arrow moving with it; still all four.
+- [ ] At phone width, **expect** only the ranked column beside the name — games
+  when ranked by games — and no sideways scroll.
 
 ### U-1 Register
 

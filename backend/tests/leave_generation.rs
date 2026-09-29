@@ -383,6 +383,17 @@ async fn nothing_is_handed_out_once_every_rack_is_at_target() {
     // Its result brings the rack to target. Staged, it is not yet in the
     // counts, so the claim asks for a merge rather than closing the generation.
     submit(&app, &out, &[(short, 1)]).await;
+    // Its worker is credited with the task's games -- the job's 100 -- and the
+    // one rack it reported.
+    let credited: (i64, i64, i64) = sqlx::query_as(
+        "SELECT tasks_completed, games_played, racks_analyzed FROM anonymous_workers
+         WHERE uuid = $1::uuid",
+    )
+    .bind(out["worker_uuid"].as_str().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(credited, (1, 100, 1));
     assert_eq!(next_step(&db, job).await, Step::NeedsMerge(1));
     leave_gen::merge_staged(&db.pool, job, 1, true)
         .await

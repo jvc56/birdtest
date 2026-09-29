@@ -862,7 +862,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 - Job metadata: type, status, config summary, created by, created at.
 - Completion progress.
-- **Per-worker contribution table**: worker identity (username, or an anonymous worker's pseudonym — never its UUID, which is its credential), tasks completed for this job. Sorted by tasks completed descending.
+- **Per-worker contribution table**: worker identity (username, or an anonymous worker's pseudonym — never its UUID, which is its credential), tasks completed for this job and the compute time those claims were held (on a wide screen). Sorted by tasks completed descending.
 
 #### Job Detail Page — By Job Type
 
@@ -923,7 +923,7 @@ JobStats {
                        tasks_completed, games_played,            // live
                        racks_at_target, racks_total, min_rack, min_rack_count,
                        progress_as_of }                          // as of the last merge
-  workers:           [ { user_id, anon_id, username, tasks_completed } ]
+  workers:           [ { user_id, anon_id, username, tasks_completed, compute_seconds } ]
   other_workers:     number
   eta_seconds?:      number
 }
@@ -966,6 +966,23 @@ by that — finding the new maximum is the scan the counter exists to avoid, and
 it is a display figure that only ever moves forward. Account deletion subtracts
 nothing: it anonymizes in place and keeps the claims, so no donated compute is
 lost.
+
+Beside `tasks_completed` each identity carries **`compute_ms`, `games_played`
+and `racks_analyzed`**, and `/api/workers` ranks by compute time unless asked
+otherwise (`?sort=compute|games|racks|tasks`). MAGPIE reports no CPU time or
+thread count, so compute is the time each accepted claim was held, claim to
+submission, in whole milliseconds (`CLAIM_COMPUTE_MS`, one expression for the
+submission that adds it, the purge that gives it back and RUNBOOK §2.3b's
+recount). Unlike the job's counters, which count a task's first result, these
+count every accepted claim: a redundant claim replays the same work, but its
+contributor still did it. Each claim records its own games and racks
+(`task_claims.games_played`, `racks_analyzed`: a games or pairs batch's games,
+an opening-rack batch's racks, a leave task's `num_iterations` games and the
+distinct racks it reported), which is what lets a purge give back exactly what
+the submissions added by summing the claims it is about to delete, without
+reading the results. Each order is its own pair of partial indexes, one per kind
+of identity, so every order is two index scans merged, as the list always was;
+the cost is three more index entries on the identity's row per submission.
 
 With the two opening-rack aggregates removed, `opening_racks` is now those two
 counters and nothing else: two single-row reads, constant time at any job size.
@@ -5183,7 +5200,7 @@ do not exist.
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
 
 | `GET` | `/api/users` | List all registered user accounts with contribution stats. Paginated. |
-| `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated), paginated. |
+| `GET` | `/api/workers` | Contributor stats for all workers (anonymous and authenticated) — compute time, games, racks, tasks and the last result — paginated, ranked by compute time or by `?sort=compute\|games\|racks\|tasks`. |
 | `GET` | `/api/rating-pools` | Rating pools with their conditions, member counts and last fit time. |
 | `GET` | `/api/rating-pools/:id` | Latest fit for one pool: run provenance, every member's rating with uncertainty, and the residuals. |
 | `GET` | `/api/rating-pools/:id/history` | Stored runs' ratings, oldest first, thinned to at most 500 runs evenly spaced over the pool's history, for the six current members rated highest in the newest run. No page draws it now. |
@@ -5212,7 +5229,7 @@ SvelteKit uses file-based routing under `frontend/src/routes/`. Each directory w
 | `/jobs` | Job list — all jobs with type, status, allocation, and completion counter. Loaded on visit rather than live: there is no job-list stream, only a per-job one. |
 | `/jobs/[id]` | Job detail — four headline cards (status, allocation, tasks completed, estimated time left; the admin page has the same), job-type-specific stats and per-worker contribution table. Live-updated via SSE. Beside the lexicon and variant, how each player searches ("4-ply sim, 1,000 iterations vs static, by equity"); a Settings card of two tables — the job's settings and its type's, grouped, and the players' side by side (`PlayerSettingsTable`: one column per player, those they differ in bold, each name linking to its config) — showing their key rows, with one "All settings" toggle for every row of both, and a JSON download (`GET /api/jobs/:id/config`). Which rows are key is `jobSettings.ts`'s (`jobGroups`, `keySettings`). The admin job page has the same card. |
 | `/users` | Registered user list — all user accounts with contribution stats. |
-| `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by tasks completed. |
+| `/workers` | Contributor leaderboard — all workers (anonymous and authenticated) ranked by compute time, or by games, racks or tasks at a click on the column; on a phone only the ranked column is shown beside the name. |
 | `/ratings` | Rating pool list — each pool's conditions, member count and last fit. |
 | `/player-configs` | Every player config, newest first: its name, how it searches, its lexicon and leaves. Public, like the job pages that already show players' settings. |
 | `/player-configs/[id]` | One config: a table of its key settings (search, files, plays considered, what is kept, wordmap and rack info table) that "All settings" grows to every setting — the job page's `PlayerSettingsTable` with one column — a JSON download, and the config it was cloned from. The job page's Settings card links each player here. |
@@ -5549,6 +5566,20 @@ CREATE TABLE users (
     -- counter exists to avoid; it only ever moves forward, and is a display
     -- figure.
     tasks_completed      BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    -- The rest of the contribution, kept the same way and given back the same
+    -- way: the time each accepted claim was held, claim to submission, in
+    -- milliseconds (MAGPIE reports no CPU or thread counts, so this is the
+    -- measure of compute there is, and what the contributor list ranks by);
+    -- the games those claims played; and the racks they analysed -- an
+    -- opening-rack batch's racks, the distinct racks a leave task drew. Summed
+    -- from each claim's own figures (`task_claims.games_played`,
+    -- `racks_analyzed`), every claim counted: unlike a job's progress, which
+    -- counts one result per task, a contributor did the work of each claim.
+    -- Integer milliseconds rather than fractional seconds so that what a purge
+    -- takes back is exactly what the submissions added.
+    compute_ms           BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
+    games_played         BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
+    racks_analyzed       BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
     last_completed_at    TIMESTAMPTZ,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -5558,10 +5589,18 @@ CREATE TABLE users (
 CREATE INDEX users_contribution_idx ON users (tasks_completed DESC, created_at ASC)
     WHERE deleted_at IS NULL;
 
--- Serves the account half of /api/workers, in that list's order (see
--- anonymous_workers_contribution_idx). A deleted account keeps its place there:
--- its work was done, and it is listed under its anonymized name.
+-- Serve the account half of /api/workers, one per order that list offers --
+-- compute time (its default), games, racks and tasks -- with the list's own
+-- predicate, so whichever it is sorted by it is the same contributors (see
+-- anonymous_workers_contribution_idx). A deleted account keeps its place
+-- there: its work was done, and it is listed under its anonymized name.
 CREATE INDEX users_worker_rank_idx ON users (tasks_completed DESC, id)
+    WHERE tasks_completed > 0;
+CREATE INDEX users_worker_compute_idx ON users (compute_ms DESC, id)
+    WHERE tasks_completed > 0;
+CREATE INDEX users_worker_games_idx ON users (games_played DESC, id)
+    WHERE tasks_completed > 0;
+CREATE INDEX users_worker_racks_idx ON users (racks_analyzed DESC, id)
     WHERE tasks_completed > 0;
 
 CREATE TABLE email_confirmations (
@@ -5619,20 +5658,31 @@ CREATE TABLE anonymous_workers (
     -- Any request from this identity touches this, at most once a minute: it
     -- answers "is this worker still around".
     last_seen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- The contribution counters, mirroring users.tasks_completed /
-    -- last_completed_at; see there for why they are counters and who
-    -- decrements them. `last_completed_at` is distinct from `last_seen_at`
-    -- above: one is the last task finished, the other is the last request of
-    -- any kind, and the contributor list shows the first.
+    -- The contribution counters, mirroring users.tasks_completed, compute_ms,
+    -- games_played, racks_analyzed and last_completed_at; see there for what
+    -- each counts, why they are counters and who decrements them.
+    -- `last_completed_at` is distinct from `last_seen_at` above: one is the
+    -- last task finished, the other is the last request of any kind, and the
+    -- contributor list shows the first.
     tasks_completed   BIGINT NOT NULL DEFAULT 0 CHECK (tasks_completed >= 0),
+    compute_ms        BIGINT NOT NULL DEFAULT 0 CHECK (compute_ms >= 0),
+    games_played      BIGINT NOT NULL DEFAULT 0 CHECK (games_played >= 0),
+    racks_analyzed    BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
     last_completed_at TIMESTAMPTZ
 );
 
--- Serves the anonymous half of /api/workers, which merges both kinds of
--- identity in one ranking. Partial: an identity that has completed nothing is
--- not a contributor and is not listed.
+-- Serve the anonymous half of /api/workers, which merges both kinds of
+-- identity in one ranking, one per order it offers (users_worker_*_idx is the
+-- other half). Partial: an identity that has completed nothing is not a
+-- contributor and is not listed, whatever the list is sorted by.
 CREATE INDEX anonymous_workers_contribution_idx
     ON anonymous_workers (tasks_completed DESC, uuid) WHERE tasks_completed > 0;
+CREATE INDEX anonymous_workers_compute_idx
+    ON anonymous_workers (compute_ms DESC, uuid) WHERE tasks_completed > 0;
+CREATE INDEX anonymous_workers_games_idx
+    ON anonymous_workers (games_played DESC, uuid) WHERE tasks_completed > 0;
+CREATE INDEX anonymous_workers_racks_idx
+    ON anonymous_workers (racks_analyzed DESC, uuid) WHERE tasks_completed > 0;
 
 CREATE TABLE worker_bans (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -6351,6 +6401,16 @@ CREATE TABLE task_claims (
     claimed_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_heartbeat_at    TIMESTAMPTZ,
     completed_at         TIMESTAMPTZ,
+    -- What this claim's accepted result played and analysed, written when it
+    -- completes (zero until then, and for a claim that never does): the games
+    -- of a games or pairs batch or of a leave task, the racks of an
+    -- opening-rack batch or the distinct racks a leave task drew. Its
+    -- contributor's running totals add these, so a purge can give back
+    -- exactly what they added by summing the claims it is about to delete,
+    -- without reading the results. Every claim's own, not the task's first
+    -- result's.
+    games_played         INT NOT NULL DEFAULT 0,
+    racks_analyzed       INT NOT NULL DEFAULT 0,
     -- As reported at claim time. What the fleet is actually running, which is
     -- the evidence for raising a job's floor.
     magpie_version       TEXT,
@@ -9122,11 +9182,13 @@ says so in its implemented option, rather than being removed.
   dead tuples is several merges' worth before autovacuum starts. A per-table
   `autovacuum_vacuum_scale_factor` near 0.02 is a tuning choice left for when
   a production table's bloat is measured. *(Fifteenth audit.)*
-- **`users` carries two contribution indexes** (`users_contribution_idx` for
+- **`users` carries two tasks-completed indexes** (`users_contribution_idx` for
   `/api/users`, tie-broken by `created_at`, and `users_worker_rank_idx` for
   `/api/workers`, by `id`), each written on every registered submission. One
   would do if `/api/users` broke ties by id — a visible ordering change, left
-  for a decision. *(Fifteenth audit.)*
+  for a decision. *(Fifteenth audit.)* (The worker list's other three orders,
+  compute, games and racks, have an index each too, on both kinds of
+  identity: every submission writes them.)
 - **The job list's `stalled` flag reads `jobs.last_completed_at`** — done
   (nineteenth audit). Answered from the claims, "no result in a day" joined
   every task of the job to the day's completions (hundreds of milliseconds at a

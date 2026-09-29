@@ -28,6 +28,26 @@ export function duration(seconds: number | null): string {
   return `${(seconds / 86400).toFixed(1)}d`;
 }
 
+/**
+ * A contributor's compute time, in its two largest units: "45s", "12m",
+ * "5h 20m", "3d 4h", "2y 17d". `duration` gives one unit to a decimal, which
+ * reads well for a time left but blurs a total that runs to years across
+ * the whole fleet: "1.0h" and "912.3d" side by side in one column.
+ */
+export function computeTime(seconds: number | null): string {
+  if (seconds === null || !isFinite(seconds) || seconds < 0) return '—';
+  const s = Math.floor(seconds);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h}h ${m % 60}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  if (d < 365) return h % 24 ? `${d}d ${h % 24}h` : `${d}d`;
+  const y = Math.floor(d / 365);
+  return d % 365 ? `${y.toLocaleString()}y ${d % 365}d` : `${y.toLocaleString()}y`;
+}
+
 export function datetime(value: string | null): string {
   if (!value) return '—';
   return new Date(value).toLocaleString();

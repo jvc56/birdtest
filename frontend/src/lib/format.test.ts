@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   blankFields,
+  computeTime,
   unchosenText,
   datetime,
   duration,
@@ -328,5 +329,26 @@ describe('F-FMT-15 parseTargetRackCounts', () => {
     expect(parseTargetRackCounts([...most, '10'].join(','))).toEqual({
       error: `At most ${MAX_LEAVE_GENERATIONS} generations, not ${MAX_LEAVE_GENERATIONS + 1}.`
     });
+  });
+});
+
+describe('F-FMT-16 computeTime', () => {
+  it('reads a total in its two largest units', () => {
+    expect(computeTime(0)).toBe('0s');
+    expect(computeTime(59.9)).toBe('59s');
+    expect(computeTime(60)).toBe('1m');
+    expect(computeTime(3599)).toBe('59m');
+    expect(computeTime(3600)).toBe('1h');
+    expect(computeTime(5 * 3600 + 20 * 60 + 7)).toBe('5h 20m');
+    expect(computeTime(86400)).toBe('1d');
+    expect(computeTime(3 * 86400 + 4 * 3600 + 59)).toBe('3d 4h');
+    expect(computeTime(365 * 86400)).toBe('1y');
+    expect(computeTime((2 * 365 + 17) * 86400 + 3600)).toBe('2y 17d');
+  });
+
+  it('shows nothing it cannot read as a time', () => {
+    expect(computeTime(null)).toBe('—');
+    expect(computeTime(Number.NaN)).toBe('—');
+    expect(computeTime(-1)).toBe('—');
   });
 });

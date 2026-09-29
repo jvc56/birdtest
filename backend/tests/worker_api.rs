@@ -482,6 +482,19 @@ async fn analysed_racks_are_counted_once_per_task_as_they_arrive() {
     let stats = birdtest::jobstats::compute(&db.pool, &job_row).await.unwrap();
     let racks = stats.opening_racks.expect("an opening-rack job reports rack stats");
     assert_eq!(racks.racks_analyzed, 2, "two racks were analysed, by two workers");
+
+    // Each worker, though, analysed both: a contributor is credited with its
+    // own claim, not the task's first result.
+    for uuid in [&uuid_a, &uuid_b] {
+        let credited: (i64, i64) = sqlx::query_as(
+            "SELECT games_played, racks_analyzed FROM anonymous_workers WHERE uuid = $1::uuid",
+        )
+        .bind(uuid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(credited, (0, 2), "{uuid}");
+    }
 }
 
 /// Bug: any error claiming from one job failed the whole claim, so a single
@@ -1118,6 +1131,81 @@ async fn contributions_are_counted_as_they_arrive() {
     assert_eq!(body["total"], 1);
     assert_eq!(body["items"][0]["tasks_completed"], 2);
     assert!(body["items"][0]["last_seen_at"].is_string(), "{body}");
+}
+
+/// A contributor is credited with what each of its claims did: the time the
+/// claim was held, claim to submission, and the games it played -- every
+/// accepted claim, not only the task's first result, which is all the job's
+/// own progress counts. Two workers on one task at redundancy 2 are each
+/// credited its games; the job counts them once.
+#[tokio::test]
+async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
+    let db = TestDb::new().await;
+    let job = db.games_job(2, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let counters = |uuid: String| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (i64, i64, i64, i64)>(
+                "SELECT tasks_completed, compute_ms, games_played, racks_analyzed
+                 FROM anonymous_workers WHERE uuid = $1::uuid",
+            )
+            .bind(uuid)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    let (first, a) = first_claim(&app).await;
+    let (second, b) = first_claim(&app).await;
+    assert_eq!(
+        first["task_request"]["seed"], second["task_request"]["seed"],
+        "both claims are of the one task"
+    );
+    assert_eq!(counters(a.clone()).await, (0, 0, 0, 0), "a claim is not a contribution");
+    // The first claim was held a minute and a half; the second not at all.
+    sqlx::query(
+        "UPDATE task_claims SET claimed_at = now() - interval '90 seconds' WHERE claim_token = $1::uuid",
+    )
+    .bind(first["claim_token"].as_str().unwrap())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+
+    for (assignment, uuid) in [(&first, &a), (&second, &b)] {
+        let token = assignment["claim_token"].as_str().unwrap();
+        let (_, body) = submit_as(&app, uuid, token, games_result(2, 1)).await;
+        assert_eq!(body["accepted"], true, "{body}");
+    }
+
+    let (tasks, compute_ms, games, racks) = counters(a.clone()).await;
+    assert_eq!((tasks, games, racks), (1, 2, 0));
+    assert!((90_000..100_000).contains(&compute_ms), "held 90 s: {compute_ms} ms");
+    let (tasks, compute_ms, games, racks) = counters(b.clone()).await;
+    assert_eq!((tasks, games, racks), (1, 2, 0), "the second result is credited its games too");
+    assert!(compute_ms < 10_000, "{compute_ms} ms");
+    let games_completed: i64 = sqlx::query_scalar("SELECT games_completed FROM jobs WHERE id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(games_completed, 2, "the job counts the task's first result alone");
+
+    // The claims keep what they did, and the list shows it.
+    let per_claim: Vec<(i32, i32)> = sqlx::query_as(
+        "SELECT games_played, racks_analyzed FROM task_claims WHERE job_id = $1 ORDER BY claimed_at",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(per_claim, [(2, 0), (2, 0)]);
+    let (_, body) = send(&app, get_request("/api/workers", &[])).await;
+    assert_eq!(body["items"][0]["anon_id"], birdtest::auth::public_anon_id(a.parse().unwrap()));
+    assert!(body["items"][0]["compute_seconds"].as_f64().unwrap() >= 90.0, "{body}");
+    assert_eq!(body["items"][0]["games_played"], 2);
 }
 
 /// The results feed pages by cursor, because a job's corpus is millions of rows

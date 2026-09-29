@@ -2156,74 +2156,100 @@ struct PurgeResult {
 /// that only ever moves forward; a purge can leave it pointing at a time whose
 /// task is gone.
 struct Contributions {
-    users: Vec<(Uuid, i64)>,
-    anonymous: Vec<(Uuid, i64)>,
+    users: Earned,
+    anonymous: Earned,
+}
+
+/// One kind of identity's share of a job, as parallel arrays in id order:
+/// claims completed, the milliseconds they were held, the games they played
+/// and the racks they analysed -- every counter the submit path adds to.
+#[derive(Default)]
+struct Earned {
+    ids: Vec<Uuid>,
+    tasks: Vec<i64>,
+    compute_ms: Vec<i64>,
+    games: Vec<i64>,
+    racks: Vec<i64>,
+}
+
+impl Earned {
+    /// Each identity of `column`'s kind with a completed claim of the job, and
+    /// what those claims added, summed as the submit path added it.
+    async fn count(conn: &mut sqlx::PgConnection, job_id: Uuid, column: &str) -> AppResult<Self> {
+        let rows = sqlx::query_as::<_, (Uuid, i64, i64, i64, i64)>(&format!(
+            "SELECT c.{column}, COUNT(*)::bigint,
+                    COALESCE(SUM({compute}), 0)::bigint,
+                    COALESCE(SUM(c.games_played), 0)::bigint,
+                    COALESCE(SUM(c.racks_analyzed), 0)::bigint
+             FROM task_claims c JOIN tasks t ON t.id = c.task_id
+             WHERE t.job_id = $1 AND c.state = 'completed' AND c.{column} IS NOT NULL
+             GROUP BY 1 ORDER BY 1",
+            compute = super::worker::CLAIM_COMPUTE_MS,
+        ))
+        .bind(job_id)
+        .fetch_all(&mut *conn)
+        .await?;
+        let mut earned = Earned::default();
+        for (id, tasks, compute_ms, games, racks) in rows {
+            earned.ids.push(id);
+            earned.tasks.push(tasks);
+            earned.compute_ms.push(compute_ms);
+            earned.games.push(games);
+            earned.racks.push(racks);
+        }
+        Ok(earned)
+    }
+
+    /// Takes it back from `table`, whose `key` the ids are: locked in id order
+    /// first, since the update locks rows in whatever order its plan visits
+    /// them, which a sorted array does not decide.
+    async fn give_back(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        table: &str,
+        key: &str,
+    ) -> AppResult<()> {
+        sqlx::query(&format!(
+            "SELECT 1 FROM {table} WHERE {key} = ANY($1) ORDER BY {key} FOR NO KEY UPDATE"
+        ))
+        .bind(&self.ids)
+        .execute(&mut *conn)
+        .await?;
+        sqlx::query(&format!(
+            "UPDATE {table} x
+             SET tasks_completed = GREATEST(x.tasks_completed - d.tasks, 0),
+                 compute_ms = GREATEST(x.compute_ms - d.compute_ms, 0),
+                 games_played = GREATEST(x.games_played - d.games, 0),
+                 racks_analyzed = GREATEST(x.racks_analyzed - d.racks, 0)
+             FROM UNNEST($1::uuid[], $2::bigint[], $3::bigint[], $4::bigint[], $5::bigint[])
+                  AS d(id, tasks, compute_ms, games, racks)
+             WHERE x.{key} = d.id"
+        ))
+        .bind(&self.ids)
+        .bind(&self.tasks)
+        .bind(&self.compute_ms)
+        .bind(&self.games)
+        .bind(&self.racks)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
 }
 
 impl Contributions {
     async fn count(conn: &mut sqlx::PgConnection, job_id: Uuid) -> AppResult<Self> {
-        let users = sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT c.claimed_by_user_id, COUNT(*)::bigint
-             FROM task_claims c JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND c.state = 'completed'
-               AND c.claimed_by_user_id IS NOT NULL
-             GROUP BY 1 ORDER BY 1",
-        )
-        .bind(job_id)
-        .fetch_all(&mut *conn)
-        .await?;
-        let anonymous = sqlx::query_as::<_, (Uuid, i64)>(
-            "SELECT c.claimed_by_anon_uuid, COUNT(*)::bigint
-             FROM task_claims c JOIN tasks t ON t.id = c.task_id
-             WHERE t.job_id = $1 AND c.state = 'completed'
-               AND c.claimed_by_anon_uuid IS NOT NULL
-             GROUP BY 1 ORDER BY 1",
-        )
-        .bind(job_id)
-        .fetch_all(&mut *conn)
-        .await?;
-        Ok(Contributions { users, anonymous })
+        Ok(Contributions {
+            users: Earned::count(conn, job_id, "claimed_by_user_id").await?,
+            anonymous: Earned::count(conn, job_id, "claimed_by_anon_uuid").await?,
+        })
     }
 
     /// The caller's last statement before it commits, so the rows are held
     /// for milliseconds. In id order, so two purges sharing contributors lock
     /// them in the same order rather than deadlocking at the end of both.
     async fn give_back(self, conn: &mut sqlx::PgConnection) -> AppResult<()> {
-        let (ids, counts): (Vec<Uuid>, Vec<i64>) = self.users.into_iter().unzip();
-        // Locked in id order first: the update below locks rows in whatever
-        // order its plan visits them, which a sorted array does not decide.
-        sqlx::query("SELECT 1 FROM users WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE")
-            .bind(&ids)
-            .execute(&mut *conn)
-            .await?;
-        sqlx::query(
-            "UPDATE users u
-             SET tasks_completed = GREATEST(u.tasks_completed - d.n, 0)
-             FROM UNNEST($1::uuid[], $2::bigint[]) AS d(id, n)
-             WHERE u.id = d.id",
-        )
-        .bind(&ids)
-        .bind(&counts)
-        .execute(&mut *conn)
-        .await?;
-        let (uuids, counts): (Vec<Uuid>, Vec<i64>) = self.anonymous.into_iter().unzip();
-        sqlx::query(
-            "SELECT 1 FROM anonymous_workers WHERE uuid = ANY($1) ORDER BY uuid FOR NO KEY UPDATE",
-        )
-        .bind(&uuids)
-        .execute(&mut *conn)
-        .await?;
-        sqlx::query(
-            "UPDATE anonymous_workers w
-             SET tasks_completed = GREATEST(w.tasks_completed - d.n, 0)
-             FROM UNNEST($1::uuid[], $2::bigint[]) AS d(uuid, n)
-             WHERE w.uuid = d.uuid",
-        )
-        .bind(&uuids)
-        .bind(&counts)
-        .execute(&mut *conn)
-        .await?;
-        Ok(())
+        self.users.give_back(conn, "users", "id").await?;
+        self.anonymous.give_back(conn, "anonymous_workers", "uuid").await
     }
 }
 

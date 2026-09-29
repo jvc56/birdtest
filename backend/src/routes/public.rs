@@ -1630,13 +1630,55 @@ pub(super) struct WorkerListItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     anon_uuid: Option<Uuid>,
     username: Option<String>,
+    /// Every claim this contributor completed, held from claim to submission:
+    /// MAGPIE reports no CPU time, so this is the compute it is credited with.
+    compute_seconds: f64,
+    games_played: i64,
+    racks_analyzed: i64,
     tasks_completed: i64,
     last_seen_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// What the contributor list is ranked by. Each has a partial index per kind
+/// of identity (`users_worker_*_idx`, `anonymous_workers_*_idx`), which is what
+/// keeps every order a merge of two index scans.
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum WorkerSort {
+    /// The default: the fairest single measure of what a contributor gave, as
+    /// a machine that plays slow, deep games finishes few tasks in many hours.
+    #[default]
+    Compute,
+    Games,
+    Racks,
+    Tasks,
+}
+
+impl WorkerSort {
+    /// The counter column, on either table. From this closed set only, since
+    /// it is spliced into the statement.
+    fn column(self) -> &'static str {
+        match self {
+            WorkerSort::Compute => "compute_ms",
+            WorkerSort::Games => "games_played",
+            WorkerSort::Racks => "racks_analyzed",
+            WorkerSort::Tasks => "tasks_completed",
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(super) struct WorkerPageQuery {
+    #[serde(default)]
+    page: i64,
+    per_page: Option<i64>,
+    #[serde(default)]
+    sort: WorkerSort,
+}
+
 async fn list_workers(
     State(state): State<AppState>,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<WorkerPageQuery>,
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     worker_page(&state, query, false).await
 }
@@ -1645,17 +1687,18 @@ async fn list_workers(
 pub(super) async fn list_workers_admin(
     State(state): State<AppState>,
     _admin: crate::auth::AdminUser,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<WorkerPageQuery>,
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     worker_page(&state, query, true).await
 }
 
 async fn worker_page(
     state: &AppState,
-    query: PageQuery,
+    query: WorkerPageQuery,
     with_credentials: bool,
 ) -> AppResult<Json<super::Page<WorkerListItem>>> {
     let (limit, offset) = super::paginate(query.page, query.per_page);
+    let rank = query.sort.column();
 
     // Counted first, so a page past the end is answered without its query:
     // each arm reads `offset + limit` rows of its index before the merge, and
@@ -1669,8 +1712,10 @@ async fn worker_page(
     .await?;
 
     // Both kinds of contributor in one ranking, each from its own running
-    // total. Each arm is an ordered scan of its own partial index, cut off at
-    // the end of the requested page, and the two are merged. The arms must be
+    // total -- whichever `rank` is. Each arm is an ordered scan of its own
+    // partial index for that counter (every one has the list's predicate,
+    // `tasks_completed > 0`, so every order lists the same contributors), cut
+    // off at the end of the requested page, and the two are merged. The arms must be
     // limited themselves: with the LIMIT only outside the UNION, Postgres
     // sorted every contributor of both kinds on each view (the constant NULL
     // column in each arm defeats a merge of the index orders). Within a count,
@@ -1694,30 +1739,34 @@ async fn worker_page(
     let rows = if offset >= total {
         Vec::new()
     } else {
-        sqlx::query(
+        sqlx::query(&format!(
             "SELECT c.user_id, c.anon_uuid,
                     CASE WHEN c.anon_uuid IS NOT NULL
                          THEN left(encode(sha256(convert_to(c.anon_uuid::text, 'UTF8')), 'hex'), 16)
                     END AS anon_id,
-                    c.username, c.tasks_completed, c.last_seen_at
+                    c.username, c.compute_ms, c.games_played, c.racks_analyzed,
+                    c.tasks_completed, c.last_seen_at
              FROM (
                  SELECT * FROM (
-                     (SELECT u.id AS user_id, NULL::uuid AS anon_uuid,
-                             u.username, u.tasks_completed, u.last_completed_at AS last_seen_at
+                     (SELECT u.id AS user_id, NULL::uuid AS anon_uuid, u.username,
+                             u.compute_ms, u.games_played, u.racks_analyzed, u.tasks_completed,
+                             u.last_completed_at AS last_seen_at
                       FROM users u WHERE u.tasks_completed > 0
-                      ORDER BY u.tasks_completed DESC, u.id
+                      ORDER BY u.{rank} DESC, u.id
                       LIMIT $3)
                      UNION ALL
-                     (SELECT NULL::uuid, w.uuid, NULL::text, w.tasks_completed, w.last_completed_at
+                     (SELECT NULL::uuid, w.uuid, NULL::text,
+                             w.compute_ms, w.games_played, w.racks_analyzed, w.tasks_completed,
+                             w.last_completed_at
                       FROM anonymous_workers w WHERE w.tasks_completed > 0
-                      ORDER BY w.tasks_completed DESC, w.uuid
+                      ORDER BY w.{rank} DESC, w.uuid
                       LIMIT $3)
                  ) contributors
-                 ORDER BY tasks_completed DESC, user_id, anon_uuid
+                 ORDER BY {rank} DESC, user_id, anon_uuid
                  LIMIT $1 OFFSET $2
              ) c
-             ORDER BY c.tasks_completed DESC, c.user_id, c.anon_uuid",
-        )
+             ORDER BY c.{rank} DESC, c.user_id, c.anon_uuid"
+        ))
         .bind(limit)
         .bind(offset)
         .bind(offset.saturating_add(limit))
@@ -1733,6 +1782,9 @@ async fn worker_page(
                 anon_id: r.get("anon_id"),
                 anon_uuid: if with_credentials { r.get("anon_uuid") } else { None },
                 username: r.get("username"),
+                compute_seconds: r.get::<i64, _>("compute_ms") as f64 / 1000.0,
+                games_played: r.get("games_played"),
+                racks_analyzed: r.get("racks_analyzed"),
                 tasks_completed: r.get("tasks_completed"),
                 last_seen_at: r.get("last_seen_at"),
             })

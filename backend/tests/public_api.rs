@@ -130,11 +130,13 @@ async fn game_result_at(
     task
 }
 
+/// An anonymous worker with `tasks_completed` tasks finished, each held a
+/// second.
 async fn anon_worker(db: &TestDb, tasks_completed: i64) -> Uuid {
     let uuid = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO anonymous_workers (uuid, tasks_completed, last_completed_at)
-         VALUES ($1, $2, CASE WHEN $2 > 0 THEN now() END)",
+        "INSERT INTO anonymous_workers (uuid, tasks_completed, compute_ms, last_completed_at)
+         VALUES ($1, $2, $2 * 1000, CASE WHEN $2 > 0 THEN now() END)",
     )
     .bind(uuid)
     .bind(tasks_completed)
@@ -1017,7 +1019,7 @@ async fn contributor_lists_paginate_and_leak_no_credentials() {
         let id = db.user(name, false).await;
         users.push(id);
         sqlx::query(
-            "UPDATE users SET tasks_completed = $2, last_completed_at = now(),
+            "UPDATE users SET tasks_completed = $2, compute_ms = $2 * 1000, last_completed_at = now(),
                               password_hash = '$argon2id$v=19$secret-' || username
              WHERE id = $1",
         )
@@ -1106,6 +1108,69 @@ async fn contributor_lists_paginate_and_leak_no_credentials() {
         "both kinds of contributor in one ranking, the idle worker left out"
     );
 
+    // Ranked by compute time unless asked otherwise: each order its own, and
+    // the same contributors in each. Games and racks run against tasks here,
+    // so each order is visibly its own.
+    for (name, games, racks) in
+        [("alice", 10, 600), ("bob", 20, 500), ("carol", 100, 400), ("deleted-dave", 30, 300)]
+    {
+        sqlx::query("UPDATE users SET games_played = $2, racks_analyzed = $3 WHERE username = $1")
+            .bind(name)
+            .bind(games as i64)
+            .bind(racks as i64)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    for (uuid, games, racks) in [(busy, 40, 200), (light, 50, 100), (idle, 0, 0)] {
+        sqlx::query("UPDATE anonymous_workers SET games_played = $2, racks_analyzed = $3 WHERE uuid = $1")
+            .bind(uuid)
+            .bind(games as i64)
+            .bind(racks as i64)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+    }
+    let ranked = |sort: &'static str| {
+        let app = app.clone();
+        async move {
+            let (status, body) = send(&app, get_request(&format!("/api/workers{sort}"), &[])).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["total"], 6, "{sort}");
+            body["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["username"].as_str().or(item["anon_id"].as_str()).unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    let (busy_id, light_id) =
+        (birdtest::auth::public_anon_id(busy), birdtest::auth::public_anon_id(light));
+    let by_tasks = ["deleted-dave", "alice", &busy_id, "bob", &light_id, "carol"];
+    assert_eq!(ranked("").await, by_tasks, "compute time, by default");
+    assert_eq!(ranked("?sort=compute").await, by_tasks);
+    assert_eq!(ranked("?sort=tasks").await, by_tasks);
+    assert_eq!(
+        ranked("?sort=games").await,
+        ["carol", &light_id, &busy_id, "deleted-dave", "bob", "alice"]
+    );
+    assert_eq!(
+        ranked("?sort=racks").await,
+        ["alice", "bob", "carol", "deleted-dave", &busy_id, &light_id]
+    );
+    let (_, body) = send(&app, get_request("/api/workers?per_page=1", &[])).await;
+    assert_eq!(
+        body["items"][0],
+        json!({
+            "user_id": users[3], "anon_id": null, "username": "deleted-dave",
+            "compute_seconds": 9.0, "games_played": 30, "racks_analyzed": 300,
+            "tasks_completed": 9, "last_seen_at": body["items"][0]["last_seen_at"],
+        })
+    );
+    let (status, body) = send(&app, get_request("/api/workers?sort=username", &[])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "only a counter ranks: {body}");
+
     for path in ["/api/users", "/api/workers"] {
         let (_, body) = send(&app, get_request(&format!("{path}?per_page=100000"), &[])).await;
         assert_eq!(body["per_page"], 500, "{path}");
@@ -1124,7 +1189,7 @@ async fn tied_contributors_are_each_listed_exactly_once() {
     let mut expected = Vec::new();
     for i in 0..9 {
         let id = db.user(&format!("user{i}"), false).await;
-        sqlx::query("UPDATE users SET tasks_completed = 1 WHERE id = $1")
+        sqlx::query("UPDATE users SET tasks_completed = 1, compute_ms = 1000 WHERE id = $1")
             .bind(id)
             .execute(&db.pool)
             .await
@@ -1134,10 +1199,12 @@ async fn tied_contributors_are_each_listed_exactly_once() {
     }
     expected.sort();
 
-    for per_page in [2, 3, 4, 5, 7] {
+    // Every order ties here -- one task each, a second each, no games or racks.
+    for (per_page, sort) in [(2, ""), (3, "compute"), (4, "games"), (5, "racks"), (7, "tasks")] {
         let mut seen = Vec::new();
         for page in 0..=(18 / per_page) {
-            let path = format!("/api/workers?page={page}&per_page={per_page}");
+            let sort = if sort.is_empty() { String::new() } else { format!("&sort={sort}") };
+            let path = format!("/api/workers?page={page}&per_page={per_page}{sort}");
             let (status, body) = send(&app, get_request(&path, &[])).await;
             assert_eq!(status, StatusCode::OK, "{body}");
             assert_eq!(body["total"], 18);
@@ -1147,7 +1214,7 @@ async fn tied_contributors_are_each_listed_exactly_once() {
             }
         }
         seen.sort();
-        assert_eq!(seen, expected, "per_page={per_page}");
+        assert_eq!(seen, expected, "per_page={per_page} sort={sort}");
     }
 
     // Far past the end: an empty page with the true total, not a scan.

@@ -137,6 +137,26 @@ export interface SavedPosition {
 }
 
 /** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
+/** What the contributor list can be ranked by; the server's default is compute time. */
+export type ContributorSort = 'compute' | 'games' | 'racks' | 'tasks';
+
+/** One row of the contributor list (`/api/workers`). */
+export interface Contributor {
+  user_id: string | null;
+  /** An anonymous worker's public pseudonym; its UUID is never published. */
+  anon_id: string | null;
+  /** The anonymous worker's UUID, its credential: the admin list only. */
+  anon_uuid?: string;
+  username: string | null;
+  /** Every accepted claim, held from claim to submission: the compute MAGPIE does not report. */
+  compute_seconds: number;
+  games_played: number;
+  racks_analyzed: number;
+  tasks_completed: number;
+  /** The last task finished. */
+  last_seen_at: string | null;
+}
+
 export type BoardSquare =
   | 'normal'
   | 'double_letter'
@@ -312,6 +332,8 @@ export interface JobStats {
     anon_id: string | null;
     username: string | null;
     tasks_completed: number;
+    /** Those claims held from claim to submission. */
+    compute_seconds: number;
   }[];
   /** Contributors beyond the ones listed; the list is capped. */
   other_workers: number;
@@ -619,7 +641,8 @@ export const api = {
   ratingPool: (id: string) => get<RatingPoolDetail>(`/api/rating-pools/${id}`),
 
   users: (page = 0) => get<Page<Record<string, unknown>>>(`/api/users?page=${page}`),
-  workers: (page = 0) => get<Page<Record<string, unknown>>>(`/api/workers?page=${page}`),
+  workers: (page = 0, sort: ContributorSort = 'compute') =>
+    get<Page<Contributor>>(`/api/workers?page=${page}&sort=${sort}`),
 
   clientVersion: () =>
     get<{ min_magpie_version: string; download_url: string }>('/api/worker/client-version'),
@@ -698,7 +721,7 @@ export const api = {
   deleteUser: (id: string) => del<void>(`/api/admin/users/${id}`),
   /** Like `workers`, plus anonymous workers' UUIDs, which a ban needs. */
   adminWorkers: (page = 0) =>
-    get<Page<Record<string, unknown>>>(`/api/admin/workers?page=${page}`),
+    get<Page<Contributor>>(`/api/admin/workers?page=${page}`),
   banWorker: (body: { user_id?: string; anon_uuid?: string; reason?: string }) =>
     post<{ id: string }>('/api/admin/workers/ban', body),
   unbanWorker: (id: string) => del<void>(`/api/admin/workers/ban/${id}`),

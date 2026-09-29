@@ -384,6 +384,10 @@ async fn insert_on_demand_task(
 /// size a task was dispatched with and the number of moves to keep per
 /// position come from: both are job settings the request rows denormalize, so
 /// reading them from the template costs no round trip inside the task's lock.
+///
+/// Returns what the result adds to the job's totals (first results only) and
+/// what this claim did, which its contributor is credited with whichever
+/// result it was.
 pub async fn store_result(
     conn: &mut PgConnection,
     template: &JobTemplate,
@@ -391,7 +395,7 @@ pub async fn store_result(
     claim_id: Uuid,
     first_result: bool,
     decoded: DecodedResult,
-) -> AppResult<ProgressDelta> {
+) -> AppResult<(ProgressDelta, ClaimUnits)> {
     match decoded {
         DecodedResult::OpeningRack(record) => {
             let racks: Vec<String> =
@@ -404,27 +408,41 @@ pub async fn store_result(
             // submission's length is its distinct-rack count. Racks never
             // repeat across tasks either: each task analyses its own slice of
             // the enumerated space.
-            Ok(ProgressDelta::first_result(first_result, 0, record.positions.len() as i64))
+            let racks = record.positions.len() as i64;
+            Ok((ProgressDelta::first_result(first_result, 0, racks), ClaimUnits { games: 0, racks }))
         }
         DecodedResult::Games(record) => {
             game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
-            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
+            let games = record.all_games.games as i64;
+            Ok((ProgressDelta::first_result(first_result, games, 0), ClaimUnits { games, racks: 0 }))
         }
         DecodedResult::GamePairs(record) => {
             game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
                 .await?;
             // Games, not pairs, for both job types: the pairs count is half of
             // it and is derived where it is displayed.
-            Ok(ProgressDelta::first_result(first_result, record.all_games.games as i64, 0))
+            let games = record.all_games.games as i64;
+            Ok((ProgressDelta::first_result(first_result, games, 0), ClaimUnits { games, racks: 0 }))
         }
         DecodedResult::LeaveGeneration(record) => {
+            let JobKind::LeaveGeneration { config, .. } = &template.kind else {
+                return Err(template.mismatch("leave_generation"));
+            };
             if first_result {
                 leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
                     .await?;
             } else {
                 leave_gen::credit_claim(conn, task_id, claim_id, &record).await?;
             }
-            Ok(ProgressDelta::default())
+            // A leave task plays the job's `num_iterations` games and stops
+            // (its request's `num_games`, written from the same setting), and
+            // reports every rack its games drew: the racks it analysed, as the
+            // claim's `leave_records.rack_count` says.
+            let units = ClaimUnits {
+                games: i64::from(config.num_iterations),
+                racks: record.racks.len() as i64,
+            };
+            Ok((ProgressDelta::default(), units))
         }
     }
 }
@@ -619,6 +637,17 @@ impl ProgressDelta {
             ProgressDelta::default()
         }
     }
+}
+
+/// What one accepted claim did, which its contributor's running totals add
+/// (`users` / `anonymous_workers`, and the claim's own row, from which a purge
+/// gives them back): games played, racks analysed. Unlike [`ProgressDelta`],
+/// every accepted claim counts, not only its task's first result -- a
+/// redundant claim replays the same work, but its contributor still did it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimUnits {
+    pub games: i64,
+    pub racks: i64,
 }
 
 /// The part of job initialization that cannot run inside the creating

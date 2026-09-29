@@ -69,9 +69,9 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 228 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (15), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 167 | Vitest, `frontend/src/lib/`: `format.test.ts` (36), `jobSettings.test.ts` (8), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1F Frontend unit | 169 | Vitest, `frontend/src/lib/`: `format.test.ts` (38), `jobSettings.test.ts` (8), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 173 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
-| 3 API | 234 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
+| 3 API | 235 | `backend/tests/`: `worker_api.rs` (49), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 18 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 664 backend tests (the per-tier counts above are
+--run-ignored all` runs 665 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -742,6 +742,9 @@ Each entry's tests are the `describe` block named for its id.
   what is wrong with anything else — nothing listed, an empty entry, a
   non-integer, a target outside 1–1,000,000, more than 100 generations —
   rather than sending it. *(Covered: `format.test.ts`.)*
+- `F-FMT-16` `computeTime` reads a contributor's compute time in its two
+  largest units ("5h 20m", "3d 4h", "2y 17d"), and a dash for anything that is
+  not a time. *(Covered: `format.test.ts`.)*
 
 ### `F-CGP-*` — `lib/cgp.ts`
 
@@ -1733,6 +1736,24 @@ permanent.
   totals correctly across both identity types. *(Covered:
   `stats::contributions_are_attributed_to_each_identity_across_both_kinds`,
   `worker_api::contributions_are_counted_as_they_arrive`.)*
+- `I-STATS-7b` **A contributor is credited with each claim it completed**: the
+  time the claim was held, claim to submission, in whole milliseconds, and the
+  games and racks it did -- every accepted claim, where the job's own totals
+  count a task's first result. Two workers on one task at redundancy 2 are each
+  credited its two games (and the job two); a claim held 90 s is credited
+  90 s; each of two redundant opening-rack claims is credited the batch's
+  racks; a leave task is credited the job's `num_iterations` games and the
+  racks it reported; each claim keeps its own games and racks. *(Covered:
+  `worker_api::each_accepted_claim_credits_its_time_and_games_to_its_contributor`,
+  `worker_api::analysed_racks_are_counted_once_per_task_as_they_arrive`,
+  `leave_generation::nothing_is_handed_out_once_every_rack_is_at_target`.)*
+- `I-STATS-7c` **A purge or a delete gives back every contributor counter** the
+  job's claims added -- tasks, compute time, games and racks -- to the
+  millisecond, summed from the claims it is about to delete with the
+  submission's own expression (`CLAIM_COMPUTE_MS`), including a submission that
+  landed mid-purge. *(Covered:
+  `admin_api::purging_and_deleting_a_job_give_back_what_it_earned`,
+  `admin_api::a_purge_waits_for_a_submission_in_flight_before_counting_contributions`.)*
 - `I-STATS-8` ETA is `None` without recent throughput rather than infinity.
   *(Covered: `stats::the_eta_is_none_without_recent_throughput`.)*
 - `I-STATS-8b` A games job's ETA divides by the redundancy: units left at claims
@@ -2721,7 +2742,10 @@ below.
 - `A-PUBLIC-7` User and worker lists paginate and do not leak email addresses or
   key hashes — nor an anonymous worker's UUID, its only credential, which
   public endpoints replace with a derived pseudonym; contributors that tie are
-  each listed exactly once. *(Covered:
+  each listed exactly once, in every order. The worker list carries compute
+  seconds, games, racks and tasks, is ranked by compute time by default and by
+  `?sort=games|racks|tasks` on request (each order its own, the same
+  contributors in each), and refuses any other `sort`. *(Covered:
   `public_api::contributor_lists_paginate_and_leak_no_credentials`,
   `public_api::tied_contributors_are_each_listed_exactly_once`,
   `public_api::tied_jobs_and_users_are_each_listed_exactly_once`,
@@ -2957,7 +2981,8 @@ admin in once and the admin journeys reuse its storage state.
 
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
   page — its four headline cards, status first — and the contributor
-  leaderboard. *(Covered:
+  leaderboard, ranked by compute time and re-ranked by tasks at a click.
+  *(Covered:
   `e1-anonymous-browsing.spec.ts`.)*
 - `E-2` Register → confirm the email → log in → generate an API key → see it
   exactly once → deactivate it; first, a bad username, `a@b` and no password
@@ -2995,7 +3020,9 @@ admin in once and the admin journeys reuse its storage state.
   thirty-second audit. The contributors' list is measured with a row in it;
   the job page again with a 32-character creator and contributor, and both
   lists with a 32-character username and a tombstone (and the contributors'
-  list a pseudonym), which the seed does not register.)* The screen is the device's width:
+  list a pseudonym), which the seed does not register; the contributors'
+  list shows only its ranked column beside the name — compute time, then
+  games once ranked by games.)* The screen is the device's width:
   compared with `innerWidth`, as it was, the check could not fail, because a
   phone's browser widens its layout viewport to fit what overflows — and the
   header's links ran to 533 pixels on a 393-pixel screen, "Sign in" and

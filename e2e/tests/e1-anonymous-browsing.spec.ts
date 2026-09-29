@@ -49,11 +49,23 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await expect(page.getByRole('heading', { name: 'Contributors' })).toBeVisible();
   const leaders = page.locator('tbody tr');
   await expect(leaders.first()).toContainText(/Anonymous · [0-9a-f]{16}/);
-  // Ranked by tasks completed, most first.
-  const counts = (await leaders.locator('td:last-child').allInnerTexts()).map((text) =>
-    Number(text.replace(/,/g, ''))
+  // Ranked by compute time unless another column is chosen.
+  await expect(page.getByRole('columnheader', { name: 'Compute time' })).toHaveAttribute(
+    'aria-sort',
+    'descending'
   );
-  expect(counts.length).toBeGreaterThan(0);
-  expect(counts.every((count) => count > 0)).toBe(true);
-  expect([...counts].sort((a, b) => b - a)).toEqual(counts);
+  // Chosen: tasks completed, most first -- once the reordered page is in.
+  await page.getByRole('button', { name: 'Tasks' }).click();
+  await expect(page.getByRole('columnheader', { name: 'Tasks' })).toHaveAttribute('aria-sort', 'descending');
+  const counts = async () =>
+    (await leaders.locator('td[data-column="tasks"]').allInnerTexts()).map((text) =>
+      Number(text.replace(/,/g, ''))
+    );
+  await expect
+    .poll(async () => {
+      const seen = await counts();
+      return seen.length > 0 && seen.join() === [...seen].sort((a, b) => b - a).join();
+    })
+    .toBe(true);
+  expect((await counts()).every((count) => count > 0)).toBe(true);
 });

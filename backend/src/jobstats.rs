@@ -204,6 +204,9 @@ pub struct WorkerContribution {
     pub anon_id: Option<String>,
     pub username: Option<String>,
     pub tasks_completed: i64,
+    /// Those claims held from claim to submission, as the contributor list
+    /// counts compute (`routes::worker::CLAIM_COMPUTE_MS`).
+    pub compute_seconds: f64,
 }
 
 pub async fn load_job(pool: &PgPool, job_id: Uuid) -> AppResult<Job> {
@@ -893,14 +896,15 @@ async fn worker_contributions_on(
     // the pseudonym, the SHA-256 was computed for every completed claim of the
     // job -- a hundred thousand of them for a long job, on every detail view
     // and every live push -- to name at most fifty-one.
-    let rows = sqlx::query(
+    let rows = sqlx::query(&format!(
         "SELECT w.user_id,
                 left(encode(sha256(convert_to(w.anon_uuid::text, 'UTF8')), 'hex'), 16) AS anon_id,
                 u.username,
-                w.tasks_completed, w.contributors
+                w.tasks_completed, w.compute_ms, w.contributors
          FROM (
              SELECT c.claimed_by_user_id AS user_id, c.claimed_by_anon_uuid AS anon_uuid,
                     COUNT(*)::bigint AS tasks_completed,
+                    SUM({compute})::bigint AS compute_ms,
                     COUNT(*) OVER ()::bigint AS contributors
              FROM task_claims c
              JOIN tasks t ON t.id = c.task_id
@@ -911,7 +915,8 @@ async fn worker_contributions_on(
          ) w
          LEFT JOIN users u ON u.id = w.user_id
          ORDER BY w.tasks_completed DESC, w.user_id, w.anon_uuid",
-    )
+        compute = crate::routes::worker::CLAIM_COMPUTE_MS,
+    ))
     .bind(job_id)
     .bind(MAX_WORKER_CONTRIBUTIONS + 1)
     .fetch_all(&mut *conn)
@@ -934,6 +939,7 @@ async fn worker_contributions_on(
                 anon_id: r.get("anon_id"),
                 username: r.get("username"),
                 tasks_completed: r.get("tasks_completed"),
+                compute_seconds: r.get::<i64, _>("compute_ms") as f64 / 1000.0,
             })
             .collect(),
         other_workers,
