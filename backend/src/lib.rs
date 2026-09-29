@@ -6,6 +6,7 @@ pub mod artifacts;
 pub mod audit;
 pub mod auth;
 pub mod backups;
+pub mod board;
 pub mod clientip;
 pub mod compat;
 pub mod config;

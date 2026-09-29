@@ -1091,7 +1091,9 @@ CREATE TABLE position_analysis_records (
 -- games and would capture identical positions. Keying on the task rather than
 -- the claim makes the first accepted claim the one that lands and the rest
 -- no-ops, so redundancy still verifies the *result* without multiplying the
--- corpus.
+-- corpus. It is also how a random saved position is drawn
+-- (`/api/jobs/:id/positions/random`): a random turn of one task's games, a
+-- few hundred entries at most, where `ORDER BY random()` read the whole job.
 CREATE UNIQUE INDEX position_analysis_records_in_game_idx
     ON position_analysis_records (task_id, game_index, turn_number)
     WHERE game_index IS NOT NULL;

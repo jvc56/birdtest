@@ -13,6 +13,17 @@ pub struct Tile {
     pub count: u32,
 }
 
+/// One row of a distribution: a letter as MAGPIE names it on a tile and as a
+/// blank played for it, and what the tile scores.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Letter {
+    /// `A`, `L·L`; the blank's own row is `?`.
+    pub letter: String,
+    /// The same letter as a blank on the board: `a`, `l·l`.
+    pub blank: String,
+    pub score: i32,
+}
+
 #[derive(Debug, Clone)]
 pub struct LetterDistribution {
     /// The `input_data` name this was parsed from -- `english`, `polish`.
@@ -40,6 +51,11 @@ pub struct LetterDistribution {
     /// numbering baked into a KWG's node bytes; nothing else in this struct
     /// does, which is why it's kept separately rather than replacing `tiles`.
     machine_letters: Vec<char>,
+    /// Every row whole, in the same machine-letter order: what the saved
+    /// positions page needs to draw a tile, which `machine_letters` (a
+    /// letter's first character) and `tiles` (sorted, zero counts dropped)
+    /// cannot say.
+    letters: Vec<Letter>,
     /// Why this distribution's racks cannot be enumerated, if they cannot.
     ///
     /// A rack here is a string of one-character letters, so a distribution
@@ -75,6 +91,7 @@ impl LetterDistribution {
         // reads, so a row this parser dropped would shift every letter after
         // it (see the field comment).
         let mut machine_letters: Vec<char> = Vec::new();
+        let mut letters = Vec::new();
         let mut unenumerable = None;
         // Read as MAGPIE reads it (`ld_create_internal`), so that a file this
         // accepts -- job creation's check -- is one every worker and builder
@@ -140,7 +157,8 @@ impl LetterDistribution {
             if count > 255 {
                 return Err(malformed(line, "a tile count above 255"));
             }
-            number(cols[3]).parse::<i32>().map_err(|_| malformed(line, "non-numeric score"))?;
+            let score =
+                number(cols[3]).parse::<i32>().map_err(|_| malformed(line, "non-numeric score"))?;
             if !matches!(number(cols[4]), "0" | "1") {
                 return Err(malformed(line, "is_vowel must be 0 or 1"));
             }
@@ -157,6 +175,7 @@ impl LetterDistribution {
                 }
             }
             machine_letters.push(letter);
+            letters.push(Letter { letter: token.to_string(), blank: cols[1].to_string(), score });
             if count > 0 {
                 tiles.push(Tile { letter, count });
             }
@@ -182,8 +201,66 @@ impl LetterDistribution {
             bytes: bytes.to_vec(),
             tiles,
             machine_letters,
+            letters,
             unenumerable,
         })
+    }
+
+    /// Every letter, in machine-letter order, the blank's row included.
+    pub fn letters(&self) -> &[Letter] {
+        &self.letters
+    }
+
+    /// A rack however it was typed -- any case, any order, a multi-character
+    /// letter bracketed or not -- spelled the way MAGPIE spells one
+    /// (`rack_get_string`, which is what a captured position's `rack` is): its
+    /// tiles in machine-letter order, the blank (machine letter 0) last
+    /// whatever the order puts first, and a letter of more than one character
+    /// in brackets (`ld_ml_to_hl`). `None` when something in it is not a tile
+    /// of this distribution, which no captured rack can hold.
+    ///
+    /// A plain character sort was the canonical form before, and it matched
+    /// only racks of single-character letters in alphabetical machine order
+    /// and no blank: `?` sorts before `A`, so `AEINST?`, as MAGPIE writes it,
+    /// was never found; nor was a Catalan `Ç`, which MAGPIE orders after `C`.
+    pub fn canonical_rack(&self, typed: &str) -> Option<String> {
+        let text = typed.chars().filter(|c| !c.is_whitespace()).collect::<String>().to_uppercase();
+        let position = |letter: &str| self.letters.iter().position(|l| l.letter == letter);
+        let mut tiles = Vec::new();
+        let mut rest = text.as_str();
+        while !rest.is_empty() {
+            let (ml, len) = match rest.strip_prefix('[') {
+                Some(inner) => {
+                    let end = inner.find(']')?;
+                    (position(&inner[..end])?, end + 2)
+                }
+                // The longest letter the rest starts with: `NY` is one
+                // Catalan tile, never an `N` and a `Y` it does not have.
+                None => self
+                    .letters
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, l)| rest.starts_with(l.letter.as_str()))
+                    .max_by_key(|(_, l)| l.letter.len())
+                    .map(|(ml, l)| (ml, l.letter.len()))?,
+            };
+            tiles.push(ml);
+            rest = &rest[len..];
+        }
+        tiles.sort_unstable_by_key(|&ml| (ml == 0, ml));
+        Some(
+            tiles
+                .into_iter()
+                .map(|ml| {
+                    let letter = &self.letters[ml].letter;
+                    if letter.chars().count() > 1 {
+                        format!("[{letter}]")
+                    } else {
+                        letter.clone()
+                    }
+                })
+                .collect(),
+        )
     }
 
     /// MAGPIE's machine-letter index for `letter` -- see the `machine_letters`
@@ -212,9 +289,17 @@ impl LetterDistribution {
             .map(|t| format!("{},{},{},1,0\n", t.letter, t.letter.to_lowercase(), t.count))
             .collect::<String>()
             .into_bytes();
+        let letters = tiles
+            .iter()
+            .map(|t| Letter {
+                letter: t.letter.to_string(),
+                blank: t.letter.to_lowercase().to_string(),
+                score: 1,
+            })
+            .collect();
         let mut tiles = tiles;
         tiles.sort_by_key(|t| t.letter);
-        Self { name: "test".into(), bytes, tiles, machine_letters, unenumerable: None }
+        Self { name: "test".into(), bytes, tiles, machine_letters, letters, unenumerable: None }
     }
 
     /// Every distinct multiset of exactly `size` tiles drawable from the bag,
@@ -634,6 +719,31 @@ mod tests {
             );
         }
         assert!(crate::jobs::opening_rack::total_racks(&catalan, 7).is_err());
+    }
+
+    /// U-RACK-2b: every row is kept whole for drawing a tile -- a multi-
+    /// character letter, its blank's spelling, its score -- and a rack typed
+    /// any way is spelt as MAGPIE spells a captured position's: machine-letter
+    /// order, blanks last, a multi-character letter in brackets.
+    #[test]
+    fn a_rack_is_spelt_as_magpie_spells_it() {
+        let catalan = LetterDistribution::parse(CATALAN, "catalan").unwrap();
+        let ll = catalan.letters().iter().find(|l| l.letter == "L·L").unwrap();
+        assert_eq!((ll.blank.as_str(), ll.score), ("l·l", 10));
+        assert_eq!(catalan.letters()[0], Letter { letter: "?".into(), blank: "?".into(), score: 0 });
+        assert_eq!(catalan.letters().len(), 27, "every row, in file order");
+
+        // `Ç` after `C`, where a character sort puts it after `Z`; `NY` and
+        // `L·L` one tile each, bracketed or not; the blank last.
+        assert_eq!(catalan.canonical_rack("zç?cny[l·l]").as_deref(), Some("CÇ[L·L][NY]Z?"));
+        assert_eq!(catalan.canonical_rack("QUl·l a").as_deref(), Some("A[L·L][QU]"));
+        assert_eq!(catalan.canonical_rack("Y"), None, "no Catalan tile is a Y alone");
+        assert_eq!(catalan.canonical_rack("[L·L"), None, "an unclosed bracket");
+
+        let english = LetterDistribution::parse(ENGLISH, "english").unwrap();
+        assert_eq!(english.canonical_rack("?tsrnie").as_deref(), Some("EINRST?"));
+        assert_eq!(english.canonical_rack(" aeinrst ").as_deref(), Some("AEINRST"));
+        assert_eq!(english.canonical_rack("1"), None);
     }
 
     /// U-RACK-3: every rack of every size is sorted, distinct, drawable from

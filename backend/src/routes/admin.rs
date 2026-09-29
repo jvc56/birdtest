@@ -782,48 +782,9 @@ const MAGPIE_MAX_MARGIN: f64 = 2_147_483.645;
 const MAX_NUM_PLAYS: i32 = 200_000;
 /// Plays recorded: each is stored with its rank as a `SMALLINT`.
 const MAX_NUM_PLAYS_RECORDED: i32 = i16::MAX as i32;
-/// The board every MAGPIE the fleet runs is built for (`BOARD_DIM`). A layout
-/// of another size, or one MAGPIE otherwise refuses, loads on no worker: each
-/// fails the task, and after five in a row `magpie contribute` stops.
-const MAGPIE_BOARD_DIM: usize = 15;
-
-/// Why MAGPIE would refuse this board layout — never accepting one its loader
-/// (`board_layout.c`) refuses, and stricter than it only on parser quirks — the file split on newlines with empty lines
-/// ignored, a line's trailing `\r` dropped; a start square `row, col` inside
-/// the board; then exactly `BOARD_DIM` rows of `BOARD_DIM` bonus squares.
+/// Why MAGPIE would refuse this board layout; see [`crate::board::BoardLayout::parse`].
 pub(crate) fn layout_problem(content: &[u8]) -> Option<String> {
-    let text = String::from_utf8_lossy(content);
-    let lines: Vec<&str> = text
-        .split('\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| line.strip_suffix('\r').unwrap_or(line))
-        .collect();
-    if lines.len() != MAGPIE_BOARD_DIM + 1 {
-        return Some(format!(
-            "has {} rows; every MAGPIE build the fleet runs plays on {MAGPIE_BOARD_DIM}x{MAGPIE_BOARD_DIM}",
-            lines.len().saturating_sub(1)
-        ));
-    }
-    let coords: Vec<&str> = lines[0].split(',').filter(|part| !part.is_empty()).collect();
-    let in_board = |part: &str| {
-        part.trim_matches([' ', '\t', '\n', '\r'])
-            .parse::<i64>()
-            .is_ok_and(|v| (0..MAGPIE_BOARD_DIM as i64).contains(&v))
-    };
-    if coords.len() != 2 || !coords.iter().all(|part| in_board(part)) {
-        return Some(format!("has a start square MAGPIE cannot read: {:?}", lines[0]));
-    }
-    for (row, line) in lines[1..].iter().enumerate() {
-        // Bytes, as MAGPIE counts them (a non-UTF-8 byte reads as three here,
-        // after the lossy decode, and is refused either way).
-        if line.len() != MAGPIE_BOARD_DIM {
-            return Some(format!("row {} is {} squares wide, not {MAGPIE_BOARD_DIM}", row + 1, line.len()));
-        }
-        if let Some(square) = line.chars().find(|c| !matches!(c, ' ' | '\'' | '-' | '"' | '=' | '^' | '~' | '#')) {
-            return Some(format!("row {} has a square MAGPIE does not know: {square:?}", row + 1));
-        }
-    }
-    None
+    crate::board::layout_problem(content)
 }
 
 fn validate_player_config_body(body: &CreatePlayerConfigBody) -> AppResult<()> {
