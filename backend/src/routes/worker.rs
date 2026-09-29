@@ -939,8 +939,8 @@ async fn after_submission(state: &AppState, job: &Job, purges_before: u64) -> Ap
     } else {
         None
     };
-    if let Some(decided) = finished {
-        complete_finished(state, job, decided, purges_before).await?;
+    if let Some(finish) = finished {
+        complete_finished(state, job, finish, purges_before).await?;
     }
 
     // Checked here so a job nobody is watching costs nothing at all; the
@@ -957,7 +957,7 @@ async fn after_submission(state: &AppState, job: &Job, purges_before: u64) -> Ap
 async fn complete_finished(
     state: &AppState,
     job: &Job,
-    decided: Option<(crate::stats::sprt::SprtResult, u64)>,
+    finish: crate::jobs::Finish,
     purges_before: u64,
 ) -> AppResult<bool> {
     let job_id = job.id;
@@ -968,7 +968,7 @@ async fn complete_finished(
             || state.dispatch_holds.claims_held(job_id)
     };
     let completed =
-        crate::jobs::complete_unless_purged(&state.pool, job_id, job.claims_issued, decided, purged_since)
+        crate::jobs::complete_unless_purged(&state.pool, job_id, job.claims_issued, finish, purged_since)
             .await?;
     if completed {
         tracing::info!(job_id = %job_id, "job auto-completed");
@@ -1010,7 +1010,7 @@ pub(crate) async fn finish_idle_job(state: &AppState, job_id: Uuid) -> AppResult
         return Ok(false);
     }
     match finish_condition_met(state, &job).await? {
-        Some(decided) => complete_finished(state, &job, decided, purges_before).await,
+        Some(finish) => complete_finished(state, &job, finish, purges_before).await,
         None => Ok(false),
     }
 }
@@ -1128,22 +1128,28 @@ async fn should_check_finish(state: &AppState, job_id: Uuid) -> AppResult<bool> 
     .await?)
 }
 
-/// Either finish condition: SPRT significance (only after `min_units`) or the
-/// hard cap for game jobs; an exhausted and fully completed rack space for
-/// opening racks.
+/// Whether the job is done: for a games or pairs job with an SPRT, its
+/// significance (only after `min_units`) or the hard cap; for one without, its
+/// target of `max_units` played; for opening racks, an exhausted and fully
+/// completed rack space.
 ///
-/// `None` while the job goes on. `Some` when it is done, carrying for a games
-/// job the verdict that finished it and the units it had, which the completion
+/// `None` while the job goes on. `Some` when it is done, saying what on --
+/// for an SPRT job the verdict and the units it had, which the completion
 /// stores: later results move the live LLR, but not what was decided.
-async fn finish_condition_met(
-    state: &AppState,
-    job: &Job,
-) -> AppResult<Option<Option<(crate::stats::sprt::SprtResult, u64)>>> {
+async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<Option<crate::jobs::Finish>> {
+    use crate::jobs::Finish;
     Ok(match job.job_type {
-        JobType::Games | JobType::GamePairs => jobstats::game_stats(&state.pool, job)
-            .await?
-            .filter(|games| games.sprt.status.is_finished())
-            .map(|games| Some((games.sprt, games.units_completed))),
+        JobType::Games | JobType::GamePairs => {
+            jobstats::game_stats(&state.pool, job).await?.and_then(|games| match games.sprt {
+                Some(sprt) => {
+                    sprt.status.is_finished().then_some(Finish::Sprt(sprt, games.units_completed))
+                }
+                // The same count the cap gates on for an SPRT job, so a job
+                // stops at the same point with the test on or off.
+                None => (games.units_completed >= games.max_units as u64)
+                    .then_some(Finish::ReachedTarget),
+            })
+        }
         JobType::OpeningRack => {
             // Tasks are generated on demand, so "all tasks complete" is not
             // enough -- it is trivially true before anything is dispatched.
@@ -1161,7 +1167,7 @@ async fn finish_condition_met(
             .fetch_optional(&state.pool)
             .await?
             .unwrap_or(false)
-            .then_some(None)
+            .then_some(Finish::RacksAnalysed)
         }
         // Leave generation completes in `run_transition` once the final
         // generation is aggregated.

@@ -69,8 +69,10 @@ pub struct Completion {
     /// Completed by an admin (force-complete) rather than by its own rule.
     pub forced: bool,
     /// The server's reason, when it completed the job: the SPRT verdict
-    /// (`passed`, `failed`, `terminated_at_max`) or `last generation built`.
-    /// None for an opening-rack job whose racks were all analysed.
+    /// (`passed`, `failed`, `terminated_at_max`), `reached_target` for a
+    /// games or pairs job that runs no SPRT and played its games, or `last
+    /// generation built`. None for an opening-rack job whose racks were all
+    /// analysed.
     pub reason: Option<String>,
 }
 
@@ -113,8 +115,10 @@ pub struct GameStats {
     pub win_pct: f64,
     pub loss_pct: f64,
     pub draw_pct: f64,
-    /// The test over every accepted result, recomputed on each read.
-    pub sprt: SprtResult,
+    /// The test over every accepted result, recomputed on each read. `None`
+    /// for a job that runs no SPRT: it plays `max_units` and stops, and an LLR
+    /// nobody acts on would read as a verdict.
+    pub sprt: Option<SprtResult>,
     /// What the job was completed on, when the finish check completed it
     /// (`jobs.sprt_decided_*`). The claims in flight at that moment are still
     /// played and accepted, so `sprt` can move after it -- even back inside
@@ -718,16 +722,18 @@ fn build_game_stats(
             100.0 * n as f64 / total as f64
         }
     };
-    let sprt = sprt::evaluate(
-        &sample,
-        units_completed,
-        params.min_units as u64,
-        params.max_units as u64,
-        params.alpha,
-        params.beta,
-        params.elo_low,
-        params.elo_high,
-    );
+    let sprt = params.enabled.then(|| {
+        sprt::evaluate(
+            &sample,
+            units_completed,
+            params.min_units as u64,
+            params.max_units as u64,
+            params.alpha,
+            params.beta,
+            params.elo_low,
+            params.elo_high,
+        )
+    });
     GameStats {
         unit,
         wins: tally.wins,
@@ -887,9 +893,10 @@ async fn worker_contributions_on(
     ))
 }
 
-/// Throughput over the last hour, extrapolated to whatever is left. For SPRT
-/// jobs "what's left" is the distance to `max_units`, which is a ceiling — the
-/// job may well stop earlier when the LLR crosses.
+/// Throughput over the last hour, extrapolated to whatever is left. For games
+/// and pairs jobs "what's left" is the distance to `max_units`: the target of
+/// a job without an SPRT, and a ceiling for one with it -- that job may well
+/// stop earlier when the LLR crosses.
 async fn estimate_eta(
     conn: &mut PgConnection,
     job: &Job,

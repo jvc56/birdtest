@@ -65,7 +65,8 @@ pub struct Job {
     pub last_claimed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// The SPRT verdict the job was completed on, if the finish check completed
     /// it: `passed`, `failed` or `terminated_at_max`, the LLR it crossed at,
-    /// and the units it had then. All three or none.
+    /// and the units it had then. All three or none -- none for a job that
+    /// runs no SPRT, which has no verdict to keep.
     pub sprt_decided_status: Option<String>,
     pub sprt_decided_llr: Option<f64>,
     pub sprt_decided_units: Option<i64>,
@@ -157,6 +158,9 @@ pub struct GameConfig {
     pub player1_config_id: Uuid,
     pub player2_config_id: Uuid,
     pub games_per_batch: i32,
+    /// Whether the job runs an SPRT. Off, it plays `max_games` and stops, and
+    /// `min_games` and the SPRT parameters are stored defaults nothing reads.
+    pub sprt_enabled: bool,
     pub min_games: i32,
     pub max_games: i32,
     pub sprt_alpha: f64,
@@ -174,6 +178,9 @@ pub struct GamePairConfig {
     pub player1_config_id: Uuid,
     pub player2_config_id: Uuid,
     pub pairs_per_batch: i32,
+    /// Whether the job runs an SPRT. Off, it plays `max_pairs` and stops, and
+    /// `min_pairs` and the SPRT parameters are stored defaults nothing reads.
+    pub sprt_enabled: bool,
     pub min_pairs: i32,
     pub max_pairs: i32,
     pub sprt_alpha: f64,
@@ -203,6 +210,8 @@ pub struct LeaveConfig {
 /// shape here keeps the SPRT and dashboard code from branching on job type.
 #[derive(Debug, Clone)]
 pub struct SprtParams {
+    /// Off, the job plays `max_units` and stops: nothing else here is read.
+    pub enabled: bool,
     pub min_units: i32,
     pub max_units: i32,
     pub alpha: f64,
@@ -214,6 +223,7 @@ pub struct SprtParams {
 impl From<&GameConfig> for SprtParams {
     fn from(c: &GameConfig) -> Self {
         Self {
+            enabled: c.sprt_enabled,
             min_units: c.min_games,
             max_units: c.max_games,
             alpha: c.sprt_alpha,
@@ -227,6 +237,7 @@ impl From<&GameConfig> for SprtParams {
 impl From<&GamePairConfig> for SprtParams {
     fn from(c: &GamePairConfig) -> Self {
         Self {
+            enabled: c.sprt_enabled,
             min_units: c.min_pairs,
             max_units: c.max_pairs,
             alpha: c.sprt_alpha,
@@ -328,6 +339,7 @@ mod tests {
             player1_config_id: p1,
             player2_config_id: p2,
             games_per_batch: 7,
+            sprt_enabled: true,
             min_games: 100,
             max_games: 5000,
             sprt_alpha: 0.05,
@@ -341,6 +353,7 @@ mod tests {
             player1_config_id: p1,
             player2_config_id: p2,
             pairs_per_batch: 7,
+            sprt_enabled: true,
             min_pairs: 100,
             max_pairs: 5000,
             sprt_alpha: 0.05,
@@ -350,8 +363,10 @@ mod tests {
             capture_positions: false,
         };
 
-        let fields = |p: SprtParams| (p.min_units, p.max_units, p.alpha, p.beta, p.elo_low, p.elo_high);
-        let expected = (100, 5000, 0.05, 0.1, -3.0, 4.5);
+        let fields = |p: SprtParams| {
+            (p.enabled, p.min_units, p.max_units, p.alpha, p.beta, p.elo_low, p.elo_high)
+        };
+        let expected = (true, 100, 5000, 0.05, 0.1, -3.0, 4.5);
         assert_eq!(fields(SprtParams::from(&games)), expected);
         assert_eq!(fields(SprtParams::from(&pairs)), expected);
     }

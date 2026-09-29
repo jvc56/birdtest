@@ -38,7 +38,13 @@ test.beforeAll(async ({ playwright }) => {
   const anchorId = await api.playerConfigId(ANCHOR);
   const ratedId = await api.playerConfigId(RATED);
 
-  const pairs = { job_type: 'game_pairs', pairs_per_batch: 10, min_pairs: 100, max_pairs: 300 };
+  const pairs = {
+    job_type: 'game_pairs',
+    pairs_per_batch: 10,
+    sprt_enabled: true,
+    min_pairs: 100,
+    max_pairs: 300
+  };
   const jobs = [
     await api.activeJob({ ...pairs, player1_config_id: ratedId, player2_config_id: thirdId }, 20),
     await api.activeJob({ ...pairs, player1_config_id: anchorId, player2_config_id: thirdId }, 20),

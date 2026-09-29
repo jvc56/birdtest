@@ -184,6 +184,7 @@ async fn a_jobs_full_configuration_is_public() {
     assert_eq!(config["games"]["unit"], "game");
     assert_eq!(config["games"]["max_units"], 1_000_000);
     assert_eq!(config["games"]["per_batch"], 10);
+    assert_eq!(config["games"]["sprt_enabled"], true, "{config}");
     let players = config["players"].as_array().unwrap();
     assert_eq!(players.len(), 2, "{config}");
     assert_eq!(players[0]["role"], "player 1");
@@ -431,6 +432,10 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     assert_eq!(pairs["games"]["pentanomial"], json!([0, 0, 0, 0, 0]));
     assert_eq!(pairs["games"]["min_units"], 10);
     assert_eq!(pairs["games"]["max_units"], 20);
+    // A config row that says nothing of the test runs none, and reports none:
+    // `games_job` asks for one, this pairs job does not.
+    assert_eq!(games["games"]["sprt"]["status"], "running", "{games}");
+    assert_eq!(pairs["games"]["sprt"], json!(null), "{pairs}");
     let (_, racks) = send(&app, get_request(&format!("/api/jobs/{racks}"), &[])).await;
     assert_eq!(racks["opening_racks"], json!({ "racks_analyzed": 0, "racks_total": 100 }));
     let (_, leave) = send(&app, get_request(&format!("/api/jobs/{leave}"), &[])).await;

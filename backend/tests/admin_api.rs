@@ -937,7 +937,7 @@ async fn a_games_job_may_pit_a_static_player_against_a_simmer() {
                 "job_type": "games", "variant": "classic",
                 "letterdist_id": letterdist, "layout_id": layout,
                 "player1_config_id": p1, "player2_config_id": p2,
-                "min_games": 1, "max_games": 10,
+                "max_games": 10,
             }),
         )
     };
@@ -1047,7 +1047,7 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
             "player1_config_id": capturing["id"], "player2_config_id": p2,
-            "min_games": 1, "max_games": 10, "capture_positions": capture,
+            "max_games": 10, "capture_positions": capture,
         }))
     };
     let (status, body) = send(&app, create(&simmers[0], true)).await;
@@ -1133,7 +1133,7 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
         "job_type": "games", "variant": "classic",
         "letterdist_id": letterdist, "layout_id": layout,
         "player1_config_id": static_player["id"], "player2_config_id": simmer["id"],
-        "min_games": 1, "max_games": 10,
+        "max_games": 10,
     }))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["job"]["bingo_bonus"], json!(50), "{created}");
@@ -1218,7 +1218,8 @@ async fn a_config_or_job_no_worker_can_run_is_refused() {
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout_id,
             "player1_config_id": player["id"], "player2_config_id": player["id"],
-            "min_games": 1, "max_games": 10, "sprt_alpha": alpha, "sprt_beta": beta,
+            "sprt_enabled": true, "min_games": 1, "max_games": 10,
+            "sprt_alpha": alpha, "sprt_beta": beta,
         })
     };
     let job = |layout_id: uuid::Uuid, alpha: f64| job_with(layout_id, alpha, 0.05);
@@ -1331,13 +1332,22 @@ async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
         }
     };
 
+    // The check observed five claims; `purged` is the second witness.
+    let complete = |db: &TestDb, purged: bool| {
+        let pool = db.pool.clone();
+        async move {
+            let finish = birdtest::jobs::Finish::ReachedTarget;
+            birdtest::jobs::complete_unless_purged(&pool, job, 5, finish, || purged).await.unwrap()
+        }
+    };
+
     // The check observed five claims; a purge then reset the counter.
     sqlx::query("UPDATE jobs SET claims_issued = 0 WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || false).await.unwrap());
+    assert!(!complete(&db, false).await);
     assert_eq!(status(&db).await, "active");
 
     // The counter has grown past what was observed -- but a purge came and
@@ -1347,11 +1357,11 @@ async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
         .execute(&db.pool)
         .await
         .unwrap();
-    assert!(!birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || true).await.unwrap());
+    assert!(!complete(&db, true).await);
     assert_eq!(status(&db).await, "active");
 
     // With no purge in between the counter has only grown, and it completes.
-    assert!(birdtest::jobs::complete_unless_purged(&db.pool, job, 5, None, || false).await.unwrap());
+    assert!(complete(&db, false).await);
     assert_eq!(status(&db).await, "completed");
 }
 
@@ -1995,7 +2005,7 @@ async fn a_job_cannot_pin_two_files_under_one_name() {
             "job_type": "games", "variant": "classic",
             "letterdist_id": letterdist, "layout_id": layout,
             "player1_config_id": p1, "player2_config_id": p2,
-            "min_games": 1, "max_games": 10,
+            "max_games": 10,
         }))
     };
 
@@ -2114,7 +2124,7 @@ async fn a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused() {
         "job_type": "games", "variant": "classic",
         "letterdist_id": three_blanks, "layout_id": layout,
         "player1_config_id": player, "player2_config_id": player,
-        "min_games": 1, "max_games": 10,
+        "max_games": 10,
     });
     let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(&players[0]))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");

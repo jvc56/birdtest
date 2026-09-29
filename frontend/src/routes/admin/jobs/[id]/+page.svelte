@@ -590,14 +590,16 @@
           max={stats.games.max_units}
           label="{stats.games.unit}s completed"
         />
-        <p class="text-sm text-muted-foreground">
-          {#if stats.games.decided}
-            SPRT {sprtLabel(stats.games.decided.status)}, LLR
-            {stats.games.decided.llr.toFixed(3)} (now {stats.games.sprt.llr.toFixed(3)})
-          {:else}
-            SPRT {sprtLabel(sprtState(stats.job.status, stats.games))} — LLR {stats.games.sprt.llr.toFixed(3)}
-          {/if}
-        </p>
+        {#if stats.games.sprt}
+          <p class="text-sm text-muted-foreground">
+            {#if stats.games.decided}
+              SPRT {sprtLabel(stats.games.decided.status)}, LLR
+              {stats.games.decided.llr.toFixed(3)} (now {stats.games.sprt.llr.toFixed(3)})
+            {:else}
+              SPRT {sprtLabel(sprtState(stats.job.status, stats.games))} — LLR {stats.games.sprt.llr.toFixed(3)}
+            {/if}
+          </p>
+        {/if}
       {:else if stats.opening_racks}
         <ProgressBar
           value={stats.opening_racks.racks_analyzed}

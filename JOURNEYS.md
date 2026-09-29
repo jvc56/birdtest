@@ -134,7 +134,7 @@ Open "dev game pairs: static equity vs static score".
   "CSW24 · classic · static, by equity vs static, by score".
 - [ ] **Expect** cards for Status (a badge), Allocation, Tasks completed and
   Estimated time left; the redundancy is under **All settings**.
-- [ ] **Expect** a Progress card: a bar of "pairs completed (hard cap)", the
+- [ ] **Expect** a Progress card: a bar of "pairs completed", the
   Available / Claimed / Completed task counts, when it was created, "Created
   by dev" and "requires MAGPIE ≥ …".
 - [ ] **Expect** a Settings card with one line per player: its name, linking to
@@ -176,6 +176,9 @@ On the same job:
   pentanomial.
 - [ ] On a job an admin has deactivated (A-8), **expect** "paused while the job
   is inactive: no pairs are being played, so the test is not moving".
+- [ ] On "tester no test" (A-7), **expect** no SPRT card, and under **All
+  settings** a "Game pairs" group with "Pairs to play 20" and "SPRT none" in
+  place of the test's settings.
 
 ### V-7 A finished job says why it finished
 
@@ -189,6 +192,7 @@ and [A-12](#a-12-a-leave-generation-job-start-to-finish), then check:
   LLR x reached the upper bound y" (or failed, and the lower bound);
 - [ ] a job an admin forced: "an admin force-completed it before its test
   decided";
+- [ ] a job without a test: "it played the 20 pairs it was set to";
 - [ ] a leave-generation job: "its last generation was built".
 
 ### V-8 Opening-rack jobs: look up a rack
@@ -482,13 +486,19 @@ Do this last: it empties the database.
 **inactive**, with no allocation. The letter distribution and board layout
 start on "Choose…": pick `english` and `standard15` each time.
 
-- [ ] **Game pairs** "tester cap": `static-equity` vs `static-score`, 10 pairs
-  per batch, min before SPRT 20, hard cap 20. It finishes at its cap (V-7).
+- [ ] **Game pairs** "tester no test": `static-equity` vs `static-score`, 10
+  pairs per batch. **Expect** **Run an SPRT** unticked, no α, β, Elo or "Min
+  before SPRT" fields, and the target labelled "Pairs to play": set it to 20.
+  It finishes once it has played them (V-7).
+- [ ] **Game pairs** "tester cap": the same, with **Run an SPRT** ticked:
+  **expect** the SPRT fields to appear and the target to read "Hard cap". Min
+  before SPRT 20, hard cap 20. It finishes at its cap (V-7).
 - [ ] **Game pairs** "tester decided": `static-equity` vs `static-score`, 10 per
-  batch, min before SPRT 0, cap 5,000, Elo low 0, Elo high 50. Its test should
-  decide once it runs (V-7); if it has not after an hour, note how far the LLR
-  got.
-- [ ] **Games** "tester positions": the same two players, 2 per batch, cap 20,
+  batch, **Run an SPRT** ticked, min before SPRT 0, cap 5,000, Elo low 0, Elo
+  high 50. Its test should decide once it runs (V-7); if it has not after an
+  hour, note how far the LLR got.
+- [ ] **Games** "tester positions": the same two players, 2 per batch, 20 games
+  to play,
   **Save the positions played** ticked. **Expect** the batch's maximum to drop
   to 1,000, and, once it runs, a saved-positions section on its page (V-10).
 - [ ] **Games**: **expect** the batch field to step by 2, and the browser to
@@ -772,14 +782,16 @@ curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
 **Create a job, activate it, deactivate it.** Created inactive (`201`);
 activation sets the share (`200`), and a share that would take the active
 jobs past 100% is `409` — with the seed's six jobs active, 4% is the most
-left.
+left. This one runs no SPRT and plays its 20 pairs; `"sprt_enabled": true`
+turns the test on, with `min_pairs` then required, and `min_pairs`, α, β or
+an Elo bound sent without it is a `400` naming each.
 
 ```bash
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"name":"cli test","job_type":"game_pairs","variant":"classic",
        "letterdist_id":"<letterdist id>","layout_id":"<layout id>",
        "player1_config_id":"<config id>","player2_config_id":"<config id>",
-       "pairs_per_batch":10,"min_pairs":20,"max_pairs":20}' \
+       "pairs_per_batch":10,"max_pairs":20}' \
   "$SITE/api/admin/jobs" | jq '.job.id'
 curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
   -d '{"allocation":4}' "$SITE/api/admin/jobs/$JOB/activate"

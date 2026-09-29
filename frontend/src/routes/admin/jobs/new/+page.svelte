@@ -38,6 +38,9 @@
   let player1 = '';
   let player2 = '';
   let batchSize = 1;
+  // Off by default: without a test the job plays its games and stops, and the
+  // test's settings are not sent (the server refuses them without the flag).
+  let sprtEnabled = false;
   let minUnits = 1000;
   let maxUnits = 40000;
   let sprtAlpha = 0.05;
@@ -113,12 +116,15 @@
       layout_id: layoutId,
       ...(minMagpieVersion ? { min_magpie_version: minMagpieVersion } : {})
     };
-    const sprt = {
-      sprt_alpha: sprtAlpha,
-      sprt_beta: sprtBeta,
-      elo_low: eloLow,
-      elo_high: eloHigh
-    };
+    const sprt = sprtEnabled
+      ? {
+          sprt_enabled: true,
+          sprt_alpha: sprtAlpha,
+          sprt_beta: sprtBeta,
+          elo_low: eloLow,
+          elo_high: eloHigh
+        }
+      : { sprt_enabled: false };
     switch (jobType) {
       case 'opening_rack':
         return { ...common, player_config_id: playerConfigId };
@@ -126,14 +132,16 @@
         return {
           ...common,
           player1_config_id: player1, player2_config_id: player2,
-          games_per_batch: batchSize, min_games: minUnits, max_games: maxUnits, ...sprt,
+          games_per_batch: batchSize, max_games: maxUnits, ...sprt,
+          ...(sprtEnabled ? { min_games: minUnits } : {}),
           capture_positions: capturePositions
         };
       case 'game_pairs':
         return {
           ...common,
           player1_config_id: player1, player2_config_id: player2,
-          pairs_per_batch: batchSize, min_pairs: minUnits, max_pairs: maxUnits, ...sprt,
+          pairs_per_batch: batchSize, max_pairs: maxUnits, ...sprt,
+          ...(sprtEnabled ? { min_pairs: minUnits } : {}),
           capture_positions: capturePositions
         };
       case 'leave_generation':
@@ -306,7 +314,7 @@
         </select>
       </div>
     </div>
-    <div class="grid grid-cols-3 gap-3">
+    <div class="grid {sprtEnabled ? 'grid-cols-3' : 'grid-cols-2'} gap-3">
       <div>
         <label class="label" for="batch">
           {jobType === 'games' ? 'Games' : 'Pairs'} per batch
@@ -327,21 +335,42 @@
           </p>
         {/if}
       </div>
+      {#if sprtEnabled}
+        <div>
+          <label class="label" for="min">Min before SPRT</label>
+          <input id="min" type="number" min="0" class="input" bind:value={minUnits} />
+        </div>
+      {/if}
       <div>
-        <label class="label" for="min">Min before SPRT</label>
-        <input id="min" type="number" min="0" class="input" bind:value={minUnits} />
-      </div>
-      <div>
-        <label class="label" for="max">Hard cap</label>
+        <label class="label" for="max">
+          {sprtEnabled ? 'Hard cap' : jobType === 'games' ? 'Games to play' : 'Pairs to play'}
+        </label>
         <input id="max" type="number" min="1" class="input" bind:value={maxUnits} />
       </div>
     </div>
-    <div class="grid grid-cols-4 gap-3">
-      <div><label class="label" for="alpha">α</label><input id="alpha" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtAlpha} /></div>
-      <div><label class="label" for="beta">β</label><input id="beta" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtBeta} /></div>
-      <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloLow} /></div>
-      <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloHigh} /></div>
+    <div>
+      <label class="flex items-center gap-2">
+        <input type="checkbox" bind:checked={sprtEnabled} />
+        <span class="label mb-0">Run an SPRT</span>
+      </label>
+      <p class="mt-1 text-xs text-muted-foreground">
+        {#if sprtEnabled}
+          The job stops as soon as the test decides between the two Elo hypotheses (once the
+          minimum is played), or at the hard cap if it never does.
+        {:else}
+          Without a test the job plays every {jobType === 'games' ? 'game' : 'pair'} it is set
+          to, and its result is the match score.
+        {/if}
+      </p>
     </div>
+    {#if sprtEnabled}
+      <div class="grid grid-cols-4 gap-3">
+        <div><label class="label" for="alpha">α</label><input id="alpha" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtAlpha} /></div>
+        <div><label class="label" for="beta">β</label><input id="beta" type="number" step="any" min="0.000001" max="0.999999" class="input" bind:value={sprtBeta} /></div>
+        <div><label class="label" for="lo">Elo low (H0)</label><input id="lo" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloLow} /></div>
+        <div><label class="label" for="hi">Elo high (H1)</label><input id="hi" type="number" step="any" min="-1000" max="1000" class="input" bind:value={eloHigh} /></div>
+      </div>
+    {/if}
     <div>
       <label class="flex items-center gap-2">
         <input type="checkbox" bind:checked={capturePositions} />

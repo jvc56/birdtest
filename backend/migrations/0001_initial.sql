@@ -433,8 +433,10 @@ CREATE TABLE jobs (
     -- jobs that were actually running until it had caught up with them.
     last_claimed_at TIMESTAMPTZ,
     -- The SPRT verdict a games or game-pairs job was completed on, as the
-    -- finish check saw it: NULL for every other job, and for one completed any
-    -- other way (by an admin, or at its cap in the claim path). The live
+    -- finish check saw it: NULL for every other job, for one completed any
+    -- other way (by an admin, or at its cap in the claim path), and for one
+    -- that runs no SPRT -- there is no verdict to keep, and its `job.completed`
+    -- audit row says `reached_target` instead. The live
     -- figures are recomputed from every accepted result, and the claims in
     -- flight when a job completes are still played and accepted -- so without
     -- this the page of a job that passed could drift back to "running" with no
@@ -617,6 +619,11 @@ CREATE TABLE job_game_config (
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     games_per_batch     INT NOT NULL DEFAULT 1,
+    -- Whether the job runs an SPRT. Off, it plays max_games and stops, and
+    -- min_games and the four SPRT parameters are stored at their defaults and
+    -- read by nothing. Off by default: a job that only wants the games played
+    -- should not be stopped early by a test it did not ask for.
+    sprt_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
     -- Two finish conditions: SPRT significance (evaluated after min_games) OR reaching max_games.
     min_games           INT NOT NULL,   -- SPRT is not evaluated until this many games are complete
     max_games           INT NOT NULL,   -- job auto-completes at this count regardless of SPRT
@@ -639,6 +646,8 @@ CREATE TABLE job_game_pair_config (
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     pairs_per_batch     INT NOT NULL DEFAULT 1,
+    -- As on job_game_config: off, the job plays max_pairs and stops.
+    sprt_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
     min_pairs           INT NOT NULL,
     max_pairs           INT NOT NULL,
     sprt_alpha          DOUBLE PRECISION NOT NULL DEFAULT 0.05,

@@ -207,8 +207,11 @@ export interface GameStats {
   win_pct: number;
   loss_pct: number;
   draw_pct: number;
-  /** The test over every accepted result, recomputed on each read. */
-  sprt: SprtResult;
+  /**
+   * The test over every accepted result, recomputed on each read; null for a
+   * job that runs none, which plays `max_units` and stops.
+   */
+  sprt: SprtResult | null;
   /**
    * What a completed job stopped on, when the finish check completed it. Results
    * in flight at that moment still land, so `sprt` can move afterwards; this is
@@ -220,8 +223,9 @@ export interface GameStats {
 /**
  * How a job was completed. `forced` is an admin's force-complete; otherwise
  * `reason` is the server's: the SPRT verdict (`passed`, `failed`,
- * `terminated_at_max`), `last generation built`, or none for an opening-rack
- * job whose racks were all analysed.
+ * `terminated_at_max`), `reached_target` for a games or pairs job without a
+ * test, `last generation built`, or none for an opening-rack job whose racks
+ * were all analysed.
  */
 export interface Completion {
   at: string;

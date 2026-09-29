@@ -240,6 +240,9 @@ struct GamesSettings {
     /// "game" or "pair": the unit every count here is in.
     unit: &'static str,
     per_batch: i32,
+    /// Off, the job plays `max_units` and stops, and the test's settings
+    /// below are stored defaults it never reads.
+    sprt_enabled: bool,
     min_units: i32,
     max_units: i32,
     sprt_alpha: f64,
@@ -410,6 +413,7 @@ async fn job_config(
             games = Some(GamesSettings {
                 unit: "game",
                 per_batch: c.games_per_batch,
+                sprt_enabled: c.sprt_enabled,
                 min_units: c.min_games,
                 max_units: c.max_games,
                 sprt_alpha: c.sprt_alpha,
@@ -429,6 +433,7 @@ async fn job_config(
             games = Some(GamesSettings {
                 unit: "pair",
                 per_batch: c.pairs_per_batch,
+                sprt_enabled: c.sprt_enabled,
                 min_units: c.min_pairs,
                 max_units: c.max_pairs,
                 sprt_alpha: c.sprt_alpha,

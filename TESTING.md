@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 141 | Vitest, `frontend/src/lib/`: `format.test.ts` (28), `jobSettings.test.ts` (5), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
-| 3 API | 229 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (11), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (6), `fake_worker.rs` (1) |
+| 1 Unit | 225 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 144 | Vitest, `frontend/src/lib/`: `format.test.ts` (30), `jobSettings.test.ts` (6), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 164 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (18), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
+| 3 API | 232 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 17 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 640 backend tests (the per-tier counts above are
+--run-ignored all` runs 650 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -694,7 +694,8 @@ Each entry's tests are the `describe` block named for its id.
 - `F-FMT-5b` `sprtState`: a games or pairs job's test reads `paused` while the
   job is inactive and `undecided` when it was completed without a decision,
   never `running` with nothing being played; a completed job shows the
-  decision it stopped on. *(Covered: `format.test.ts`, `F-FMT-5b sprtState`.)*
+  decision it stopped on; a job without a test is `off` whatever its status.
+  *(Covered: `format.test.ts`, `F-FMT-5b sprtState`.)*
 - `F-FMT-5` `sprtLabel` covers all four statuses. *(Covered:
   `format.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
@@ -1242,7 +1243,9 @@ These are the functions the `win_pct_model` bug lived in. Every SQL string that
 job creation touches needs one caller here.
 
 - `I-JOB-1` Creating each of the four job types inserts its config row with
-  every column populated, and reads back identical. *(Covered:
+  every column populated, and reads back identical; a games job created with
+  only its target runs no SPRT, and stores the test's defaults and a floor of
+  0. *(Covered:
   `jobs::each_job_type_stores_every_setting_it_was_created_with`,
   `jobs::a_leave_generation_job_stores_every_setting_it_was_created_with`.)*
 - `I-JOB-1b` A `games` job's batch is even (default 2), and a games or
@@ -1251,6 +1254,14 @@ job creation touches needs one caller here.
   SPRT passed two identical players (thirty-second audit, pass 18). *(Covered:
   `routes::admin::tests::a_games_batch_must_be_even`,
   `routes::admin::tests::elo_hypotheses_past_a_thousand_are_refused`.)*
+- `I-JOB-1c` **The SPRT is off unless asked for.** A games or pairs body
+  without `sprt_enabled` runs no test and needs no `min_*`; with the flag off,
+  `min_*`, `sprt_alpha`, `sprt_beta`, `elo_low` and `elo_high` are each refused
+  by name rather than dropped (a script from when the test was always on would
+  otherwise get a job with none); with it on, `min_*` is required. *(Covered:
+  `routes::admin::tests::a_job_runs_no_sprt_unless_it_asks_for_one`,
+  `routes::admin::tests::sprt_settings_without_the_test_are_refused`,
+  `routes::admin::tests::an_sprt_needs_its_floor`.)*
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
   accepted; two with different `movegen_margin` are rejected. The regression
@@ -1663,7 +1674,8 @@ permanent.
   (Eleventh audit; the in-flight half, twelfth.)
 - `I-STATS-9f` A completed job's stats say how it was completed (`completion`:
   when, whether an admin forced it, and the server's reason — the SPRT verdict,
-  `last generation built`, or none when an opening-rack job's racks ran out),
+  `reached_target` for a games or pairs job without a test, `last generation
+  built`, or none when an opening-rack job's racks ran out),
   from its `job.completed` audit row; a job not completed has none. The job
   pages turn it into "Finished …: …" under the title. *(Covered:
   `finish::under_steady_load_the_finish_check_runs_on_every_nth_submission`,
@@ -1700,6 +1712,14 @@ permanent.
   `finish::a_job_whose_last_results_landed_while_inactive_completes_once_reactivated`,
   `finish::a_games_job_at_its_cap_whose_results_landed_while_inactive_completes`.)*
   (Thirty-second audit.)
+- `I-STATS-9g` **A job without an SPRT plays to its target.** A 90-10 batch
+  past its floor, which completes an SPRT job, leaves it active and reports no
+  test (`games.sprt` null); the batch that reaches `max_games` completes it with
+  no verdict stored and `reached_target` as the reason, on a submission and on
+  the idle path alike. A config row that says nothing of the test runs none.
+  *(Covered: `stats::a_job_without_an_sprt_completes_at_its_target_and_not_before`,
+  `finish::a_games_job_without_an_sprt_completes_at_its_target_once_reactivated`,
+  `public_api::job_detail_carries_the_stats_block_of_its_type`.)*
 - `I-STATS-10` A stats build takes one connection from its pool, not one per
   statement (eight): on a saturated display pool a build waited out the
   acquire timeout once per statement and answered in tens of seconds, where
@@ -2484,7 +2504,8 @@ below.
   audit: nothing tested it.)
 - `A-PUBLIC-1c` A job's full configuration is public (`GET /api/jobs/:id/config`):
   the job's settings with files by name, its type's (a games job's batch, cap
-  and test), and every setting of each player config, in role order, with the
+  and test, or its target and `sprt_enabled` false without one), and every
+  setting of each player config, in role order, with the
   config's id to link to; it names no creator and carries no user id; an
   unknown job is a `404`. *(Covered:
   `public_api::a_jobs_full_configuration_is_public`; the page's summary and

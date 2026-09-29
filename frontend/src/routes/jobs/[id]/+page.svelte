@@ -110,7 +110,7 @@
         <ProgressBar
           value={stats.games.units_completed}
           max={stats.games.max_units}
-          label="{stats.games.unit}s completed (hard cap)"
+          label="{stats.games.unit}s completed"
         />
       {:else if stats.opening_racks}
         <!-- Tasks are made on demand, so a task count is only what has been
@@ -149,7 +149,8 @@
       <JobSettings {config} />
     {/if}
 
-    {#if stats.games}
+    <!-- A job without a test has no card for one. -->
+    {#if stats.games?.sprt}
       <div class="card space-y-4">
         <div class="flex items-center justify-between">
           <h2 class="text-lg font-medium">SPRT</h2>

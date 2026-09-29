@@ -90,7 +90,8 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
         let row = jobstats::load_job(&db.pool, job).await.unwrap();
         let games = jobstats::game_stats(&db.pool, &row).await.unwrap().unwrap();
         assert_eq!(games.units_completed, 100 * n);
-        assert_eq!(games.sprt.status, SprtStatus::Passed, "the verdict is there at {n}");
+        let sprt = games.sprt.expect("an SPRT job");
+        assert_eq!(sprt.status, SprtStatus::Passed, "the verdict is there at {n}");
         if n < SPRT_CHECK_EVERY {
             assert_eq!(row.status, JobStatus::Active, "unchecked after submission {n}");
         }
@@ -109,7 +110,8 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
     assert_eq!(job_status(&db, job).await, "completed");
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
     let games = jobstats::game_stats(&db.pool, &row).await.unwrap().unwrap();
-    assert!(games.sprt.llr < decided_llr, "the live LLR moved: {} vs {decided_llr}", games.sprt.llr);
+    let live = games.sprt.expect("an SPRT job").llr;
+    assert!(live < decided_llr, "the live LLR moved: {live} vs {decided_llr}");
     let stored = games.decided.expect("the stored verdict is reported");
     assert_eq!((stored.status.as_str(), stored.llr), ("passed", decided_llr));
     // I-STATS-9f: and the page is told why it finished -- its test, not an
@@ -315,16 +317,21 @@ async fn a_job_whose_last_results_landed_while_inactive_completes_once_reactivat
     assert_eq!(eventually_completed(&db, job).await, "completed");
 }
 
-/// I-STATS-9f (games): the same for a games job at its `max_games` cap.
-#[tokio::test]
-async fn a_games_job_at_its_cap_whose_results_landed_while_inactive_completes() {
+/// A games job at its `max_games` of 200, with or without its SPRT, whose
+/// last two batches, both even, landed while it was inactive; reactivated,
+/// the first claim to find it empty completes it.
+async fn a_games_job_whose_cap_landed_while_inactive(sprt_enabled: bool) -> (TestDb, Uuid) {
     let db = TestDb::new().await;
     let job = db.games_job(1, 100).await;
-    sqlx::query("UPDATE job_game_config SET min_games = 100, max_games = 200 WHERE job_id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE job_game_config SET sprt_enabled = $2, min_games = 100, max_games = 200
+         WHERE job_id = $1",
+    )
+    .bind(job)
+    .bind(sprt_enabled)
+    .execute(&db.pool)
+    .await
+    .unwrap();
     let boss = db.user("boss", true).await;
     let state = db.state().await;
     let headers = admin_headers(&state.cfg, boss);
@@ -345,6 +352,25 @@ async fn a_games_job_at_its_cap_whose_results_landed_while_inactive_completes() 
     let (status, _) = send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert_eq!(eventually_completed(&db, job).await, "completed");
+    (db, job)
+}
+
+/// I-STATS-9f (games): the same for a games job at its `max_games` cap.
+#[tokio::test]
+async fn a_games_job_at_its_cap_whose_results_landed_while_inactive_completes() {
+    let (db, job) = a_games_job_whose_cap_landed_while_inactive(true).await;
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
     assert_eq!(row.sprt_decided_status.as_deref(), Some("terminated_at_max"));
+}
+
+/// I-STATS-9g (games, no SPRT): and for one without a test, at its target --
+/// with no verdict stored, and `reached_target` as the reason.
+#[tokio::test]
+async fn a_games_job_without_an_sprt_completes_at_its_target_once_reactivated() {
+    let (db, job) = a_games_job_whose_cap_landed_while_inactive(false).await;
+    let row = jobstats::load_job(&db.pool, job).await.unwrap();
+    assert_eq!(row.sprt_decided_status, None);
+    let completion = jobstats::compute(&db.pool, &row).await.unwrap().completion.expect("completed");
+    assert!(!completion.forced);
+    assert_eq!(completion.reason.as_deref(), Some("reached_target"));
 }

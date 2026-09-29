@@ -57,6 +57,8 @@ export interface JobConfig {
   games?: {
     unit: 'game' | 'pair';
     per_batch: number;
+    /** Off, the job plays `max_units` and stops; the test's settings are unused. */
+    sprt_enabled: boolean;
     min_units: number;
     max_units: number;
     sprt_alpha: number;
@@ -120,16 +122,28 @@ export function jobGroups(c: JobConfig): SettingGroup[] {
   ];
   if (c.games) {
     const g = c.games;
+    const units = g.unit === 'pair' ? 'Pairs' : 'Games';
+    const kind = g.unit === 'pair' ? 'Game pairs' : 'Games';
+    // A job without a test stores the test's defaults, which it never reads:
+    // shown, they would read as a test it runs.
+    const test: [string, string][] = g.sprt_enabled
+      ? [
+          [`Fewest ${g.unit}s before the test is acted on`, show(g.min_units)],
+          [`Cap (${g.unit}s)`, show(g.max_units)],
+          ['SPRT α', show(g.sprt_alpha)],
+          ['SPRT β', show(g.sprt_beta)],
+          ['Elo H0', show(g.elo_low)],
+          ['Elo H1', show(g.elo_high)]
+        ]
+      : [
+          [`${units} to play`, show(g.max_units)],
+          ['SPRT', 'none']
+        ];
     groups.push({
-      title: g.unit === 'pair' ? 'Game pairs and the test' : 'Games and the test',
+      title: g.sprt_enabled ? `${kind} and the test` : kind,
       rows: [
-        [`${g.unit === 'pair' ? 'Pairs' : 'Games'} per task`, show(g.per_batch)],
-        [`Fewest ${g.unit}s before the test is acted on`, show(g.min_units)],
-        [`Cap (${g.unit}s)`, show(g.max_units)],
-        ['SPRT α', show(g.sprt_alpha)],
-        ['SPRT β', show(g.sprt_beta)],
-        ['Elo H0', show(g.elo_low)],
-        ['Elo H1', show(g.elo_high)],
+        [`${units} per task`, show(g.per_batch)],
+        ...test,
         ['Records positions', show(g.capture_positions)]
       ]
     });

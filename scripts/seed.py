@@ -391,12 +391,12 @@ def job_config(job_type: str, players: list, args) -> dict:
                 "rack_size": args.rack_size}
     if job_type == "games":
         return {"player1_config_id": players[0], "player2_config_id": players[1],
-                "games_per_batch": args.batch,
+                "games_per_batch": args.batch, "sprt_enabled": True,
                 "min_games": 100 if args.min_units is None else args.min_units,
                 "max_games": args.max_units}
     if job_type == "game_pairs":
         return {"player1_config_id": players[0], "player2_config_id": players[1],
-                "pairs_per_batch": args.batch,
+                "pairs_per_batch": args.batch, "sprt_enabled": True,
                 "min_pairs": 50000 if args.min_units is None else args.min_units,
                 "max_pairs": args.max_units}
     if job_type == "leave_generation":

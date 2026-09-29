@@ -1052,16 +1052,15 @@ enum JobTypeConfig {
         player2_config_id: Uuid,
         #[serde(default = "two")]
         games_per_batch: i32,
-        min_games: i32,
+        /// With the test off, the job plays this many games and stops; with it
+        /// on, it stops here at the latest.
         max_games: i32,
-        #[serde(default = "default_alpha")]
-        sprt_alpha: f64,
-        #[serde(default = "default_alpha")]
-        sprt_beta: f64,
-        #[serde(default = "default_elo_low")]
-        elo_low: f64,
-        #[serde(default = "default_elo_high")]
-        elo_high: f64,
+        /// The fewest games before the test is acted on: an SPRT setting,
+        /// required with one and refused without.
+        #[serde(default)]
+        min_games: Option<i32>,
+        #[serde(flatten)]
+        sprt: SprtRequest,
         #[serde(default)]
         capture_positions: bool,
     },
@@ -1070,16 +1069,15 @@ enum JobTypeConfig {
         player2_config_id: Uuid,
         #[serde(default = "one")]
         pairs_per_batch: i32,
-        min_pairs: i32,
+        /// With the test off, the job plays this many pairs and stops; with it
+        /// on, it stops here at the latest.
         max_pairs: i32,
-        #[serde(default = "default_alpha")]
-        sprt_alpha: f64,
-        #[serde(default = "default_alpha")]
-        sprt_beta: f64,
-        #[serde(default = "default_elo_low")]
-        elo_low: f64,
-        #[serde(default = "default_elo_high")]
-        elo_high: f64,
+        /// The fewest pairs before the test is acted on: an SPRT setting,
+        /// required with one and refused without.
+        #[serde(default)]
+        min_pairs: Option<i32>,
+        #[serde(flatten)]
+        sprt: SprtRequest,
         #[serde(default)]
         capture_positions: bool,
     },
@@ -1100,15 +1098,61 @@ enum JobTypeConfig {
     },
 }
 
-fn default_alpha() -> f64 {
-    0.05
+/// A games or pairs job's test, as the request states it.
+///
+/// Off unless `sprt_enabled` says otherwise, and then every other setting here
+/// is refused (see [`validate_job_body`]). On, a setting left out takes the
+/// schema's default, as it always has.
+#[derive(Deserialize)]
+struct SprtRequest {
+    #[serde(default)]
+    sprt_enabled: bool,
+    #[serde(default)]
+    sprt_alpha: Option<f64>,
+    #[serde(default)]
+    sprt_beta: Option<f64>,
+    #[serde(default)]
+    elo_low: Option<f64>,
+    #[serde(default)]
+    elo_high: Option<f64>,
 }
-fn default_elo_low() -> f64 {
-    -10.0
+
+/// The test as a config row stores it. A job without one stores the defaults
+/// and a floor of 0, which nothing reads: `SprtParams::enabled` gates them all.
+struct SprtSettings {
+    enabled: bool,
+    min_units: i32,
+    alpha: f64,
+    beta: f64,
+    elo_low: f64,
+    elo_high: f64,
 }
-fn default_elo_high() -> f64 {
-    10.0
+
+impl SprtRequest {
+    fn settings(&self, min_units: Option<i32>) -> SprtSettings {
+        SprtSettings {
+            enabled: self.sprt_enabled,
+            min_units: min_units.unwrap_or(0),
+            alpha: self.sprt_alpha.unwrap_or(0.05),
+            beta: self.sprt_beta.unwrap_or(0.05),
+            elo_low: self.elo_low.unwrap_or(-10.0),
+            elo_high: self.elo_high.unwrap_or(10.0),
+        }
+    }
+
+    /// The test's settings the request states, by field name.
+    fn stated(&self) -> impl Iterator<Item = &'static str> + '_ {
+        [
+            ("sprt_alpha", self.sprt_alpha.is_some()),
+            ("sprt_beta", self.sprt_beta.is_some()),
+            ("elo_low", self.elo_low.is_some()),
+            ("elo_high", self.elo_high.is_some()),
+        ]
+        .into_iter()
+        .filter_map(|(field, stated)| stated.then_some(field))
+    }
 }
+
 fn default_true() -> bool {
     true
 }
@@ -1324,21 +1368,38 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     let sprt = |mut err: AppError,
                 unit: &str,
                 batch: i32,
-                min_units: i32,
+                min_units: Option<i32>,
                 max_units: i32,
-                alpha: f64,
-                beta: f64,
-                elo_low: f64,
-                elo_high: f64| {
+                test: &SprtRequest| {
         if batch < 1 {
             err = err.with_field(format!("{unit}s_per_batch"), "must be at least 1");
-        }
-        if min_units < 0 {
-            err = err.with_field(format!("min_{unit}s"), "must not be negative");
         }
         if max_units < 1 {
             err = err.with_field(format!("max_{unit}s"), "must be at least 1");
         }
+        let min_field = format!("min_{unit}s");
+        // Refused rather than ignored. The test was once always on, so a
+        // request that sets it up without turning it on is most likely a
+        // script written then: ignored, its job would play to its cap with no
+        // test, and nothing would say so until it finished.
+        if !test.sprt_enabled {
+            let stated = min_units.is_some().then_some(min_field);
+            for field in stated.into_iter().chain(test.stated().map(String::from)) {
+                err = err.with_field(
+                    field,
+                    "is an SPRT setting: send sprt_enabled: true to run the test, or leave it out",
+                );
+            }
+            return err;
+        }
+        match min_units {
+            None => err = err.with_field(min_field, "is required when the job runs an SPRT"),
+            Some(min_units) if min_units < 0 => {
+                err = err.with_field(min_field, "must not be negative")
+            }
+            Some(_) => {}
+        }
+        let SprtSettings { alpha, beta, elo_low, elo_high, .. } = test.settings(min_units);
         // Not merely above 0: a subnormal alpha made the upper bound
         // infinite, serialised as `null`, and the public job page threw on it.
         for (field, value) in [("sprt_alpha", alpha), ("sprt_beta", beta)] {
@@ -1378,13 +1439,9 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::Game {
-            games_per_batch, min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
-            capture_positions, ..
+            games_per_batch, min_games, max_games, sprt: test, capture_positions, ..
         } => {
-            let mut err = sprt(
-                err, "game", *games_per_batch, *min_games, *max_games, *sprt_alpha, *sprt_beta,
-                *elo_low, *elo_high,
-            );
+            let mut err = sprt(err, "game", *games_per_batch, *min_games, *max_games, test);
             err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
             // MAGPIE alternates the first mover within one run, from player 1,
             // and every task is a run of its own: at a batch of 1 player 1
@@ -1401,13 +1458,9 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::GamePair {
-            pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
-            capture_positions, ..
+            pairs_per_batch, min_pairs, max_pairs, sprt: test, capture_positions, ..
         } => {
-            let err = sprt(
-                err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, *sprt_alpha, *sprt_beta,
-                *elo_low, *elo_high,
-            );
+            let err = sprt(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
             games_batch_field(err, "pair", 2, *pairs_per_batch, *capture_positions)
         }
         JobTypeConfig::Leave {
@@ -1723,8 +1776,7 @@ async fn insert_job_config(
             JobType::Games,
             JobTypeConfig::Game {
                 player1_config_id, player2_config_id, games_per_batch,
-                min_games, max_games, sprt_alpha, sprt_beta, elo_low, elo_high,
-                capture_positions,
+                min_games, max_games, sprt, capture_positions,
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
@@ -1739,17 +1791,18 @@ async fn insert_job_config(
                 validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
                     .await?;
             }
+            let test = sprt.settings(*min_games);
             sqlx::query(
                 "INSERT INTO job_game_config
                      (job_id, player1_config_id,
-                      player2_config_id, games_per_batch, min_games, max_games, sprt_alpha, sprt_beta,
-                      elo_low, elo_high, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                      player2_config_id, games_per_batch, sprt_enabled, min_games, max_games,
+                      sprt_alpha, sprt_beta, elo_low, elo_high, capture_positions)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
-            .bind(games_per_batch).bind(min_games).bind(max_games)
-            .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
+            .bind(games_per_batch).bind(test.enabled).bind(test.min_units).bind(max_games)
+            .bind(test.alpha).bind(test.beta).bind(test.elo_low).bind(test.elo_high)
             .bind(capture_positions)
             .execute(conn)
             .await?;
@@ -1758,8 +1811,7 @@ async fn insert_job_config(
             JobType::GamePairs,
             JobTypeConfig::GamePair {
                 player1_config_id, player2_config_id, pairs_per_batch,
-                min_pairs, max_pairs, sprt_alpha, sprt_beta, elo_low, elo_high,
-                capture_positions,
+                min_pairs, max_pairs, sprt, capture_positions,
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
@@ -1774,17 +1826,18 @@ async fn insert_job_config(
                 validate_capture_play_cap(&mut *conn, *player1_config_id, *player2_config_id)
                     .await?;
             }
+            let test = sprt.settings(*min_pairs);
             sqlx::query(
                 "INSERT INTO job_game_pair_config
                      (job_id, player1_config_id,
-                      player2_config_id, pairs_per_batch, min_pairs, max_pairs, sprt_alpha, sprt_beta,
-                      elo_low, elo_high, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+                      player2_config_id, pairs_per_batch, sprt_enabled, min_pairs, max_pairs,
+                      sprt_alpha, sprt_beta, elo_low, elo_high, capture_positions)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
-            .bind(pairs_per_batch).bind(min_pairs).bind(max_pairs)
-            .bind(sprt_alpha).bind(sprt_beta).bind(elo_low).bind(elo_high)
+            .bind(pairs_per_batch).bind(test.enabled).bind(test.min_units).bind(max_pairs)
+            .bind(test.alpha).bind(test.beta).bind(test.elo_low).bind(test.elo_high)
             .bind(capture_positions)
             .execute(conn)
             .await?;
@@ -3359,6 +3412,7 @@ mod tests {
             "job_type": "game_pairs",
             "player1_config_id": Uuid::nil(),
             "player2_config_id": Uuid::nil(),
+            "sprt_enabled": true,
             "min_pairs": 100,
             "max_pairs": 1000,
         });
@@ -3373,6 +3427,75 @@ mod tests {
     #[test]
     fn ordinary_settings_are_accepted() {
         assert!(validate_job_body(&game_pairs(serde_json::json!({}))).is_ok());
+    }
+
+    /// A games or pairs job without a word about the test runs none: it
+    /// needs only its target, and stores the defaults, which nothing reads.
+    #[test]
+    fn a_job_runs_no_sprt_unless_it_asks_for_one() {
+        let target_only = |job_type: &str, target: &str| {
+            let mut config = serde_json::json!({
+                "job_type": job_type,
+                "player1_config_id": Uuid::nil(),
+                "player2_config_id": Uuid::nil(),
+            });
+            config[target] = serde_json::json!(500);
+            body(config)
+        };
+        for (job_type, target) in [("games", "max_games"), ("game_pairs", "max_pairs")] {
+            let body = target_only(job_type, target);
+            assert!(validate_job_body(&body).is_ok(), "{job_type}");
+            let (JobTypeConfig::Game { min_games: min, sprt, .. }
+            | JobTypeConfig::GamePair { min_pairs: min, sprt, .. }) = &body.config
+            else {
+                panic!("{job_type} read as another job type");
+            };
+            let stored = sprt.settings(*min);
+            assert!(!stored.enabled, "{job_type}");
+            assert_eq!(
+                (stored.min_units, stored.alpha, stored.beta, stored.elo_low, stored.elo_high),
+                (0, 0.05, 0.05, -10.0, 10.0)
+            );
+        }
+    }
+
+    /// Settings for a test that is off are refused, each by name, rather than
+    /// dropped: a script from before the test was optional would otherwise
+    /// get a job that plays to its cap with no test and no word said.
+    #[test]
+    fn sprt_settings_without_the_test_are_refused() {
+        let off = serde_json::json!({
+            "sprt_enabled": false, "min_pairs": 100, "sprt_alpha": 0.05, "elo_high": 5.0
+        });
+        assert_eq!(
+            fields(validate_job_body(&game_pairs(off))),
+            ["min_pairs", "sprt_alpha", "elo_high"]
+        );
+        // Left out, the flag is off too: a pre-flag script's body.
+        let unflagged = body(serde_json::json!({
+            "job_type": "game_pairs",
+            "player1_config_id": Uuid::nil(),
+            "player2_config_id": Uuid::nil(),
+            "min_pairs": 100,
+            "max_pairs": 1000,
+        }));
+        assert_eq!(fields(validate_job_body(&unflagged)), ["min_pairs"]);
+    }
+
+    /// With the test on, its floor is stated: a floor of 0 lets an early
+    /// streak end the job, which is a choice to make, not a default.
+    #[test]
+    fn an_sprt_needs_its_floor() {
+        let mut config = serde_json::json!({
+            "job_type": "game_pairs",
+            "player1_config_id": Uuid::nil(),
+            "player2_config_id": Uuid::nil(),
+            "sprt_enabled": true,
+            "max_pairs": 1000,
+        });
+        assert_eq!(fields(validate_job_body(&body(config.clone()))), ["min_pairs"]);
+        config["min_pairs"] = serde_json::json!(0);
+        assert!(validate_job_body(&body(config)).is_ok());
     }
 
     /// A batch of zero makes every claim regenerate the seed the last claim
@@ -3394,6 +3517,7 @@ mod tests {
                 "job_type": "games",
                 "player1_config_id": Uuid::nil(),
                 "player2_config_id": Uuid::nil(),
+                "sprt_enabled": true,
                 "min_games": 100,
                 "max_games": 1000,
             });
@@ -3421,6 +3545,7 @@ mod tests {
                 "job_type": "games",
                 "player1_config_id": Uuid::nil(),
                 "player2_config_id": Uuid::nil(),
+                "sprt_enabled": true,
                 "min_games": 100,
                 "max_games": 100_000,
                 "games_per_batch": batch,

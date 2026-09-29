@@ -21,8 +21,8 @@ const config: JobConfig = {
     layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, redundancy: 1, min_magpie_version: '0.1.1'
   },
   games: {
-    unit: 'pair', per_batch: 1, min_units: 100, max_units: 5000, sprt_alpha: 0.05, sprt_beta: 0.05,
-    elo_low: -10, elo_high: 10, capture_positions: false
+    unit: 'pair', per_batch: 1, sprt_enabled: true, min_units: 100, max_units: 5000,
+    sprt_alpha: 0.05, sprt_beta: 0.05, elo_low: -10, elo_high: 10, capture_positions: false
   },
   players: [staticPlayer, simPlayer]
 };
@@ -44,6 +44,18 @@ describe('F-SET-1 job settings', () => {
     const groups = jobGroups(config);
     expect(groups.map((g) => g.title)).toEqual(['Job', 'Game pairs and the test']);
     expect(groups[1].rows).toContainEqual(['Cap (pairs)', (5000).toLocaleString()]);
+  });
+
+  it('shows a job without a test its target, and none of the test it does not run', () => {
+    const groups = jobGroups({ ...config, games: { ...config.games!, sprt_enabled: false } });
+    expect(groups[1].title).toBe('Game pairs');
+    const labels = groups[1].rows.map(([label]) => label);
+    expect(groups[1].rows).toContainEqual(['Pairs to play', (5000).toLocaleString()]);
+    expect(groups[1].rows).toContainEqual(['SPRT', 'none']);
+    for (const hidden of ['SPRT α', 'SPRT β', 'Elo H0', 'Elo H1', 'Cap (pairs)']) {
+      expect(labels).not.toContain(hidden);
+    }
+    expect(labels.some((label) => label.startsWith('Fewest'))).toBe(false);
   });
 
   it('puts the players side by side and marks what they differ in', () => {

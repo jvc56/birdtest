@@ -402,7 +402,9 @@ impl TestDb {
         .unwrap()
     }
 
-    /// An active `games` job at 50% allocation, with its config row.
+    /// An active `games` job at 50% allocation, with its config row. It runs
+    /// an SPRT at the schema's defaults, which the stats and finish tests read;
+    /// at a floor and cap of a million games it never decides anything else.
     pub async fn games_job(&self, redundancy: i32, games_per_batch: i32) -> Uuid {
         let admin = self.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
         let p1 = self.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
@@ -410,8 +412,9 @@ impl TestDb {
         let job = self.bare_job("games", redundancy, admin).await;
         sqlx::query(
             "INSERT INTO job_game_config
-                 (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
-             VALUES ($1, $2, $3, $4, 1000000, 1000000)",
+                 (job_id, player1_config_id, player2_config_id, games_per_batch, sprt_enabled,
+                  min_games, max_games)
+             VALUES ($1, $2, $3, $4, TRUE, 1000000, 1000000)",
         )
         .bind(job)
         .bind(p1)

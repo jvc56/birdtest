@@ -517,7 +517,7 @@ def static_best_player(ctx: Context) -> str:
 
 
 def games_body(players: dict, batch: int, **extra) -> dict:
-    return {"job_type": "games", **players, "games_per_batch": batch,
+    return {"job_type": "games", **players, "games_per_batch": batch, "sprt_enabled": True,
             "min_games": 1_000_000, "max_games": 1_000_000, **extra}
 
 
@@ -596,7 +596,8 @@ def case_pairs(ctx: Context) -> None:
                f"pentanomial {penta} does not count every pair: {stats['games']}")
 
     run_job(ctx, ctx.data, {"job_type": "game_pairs", **static_players(ctx),
-                            "pairs_per_batch": 2, "min_pairs": 1000, "max_pairs": 1000},
+                            "pairs_per_batch": 2, "sprt_enabled": True,
+                            "min_pairs": 1000, "max_pairs": 1000},
             pairs_counted)
 
 
@@ -1004,7 +1005,8 @@ def case_capture(ctx: Context) -> None:
         expect(worker.uuid() is not None, "the first assignment minted no worker UUID")
         # Players with a wordmap, so the assignment pins a derived file.
         one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,
-             "min_pairs": 1_000_000, "max_pairs": 1_000_000}, ctx.data, needs_build=True)
+             "sprt_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000}, ctx.data,
+            needs_build=True)
         one({"job_type": "opening_rack", "player_config_id": simming_player(ctx),
              "racks_per_batch": 2, "rack_size": 7}, ctx.data)
         small = small_data(ctx)

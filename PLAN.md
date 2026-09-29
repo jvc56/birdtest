@@ -306,7 +306,7 @@ move's score: MAGPIE sets it so under a score sort.
 
 ### Statistical Result Evaluation
 
-For game and game-pair jobs, results are evaluated using the Sequential Probability Ratio Test (SPRT). A job has two finish conditions:
+For game and game-pair jobs, results can be evaluated using the Sequential Probability Ratio Test (SPRT). The test is **optional and off by default** (`sprt_enabled`): a job without it plays `max_games` (or `max_pairs`) and completes, with no verdict stored — its `job.completed` audit row says `reached_target` — and its result is the match score (wins, losses and draws, score and win rate, the players' average scores and spread). A job that only wants the games played should not be stopped early by a test nobody asked for, nor show an LLR nobody acts on. Its `min_*` and SPRT parameters are stored at their defaults and read by nothing, and the API refuses any of them sent without `sprt_enabled: true` rather than dropping them: a script written when the test was always on would otherwise get a job with no test and no word said. A job with the test has two finish conditions:
 
 1. **SPRT significance**: SPRT is evaluated as results are submitted (debounced, below), and acted on once `min_games` (or `min_pairs`) have been completed. The job auto-completes when a check finds the LLR past the significance boundary.
 2. **Hard cap**: the job auto-completes when `max_games` (or `max_pairs`) is reached, regardless of SPRT outcome. **No task is generated past the cap**: once every game (or pair) up to it has been handed out, a claim finds nothing new to generate, tasks whose claims lapse are still re-dispatched, and the job completes as their results land. Generating beyond the cap handed out work that could not change the verdict — as many batches as workers asked before the debounced check next ran.
@@ -853,7 +853,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 **Games / Game pairs**
 
-- SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `stopped at its cap`.
+- SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `stopped at its cap` — for a job that runs the test; one without has no SPRT card, and `games.sprt` is `null`.
 - The pentanomial (game pairs only): the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
 - Running result counts and percentages: wins / losses / draws for player 1.
 - **Saved positions**, for a job with `capture_positions` set: the latest captured positions, ten at a time, each with its board (CGP), the rack of the player to move, the move before it and the ranked moves; and a search for the positions played from one rack. Signed-in users only (`GET /api/jobs/:id/positions`); a signed-out visitor is told to sign in. The public has the results feed, and a job that captures holds millions of positions.
@@ -898,7 +898,8 @@ JobStats {
   games?:            { unit: "game" | "pair", wins, losses, draws,
                        units_completed, pentanomial?, divergent_pairs?, min_units, max_units,
                        win_pct, loss_pct, draw_pct,
-                       sprt: { llr, lower_bound, upper_bound, status } }
+                       sprt: { llr, lower_bound, upper_bound, status } | null,
+                       decided? }
   opening_racks?:    { racks_analyzed, racks_total }
   leave_generation?: { current_generation, generation_count, target_rack_count,
                        tasks_completed, games_played,            // live
@@ -4823,7 +4824,7 @@ insert).
 |---|---|
 | `user.registered` | Registration |
 | `task.declined` | A worker declining, with the reason in `reason` |
-| `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle; `job.completed` also for a job the server completes (its stopping rule, SPRT, its last generation), with no actor and the verdict in `reason` |
+| `job.created` / `job.activated` / `job.deactivated` / `job.completed` | Admin job lifecycle; `job.completed` also for a job the server completes (its stopping rule, SPRT, its last generation), with no actor and the verdict in `reason` — or `reached_target` for a games or pairs job without a test |
 | `job.purged` / `job.purged.census` | Purge |
 | `job.deleted` / `job.deleted.census` | Delete |
 | `user.deleted` / `user.deleted.census` | Account deletion |
@@ -4994,6 +4995,8 @@ the body omits them:
 | `pairs_per_batch` | 1 |
 | `racks_per_batch` | 500 |
 | `rack_size` | 7 |
+| `sprt_enabled` | **false** — the job plays its `max_games` / `max_pairs` and stops; `min_*`, α, β and the Elo bounds are refused without it |
+| `min_games` / `min_pairs` | none: required when `sprt_enabled` is true |
 | `sprt_alpha` / `sprt_beta` | 0.05 |
 | `elo_low` / `elo_high` | −10 / +10 |
 | `generation_count` | 1 |
@@ -5010,8 +5013,9 @@ Beyond role matching, creation enforces seven rules the schema cannot express:
 - **Settings a worker can run and a test can evaluate.** `redundancy` at least 1;
   `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
   at most 10,000; `games_per_batch` at most 10,000 games, 1,000 when the job
-  captures positions, and `pairs_per_batch` half of that); `rack_size` 1–7; `max_*` at least 1 and
-  `min_*` at least 0; `sprt_alpha` and `sprt_beta` at least 0.000001 and below 1
+  captures positions, and `pairs_per_batch` half of that); `rack_size` 1–7; `max_*` at least 1;
+  with `sprt_enabled`, `min_*` given and at least 0, and without it no `min_*`,
+  `sprt_*` or `elo_*` at all; `sprt_alpha` and `sprt_beta` at least 0.000001 and below 1
   with a sum below 1 (a subnormal alpha made the upper bound infinite; beta
   has the same floor for symmetry); `elo_low` below `elo_high`; `min_magpie_version`, when given, a
   version (`major.minor[.patch]`, digits only — read loosely, a typo was 0.0.0,
@@ -5116,10 +5120,10 @@ do not exist.
 | Method | Path | Description |
 |---|---|---|
 | `GET` | `/api/jobs` | List jobs with status and summary stats. Paginated; `?status=active` (or `inactive`, `completed`) lists only those, with a matching total. |
-| `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), its type's (a games or pairs job's batch, minimum, cap and SPRT parameters; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name and its id. No creator, no user ids. |
+| `GET` | `/api/jobs/:id/config` | Everything the job runs with, public: the job's settings (variant, letter distribution and board by name, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), its type's (a games or pairs job's batch, whether it runs an SPRT, minimum, cap and SPRT parameters; an opening-rack or leave-generation job's own), and every setting of each player config, with its files by name and its id. No creator, no user ids. |
 | `GET` | `/api/player-configs` | Every player config, newest first, public: every setting with files by name, the config it was cloned from and when it was made. No creator. |
 | `GET` | `/api/player-configs/:id` | One player config, in the same shape. |
-| `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the SPRT verdict, `last generation built`, or none when an opening-rack job's racks ran out). |
+| `GET` | `/api/jobs/:id` | Job detail, configuration, and aggregate statistics; for a completed job, how it was completed (`completion`: when, whether an admin forced it, and the server's reason — the SPRT verdict, `reached_target` for a games or pairs job without a test, `last generation built`, or none when an opening-rack job's racks ran out). |
 | `GET` | `/api/jobs/:id/results` | Task records for a job, paginated by cursor (`?cursor=`; see [Pagination](#pagination)). `?worker=` filters to one contributor by username or anonymous pseudonym (`anon_id`), resolved to an identity before the job is read; a name that is nobody's is an empty page. `?rack=` is opening-rack jobs only and switches to a single-rack lookup, returned whole. |
 | `GET` | `/api/jobs/:id/positions` | **Signed in.** A games or game-pairs job's captured positions, newest first, at most 20 a page by cursor, each with its CGP, game, turn, rack, previous move and ranked moves. `?rack=` keeps those whose player to move held that rack, however it is typed. Another job type is a `400`. |
 | `GET` | `/api/jobs/:id/stream` | SSE stream of live stat updates for a job. Pushes an event after accepted results, coalesced to at most one per `JOB_STATS_CACHE_SECONDS` (an admin's change, a completion or a generation closing at once). |
@@ -5898,8 +5902,10 @@ CREATE TABLE jobs (
     -- jobs that were actually running until it had caught up with them.
     last_claimed_at TIMESTAMPTZ,
     -- The SPRT verdict a games or game-pairs job was completed on, as the
-    -- finish check saw it: NULL for every other job, and for one completed any
-    -- other way (by an admin, or at its cap in the claim path). The live
+    -- finish check saw it: NULL for every other job, for one completed any
+    -- other way (by an admin, or at its cap in the claim path), and for one
+    -- that runs no SPRT -- there is no verdict to keep, and its `job.completed`
+    -- audit row says `reached_target` instead. The live
     -- figures are recomputed from every accepted result, and the claims in
     -- flight when a job completes are still played and accepted -- so without
     -- this the page of a job that passed could drift back to "running" with no
@@ -6082,6 +6088,11 @@ CREATE TABLE job_game_config (
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     games_per_batch     INT NOT NULL DEFAULT 1,
+    -- Whether the job runs an SPRT. Off, it plays max_games and stops, and
+    -- min_games and the four SPRT parameters are stored at their defaults and
+    -- read by nothing. Off by default: a job that only wants the games played
+    -- should not be stopped early by a test it did not ask for.
+    sprt_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
     -- Two finish conditions: SPRT significance (evaluated after min_games) OR reaching max_games.
     min_games           INT NOT NULL,   -- SPRT is not evaluated until this many games are complete
     max_games           INT NOT NULL,   -- job auto-completes at this count regardless of SPRT
@@ -6104,6 +6115,8 @@ CREATE TABLE job_game_pair_config (
     player1_config_id   UUID NOT NULL REFERENCES player_configs(id),
     player2_config_id   UUID NOT NULL REFERENCES player_configs(id),
     pairs_per_batch     INT NOT NULL DEFAULT 1,
+    -- As on job_game_config: off, the job plays max_pairs and stops.
+    sprt_enabled        BOOLEAN NOT NULL DEFAULT FALSE,
     min_pairs           INT NOT NULL,
     max_pairs           INT NOT NULL,
     sprt_alpha          DOUBLE PRECISION NOT NULL DEFAULT 0.05,

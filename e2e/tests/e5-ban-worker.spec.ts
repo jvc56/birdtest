@@ -19,6 +19,7 @@ test.beforeAll(async () => {
       player1_config_id: await api.playerConfigId('static-equity'),
       player2_config_id: await api.playerConfigId('static-score'),
       games_per_batch: 2,
+      sprt_enabled: true,
       min_games: 100000,
       max_games: 100000
     },

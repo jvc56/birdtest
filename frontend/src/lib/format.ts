@@ -59,7 +59,8 @@ const SPRT_LABELS: Record<string, string> = {
   undecided: 'not decided: the job was completed before the test was',
   passed: 'passed (H1 accepted)',
   failed: 'failed (H0 accepted)',
-  terminated_at_max: 'stopped at its cap'
+  terminated_at_max: 'stopped at its cap',
+  off: 'not run: the job plays to its target'
 };
 
 export function sprtLabel(status: string): string {
@@ -72,12 +73,13 @@ export function sprtLabel(status: string): string {
  * work going on while the job was inactive and nothing was being played:
  * the job's status comes first. A completed job shows the decision it was
  * completed on, or `undecided` when it was completed without one (an admin's
- * force-complete).
+ * force-complete). A job that runs no test is `off` whatever its status.
  */
 export function sprtState(
   jobStatus: string,
-  games: { sprt: { status: string }; decided?: { status: string } }
+  games: { sprt: { status: string } | null; decided?: { status: string } }
 ): string {
+  if (!games.sprt) return 'off';
   if (games.decided) return games.decided.status;
   if (jobStatus === 'inactive') return 'paused';
   if (jobStatus === 'completed') return 'undecided';
@@ -129,7 +131,7 @@ export function unchosenText(choices: Record<string, string>): string | null {
  * Why a completed job finished, as a sentence: the job page said only
  * "completed", and a pairs job its test stopped read like one stopped at its
  * cap. From the completion record and, for a games or pairs job, the decision
- * and the test's bounds.
+ * and the test's bounds -- or, for one that runs no test, its target.
  */
 export function completionText(stats: {
   job: { job_type: string };
@@ -137,7 +139,7 @@ export function completionText(stats: {
   games?: {
     unit: string;
     max_units: number;
-    sprt: { lower_bound: number; upper_bound: number };
+    sprt: { lower_bound: number; upper_bound: number } | null;
     decided?: { status: string; llr: number; units: number };
   };
 }): string {
@@ -145,21 +147,26 @@ export function completionText(stats: {
   const games = stats.games;
   const units = (n: number, unit: string) => `${n.toLocaleString()} ${unit}${n === 1 ? '' : 's'}`;
   if (completion?.forced) {
-    return games && !games.decided
+    return games?.sprt && !games.decided
       ? 'an admin force-completed it before its test decided'
       : 'an admin force-completed it';
   }
   const decided = games?.decided;
-  if (games && decided) {
+  const sprt = games?.sprt;
+  if (games && decided && sprt) {
     const llr = decided.llr.toFixed(3);
     switch (decided.status) {
       case 'passed':
-        return `the SPRT passed (H1 accepted) after ${units(decided.units, games.unit)}: LLR ${llr} reached the upper bound ${games.sprt.upper_bound.toFixed(2)}`;
+        return `the SPRT passed (H1 accepted) after ${units(decided.units, games.unit)}: LLR ${llr} reached the upper bound ${sprt.upper_bound.toFixed(2)}`;
       case 'failed':
-        return `the SPRT failed (H0 accepted) after ${units(decided.units, games.unit)}: LLR ${llr} reached the lower bound ${games.sprt.lower_bound.toFixed(2)}`;
+        return `the SPRT failed (H0 accepted) after ${units(decided.units, games.unit)}: LLR ${llr} reached the lower bound ${sprt.lower_bound.toFixed(2)}`;
       case 'terminated_at_max':
-        return `it reached its cap of ${units(games.max_units, games.unit)} before the SPRT decided (LLR ${llr}, bounds [${games.sprt.lower_bound.toFixed(2)}, ${games.sprt.upper_bound.toFixed(2)}])`;
+        return `it reached its cap of ${units(games.max_units, games.unit)} before the SPRT decided (LLR ${llr}, bounds [${sprt.lower_bound.toFixed(2)}, ${sprt.upper_bound.toFixed(2)}])`;
     }
+  }
+  // A job without a test has only its target to reach.
+  if (games && completion?.reason === 'reached_target') {
+    return `it played the ${units(games.max_units, games.unit)} it was set to`;
   }
   if (completion?.reason === 'last generation built') return 'its last generation was built';
   if (stats.job.job_type === 'opening_rack' && completion) return 'every rack was analysed';

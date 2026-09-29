@@ -151,9 +151,10 @@ INSERT INTO jobs (id, job_type, status, allocation, redundancy, variant,
 SELECT '00000000-0000-0000-0000-00000000000d', 'games', 'active', 100, 1, 'classic',
        (SELECT id FROM input_data WHERE role = 'letterdist'), (SELECT id FROM input_data WHERE role = 'layout'),
        (SELECT id FROM users), 50, 0.1;
-INSERT INTO job_game_config (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
+INSERT INTO job_game_config (job_id, player1_config_id, player2_config_id, games_per_batch,
+                             sprt_enabled, min_games, max_games)
 VALUES ('00000000-0000-0000-0000-00000000000d', '00000000-0000-0000-0000-0000000000f1',
-        '00000000-0000-0000-0000-0000000000f1', 10, 100, 1000);
+        '00000000-0000-0000-0000-0000000000f1', 10, true, 100, 1000);
 -- A rating pool whose newest run has seen its evidence: a restore must leave it
 -- to refit.
 INSERT INTO player_configs (id, name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,

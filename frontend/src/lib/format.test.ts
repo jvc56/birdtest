@@ -138,6 +138,12 @@ describe('F-FMT-5b sprtState', () => {
     // A purged job that had a decision keeps none: the purge clears it.
     expect(sprtState('inactive', { sprt: { status: 'failed' } })).toBe('paused');
   });
+  it('is off, whatever the job is doing, for a job that runs no test', () => {
+    for (const status of ['active', 'inactive', 'completed']) {
+      expect(sprtState(status, { sprt: null })).toBe('off');
+    }
+    expect(sprtLabel('off')).toBe('not run: the job plays to its target');
+  });
 });
 
 describe('F-FMT-5 sprtLabel', () => {
@@ -187,9 +193,10 @@ describe('F-FMT-12 completionText', () => {
   const games = (decided?: { status: string; llr: number; units: number }) => ({
     unit: 'pair',
     max_units: 5000,
-    sprt: { lower_bound: -2.94, upper_bound: 2.94 },
+    sprt: { lower_bound: -2.94, upper_bound: 2.94 } as { lower_bound: number; upper_bound: number } | null,
     decided
   });
+  const untested = { ...games(), sprt: null };
   const pairs = { job_type: 'game_pairs' };
   it('tells a test that decided from a cap that was reached', () => {
     expect(
@@ -211,6 +218,15 @@ describe('F-FMT-12 completionText', () => {
     expect(completionText({ job: pairs, completion: { forced: true, reason: null }, games: games() })).toBe(
       'an admin force-completed it before its test decided'
     );
+    // With no test there is nothing it came before.
+    expect(completionText({ job: pairs, completion: { forced: true, reason: null }, games: untested })).toBe(
+      'an admin force-completed it'
+    );
+  });
+  it('says a job without a test played what it was set to', () => {
+    expect(
+      completionText({ job: pairs, completion: { forced: false, reason: 'reached_target' }, games: untested })
+    ).toBe('it played the 5,000 pairs it was set to');
   });
   it('names the other job types\' own ends', () => {
     expect(

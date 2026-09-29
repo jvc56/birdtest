@@ -299,15 +299,20 @@ pub(crate) async fn try_lock_job_dispatch_now(
 /// is `DispatchHolds::claims_holds_taken` compared with a count read before
 /// the check read anything.
 ///
-/// `decided` is the SPRT verdict the check completed a games job on, with the
-/// units it had, and is stored with the completion (`jobs.sprt_decided_*`).
+/// `finish` is what the check completed the job on. An SPRT verdict is
+/// stored with the completion (`jobs.sprt_decided_*`), and it or
+/// `reached_target` is the audit row's reason.
 pub async fn complete_unless_purged(
     pool: &sqlx::PgPool,
     job_id: Uuid,
     observed_claims_issued: i64,
-    decided: Option<(crate::stats::sprt::SprtResult, u64)>,
+    finish: Finish,
     purged_since: impl Fn() -> bool,
 ) -> AppResult<bool> {
+    let decided = match finish {
+        Finish::Sprt(sprt, units) => Some((sprt, units)),
+        Finish::ReachedTarget | Finish::RacksAnalysed => None,
+    };
     let status = decided.map(|(sprt, _)| sprt.status.as_str());
     let mut tx = pool.begin().await?;
     let completed = sqlx::query(
@@ -332,10 +337,38 @@ pub async fn complete_unless_purged(
         return Ok(false);
     }
     if completed {
-        crate::audit::log_server_completion(&mut tx, job_id, status).await?;
+        crate::audit::log_server_completion(&mut tx, job_id, finish.reason()).await?;
     }
     tx.commit().await?;
     Ok(completed)
+}
+
+/// What a job's own finish condition completed it on.
+#[derive(Debug, Clone, Copy)]
+pub enum Finish {
+    /// A games or pairs job's SPRT verdict, and the units it had then. Kept
+    /// with the job (`jobs.sprt_decided_*`): results still in flight move the
+    /// live LLR afterwards, and this is the decision that stands.
+    Sprt(crate::stats::sprt::SprtResult, u64),
+    /// A games or pairs job that runs no SPRT played its `max_units`. There is
+    /// no verdict to keep, so `sprt_decided_*` stay NULL and the audit row's
+    /// reason is what says why it stopped.
+    ReachedTarget,
+    /// An opening-rack job's racks were all handed out and analysed.
+    RacksAnalysed,
+}
+
+impl Finish {
+    /// The `job.completed` audit row's reason, which is what the job page
+    /// reads (`jobstats::Completion`). None for the one job type with a single
+    /// way to finish.
+    pub fn reason(self) -> Option<&'static str> {
+        match self {
+            Finish::Sprt(sprt, _) => Some(sprt.status.as_str()),
+            Finish::ReachedTarget => Some("reached_target"),
+            Finish::RacksAnalysed => None,
+        }
+    }
 }
 
 pub(crate) async fn load_player_spec(

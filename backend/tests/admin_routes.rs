@@ -103,7 +103,7 @@ fn games_job_body(files: &Files, p1: &Value, p2: &Value) -> Value {
         "job_type": "games", "variant": "classic",
         "letterdist_id": files.letterdist, "layout_id": files.layout,
         "player1_config_id": p1, "player2_config_id": p2,
-        "games_per_batch": 2, "min_games": 1, "max_games": 1000,
+        "games_per_batch": 2, "max_games": 1000,
     })
 }
 
@@ -209,7 +209,7 @@ async fn creating_each_job_type_answers_it_inactive_and_unallocated() {
                 "job_type": "game_pairs", "variant": "classic",
                 "letterdist_id": files.letterdist, "layout_id": files.layout,
                 "player1_config_id": player["id"], "player2_config_id": player["id"],
-                "min_pairs": 1, "max_pairs": 100,
+                "max_pairs": 100,
             }),
         ),
         (

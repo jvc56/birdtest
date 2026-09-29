@@ -89,7 +89,11 @@ export class AdminApi {
     return created.id;
   }
 
-  /** Creates and activates a job on the seeded data; returns its id. */
+  /**
+   * Creates and activates a job on the seeded data; returns its id. A games
+   * or pairs job runs an SPRT only when `config` says `sprt_enabled: true`,
+   * and the server refuses a floor or test setting sent without it.
+   */
   async activeJob(config: Record<string, unknown>, allocation: number): Promise<string> {
     const data = await this.seededData();
     const created = await this.post<{ job: { id: string } }>('/api/admin/jobs', {

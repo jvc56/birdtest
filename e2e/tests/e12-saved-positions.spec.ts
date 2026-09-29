@@ -34,8 +34,10 @@ test.beforeAll(async ({ browser, playwright }) => {
   await form.getByLabel('Player 1').selectOption({ label: a });
   await form.getByLabel('Player 2').selectOption({ label: b });
   await form.getByLabel('Games per batch').fill('2');
-  await form.getByLabel('Min before SPRT').fill('4');
-  await form.getByLabel('Hard cap').fill('4');
+  // No SPRT, the form's default: the job plays its four games and stops.
+  await expect(form.getByLabel('Run an SPRT')).not.toBeChecked();
+  await expect(form.getByLabel('Min before SPRT')).toHaveCount(0);
+  await form.getByLabel('Games to play').fill('4');
   await form.getByLabel('Save the positions played').check();
   await form.getByRole('button', { name: 'Create job' }).click();
   await expect(form).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
