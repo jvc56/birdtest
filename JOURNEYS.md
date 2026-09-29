@@ -431,7 +431,8 @@ Do this last: it empties the database.
   `english_ab.csv`. **Do** **Insert 3 rows**. **Expect** "Confirmed. 3 rows
   inserted." and the three files in the list.
 - [ ] **Do** import `20000101` / `two-letter` again. **Expect** "0 new, 0
-  changed, 3 already known." and **Insert 0 rows**.
+  changed, 3 already known." and "No new data to insert.", with no **Insert**
+  button, and `input_data.import_nothing_new` in the audit log.
 - [ ] **Do** re-import the seeded version (its date is in the file list) on
   branch `main`, and leave the page while it downloads; come back. **Expect**
   the import picked up where it was, and every file "already known".
@@ -623,6 +624,7 @@ closes in seconds rather than never.
   `job.created`, `job.activated`, `job.deactivated`, `job.completed`,
   `job.purged`, `job.deleted`, `job.export_started`,
   `input_data.import_staged`, `input_data.import_confirmed`,
+  `input_data.import_nothing_new`,
   `rating_pool.created`, `rating_pool.member_added`, `user.deleted`,
   `worker.banned`, `worker.unbanned` and more.
 - [ ] **Do** filter by action `job.activated`, then by target type `job`.

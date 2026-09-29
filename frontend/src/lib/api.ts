@@ -344,7 +344,8 @@ export interface ImportDetail {
   tarball_date: string;
   commit_sha: string;
   tarball_sha256: string | null;
-  state: 'running' | 'staged' | 'confirmed' | 'cancelled' | 'failed';
+  /** `nothing_new`: staged, but every file was already known. */
+  state: 'running' | 'staged' | 'nothing_new' | 'confirmed' | 'cancelled' | 'failed';
   progress_bytes: number;
   progress_entries: number;
   error: string | null;

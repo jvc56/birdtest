@@ -309,6 +309,10 @@ def import_input_data(client: Client, args) -> None:
         state = client.json(client.get(f"/api/admin/input-data/imports/{import_id}"), "poll import")
         if state["state"] == "staged":
             break
+        if state["state"] == "nothing_new":
+            # Every file already known (under another date): nothing to confirm.
+            log(f"input data {args.tarball_date} has nothing new")
+            return
         if state["state"] in ("failed", "cancelled"):
             raise SeedError(f"import {state['state']}: {state.get('error')}")
         time.sleep(2)

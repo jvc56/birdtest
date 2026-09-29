@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 132 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (5), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1F Frontend unit | 133 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (5), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 229 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (11), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (6), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -743,7 +743,8 @@ Each entry's tests are the `describe` block named for its id.
 ### `F-IMPORT-*` — `lib/importWatch.ts`
 
 - `F-IMPORT-1` The import page's polling: it reads at once and polls while the
-  import runs; it stops once staged (keeping the id) and forgets a failed one;
+  import runs; it stops once staged (keeping the id) and forgets a failed one,
+  or one with nothing new (shown, with nothing to confirm);
   a late `running` cannot undo a newer `staged`; an earlier import's late answer
   cannot touch a newer watch (it put that import on the page, stopped the new
   one's poll and forgot its id, and Insert then confirmed the wrong import); a
@@ -1733,10 +1734,14 @@ import can be watched) and a per-test MinIO bucket.
   build's remedy (import again) changed nothing. *(Covered:
   `input_data::a_damaged_lexicon_object_is_replaced_by_the_next_import`.)*
   (Thirty-second audit.)
-- `I-INPUT-4` A second import of the same tarball is a no-op. *(Covered:
+- `I-INPUT-4` A second import of the same tarball is a no-op: every file is
+  `known`, so the import goes straight to `nothing_new` — not `staged`, where it
+  offered an Insert of 0 rows and waited a day to be expired — audited as
+  `input_data.import_nothing_new` under the admin who started it, refused a
+  confirmation, and never swept as unconfirmed. *(Covered:
   `input_data::a_second_import_of_the_same_tarball_is_a_no_op`.)*
 - `I-INPUT-5` `fail_orphaned_imports` fails a row left `running` by a restart
-  and leaves `staged` and `confirmed` rows alone. *(Covered:
+  and leaves `staged`, `nothing_new` and `confirmed` rows alone. *(Covered:
   `input_data::a_restart_fails_running_imports_and_leaves_the_rest`.)*
 - `I-INPUT-6` Deleting an `input_data` row referenced by a player config or job
   is refused. One that only `derived_data` refers to — a wordmap built from it
@@ -2315,7 +2320,8 @@ below.
   tag sharing one name; a tag naming a tree is refused. *(Covered:
   `input_data::a_ref_resolves_among_the_repositorys_own_branches_and_tags`.)*
   (Thirty-second audit.)
-- `A-ADMIN-6` Confirming an import that is not `staged` is rejected. *(Covered:
+- `A-ADMIN-6` Confirming an import that is not `staged` is rejected; one with
+  nothing new says so. *(Covered:
   `input_data::only_a_staged_import_can_be_confirmed`.)*
 - `A-ADMIN-7` `input-data` list and delete, including the in-use refusal.
   *(Covered: `input_data::an_input_file_in_use_cannot_be_deleted`,

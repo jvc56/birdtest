@@ -63,6 +63,16 @@ describe('F-IMPORT-1 import polling', () => {
     expect(watcher.polling).toBe(false);
   });
 
+  it('stops on an import with nothing new, shown but forgotten: there is nothing to confirm', async () => {
+    const { hooks, reads, states, watcher } = harness();
+    watcher.watch('a');
+    reads[0].answer.resolve(detail('a', 'nothing_new'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(states.map((s) => s.state)).toEqual(['nothing_new']);
+    expect(hooks.forget).toHaveBeenCalledOnce();
+    expect(watcher.polling).toBe(false);
+  });
+
   it("a late `running` cannot undo a newer `staged` within one watch", async () => {
     const { reads, states, watcher } = harness();
     watcher.watch('a');

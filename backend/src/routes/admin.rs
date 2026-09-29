@@ -333,6 +333,9 @@ async fn confirm_import(
     .await?
     .ok_or_else(|| AppError::not_found("no such import"))?;
 
+    if import.state == "nothing_new" {
+        return Err(AppError::conflict("this import has nothing new to insert"));
+    }
     if import.state != "staged" {
         return Err(AppError::conflict(format!(
             "this import is {}, not staged",

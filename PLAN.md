@@ -1761,7 +1761,12 @@ is the first thing that breaks.
 5. Compare each `(path, sha256)` against `input_data`. Stage the result, keeping
    the bytes of every `letterdist` and `layout` entry, and the object key of
    every `kwg` and `klv` entry, so confirmation does not have to download again.
-6. Mark the row `staged`, or `failed` with the reason in `error`.
+6. Mark the row `staged`, or `failed` with the reason in `error` — or, when
+   every file is already known, `nothing_new`, audited as
+   `input_data.import_nothing_new`: there is nothing to confirm, and left
+   `staged` it offered an Insert of 0 rows and waited a day to be expired. The
+   page says "No new data to insert." Its lexica and leaves were still
+   uploaded in step 4, so an import is still how a missing object comes back.
 
 **Phase 2 — confirm.** The admin sees three groups: **new** rows, **known** rows
 (the majority, and the reason the diff exists), and **path collisions** — a path
@@ -4825,7 +4830,7 @@ insert).
 | `job.artifacts_rebuild_started` | An artifact rebuild, before it rewrites anything, with `force` |
 | `job.artifacts_rebuilt` | Artifact rebuild, with counts, when it ends |
 | `job.export_started` | An admin starting a results export |
-| `input_data.import_staged` / `input_data.import_confirmed` | Tarball import |
+| `input_data.import_staged` / `input_data.import_confirmed` / `input_data.import_nothing_new` | Tarball import; the last when every file was already known, so there was nothing to confirm (actor: the admin who started it) |
 | `worker.banned` | Ban, with the free-text reason |
 | `worker.unbanned` | Lifting a ban, naming the identity rather than the ban row, which is gone |
 | `user.signed_out_everywhere` | "Sign out everywhere" on the account page |
@@ -4911,7 +4916,7 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `GET` | `/api/admin/input-data` | List known input data rows — path, role, name, digest, tarball date. |
 | `DELETE` | `/api/admin/input-data/:id` | Delete an input data row. A row referenced by a job, player config or rating pool cannot be deleted; the foreign key is the safety mechanism and the error reads "this file is pinned by N jobs, player configs or rating pools". |
 | `POST` | `/api/admin/input-data/imports` | Start a tarball import. Returns `202` and an import id immediately; the fetch and diff run as a background task. |
-| `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged, or the failure reason. |
+| `GET` | `/api/admin/input-data/imports/:id` | Poll an import: progress while running, the staged diff once staged (or `nothing_new`, every file already known), or the failure reason. |
 | `POST` | `/api/admin/input-data/imports/:id/confirm` | Insert the staged new and changed (collision) rows, in one transaction. |
 | `GET` | `/api/admin/jobs/:id/data-gaps` | What workers reported they were missing for this job, from `worker_data_gaps`. |
 | `GET` | `/api/admin/jobs/:id/results/stream` | Newline-delimited JSON (`application/x-ndjson`) of every record for the job, streamed straight from a database cursor so a download never buffers a whole job in memory. The source table follows the job type: position analyses (each with its ranked moves and plies nested), game results, or leave-rack progress — the export's own queries. `?positions=true` (games and game-pairs jobs) streams the positions the job captured instead of its result rows. At most two run at once (a third gets `429`); a completed job with a ready export gets a `303` to it instead. A stream is complete exactly when it ends cleanly: what can fail before the first row (a connection, a leave job's settle) is a status, and a query that fails part-way cuts the body off with an error rather than ending it, which a client over HTTP/1.1 or later reports as a failed transfer (HTTP/1.0 has no chunks, and a cut reads as an end there). |
@@ -5670,7 +5675,7 @@ CREATE TABLE input_data_imports (
     -- background task is spawned.
     tarball_sha256 TEXT,
     state          TEXT NOT NULL DEFAULT 'running'
-                   CHECK (state IN ('running', 'staged', 'confirmed',
+                   CHECK (state IN ('running', 'staged', 'nothing_new', 'confirmed',
                                     'cancelled', 'failed')),
     -- What the poller renders while state = 'running'.
     progress_bytes   BIGINT NOT NULL DEFAULT 0,

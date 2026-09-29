@@ -213,8 +213,11 @@ CREATE TABLE input_data_imports (
     -- NULL until the download completes: the row exists from the moment the
     -- background task is spawned.
     tarball_sha256 TEXT,
+    -- 'nothing_new': staged, every file already known, so there is nothing
+    -- to confirm; it goes there straight from 'running' rather than waiting
+    -- a day in 'staged' to be expired.
     state          TEXT NOT NULL DEFAULT 'running'
-                   CHECK (state IN ('running', 'staged', 'confirmed',
+                   CHECK (state IN ('running', 'staged', 'nothing_new', 'confirmed',
                                     'cancelled', 'failed')),
     -- What the poller renders while state = 'running'.
     progress_bytes   BIGINT NOT NULL DEFAULT 0,
