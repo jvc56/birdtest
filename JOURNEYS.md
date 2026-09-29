@@ -123,6 +123,8 @@ Use a signed-out window for the V journeys unless one says otherwise.
 - [ ] A job that workers keep declining, and none has completed in 24 hours,
   shows a red **stalled** pill with a tooltip saying so. (Hard to stage
   locally; note it if you see it.)
+- [ ] Signed out, **expect** no **New job** button; as an admin, **expect** one
+  beside the title, opening the job form.
 
 ### V-4 A job's page: what every job shows
 
@@ -259,6 +261,8 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
   download.
 - [ ] **Do** open `/player-configs/00000000-0000-4000-8000-000000000000`.
   **Expect** "no such player config".
+- [ ] Signed out, **expect** no **New player config** button on **Players**; as
+  an admin, **expect** one beside the title, opening the player-config form.
 
 ### V-13 Users and contributors
 
@@ -374,7 +378,8 @@ As alice:
 
 - [ ] **Do** open `/admin/jobs/new`. **Expect** to be sent to the home page.
 - [ ] **Expect** no **Admin** link, no **Manage** button on job pages, no **New
-  rating pool** button, and no membership controls on a pool.
+  job** button on **Jobs**, no **New player config** button on **Players**, no
+  **New rating pool** button, and no membership controls on a pool.
 
 ---
 

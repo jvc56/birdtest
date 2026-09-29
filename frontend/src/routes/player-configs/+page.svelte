@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import { api } from '$lib/api';
+  import { session } from '$lib/auth';
   import { playerSummary, type PublicPlayerConfig } from '$lib/jobSettings';
 
   let configs: PublicPlayerConfig[] = [];
@@ -15,11 +16,16 @@
       error = e instanceof Error ? e.message : String(e);
     }
   });
+
+  $: isAdmin = $session?.is_admin ?? false;
 </script>
 
 <section class="space-y-6">
   <div class="space-y-2">
-    <h1 class="text-2xl font-semibold">Player configs</h1>
+    <div class="flex flex-wrap items-center justify-between gap-2">
+      <h1 class="text-2xl font-semibold">Player configs</h1>
+      {#if isAdmin}<a class="btn-primary no-underline hover:no-underline" href="/admin/player-configs/new">New player config</a>{/if}
+    </div>
     <p class="max-w-3xl text-sm text-muted-foreground">
       A player config is one bot: the lexicon and leaves it plays with, how it searches for a
       move, and what it reports. Jobs pit configs against each other, and ratings are about them.
