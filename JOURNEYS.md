@@ -480,7 +480,8 @@ Do this last: it empties the database.
 ### A-7 Create jobs
 
 **New job**, then **Create job**; each lands on the job's admin page,
-**inactive**, with no allocation.
+**inactive**, with no allocation. The letter distribution and board layout
+start on "Choose…": pick `english` and `standard15` each time.
 
 - [ ] **Game pairs** "tester cap": `static-equity` vs `static-score`, 10 pairs
   per batch, min before SPRT 20, hard cap 20. It finishes at its cap (V-7).
@@ -496,6 +497,8 @@ Do this last: it empties the database.
 - [ ] **Opening rack analysis** with `static-equity` (recorder best, 10 plays
   kept). **Expect** a warning that only one play per rack would be stored, and
   creation refused; with `static-equity-all` it is accepted.
+- [ ] **Do** leave the letter distribution on "Choose…" and submit. **Expect**
+  the browser to hold the form on that field.
 - [ ] **Do** clear a number box and submit. **Expect** "Fill in every setting: …
   is empty."
 - [ ] **Do** set Elo high below Elo low. **Expect** "must be a finite number
@@ -585,6 +588,8 @@ closes in seconds rather than never.
 
 ### A-13 Rating pools
 
+- [ ] **Do** **New rating pool**. **Expect** the letter distribution and board
+  layout on "Choose…", not filled in.
 - [ ] **Do** **New rating pool**: "tester pool", classic, the `english`
   distribution and `standard15` the seeded jobs use, anchor `static-equity` at
   1500, with `static-score` and `sim-1ply` ticked. **Expect** the pool's page,

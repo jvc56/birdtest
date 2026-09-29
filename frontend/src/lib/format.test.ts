@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   blankFields,
+  unchosenText,
   datetime,
   duration,
   jobTypeLabel,
@@ -169,6 +170,16 @@ describe('F-FMT-6 form numbers', () => {
   it('names the fields a request would send blank', () => {
     expect(blankFields({ a: 1, b: null, c: Number.NaN, d: 'x', e: 0 })).toEqual(['b', 'c']);
     expect(blankFields({ a: 1 })).toEqual([]);
+  });
+
+  it('names the selects left on their empty choice', () => {
+    const choose = (ld: string, layout: string) =>
+      unchosenText({ 'a letter distribution': ld, 'a board layout': layout });
+    expect(choose('', '')).toBe('Choose a letter distribution and a board layout.');
+    expect(choose('x', '')).toBe('Choose a board layout.');
+    expect(choose('', 'y')).toBe('Choose a letter distribution.');
+    expect(choose('x', 'y')).toBeNull();
+    expect(unchosenText({ a: '', b: '', c: '' })).toBe('Choose a, b and c.');
   });
 });
 

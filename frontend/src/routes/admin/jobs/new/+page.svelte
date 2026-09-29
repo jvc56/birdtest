@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
-  import { blankFields, jobTypeLabel } from '$lib/format';
+  import { blankFields, jobTypeLabel, unchosenText } from '$lib/format';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -94,8 +94,9 @@
     // Filtered from `files` here rather than read off the `$:` arrays above:
     // those are recomputed on the update cycle, not on assignment, so they
     // would still be empty on the next line and every default would be ''.
-    letterdistId = firstOfRole('letterdist');
-    layoutId = firstOfRole('layout');
+    // The letter distribution and board are left for the admin to choose: the
+    // first of each was whichever was imported first, and a job made on it
+    // unnoticed played with the wrong bag or board.
     leaveKwgId = firstOfRole('kwg');
     serverFloor = (await api.clientVersion()).min_magpie_version;
     minMagpieVersion = serverFloor;
@@ -153,6 +154,17 @@
     // A cleared number box binds as null, and the server's answer to a null
     // setting names the whole request ("data did not match any variant"),
     // not the field.
+    // The browser holds a form whose required select is on its empty choice;
+    // this names it should one get past, rather than sending an empty id.
+    const unchosen = unchosenText({
+      'a letter distribution': letterdistId,
+      'a board layout': layoutId
+    });
+    if (unchosen) {
+      error = unchosen;
+      fromSubmit = true;
+      return;
+    }
     const request = body();
     const blank = blankFields(request);
     if (blank.length) {
@@ -234,12 +246,14 @@
     <div>
       <label class="label" for="ld">Letter distribution</label>
       <select id="ld" class="input" bind:value={letterdistId} required>
+        <option value="" disabled selected>Choose…</option>
         {#each letterdists as file}<option value={file.id}>{label(file)}</option>{/each}
       </select>
     </div>
     <div>
       <label class="label" for="layout">Board layout</label>
       <select id="layout" class="input" bind:value={layoutId} required>
+        <option value="" disabled selected>Choose…</option>
         {#each layouts as file}<option value={file.id}>{label(file)}</option>{/each}
       </select>
     </div>

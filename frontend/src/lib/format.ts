@@ -108,6 +108,24 @@ export function blankFields(body: Record<string, unknown>): string[] {
 }
 
 /**
+ * Why a form's selects, keyed by what they choose, cannot be sent: "Choose a
+ * letter distribution and a board layout.", or null when every one holds an
+ * id. An empty id sent reads as a malformed body to the server, whose answer
+ * names no field.
+ */
+export function unchosenText(choices: Record<string, string>): string | null {
+  const missing = Object.entries(choices)
+    .filter(([, id]) => id === '')
+    .map(([what]) => what);
+  if (!missing.length) return null;
+  const list =
+    missing.length === 1
+      ? missing[0]
+      : `${missing.slice(0, -1).join(', ')} and ${missing[missing.length - 1]}`;
+  return `Choose ${list}.`;
+}
+
+/**
  * Why a completed job finished, as a sentence: the job page said only
  * "completed", and a pairs job its test stopped read like one stopped at its
  * cap. From the completion record and, for a games or pairs job, the decision

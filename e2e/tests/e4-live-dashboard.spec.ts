@@ -46,9 +46,15 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   const jobName = `e2e pairs ${suffix}`;
   await page.getByLabel('Job name').fill(jobName);
   await page.getByLabel('Job type').selectOption({ label: 'Game pairs' });
+  // Neither the bag nor the board is chosen for the admin.
   const letterdist = page.getByLabel('Letter distribution');
+  const layout = page.getByLabel('Board layout');
+  await expect(letterdist).toHaveValue('');
+  await expect(layout).toHaveValue('');
   const fixtureBag = letterdist.locator('option', { hasText: `english_fixture (${SEEDED_DATA},` });
   await letterdist.selectOption((await fixtureBag.getAttribute('value'))!);
+  const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
+  await layout.selectOption((await board.getAttribute('value'))!);
   await page.getByLabel('Player 1').selectOption({ label: p1 });
   await page.getByLabel('Player 2').selectOption({ label: p2 });
   // One pair per task, so results arrive steadily rather than in lumps.

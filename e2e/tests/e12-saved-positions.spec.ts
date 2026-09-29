@@ -28,6 +28,9 @@ test.beforeAll(async ({ browser, playwright }) => {
   const letterdist = form.getByLabel('Letter distribution');
   const fixtureBag = letterdist.locator('option', { hasText: `english_fixture (${SEEDED_DATA},` });
   await letterdist.selectOption((await fixtureBag.getAttribute('value'))!);
+  const layout = form.getByLabel('Board layout');
+  const board = layout.locator('option', { hasText: `standard15 (${SEEDED_DATA},` });
+  await layout.selectOption((await board.getAttribute('value'))!);
   await form.getByLabel('Player 1').selectOption({ label: a });
   await form.getByLabel('Player 2').selectOption({ label: b });
   await form.getByLabel('Games per batch').fill('2');
