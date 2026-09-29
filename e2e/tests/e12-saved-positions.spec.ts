@@ -69,15 +69,20 @@ test('E-12: a signed-in user draws saved positions at random and searches them b
   await expect(shown).toBeVisible();
 
   // A position after a play, rather than an opening turn's empty board or
-  // one after an exchange: its tiles are down and the play's are outlined.
+  // one after an exchange -- and not the second turn's either, whose only
+  // tiles are the opening play's: tiles are down, and only the play's are
+  // outlined.
   await expect(async () => {
-    if (!(await board.locator('.tile.last').count())) {
+    const outlined = await board.locator('.tile.last').count();
+    const tiles = await board.locator('.tile').count();
+    if (!outlined || tiles <= outlined) {
       await page.getByRole('button', { name: 'Random position' }).click();
     }
-    await expect(board.locator('.tile.last').first()).toBeVisible({ timeout: 1_000 });
+    expect(outlined).toBeGreaterThan(0);
+    expect(tiles).toBeGreaterThan(outlined);
   }).toPass({ timeout: 30_000 });
+  await expect(board.locator('.tile.last').first()).toBeVisible();
   await expect(shown).toContainText('after');
-  expect(await board.locator('.tile').count()).toBeGreaterThan(await board.locator('.tile.last').count());
   // Both racks and scores, the player to move marked, and the ranked moves.
   await expect(shown.getByTestId('rack')).toHaveCount(2);
   await expect(shown.getByTestId('score')).toHaveCount(2);
