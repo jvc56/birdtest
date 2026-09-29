@@ -220,6 +220,8 @@ pub struct GameRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeaveRequest {
+    /// The player's lexicon, stated at the top as well: MAGPIE names the KLV it
+    /// fetches after it, and loads the two together.
     pub lexicon: String,
     pub variant: String,
     /// Stated by the job rather than inferred from the lexicon name.
@@ -252,12 +254,14 @@ pub struct LeaveRequest {
     /// early at the forced racks' target would discard coverage the server
     /// would have folded in. The target stays server-only state.
     pub num_games: i32,
-    /// Leave generation has one bot rather than a player pair, so its wordmap
-    /// setting sits on the request instead of on a player spec.
-    pub use_wordmap: bool,
     /// The job's bingo bonus. No cutoff: the leave-generating bot plays
     /// statically.
     pub bingo_bonus: i32,
+    /// The player the bot plays as, in both seats, and so the one wordmap
+    /// setting. Its leaves are stated, as every player's are, and never
+    /// loaded: the bot plays the KLV at `previous_artifact_key`, whose values
+    /// are what the job measures.
+    pub player: PlayerSpec,
 }
 
 /// What actually goes over the wire to the worker. Internally tagged so the

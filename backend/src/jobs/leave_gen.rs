@@ -1,4 +1,4 @@
-use super::dispatch::JobTemplate;
+use super::dispatch::{JobKind, JobTemplate};
 use super::handler::*;
 use super::racks::{LetterDistribution, RackIndex};
 use super::JobData;
@@ -25,15 +25,15 @@ pub async fn insert_request(
     conn: &mut PgConnection,
     task_id: Uuid,
     req: &LeaveRequest,
+    player_config_id: Uuid,
 ) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO leave_requests
-             (task_id, lexicon, variant, letter_distribution, board_layout, generation,
-              seed, forced_racks, num_games, previous_artifact_key, use_wordmap)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+             (task_id, variant, letter_distribution, board_layout, generation,
+              seed, forced_racks, num_games, previous_artifact_key, player_config_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(task_id)
-    .bind(&req.lexicon)
     .bind(&req.variant)
     .bind(&req.letter_distribution)
     .bind(&req.board_layout)
@@ -42,7 +42,7 @@ pub async fn insert_request(
     .bind(&req.forced_racks)
     .bind(req.num_games)
     .bind(&req.previous_artifact_key)
-    .bind(req.use_wordmap)
+    .bind(player_config_id)
     .execute(conn)
     .await?;
     Ok(())
@@ -58,11 +58,14 @@ impl JobHandler for LeaveGenHandler {
         template: &JobTemplate,
         task_id: Uuid,
     ) -> AppResult<Self::Request> {
+        let JobKind::LeaveGeneration { player, .. } = &template.kind else {
+            return Err(template.mismatch("leave_generation"));
+        };
         // The artifact's hash is read from the row that names it rather than
         // stored with the request: one source, whichever path sends the task.
         let row = sqlx::query(
-            "SELECT r.lexicon, r.variant, r.letter_distribution, r.board_layout, r.generation,
-                    r.seed, r.forced_racks, r.num_games, r.previous_artifact_key, r.use_wordmap,
+            "SELECT r.variant, r.letter_distribution, r.board_layout, r.generation,
+                    r.seed, r.forced_racks, r.num_games, r.previous_artifact_key,
                     COALESCE(a.served_sha256, a.sha256) AS previous_artifact_sha256
              FROM leave_requests r
              JOIN leave_generation_artifacts a ON a.artifact_key = r.previous_artifact_key
@@ -72,7 +75,7 @@ impl JobHandler for LeaveGenHandler {
         .fetch_one(&mut *conn)
         .await?;
         Ok(LeaveRequest {
-            lexicon: row.get("lexicon"),
+            lexicon: player.lexicon.clone(),
             variant: row.get("variant"),
             letter_distribution: row.get("letter_distribution"),
             board_layout: row.get("board_layout"),
@@ -82,8 +85,8 @@ impl JobHandler for LeaveGenHandler {
             num_games: row.get("num_games"),
             previous_artifact_key: row.get("previous_artifact_key"),
             previous_artifact_sha256: row.get("previous_artifact_sha256"),
-            use_wordmap: row.get("use_wordmap"),
             bingo_bonus: template.data.bingo_bonus,
+            player: player.clone(),
         })
     }
 
@@ -726,8 +729,9 @@ pub async fn lock_claim_decisions(conn: &mut PgConnection, job_id: Uuid) -> AppR
 
 /// What the scheduler should do next for a leave-generation job.
 pub enum LeaveGenStep {
-    /// Dispatch this forced-rack partition.
-    Dispatch(LeaveRequest),
+    /// Dispatch this forced-rack partition. Boxed: the request carries its
+    /// player whole, and every other step is a generation number or nothing.
+    Dispatch(Box<LeaveRequest>),
     /// Every rack in this generation hit its target and no claim is in flight;
     /// the generation must be aggregated before any more work exists. Done
     /// outside the claim transaction because it uploads to S3.
@@ -838,13 +842,13 @@ pub const SWEEP_WHILE_TASKS_REMAIN: i64 = 100;
 /// a lap in progress runs to its end, and the tail, once begun, runs to the
 /// generation's close.
 ///
-/// `lexicon` is the name of the row the job pins, from its template.
+/// `player` is the job's player, from its template.
 pub async fn next_step(
     conn: &mut PgConnection,
     job_id: Uuid,
     config: &LeaveConfig,
     job_data: &JobData,
-    lexicon: &str,
+    player: &PlayerSpec,
 ) -> AppResult<LeaveGenStep> {
     let Some(generation) = current_generation(&mut *conn, job_id, config).await? else {
         return Ok(LeaveGenStep::Finished);
@@ -890,8 +894,8 @@ pub async fn next_step(
         ))
     })?;
 
-    Ok(LeaveGenStep::Dispatch(LeaveRequest {
-        lexicon: lexicon.to_string(),
+    Ok(LeaveGenStep::Dispatch(Box::new(LeaveRequest {
+        lexicon: player.lexicon.clone(),
         variant: job_data.variant.clone(),
         letter_distribution: job_data.letterdist_name.clone(),
         board_layout: job_data.layout_name.clone(),
@@ -905,9 +909,9 @@ pub async fn next_step(
         previous_artifact_key,
         previous_artifact_sha256,
         num_games: config.num_iterations,
-        use_wordmap: config.use_wordmap,
         bingo_bonus: job_data.bingo_bonus,
-    }))
+        player: player.clone(),
+    })))
 }
 
 /// What a selection came back with: racks to force, or the reason there are
@@ -1565,16 +1569,6 @@ pub async fn close_generation(
     // and the copy stood or fell together. Seeded at the other end it happens
     // while workers are busy, and a failure costs a retry of the seeding alone.
     Ok(())
-}
-
-/// The lexicon name a leave job's bot plays with, from the row it pins.
-pub async fn lexicon_name(conn: &mut PgConnection, kwg_id: Uuid) -> AppResult<String> {
-    Ok(
-        sqlx::query_scalar::<_, String>("SELECT name FROM input_data WHERE id = $1")
-            .bind(kwg_id)
-            .fetch_one(conn)
-            .await?,
-    )
 }
 
 /// The zeroed KLV generation 1 plays with, stored as generation 0's artifact.

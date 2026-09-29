@@ -402,6 +402,30 @@ impl TestDb {
         .unwrap()
     }
 
+    /// A leave job's player on `kwg`: static, sorting on equity, no rack info
+    /// table, as job creation requires. Its leaves are a row of their own,
+    /// which the job must never pin -- leave generation plays the server's KLV.
+    pub async fn leave_player(&self, kwg: Uuid, use_wordmap: bool, created_by: Uuid) -> Uuid {
+        let name = format!("leave{}", Uuid::new_v4().simple());
+        let klv = self.input_data("klv", &name).await;
+        sqlx::query_scalar(
+            "INSERT INTO player_configs
+                 (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
+                  num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
+                  movegen_margin, created_by)
+             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, $4, false, 5, $5)
+             RETURNING id",
+        )
+        .bind(name)
+        .bind(kwg)
+        .bind(klv)
+        .bind(use_wordmap)
+        .bind(created_by)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap()
+    }
+
     /// An active `games` job at 50% allocation, with its config row. It runs
     /// an SPRT at the schema's defaults, which the stats and finish tests read;
     /// at a floor and cap of a million games it never decides anything else.

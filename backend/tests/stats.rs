@@ -328,14 +328,15 @@ async fn leave_job(db: &TestDb, generations: i32) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let job = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 100, (SELECT array_agg(g * 500 ORDER BY g) FROM generate_series(1, $3) g),
                  50)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .bind(generations)
     .execute(&db.pool)
     .await

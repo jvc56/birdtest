@@ -70,13 +70,12 @@ export interface JobConfig {
     capture_positions: boolean;
   };
   opening_racks?: { racks_per_batch: number; rack_size: number; total_racks: number };
+  /** Its lexicon and wordmap setting are its player's, in `players`. */
   leave_generation?: {
-    lexicon: string;
     num_iterations: number;
     /** One occurrence target per generation, in order; its length is the generation count. */
     target_rack_counts: number[];
     racks_per_task: number;
-    use_wordmap: boolean;
   };
   players: PlayerSettings[];
 }
@@ -122,10 +121,11 @@ const more = (label: string, value: string): JobSetting => ({ label, value, key:
  * say what the job is: its type; the variant, letter distribution and board
  * every game is played on; how much it plays -- a games job's target, and
  * whether a test can stop it sooner and between which Elo bounds; an
- * opening-rack job's racks and their size; a leave job's lexicon, iterations,
- * generations and target. The rest -- batch sizes, bingo bonus, sim cutoff,
- * redundancy, the oldest MAGPIE, the test's error rates and minimum, whether
- * positions are recorded, the wordmap -- is under "All settings".
+ * opening-rack job's racks and their size; a leave job's generations, each
+ * one's target and the games a task plays. The rest -- batch sizes, bingo
+ * bonus, sim cutoff, redundancy, the oldest MAGPIE, the test's error rates and
+ * minimum, whether positions are recorded -- is under "All settings". A leave
+ * job's lexicon and wordmap are its player's, and shown with it.
  */
 export function jobGroups(c: JobConfig): SettingGroup[] {
   const groups: SettingGroup[] = [
@@ -184,12 +184,10 @@ export function jobGroups(c: JobConfig): SettingGroup[] {
     groups.push({
       title: 'Leave generation',
       rows: [
-        key('Lexicon', show(l.lexicon)),
-        key('Iterations', show(l.num_iterations)),
         key('Generations', show(l.target_rack_counts.length)),
         key('Target per rack', l.target_rack_counts.map((t) => t.toLocaleString()).join(', ')),
-        more('Racks per task', show(l.racks_per_task)),
-        more('Wordmap', show(l.use_wordmap))
+        key('Games per task', show(l.num_iterations)),
+        more('Racks per task', show(l.racks_per_task))
       ]
     });
   }
@@ -235,18 +233,48 @@ export interface SettingRow {
   label: string;
   values: string[];
   differs: boolean;
+  /** The config has it, and the job never reads it; absent when the job does. */
+  unused?: true;
 }
 
 function row(label: string, values: string[]): SettingRow {
   return { label, values, differs: new Set(values).size > 1 };
 }
 
+const NONE: ReadonlySet<string> = new Set();
+
+/**
+ * What a leave job's bot never reads of its player: the leaves, because every
+ * generation plays the KLV the server built from the one before; the win%
+ * model, because it plays statically; and what is kept of its moves -- the
+ * recorder, the plays and plies recorded, and the move-gen margin that bounds
+ * an equity recorder -- because it plays the best move and reports only the
+ * racks it drew.
+ */
+const LEAVE_UNUSED: ReadonlySet<string> = new Set([
+  'Leaves',
+  'Win %',
+  'Recorder',
+  'Plays recorded',
+  'Plies recorded',
+  'Move-gen margin'
+]);
+
+/** The player settings, by row label, that a job of `jobType` never reads. */
+export function unusedPlayerSettings(jobType: JobType): ReadonlySet<string> {
+  return jobType === 'leave_generation' ? LEAVE_UNUSED : NONE;
+}
+
+function marked(rows: SettingRow[], unused: ReadonlySet<string>): SettingRow[] {
+  return rows.map((r) => (unused.has(r.label) ? { ...r, unused: true } : r));
+}
+
 /**
  * What a reader compares configs by first -- the search in a few words, the
  * files, the plays considered and what is kept -- one value per player.
- * `playerRows` has every setting.
+ * `playerRows` has every setting. Rows named in `unused` are marked so.
  */
-export function keySettings(players: PlayerSettings[]): SettingRow[] {
+export function keySettings(players: PlayerSettings[], unused = NONE): SettingRow[] {
   const rows = [
     row('Search', players.map(playerSummary)),
     row('Lexicon', players.map((p) => show(p.lexicon))),
@@ -263,18 +291,22 @@ export function keySettings(players: PlayerSettings[]): SettingRow[] {
     row('Wordmap', players.map((p) => show(p.use_wordmap))),
     row('Rack info table', players.map((p) => show(p.use_rit)))
   );
-  return rows;
+  return marked(rows, unused);
 }
 
 /**
  * Every setting, one value per player, after the search in a few words: the
- * row a reader looks for first stays first when the table grows.
+ * row a reader looks for first stays first when the table grows. Rows named in
+ * `unused` are marked so.
  */
-export function playerRows(players: PlayerSettings[]): SettingRow[] {
-  return [
-    row('Search', players.map(playerSummary)),
-    ...PLAYER_ROWS.map(([k, label]) => row(label, players.map((p) => show(p[k] as Value))))
-  ];
+export function playerRows(players: PlayerSettings[], unused = NONE): SettingRow[] {
+  return marked(
+    [
+      row('Search', players.map(playerSummary)),
+      ...PLAYER_ROWS.map(([k, label]) => row(label, players.map((p) => show(p[k] as Value))))
+    ],
+    unused
+  );
 }
 
 /** The players' searches in one line, for beside a job's lexicon and variant. */

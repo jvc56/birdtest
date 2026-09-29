@@ -112,13 +112,14 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let job = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 100, ARRAY[1000, 1000], $3)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .bind(racks_per_task)
     .execute(&db.pool)
     .await
@@ -415,6 +416,83 @@ async fn a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_on
         next["task_request"]["seed"], assignment["task_request"]["seed"],
         "the declined task goes straight to the next worker"
     );
+}
+
+/// A-WORKER-7 (leave generation): a leave task carries its job's player, whole,
+/// as every other job type's request carries its players -- and the lexicon
+/// and wordmap setting it plays with are that player's. What the assignment
+/// pins is the player's lexicon, the bag and the board, and the wordmap it
+/// asks for; never the player's leaves, which leave generation does not load
+/// (it plays the server's KLV), so a worker without them is not turned away.
+#[tokio::test]
+async fn a_leave_claim_carries_its_player_and_pins_only_its_lexicon() {
+    let db = TestDb::new().await;
+    let job = leave_job(&db, 2).await;
+    let app = birdtest::app(db.state().await);
+
+    let (assignment, _) = first_claim(&app).await;
+    let request = &assignment["task_request"];
+    let (player_id, leaves): (Uuid, String) = sqlx::query_as(
+        "SELECT pc.id, klv.name FROM job_leave_config c
+         JOIN player_configs pc ON pc.id = c.player_config_id
+         JOIN input_data klv ON klv.id = pc.klv_id
+         WHERE c.job_id = $1",
+    )
+    .bind(job)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    let name: String = sqlx::query_scalar("SELECT name FROM player_configs WHERE id = $1")
+        .bind(player_id)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(request["player"]["name"], json!(name), "{request}");
+    assert_eq!(request["player"]["lexicon"], "NWL23", "{request}");
+    assert_eq!(request["player"]["leaves"], json!(leaves), "{request}");
+    assert_eq!(request["player"]["num_plies"], 0, "{request}");
+    assert_eq!(request["player"]["sort_strategy"], "equity", "{request}");
+    assert_eq!(request["player"]["use_wordmap"], true, "{request}");
+    assert_eq!(request["lexicon"], "NWL23", "the top-level lexicon is the player's: {request}");
+    assert!(request.get("use_wordmap").is_none(), "the player states it: {request}");
+
+    let expected = &assignment["expected_data"];
+    let mut files: Vec<(&str, &str)> = expected["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| (f["role"].as_str().unwrap(), f["name"].as_str().unwrap()))
+        .collect();
+    files.sort_unstable();
+    assert_eq!(
+        files,
+        [("kwg", "NWL23"), ("layout", "standard15"), ("letterdist", "english")],
+        "{assignment}"
+    );
+    let derived: Vec<&str> =
+        expected["derived"].as_array().unwrap().iter().map(|d| d["role"].as_str().unwrap()).collect();
+    assert_eq!(derived, ["wmp"], "the player's wordmap, and no rack info table: {assignment}");
+
+    // A re-dispatched task carries the same player: it comes from the job,
+    // not from the stored request.
+    let task = sqlx::query_scalar::<_, Uuid>("SELECT id FROM tasks WHERE job_id = $1")
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE task_claims SET state = 'abandoned' WHERE task_id = $1")
+        .bind(task)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET state = 'available', active_claim_count = 0 WHERE id = $1")
+        .bind(task)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let (again, _) = first_claim(&app).await;
+    assert_eq!(again["task_request"]["seed"], request["seed"], "the same task: {again}");
+    assert_eq!(again["task_request"]["player"], request["player"], "{again}");
 }
 
 /// A-WORKER-8: a decline must give one of the five reasons the protocol knows.

@@ -83,7 +83,6 @@ async fn list_input_data(
                       WHERE j.letterdist_id = d.id OR j.layout_id = d.id)
                   + (SELECT COUNT(*) FROM player_configs pc
                       WHERE pc.kwg_id = d.id OR pc.klv_id = d.id OR pc.winpct_id = d.id)
-                  + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = d.id)
                   + (SELECT COUNT(*) FROM rating_pools rp
                       WHERE rp.letterdist_id = d.id OR rp.layout_id = d.id)
                     AS references
@@ -114,7 +113,6 @@ async fn delete_input_data(
                   WHERE j.letterdist_id = $1 OR j.layout_id = $1)
               + (SELECT COUNT(*) FROM player_configs pc
                   WHERE pc.kwg_id = $1 OR pc.klv_id = $1 OR pc.winpct_id = $1)
-              + (SELECT COUNT(*) FROM job_leave_config lc WHERE lc.kwg_id = $1)
               + (SELECT COUNT(*) FROM rating_pools rp
                   WHERE rp.letterdist_id = $1 OR rp.layout_id = $1)",
     )
@@ -904,6 +902,7 @@ async fn delete_player_config(
                  WHERE player1_config_id = $1 OR player2_config_id = $1
              UNION ALL SELECT 1 FROM job_game_pair_config
                  WHERE player1_config_id = $1 OR player2_config_id = $1
+             UNION ALL SELECT 1 FROM job_leave_config WHERE player_config_id = $1
              UNION ALL SELECT 1 FROM rating_pools WHERE anchor_player_config_id = $1
              UNION ALL SELECT 1 FROM rating_pool_members WHERE player_config_id = $1
              UNION ALL SELECT 1 FROM player_config_ratings WHERE player_config_id = $1
@@ -1006,9 +1005,25 @@ fn two() -> i32 {
 
 /// Per-job-type configuration, expanded into typed columns rather than stored
 /// as JSON.
+///
+/// Untagged, so the first variant a body fits is the one it becomes, and extra
+/// fields are ignored: `Leave` comes first because a leave body, which names a
+/// `player_config_id` too, would otherwise fit `OpeningRack` on its defaults.
+/// No other body fits `Leave`, whose settings have no defaults.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum JobTypeConfig {
+    Leave {
+        /// The player the leave-generating bot plays as, in both seats: its
+        /// lexicon and wordmap setting are the job's. Held to static equity
+        /// play without a rack info table (see [`validate_leave_player`]).
+        player_config_id: Uuid,
+        num_iterations: i32,
+        /// One occurrence target per generation, in order; its length is how
+        /// many generations the job runs.
+        target_rack_counts: Vec<i32>,
+        racks_per_task: i32,
+    },
     OpeningRack {
         player_config_id: Uuid,
         #[serde(default = "default_racks_per_batch")]
@@ -1049,21 +1064,6 @@ enum JobTypeConfig {
         sprt: SprtRequest,
         #[serde(default)]
         capture_positions: bool,
-    },
-    Leave {
-        /// The one place a lexicon still sits on a job: leave generation has a
-        /// single bot and no player config to hold it.
-        kwg_id: Uuid,
-        num_iterations: i32,
-        /// One occurrence target per generation, in order; its length is how
-        /// many generations the job runs.
-        target_rack_counts: Vec<i32>,
-        racks_per_task: i32,
-        /// Whether the leave-generating bot plays with a wordmap. Defaults on:
-        /// leave generation is the most game-heavy job type there is, and a
-        /// wordmap is a large speedup. Workers build one on demand.
-        #[serde(default = "default_true")]
-        use_wordmap: bool,
     },
 }
 
@@ -1122,9 +1122,6 @@ impl SprtRequest {
     }
 }
 
-fn default_true() -> bool {
-    true
-}
 fn default_racks_per_batch() -> i32 {
     500
 }
@@ -1232,8 +1229,7 @@ async fn create_job(
             "letterdist_id",
             format!(
                 "{letterdist_name} has {blanks} blanks, and MAGPIE builds them for at most \
-                 {MAGPIE_MAX_WORDMAP_BLANKS}: no player of this job may use either, and a leave \
-                 job must not use a wordmap"
+                 {MAGPIE_MAX_WORDMAP_BLANKS}: no player of this job may use either"
             ),
         ));
     }
@@ -1684,6 +1680,67 @@ async fn player_file_names(
     Ok(row)
 }
 
+/// A leave job's player, held to what leave generation measures.
+///
+/// A generation's leave values are the mean equity of every rack the bot
+/// drew, as MAGPIE's own `leavegen` computes them: static play, ranked on
+/// equity, with the generation's KLV supplying the leave half of that equity.
+/// A simulating player would rank on something else and play each game orders
+/// of magnitude slower; a score sort ignores the very leave values each
+/// generation feeds back in, so no generation would learn from the last; and a
+/// rack info table caches the leave values of one fixed KLV, where every
+/// generation plays a new one -- MAGPIE loads none for this job type, so the
+/// setting would be shown and not honoured. Each is refused rather than
+/// quietly overridden.
+///
+/// Its lexicon must be a kwg that the job's distribution can spell. Its leaves
+/// are not checked: every generation plays a server-built KLV, generation 1's
+/// being a zeroed one, and the player's own is never loaded.
+async fn validate_leave_player(
+    conn: &mut sqlx::PgConnection,
+    player_config_id: Uuid,
+    letterdist_name: &str,
+) -> AppResult<()> {
+    let (plies, sort, use_rit, kwg_role, lexicon) =
+        sqlx::query_as::<_, (i32, String, bool, String, String)>(
+            "SELECT pc.num_plies, pc.sort_strategy, pc.use_rit, kwg.role, kwg.name
+             FROM player_configs pc JOIN input_data kwg ON kwg.id = pc.kwg_id
+             WHERE pc.id = $1",
+        )
+        .bind(player_config_id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .ok_or_else(|| AppError::bad_request("no such player config"))?;
+
+    let mut problems = Vec::new();
+    if plies > 0 {
+        problems.push(format!("simulates {plies} plies (it must play statically: num_plies 0)"));
+    }
+    if sort != "equity" {
+        problems.push(format!("sorts on {sort} (it must sort on equity)"));
+    }
+    if use_rit {
+        problems.push("asks for a rack info table (it must not)".to_string());
+    }
+    if !problems.is_empty() {
+        return Err(AppError::bad_request("this player config cannot generate leaves").with_field(
+            "player_config_id",
+            format!("leave generation plays statically on equity; this config {}", problems.join(", ")),
+        ));
+    }
+    if kwg_role != "kwg" {
+        return Err(AppError::bad_request(format!(
+            "expected a kwg row, but {lexicon} is a {kwg_role} row"
+        )));
+    }
+    if !crate::compat::lex_ld_compat(&lexicon, letterdist_name) {
+        return Err(AppError::bad_request(format!(
+            "lexicon {lexicon:?} is not compatible with letter distribution {letterdist_name:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// MAGPIE decides compatibility from names, and birdtest must not be able to
 /// build a job MAGPIE would refuse to load.
 async fn validate_player_compatibility(
@@ -1825,30 +1882,10 @@ async fn insert_job_config(
         (
             JobType::LeaveGeneration,
             JobTypeConfig::Leave {
-                kwg_id, num_iterations, target_rack_counts, racks_per_task, use_wordmap,
+                player_config_id, num_iterations, target_rack_counts, racks_per_task,
             },
         ) => {
-            let lexicon: (String, String) = sqlx::query_as(
-                "SELECT role, name FROM input_data WHERE id = $1",
-            )
-            .bind(kwg_id)
-            .fetch_optional(&mut *conn)
-            .await?
-            .ok_or_else(|| AppError::bad_request("no such input data row"))?;
-            if lexicon.0 != "kwg" {
-                return Err(AppError::bad_request(format!(
-                    "expected a kwg row, but {} is a {} row",
-                    lexicon.1, lexicon.0
-                )));
-            }
-            // No leaves to check: every generation plays with a server-built
-            // KLV, generation 1's being a zeroed one.
-            if !crate::compat::lex_ld_compat(&lexicon.1, letterdist_name) {
-                return Err(AppError::bad_request(format!(
-                    "lexicon {:?} is not compatible with letter distribution {letterdist_name:?}",
-                    lexicon.1
-                )));
-            }
+            validate_leave_player(&mut *conn, *player_config_id, letterdist_name).await?;
             // Every generation seeds and hands out full racks over the pinned
             // distribution, so one whose racks cannot be spelt is refused now
             // rather than at the first claim.
@@ -1856,13 +1893,13 @@ async fn insert_job_config(
             crate::jobs::racks::RackIndex::new(&job_data.letterdist, crate::jobs::leave_gen::RACK_SIZE)?;
             sqlx::query(
                 "INSERT INTO job_leave_config
-                     (job_id, kwg_id, num_iterations,
-                      target_rack_counts, racks_per_task, use_wordmap)
-                 VALUES ($1,$2,$3,$4,$5,$6)",
+                     (job_id, player_config_id, num_iterations,
+                      target_rack_counts, racks_per_task)
+                 VALUES ($1,$2,$3,$4,$5)",
             )
-            .bind(job.id).bind(kwg_id)
+            .bind(job.id).bind(player_config_id)
             .bind(num_iterations).bind(target_rack_counts)
-            .bind(racks_per_task).bind(use_wordmap)
+            .bind(racks_per_task)
             .execute(conn)
             .await?;
         }
@@ -3617,11 +3654,32 @@ mod tests {
         }
     }
 
+    /// A leave body names a `player_config_id`, as an opening-rack body does,
+    /// and an untagged enum takes the first variant a body fits: read as an
+    /// opening-rack config it would pass as one on its defaults, and fail as a
+    /// type mismatch after its settings had gone unchecked.
+    #[test]
+    fn a_leave_body_is_read_as_a_leave_config_and_an_opening_rack_body_is_not() {
+        let leave = body(serde_json::json!({
+            "job_type": "leave_generation",
+            "player_config_id": Uuid::nil(),
+            "num_iterations": 10,
+            "target_rack_counts": [10],
+            "racks_per_task": 10,
+        }));
+        assert!(matches!(leave.config, JobTypeConfig::Leave { .. }));
+        let racks = body(serde_json::json!({
+            "job_type": "opening_rack",
+            "player_config_id": Uuid::nil(),
+        }));
+        assert!(matches!(racks.config, JobTypeConfig::OpeningRack { .. }));
+    }
+
     #[test]
     fn leave_generation_bounds_are_enforced() {
         let leave = body(serde_json::json!({
             "job_type": "leave_generation",
-            "kwg_id": Uuid::nil(),
+            "player_config_id": Uuid::nil(),
             "num_iterations": 0,
             "target_rack_counts": [10],
             "racks_per_task": 0,
@@ -3629,7 +3687,7 @@ mod tests {
         assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "racks_per_task"]);
         let mut leave = serde_json::json!({
             "job_type": "leave_generation",
-            "kwg_id": Uuid::nil(),
+            "player_config_id": Uuid::nil(),
             "num_iterations": 10,
             "target_rack_counts": [10],
             "racks_per_task": MAX_RACKS_PER_TASK,
@@ -3644,7 +3702,7 @@ mod tests {
         let with_targets = |targets: serde_json::Value| {
             body(serde_json::json!({
                 "job_type": "leave_generation",
-                "kwg_id": Uuid::nil(),
+                "player_config_id": Uuid::nil(),
                 "num_iterations": 10,
                 "target_rack_counts": targets,
                 "racks_per_task": 10,
@@ -3672,7 +3730,7 @@ mod tests {
     fn leave_generation_runs_at_redundancy_one() {
         let mut leave = body(serde_json::json!({
             "job_type": "leave_generation",
-            "kwg_id": Uuid::nil(),
+            "player_config_id": Uuid::nil(),
             "num_iterations": 1,
             "target_rack_counts": [10],
             "racks_per_task": 1,

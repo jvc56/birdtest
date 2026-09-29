@@ -37,13 +37,14 @@ async fn leave_job(
         .await;
     let job = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, $3, array_fill($5::int, ARRAY[$4::int]), $6)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .bind(num_iterations)
     .bind(generation_count)
     .bind(target)
@@ -172,11 +173,11 @@ async fn try_next_step(db: &TestDb, job: Uuid) -> birdtest::error::AppResult<Ste
             .await
             .unwrap();
     let job_data = birdtest::jobs::load_job_data(&mut tx, job).await.unwrap();
-    let lexicon = leave_gen::lexicon_name(&mut tx, config.kwg_id)
+    let player = birdtest::jobs::load_player_spec(&mut tx, config.player_config_id)
         .await
         .unwrap();
     assert!(leave_gen::lock_claim_decisions(&mut tx, job).await.unwrap());
-    let step = match leave_gen::next_step(&mut tx, job, &config, &job_data, &lexicon).await? {
+    let step = match leave_gen::next_step(&mut tx, job, &config, &job_data, &player).await? {
         LeaveGenStep::Dispatch(request) => Step::Dispatch {
             generation: request.generation,
             racks: request.forced_racks,
@@ -687,10 +688,10 @@ async fn the_rack_target_is_not_sent_to_the_worker() {
             "letter_distribution",
             "lexicon",
             "num_games",
+            "player",
             "previous_artifact_key",
             "previous_artifact_sha256",
             "seed",
-            "use_wordmap",
             "variant",
         ],
         "a leave task's request is exactly these fields"

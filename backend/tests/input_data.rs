@@ -801,8 +801,8 @@ async fn only_a_staged_import_can_be_confirmed() {
 
 /// I-INPUT-6 and A-ADMIN-7: the list reports, per file, how many jobs, player
 /// configs and rating pools pin it; a file pinned by any of them -- a job's
-/// distribution or board, a player's lexicon, leaves or win% model, a leave
-/// job's lexicon, a rating pool's distribution or board -- cannot be deleted
+/// distribution or board, a player's lexicon, leaves or win% model (a leave
+/// job's player's among them), a rating pool's distribution or board -- cannot be deleted
 /// and stays; an unpinned one can, once.
 #[tokio::test]
 async fn an_input_file_in_use_cannot_be_deleted() {
@@ -836,17 +836,23 @@ async fn an_input_file_in_use_cannot_be_deleted() {
         .await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let player: Uuid = body["id"].as_str().unwrap().parse().unwrap();
-    // A leave job's lexicon.
+    // A leave job's player, whose config pins its lexicon and leaves.
     let leave = db.bare_job("leave_generation", 1, admin.id).await;
     let (leave_ld, leave_layout) = board(leave).await;
     let leave_kwg = db.input_data("kwg", "CSW21").await;
+    let leave_player = db.leave_player(leave_kwg, true, admin.id).await;
+    let leave_klv: Uuid = sqlx::query_scalar("SELECT klv_id FROM player_configs WHERE id = $1")
+        .bind(leave_player)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 10, ARRAY[10], 10)",
     )
     .bind(leave)
-    .bind(leave_kwg)
+    .bind(leave_player)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -866,7 +872,8 @@ async fn an_input_file_in_use_cannot_be_deleted() {
     let unused = db.input_data("kwg", "unused").await;
 
     let pinned = [
-        job_ld, job_layout, kwg, klv, winpct, leave_ld, leave_layout, leave_kwg, pool_ld, pool_layout,
+        job_ld, job_layout, kwg, klv, winpct, leave_ld, leave_layout, leave_kwg, leave_klv, pool_ld,
+        pool_layout,
     ];
     let (status, list) = admin.call("GET", "/api/admin/input-data", None).await;
     assert_eq!(status, StatusCode::OK, "{list}");

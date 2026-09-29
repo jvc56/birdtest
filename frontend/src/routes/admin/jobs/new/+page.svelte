@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
-  import { blankFields, jobTypeLabel, parseTargetRackCounts, unchosenText } from '$lib/format';
+  import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, unchosenText } from '$lib/format';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -23,11 +23,9 @@
   let variant = 'classic';
   let letterdistId = '';
   let layoutId = '';
-  let leaveKwgId = '';
 
   $: letterdists = files.filter((f) => f.role === 'letterdist');
   $: layouts = files.filter((f) => f.role === 'layout');
-  $: lexica = files.filter((f) => f.role === 'kwg');
 
   function label(file: InputData): string {
     return `${file.name} (${file.tarball_date}, ${file.sha256.slice(0, 8)})`;
@@ -55,7 +53,6 @@
   let targetRackCounts = '500';
   $: targets = parseTargetRackCounts(targetRackCounts);
   let racksPerTask = 50;
-  let leaveUseWordmap = true;
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
@@ -76,10 +73,9 @@
         : selectedConfig.num_plays < selectedConfig.num_plays_recorded
           ? `${selectedConfig.name} generates ${selectedConfig.num_plays} plays, so this job would store at most that many per rack rather than the ${selectedConfig.num_plays_recorded} it asks for.`
           : null;
-
-  function firstOfRole(role: string): string {
-    return files.find((f) => f.role === role)?.id ?? '';
-  }
+  // A leave job's player plays statically on equity with no rack info table.
+  $: leaveConflict =
+    jobType !== 'leave_generation' || !selectedConfig ? null : leavePlayerConflict(selectedConfig);
 
   onMount(async () => {
     try {
@@ -96,13 +92,9 @@
       player1 = configs[0].id;
       player2 = configs[configs.length - 1].id;
     }
-    // Filtered from `files` here rather than read off the `$:` arrays above:
-    // those are recomputed on the update cycle, not on assignment, so they
-    // would still be empty on the next line and every default would be ''.
     // The letter distribution and board are left for the admin to choose: the
     // first of each was whichever was imported first, and a job made on it
     // unnoticed played with the wrong bag or board.
-    leaveKwgId = firstOfRole('kwg');
     serverFloor = (await api.clientVersion()).min_magpie_version;
     minMagpieVersion = serverFloor;
   }
@@ -149,11 +141,10 @@
       case 'leave_generation':
         return {
           ...common,
-          kwg_id: leaveKwgId,
+          player_config_id: playerConfigId,
           num_iterations: numIterations,
           target_rack_counts: 'targets' in targets ? targets.targets : [],
-          racks_per_task: racksPerTask,
-          use_wordmap: leaveUseWordmap
+          racks_per_task: racksPerTask
         };
     }
   }
@@ -277,19 +268,31 @@
     Each player's lexicon and leaves come from its own config.
   </p>
 
-  {#if jobType === 'opening_rack'}
+  {#if jobType === 'opening_rack' || jobType === 'leave_generation'}
+    <!-- One player, in both cases: an opening-rack job's analyses every rack,
+         a leave job's plays both seats of every game. -->
     <div>
       <label class="label" for="pc">Player config</label>
       <select id="pc" class="input" bind:value={playerConfigId} required>
         {#each configs as config}
           <option value={config.id}>
-            {config.name} — recorder {config.recorder_type}, {config.num_plays_recorded} play{config.num_plays_recorded === 1
-              ? ''
-              : 's'} recorded
+            {#if jobType === 'opening_rack'}
+              {config.name} — recorder {config.recorder_type}, {config.num_plays_recorded} play{config.num_plays_recorded === 1
+                ? ''
+                : 's'} recorded
+            {:else}
+              {config.name} — {config.num_plies > 0 ? `${config.num_plies}-ply sim` : 'static'}, by
+              {config.sort_strategy}{config.use_rit ? ', rack info table' : ''}{config.use_wordmap
+                ? ', wordmap'
+                : ''}
+            {/if}
           </option>
         {/each}
       </select>
     </div>
+  {/if}
+
+  {#if jobType === 'opening_rack'}
     {#if openingRackConflict}
       <p class="field-error">
         {openingRackConflict} Pick a static config whose recorder is <strong>all</strong>
@@ -390,17 +393,14 @@
       </p>
     </div>
   {:else}
-    <div>
-      <label class="label" for="leavekwg">Lexicon</label>
-      <select id="leavekwg" class="input" bind:value={leaveKwgId} required>
-        {#each lexica as file}<option value={file.id}>{label(file)}</option>{/each}
-      </select>
-      <p class="mt-1 text-xs text-muted-foreground">
-        Leave generation has one bot and no player config, so its lexicon sits on the job. It needs
-        no leaves file: generation 1 plays with a zeroed KLV the server builds, and every later
-        generation plays with the KLV built from the one before.
-      </p>
-    </div>
+    {#if leaveConflict}
+      <p class="field-error">{leaveConflict} Pick a static config that sorts on equity.</p>
+    {/if}
+    <p class="text-xs text-muted-foreground">
+      The bot plays both seats as this player, with its lexicon and its wordmap setting. Its
+      leaves are not used: generation 1 plays with a zeroed KLV the server builds, and every later
+      generation plays with the KLV built from the one before.
+    </p>
     <div class="grid grid-cols-2 gap-3">
       <div>
         <label class="label" for="iters">Games per task</label>
@@ -431,10 +431,6 @@
         {/if}
       </p>
     </div>
-    <label class="flex items-center gap-2">
-      <input type="checkbox" bind:checked={leaveUseWordmap} />
-      <span class="label mb-0">Use wordmap</span>
-    </label>
   {/if}
 
   <!-- Announced: an error that appears after a submit is otherwise silent to a

@@ -195,9 +195,11 @@ pub struct GamePairConfig {
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct LeaveConfig {
     pub job_id: Uuid,
-    /// Leave generation has one bot and no `player_configs` row to hold its
-    /// lexicon, so this is the one place a lexicon still sits on a job.
-    pub kwg_id: Uuid,
+    /// The player the leave-generating bot plays as, in both seats. Its lexicon
+    /// and wordmap setting are the job's; its leaves are never loaded, since
+    /// every generation plays the server's KLV. Job creation holds it to static
+    /// equity play without a rack info table.
+    pub player_config_id: Uuid,
     pub num_iterations: i32,
     /// The occurrence target every rack must reach before each generation
     /// closes, one per generation: its length is how many generations the job
@@ -206,7 +208,6 @@ pub struct LeaveConfig {
     /// generations, playing better leaves, are worth sampling harder.
     pub target_rack_counts: Vec<i32>,
     pub racks_per_task: i32,
-    pub use_wordmap: bool,
 }
 
 impl LeaveConfig {

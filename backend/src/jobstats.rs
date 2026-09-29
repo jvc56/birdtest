@@ -551,8 +551,7 @@ fn status_label(job: &Job) -> &'static str {
 /// It is no longer a single job-level setting: it lives on the player configs,
 /// and a games job may legitimately compare two different lexicons. Distinct
 /// names are joined so the dashboard says what is actually being played rather
-/// than picking one arbitrarily. Leave generation is the exception -- one bot,
-/// one lexicon, on the job config.
+/// than picking one arbitrarily. Leave generation has one player, so one.
 async fn lexicon_and_variant(
     conn: &mut PgConnection,
     job: &Job,
@@ -584,7 +583,8 @@ async fn lexicon_and_variant(
         JobType::LeaveGeneration => {
             "SELECT DISTINCT d.name
              FROM job_leave_config c
-             JOIN input_data d ON d.id = c.kwg_id
+             JOIN player_configs pc ON pc.id = c.player_config_id
+             JOIN input_data d ON d.id = pc.kwg_id
              WHERE c.job_id = $1"
         }
     };

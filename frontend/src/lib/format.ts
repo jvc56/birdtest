@@ -228,6 +228,29 @@ export function parseTargetRackCounts(text: string): { targets: number[] } | { e
   return { targets };
 }
 
+/**
+ * Why a player config cannot be a leave job's player, or null if it can --
+ * what job creation refuses, said before the submit. Leave values are measured
+ * from static play ranked on equity (a score sort ignores the very leaves each
+ * generation feeds back), and a rack info table caches the leaves every
+ * generation replaces.
+ */
+export function leavePlayerConflict(p: {
+  name: string;
+  num_plies: number;
+  sort_strategy: string;
+  use_rit: boolean;
+}): string | null {
+  const problems: string[] = [];
+  if (p.num_plies > 0) problems.push(`simulates ${p.num_plies} ${p.num_plies === 1 ? 'ply' : 'plies'}`);
+  if (p.sort_strategy !== 'equity') problems.push(`sorts on ${p.sort_strategy}`);
+  if (p.use_rit) problems.push('asks for a rack info table');
+  if (!problems.length) return null;
+  const list =
+    problems.length === 1 ? problems[0] : `${problems.slice(0, -1).join(', ')} and ${problems[problems.length - 1]}`;
+  return `${p.name} ${list}; leave generation plays statically on equity, without a rack info table.`;
+}
+
 /** A job's title: the name it was given, or its type for one given none. */
 export function jobTitle(job: { name?: string | null; job_type: string }): string {
   const name = job.name?.trim();

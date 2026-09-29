@@ -696,13 +696,15 @@ CREATE TABLE job_game_pair_config (
 
 CREATE TABLE job_leave_config (
     job_id         UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    -- The one place a lexicon still sits on a job: leave generation has a
-    -- single bot and no player_configs row to hold it. It needs no klv_id
-    -- (every generation's leaves come from the server-built KLV artifact, and
-    -- generation 1's is a zeroed one) and no winpct_id (the bot plays
-    -- statically). Its complete data requirement is this plus the job's
-    -- letterdist_id and layout_id.
-    kwg_id         UUID NOT NULL REFERENCES input_data(id),
+    -- The player the leave-generating bot plays as, in both seats: its lexicon
+    -- and wordmap setting are the job's. Its leaves are never loaded -- every
+    -- generation's come from the server-built KLV artifact, and generation 1's
+    -- is a zeroed one -- and nor is its win% model, since the bot plays
+    -- statically. So the job's complete data requirement is this player's kwg
+    -- plus the job's letterdist_id and layout_id. Job creation refuses a player
+    -- that simulates, sorts on anything but equity, or asks for a rack info
+    -- table: leave values are measured from static equity play.
+    player_config_id UUID NOT NULL REFERENCES player_configs(id),
     -- Games each leave-gen task plays over its forced-rack subset.
     num_iterations INT NOT NULL,
     -- The occurrence target every rack must reach before a generation closes,
@@ -720,11 +722,7 @@ CREATE TABLE job_leave_config (
         AND array_position(target_rack_counts, NULL) IS NULL
     ),
     -- Size of the forced-rack subset handed to a single task.
-    racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
-    -- Whether the leave-generating bot plays with a wordmap. Sent to the worker,
-    -- which builds one from its .kwg if it does not already have it. A player
-    -- setting like any other -- workers assume nothing about wordmaps.
-    use_wordmap       BOOLEAN NOT NULL DEFAULT TRUE
+    racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1)
 );
 
 -- Exports
@@ -968,7 +966,7 @@ CREATE TABLE game_requests (
 
 CREATE TABLE leave_requests (
     task_id             UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-    lexicon             TEXT NOT NULL,
+    -- No lexicon or wordmap column: the player config carries both.
     variant             TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
     board_layout        TEXT NOT NULL,
@@ -984,7 +982,7 @@ CREATE TABLE leave_requests (
     -- the server-built zeroed KLV at generation-0, so every generation fetches
     -- its leaves the same way and the client has no first-generation branch.
     previous_artifact_key TEXT NOT NULL,
-    use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
+    player_config_id    UUID NOT NULL REFERENCES player_configs(id)
 );
 
 -- Per-rack occurrence progress for each generation of a leave-gen job, one row per

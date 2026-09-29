@@ -50,8 +50,8 @@ pub enum JobKind {
     },
     LeaveGeneration {
         config: LeaveConfig,
-        /// The lexicon the job's bot plays with, by name, from the row it pins.
-        lexicon: String,
+        /// The player the job's bot plays as, which names its lexicon.
+        player: PlayerSpec,
     },
 }
 
@@ -110,8 +110,8 @@ impl JobTemplate {
                         .bind(job.id)
                         .fetch_one(&mut *conn)
                         .await?;
-                let lexicon = super::leave_gen::lexicon_name(conn, config.kwg_id).await?;
-                JobKind::LeaveGeneration { config, lexicon }
+                let player = super::load_player_spec(conn, config.player_config_id).await?;
+                JobKind::LeaveGeneration { config, player }
             }
         };
         Ok(Self { job_id: job.id, data, expected: Arc::new(expected), kind })

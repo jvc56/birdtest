@@ -68,10 +68,10 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 228 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (15), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 169 | Vitest, `frontend/src/lib/`: `format.test.ts` (38), `jobSettings.test.ts` (8), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 173 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
-| 3 API | 235 | `backend/tests/`: `worker_api.rs` (49), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
+| 1 Unit | 229 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 172 | Vitest, `frontend/src/lib/`: `format.test.ts` (40), `jobSettings.test.ts` (9), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 174 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (15), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
+| 3 API | 236 | `backend/tests/`: `worker_api.rs` (49), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 18 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 665 backend tests (the per-tier counts above are
+--run-ignored all` runs 668 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -723,7 +723,10 @@ Each entry's tests are the `describe` block named for its id.
   in marked, every setting after the search; the key rows for one player or
   two, a Win % row only when a player has a model, and every key row also a
   row of the full table; a leave job's generations counted from its list of
-  targets, and each target shown. *(Covered: `jobSettings.test.ts`.)*
+  targets, each target shown, and no lexicon or wordmap row of its own (its
+  player's table has them); the player settings a leave job never reads --
+  leaves, win %, recorder, plays and plies recorded, move-gen margin -- marked
+  unused, and none for any other job type. *(Covered: `jobSettings.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
@@ -742,6 +745,10 @@ Each entry's tests are the `describe` block named for its id.
   what is wrong with anything else — nothing listed, an empty entry, a
   non-integer, a target outside 1–1,000,000, more than 100 generations —
   rather than sending it. *(Covered: `format.test.ts`.)*
+- `F-FMT-17` `leavePlayerConflict` names what job creation refuses of a leave
+  job's player -- simulating, sorting on anything but equity, a rack info
+  table -- before the submit, and accepts a static equity player. *(Covered:
+  `format.test.ts`.)*
 - `F-FMT-16` `computeTime` reads a contributor's compute time in its two
   largest units ("5h 20m", "3d 4h", "2y 17d"), and a dash for anything that is
   not a time. *(Covered: `format.test.ts`.)*
@@ -1295,8 +1302,9 @@ The single most important group. Every entry is about a decision made in SQL.
   same-config case rests on.)*
 - `I-EXPECT-3` A static player contributes no `winpct` entry. *(Covered: the
   same test.)*
-- `I-EXPECT-4` A `leave_generation` job yields exactly `kwg`, `letterdist` and
-  `layout`, and never a `klv` — its leaves come from the server-built artifact.
+- `I-EXPECT-4` A `leave_generation` job yields exactly its player's `kwg`,
+  `letterdist` and `layout`, and never a `klv`, not even its player's own —
+  its leaves come from the server-built artifact.
   *(Covered: `scheduler::a_leave_job_needs_its_lexicon_bag_and_board_and_never_leaves`.)*
 - `I-EXPECT-5` Every entry carries the SHA-256 from `input_data`, not a name.
   *(Covered: `scheduler::every_expected_file_carries_the_pinned_rows_digest`.)*
@@ -1379,7 +1387,8 @@ job creation touches needs one caller here.
   `jobs::a_purge_writes_its_census_before_it_destroys_anything`,
   `audit::every_destructive_admin_action_writes_exactly_its_record`,
   `admin_api::a_job_with_history_can_be_deleted_and_its_census_survives`.)*
-- `I-JOB-11` A player config referenced by any job cannot be deleted. *(Covered:
+- `I-JOB-11` A player config referenced by any job -- a leave job's player
+  included -- cannot be deleted. *(Covered:
   `jobs::a_player_config_in_use_by_any_job_cannot_be_deleted`.)*
 - `I-JOB-12` `delete_user` leaves their contributions attributed but anonymised,
   per the design, and does not cascade away results. *(Covered:
@@ -1402,6 +1411,13 @@ job creation touches needs one caller here.
   below its `num_plays_recorded`: each would store fewer moves per rack than it
   asks for. A `best` simmer is accepted (twenty-ninth audit). *(Covered:
   `admin_api::an_opening_rack_job_cannot_rank_moves_with_a_best_recorder`.)*
+- `I-JOB-14d` A leave job refuses a player that simulates, sorts on anything
+  but equity, or asks for a rack info table, naming the player field, and
+  leaves no job behind; a static equity player is accepted. A leave body is
+  read as a leave config, though it names a `player_config_id` as an
+  opening-rack body does. *(Covered:
+  `jobs::a_leave_job_refuses_a_player_it_cannot_generate_leaves_with`,
+  `routes::admin::tests::a_leave_body_is_read_as_a_leave_config_and_an_opening_rack_body_is_not`.)*
 
 ### `I-SUBMIT-*` — result submission (`jobs/mod.rs`, `jobs/*.rs`)
 
@@ -2332,7 +2348,11 @@ below.
   declining with `missing_data` records `worker_data_gaps` and releases the
   claim immediately. *(Covered:
   `worker_routes::a_claim_states_its_digests_and_a_missing_data_decline_releases_it_at_once`;
-  a decline's size by `A-BOUND-6`.)*
+  a decline's size by `A-BOUND-6`.)* A leave task carries its job's player,
+  whole, the same on a reissue, with the top-level lexicon the player's and no
+  `use_wordmap` of its own, and pins the player's lexicon and wordmap but not
+  its leaves. *(Covered:
+  `worker_routes::a_leave_claim_carries_its_player_and_pins_only_its_lexicon`.)*
 - `A-WORKER-8` A decline with an unknown reason is rejected; the five known
   reasons (`missing_data`, `magpie_version`, `unknown_job_type`,
   `derived_mismatch`, `task_failed`) are accepted. *(Covered:
@@ -2651,7 +2671,8 @@ below.
 - `A-PUBLIC-1c` A job's full configuration is public (`GET /api/jobs/:id/config`):
   the job's settings with files by name, its type's (a games job's batch, cap
   and test, or its target and `sprt_enabled` false without one), and every
-  setting of each player config, in role order, with the
+  setting of each player config, in role order (a leave job's one player
+  too, which carries its lexicon and wordmap), with the
   config's id to link to; it names no creator and carries no user id; an
   unknown job is a `404`. *(Covered:
   `public_api::a_jobs_full_configuration_is_public`; the page's key and full

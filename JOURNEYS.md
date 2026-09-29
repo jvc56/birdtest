@@ -51,7 +51,7 @@ needs a separate run with `--fresh`. Do it last: it empties the database.
 | **Contributor accounts** | `dev-contributor-1` and `dev-contributor-2`, same password; workers 3 and 4 run under their API keys |
 | **Anonymous workers** | Workers 1 and 2 |
 | **Data** | The MAGPIE-DATA version your MAGPIE checkout installed; every job is on CSW24 |
-| **Player configs** | `static-equity`, `static-score`, `sim-1ply` (a 1-ply simmer) and `static-equity-all` |
+| **Player configs** | `static-equity`, `static-score`, `sim-1ply` (a 1-ply simmer), `static-equity-all` and `static-equity-no-rit` (the leave job's player) |
 | **Jobs**, each active at 16% | "dev games"; three game-pairs jobs, one for each pair of the three players, of which "static equity vs 1-ply sim" saves its positions; "dev opening racks"; "dev leave generation" |
 
 The seeded games and pairs jobs run for hours: their cap is 100,000, and a
@@ -231,6 +231,14 @@ Open "dev leave generation".
   3,199,724, and "Fewest occurrences so far: …" with when the rack figures
   were last merged (or "not computed yet"), and a note that totals are merged
   in batches.
+- [ ] **Expect** a Settings card: a "Leave generation" group (generations 1,
+  target per rack 1, games per task 20; racks per task under **All
+  settings**), with no lexicon or wordmap row of its own; then one column
+  headed "Player", `static-equity-no-rit` linking to its config: search
+  "static, by equity", lexicon CSW24, wordmap "yes", rack info table "no" -- and
+  its leaves and recorder in grey, under "Settings in grey are the player
+  config's, and this job does not use them." **Do** **All settings**. **Expect**
+  win %, plays and plies recorded and the move-gen margin grey too.
 
 ### V-10 Saved positions
 
@@ -615,12 +623,17 @@ The six seeded jobs hold 96% between them.
 On the two-letter data imported in A-3: eight possible racks, so a generation
 closes in seconds rather than never.
 
+- [ ] **Do** **Player configs** → **New**: `tester-ab`, recorder **best**, the
+  `CSW21_ab` lexicon and leaves, sort **equity**, static.
 - [ ] **Do** **New job**: Leave generation, "tester leaves", letter distribution
-  `english_ab`, board `standard15`, lexicon `CSW21_ab`, games per task 1,000,
-  racks per task 50, occurrences per rack per generation "100, 200, 300".
-  **Expect** "3 generations." under the targets, and Redundancy greyed out:
-  leave generation runs at redundancy 1. (**Do** type "100, 0" there first.
-  **Expect** a red "Every target must be between 1 and 1,000,000, not 0.")
+  `english_ab`, board `standard15`, player config `sim-1ply`. **Expect** a red
+  "sim-1ply simulates 1 ply; leave generation plays statically on equity,
+  without a rack info table." (Submitted anyway, the server refuses it the
+  same way.) **Do** pick `tester-ab`, games per task 1,000, racks per task 50,
+  occurrences per rack per generation "100, 200, 300". **Expect** "3
+  generations." under the targets, and Redundancy greyed out: leave generation
+  runs at redundancy 1. (**Do** type "100, 0" there first. **Expect** a red
+  "Every target must be between 1 and 1,000,000, not 0.")
 - [ ] **Do** make room (A-8) and activate it at 16%. **Expect** its wordmap built
   on **Derived data** within about fifteen seconds (A-6).
 - [ ] **Expect**, on its public page, the generations closing one after another

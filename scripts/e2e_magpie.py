@@ -494,6 +494,12 @@ def wordmap_players(ctx: Context) -> dict:
     }
 
 
+def leave_player(ctx: Context, data: dict, name: str) -> str:
+    # What job creation holds a leave job's player to: static, sorting on
+    # equity, no rack info table. With a wordmap, so the job pins one.
+    return create_player(ctx, data, name, {"use_wordmap": True, "use_rit": False})
+
+
 def simming_player(ctx: Context) -> str:
     # `all`, not `best`: -r best is MOVE_RECORD_BEST, which leaves movegen with
     # one play, so a simmer configured that way has nothing to choose between
@@ -701,9 +707,10 @@ def case_leave(ctx: Context) -> None:
         stray = [name for name in written if "_gen_" in name or name.endswith("_report.txt")]
         expect(not stray, f"leave generation wrote into MAGPIE's data directory: {stray}")
 
-    # With the wordmap a leave job asks for by default: the builder finds the
+    # With the wordmap the job's player asks for: the builder finds the
     # wordmap already built if M-3 ran, and the worker its own copy matching.
-    run_job(ctx, ctx.data, {"job_type": "leave_generation", "kwg_id": ctx.data["kwg"],
+    run_job(ctx, ctx.data, {"job_type": "leave_generation",
+                            "player_config_id": leave_player(ctx, ctx.data, "e2e-leave"),
                             "num_iterations": 20, "target_rack_counts": [1],
                             "racks_per_task": 50},
             leave_occurrences, needs_build=True)
@@ -1010,8 +1017,9 @@ def case_capture(ctx: Context) -> None:
         one({"job_type": "opening_rack", "player_config_id": simming_player(ctx),
              "racks_per_batch": 2, "rack_size": 7}, ctx.data)
         small = small_data(ctx)
-        one({"job_type": "leave_generation", "kwg_id": small["kwg"], "num_iterations": 20,
-             "target_rack_counts": [1], "racks_per_task": 50},
+        one({"job_type": "leave_generation",
+             "player_config_id": leave_player(ctx, small, "e2e-small-leave"),
+             "num_iterations": 20, "target_rack_counts": [1], "racks_per_task": 50},
             small, needs_build=True)
 
         # A heartbeat goes out thirty seconds into a task, so the last one is a

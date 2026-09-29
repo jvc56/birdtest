@@ -1942,9 +1942,10 @@ knowing its type first. Putting the letter distribution here rather than on the
 player is not arbitrary: MAGPIE takes one `-ld` for the whole game, and two
 players cannot draw from different bags. The same is true of the board.
 
-**The per-type tables** keep only what is genuinely per-type.
-`job_leave_config` is the one place a lexicon still sits on a job, because leave
-generation has one bot and no `player_configs` row to hold it.
+**The per-type tables** keep only what is genuinely per-type. No lexicon sits on
+a job: leave generation's bot plays as a player config too
+(`job_leave_config.player_config_id`), in both seats, and takes its lexicon and
+wordmap setting from it.
 
 #### Validation at job creation
 
@@ -2848,7 +2849,7 @@ At claim time:
 
    **Reopened tasks are reissued here, not before.** For every other job type a task whose claim timed out is re-dispatched before anything new is generated. For leave generation that happens only after the lock is taken and the current generation determined, and only for a task whose `leave_requests.generation` is that generation *and* only while no transition for that generation is running; step 2 runs when there is none. The transition check is separate from the generation check and both are needed: a generation does not read as *closed* until its transition commits the artifact row, so throughout the tens of seconds a transition takes, the current generation is still the closing one and a reopened task of it would otherwise be handed straight back out — its occurrences folded into the very rows the transition is streaming, leaving the uploaded KLV irreproducible from the database. A transition past the takeover timeout does not count, or a job whose transition process died would stall forever instead of being taken over. Reissued before the lock, a claim would be invisible to the in-flight check exactly as a new one was. Reissued for any generation, a task from a generation that has since closed would be handed out again, played with an outdated KLV, and its result discarded. A task left over from a closed generation stays `available` and is never dispatched again, so the job list's task counts for a leave job can show a few such tasks as never completed.
 3. Draw the task's seed and `INSERT INTO tasks (job_id, seed, state) VALUES ($job_id, $seed, 'available') RETURNING id`, claimed in the same transaction.
-4. `INSERT INTO leave_requests (task_id, lexicon, variant, letter_distribution, board_layout, generation, seed, forced_racks, num_games, previous_artifact_key, use_wordmap)` — `seed` is drawn fresh for the task, and stored so a reissued task replays it; `forced_racks` is the chosen rack subset (see Schema); `previous_artifact_key` is the prior generation's combined KLV, which for generation 1 is the server-built zeroed KLV stored at generation 0, so it is never NULL.
+4. `INSERT INTO leave_requests (task_id, variant, letter_distribution, board_layout, generation, seed, forced_racks, num_games, previous_artifact_key, player_config_id)` — the request's `player` (and the top-level `lexicon`, the player's) come from the job's template, as every job type's players do; `seed` is drawn fresh for the task, and stored so a reissued task replays it; `forced_racks` is the chosen rack subset (see Schema); `previous_artifact_key` is the prior generation's combined KLV, which for generation 1 is the server-built zeroed KLV stored at generation 0, so it is never NULL.
 5. `INSERT INTO task_claims (...)`.
 6. Return the request and claim token.
 
@@ -3924,8 +3925,9 @@ pentanomial and the divergent counts kept only as a diagnostic.
 
 Whether either file is used is the **job's** decision, not the client's: both
 are player settings like any other, sent as `use_wordmap` and `use_rit` on each
-player object (and, for `leave_generation`, which has one bot rather than a
-player pair, `use_wordmap` on the request itself). The config decides; a
+player object (for `leave_generation`, the one `player` the bot plays both seats
+as; it never loads a rack info table, since each generation plays a new KLV and
+a table caches one). The config decides; a
 config created without saying gets a wordmap and a rack info table (see
 "Creating a player config"). Games run dramatically faster with a wordmap, so most jobs will
 ask for it — but the client neither assumes it nor builds one it was not asked
@@ -4242,9 +4244,9 @@ the worker applies both rather than whatever its own settings last loaded.
   "forced_racks": ["AABCELT", "AABCELU"],
   "previous_artifact_key": "leaves/<job>/generation-1.klv2",
   "previous_artifact_sha256": "<the sha256 recorded when the server built it>",
-  "use_wordmap": true,
   "bingo_bonus": 50,
-  "num_games": 10000 }
+  "num_games": 10000,
+  "player": { } }
 ```
 
 The player above is a **static** one, and it is the whole shape: the settings
@@ -5069,7 +5071,6 @@ the body omits them:
 | `sprt_alpha` / `sprt_beta` | 0.05 |
 | `elo_low` / `elo_high` | −10 / +10 |
 | `target_rack_counts` (leave generation) | none: required, one occurrence target per generation, 1 to 100 of them, each 1 to 1,000,000 |
-| `use_wordmap` (leave generation) | **true** — it is the most game-heavy job type there is and a wordmap is a large speedup; workers build one on demand |
 | `capture_positions` | false |
 
 A job's run-wide MAGPIE settings are not fields of the body: `bingo_bonus` (50)
@@ -5077,7 +5078,7 @@ and `sim_cutoff` (0.005) are written onto the job from MAGPIE's defaults at
 creation and stated on every request, for the reason player configs state
 theirs.
 
-Beyond role matching, creation enforces seven rules the schema cannot express:
+Beyond role matching, creation enforces eight rules the schema cannot express:
 
 - **Settings a worker can run and a test can evaluate.** `redundancy` at least 1;
   `variant` is `classic` or `wordsmog`; batch sizes at least 1 (`racks_per_batch`
@@ -5122,6 +5123,18 @@ Beyond role matching, creation enforces seven rules the schema cannot express:
 - **Leave generation runs at redundancy 1.** Its redundant copies replay the
   same seed only when MAGPIE is single-threaded; multi-threaded, they are
   different samples, and there is no integrity use for them today.
+- **A leave job's player plays statically on equity, with no rack info table.**
+  A generation's leave values are the mean equity of the racks the bot drew, as
+  MAGPIE's `leavegen` computes them: a simmer ranks on something else and plays
+  orders of magnitude slower, a score sort ignores the very leaves each
+  generation feeds back, and a rack info table caches the values of one KLV
+  where every generation plays a new one. `num_plies > 0`, a `sort_strategy`
+  other than `equity` and `use_rit` are each refused, naming the player. Its
+  lexicon must be a `kwg` the job's distribution can spell; its leaves are not
+  checked, because they are never loaded — every generation plays the server's
+  KLV — and they, with any win% model, are left out of the job's
+  `expected_data`, so a worker is not turned away for lacking files no task
+  reads.
 
 The response is `{ job }`. Creation writes no rows up front for any job type: no
 tasks, and no leave-generation rack universe, which the first claim seeds as it
@@ -6236,13 +6249,15 @@ CREATE TABLE job_game_pair_config (
 
 CREATE TABLE job_leave_config (
     job_id         UUID PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
-    -- The one place a lexicon still sits on a job: leave generation has a
-    -- single bot and no player_configs row to hold it. It needs no klv_id
-    -- (every generation's leaves come from the server-built KLV artifact, and
-    -- generation 1's is a zeroed one) and no winpct_id (the bot plays
-    -- statically). Its complete data requirement is this plus the job's
-    -- letterdist_id and layout_id.
-    kwg_id         UUID NOT NULL REFERENCES input_data(id),
+    -- The player the leave-generating bot plays as, in both seats: its lexicon
+    -- and wordmap setting are the job's. Its leaves are never loaded -- every
+    -- generation's come from the server-built KLV artifact, and generation 1's
+    -- is a zeroed one -- and nor is its win% model, since the bot plays
+    -- statically. So the job's complete data requirement is this player's kwg
+    -- plus the job's letterdist_id and layout_id. Job creation refuses a player
+    -- that simulates, sorts on anything but equity, or asks for a rack info
+    -- table: leave values are measured from static equity play.
+    player_config_id UUID NOT NULL REFERENCES player_configs(id),
     -- Games each leave-gen task plays over its forced-rack subset.
     num_iterations INT NOT NULL,
     -- The occurrence target every rack must reach before a generation closes,
@@ -6260,11 +6275,7 @@ CREATE TABLE job_leave_config (
         AND array_position(target_rack_counts, NULL) IS NULL
     ),
     -- Size of the forced-rack subset handed to a single task.
-    racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
-    -- Whether the leave-generating bot plays with a wordmap. Sent to the worker,
-    -- which builds one from its .kwg if it does not already have it. A player
-    -- setting like any other -- workers assume nothing about wordmaps.
-    use_wordmap       BOOLEAN NOT NULL DEFAULT TRUE
+    racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1)
 );
 
 -- Exports
@@ -6510,7 +6521,7 @@ CREATE TABLE game_requests (
 
 CREATE TABLE leave_requests (
     task_id             UUID PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
-    lexicon             TEXT NOT NULL,
+    -- No lexicon or wordmap column: the player config carries both.
     variant             TEXT NOT NULL,
     letter_distribution TEXT NOT NULL,
     board_layout        TEXT NOT NULL,
@@ -6526,7 +6537,7 @@ CREATE TABLE leave_requests (
     -- the server-built zeroed KLV at generation-0, so every generation fetches
     -- its leaves the same way and the client has no first-generation branch.
     previous_artifact_key TEXT NOT NULL,
-    use_wordmap         BOOLEAN NOT NULL   -- denormalized from job_leave_config.use_wordmap
+    player_config_id    UUID NOT NULL REFERENCES player_configs(id)
 );
 
 -- Per-rack occurrence progress for each generation of a leave-gen job, one row per

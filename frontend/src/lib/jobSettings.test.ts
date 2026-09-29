@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { jobGroups, keyGroups, keySettings, playerRows, playersLine, playerSummary, show, type JobConfig, type PlayerSettings } from './jobSettings';
+import { jobGroups, keyGroups, keySettings, playerRows, playersLine, playerSummary, show, unusedPlayerSettings, type JobConfig, type PlayerSettings } from './jobSettings';
 
 const staticPlayer: PlayerSettings = {
   role: 'player 1', id: 'p1', name: 'static-NWL23', lexicon: 'NWL23', leaves: 'NWL23', win_pct: null,
@@ -66,22 +66,45 @@ describe('F-SET-1 job settings', () => {
     expect(keyGroups([{ title: 'Nothing key', rows: [{ label: 'a', value: 'b', key: false }] }])).toEqual([]);
   });
 
-  it("shows a leave job's generations and each one's target", () => {
+  it("shows a leave job's generations and each one's target, and leaves its lexicon to its player", () => {
     const leave: JobConfig = {
       job: { ...config.job, job_type: 'leave_generation' },
-      leave_generation: {
-        lexicon: 'NWL23', num_iterations: 10000, target_rack_counts: [100, 200, 5000],
-        racks_per_task: 50, use_wordmap: true
-      },
-      players: []
+      leave_generation: { num_iterations: 10000, target_rack_counts: [100, 200, 5000], racks_per_task: 50 },
+      players: [{ ...staticPlayer, role: 'player' }]
     };
     const group = jobGroups(leave).find((g) => g.title === 'Leave generation')!;
-    expect(group.rows).toContainEqual({ label: 'Generations', value: '3', key: true });
-    expect(group.rows).toContainEqual({
-      label: 'Target per rack',
-      value: `100, 200, ${(5000).toLocaleString()}`,
-      key: true
-    });
+    expect(group.rows).toEqual([
+      { label: 'Generations', value: '3', key: true },
+      { label: 'Target per rack', value: `100, 200, ${(5000).toLocaleString()}`, key: true },
+      { label: 'Games per task', value: (10000).toLocaleString(), key: true },
+      { label: 'Racks per task', value: '50', key: false }
+    ]);
+    // The lexicon and wordmap are the player's rows, not the job's.
+    const every = jobGroups(leave).flatMap((g) => g.rows.map((r) => r.label));
+    expect(every).not.toContain('Lexicon');
+    expect(every).not.toContain('Wordmap');
+    expect(keySettings(leave.players).map((r) => r.label)).toEqual(
+      expect.arrayContaining(['Lexicon', 'Wordmap'])
+    );
+  });
+
+  it("marks the player settings a leave job never reads, and no other job's", () => {
+    const unused = unusedPlayerSettings('leave_generation');
+    const muted = (rows: { label: string; unused?: true }[]) => rows.filter((r) => r.unused).map((r) => r.label);
+    expect(muted(keySettings([staticPlayer], unused))).toEqual(['Leaves', 'Recorder']);
+    expect(muted(playerRows([staticPlayer], unused))).toEqual([
+      'Leaves', 'Win %', 'Recorder', 'Plays recorded', 'Plies recorded', 'Move-gen margin'
+    ]);
+    // What it plays with is not muted: the lexicon, the search and the wordmap.
+    for (const used of ['Search', 'Lexicon', 'Plies', 'Sort', 'Wordmap']) {
+      expect(playerRows([staticPlayer], unused).find((r) => r.label === used)!.unused).toBeUndefined();
+    }
+    for (const type of ['games', 'game_pairs', 'opening_rack'] as const) {
+      expect(muted(playerRows([staticPlayer], unusedPlayerSettings(type)))).toEqual([]);
+    }
+    // Every label named is a row of the table, so none is silently unmatched.
+    const labels = playerRows([simPlayer]).map((r) => r.label);
+    for (const label of unused) expect(labels).toContain(label);
   });
 
   it('shows a job without a test its target, and none of the test it does not run', () => {

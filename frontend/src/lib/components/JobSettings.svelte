@@ -1,12 +1,13 @@
 <script lang="ts">
   /**
    * What a job runs with, as two tables: the job's own settings and its
-   * type's, grouped, and its players' -- one column for a single player, two
-   * side by side for a games or pairs job, those they differ in bold. Each
+   * type's, grouped, and its players' -- one column for a single player (an
+   * opening-rack or leave job's), two side by side for a games or pairs job,
+   * those they differ in bold, those the job never reads muted. Each
    * shows its key rows; one "All settings" toggle opens every row of both.
    * The same as JSON to download. Public, like the rest of the page.
    */
-  import { jobGroups, keyGroups, type JobConfig } from '$lib/jobSettings';
+  import { jobGroups, keyGroups, unusedPlayerSettings, type JobConfig } from '$lib/jobSettings';
   import PlayerSettingsTable from './PlayerSettingsTable.svelte';
 
   export let config: JobConfig;
@@ -43,7 +44,11 @@
   </div>
 
   {#if config.players.length}
-    <PlayerSettingsTable players={config.players} {all} />
+    <PlayerSettingsTable
+      players={config.players}
+      {all}
+      unused={unusedPlayerSettings(config.job.job_type)}
+    />
   {/if}
 
   <p class="text-xs">

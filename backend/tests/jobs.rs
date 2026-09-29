@@ -321,13 +321,15 @@ async fn a_leave_generation_job_stores_every_setting_it_was_created_with() {
     let admin = Admin::new(&db, db.state_with(cfg).await).await;
     let (ld, layout) = board(&db).await;
     let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let player = admin.static_player("leaver", kwg, klv, json!({})).await;
 
     let (status, created) = admin
         .create_job(json!({
             "job_type": "leave_generation", "variant": "classic",
-            "letterdist_id": ld, "layout_id": layout, "kwg_id": kwg,
+            "letterdist_id": ld, "layout_id": layout, "player_config_id": player,
             "num_iterations": 200, "target_rack_counts": [50, 100, 200],
-            "racks_per_task": 20, "use_wordmap": false,
+            "racks_per_task": 20,
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -337,8 +339,8 @@ async fn a_leave_generation_job_stores_every_setting_it_was_created_with() {
         "job_leave_config",
         &row,
         &json!({
-            "job_id": job, "kwg_id": kwg, "num_iterations": 200,
-            "target_rack_counts": [50, 100, 200], "racks_per_task": 20, "use_wordmap": false,
+            "job_id": job, "player_config_id": player, "num_iterations": 200,
+            "target_rack_counts": [50, 100, 200], "racks_per_task": 20,
         }),
     );
     assert_eq!(job_row(&db, job).await["job_type"], "leave_generation");
@@ -452,10 +454,10 @@ async fn a_job_naming_something_that_does_not_exist_is_a_clean_400() {
     let player = admin.static_player("p", kwg, klv, json!({})).await;
     let missing = Uuid::new_v4();
 
-    let leave = |kwg_id: Uuid| {
+    let leave = |player_config_id: Uuid| {
         json!({
             "job_type": "leave_generation", "variant": "classic", "letterdist_id": ld,
-            "layout_id": layout, "kwg_id": kwg_id, "num_iterations": 10,
+            "layout_id": layout, "player_config_id": player_config_id, "num_iterations": 10,
             "target_rack_counts": [10], "racks_per_task": 10,
         })
     };
@@ -471,7 +473,7 @@ async fn a_job_naming_something_that_does_not_exist_is_a_clean_400() {
             }),
             "no such player config".to_string(),
         ),
-        (leave(missing), "no such input data row".to_string()),
+        (leave(missing), "no such player config".to_string()),
     ];
     for (body, message) in cases {
         let (status, refused) = admin.create_job(body.clone()).await;
@@ -671,13 +673,14 @@ async fn leave_job(db: &TestDb) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let job = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 100, ARRAY[1000, 1000], 2)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -971,9 +974,9 @@ async fn a_player_config_past_magpies_limits_is_refused() {
 }
 
 /// I-JOB-11: a player config referenced by a job of any type -- either seat of
-/// a games or game-pairs job, or an opening-rack job's player -- cannot be
-/// deleted, and stays; one nothing references can, and one freed by deleting
-/// its job can too.
+/// a games or game-pairs job, an opening-rack job's player or a leave job's --
+/// cannot be deleted, and stays; one nothing references can, and one freed by
+/// deleting its job can too.
 #[tokio::test]
 async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
     let db = TestDb::new().await;
@@ -982,7 +985,7 @@ async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
     let kwg = db.input_data("kwg", "NWL23").await;
     let klv = db.input_data("klv", "NWL23").await;
     let mut configs = Vec::new();
-    for name in ["games-p1", "games-p2", "pairs-p1", "pairs-p2", "racks", "unused"] {
+    for name in ["games-p1", "games-p2", "pairs-p1", "pairs-p2", "racks", "leave", "unused"] {
         configs.push(admin.static_player(name, kwg, klv, json!({})).await);
     }
     let mut jobs = Vec::new();
@@ -998,8 +1001,22 @@ async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
         assert_eq!(status, StatusCode::CREATED, "{created}");
         jobs.push(created["job"]["id"].as_str().unwrap().to_string());
     }
+    // A leave job by hand: created through the API it would build its
+    // generation-0 KLV, which needs a MAGPIE and an object store.
+    let owner = db.user("leave-owner", true).await;
+    let leave = db.bare_job("leave_generation", 1, owner).await;
+    sqlx::query(
+        "INSERT INTO job_leave_config
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 10, ARRAY[10], 10)",
+    )
+    .bind(leave)
+    .bind(configs[5])
+    .execute(&db.pool)
+    .await
+    .unwrap();
 
-    for config in &configs[..5] {
+    for config in &configs[..6] {
         let (status, body) =
             admin.call("DELETE", &format!("/api/admin/player-configs/{config}"), None).await;
         assert_eq!(status, StatusCode::CONFLICT, "{body}");
@@ -1012,10 +1029,10 @@ async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
     }
 
     let (status, body) =
-        admin.call("DELETE", &format!("/api/admin/player-configs/{}", configs[5]), None).await;
+        admin.call("DELETE", &format!("/api/admin/player-configs/{}", configs[6]), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let (status, _) =
-        admin.call("GET", &format!("/api/admin/player-configs/{}", configs[5]), None).await;
+        admin.call("GET", &format!("/api/admin/player-configs/{}", configs[6]), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
     // Once its job is gone, a config is free again.
@@ -1024,6 +1041,55 @@ async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
     let (status, body) =
         admin.call("DELETE", &format!("/api/admin/player-configs/{}", configs[0]), None).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// I-JOB-14d: a leave job's player must play statically, sort on equity and
+/// ask for no rack info table -- leave values are measured from static equity
+/// play, and a rack info table would cache the leaves every generation
+/// replaces. Each is refused at creation, naming the player field, and leaves
+/// no job behind; a player that plays statically on equity is accepted as far
+/// as its creation's first commit.
+#[tokio::test]
+async fn a_leave_job_refuses_a_player_it_cannot_generate_leaves_with() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+    let leave = |player: Uuid| {
+        json!({
+            "job_type": "leave_generation", "variant": "classic", "letterdist_id": ld,
+            "layout_id": layout, "player_config_id": player, "num_iterations": 10,
+            "target_rack_counts": [10], "racks_per_task": 10,
+        })
+    };
+    let cases = [
+        (admin.simmer("simmer", kwg, klv, winpct).await, "simulates 2 plies"),
+        (
+            admin.static_player("by-score", kwg, klv, json!({ "sort_strategy": "score" })).await,
+            "sorts on score",
+        ),
+        (
+            admin.static_player("with-rit", kwg, klv, json!({ "use_rit": true })).await,
+            "asks for a rack info table",
+        ),
+    ];
+    for (player, reason) in cases {
+        let (status, refused) = admin.create_job(leave(player)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reason}: {refused}");
+        assert_eq!(refused["message"], "this player config cannot generate leaves", "{refused}");
+        assert_eq!(refused["fields"][0]["field"], "player_config_id", "{refused}");
+        let why = refused["fields"][0]["message"].as_str().unwrap();
+        assert!(why.contains(reason), "{reason}: {why}");
+    }
+    assert_eq!(job_count(&db).await, 0, "nothing was half-created");
+
+    // One the job can play with gets past validation into the job row; what
+    // fails after it, here, is building the generation-0 KLV with no MAGPIE.
+    let fine = admin.static_player("static", kwg, klv, json!({})).await;
+    admin.create_job(leave(fine)).await;
+    assert_eq!(job_count(&db).await, 1, "a static equity player is accepted");
 }
 
 /// The seed an anonymous claim was handed, or `None` for a 204.
@@ -1131,7 +1197,7 @@ async fn a_catalan_games_job_runs_and_a_catalan_rack_job_is_refused_at_creation(
         }),
         json!({
             "job_type": "leave_generation", "variant": "classic", "letterdist_id": ld,
-            "layout_id": layout, "kwg_id": kwg, "num_iterations": 10,
+            "layout_id": layout, "player_config_id": p1, "num_iterations": 10,
             "target_rack_counts": [10], "racks_per_task": 10,
         }),
     ] {

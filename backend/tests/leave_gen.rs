@@ -17,13 +17,14 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let job = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 100, ARRAY[1000, 1000], $3)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .bind(racks_per_task)
     .execute(&db.pool)
     .await
@@ -38,10 +39,10 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     .await
     .unwrap();
 
-    // A leave job's bot plays with a wordmap by default, and a job whose
-    // derived files are not built is not dispatched. Creation through the API
-    // queues those builds; this job was assembled with plain SQL, so the gate
-    // is satisfied here the same way the generation-0 artifact row above is.
+    // This job's player plays with a wordmap, and a job whose derived files
+    // are not built is not dispatched. Creation through the API queues those
+    // builds; this job was assembled with plain SQL, so the gate is satisfied
+    // here the same way the generation-0 artifact row above is.
     assert_eq!(db.derived_ready(job).await, 1, "a leave job needs one wordmap");
 
     let row = sqlx::query_as::<_, birdtest::models::job::Job>("SELECT * FROM jobs WHERE id = $1")
@@ -591,9 +592,9 @@ async fn next_step(db: &TestDb, job: Uuid) -> Step {
     .await
     .unwrap();
     let job_data = birdtest::jobs::load_job_data(&mut tx, job_row.id).await.unwrap();
-    let lexicon = leave_gen::lexicon_name(&mut tx, config.kwg_id).await.unwrap();
+    let player = birdtest::jobs::load_player_spec(&mut tx, config.player_config_id).await.unwrap();
     leave_gen::lock_claim_decisions(&mut tx, job).await.unwrap();
-    let step = leave_gen::next_step(&mut tx, job, &config, &job_data, &lexicon).await.unwrap();
+    let step = leave_gen::next_step(&mut tx, job, &config, &job_data, &player).await.unwrap();
     let step = match step {
         LeaveGenStep::Transition { .. } => Step::Transition,
         LeaveGenStep::TransitionInProgress { .. } => Step::InProgress,

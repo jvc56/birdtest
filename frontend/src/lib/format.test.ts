@@ -6,6 +6,7 @@ import {
   datetime,
   duration,
   jobTypeLabel,
+  leavePlayerConflict,
   optionalNumber,
   parseTargetRackCounts,
   MAX_LEAVE_GENERATIONS,
@@ -329,6 +330,24 @@ describe('F-FMT-15 parseTargetRackCounts', () => {
     expect(parseTargetRackCounts([...most, '10'].join(','))).toEqual({
       error: `At most ${MAX_LEAVE_GENERATIONS} generations, not ${MAX_LEAVE_GENERATIONS + 1}.`
     });
+  });
+});
+
+describe('F-FMT-17 leavePlayerConflict', () => {
+  const player = { name: 'static', num_plies: 0, sort_strategy: 'equity', use_rit: false };
+
+  it('accepts a static player that sorts on equity with no rack info table', () => {
+    expect(leavePlayerConflict(player)).toBeNull();
+  });
+
+  it('names everything job creation would refuse', () => {
+    expect(leavePlayerConflict({ ...player, num_plies: 1 })).toBe(
+      'static simulates 1 ply; leave generation plays statically on equity, without a rack info table.'
+    );
+    expect(leavePlayerConflict({ ...player, num_plies: 2, sort_strategy: 'score', use_rit: true })).toBe(
+      'static simulates 2 plies, sorts on score and asks for a rack info table; leave generation ' +
+        'plays statically on equity, without a rack info table.'
+    );
   });
 });
 

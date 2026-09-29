@@ -403,8 +403,8 @@ def job_config(job_type: str, players: list, args) -> dict:
         # Small, as tier 6 runs it: one generation, a few iterations. A task
         # still takes MAGPIE a couple of minutes; the rack universe is built by
         # the first claim, not at creation.
-        return {"kwg_id": args.leave_kwg, "num_iterations": 20, "target_rack_counts": [1],
-                "racks_per_task": 50, "use_wordmap": args.wordmap}
+        return {"player_config_id": players[0], "num_iterations": 20, "target_rack_counts": [1],
+                "racks_per_task": 50}
     raise SeedError(f"unknown job type {job_type!r}")
 
 
@@ -576,14 +576,16 @@ def seed(args) -> None:
     sign_in(client, args)
     import_input_data(client, args)
     data = input_data_ids(client, args)
-    args.leave_kwg = data["kwg"]
 
     def players_for(job_type: str) -> list:
         if job_type == "opening_rack":
             return [player_config(client, "static-equity-all", "equity", data, recorder="all",
                                   wordmap=args.wordmap, rit=args.rit)]
         if job_type == "leave_generation":
-            return []
+            # Leave generation plays statically on equity, with no rack info
+            # table: it measures the leaves a table would cache.
+            return [player_config(client, "static-equity-no-rit", "equity", data,
+                                  wordmap=args.wordmap, rit=False)]
         return [
             player_config(client, "static-equity", "equity", data, wordmap=args.wordmap, rit=args.rit),
             player_config(client, "static-score", "score", data, wordmap=args.wordmap, rit=args.rit),
@@ -615,7 +617,8 @@ def seed(args) -> None:
                        f"dev game pairs: {n1} vs {n2}" + (" (positions saved)" if capture else ""),
                        extra={"capture_positions": True} if capture else None)
         create_job(client, args, data, players_for("opening_rack"), "opening_rack", "dev opening racks")
-        create_job(client, args, data, [], "leave_generation", "dev leave generation")
+        create_job(client, args, data, players_for("leave_generation"), "leave_generation",
+                   "dev leave generation")
         log(f"seeded — six jobs, each at {args.allocation}%")
     else:
         create_job(client, args, data, players_for(args.job_type))

@@ -371,7 +371,7 @@ impl Finish {
     }
 }
 
-pub(crate) async fn load_player_spec(
+pub async fn load_player_spec(
     conn: &mut PgConnection,
     player_config_id: Uuid,
 ) -> AppResult<PlayerSpec> {
@@ -800,11 +800,12 @@ pub async fn expected_data(
          ids AS (
              SELECT j.letterdist_id AS id FROM jobs j WHERE j.id = $1
              UNION SELECT j.layout_id FROM jobs j WHERE j.id = $1
-             -- Leave generation has one bot and no player_configs row, so its
-             -- lexicon sits on the job config. It needs no klv (every
-             -- generation's leaves are a server-built artifact) and no winpct
-             -- (the bot plays statically).
-             UNION SELECT c.kwg_id FROM job_leave_config c WHERE c.job_id = $1
+             -- A leave job's player pins only its lexicon here: MAGPIE never
+             -- opens its klv (every generation's leaves are a server-built
+             -- artifact) or a winpct (the bot plays statically), so pinning
+             -- them would turn away workers that lack files no task reads.
+             UNION SELECT pc.kwg_id FROM job_leave_config c
+                 JOIN player_configs pc ON pc.id = c.player_config_id WHERE c.job_id = $1
              UNION SELECT pc.kwg_id FROM player_configs pc JOIN players p ON p.id = pc.id
              UNION SELECT pc.klv_id FROM player_configs pc JOIN players p ON p.id = pc.id
              -- NULL for a static player, which never opens a win% model; it

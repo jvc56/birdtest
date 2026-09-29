@@ -399,13 +399,14 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     let racks = opening_rack_job(&db, 6).await;
     let leave = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "CSW24").await;
+    let leave_player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 100, ARRAY[100, 500, 1000], 50)",
     )
     .bind(leave)
-    .bind(kwg)
+    .bind(leave_player)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -442,6 +443,15 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     assert_eq!(racks["opening_racks"], json!({ "racks_analyzed": 0, "racks_total": 100 }));
     let (_, settings) = send(&app, get_request(&format!("/api/jobs/{leave}/config"), &[])).await;
     assert_eq!(settings["leave_generation"]["target_rack_counts"], json!([100, 500, 1000]));
+    // The lexicon and wordmap setting are the player's, shown with it.
+    let players = settings["players"].as_array().unwrap();
+    assert_eq!(players.len(), 1, "{settings}");
+    assert_eq!(players[0]["role"], "player");
+    assert_eq!(players[0]["id"], json!(leave_player));
+    assert_eq!(players[0]["lexicon"], "CSW24");
+    assert_eq!(players[0]["use_wordmap"], true);
+    assert!(settings["leave_generation"].get("lexicon").is_none(), "{settings}");
+    assert!(settings["leave_generation"].get("use_wordmap").is_none(), "{settings}");
     let (_, leave) = send(&app, get_request(&format!("/api/jobs/{leave}"), &[])).await;
     assert_eq!(leave["leave_generation"]["current_generation"], 1);
     assert_eq!(leave["leave_generation"]["generation_count"], 3);

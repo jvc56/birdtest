@@ -256,14 +256,13 @@ struct GamesSettings {
     capture_positions: bool,
 }
 
+/// The lexicon and wordmap setting are the player's, and shown with it.
 #[derive(Serialize)]
 struct LeaveSettings {
-    lexicon: String,
     num_iterations: i32,
     /// One occurrence target per generation, in order.
     target_rack_counts: Vec<i32>,
     racks_per_task: i32,
-    use_wordmap: bool,
 }
 
 /// A player config's settings, without who made it or when.
@@ -460,12 +459,11 @@ async fn job_config(
                 .bind(id)
                 .fetch_one(pool)
                 .await?;
+            players.push(PlayerSettings::new("player", player(c.player_config_id).await?));
             leave_generation = Some(LeaveSettings {
-                lexicon: file(c.kwg_id).await?,
                 num_iterations: c.num_iterations,
                 target_rack_counts: c.target_rack_counts,
                 racks_per_task: c.racks_per_task,
-                use_wordmap: c.use_wordmap,
             });
         }
     }

@@ -269,7 +269,7 @@ async fn generate_leave_gen(
     identity: &WorkerIdentity,
     template: &JobTemplate,
 ) -> AppResult<Acquired> {
-    let JobKind::LeaveGeneration { config, lexicon } = &template.kind else {
+    let JobKind::LeaveGeneration { config, player } = &template.kind else {
         return Err(template.mismatch("leave_generation"));
     };
 
@@ -331,15 +331,15 @@ async fn generate_leave_gen(
         return Ok(Acquired::Task { task_id, request, created: false });
     }
 
-    match leave_gen::next_step(conn, job.id, config, &template.data, lexicon).await? {
+    match leave_gen::next_step(conn, job.id, config, &template.data, player).await? {
         leave_gen::LeaveGenStep::Dispatch(request) => {
             // The seed drawn for the task is its seed on the `tasks` row too:
             // every task has one, and the unique index on (job_id, seed) turns
             // the negligible chance of two draws colliding into a retried
             // claim rather than two tasks replaying each other's games.
             let task_id = insert_on_demand_task(conn, job.id, request.seed as i64).await?;
-            leave_gen::insert_request(conn, task_id, &request).await?;
-            Ok(Acquired::Task { task_id, request: TaskRequest::LeaveGeneration(request), created: true })
+            leave_gen::insert_request(conn, task_id, &request, config.player_config_id).await?;
+            Ok(Acquired::Task { task_id, request: TaskRequest::LeaveGeneration(*request), created: true })
         }
         leave_gen::LeaveGenStep::Transition { generation } => {
             Ok(Acquired::NeedsGenerationTransition { generation })

@@ -569,12 +569,13 @@ async fn a_leave_job_queues_its_wordmap_and_never_a_table() {
     let kwg = db.input_data("kwg", "NWL23").await;
     let klv = db.input_data("klv", "NWL23").await;
     let leave = db.bare_job("leave_generation", 1, admin).await;
+    let leave_player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
-        "INSERT INTO job_leave_config (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+        "INSERT INTO job_leave_config (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 10, ARRAY[10], 2)",
     )
     .bind(leave)
-    .bind(kwg)
+    .bind(leave_player)
     .execute(&db.pool)
     .await
     .unwrap();

@@ -871,9 +871,10 @@ async fn players_on_different_lexicons_each_contribute_a_kwg_and_a_klv() {
     assert_eq!(files.len(), 6, "{files:?}");
 }
 
-/// I-EXPECT-4: a leave-generation job needs its lexicon, distribution and board
-/// and never a `klv` -- its leaves are the server-built artifact -- even with
-/// leaves of the lexicon's name imported.
+/// I-EXPECT-4: a leave-generation job needs its player's lexicon, the
+/// distribution and the board, and never a `klv` -- its leaves are the
+/// server-built artifact -- not even the leaves its own player names, and
+/// with leaves of the lexicon's name imported.
 #[tokio::test]
 async fn a_leave_job_needs_its_lexicon_bag_and_board_and_never_leaves() {
     let db = TestDb::new().await;
@@ -881,13 +882,14 @@ async fn a_leave_job_needs_its_lexicon_bag_and_board_and_never_leaves() {
     let job = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "CSW24").await;
     db.input_data("klv", "CSW24").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 100, ARRAY[1000, 1000], 10)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .execute(&db.pool)
     .await
     .unwrap();

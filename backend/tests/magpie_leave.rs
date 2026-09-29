@@ -154,13 +154,14 @@ async fn leave_job(
             .unwrap();
     }
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+             (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
          VALUES ($1, $2, 100, array_fill($4::int, ARRAY[$3::int]), 2)",
     )
     .bind(job)
-    .bind(kwg)
+    .bind(player)
     .bind(generation_count)
     .bind(target)
     .execute(&db.pool)
@@ -378,6 +379,7 @@ async fn generation_zeros_klv_exists_at_creation_and_is_worth_exactly_nothing() 
         db.input_data("layout", "standard15").await,
     );
     let kwg = db.input_data("kwg", "NWL23").await;
+    let player = db.leave_player(kwg, false, admin).await;
     let (magpie, builders) = (state.magpie.clone(), state.builders.clone());
     let app = birdtest::app(state.clone());
 
@@ -388,9 +390,9 @@ async fn generation_zeros_klv_exists_at_creation_and_is_worth_exactly_nothing() 
     }
     let body = json!({
         "job_type": "leave_generation", "variant": "classic",
-        "letterdist_id": ld, "layout_id": layout, "kwg_id": kwg,
+        "letterdist_id": ld, "layout_id": layout, "player_config_id": player,
         "num_iterations": 100, "target_rack_counts": [10, 10],
-        "racks_per_task": 2, "use_wordmap": false,
+        "racks_per_task": 2,
     });
     let (status, created) = send(
         &app,

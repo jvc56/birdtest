@@ -106,11 +106,13 @@ const NEEDS_CTE: &str = "WITH players AS (
          SELECT pc.kwg_id, pc.klv_id, pc.use_wordmap, pc.use_rit
          FROM player_configs pc JOIN players p ON p.id = pc.id
          UNION ALL
-         -- Leave generation has one bot and no player_configs row, and never
-         -- a rack info table: every generation plays with a different KLV,
-         -- which is exactly what a table would cache.
-         SELECT c.kwg_id, NULL::uuid, c.use_wordmap, false
-         FROM job_leave_config c WHERE c.job_id = $1
+         -- A leave job's player, never with a rack info table: every
+         -- generation plays with a different KLV, which is exactly what a
+         -- table would cache. Job creation refuses a player asking for one;
+         -- this says so again rather than trusting it.
+         SELECT pc.kwg_id, NULL::uuid, pc.use_wordmap, false
+         FROM job_leave_config c JOIN player_configs pc ON pc.id = c.player_config_id
+         WHERE c.job_id = $1
      ),
      needs AS (
          -- A rack info table is built from the wordmap for its lexicon, so a
