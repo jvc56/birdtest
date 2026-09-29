@@ -69,8 +69,8 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 225 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 144 | Vitest, `frontend/src/lib/`: `format.test.ts` (30), `jobSettings.test.ts` (6), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 164 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (18), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
+| 1F Frontend unit | 147 | Vitest, `frontend/src/lib/`: `format.test.ts` (30), `jobSettings.test.ts` (6), `matchScore.test.ts` (3), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 165 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 232 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 17 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 650 backend tests (the per-tier counts above are
+--run-ignored all` runs 651 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -698,6 +698,11 @@ Each entry's tests are the `describe` block named for its id.
   *(Covered: `format.test.ts`, `F-FMT-5b sprtState`.)*
 - `F-FMT-5` `sprtLabel` covers all four statuses. *(Covered:
   `format.test.ts`.)*
+- `F-MATCH-1` The match score card's figures: player 1's record "W–L–D", its
+  score W + ½D (no ".0" when whole) and that as a share of the games, the
+  average scores to a decimal place and the spread signed ("+13.4", "-2.5",
+  never "-0.0"); before any game, none of them rather than 0 or NaN.
+  *(Covered: `matchScore.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
@@ -1616,8 +1621,14 @@ permanent.
   *(Covered: `stats::a_pairs_jobs_stats_sum_the_pentanomial_and_count_every_pair`.)*
 - `I-STATS-3` `divergent_pairs` is reported and is not what SPRT consumed.
   *(Covered: `stats::divergent_pairs_are_reported_but_not_tested`.)*
+- `I-STATS-1b` Each player's average score and the spread are the batches'
+  means weighted by their games, for games and pairs jobs alike (10 games at
+  400-380 and 30 at 440-450 are 430-432.5, spread -2.5; unweighted, 420-415).
+  *(Covered: `stats::average_scores_weight_each_batch_by_its_games`; how the
+  match score card prints them, `matchScore.test.ts`, `F-MATCH-1`.)*
 - `I-STATS-4` A job with no results reports zeros and an LLR of 0, not an error
-  or a NaN. *(Covered: `stats::a_job_with_no_results_reports_zeros_not_nan`.)*
+  or a NaN, and no average score (null, not 0). *(Covered:
+  `stats::a_job_with_no_results_reports_zeros_not_nan`.)*
 - `I-STATS-5` Opening-rack stats count analysed racks against `total_racks`, from
   the running `jobs.racks_analyzed` total, and count a task's racks **once** even
   when two redundant claims of it are accepted. *(Covered:
@@ -2829,9 +2840,10 @@ admin in once and the admin journeys reuse its storage state.
   `e2-register-and-api-key.spec.ts`, reading its code from the outbox.)*
 - `E-3` An admin imports input data, reviews the staged diff, and confirms it.
   *(Covered: `e3-input-data-import.spec.ts`, against the fixture tarballs.)*
-- `E-4` An admin creates two player configs and a game-pairs job, activates it
-  with an allocation, and watches the dashboard update live over SSE as fake
-  workers contribute. **The journey that justifies the tier**: the only place
+- `E-4` An admin creates two player configs and a game-pairs job with **Run
+  an SPRT** ticked, activates it with an allocation, and watches the dashboard
+  update live over SSE as fake workers contribute; its admin page has the
+  match score and SPRT cards. **The journey that justifies the tier**: the only place
   SSE, the built Svelte app, the scheduler and a worker are exercised together.
   *(Covered: `e4-live-dashboard.spec.ts`.)*
 - `E-5` An admin bans a worker and that worker can no longer claim. *(Covered:
@@ -2845,7 +2857,8 @@ admin in once and the admin journeys reuse its storage state.
   the fit and the moved ratings go through the pool's page.
   *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table with the five buckets
-  labelled, and the SPRT status text. *(Covered: `e8-pentanomial.spec.ts`.)*
+  labelled, and the SPRT status text, and player 1's record in the match score
+  card, not the SPRT card. *(Covered: `e8-pentanomial.spec.ts`.)*
 - `E-9` The password reset flow end to end, `a@b` refused under the field
   first. *(Covered:
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*

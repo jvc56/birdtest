@@ -193,6 +193,13 @@ export interface GameStats {
   /** Games for a `games` job, pairs for a `game_pairs` job. */
   units_completed: number;
   /**
+   * Each player's average score per game and player 1's average spread, over
+   * every game played (batches weighted by their games); null before any.
+   */
+  p1_score_mean: number | null;
+  p2_score_mean: number | null;
+  spread_mean: number | null;
+  /**
    * Game pairs only: the five pair outcomes the LLR is computed from, indexed
    * by player 1's half-point score across the pair (0 = lost both, 4 = won
    * both). Every completed pair is in here, including the ones that played

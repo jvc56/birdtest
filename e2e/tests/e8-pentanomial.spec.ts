@@ -3,7 +3,8 @@ import { seededJob, waitUntilSettled } from '../lib/api';
 
 /**
  * E-8: a game-pairs job's page shows its pentanomial with the five buckets
- * labelled in order, and the SPRT status in words.
+ * labelled in order, the SPRT status in words, and player 1's record in the
+ * match score box.
  *
  * The seeded job, once the fake workers have finished it. They favour player
  * 1, so its test must have ended for player 1 -- by accepting H1 or at the
@@ -47,4 +48,14 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and SPRT ver
     pentanomial.map((n) => `${((100 * n) / pairs).toFixed(1)}%`)
   );
   await expect(sprt.getByText(`The test runs on all ${pairs.toLocaleString('en-US')} pairs`)).toBeVisible();
+
+  // Player 1's record is the match score's, in a box of its own above the
+  // test, counted in games; the SPRT card keeps only the test.
+  const score = page.locator('.card', { has: page.getByRole('heading', { name: 'Match score' }) });
+  const { wins, losses, draws } = stats.games;
+  await expect(score.getByTestId('match-record')).toHaveText(
+    [wins, losses, draws].map((n: number) => n.toLocaleString('en-US')).join('–')
+  );
+  await expect(score.getByText(/^Average score:/)).toBeVisible();
+  await expect(sprt.getByText(/^Player 1:/)).toHaveCount(0);
 });

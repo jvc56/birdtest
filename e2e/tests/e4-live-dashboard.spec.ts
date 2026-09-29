@@ -59,6 +59,9 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await page.getByLabel('Player 2').selectOption({ label: p2 });
   // One pair per task, so results arrive steadily rather than in lumps.
   await page.getByLabel('Pairs per batch').fill('1');
+  // The test is off unless asked for; on, so the page has one to watch too.
+  await page.getByLabel('Run an SPRT').check();
+  await expect(page.getByLabel('Min before SPRT')).toBeVisible();
   await page.getByRole('button', { name: 'Create job' }).click();
 
   await expect(page).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
@@ -96,7 +99,15 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   expect(refetches).toEqual([]);
 
   // The rest of the dashboard moves with it.
-  await expect(page.getByText(/^SPRT (running|passed \(H1 accepted\)) — LLR -?\d+\.\d{3}$/)).toBeVisible();
+  // The admin page has the public page's match score and SPRT boxes, where it
+  // had a one-line summary.
+  const sprt = page.locator('.card', { has: page.getByRole('heading', { name: 'SPRT' }) });
+  await expect(
+    sprt.getByText(/^(running — LLR|Completed: passed \(H1 accepted\), LLR) -?\d+\.\d{3}/)
+  ).toBeVisible();
+  const score = page.locator('.card', { has: page.getByRole('heading', { name: 'Match score' }) });
+  await expect(score.getByTestId('match-record')).toHaveText(/^\d[\d,]*–\d[\d,]*–\d[\d,]*$/);
+  await expect(score.getByText(/^Average score:/)).toBeVisible();
   await expect(page.getByText('No contributions yet.')).toHaveCount(0);
   await expect(
     page.locator('.card', { has: page.getByRole('heading', { name: 'Contributors' }) }).getByText(/^Anonymous · /).first()

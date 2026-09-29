@@ -11,11 +11,15 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { jobTitle, jobTypeLabel, sprtLabel, sprtState } from '$lib/format';
+  import { jobTitle, jobTypeLabel } from '$lib/format';
+  import type { JobConfig } from '$lib/jobSettings';
   import CompletionNote from '$lib/components/CompletionNote.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
   import DerivedDataStatus from '$lib/components/DerivedDataStatus.svelte';
+  import JobSettings from '$lib/components/JobSettings.svelte';
+  import MatchScore from '$lib/components/MatchScore.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
+  import SprtCard from '$lib/components/SprtCard.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
 
   // The [id] route only matches when the param is present.
@@ -38,6 +42,9 @@
   //   one shows as that and not as an empty answer, and failed reads are
   //   tried again on the next live payload and every five seconds.
   let stats: JobStats | null = null;
+  // Fixed once the job exists, so read until one read succeeds; the page
+  // shows without it, as the public page does.
+  let config: JobConfig | null = null;
   // null until read: shown as "could not load", never as "none".
   let gaps: DataGap[] | null = null;
   let allocation: number | null = null;
@@ -106,6 +113,12 @@
     const payloadsAtStart = streamPayloads;
     reloading = true;
     window.clearTimeout(retry);
+    if (config === null) {
+      api
+        .jobConfig(jobId)
+        .then((value) => (config = value))
+        .catch(() => {});
+    }
     const [job, gapsRead, exportRead] = await Promise.allSettled([
       api.job(jobId),
       api.jobDataGaps(jobId),
@@ -590,16 +603,6 @@
           max={stats.games.max_units}
           label="{stats.games.unit}s completed"
         />
-        {#if stats.games.sprt}
-          <p class="text-sm text-muted-foreground">
-            {#if stats.games.decided}
-              SPRT {sprtLabel(stats.games.decided.status)}, LLR
-              {stats.games.decided.llr.toFixed(3)} (now {stats.games.sprt.llr.toFixed(3)})
-            {:else}
-              SPRT {sprtLabel(sprtState(stats.job.status, stats.games))} — LLR {stats.games.sprt.llr.toFixed(3)}
-            {/if}
-          </p>
-        {/if}
       {:else if stats.opening_racks}
         <ProgressBar
           value={stats.opening_racks.racks_analyzed}
@@ -620,6 +623,14 @@
         {stats.tasks_claimed.toLocaleString()} claimed
       </p>
     </div>
+
+    {#if config}
+      <JobSettings {config} />
+    {/if}
+    {#if stats.games}
+      <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
+    {/if}
+    <SprtCard {stats} />
 
     <div class="card">
       <h2 class="mb-1 text-lg font-medium">Data gaps</h2>

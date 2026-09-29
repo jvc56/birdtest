@@ -4,17 +4,16 @@
   import { api, type JobStats } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { datetime, jobTypeLabel, sprtLabel, sprtState, jobTitle } from '$lib/format';
-  import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
+  import { datetime, jobTypeLabel, jobTitle } from '$lib/format';
   import CompletionNote from '$lib/components/CompletionNote.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
-  import OutcomeChart from '$lib/components/OutcomeChart.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
+  import MatchScore from '$lib/components/MatchScore.svelte';
+  import SprtCard from '$lib/components/SprtCard.svelte';
   import SavedPositions from '$lib/components/SavedPositions.svelte';
   import { playersLine, type JobConfig } from '$lib/jobSettings';
-  import { pentanomialRows } from '$lib/charts/pentanomial';
 
   // The [id] route only matches when the param is present.
   const jobId = $page.params.id as string;
@@ -149,95 +148,10 @@
       <JobSettings {config} />
     {/if}
 
-    <!-- A job without a test has no card for one. -->
-    {#if stats.games?.sprt}
-      <div class="card space-y-4">
-        <div class="flex items-center justify-between">
-          <h2 class="text-lg font-medium">SPRT</h2>
-          <JobStatusBadge status={sprtState(stats.job.status, stats.games)} />
-        </div>
-        {#if stats.games.decided}
-          <p class="text-sm text-muted-foreground">
-            Completed: {sprtLabel(stats.games.decided.status)}, LLR
-            {stats.games.decided.llr.toFixed(3)} after {stats.games.decided.units.toLocaleString()}
-            {stats.games.unit}{stats.games.decided.units === 1 ? '' : 's'}. With the {stats.games.unit}s that were in flight then, LLR
-            {stats.games.sprt.llr.toFixed(3)}, bounds [{stats.games.sprt.lower_bound.toFixed(2)},
-            {stats.games.sprt.upper_bound.toFixed(2)}].
-          </p>
-        {:else if stats.job.status !== 'active'}
-          <!-- Nothing is being played: the test is where it stopped, and said
-               "running" as if it were not. -->
-          <p class="text-sm text-muted-foreground">
-            {sprtLabel(sprtState(stats.job.status, stats.games))}{stats.job.status === 'inactive'
-              ? `: no ${stats.games.unit}s are being played, so the test is not moving`
-              : ''}. LLR {stats.games.sprt.llr.toFixed(3)}, bounds
-            [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
-          </p>
-        {:else}
-          <p class="text-sm text-muted-foreground">
-            {sprtLabel(stats.games.sprt.status)} — LLR {stats.games.sprt.llr.toFixed(3)}, bounds
-            [{stats.games.sprt.lower_bound.toFixed(2)}, {stats.games.sprt.upper_bound.toFixed(2)}].
-            {#if stats.games.min_units > 0 && stats.games.units_completed < stats.games.min_units}
-              SPRT is not acted on until {stats.games.min_units.toLocaleString()}
-              {stats.games.unit}{stats.games.min_units === 1 ? ' is' : 's are'} complete.
-            {:else if stats.games.min_units > 0}
-              The minimum of {stats.games.min_units.toLocaleString()}
-              {stats.games.unit}{stats.games.min_units === 1 ? '' : 's'} is reached; SPRT is checked as
-              {stats.games.unit}s arrive.
-            {:else}
-              SPRT is checked as {stats.games.unit}s arrive, with no minimum number of them.
-            {/if}
-          </p>
-        {/if}
-        <OutcomeChart
-          wins={stats.games.wins}
-          losses={stats.games.losses}
-          draws={stats.games.draws}
-        />
-        <p class="text-sm tabular-nums text-muted-foreground">
-          Player 1: {stats.games.wins.toLocaleString()} W ({stats.games.win_pct.toFixed(1)}%) ·
-          {stats.games.losses.toLocaleString()} L ({stats.games.loss_pct.toFixed(1)}%) ·
-          {stats.games.draws.toLocaleString()} D ({stats.games.draw_pct.toFixed(1)}%)
-        </p>
-        {#if stats.games.pentanomial}
-          <div class="space-y-1">
-            <p class="text-xs text-muted-foreground">
-              The test runs on all {stats.games.units_completed.toLocaleString()} pairs, scored by
-              player 1's result across the pair. Pairs whose two games played identically are 1-1
-              ties — they stay in the sample, where they are what makes a paired run
-              lower-variance than an unpaired one.
-            </p>
-            <div class="overflow-x-auto">
-            <table class="table text-xs">
-              <thead>
-                <tr>
-                  <th>Pair outcome</th>
-                  <th class="text-right">Pairs</th>
-                  <th class="text-right">Share</th>
-                </tr>
-              </thead>
-              <tbody>
-                {#each pentanomialRows(stats.games.pentanomial, stats.games.units_completed) as bucket}
-                  <tr>
-                    <td>{bucket.label}</td>
-                    <td class="text-right tabular-nums">{bucket.pairs.toLocaleString()}</td>
-                    <td class="text-right tabular-nums">{bucket.share}%</td>
-                  </tr>
-                {/each}
-              </tbody>
-            </table>
-            </div>
-            {#if stats.games.divergent_pairs !== undefined}
-              <p class="text-xs text-muted-foreground">
-                {stats.games.divergent_pairs.toLocaleString()} of {stats.games.units_completed.toLocaleString()}
-                pairs diverged — a diagnostic of how often these two configs differ at all, not
-                part of the test.
-              </p>
-            {/if}
-          </div>
-        {/if}
-      </div>
+    {#if stats.games}
+      <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
     {/if}
+    <SprtCard {stats} />
 
     {#if config?.games?.capture_positions}
       {#if $session}

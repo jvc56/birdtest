@@ -854,8 +854,8 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 **Games / Game pairs**
 
 - SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `stopped at its cap` — for a job that runs the test; one without has no SPRT card, and `games.sprt` is `null`.
-- The pentanomial (game pairs only): the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
-- Running result counts and percentages: wins / losses / draws for player 1.
+- The pentanomial (game pairs only), in the SPRT card: the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
+- A **match score** card, after the settings and before the SPRT card: player 1's wins–losses–draws, its score (W + ½D) out of the games played and the win % that is, each player's average score per game and player 1's average spread, and the win/loss/draw chart and percentages. It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over the first accepted result of each task (`jobstats::SCORE_MEANS`).
 - **Saved positions**, for a job with `capture_positions` set: the latest captured positions, ten at a time, each with its board (CGP), the rack of the player to move, the move before it and the ranked moves; and a search for the positions played from one rack. Signed-in users only (`GET /api/jobs/:id/positions`); a signed-out visitor is told to sign in. The public has the results feed, and a job that captures holds millions of positions.
 
 **Opening rack analysis**
@@ -897,6 +897,7 @@ JobStats {
   tasks_total, tasks_completed, tasks_available, tasks_claimed, results_accepted
   games?:            { unit: "game" | "pair", wins, losses, draws,
                        units_completed, pentanomial?, divergent_pairs?, min_units, max_units,
+                       p1_score_mean, p2_score_mean, spread_mean,   // null before any game
                        win_pct, loss_pct, draw_pct,
                        sprt: { llr, lower_bound, upper_bound, status } | null,
                        decided? }
@@ -5191,7 +5192,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 |---|---|
 | `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
 | `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs. The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. |
-| `/admin/jobs/[id]` | Admin job view — the public page's four headline cards (status, allocation, tasks completed, ETA), the job's progress, contributors and data gaps (what workers declined it for; the public page has the rest: pentanomial, W/L/D, SPRT bounds) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
+| `/admin/jobs/[id]` | Admin job view — the public page's four headline cards (status, allocation, tasks completed, ETA), the job's progress, its settings, match score and SPRT cards as the public page has them, contributors and data gaps (what workers declined it for) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form. |
 | `/admin/rating-pools/new` | Create rating pool form — name, variant, letter distribution, board layout, anchor config and rating, and optionally the other members to add once it exists. Linked from `/ratings` for an admin; membership is managed on the pool's page after that. |

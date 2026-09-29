@@ -82,13 +82,25 @@ async fn claim(
 
 /// A completed batch for `job`: `(wins, losses, ties)` over every game, and
 /// for a paired batch its pentanomial and the divergent subset's
-/// `(wins, losses, ties)`.
+/// `(wins, losses, ties)`. The players averaged 420 and 410 points.
 async fn result(
     db: &TestDb,
     job: Uuid,
     tally: (i32, i32, i32),
     pent: Option<[i32; 5]>,
     divergent: Option<(i32, i32, i32)>,
+) {
+    scored_result(db, job, tally, pent, divergent, (420.0, 410.0)).await;
+}
+
+/// [`result`], with the players' average scores over the batch.
+async fn scored_result(
+    db: &TestDb,
+    job: Uuid,
+    tally: (i32, i32, i32),
+    pent: Option<[i32; 5]>,
+    divergent: Option<(i32, i32, i32)>,
+    (p1_mean, p2_mean): (f64, f64),
 ) {
     let owner = Owner::Anon(anon(db).await);
     let (task, claim) = claim(db, job, owner, "completed", 0).await;
@@ -100,7 +112,7 @@ async fn result(
               p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd,
               pent_0, pent_1, pent_2, pent_3, pent_4,
               divergent_games, divergent_wins, divergent_losses, divergent_ties)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 420, 60, 410, 58,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $10, 60, $11, 58,
                  $8[1], $8[2], $8[3], $8[4], $8[5], $9[1], $9[2], $9[3], $9[4])",
     )
     .bind(claim)
@@ -112,6 +124,8 @@ async fn result(
     .bind(ties)
     .bind(pent.map(|p| p.to_vec()))
     .bind(divergent)
+    .bind(p1_mean)
+    .bind(p2_mean)
     .execute(&db.pool)
     .await
     .unwrap();
@@ -198,6 +212,31 @@ async fn a_games_jobs_stats_sum_every_result_and_test_the_games() {
     close(test.lower_bound, -2.944_438_979_166_440_5);
 }
 
+/// I-STATS-1b: each player's average score, and the spread, are the batches'
+/// means weighted by their games, for both job types -- 10 games at 400-380
+/// and 30 at 440-450 are 430-432.5, where the batches' plain average would say
+/// 420-415 and the spread the wrong way round.
+#[tokio::test]
+async fn average_scores_weight_each_batch_by_its_games() {
+    let db = TestDb::new().await;
+    let games = db.games_job(1, 10).await;
+    scored_result(&db, games, (6, 4, 0), None, None, (400.0, 380.0)).await;
+    scored_result(&db, games, (12, 18, 0), None, None, (440.0, 450.0)).await;
+    let pairs = pairs_job(&db).await;
+    let split = |pairs: i32| (Some([0, 0, pairs, 0, 0]), Some((0, 0, 0)));
+    let (pent, divergent) = split(5);
+    scored_result(&db, pairs, (5, 5, 0), pent, divergent, (400.0, 380.0)).await;
+    let (pent, divergent) = split(15);
+    scored_result(&db, pairs, (15, 15, 0), pent, divergent, (440.0, 450.0)).await;
+
+    for job in [games, pairs] {
+        let stats = game_stats(&db, job).await;
+        close(stats.p1_score_mean.unwrap(), 430.0);
+        close(stats.p2_score_mean.unwrap(), 432.5);
+        close(stats.spread_mean.unwrap(), -2.5);
+    }
+}
+
 /// Two paired batches: 16 pairs, 7 of which diverged.
 async fn two_paired_batches(db: &TestDb) -> Uuid {
     let job = pairs_job(db).await;
@@ -266,8 +305,13 @@ async fn a_job_with_no_results_reports_zeros_not_nan() {
             assert_eq!(games.divergent_pairs, Some(0));
         }
 
+        // No games, no average: not 0 points, and not NaN.
+        let means = (games.p1_score_mean, games.p2_score_mean, games.spread_mean);
+        assert_eq!(means, (None, None, None));
+
         let payload = serde_json::to_value(stats(&db, job).await).unwrap();
         assert_eq!(payload["games"]["sprt"]["llr"], json!(0.0), "{payload}");
+        assert_eq!(payload["games"]["spread_mean"], json!(null), "{payload}");
         assert_eq!(payload["games"]["win_pct"], json!(0.0), "{payload}");
         assert_eq!(payload["tasks_total"], 0);
         assert_eq!(payload["eta_seconds"], json!(null));

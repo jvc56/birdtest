@@ -102,6 +102,12 @@ pub struct GameStats {
     /// Games for a `games` job, pairs for a `game_pairs` job — the unit the
     /// job's min/max thresholds are stated in.
     pub units_completed: u64,
+    /// Each player's score per game, and player 1's spread (the difference),
+    /// over every game played: the batches' means weighted by their games.
+    /// `None` before any game is.
+    pub p1_score_mean: Option<f64>,
+    pub p2_score_mean: Option<f64>,
+    pub spread_mean: Option<f64>,
     /// Game pairs only: the five pair-outcome counts the LLR is computed from,
     /// indexed by player 1's half-point score across the pair.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -621,7 +627,8 @@ async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameS
         "SELECT COALESCE(SUM(r.games), 0)::bigint  AS games,
                 COALESCE(SUM(r.wins), 0)::bigint   AS wins,
                 COALESCE(SUM(r.losses), 0)::bigint AS losses,
-                COALESCE(SUM(r.ties), 0)::bigint   AS ties
+                COALESCE(SUM(r.ties), 0)::bigint   AS ties,
+                {SCORE_MEANS}
          FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
     ))
     .bind(job.id)
@@ -635,7 +642,16 @@ async fn plain_game_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameS
     };
     let games = row.get::<i64, _>("games") as u64;
     let sample = Sample::from_games(&tally);
-    Ok(build_game_stats("game", tally, sample, games, None, None, &SprtParams::from(&config)))
+    Ok(build_game_stats(
+        "game",
+        tally,
+        sample,
+        games,
+        ScoreMeans::from_row(&row),
+        None,
+        None,
+        &SprtParams::from(&config),
+    ))
 }
 
 /// A game-pairs job is evaluated on the **pentanomial**: every completed pair,
@@ -669,7 +685,8 @@ async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameSt
                 COALESCE(SUM(r.pent_2), 0)::bigint           AS pent_2,
                 COALESCE(SUM(r.pent_3), 0)::bigint           AS pent_3,
                 COALESCE(SUM(r.pent_4), 0)::bigint           AS pent_4,
-                COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games
+                COALESCE(SUM(r.divergent_games), 0)::bigint  AS divergent_games,
+                {SCORE_MEANS}
          FROM ({FIRST_GAME_RESULT_PER_TASK}) r"
     ))
     .bind(job.id)
@@ -696,10 +713,32 @@ async fn game_pair_stats(conn: &mut PgConnection, job: &Job) -> AppResult<GameSt
         tally,
         sample,
         pairs_played,
+        ScoreMeans::from_row(&row),
         Some(counts),
         Some(row.get::<i64, _>("divergent_games") as u64 / 2),
         &SprtParams::from(&config),
     ))
+}
+
+/// Each player's mean score per game over the rows of
+/// [`FIRST_GAME_RESULT_PER_TASK`] aliased `r`, as columns `p1_mean` and
+/// `p2_mean`. A batch reports its own means, so they are weighted by its
+/// games: an average of the batches' means would count a batch of 2 games as
+/// much as one of 200. NULL before any game is played.
+const SCORE_MEANS: &str = "
+    SUM(r.games * r.p1_score_mean) / NULLIF(SUM(r.games), 0) AS p1_mean,
+    SUM(r.games * r.p2_score_mean) / NULLIF(SUM(r.games), 0) AS p2_mean";
+
+/// The two columns [`SCORE_MEANS`] reads.
+struct ScoreMeans {
+    p1: Option<f64>,
+    p2: Option<f64>,
+}
+
+impl ScoreMeans {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Self {
+        Self { p1: row.get("p1_mean"), p2: row.get("p2_mean") }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -708,6 +747,7 @@ fn build_game_stats(
     tally: Tally,
     sample: Sample,
     units_completed: u64,
+    scores: ScoreMeans,
     pentanomial: Option<[u64; 5]>,
     divergent_pairs: Option<u64>,
     params: &SprtParams,
@@ -740,6 +780,9 @@ fn build_game_stats(
         losses: tally.losses,
         draws: tally.draws,
         units_completed,
+        p1_score_mean: scores.p1,
+        p2_score_mean: scores.p2,
+        spread_mean: scores.p1.zip(scores.p2).map(|(p1, p2)| p1 - p2),
         pentanomial,
         divergent_pairs,
         min_units: params.min_units,

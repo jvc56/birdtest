@@ -161,24 +161,32 @@ Open "dev game pairs: static equity vs static score".
 - [ ] **Do** `docker compose restart backend` and wait. **Expect** the page to
   recover by itself within a minute.
 
-### V-6 Games and game-pairs jobs: the test
+### V-6 Games and game-pairs jobs: the score and the test
 
 On the same job:
 
-- [ ] **Expect** an SPRT card: "running — LLR …, bounds [a, b]. SPRT is not
-  acted on until 50,000 pairs are complete."
-- [ ] **Expect** a win/loss/draw bar chart and "Player 1: W W (x%) · L L (y%) ·
-  D D (z%)".
-- [ ] **Expect** the pentanomial table — "P1 lost both", "Lost one, drew one",
-  "Split 1-1", "Won one, drew one", "P1 won both" — with counts and shares,
-  and a line on how many pairs diverged.
-- [ ] On "dev games", **expect** the same test card and chart, and no
-  pentanomial.
+- [ ] **Expect**, after Settings, a **Match score** card: player 1's W–L–D
+  (e.g. "1,204–1,187–9"), the score out of the games played ("1,208.5 /
+  2,400", a draw counting half), win %, the average spread signed ("+3.2"),
+  "Average score: static-equity 412.3 · static-score 409.1", a
+  win/loss/draw bar chart and "Player 1: W W (x%) · L L (y%) · D D (z%) — per
+  game, over both games of every pair". The figures count games, not pairs.
+- [ ] **Expect** after it an SPRT card: "running — LLR …, bounds [a, b]. SPRT
+  is not acted on until 50,000 pairs are complete", with no W/L/D line of its
+  own.
+- [ ] **Expect** the pentanomial table in the SPRT card — "P1 lost both",
+  "Lost one, drew one", "Split 1-1", "Won one, drew one", "P1 won both" — with
+  counts and shares, and a line on how many pairs diverged.
+- [ ] On "dev games", **expect** the same score and test cards, no "per game"
+  note, and no pentanomial.
 - [ ] On a job an admin has deactivated (A-8), **expect** "paused while the job
   is inactive: no pairs are being played, so the test is not moving".
-- [ ] On "tester no test" (A-7), **expect** no SPRT card, and under **All
-  settings** a "Game pairs" group with "Pairs to play 20" and "SPRT none" in
-  place of the test's settings.
+- [ ] On "tester no test" (A-7), **expect** the Match score card and no SPRT
+  card, and under **All settings** a "Game pairs" group with "Pairs to play
+  20" and "SPRT none" in place of the test's settings.
+- [ ] On a games or pairs job's **Manage** page, **expect** the same Settings,
+  Match score and (with a test) SPRT cards after Progress, and no one-line
+  "SPRT … LLR" summary in Progress.
 
 ### V-7 A finished job says why it finished
 
