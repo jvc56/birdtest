@@ -883,8 +883,8 @@ async fn a_leave_job_needs_its_lexicon_bag_and_board_and_never_leaves() {
     db.input_data("klv", "CSW24").await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, 2, 1000, 10)",
+             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, ARRAY[1000, 1000], 10)",
     )
     .bind(job)
     .bind(kwg)

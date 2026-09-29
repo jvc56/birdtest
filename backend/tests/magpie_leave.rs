@@ -156,8 +156,8 @@ async fn leave_job(
     let kwg = db.input_data("kwg", "NWL23").await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, $3, $4, 2)",
+             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, array_fill($4::int, ARRAY[$3::int]), 2)",
     )
     .bind(job)
     .bind(kwg)
@@ -389,7 +389,7 @@ async fn generation_zeros_klv_exists_at_creation_and_is_worth_exactly_nothing() 
     let body = json!({
         "job_type": "leave_generation", "variant": "classic",
         "letterdist_id": ld, "layout_id": layout, "kwg_id": kwg,
-        "num_iterations": 100, "generation_count": 2, "target_rack_count": 10,
+        "num_iterations": 100, "target_rack_counts": [10, 10],
         "racks_per_task": 2, "use_wordmap": false,
     });
     let (status, created) = send(

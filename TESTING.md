@@ -68,9 +68,9 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 227 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 164 | Vitest, `frontend/src/lib/`: `format.test.ts` (34), `jobSettings.test.ts` (7), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 172 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
+| 1 Unit | 228 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (15), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 167 | Vitest, `frontend/src/lib/`: `format.test.ts` (36), `jobSettings.test.ts` (8), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 2 Integration | 173 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 234 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 18 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
@@ -79,7 +79,7 @@ at tier 5 names a symptom.
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 662 backend tests (the per-tier counts above are
+--run-ignored all` runs 664 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -722,7 +722,8 @@ Each entry's tests are the `describe` block named for its id.
   settings; players side by side, one row per setting and a row they differ
   in marked, every setting after the search; the key rows for one player or
   two, a Win % row only when a player has a model, and every key row also a
-  row of the full table. *(Covered: `jobSettings.test.ts`.)*
+  row of the full table; a leave job's generations counted from its list of
+  targets, and each target shown. *(Covered: `jobSettings.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
@@ -736,6 +737,11 @@ Each entry's tests are the `describe` block named for its id.
   failed build, is offered **Build the final export**; a running job's button
   exports a snapshot; a leave job's snapshot notes it is as of the last merge.
   *(Covered: `format.test.ts`.)*
+- `F-FMT-15` `parseTargetRackCounts` reads the job form's "100, 200, 500" as
+  one target per generation, spaces and a trailing comma forgiven, and names
+  what is wrong with anything else — nothing listed, an empty entry, a
+  non-integer, a target outside 1–1,000,000, more than 100 generations —
+  rather than sending it. *(Covered: `format.test.ts`.)*
 
 ### `F-CGP-*` — `lib/cgp.ts`
 
@@ -1320,6 +1326,13 @@ job creation touches needs one caller here.
   `routes::admin::tests::a_job_runs_no_sprt_unless_it_asks_for_one`,
   `routes::admin::tests::sprt_settings_without_the_test_are_refused`,
   `routes::admin::tests::an_sprt_needs_its_floor`.)*
+- `I-JOB-1d` A leave job lists one occurrence target per generation
+  (`target_rack_counts`, MAGPIE's `leavegen 100,200,500,…`): between 1 and 100
+  of them, each between 1 and 1,000,000; an empty list, a zero, a negative, one
+  past either bound is refused by name. The schema's CHECK refuses the same
+  shapes (and a NULL element) below the API. *(Covered:
+  `routes::admin::tests::a_leave_job_lists_between_one_and_the_most_generations_each_with_a_sane_target`;
+  the form's parse, `F-FMT-15`.)*
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
   accepted; two with different `movegen_margin` are rejected. The regression
@@ -1504,8 +1517,8 @@ job creation touches needs one caller here.
   older object version copied back is served under its own hash again
   (fourteenth audit). *(Covered,
   tier 6 opt-in: `magpie_leave::a_rebuild_reproduces_every_generations_bytes`.)*
-- `I-LEAVE-9` A job with `generation_count > 1` advances to the next generation
-  and finishes after the last. *(Covered:
+- `I-LEAVE-9` A job listing more than one generation's target advances to the
+  next generation and finishes after the last. *(Covered:
   `leave_generation::a_two_generation_job_advances_and_finishes_after_its_last`;
   on real KLVs, `magpie_leave::a_two_generation_job_runs_to_completion_on_real_klvs`.)*
 - `I-LEAVE-10` The task's `num_games` is the only termination condition — the
@@ -1607,6 +1620,14 @@ job creation touches needs one caller here.
   again on a second claim. *(Covered:
   `leave_gen::a_declined_leave_task_is_reissued_as_it_stands`.)*
   (Thirty-second audit.)
+- `I-LEAVE-24` **Each generation closes at its own target.** Targets of 10 then
+  30: every rack at 10 closes generation 1 and not generation 2, whose racks
+  are still handed out and whose summary counts a rack at target only at 30;
+  every rack at 30 closes generation 2 and completes the job. The job page's
+  stats report the current generation's target and the whole list. *(Covered:
+  `leave_generation::each_generation_closes_at_its_own_target`;
+  `stats::leave_stats_report_the_current_generations_racks_against_its_universe`,
+  `public_api::job_detail_carries_the_stats_block_of_its_type`.)*
 
 ### `I-RATE-*` — rating pools (`ratings.rs`)
 

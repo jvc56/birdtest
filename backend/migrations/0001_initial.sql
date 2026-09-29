@@ -672,10 +672,20 @@ CREATE TABLE job_leave_config (
     kwg_id         UUID NOT NULL REFERENCES input_data(id),
     -- Games each leave-gen task plays over its forced-rack subset.
     num_iterations INT NOT NULL,
-    -- How many sequential generations this job runs before it is complete.
-    generation_count  INT NOT NULL DEFAULT 1 CHECK (generation_count >= 1),
-    -- Per-generation occurrence target every rack must reach before the generation closes.
-    target_rack_count INT NOT NULL CHECK (target_rack_count >= 1),
+    -- The occurrence target every rack must reach before a generation closes,
+    -- one per generation: element g (1-based, as generations are numbered) is
+    -- generation g's, and the array's length is how many generations the job
+    -- runs before it is complete. MAGPIE's `leavegen 100,200,500,…` shape.
+    -- `<= ALL` over an array holding a NULL is NULL, which a CHECK passes, so
+    -- the NULL test is separate; and it is indexed by generation, so flat and
+    -- starting at 1.
+    target_rack_counts INT[] NOT NULL CHECK (
+        array_ndims(target_rack_counts) = 1
+        AND array_lower(target_rack_counts, 1) = 1
+        AND cardinality(target_rack_counts) >= 1
+        AND 1 <= ALL (target_rack_counts)
+        AND array_position(target_rack_counts, NULL) IS NULL
+    ),
     -- Size of the forced-rack subset handed to a single task.
     racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
     -- Whether the leave-generating bot plays with a wordmap. Sent to the worker,

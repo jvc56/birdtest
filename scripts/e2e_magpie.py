@@ -704,8 +704,8 @@ def case_leave(ctx: Context) -> None:
     # With the wordmap a leave job asks for by default: the builder finds the
     # wordmap already built if M-3 ran, and the worker its own copy matching.
     run_job(ctx, ctx.data, {"job_type": "leave_generation", "kwg_id": ctx.data["kwg"],
-                            "num_iterations": 20, "generation_count": 1,
-                            "target_rack_count": 1, "racks_per_task": 50},
+                            "num_iterations": 20, "target_rack_counts": [1],
+                            "racks_per_task": 50},
             leave_occurrences, needs_build=True)
 
 
@@ -1011,7 +1011,7 @@ def case_capture(ctx: Context) -> None:
              "racks_per_batch": 2, "rack_size": 7}, ctx.data)
         small = small_data(ctx)
         one({"job_type": "leave_generation", "kwg_id": small["kwg"], "num_iterations": 20,
-             "generation_count": 1, "target_rack_count": 1, "racks_per_task": 50},
+             "target_rack_counts": [1], "racks_per_task": 50},
             small, needs_build=True)
 
         # A heartbeat goes out thirty seconds into a task, so the last one is a

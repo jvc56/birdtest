@@ -19,8 +19,8 @@ async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     let kwg = db.input_data("kwg", "NWL23").await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, 2, 1000, $3)",
+             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, ARRAY[1000, 1000], $3)",
     )
     .bind(job)
     .bind(kwg)

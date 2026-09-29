@@ -66,8 +66,7 @@ impl Stack {
             "letterdist_id": self.db.input_data("letterdist", "english").await,
             "layout_id": self.db.input_data("layout", "standard15").await,
             "kwg_id": self.db.input_data("kwg", "NWL23").await,
-            "num_iterations": 100, "generation_count": 2,
-            "target_rack_count": 10, "racks_per_task": 5,
+            "num_iterations": 100, "target_rack_counts": [10, 10], "racks_per_task": 5,
         });
         let (status, created) = self.post("/api/admin/jobs", body).await;
         assert_eq!(status, axum::http::StatusCode::CREATED, "{created}");

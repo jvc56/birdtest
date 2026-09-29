@@ -399,8 +399,8 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     let kwg = db.input_data("kwg", "CSW24").await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, 3, 1000, 50)",
+             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, ARRAY[100, 500, 1000], 50)",
     )
     .bind(leave)
     .bind(kwg)
@@ -438,9 +438,13 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     assert_eq!(pairs["games"]["sprt"], json!(null), "{pairs}");
     let (_, racks) = send(&app, get_request(&format!("/api/jobs/{racks}"), &[])).await;
     assert_eq!(racks["opening_racks"], json!({ "racks_analyzed": 0, "racks_total": 100 }));
+    let (_, settings) = send(&app, get_request(&format!("/api/jobs/{leave}/config"), &[])).await;
+    assert_eq!(settings["leave_generation"]["target_rack_counts"], json!([100, 500, 1000]));
     let (_, leave) = send(&app, get_request(&format!("/api/jobs/{leave}"), &[])).await;
     assert_eq!(leave["leave_generation"]["current_generation"], 1);
     assert_eq!(leave["leave_generation"]["generation_count"], 3);
+    assert_eq!(leave["leave_generation"]["target_rack_count"], 100, "generation 1's target");
+    assert_eq!(leave["leave_generation"]["target_rack_counts"], json!([100, 500, 1000]));
     assert_eq!(leave["job"]["lexicon"], "CSW24");
 
     let unknown = Uuid::new_v4();

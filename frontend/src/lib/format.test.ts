@@ -6,6 +6,9 @@ import {
   duration,
   jobTypeLabel,
   optionalNumber,
+  parseTargetRackCounts,
+  MAX_LEAVE_GENERATIONS,
+  MAX_TARGET_RACK_COUNT,
   sprtLabel,
   sprtState,
   completionText,
@@ -299,5 +302,31 @@ describe('F-FMT-14 exportSummary', () => {
     const leave = { status: 'active', job_type: 'leave_generation' };
     expect(exportSummary(snapshot, leave).note).toContain('last merge');
     expect(exportSummary(final, { ...leave, status: 'completed' }).note).toBeNull();
+  });
+});
+
+describe('F-FMT-15 parseTargetRackCounts', () => {
+  it("reads a comma-separated list as MAGPIE's leavegen takes it", () => {
+    expect(parseTargetRackCounts('100,200,500,1000')).toEqual({ targets: [100, 200, 500, 1000] });
+    expect(parseTargetRackCounts(' 100 , 200, 500, ')).toEqual({ targets: [100, 200, 500] });
+    expect(parseTargetRackCounts('500')).toEqual({ targets: [500] });
+  });
+
+  it('names what is wrong rather than sending it', () => {
+    for (const bad of ['', '  ', ',', '100,,200', '100, x', '1.5', '-3', '0', '100, 0']) {
+      expect(parseTargetRackCounts(bad), bad).toHaveProperty('error');
+    }
+    expect(parseTargetRackCounts('100, abc')).toEqual({
+      error: '"abc" is not a whole number of occurrences.'
+    });
+    expect(parseTargetRackCounts(String(MAX_TARGET_RACK_COUNT))).toEqual({
+      targets: [MAX_TARGET_RACK_COUNT]
+    });
+    expect(parseTargetRackCounts(String(MAX_TARGET_RACK_COUNT + 1))).toHaveProperty('error');
+    const most = Array(MAX_LEAVE_GENERATIONS).fill('10');
+    expect(parseTargetRackCounts(most.join(','))).toHaveProperty('targets');
+    expect(parseTargetRackCounts([...most, '10'].join(','))).toEqual({
+      error: `At most ${MAX_LEAVE_GENERATIONS} generations, not ${MAX_LEAVE_GENERATIONS + 1}.`
+    });
   });
 });

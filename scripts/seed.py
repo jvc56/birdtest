@@ -403,8 +403,8 @@ def job_config(job_type: str, players: list, args) -> dict:
         # Small, as tier 6 runs it: one generation, a few iterations. A task
         # still takes MAGPIE a couple of minutes; the rack universe is built by
         # the first claim, not at creation.
-        return {"kwg_id": args.leave_kwg, "num_iterations": 20, "generation_count": 1,
-                "target_rack_count": 1, "racks_per_task": 50, "use_wordmap": args.wordmap}
+        return {"kwg_id": args.leave_kwg, "num_iterations": 20, "target_rack_counts": [1],
+                "racks_per_task": 50, "use_wordmap": args.wordmap}
     raise SeedError(f"unknown job type {job_type!r}")
 
 

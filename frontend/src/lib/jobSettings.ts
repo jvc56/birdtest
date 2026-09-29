@@ -73,8 +73,8 @@ export interface JobConfig {
   leave_generation?: {
     lexicon: string;
     num_iterations: number;
-    generation_count: number;
-    target_rack_count: number;
+    /** One occurrence target per generation, in order; its length is the generation count. */
+    target_rack_counts: number[];
     racks_per_task: number;
     use_wordmap: boolean;
   };
@@ -186,8 +186,8 @@ export function jobGroups(c: JobConfig): SettingGroup[] {
       rows: [
         key('Lexicon', show(l.lexicon)),
         key('Iterations', show(l.num_iterations)),
-        key('Generations', show(l.generation_count)),
-        key('Target racks', show(l.target_rack_count)),
+        key('Generations', show(l.target_rack_counts.length)),
+        key('Target per rack', l.target_rack_counts.map((t) => t.toLocaleString()).join(', ')),
         more('Racks per task', show(l.racks_per_task)),
         more('Wordmap', show(l.use_wordmap))
       ]

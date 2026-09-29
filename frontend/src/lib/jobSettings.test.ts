@@ -66,6 +66,24 @@ describe('F-SET-1 job settings', () => {
     expect(keyGroups([{ title: 'Nothing key', rows: [{ label: 'a', value: 'b', key: false }] }])).toEqual([]);
   });
 
+  it("shows a leave job's generations and each one's target", () => {
+    const leave: JobConfig = {
+      job: { ...config.job, job_type: 'leave_generation' },
+      leave_generation: {
+        lexicon: 'NWL23', num_iterations: 10000, target_rack_counts: [100, 200, 5000],
+        racks_per_task: 50, use_wordmap: true
+      },
+      players: []
+    };
+    const group = jobGroups(leave).find((g) => g.title === 'Leave generation')!;
+    expect(group.rows).toContainEqual({ label: 'Generations', value: '3', key: true });
+    expect(group.rows).toContainEqual({
+      label: 'Target per rack',
+      value: `100, 200, ${(5000).toLocaleString()}`,
+      key: true
+    });
+  });
+
   it('shows a job without a test its target, and none of the test it does not run', () => {
     const groups = jobGroups({ ...config, games: { ...config.games!, sprt_enabled: false } });
     expect(groups[1].title).toBe('Game pairs');

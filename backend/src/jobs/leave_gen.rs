@@ -547,8 +547,9 @@ async fn refresh_summary(conn: &mut PgConnection, job_id: Uuid, generation: i32)
              (job_id, generation, racks_total, racks_at_target, min_rack, min_rack_count, merged_at)
          SELECT $1, $2, totals.total, totals.at_target, lowest.rack, lowest.occurrence_count, now()
          FROM (SELECT COUNT(*)::bigint AS total,
-                      COUNT(*) FILTER (WHERE p.occurrence_count >= c.target_rack_count)::bigint
-                          AS at_target
+                      COUNT(*) FILTER (
+                          WHERE p.occurrence_count >= c.target_rack_counts[p.generation]
+                      )::bigint AS at_target
                FROM leave_rack_progress p
                JOIN job_leave_config c ON c.job_id = p.job_id
                WHERE p.job_id = $1 AND p.generation = $2) totals
@@ -801,7 +802,7 @@ pub async fn current_generation(
     .bind(job_id)
     .fetch_one(&mut *conn)
     .await?;
-    Ok((completed < config.generation_count as i64).then_some(completed as i32 + 1))
+    Ok((completed < i64::from(config.generation_count())).then_some(completed as i32 + 1))
 }
 
 /// A generation has "many" racks below target -- and is selected by sweep --
@@ -945,7 +946,7 @@ async fn any_rack_below_target(
     )
     .bind(job_id)
     .bind(generation)
-    .bind(config.target_rack_count as i64)
+    .bind(config.target_for(generation))
     .fetch_one(&mut *conn)
     .await?)
 }
@@ -1063,7 +1064,7 @@ async fn racks_after(
     .bind(job_id)
     .bind(generation)
     .bind(after)
-    .bind(config.target_rack_count as i64)
+    .bind(config.target_for(generation))
     .bind(config.racks_per_task as i64 + 1)
     .fetch_all(&mut *conn)
     .await?;
@@ -1263,7 +1264,7 @@ async fn furthest_below_target(
     )
     .bind(job_id)
     .bind(generation)
-    .bind(config.target_rack_count as i64)
+    .bind(config.target_for(generation))
     .bind(config.racks_per_task as i64)
     .fetch_all(&mut *conn)
     .await?;
@@ -1540,7 +1541,7 @@ pub async fn close_generation(
     // who deactivated the job during its last transition decided something,
     // and it stands. Reactivated, its first claim finds the last generation
     // closed and completes it then.
-    if generation >= config.generation_count {
+    if generation >= config.generation_count() {
         let completed = sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1 AND status = 'active'")
             .bind(job_id)
             .execute(&mut *tx)

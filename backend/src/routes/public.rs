@@ -104,7 +104,8 @@ async fn list_jobs(
                 -- generation a task count is no denominator: it is only what
                 -- has been handed out so far. Their own units instead: racks
                 -- analysed of the rack space, generations closed of the count.
-                j.racks_analyzed, rc.total_racks, lc.generation_count,
+                j.racks_analyzed, rc.total_racks,
+                cardinality(lc.target_rack_counts) AS generation_count,
                 (SELECT COUNT(*) FROM leave_generation_artifacts a
                   WHERE a.job_id = j.id AND a.generation >= 1) AS generations_closed,
                 -- Stalled: at least one decline and no submission in the last
@@ -259,8 +260,8 @@ struct GamesSettings {
 struct LeaveSettings {
     lexicon: String,
     num_iterations: i32,
-    generation_count: i32,
-    target_rack_count: i32,
+    /// One occurrence target per generation, in order.
+    target_rack_counts: Vec<i32>,
     racks_per_task: i32,
     use_wordmap: bool,
 }
@@ -462,8 +463,7 @@ async fn job_config(
             leave_generation = Some(LeaveSettings {
                 lexicon: file(c.kwg_id).await?,
                 num_iterations: c.num_iterations,
-                generation_count: c.generation_count,
-                target_rack_count: c.target_rack_count,
+                target_rack_counts: c.target_rack_counts,
                 racks_per_task: c.racks_per_task,
                 use_wordmap: c.use_wordmap,
             });

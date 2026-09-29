@@ -293,7 +293,9 @@ export interface JobStats {
     /** Generations whose KLV is built; `current_generation` stops at the last one. */
     generations_closed: number;
     generation_count: number;
+    /** The in-progress generation's occurrence target, from `target_rack_counts` (every generation's, in order). */
     target_rack_count: number;
+    target_rack_counts: number[];
     /** Live: accepted tasks of the in-progress generation, and the games they played. */
     tasks_completed: number;
     games_played: number;

@@ -762,6 +762,14 @@ const MAGPIE_MAX_WORDMAP_BLANKS: u32 = 2;
 /// about 80 KB of racks in each claim.
 const MAX_RACKS_PER_TASK: i32 = 10_000;
 
+/// The most generations a leave job runs. MAGPIE's own runs are a handful;
+/// each generation is a full pass over the rack universe and a KLV build.
+const MAX_LEAVE_GENERATIONS: usize = 100;
+/// The highest occurrence target a generation may set. A million per rack is
+/// some three trillion forced racks for English's 3.2 million -- no run gets
+/// there, so a larger number is a typo, not a plan.
+const MAX_TARGET_RACK_COUNT: i32 = 1_000_000;
+
 /// Numbers MAGPIE would refuse, or silently read as "use your own default".
 ///
 /// MAGPIE validates these too, but only on a contributor's machine, after a
@@ -1047,9 +1055,9 @@ enum JobTypeConfig {
         /// single bot and no player config to hold it.
         kwg_id: Uuid,
         num_iterations: i32,
-        #[serde(default = "one")]
-        generation_count: i32,
-        target_rack_count: i32,
+        /// One occurrence target per generation, in order; its length is how
+        /// many generations the job runs.
+        target_rack_counts: Vec<i32>,
         racks_per_task: i32,
         /// Whether the leave-generating bot plays with a wordmap. Defaults on:
         /// leave generation is the most game-heavy job type there is, and a
@@ -1424,18 +1432,29 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             let err = sprt(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
             games_batch_field(err, "pair", 2, *pairs_per_batch, *capture_positions)
         }
-        JobTypeConfig::Leave {
-            num_iterations, generation_count, target_rack_count, racks_per_task, ..
-        } => {
+        JobTypeConfig::Leave { num_iterations, target_rack_counts, racks_per_task, .. } => {
             for (field, value) in [
                 ("num_iterations", *num_iterations),
-                ("generation_count", *generation_count),
-                ("target_rack_count", *target_rack_count),
                 ("racks_per_task", *racks_per_task),
             ] {
                 if value < 1 {
                     err = err.with_field(field, "must be at least 1");
                 }
+            }
+            if target_rack_counts.is_empty() {
+                err = err.with_field("target_rack_counts", "must list at least one generation's target");
+            } else if target_rack_counts.len() > MAX_LEAVE_GENERATIONS {
+                err = err.with_field(
+                    "target_rack_counts",
+                    format!("must list at most {MAX_LEAVE_GENERATIONS} generations"),
+                );
+            } else if let Some(bad) =
+                target_rack_counts.iter().find(|t| !(1..=MAX_TARGET_RACK_COUNT).contains(*t))
+            {
+                err = err.with_field(
+                    "target_rack_counts",
+                    format!("every target must be between 1 and {MAX_TARGET_RACK_COUNT}, not {bad}"),
+                );
             }
             // Every claim carries its task's forced racks, and so does every
             // `leave_requests` row: a typo of millions sent the generation's
@@ -1806,8 +1825,7 @@ async fn insert_job_config(
         (
             JobType::LeaveGeneration,
             JobTypeConfig::Leave {
-                kwg_id, num_iterations,
-                generation_count, target_rack_count, racks_per_task, use_wordmap,
+                kwg_id, num_iterations, target_rack_counts, racks_per_task, use_wordmap,
             },
         ) => {
             let lexicon: (String, String) = sqlx::query_as(
@@ -1839,11 +1857,11 @@ async fn insert_job_config(
             sqlx::query(
                 "INSERT INTO job_leave_config
                      (job_id, kwg_id, num_iterations,
-                      generation_count, target_rack_count, racks_per_task, use_wordmap)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                      target_rack_counts, racks_per_task, use_wordmap)
+                 VALUES ($1,$2,$3,$4,$5,$6)",
             )
             .bind(job.id).bind(kwg_id)
-            .bind(num_iterations).bind(generation_count).bind(target_rack_count)
+            .bind(num_iterations).bind(target_rack_counts)
             .bind(racks_per_task).bind(use_wordmap)
             .execute(conn)
             .await?;
@@ -3579,7 +3597,7 @@ mod tests {
             "job_type": "leave_generation",
             "kwg_id": Uuid::nil(),
             "num_iterations": 0,
-            "target_rack_count": 10,
+            "target_rack_counts": [10],
             "racks_per_task": 0,
         }));
         assert_eq!(fields(validate_job_body(&leave)), ["num_iterations", "racks_per_task"]);
@@ -3587,7 +3605,7 @@ mod tests {
             "job_type": "leave_generation",
             "kwg_id": Uuid::nil(),
             "num_iterations": 10,
-            "target_rack_count": 10,
+            "target_rack_counts": [10],
             "racks_per_task": MAX_RACKS_PER_TASK,
         });
         assert!(validate_job_body(&body(leave.clone())).is_ok());
@@ -3596,12 +3614,41 @@ mod tests {
     }
 
     #[test]
+    fn a_leave_job_lists_between_one_and_the_most_generations_each_with_a_sane_target() {
+        let with_targets = |targets: serde_json::Value| {
+            body(serde_json::json!({
+                "job_type": "leave_generation",
+                "kwg_id": Uuid::nil(),
+                "num_iterations": 10,
+                "target_rack_counts": targets,
+                "racks_per_task": 10,
+            }))
+        };
+        assert!(validate_job_body(&with_targets(serde_json::json!([100, 200, 500, 1000]))).is_ok());
+        let most = vec![MAX_TARGET_RACK_COUNT; MAX_LEAVE_GENERATIONS];
+        assert!(validate_job_body(&with_targets(serde_json::json!(most))).is_ok());
+        for bad in [
+            serde_json::json!([]),
+            serde_json::json!([100, 0, 500]),
+            serde_json::json!([-5]),
+            serde_json::json!([MAX_TARGET_RACK_COUNT + 1]),
+            serde_json::json!(vec![10; MAX_LEAVE_GENERATIONS + 1]),
+        ] {
+            assert_eq!(
+                fields(validate_job_body(&with_targets(bad.clone()))),
+                ["target_rack_counts"],
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
     fn leave_generation_runs_at_redundancy_one() {
         let mut leave = body(serde_json::json!({
             "job_type": "leave_generation",
             "kwg_id": Uuid::nil(),
             "num_iterations": 1,
-            "target_rack_count": 10,
+            "target_rack_counts": [10],
             "racks_per_task": 1,
         }));
         assert!(validate_job_body(&leave).is_ok());

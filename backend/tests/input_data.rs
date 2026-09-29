@@ -842,8 +842,8 @@ async fn an_input_file_in_use_cannot_be_deleted() {
     let leave_kwg = db.input_data("kwg", "CSW21").await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 10, 10, 10)",
+             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 10, ARRAY[10], 10)",
     )
     .bind(leave)
     .bind(leave_kwg)

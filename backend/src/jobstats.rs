@@ -179,7 +179,10 @@ pub struct LeaveGenStats {
     /// Generations whose KLV is built. `current_generation` stops at the last
     /// generation, so it cannot say a finished job's last one closed.
     pub generations_closed: i32,
-    pub target_rack_count: i32,
+    /// The in-progress generation's occurrence target, from
+    /// `target_rack_counts`, which is every generation's in order.
+    pub target_rack_count: i64,
+    pub target_rack_counts: Vec<i32>,
     /// Accepted tasks of the in-progress generation, and the games they played.
     pub tasks_completed: i64,
     pub games_played: i64,
@@ -834,7 +837,7 @@ async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Lea
     .fetch_one(&mut *conn)
     .await?;
     let generations_closed = completed as i32;
-    let current_generation = (generations_closed + 1).min(config.generation_count);
+    let current_generation = (generations_closed + 1).min(config.generation_count());
 
     // One row, kept by the submit path (the live counters) and by each merge
     // (the rack summary). Absent until the generation's universe is seeded.
@@ -850,8 +853,8 @@ async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Lea
 
     Ok(LeaveGenStats {
         current_generation,
-        generation_count: config.generation_count,
-        target_rack_count: config.target_rack_count,
+        generation_count: config.generation_count(),
+        target_rack_count: config.target_for(current_generation),
         generations_closed,
         tasks_completed: row.as_ref().map_or(0, |r| r.get("tasks_completed")),
         games_played: row.as_ref().map_or(0, |r| r.get("games_played")),
@@ -860,6 +863,7 @@ async fn leave_gen_stats(conn: &mut PgConnection, job_id: Uuid) -> AppResult<Lea
         min_rack: row.as_ref().and_then(|r| r.get("min_rack")),
         min_rack_count: row.as_ref().and_then(|r| r.get("min_rack_count")),
         progress_as_of: row.as_ref().and_then(|r| r.get("merged_at")),
+        target_rack_counts: config.target_rack_counts,
     })
 }
 

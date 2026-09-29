@@ -173,6 +173,41 @@ export function completionText(stats: {
   return 'it was completed';
 }
 
+/** The most generations a leave job runs, and the highest target one may set (the server's bounds). */
+export const MAX_LEAVE_GENERATIONS = 100;
+export const MAX_TARGET_RACK_COUNT = 1_000_000;
+
+/**
+ * A leave job's per-generation rack targets, typed as MAGPIE's `leavegen`
+ * takes them -- "100, 200, 500, 1000" -- one occurrence target per generation,
+ * the list's length the number of generations. Spaces are ignored and a
+ * trailing comma forgiven. Either the list or why it cannot be sent.
+ */
+export function parseTargetRackCounts(text: string): { targets: number[] } | { error: string } {
+  const parts = text.split(',').map((part) => part.trim());
+  if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+  if (parts.length === 1 && parts[0] === '') {
+    return { error: 'List at least one generation\'s target, e.g. 100, 200, 500.' };
+  }
+  const targets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) {
+      return { error: `"${part}" is not a whole number of occurrences.` };
+    }
+    const target = Number(part);
+    if (target < 1 || target > MAX_TARGET_RACK_COUNT) {
+      return {
+        error: `Every target must be between 1 and ${MAX_TARGET_RACK_COUNT.toLocaleString()}, not ${part}.`
+      };
+    }
+    targets.push(target);
+  }
+  if (targets.length > MAX_LEAVE_GENERATIONS) {
+    return { error: `At most ${MAX_LEAVE_GENERATIONS} generations, not ${targets.length}.` };
+  }
+  return { targets };
+}
+
 /** A job's title: the name it was given, or its type for one given none. */
 export function jobTitle(job: { name?: string | null; job_type: string }): string {
   const name = job.name?.trim();

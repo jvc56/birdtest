@@ -322,16 +322,17 @@ async fn a_job_with_no_results_reports_zeros_not_nan() {
 // Leave generation
 // ---------------------------------------------------------------------------
 
-/// A leave-generation job of `generations` generations at a target of 1000,
-/// with the generation-0 artifact every job starts from.
+/// A leave-generation job of `generations` generations, generation g's target
+/// 500g, with the generation-0 artifact every job starts from.
 async fn leave_job(db: &TestDb, generations: i32) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let job = db.bare_job("leave_generation", 1, admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, $3, 1000, 50)",
+             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, (SELECT array_agg(g * 500 ORDER BY g) FROM generate_series(1, $3) g),
+                 50)",
     )
     .bind(job)
     .bind(kwg)
@@ -392,6 +393,7 @@ async fn leave_stats_report_the_current_generations_racks_against_its_universe()
     assert_eq!(fresh.current_generation, 1, "generation 0 is not a closed generation");
     assert_eq!((fresh.racks_at_target, fresh.racks_total, fresh.tasks_completed), (0, 0, 0));
     assert_eq!(fresh.progress_as_of, None);
+    assert_eq!(fresh.target_rack_count, 500, "generation 1's own target");
 
     progress(&db, job, 1, (40, 4000, 100, 100)).await;
     close_generation(&db, job, 1).await;
@@ -401,7 +403,8 @@ async fn leave_stats_report_the_current_generations_racks_against_its_universe()
     assert!(current.games.is_none() && current.opening_racks.is_none());
     let leave = current.leave_generation.expect("a leave job's block");
     assert_eq!((leave.current_generation, leave.generation_count), (2, 2));
-    assert_eq!(leave.target_rack_count, 1000);
+    assert_eq!(leave.target_rack_count, 1000, "generation 2's own target");
+    assert_eq!(leave.target_rack_counts, [500, 1000]);
     assert_eq!((leave.racks_at_target, leave.racks_total), (37, 100), "generation 2's, not 1's");
     assert_eq!((leave.tasks_completed, leave.games_played), (4, 400));
     assert_eq!((leave.min_rack.as_deref(), leave.min_rack_count), (Some("AEINRST"), Some(12)));

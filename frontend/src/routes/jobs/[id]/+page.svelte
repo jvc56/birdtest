@@ -243,6 +243,13 @@
           Generation {lg.current_generation} of {lg.generation_count} — target
           {lg.target_rack_count.toLocaleString()} occurrences per rack
         </h2>
+        {#if new Set(lg.target_rack_counts).size > 1}
+          <p class="text-sm text-muted-foreground">
+            Targets by generation: {lg.target_rack_counts
+              .map((t) => t.toLocaleString())
+              .join(', ')}.
+          </p>
+        {/if}
         <p class="text-sm">
           <span class="tabular-nums">{lg.tasks_completed.toLocaleString()}</span> tasks and
           <span class="tabular-nums">{lg.games_played.toLocaleString()}</span> games played this

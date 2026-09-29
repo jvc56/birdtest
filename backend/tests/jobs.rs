@@ -326,7 +326,7 @@ async fn a_leave_generation_job_stores_every_setting_it_was_created_with() {
         .create_job(json!({
             "job_type": "leave_generation", "variant": "classic",
             "letterdist_id": ld, "layout_id": layout, "kwg_id": kwg,
-            "num_iterations": 200, "generation_count": 3, "target_rack_count": 50,
+            "num_iterations": 200, "target_rack_counts": [50, 100, 200],
             "racks_per_task": 20, "use_wordmap": false,
         }))
         .await;
@@ -337,8 +337,8 @@ async fn a_leave_generation_job_stores_every_setting_it_was_created_with() {
         "job_leave_config",
         &row,
         &json!({
-            "job_id": job, "kwg_id": kwg, "num_iterations": 200, "generation_count": 3,
-            "target_rack_count": 50, "racks_per_task": 20, "use_wordmap": false,
+            "job_id": job, "kwg_id": kwg, "num_iterations": 200,
+            "target_rack_counts": [50, 100, 200], "racks_per_task": 20, "use_wordmap": false,
         }),
     );
     assert_eq!(job_row(&db, job).await["job_type"], "leave_generation");
@@ -456,7 +456,7 @@ async fn a_job_naming_something_that_does_not_exist_is_a_clean_400() {
         json!({
             "job_type": "leave_generation", "variant": "classic", "letterdist_id": ld,
             "layout_id": layout, "kwg_id": kwg_id, "num_iterations": 10,
-            "target_rack_count": 10, "racks_per_task": 10,
+            "target_rack_counts": [10], "racks_per_task": 10,
         })
     };
     let cases = [
@@ -673,8 +673,8 @@ async fn leave_job(db: &TestDb) -> Uuid {
     let kwg = db.input_data("kwg", "NWL23").await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, 100, 2, 1000, 2)",
+             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, 100, ARRAY[1000, 1000], 2)",
     )
     .bind(job)
     .bind(kwg)
@@ -1132,7 +1132,7 @@ async fn a_catalan_games_job_runs_and_a_catalan_rack_job_is_refused_at_creation(
         json!({
             "job_type": "leave_generation", "variant": "classic", "letterdist_id": ld,
             "layout_id": layout, "kwg_id": kwg, "num_iterations": 10,
-            "target_rack_count": 10, "racks_per_task": 10,
+            "target_rack_counts": [10], "racks_per_task": 10,
         }),
     ] {
         let (status, refused) = admin.create_job(body.clone()).await;

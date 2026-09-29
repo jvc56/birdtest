@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
-  import { blankFields, jobTypeLabel, unchosenText } from '$lib/format';
+  import { blankFields, jobTypeLabel, parseTargetRackCounts, unchosenText } from '$lib/format';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -50,8 +50,10 @@
   // Keep every position the games analyse, searchable on the job's page.
   let capturePositions = false;
   let numIterations = 10000;
-  let generationCount = 1;
-  let targetRackCount = 500;
+  // One occurrence target per generation, as MAGPIE's `leavegen` takes them:
+  // the list's length is how many generations the job runs.
+  let targetRackCounts = '500';
+  $: targets = parseTargetRackCounts(targetRackCounts);
   let racksPerTask = 50;
   let leaveUseWordmap = true;
 
@@ -149,8 +151,7 @@
           ...common,
           kwg_id: leaveKwgId,
           num_iterations: numIterations,
-          generation_count: generationCount,
-          target_rack_count: targetRackCount,
+          target_rack_counts: 'targets' in targets ? targets.targets : [],
           racks_per_task: racksPerTask,
           use_wordmap: leaveUseWordmap
         };
@@ -170,6 +171,11 @@
     });
     if (unchosen) {
       error = unchosen;
+      fromSubmit = true;
+      return;
+    }
+    if (jobType === 'leave_generation' && 'error' in targets) {
+      error = `Targets per generation: ${targets.error}`;
       fromSubmit = true;
       return;
     }
@@ -401,19 +407,29 @@
         <input id="iters" type="number" min="1" class="input" bind:value={numIterations} />
       </div>
       <div>
-        <label class="label" for="gens">Generations</label>
-        <input id="gens" type="number" min="1" class="input" bind:value={generationCount} />
-      </div>
-    </div>
-    <div class="grid grid-cols-2 gap-3">
-      <div>
-        <label class="label" for="target">Occurrences per rack</label>
-        <input id="target" type="number" min="1" class="input" bind:value={targetRackCount} />
-      </div>
-      <div>
         <label class="label" for="rpt">Racks per task</label>
         <input id="rpt" type="number" min="1" max="10000" class="input" bind:value={racksPerTask} />
       </div>
+    </div>
+    <div>
+      <label class="label" for="targets">Occurrences per rack, per generation</label>
+      <input
+        id="targets"
+        class="input"
+        inputmode="numeric"
+        placeholder="100, 200, 500, 1000"
+        bind:value={targetRackCounts}
+      />
+      <p class="mt-1 text-xs text-muted-foreground">
+        {#if 'error' in targets}
+          <span class="field-error">{targets.error}</span>
+        {:else}
+          {targets.targets.length}
+          {targets.targets.length === 1 ? 'generation' : 'generations'}. Each closes once every
+          rack has occurred its own target number of times, as in MAGPIE's
+          <code>leavegen 100,200,500,…</code>.
+        {/if}
+      </p>
     </div>
     <label class="flex items-center gap-2">
       <input type="checkbox" bind:checked={leaveUseWordmap} />

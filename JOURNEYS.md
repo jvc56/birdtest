@@ -611,12 +611,15 @@ closes in seconds rather than never.
 
 - [ ] **Do** **New job**: Leave generation, "tester leaves", letter distribution
   `english_ab`, board `standard15`, lexicon `CSW21_ab`, games per task 1,000,
-  generations 3, occurrences per rack 100, racks per task 50. **Expect**
-  Redundancy greyed out: leave generation runs at redundancy 1.
+  racks per task 50, occurrences per rack per generation "100, 200, 300".
+  **Expect** "3 generations." under the targets, and Redundancy greyed out:
+  leave generation runs at redundancy 1. (**Do** type "100, 0" there first.
+  **Expect** a red "Every target must be between 1 and 1,000,000, not 0.")
 - [ ] **Do** make room (A-8) and activate it at 16%. **Expect** its wordmap built
   on **Derived data** within about fifteen seconds (A-6).
 - [ ] **Expect**, on its public page, the generations closing one after another
-  — "Generation 2 of 3", racks at target "8 / 8" — and the job completed
+  — "Generation 2 of 3 — target 200 occurrences per rack", "Targets by
+  generation: 100, 200, 300.", racks at target "8 / 8" — and the job completed
   within about a minute: "its last generation was built".
 - [ ] **Do** **Merge progress now** on its **Manage** page. **Expect** "Merged N
   staged results into M racks." (N may be 0 once it has finished.)

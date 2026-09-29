@@ -894,7 +894,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 
 **Leave generation**
 
-- Current generation number and the configured per-generation minimum rack target (e.g., "Generation 3 — target: 500 occurrences per rack").
+- Current generation number and that generation's own occurrence target (e.g., "Generation 3 of 6 — target 500 occurrences per rack"), and every generation's target when they differ.
 - **Live**, pushed as results land: tasks completed and games played in the in-progress generation.
 - **As of the last merge**, and labelled with its time: racks at target out of the generation's total, and the rack with the fewest occurrences with its count. Accepted results are staged and merged into the per-rack totals in batches — every half hour, and about once a minute as a generation nears its end — so these lag by that much; see [What a merge costs](#what-a-merge-costs). Neither comes from a worker's heartbeat.
 
@@ -917,7 +917,9 @@ JobStats {
                        sprt: { llr, lower_bound, upper_bound, status } | null,
                        decided? }
   opening_racks?:    { racks_analyzed, racks_total }
-  leave_generation?: { current_generation, generation_count, target_rack_count,
+  leave_generation?: { current_generation, generation_count,
+                       target_rack_count,     // the current generation's
+                       target_rack_counts,    // every generation's, in order
                        tasks_completed, games_played,            // live
                        racks_at_target, racks_total, min_rack, min_rack_count,
                        progress_as_of }                          // as of the last merge
@@ -2790,7 +2792,7 @@ Results are a `GameResultsResponse` — the same type games use — carrying the
 
 #### Leave Generation — On-demand, partitioned generations
 
-Leave generation has sequential phases: generation N must complete before generation N+1 begins. Within a generation, work is **partitioned across many parallel workers**: each task forces a different subset of the racks that still need occurrences for the current generation and plays a bounded batch of games. A generation is not "one worker, one task" — it's many small tasks that collectively drive every rack up to the configured per-generation occurrence target.
+Leave generation has sequential phases: generation N must complete before generation N+1 begins. Within a generation, work is **partitioned across many parallel workers**: each task forces a different subset of the racks that still need occurrences for the current generation and plays a bounded batch of games. A generation is not "one worker, one task" — it's many small tasks that collectively drive every rack up to the generation's occurrence target. The job states one target per generation — `target_rack_counts`, MAGPIE's own `leavegen 100,200,500,…` shape — and the list's length is how many generations it runs; a later generation, playing better leaves, can be sampled harder.
 
 **State**: Per-rack occurrence progress *within* the current generation is tracked directly in Postgres, in `leave_rack_progress (job_id, generation, rack, occurrence_count, equity_sum)`. An accepted result is **staged** (`leave_rack_staging`, one row per task) and folded into those totals by a **merge** (`leave_gen::merge_staged`) — periodically, when a claim finds the generation nearly done, and always before a generation closes — rather than by the submission itself; see "On result acceptance" and [What a merge costs](#what-a-merge-costs). The generation's live counters (`leave_generation_progress`) move with every accepted result. None of it needs anything from MAGPIE beyond what already exists. The output of a *completed* generation (a combined KLV, built server-side once every rack has reached target — see Aggregation below) is stored in S3 and referenced by `leave_generation_artifacts.artifact_key`; the next generation's tasks receive that artifact key as input.
 
@@ -2814,8 +2816,8 @@ one still uploading does not — see "A request fails on a stall" under
 unaffected either way, since they send keep-alives every 15 seconds.
 
 At claim time:
-1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and `configured_generation_count` generations are already done, return "no work."
-2. Check that the generation's rack universe exists — every generation's, the first included, is written by a task the first claim to find it missing starts. That check is one indexed `EXISTS`. A claim that finds the universe missing rolls back, starts the seeding on its own task, and treats the job as having no work yet: the seeding takes the job's lock without waiting and holds it while it writes, so no claim reads a half-written universe, and a seeding a client or a deploy interrupts rolls back whole and is started again by the next claim. (It used to run inside the claim itself, where MAGPIE's 120-second request timeout could cancel it — on a database slower than that at writing 3.2 million rows, every claim restarted it and none finished.) Then select up to `racks_per_task` racks below `target_rack_count`, in one of two ways (`leave_gen::next_step`), chosen from the generation's summary row — how many racks were below target as of the last merge, the same age as the counts both selections read.
+1. Determine the current generation: the lowest generation number that hasn't been marked complete. If none exists and as many generations as `target_rack_counts` lists are already done, return "no work."
+2. Check that the generation's rack universe exists — every generation's, the first included, is written by a task the first claim to find it missing starts. That check is one indexed `EXISTS`. A claim that finds the universe missing rolls back, starts the seeding on its own task, and treats the job as having no work yet: the seeding takes the job's lock without waiting and holds it while it writes, so no claim reads a half-written universe, and a seeding a client or a deploy interrupts rolls back whole and is started again by the next claim. (It used to run inside the claim itself, where MAGPIE's 120-second request timeout could cancel it — on a database slower than that at writing 3.2 million rows, every claim restarted it and none finished.) Then select up to `racks_per_task` racks below the generation's own target (`target_rack_counts[generation]`), in one of two ways (`leave_gen::next_step`), chosen from the generation's summary row — how many racks were below target as of the last merge, the same age as the counts both selections read.
 
    **While many racks are below target — more than a hundred tasks' worth (`SWEEP_WHILE_TASKS_REMAIN`) — a sweep.** The generation's racks are handed out in primary-key order from a cursor remembered between claims (`leave_selection_cursors`, one row per generation, read and written only under the job's lock), one *lap* over the universe at a time, skipping racks already at target. A lap **starts only with no claim of the generation in flight and nothing staged**. From there every rack that is out — forced by an open claim, or by a result not yet merged — was handed out during this lap and so lies behind the cursor, and nothing ahead of it is out: a claim needs no list of what is out, and selection costs the same with one result staged as with ten thousand. (A task whose claim lapsed is reissued as it stands, before anything new is selected, so its racks stay behind the cursor with it.) Each selection reads one rack more than a task holds, so the task that takes a lap's last racks knows it and deletes the cursor in its own transaction; after that the job hands out nothing until the lap's last results are in and merged, and the next lap selects on exact counts. That pause is one task's duration and one merge per lap — some 6,400 tasks for English — and it is the wait that already precedes closing a generation, which is simply a lap that starts and finds nothing below target. (One task's duration when every worker holding one of the lap's last tasks is alive. When one is not, it is the heartbeat timeout for that claim to lapse plus a whole task for whoever is reissued it, with the job handing out nothing meanwhile; it is left that way on purpose for now — see [Known Limits and Open Questions](#known-limits-and-open-questions), KL-15.) A cursor lost to a purge or a partial restore is a lap not started: the same rule applies and nothing is handed out twice. A claim that hands out nothing commits rather than rolls back, so a lap found finished stays found.
 
@@ -5049,7 +5051,7 @@ the body omits them:
 | `min_games` / `min_pairs` | none: required when `sprt_enabled` is true |
 | `sprt_alpha` / `sprt_beta` | 0.05 |
 | `elo_low` / `elo_high` | −10 / +10 |
-| `generation_count` | 1 |
+| `target_rack_counts` (leave generation) | none: required, one occurrence target per generation, 1 to 100 of them, each 1 to 1,000,000 |
 | `use_wordmap` (leave generation) | **true** — it is the most game-heavy job type there is and a wordmap is a large speedup; workers build one on demand |
 | `capture_positions` | false |
 
@@ -6193,10 +6195,20 @@ CREATE TABLE job_leave_config (
     kwg_id         UUID NOT NULL REFERENCES input_data(id),
     -- Games each leave-gen task plays over its forced-rack subset.
     num_iterations INT NOT NULL,
-    -- How many sequential generations this job runs before it is complete.
-    generation_count  INT NOT NULL DEFAULT 1 CHECK (generation_count >= 1),
-    -- Per-generation occurrence target every rack must reach before the generation closes.
-    target_rack_count INT NOT NULL CHECK (target_rack_count >= 1),
+    -- The occurrence target every rack must reach before a generation closes,
+    -- one per generation: element g (1-based, as generations are numbered) is
+    -- generation g's, and the array's length is how many generations the job
+    -- runs before it is complete. MAGPIE's `leavegen 100,200,500,…` shape.
+    -- `<= ALL` over an array holding a NULL is NULL, which a CHECK passes, so
+    -- the NULL test is separate; and it is indexed by generation, so flat and
+    -- starting at 1.
+    target_rack_counts INT[] NOT NULL CHECK (
+        array_ndims(target_rack_counts) = 1
+        AND array_lower(target_rack_counts, 1) = 1
+        AND cardinality(target_rack_counts) >= 1
+        AND 1 <= ALL (target_rack_counts)
+        AND array_position(target_rack_counts, NULL) IS NULL
+    ),
     -- Size of the forced-rack subset handed to a single task.
     racks_per_task    INT NOT NULL CHECK (racks_per_task >= 1),
     -- Whether the leave-generating bot plays with a wordmap. Sent to the worker,
@@ -7613,7 +7625,8 @@ says so in its implemented option, rather than being removed.
 - **Options considered:** a spawned task with a status row, like exports.
 - **Option implemented:** None.
 - **Justification:** Each upload is idempotent, so running it again repairs a
-  partial run. Build the task if a job ever has that many generations.
+  partial run. Build the task if a job ever has that many generations. (A job
+  may list up to 100 generations' targets, so one that long can exist.)
 
 **KL-20. A submission's validation ran while its claim and task rows were locked.** *(Closed.)*
 - **Context:** It ran inside the same locks before, on an async worker, and then on the blocking pool.

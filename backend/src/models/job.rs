@@ -199,10 +199,30 @@ pub struct LeaveConfig {
     /// lexicon, so this is the one place a lexicon still sits on a job.
     pub kwg_id: Uuid,
     pub num_iterations: i32,
-    pub generation_count: i32,
-    pub target_rack_count: i32,
+    /// The occurrence target every rack must reach before each generation
+    /// closes, one per generation: its length is how many generations the job
+    /// runs. MAGPIE's own `leavegen 100,200,500,…` takes the same list; a
+    /// generation's leaves are only as good as the counts behind them, so later
+    /// generations, playing better leaves, are worth sampling harder.
+    pub target_rack_counts: Vec<i32>,
     pub racks_per_task: i32,
     pub use_wordmap: bool,
+}
+
+impl LeaveConfig {
+    /// How many generations the job runs before it is complete.
+    pub fn generation_count(&self) -> i32 {
+        self.target_rack_counts.len() as i32
+    }
+
+    /// The occurrence target of `generation` (1-based, as generations are
+    /// numbered). The schema guarantees at least one target; a generation past
+    /// the last is never opened, and reads the last one's.
+    pub fn target_for(&self, generation: i32) -> i64 {
+        let last = self.target_rack_counts.len().saturating_sub(1);
+        let index = usize::try_from(generation - 1).unwrap_or(0).min(last);
+        self.target_rack_counts.get(index).copied().map_or(1, i64::from)
+    }
 }
 
 /// `games` and `game_pairs` share every SPRT-relevant field; the only difference

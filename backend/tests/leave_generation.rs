@@ -1,5 +1,5 @@
 //! Leave generation's claim-time decisions and generation bookkeeping, against
-//! a real database and nothing else (`I-LEAVE-3`, `-5`, `-7`, `-9`, `-10`, and
+//! a real database and nothing else (`I-LEAVE-3`, `-5`, `-7`, `-9`, `-10`, `-24`, and
 //! the `seed_generation` half of `I-DATA-2`).
 //!
 //! What needs a real MAGPIE or an object store -- building, uploading and
@@ -39,8 +39,8 @@ async fn leave_job(
     let kwg = db.input_data("kwg", "NWL23").await;
     sqlx::query(
         "INSERT INTO job_leave_config
-             (job_id, kwg_id, num_iterations, generation_count, target_rack_count, racks_per_task)
-         VALUES ($1, $2, $3, $4, $5, $6)",
+             (job_id, kwg_id, num_iterations, target_rack_counts, racks_per_task)
+         VALUES ($1, $2, $3, array_fill($5::int, ARRAY[$4::int]), $6)",
     )
     .bind(job)
     .bind(kwg)
@@ -558,6 +558,80 @@ async fn a_two_generation_job_advances_and_finishes_after_its_last() {
         vec![0, 1, 2],
         "no third generation was started"
     );
+}
+
+/// I-LEAVE-24: each generation closes at its own target. Generation 1's is 10
+/// and generation 2's 30, so every rack at 10 closes the first and not the
+/// second -- selection still hands generation 2's racks out, and its summary
+/// counts a rack at target only at 30 -- and every rack at 30 closes the
+/// second, the last, which completes the job.
+#[tokio::test]
+async fn each_generation_closes_at_its_own_target() {
+    let db = TestDb::new().await;
+    let (job, seeded) = leave_job(&db, 2, 10, 2, 100).await;
+    sqlx::query("UPDATE job_leave_config SET target_rack_counts = ARRAY[10, 30] WHERE job_id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    // The generation's summary as a merge recomputes it. A merge with nothing
+    // to fold recomputes only a summary never computed, so it is marked so.
+    let at_target = |generation: i32| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query(
+                "UPDATE leave_generation_progress SET merged_at = NULL
+                 WHERE job_id = $1 AND generation = $2",
+            )
+            .bind(job)
+            .bind(generation)
+            .execute(&pool)
+            .await
+            .unwrap();
+            leave_gen::merge_staged(&pool, job, generation, true).await.unwrap();
+            sqlx::query_scalar::<_, i64>(
+                "SELECT racks_at_target FROM leave_generation_progress
+                 WHERE job_id = $1 AND generation = $2",
+            )
+            .bind(job)
+            .bind(generation)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+
+    set_all_counts(&db, job, 1, 10).await;
+    assert_eq!(at_target(1).await, seeded, "10 is generation 1's target");
+    assert_eq!(next_step(&db, job).await, Step::Transition(1));
+    close(&db, job, 1, &"1".repeat(64)).await;
+    assert_eq!(job_status(&db, job).await, "active");
+    seed(&db, job, 2).await;
+
+    // At generation 1's target, generation 2 has every rack still to raise:
+    // no rack counts as at target, and a claim is handed racks.
+    let order = racks_in_order(&db, job, 2).await;
+    set_all_counts(&db, job, 2, 10).await;
+    for rack in &order[..40] {
+        set_count(&db, job, 2, rack, 30).await;
+    }
+    assert_eq!(at_target(2).await, 40, "only the racks at 30 are at generation 2's target");
+    match next_step(&db, job).await {
+        Step::Dispatch { generation, racks, .. } => {
+            assert_eq!(generation, 2);
+            for rack in &racks {
+                assert_eq!(count_of(&db, job, 2, rack).await, 10, "{rack} is below 30");
+            }
+        }
+        other => panic!("generation 2 closed at generation 1's target: {other:?}"),
+    }
+    set_all_counts(&db, job, 2, 29).await;
+    assert!(matches!(next_step(&db, job).await, Step::Dispatch { generation: 2, .. }));
+
+    set_all_counts(&db, job, 2, 30).await;
+    assert_eq!(next_step(&db, job).await, Step::Transition(2));
+    close(&db, job, 2, &"2".repeat(64)).await;
+    assert_eq!(job_status(&db, job).await, "completed", "two targets, two generations");
 }
 
 /// Every key anywhere in `value`, and every number or string it holds, for
