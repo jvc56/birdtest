@@ -7,7 +7,8 @@ test.use({ storageState: ADMIN_STATE });
 /**
  * E-7: the ratings page. An admin creates a pool through its form, adds a config, sees the fit
  * appear, removes it, and sees the ratings change -- the one flow where a
- * write is meant to move numbers elsewhere on the page.
+ * write is meant to move numbers elsewhere on the page. Then moves the anchor,
+ * and deletes the pool.
  *
  * The evidence is three finished game-pairs jobs among three static configs:
  * the seeded static-equity vs static-score, and two this journey starts. The
@@ -143,4 +144,25 @@ test('E-7: an admin builds a rating pool and watches membership move the ratings
   await expect(fitLine(page)).toHaveText(membershipFit('1 job'));
   await expect(configRow(page, RATED).locator('td').nth(1)).toHaveText(alone);
   expect(alone).not.toBe(withThird);
+
+  // Move the anchor to the other member, pinned at 1600: the pool refits on
+  // the new scale, and the old anchor sits as far from it as before, the other
+  // way (to the table's rounding).
+  await page.getByLabel('Anchor player config').selectOption({ label: RATED });
+  await page.getByLabel('Anchor rating').fill('1600');
+  await page.getByRole('button', { name: 'Save', exact: true }).click();
+  await expect(fitLine(page)).toContainText('(anchor)');
+  await expect(page.getByText('anchored at 1600')).toBeVisible();
+  const ratedRow = configRow(page, RATED);
+  await expect(ratedRow.locator('td').nth(0)).toContainText('anchor');
+  await expect(ratedRow.locator('td').nth(1)).toHaveText('1600.0');
+  await expect(ratedRow.locator('td').nth(2)).toHaveText('fixed');
+  const oldAnchor = Number(await rating(page, ANCHOR));
+  expect(Math.abs(oldAnchor - (1600 + 1500 - Number(alone)))).toBeLessThan(0.2);
+
+  // Delete it: confirmed, then back on the list, where it is gone.
+  page.once('dialog', (dialog) => dialog.accept());
+  await page.getByRole('button', { name: 'Delete pool' }).click();
+  await expect(page).toHaveURL(/\/ratings$/);
+  await expect(page.locator('tbody tr', { hasText: poolName })).toHaveCount(0);
 });

@@ -635,6 +635,17 @@ closes in seconds rather than never.
   **Add** it back. **Expect** every rating to move: its games are evidence for
   everyone. **Expect** no Remove on the anchor.
 - [ ] **Do** **Recompute**. **Expect** "Last fit … (manual)".
+- [ ] **Do** under **Anchor**, pick `static-score` and 1600, **Save**. **Expect**
+  "anchored at 1600", "Last fit … (anchor)", `static-score` marked anchor at
+  1600.0 and every other rating moved by the same amount. **Expect**
+  `static-equity` now has a **Remove** button.
+- [ ] **Do** pick a config that is not a member as the anchor (from "Other
+  player configs") and **Save**. **Expect** it listed as a member and the
+  anchor.
+- [ ] **Do** **Delete pool** on the second pool, and confirm. **Expect** the
+  ratings list, without it.
+- [ ] **Expect** no Anchor card or Delete button when signed out or as a
+  non-admin.
 
 ### A-14 Delete a user
 

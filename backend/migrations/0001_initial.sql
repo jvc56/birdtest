@@ -1420,7 +1420,8 @@ CREATE TABLE rating_runs (
     pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
     computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Why this run happened: 'membership' (an admin added or removed a config),
-    -- 'evidence' (new results arrived), or 'manual'.
+    -- 'evidence' (new results arrived), 'manual', or 'anchor' (an admin moved
+    -- the anchor or its rating).
     trigger       TEXT NOT NULL,
     method        TEXT NOT NULL DEFAULT 'bradley_terry_newton',
     -- Fit provenance. A run that did not converge is still stored and still

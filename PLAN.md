@@ -456,13 +456,14 @@ Everything below lives in four `rating_*` tables and one module. See
 #### In one place: when a rating is computed, and where it is shown
 
 A rating is never updated by a result landing. It is recomputed for a whole
-pool, from scratch, by `ratings::fit_and_store`, on exactly three triggers:
+pool, from scratch, by `ratings::fit_and_store`, on exactly four triggers:
 
 | Trigger | When | Who | What is written |
 |---|---|---|---|
 | **evidence** | Every two minutes, from a sweep started by `main.rs` (`ratings::recompute_stale`), for each pool whose eligible jobs' `games_completed` sum, or whose members, differ from its last run's (`evidence_games`) | The server, unattended | A new `rating_runs` row with a `player_config_ratings` row per member and a `rating_run_residuals` row per head-to-head — or nothing, if the evidence has not moved |
 | **membership** | Immediately, inside the request, when an admin adds or removes a member (`POST`/`DELETE /api/admin/rating-pools/:id/members`) | An admin | The same, unconditionally |
 | **manual** | Immediately, on `POST /api/admin/rating-pools/:id/recompute` | An admin | The same, unconditionally |
+| **anchor** | Immediately, in the same transaction as the change, when an admin moves the anchor or its rating (`PATCH /api/admin/rating-pools/:id`). The sweep would never notice: neither the evidence nor the members moved | An admin | The same, unconditionally |
 
 So a result submitted now is in a rating within two minutes, and a job that
 finishes at 03:00 is rated by 03:02 without anyone doing anything. Nothing on
@@ -478,7 +479,8 @@ Ratings are **displayed on the ratings pages and nowhere else**:
   run's provenance (trigger, iterations, convergence, evidence consumed), and
   the residual table showing where the fit disagrees with the games. A config
   with no path of games to the anchor is listed as unrated rather than drawn.
-  Admin membership controls appear inline here for admins.
+  Admin membership controls appear inline here for admins, with the anchor
+  (config and rating) and a Delete button.
 - **No history chart.** The page once drew each config's rating across the
   stored runs; it was removed as more noise than signal on a page read for the
   latest fit. `GET /api/rating-pools/:id/history` still serves those series to
@@ -589,7 +591,20 @@ membership row goes, the results stay in `game_results`, so re-adding costs
 nothing but a recompute.
 
 The anchor cannot be removed while it is the anchor; the pool would lose its
-scale.
+scale. It can be moved: `PATCH /api/admin/rating-pools/:id` sets another config
+(added as a member if it is not one) or another rating, and refits in the same
+transaction, so the page never shows the new anchor beside ratings on the old
+scale. Earlier runs keep the scale they were fitted on, so the history steps at
+the change — which is what happened. The change, a removal's anchor check and a
+pool's delete all take the pool's fit lock, so none of them interleaves with a
+fit or with each other: a removal that passed its check cannot land after an
+anchor change made its config the anchor.
+
+A pool can be deleted (`DELETE /api/admin/rating-pools/:id`): its members, runs,
+ratings and residuals cascade, and its census (`name`, `members`, `runs`) is
+logged first. The games stay with their jobs — a pool is only a view over them
+— and its configs and input data are free to be deleted after it. A sweep that
+listed the pool before the delete skips it without logging a failure.
 
 #### Two things the fit has to handle honestly
 
@@ -4931,7 +4946,9 @@ All Admin API endpoints require the requesting user to have `is_admin = TRUE`. A
 | `GET` | `/api/admin/backups` | Recent backup runs and how stale the newest successful one is. Read-only: backups are performed by a scheduled task, never by the server — see [Backups and Restore](#backups-and-restore). |
 | `POST` | `/api/admin/rating-pools` | Create a rating pool: name, scope, and the anchor config that fixes the scale. The anchor joins as a member automatically. |
 | `POST` | `/api/admin/rating-pools/:id/members` | Add a player config to the pool and refit it. Returns the new run id. |
-| `DELETE` | `/api/admin/rating-pools/:id/members/:config_id` | Remove a config and refit. Refused for the pool's anchor, which every other rating is measured against; `404` for a config not in the pool, which is neither logged nor refitted. |
+| `DELETE` | `/api/admin/rating-pools/:id/members/:config_id` | Remove a config and refit. Refused for the pool's anchor, which every other rating is measured against (move the anchor first); `404` for a config not in the pool, which is neither logged nor refitted. |
+| `PATCH` | `/api/admin/rating-pools/:id` | Move the anchor (`anchor_player_config_id`, added as a member if it is not one) and/or its `anchor_rating`, and refit in the same transaction (trigger `anchor`). Logged as `rating_pool.anchor_changed` with old → new in the reason. `run_id` is `null` when nothing changed. |
+| `DELETE` | `/api/admin/rating-pools/:id` | Delete a pool with its members, runs, ratings and residuals, after logging its census. The games stay with their jobs. `204`; `404` for a pool that does not exist. |
 | `POST` | `/api/admin/rating-pools/:id/recompute` | Force a refit without changing membership. |
 | `POST` | `/api/admin/jobs/:id/merge-progress` | Leave-generation jobs only. Fold the job's staged results into its per-rack totals now rather than at the next half-hourly merge, waiting for a merge already running. Returns `{ folds_merged, racks_updated }`. Nothing needs it — claims ask for a merge near a generation's end and a transition drains before it reads — so it is for an admin who wants the page's rack figures current, and for the end-to-end suite. |
 | `POST` | `/api/admin/jobs/:id/rebuild-artifacts` | Leave-generation jobs only. Recompute each generation's KLV from `leave_rack_progress` and report whether the stored object is still present and still matches its recorded hash. Rewrites only missing objects unless `?force=true`. |
@@ -6894,7 +6911,8 @@ CREATE TABLE rating_runs (
     pool_id       UUID NOT NULL REFERENCES rating_pools(id) ON DELETE CASCADE,
     computed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Why this run happened: 'membership' (an admin added or removed a config),
-    -- 'evidence' (new results arrived), or 'manual'.
+    -- 'evidence' (new results arrived), 'manual', or 'anchor' (an admin moved
+    -- the anchor or its rating).
     trigger       TEXT NOT NULL,
     method        TEXT NOT NULL DEFAULT 'bradley_terry_newton',
     -- Fit provenance. A run that did not converge is still stored and still
@@ -7831,16 +7849,20 @@ says so in its implemented option, rather than being removed.
 - **Justification:** A character-set rule has to allow for international names,
   which is a product decision.
 
-**KL-41. A rating pool cannot be edited or deleted once created.**
-- **Context:** A pool's anchor and scope are fixed. Creation validates them: a
+**KL-41. A rating pool could not be edited or deleted once created.** Closed in the September 2026 feature batch.
+- **Context:** A pool's anchor and scope were fixed. Creation validates them: a
   variant a job can have, input-data rows of the right roles, and an anchor
   rating whose scale does not overflow.
-- **Problem:** A pool made by mistake stays, and keeps its anchor config from
-  being deleted.
+- **Problem:** A pool made by mistake stayed, and kept its anchor config from
+  being deleted; an anchor could not be moved at all.
 - **Options considered:** an update route and a delete route.
-- **Option implemented:** Validation at creation only.
-- **Justification:** It is admin-only and cosmetic. Add the routes if it ever
-  matters.
+- **Option implemented:** Both. `PATCH /api/admin/rating-pools/:id` moves the
+  anchor and its rating and refits; `DELETE` removes the pool and what cascades
+  from it, freeing its configs and input data. The scope (variant,
+  distribution, layout) stays fixed: a pool over other conditions is another
+  pool.
+- **Justification:** Mistakes are cheap to undo, and a pool's scale can follow
+  the configs an admin wants it anchored on.
 
 **KL-42. A worker's identity was resolved before its rate limit was checked. Closed in the twenty-first and twenty-second audits.**
 - **Context:** The worker extractor looked a presented key or UUID up in the

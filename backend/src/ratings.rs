@@ -26,6 +26,9 @@ pub enum Trigger {
     /// New results arrived.
     Evidence,
     Manual,
+    /// An admin moved the anchor or its rating. The sweep would never notice:
+    /// it compares evidence and membership, and neither changed.
+    Anchor,
 }
 
 impl Trigger {
@@ -34,6 +37,7 @@ impl Trigger {
             Trigger::Membership => "membership",
             Trigger::Evidence => "evidence",
             Trigger::Manual => "manual",
+            Trigger::Anchor => "anchor",
         }
     }
 }
@@ -188,7 +192,12 @@ const RATING_LOCK_NAMESPACE: i32 = 2;
 /// decision. Per pool, so pools never wait on each other, and
 /// transaction-scoped, so it is released on commit, on rollback, and on a
 /// dropped connection.
-async fn lock_pool_fit(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<()> {
+///
+/// Everything else that changes what a fit reads takes it too: an anchor
+/// change, a member's removal (whose anchor check must still hold at its
+/// delete), and a pool's deletion, which so waits for a fit in flight rather
+/// than having its rows cascaded out from under it.
+pub(crate) async fn lock_pool_fit(conn: &mut PgConnection, pool_id: Uuid) -> AppResult<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2::text))")
         .bind(RATING_LOCK_NAMESPACE)
         .bind(pool_id)
@@ -253,7 +262,38 @@ async fn fit_and_store(
 ) -> AppResult<Option<Uuid>> {
     let mut tx = db.begin().await?;
     lock_pool_fit(&mut tx, pool_id).await?;
-    let pool = load_pool(&mut tx, pool_id).await?;
+    let run = fit_within(&mut tx, pool_id, trigger, only_if_evidence_changed).await?;
+    tx.commit().await?;
+    Ok(run)
+}
+
+/// Refits a pool inside the caller's transaction, which must already hold
+/// the pool's fit lock ([`lock_pool_fit`]).
+///
+/// For a change that must commit together with its refit: an anchor change
+/// stored without its run would leave the page showing ratings on the old
+/// scale beside the new anchor until someone pressed Recompute, since the
+/// sweep never notices an anchor move.
+pub(crate) async fn recompute_within(
+    conn: &mut PgConnection,
+    pool_id: Uuid,
+    trigger: Trigger,
+) -> AppResult<Uuid> {
+    fit_within(conn, pool_id, trigger, false)
+        .await?
+        .ok_or_else(|| AppError::internal("an unconditional refit stored nothing"))
+}
+
+/// Read, fit, write, on a connection whose transaction holds the fit lock.
+/// Returns `None` when the sweep's check finds nothing new; the caller commits
+/// either way (what that path writes is the refreshed evidence sum).
+async fn fit_within(
+    tx: &mut PgConnection,
+    pool_id: Uuid,
+    trigger: Trigger,
+    only_if_evidence_changed: bool,
+) -> AppResult<Option<Uuid>> {
+    let pool = load_pool(&mut *tx, pool_id).await?;
 
     // The cheap question first: have the pool's jobs completed any games, or
     // its members changed, since the last run? `games_completed` is each
@@ -297,12 +337,11 @@ async fn fit_and_store(
         .fetch_all(&mut *tx)
         .await?;
         if last == Some((Some(evidence_games), members)) {
-            tx.rollback().await?;
             return Ok(None);
         }
     }
 
-    let (members, matrix, pairs_used, jobs_used) = build_matrix(&mut tx, pool_id).await?;
+    let (members, matrix, pairs_used, jobs_used) = build_matrix(&mut *tx, pool_id).await?;
 
     if only_if_evidence_changed {
         // The evidence is the pairs *and* who is in the pool. Compared on the
@@ -332,7 +371,6 @@ async fn fit_and_store(
                     .bind(evidence_games)
                     .execute(&mut *tx)
                     .await?;
-                tx.commit().await?;
                 return Ok(None);
             }
         }
@@ -433,7 +471,6 @@ async fn fit_and_store(
         .await?;
     }
 
-    tx.commit().await?;
     Ok(Some(run_id))
 }
 
@@ -450,6 +487,10 @@ async fn fit_and_store(
 /// every pool ordered after it silently stopped being refit for as long as the
 /// misconfiguration lasted. Each pool is logged and skipped instead, and the
 /// count returned is of the fits that actually ran.
+///
+/// A pool an admin deleted after the list was read is skipped without a word:
+/// its fit finds no pool (the delete waits for a fit already under way, so
+/// this is the only way the two meet), and that is not a failure.
 pub async fn recompute_stale(db: &PgPool) -> AppResult<usize> {
     let pool_ids =
         sqlx::query_scalar::<_, Uuid>("SELECT id FROM rating_pools").fetch_all(db).await?;
@@ -459,6 +500,9 @@ pub async fn recompute_stale(db: &PgPool) -> AppResult<usize> {
         match recompute_if_stale(db, pool_id).await {
             Ok(true) => recomputed += 1,
             Ok(false) => {}
+            Err(err) if err.status == axum::http::StatusCode::NOT_FOUND => {
+                tracing::debug!(%pool_id, "a rating pool was deleted mid-sweep; skipping it")
+            }
             Err(err) => tracing::error!(
                 %pool_id, error = %err.message, "refitting a rating pool failed; skipping it"
             ),

@@ -637,6 +637,13 @@ export const api = {
     del<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/members/${configId}`),
   recomputeRatingPool: (poolId: string) =>
     post<{ run_id: string }>(`/api/admin/rating-pools/${poolId}/recompute`),
+  /** Moves the anchor (added as a member if it is not one) or its rating, and
+   *  refits; `run_id` is null when nothing changed. */
+  updateRatingPool: (
+    poolId: string,
+    body: { anchor_player_config_id?: string; anchor_rating?: number }
+  ) => patch<{ run_id: string | null }>(`/api/admin/rating-pools/${poolId}`, body),
+  deleteRatingPool: (poolId: string) => del<void>(`/api/admin/rating-pools/${poolId}`),
   inputData: () => get<InputData[]>('/api/admin/input-data'),
   deleteInputData: (id: string) => del<void>(`/api/admin/input-data/${id}`),
   startImport: (body: { tarball_date: string; git_ref?: string }) =>

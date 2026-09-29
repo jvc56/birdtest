@@ -1656,6 +1656,10 @@ permanent.
 - `I-RATE-11` A pool with one member (the anchor) and no games produces a run
   rather than an error. *(Covered:
   `ratings::a_pool_of_only_its_anchor_fits_to_an_empty_run`.)*
+- `I-RATE-12` A pool deleted after the sweep listed the pools is skipped
+  without an error logged, and the sweep goes on to the next. *(Covered:
+  `ratings::the_sweep_skips_a_pool_deleted_mid_sweep_quietly`, which deletes
+  the pool while the sweep waits on its fit lock and counts ERROR events.)*
 
 ### `I-STATS-*` — dashboard aggregates (`jobstats.rs`)
 
@@ -1861,14 +1865,16 @@ import can be watched) and a per-test MinIO bucket.
   the audit trail cannot claim something that did not happen. *(Covered:
   `audit::an_audit_row_in_a_rolled_back_transaction_does_not_persist`.)*
 - `I-AUDIT-3` Every destructive admin action writes exactly its record: one
-  row naming what it did, who did it and to what — except the three that
-  destroy recorded work (purge, job delete, user delete), which write that row
-  *and* their census (`I-JOB-10`), exactly that pair. The entry first said
-  "exactly one row"; the census is the second on purpose. *(Covered:
-  `audit::every_destructive_admin_action_writes_exactly_its_record`, across
-  deactivate, complete, purge and delete of a job, user delete, ban, unban,
-  input-file delete, player-config delete and pool-member removal. Deleting an
-  input file or a player config wrote nothing.)*
+  row naming what it did, who did it and to what — except the four that
+  destroy recorded work (purge, job delete, user delete, rating-pool delete),
+  which write that row *and* their census (`I-JOB-10`), exactly that pair, and
+  an anchor move that brings a new member in, which writes that addition too.
+  The entry first said "exactly one row"; the census is the second on purpose.
+  *(Covered: `audit::every_destructive_admin_action_writes_exactly_its_record`,
+  across deactivate, complete, purge and delete of a job, user delete, ban,
+  unban, input-file delete, player-config delete, pool-member removal, an
+  anchor move and a pool delete. Deleting an input file or a player config
+  wrote nothing.)*
 
 ### `I-ART-*` — object store (`artifacts.rs`)
 
@@ -2535,8 +2541,8 @@ below.
   `ratings::adding_an_unknown_member_or_to_an_unknown_pool_says_which`,
   `ratings::a_pool_that_could_rate_no_one_is_refused`.)*
 - `A-RATE-5` Removing the anchor is refused with a message naming what to do —
-  an anchor is fixed, so a pool anchored elsewhere (it named an operation that
-  did not exist until the eleventh audit).
+  move the anchor first (`A-RATE-8`). It once named an operation that did not
+  exist until the eleventh audit, and then a new pool, until anchors could move.
   *(Covered: `ratings::removing_the_anchor_is_refused_with_the_fix_named`.)*
 - `A-RATE-6` History returns points in time order and excludes unrated configs.
   *(Covered: `ratings::history_is_in_time_order_and_leaves_out_unrated_configs`,
@@ -2550,6 +2556,20 @@ below.
   audit, pass 25.)
 - `A-RATE-7` Recompute is admin-only and returns a new run. *(Covered:
   `ratings::only_an_admin_can_recompute_and_it_stores_a_new_run`.)*
+- `A-RATE-8` Moving the anchor to a config that is not a member adds it, pins
+  it at the new rating (`is_anchor` on it alone) and refits in the request as
+  an `anchor` run, logged old → new; moving only the rating shifts every rating
+  by the same amount; sending what is already there changes nothing; and the
+  old anchor can then be removed. *(Covered:
+  `ratings::an_anchor_change_refits_sets_the_anchor_and_adds_it_as_a_member`.)*
+- `A-RATE-8b` An anchor that does not exist is a `400` on its field, a rating
+  out of range or an empty body a `400`, an unknown pool a `404`, and none
+  changes the pool, its members or its runs. *(Covered:
+  `ratings::a_bad_anchor_change_is_refused_and_changes_nothing`.)*
+- `A-RATE-9` Deleting a pool cascades its members, runs, ratings and residuals,
+  logs its census, keeps the games, frees the configs it pinned for their own
+  delete, and is a `404` afterwards to read, delete or add to. *(Covered:
+  `ratings::deleting_a_pool_cascades_frees_its_configs_and_is_a_404_after`.)*
 
 ### `A-PUBLIC-*` — `routes/public.rs`
 

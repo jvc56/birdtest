@@ -239,6 +239,8 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
         Admin,
         r#"{"name":"pool","variant":"classic","letterdist_id":"00000000-0000-4000-8000-000000000001","layout_id":"00000000-0000-4000-8000-000000000001","anchor_player_config_id":"00000000-0000-4000-8000-000000000001"}"#,
     ),
+    ("PATCH", "/api/admin/rating-pools/:id", Admin, r#"{"anchor_rating":1500}"#),
+    ("DELETE", "/api/admin/rating-pools/:id", Admin, ""),
     (
         "POST",
         "/api/admin/rating-pools/:id/members",
@@ -448,8 +450,8 @@ async fn every_cookie_backed_write_requires_the_csrf_pair() {
         }
         checked += 1;
     }
-    // 22 admin writes, 3 account writes, logout and sign-out-everywhere.
-    assert_eq!(checked, 27);
+    // 24 admin writes, 3 account writes, logout and sign-out-everywhere.
+    assert_eq!(checked, 29);
 
     // Nothing was done under any of them: the admin is still signed in, and
     // the audit log is empty.
