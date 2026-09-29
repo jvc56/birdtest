@@ -1763,6 +1763,9 @@ Against a real MinIO (`TEST_S3_ENDPOINT`), one bucket per test.
   `artifacts::getting_an_absent_key_is_a_clean_not_found`.)*
 - `I-ART-3` A key is namespaced per job and generation, so two jobs cannot
   collide. *(Covered: `artifacts::two_jobs_and_two_generations_never_share_a_key`.)*
+- `I-ART-4` With `S3_PUBLIC_ENDPOINT` set, a presigned download link is signed
+  for that host and downloads there. *(Covered:
+  `artifacts::a_download_link_is_signed_for_the_public_endpoint`.)*
 
 ### `I-EXPORT-*` — exports (`exports.rs`)
 

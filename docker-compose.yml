@@ -162,6 +162,9 @@ services:
       TRUSTED_PROXY_HOPS: "1"
       S3_BUCKET: birdtest-artifacts
       S3_ENDPOINT: http://minio:9000
+      # Export downloads are presigned links the browser follows, and no
+      # browser resolves `minio`: they are signed for MinIO's published port.
+      S3_PUBLIC_ENDPOINT: http://localhost:${MINIO_PORT:-9000}
       AWS_ACCESS_KEY_ID: birdtest
       AWS_SECRET_ACCESS_KEY: birdtestbirdtest
       AWS_REGION: us-east-1

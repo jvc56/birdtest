@@ -58,17 +58,30 @@ fn cause(error: &dyn std::error::Error) -> String {
 pub struct ArtifactStore {
     cfg: Arc<Config>,
     client: aws_sdk_s3::Client,
+    /// Signs download links, and nothing else: `client` again unless
+    /// `S3_PUBLIC_ENDPOINT` names the store as a browser reaches it. A
+    /// presigned URL's signature covers its host, so one signed for
+    /// `minio:9000` cannot be rewritten to `localhost` afterwards.
+    presigner: aws_sdk_s3::Client,
 }
 
 impl ArtifactStore {
     pub async fn new(cfg: Arc<Config>) -> Self {
         let aws = aws_config::load_defaults(aws_config::BehaviorVersion::latest()).await;
-        let mut builder = aws_sdk_s3::config::Builder::from(&aws);
-        if let Some(endpoint) = &cfg.s3_endpoint {
-            // MinIO does not do virtual-host-style addressing out of the box.
-            builder = builder.endpoint_url(endpoint).force_path_style(true);
-        }
-        Self { cfg, client: aws_sdk_s3::Client::from_conf(builder.build()) }
+        let client_for = |endpoint: Option<&String>| {
+            let mut builder = aws_sdk_s3::config::Builder::from(&aws);
+            if let Some(endpoint) = endpoint {
+                // MinIO does not do virtual-host-style addressing out of the box.
+                builder = builder.endpoint_url(endpoint).force_path_style(true);
+            }
+            aws_sdk_s3::Client::from_conf(builder.build())
+        };
+        let client = client_for(cfg.s3_endpoint.as_ref());
+        let presigner = match &cfg.s3_public_endpoint {
+            Some(public) => client_for(Some(public)),
+            None => client.clone(),
+        };
+        Self { cfg, client, presigner }
     }
 
     pub async fn put(&self, key: &str, body: Vec<u8>) -> AppResult<String> {
@@ -140,7 +153,8 @@ impl ArtifactStore {
     /// doing so would put it back on the connection pool that limiting the
     /// stream exists to protect. The bucket blocks public access, so a
     /// presigned URL is the only way out of it, and it is minted for an admin
-    /// who has just asked for it.
+    /// who has just asked for it. Signed for `S3_PUBLIC_ENDPOINT` when that is
+    /// set, since the browser, not this process, follows it.
     pub async fn presigned_get(
         &self,
         key: &str,
@@ -149,7 +163,7 @@ impl ArtifactStore {
         let config = aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
             .map_err(|e| AppError::internal(format!("invalid presigning config: {e}")))?;
         let request = self
-            .client
+            .presigner
             .get_object()
             .bucket(&self.cfg.s3_bucket)
             .key(key)

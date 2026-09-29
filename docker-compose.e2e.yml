@@ -52,6 +52,8 @@ services:
       MAIL_BACKEND: file
       MAIL_OUTBOX_DIR: /outbox
       PUBLIC_URL: http://localhost:5280
+      # This project's MinIO port, not the development stack's.
+      S3_PUBLIC_ENDPOINT: http://localhost:9302
       GITHUB_API_URL: http://fixtures/api
       GITHUB_RAW_URL: http://fixtures/raw
       GITHUB_TOKEN: ""
