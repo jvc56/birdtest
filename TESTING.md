@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 222 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (11), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 123 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (5), `api.test.ts` (17), `auth.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1F Frontend unit | 132 | Vitest, `frontend/src/lib/`: `format.test.ts` (27), `jobSettings.test.ts` (5), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (9), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 162 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (17), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (4), `audit.rs` (3) |
 | 3 API | 229 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (27), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (11), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (6), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -149,6 +149,7 @@ incidentally by higher tiers.
 | `lib/api.ts` (error mapping, CSRF header) | 1F | Covered (`F-API-*`) |
 | `lib/sse.ts` | 1F | Covered (`F-SSE-*`) |
 | `lib/auth.ts` | 1F | Covered (`F-AUTH-*`) |
+| `lib/accountRules.ts` | 1F | Covered (`F-ACCOUNT-*`) |
 | Chart maths | 1F | Covered (`F-CHART-*`). The arithmetic moved out of the components into `lib/charts/*.ts` so it could be tested; the `.svelte` files that draw it are exercised only by tier 5 |
 | Every page under `routes/` | 5 | Partial — the eleven journeys (E-10 visits `/users`). `/admin/backups`, `/admin/derived-data`, `/admin/fleet` and `/admin/users` are in none of them; their endpoints are tier 3 |
 
@@ -795,6 +796,24 @@ Test the pure functions; do not snapshot the SVG.
   network failure, in flight, and a later 401 replacing a user.)*
 - `F-AUTH-2` `signOut` clears the store even if the request fails, so the UI
   cannot be left showing a session that is gone. *(Covered: `auth.test.ts`.)*
+
+### `F-ACCOUNT-*` — `lib/accountRules.ts`
+
+The register, sign-in and password-reset forms are `novalidate` and check these
+before a request, so every error is red text under its field; with the
+browser's checks, some were a native popup and the browser took `a@b`, which the
+server refuses. Each rule mirrors one in `routes/auth.rs`, with its wording.
+
+- `F-ACCOUNT-1` The email rule is `is_bare_address`: every case of
+  `only_a_bare_address_is_an_email` answers the same, `a@b` refused; the 64,
+  63 and 254 length limits hold; the address is checked trimmed and
+  lower-cased, as the server stores it. *(Covered: `accountRules.test.ts`.)*
+- `F-ACCOUNT-2` A username is 3 to 32 characters after trimming, counted in code
+  points, trimmed of Rust's white space (U+0085 is; U+FEFF, which JavaScript's
+  `trim` takes, is not). *(Covered: `accountRules.test.ts`.)*
+- `F-ACCOUNT-3` An empty field is named ("must not be empty"), a password
+  untrimmed; only the fields with a problem are reported. *(Covered:
+  `accountRules.test.ts`.)*
 
 ### `F-DOCS-*` — contributor instructions in `routes/`
 
@@ -2762,8 +2781,9 @@ admin in once and the admin journeys reuse its storage state.
   page and the contributor leaderboard. *(Covered:
   `e1-anonymous-browsing.spec.ts`.)*
 - `E-2` Register → confirm the email → log in → generate an API key → see it
-  exactly once → deactivate it. *(Covered: `e2-register-and-api-key.spec.ts`,
-  reading its code from the outbox.)*
+  exactly once → deactivate it; first, a bad username, `a@b` and no password
+  are refused as red text under each field, before any request. *(Covered:
+  `e2-register-and-api-key.spec.ts`, reading its code from the outbox.)*
 - `E-3` An admin imports input data, reviews the staged diff, and confirms it.
   *(Covered: `e3-input-data-import.spec.ts`, against the fixture tarballs.)*
 - `E-4` An admin creates two player configs and a game-pairs job, activates it
@@ -2783,7 +2803,8 @@ admin in once and the admin journeys reuse its storage state.
   *(Covered: `e7-ratings.spec.ts`.)*
 - `E-8` A job detail page renders the pentanomial table with the five buckets
   labelled, and the SPRT status text. *(Covered: `e8-pentanomial.spec.ts`.)*
-- `E-9` The password reset flow end to end. *(Covered:
+- `E-9` The password reset flow end to end, `a@b` refused under the field
+  first. *(Covered:
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
 - `E-10` A page renders correctly at phone width — one journey, not all of them.
   *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list, a

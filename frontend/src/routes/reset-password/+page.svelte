@@ -1,14 +1,21 @@
 <script lang="ts">
   import { api } from '$lib/api';
+  import { emailProblem } from '$lib/accountRules';
 
   let email = '';
   let sent = false;
   let busy = false;
   let error = '';
+  let emailError: string | null = null;
 
   async function submit() {
-    busy = true;
     error = '';
+    // Registration's rule: no account has an address it refuses, so a link
+    // could never be sent to one. Said here, as red text under the field, not
+    // in the browser's popup.
+    emailError = emailProblem(email);
+    if (emailError) return;
+    busy = true;
     try {
       await api.requestPasswordReset(email);
       // The server answers 200 either way so this page cannot be used to find
@@ -36,10 +43,11 @@
     </div>
   {:else}
     {#if error}<p class="field-error mb-4" role="alert">{error}</p>{/if}
-    <form class="card space-y-4" on:submit|preventDefault={submit}>
+    <form class="card space-y-4" novalidate on:submit|preventDefault={submit}>
       <div>
         <label class="label" for="email">Email</label>
-        <input id="email" type="email" class="input" bind:value={email} required />
+        <input id="email" type="email" class="input" bind:value={email} autocomplete="email" required />
+        {#if emailError}<p class="field-error" role="alert">{emailError}</p>{/if}
       </div>
       <button class="btn-primary w-full" disabled={busy}>
         {busy ? 'Sending…' : 'Send reset link'}

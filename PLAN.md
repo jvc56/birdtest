@@ -744,6 +744,12 @@ API keys are stored as hashes (never raw values) in the database. The raw key is
      is taken); the server's refusal says only that the password is too weak,
      not why.
 
+   The form checks the length and address rules itself first, as the server
+   words them (`frontend/src/lib/accountRules.ts`), and is `novalidate`: the
+   browser's own checks showed a popup where the server's errors are red text
+   under the field, and took `a@b`, which the server refuses. The server still
+   checks everything. The sign-in and password-reset forms do the same.
+
    A **taken username** returns `409` naming it. The user has to choose another
    one to get anywhere, and `GET /api/users` publishes the whole list anyway, so
    there is nothing here to protect.

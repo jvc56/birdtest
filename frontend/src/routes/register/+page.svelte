@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
   import { api, ApiError } from '$lib/api';
+  import { emailProblem, problems, requiredProblem, usernameProblem } from '$lib/accountRules';
 
   let username = '';
   let email = '';
@@ -26,9 +27,16 @@
   const labels = ['very weak', 'weak', 'fair', 'good', 'strong'];
 
   async function submit() {
-    busy = true;
     error = '';
-    fields = {};
+    // The server's rules, asked first so that every error reads the same way
+    // (the form is `novalidate`: the browser's own checks were a popup).
+    fields = problems({
+      username: usernameProblem(username),
+      email: emailProblem(email),
+      password: requiredProblem(password, false)
+    });
+    if (Object.keys(fields).length) return;
+    busy = true;
     try {
       const registered = await api.register({ username, email, password });
       goto('/register/check-email', {
@@ -54,7 +62,7 @@
     require one — an anonymous worker can complete every task.
   </p>
 
-  <form class="card space-y-4" on:submit|preventDefault={submit}>
+  <form class="card space-y-4" novalidate on:submit|preventDefault={submit}>
     <div>
       <label class="label" for="username">Username</label>
       <input id="username" class="input" bind:value={username} autocomplete="username" required />

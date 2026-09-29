@@ -279,8 +279,10 @@ Use a signed-out window.
 
 - [ ] **Do** open **Register** with a 2-character username. **Expect** "must be
   between 3 and 32 characters".
-- [ ] **Do** try `alice@` and `a..b@example.org` as the email. **Expect** "must
-  be a valid email address".
+- [ ] **Do** try `alice@`, `a@b` and `a..b@example.org` as the email. **Expect**
+  "must be a valid email address".
+- [ ] **Do** submit the form empty. **Expect** each error in red under its field
+  ("must not be empty" under Password) — and never the browser's own popup.
 - [ ] **Do** try the password `password123`. **Expect** "too weak — choose a
   longer, less predictable password". (The strength hint under the field is
   only a guide.)
@@ -315,6 +317,8 @@ Use a signed-out window.
   **Account**, not another site.
 - [ ] **Do** fail sign-in eleven times within a minute. **Expect** "too many
   requests".
+- [ ] **Do** **Sign in** with both fields empty. **Expect** "must not be empty"
+  in red under each, not the browser's popup.
 - [ ] **Do** **Sign out**. **Expect** the home page, with **Sign in** back in
   the header.
 
@@ -326,6 +330,8 @@ Use a signed-out window.
   alice.
 - [ ] **Do** the same with `nobody@example.org`. **Expect** the same message, and
   no mail.
+- [ ] **Do** the same with `a@b`. **Expect** "must be a valid email address" in
+  red under the field, and nothing sent.
 - [ ] **Do** open the link and set `password123`. **Expect** "too weak — …" and
   the link still usable. **Then** set a strong password. **Expect** the sign-in
   page; the old password fails and the new one works.

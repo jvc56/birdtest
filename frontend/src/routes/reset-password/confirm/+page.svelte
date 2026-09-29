@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import { api, ApiError } from '$lib/api';
   import { session } from '$lib/auth';
+  import { requiredProblem } from '$lib/accountRules';
 
   let password = '';
   let error = '';
@@ -13,9 +14,16 @@
   $: token = $page.url.searchParams.get('token') ?? '';
 
   async function submit() {
-    busy = true;
     error = '';
     outOfTries = false;
+    // Here rather than the browser's popup, so this error reads like the
+    // server's (the form is `novalidate`).
+    const empty = requiredProblem(password, false);
+    if (empty) {
+      error = empty;
+      return;
+    }
+    busy = true;
     try {
       await api.confirmPasswordReset(token, password);
       // A reset signs out every session, this tab's included.
@@ -39,7 +47,7 @@
   {#if !token}
     <p class="text-destructive">That link is missing its reset token.</p>
   {:else}
-    <form class="card space-y-4" on:submit|preventDefault={submit}>
+    <form class="card space-y-4" novalidate on:submit|preventDefault={submit}>
       <div>
         <label class="label" for="password">New password</label>
         <input

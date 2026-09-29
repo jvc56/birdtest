@@ -14,6 +14,19 @@ test('E-2: a new user registers, confirms, signs in, and makes and deactivates a
   const user = uniqueUser();
 
   await page.goto('/register');
+  // Every error is red text under its field, the server's rules checked before
+  // a request: never the browser's popup, which took `a@b` (the server does
+  // not) and showed the other errors differently.
+  await page.getByLabel('Username').fill('ab');
+  await page.getByLabel('Email').fill('a@b');
+  await page.getByRole('button', { name: 'Register' }).click();
+  await expect(page.locator('.field-error')).toHaveText([
+    'must be between 3 and 32 characters',
+    'must be a valid email address',
+    'must not be empty'
+  ]);
+  await expect(page).toHaveURL(/\/register$/);
+
   await page.getByLabel('Username').fill(user.username);
   await page.getByLabel('Email').fill(user.email);
   await page.getByLabel('Password').fill(user.password);
