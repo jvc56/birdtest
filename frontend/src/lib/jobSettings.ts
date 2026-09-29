@@ -1,9 +1,11 @@
 /**
- * A job's configuration (`GET /api/jobs/:id/config`) as the job page shows it:
- * a line naming what matters most -- each player's search -- and every
- * setting, grouped, for whoever wants them all.
+ * A job's configuration (`GET /api/jobs/:id/config`) and a player config's
+ * as their pages show them: tables of the settings that matter most -- the
+ * key rows -- with every setting a toggle away. A job's own settings are one
+ * table, grouped; its players' are another, side by side.
  */
 import type { JobType } from '$lib/api';
+import { jobTypeLabel } from '$lib/format';
 
 export interface PlayerSettings {
   /** Its part in a job ("player 1"); absent for a config read on its own. */
@@ -99,24 +101,45 @@ export function playerSummary(p: PlayerSettings): string {
   return parts.join(', ');
 }
 
-export interface SettingGroup {
-  title: string;
-  rows: [string, string][];
+/** One of a job's settings; `key` if it is shown before "All settings". */
+export interface JobSetting {
+  label: string;
+  value: string;
+  key: boolean;
 }
 
-/** The job's own settings and its type's, grouped and labelled. */
+export interface SettingGroup {
+  title: string;
+  rows: JobSetting[];
+}
+
+/** A key setting and one shown only under "All settings". */
+const key = (label: string, value: string): JobSetting => ({ label, value, key: true });
+const more = (label: string, value: string): JobSetting => ({ label, value, key: false });
+
+/**
+ * The job's own settings and its type's, grouped and labelled. The key rows
+ * say what the job is: its type; the variant, letter distribution and board
+ * every game is played on; how much it plays -- a games job's target, and
+ * whether a test can stop it sooner and between which Elo bounds; an
+ * opening-rack job's racks and their size; a leave job's lexicon, iterations,
+ * generations and target. The rest -- batch sizes, bingo bonus, sim cutoff,
+ * redundancy, the oldest MAGPIE, the test's error rates and minimum, whether
+ * positions are recorded, the wordmap -- is under "All settings".
+ */
 export function jobGroups(c: JobConfig): SettingGroup[] {
   const groups: SettingGroup[] = [
     {
       title: 'Job',
       rows: [
-        ['Variant', show(c.job.variant)],
-        ['Letter distribution', show(c.job.letter_distribution)],
-        ['Board', show(c.job.layout)],
-        ['Bingo bonus', show(c.job.bingo_bonus)],
-        ['Sim cutoff', show(c.job.sim_cutoff)],
-        ['Redundancy', `${c.job.redundancy}×`],
-        ['Oldest MAGPIE', show(c.job.min_magpie_version)]
+        key('Type', jobTypeLabel(c.job.job_type)),
+        key('Variant', show(c.job.variant)),
+        key('Letter distribution', show(c.job.letter_distribution)),
+        key('Board', show(c.job.layout)),
+        more('Bingo bonus', show(c.job.bingo_bonus)),
+        more('Sim cutoff', show(c.job.sim_cutoff)),
+        more('Redundancy', `${c.job.redundancy}×`),
+        more('Oldest MAGPIE', show(c.job.min_magpie_version))
       ]
     }
   ];
@@ -126,25 +149,22 @@ export function jobGroups(c: JobConfig): SettingGroup[] {
     const kind = g.unit === 'pair' ? 'Game pairs' : 'Games';
     // A job without a test stores the test's defaults, which it never reads:
     // shown, they would read as a test it runs.
-    const test: [string, string][] = g.sprt_enabled
+    const test: JobSetting[] = g.sprt_enabled
       ? [
-          [`Fewest ${g.unit}s before the test is acted on`, show(g.min_units)],
-          [`Cap (${g.unit}s)`, show(g.max_units)],
-          ['SPRT α', show(g.sprt_alpha)],
-          ['SPRT β', show(g.sprt_beta)],
-          ['Elo H0', show(g.elo_low)],
-          ['Elo H1', show(g.elo_high)]
+          key(`Cap (${g.unit}s)`, show(g.max_units)),
+          key('Elo H0', show(g.elo_low)),
+          key('Elo H1', show(g.elo_high)),
+          more(`Fewest ${g.unit}s before the test is acted on`, show(g.min_units)),
+          more('SPRT α', show(g.sprt_alpha)),
+          more('SPRT β', show(g.sprt_beta))
         ]
-      : [
-          [`${units} to play`, show(g.max_units)],
-          ['SPRT', 'none']
-        ];
+      : [key(`${units} to play`, show(g.max_units)), key('SPRT', 'none')];
     groups.push({
       title: g.sprt_enabled ? `${kind} and the test` : kind,
       rows: [
-        [`${units} per task`, show(g.per_batch)],
         ...test,
-        ['Records positions', show(g.capture_positions)]
+        more(`${units} per task`, show(g.per_batch)),
+        more('Records positions', show(g.capture_positions))
       ]
     });
   }
@@ -153,9 +173,9 @@ export function jobGroups(c: JobConfig): SettingGroup[] {
     groups.push({
       title: 'Opening racks',
       rows: [
-        ['Racks per task', show(o.racks_per_batch)],
-        ['Rack size', show(o.rack_size)],
-        ['Racks in all', show(o.total_racks)]
+        key('Racks in all', show(o.total_racks)),
+        key('Rack size', show(o.rack_size)),
+        more('Racks per task', show(o.racks_per_batch))
       ]
     });
   }
@@ -164,16 +184,23 @@ export function jobGroups(c: JobConfig): SettingGroup[] {
     groups.push({
       title: 'Leave generation',
       rows: [
-        ['Lexicon', show(l.lexicon)],
-        ['Iterations', show(l.num_iterations)],
-        ['Generations', show(l.generation_count)],
-        ['Target racks', show(l.target_rack_count)],
-        ['Racks per task', show(l.racks_per_task)],
-        ['Wordmap', show(l.use_wordmap)]
+        key('Lexicon', show(l.lexicon)),
+        key('Iterations', show(l.num_iterations)),
+        key('Generations', show(l.generation_count)),
+        key('Target racks', show(l.target_rack_count)),
+        more('Racks per task', show(l.racks_per_task)),
+        more('Wordmap', show(l.use_wordmap))
       ]
     });
   }
   return groups;
+}
+
+/** The groups' key rows alone, a group with none left out. */
+export function keyGroups(groups: SettingGroup[]): SettingGroup[] {
+  return groups
+    .map((g) => ({ title: g.title, rows: g.rows.filter((r) => r.key) }))
+    .filter((g) => g.rows.length > 0);
 }
 
 /** Every player setting, labelled, in the order a reader compares them. */
@@ -203,36 +230,51 @@ const PLAYER_ROWS: [keyof PlayerSettings, string][] = [
   ['use_rit', 'Rack info table']
 ];
 
+/** A player setting: one value per player, and whether the players differ in it. */
+export interface SettingRow {
+  label: string;
+  values: string[];
+  differs: boolean;
+}
+
+function row(label: string, values: string[]): SettingRow {
+  return { label, values, differs: new Set(values).size > 1 };
+}
+
 /**
- * What a reader compares two configs by first -- the files, the search and
- * what is kept -- as label and value. `playerRows` has every setting.
+ * What a reader compares configs by first -- the search in a few words, the
+ * files, the plays considered and what is kept -- one value per player.
+ * `playerRows` has every setting.
  */
-export function keySettings(p: PlayerSettings): [string, string][] {
-  const rows: [string, string][] = [
-    ['Search', playerSummary(p)],
-    ['Lexicon', show(p.lexicon)],
-    ['Leaves', show(p.leaves)]
+export function keySettings(players: PlayerSettings[]): SettingRow[] {
+  const rows = [
+    row('Search', players.map(playerSummary)),
+    row('Lexicon', players.map((p) => show(p.lexicon))),
+    row('Leaves', players.map((p) => show(p.leaves)))
   ];
-  if (p.win_pct) rows.push(['Win %', p.win_pct]);
+  // A static player has no win% model to name; a row of dashes says nothing.
+  if (players.some((p) => p.win_pct)) rows.push(row('Win %', players.map((p) => show(p.win_pct))));
   rows.push(
-    ['Plays considered', show(p.num_plays)],
-    ['Recorder', `${p.recorder_type}, ${show(p.num_plays_recorded)} play${p.num_plays_recorded === 1 ? '' : 's'} kept`],
-    ['Wordmap', show(p.use_wordmap)],
-    ['Rack info table', show(p.use_rit)]
+    row('Plays considered', players.map((p) => show(p.num_plays))),
+    row(
+      'Recorder',
+      players.map((p) => `${p.recorder_type}, ${show(p.num_plays_recorded)} play${p.num_plays_recorded === 1 ? '' : 's'} kept`)
+    ),
+    row('Wordmap', players.map((p) => show(p.use_wordmap))),
+    row('Rack info table', players.map((p) => show(p.use_rit)))
   );
   return rows;
 }
 
 /**
- * The players' settings side by side: one row per setting, one value per
- * player, and whether the players differ in it -- which is usually the
- * point of the job.
+ * Every setting, one value per player, after the search in a few words: the
+ * row a reader looks for first stays first when the table grows.
  */
-export function playerRows(players: PlayerSettings[]): { label: string; values: string[]; differs: boolean }[] {
-  return PLAYER_ROWS.map(([key, label]) => {
-    const values = players.map((p) => show(p[key] as Value));
-    return { label, values, differs: new Set(values).size > 1 };
-  });
+export function playerRows(players: PlayerSettings[]): SettingRow[] {
+  return [
+    row('Search', players.map(playerSummary)),
+    ...PLAYER_ROWS.map(([k, label]) => row(label, players.map((p) => show(p[k] as Value))))
+  ];
 }
 
 /** The players' searches in one line, for beside a job's lexicon and variant. */

@@ -78,6 +78,12 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
     const link = page.getByRole('banner').getByRole('link', { name, exact: true });
     await expect(link).toBeInViewport();
   }
+  // Every setting, the players' side by side: the tables wrap, or scroll
+  // inside their card, but never widen the page.
+  const settings = page.locator('.card', { has: page.getByRole('heading', { name: 'Settings' }) });
+  await settings.getByRole('button', { name: 'All settings' }).tap();
+  await expect(settings.getByText('Move-gen margin')).toBeVisible();
+  await expectNoSidewaysScroll(page);
 
   // The same page with the widest name as its creator and as a contributor:
   // "Created by" widened the page, and the contributors' count left its box.

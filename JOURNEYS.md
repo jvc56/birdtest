@@ -137,14 +137,20 @@ Open "dev game pairs: static equity vs static score".
 - [ ] **Expect** a Progress card: a bar of "pairs completed", the
   Available / Claimed / Completed task counts, when it was created, "Created
   by dev" and "requires MAGPIE ≥ …".
-- [ ] **Expect** a Settings card with one line per player: its name, linking to
-  the player config's page, and how it searches.
-- [ ] **Do** open **All settings**. **Expect** a "Job" group (variant, letter
-  distribution, board, bingo bonus, sim cutoff, redundancy, oldest MAGPIE), a
-  "Game pairs and the test" group (pairs per task; fewest pairs before the
-  test is acted on, 50,000; cap, 100,000; α, β, Elo H0 and H1; records
-  positions), and every player setting side by side, those the players differ
-  in bold.
+- [ ] **Expect** a Settings card of two tables, each showing its key rows: a
+  "Job" group (type "Game pairs", variant, letter distribution, board) and a
+  "Game pairs and the test" group (cap 100,000, Elo H0 and H1); then the
+  players side by side, headed "Player 1" and "Player 2" with each name
+  linking to its config's page: search ("static, by equity" / "static, by
+  score"), lexicon, leaves, plays considered, recorder, wordmap and rack info
+  table, the rows they differ in (search) bold.
+- [ ] **Do** press **All settings**. **Expect** both tables to grow: the Job
+  group adds bingo bonus, sim cutoff, redundancy and oldest MAGPIE; the pairs
+  group adds fewest pairs before the test is acted on (50,000), α, β, pairs
+  per task and records positions; the players' table every setting after the
+  search. The button now reads **Key settings only** and puts them back.
+- [ ] At phone width, **expect** the tables to wrap (or scroll inside the
+  card), never the page.
 - [ ] **Do** **Download every setting as JSON**. **Expect** the same settings,
   with no user ids and no creator.
 - [ ] **Expect** a Contributors table: `dev-contributor-1`,
@@ -182,8 +188,8 @@ On the same job:
 - [ ] On a job an admin has deactivated (A-8), **expect** "paused while the job
   is inactive: no pairs are being played, so the test is not moving".
 - [ ] On "tester no test" (A-7), **expect** the Match score card and no SPRT
-  card, and under **All settings** a "Game pairs" group with "Pairs to play
-  20" and "SPRT none" in place of the test's settings.
+  card, and a "Game pairs" group with "Pairs to play 20" and "SPRT none" in
+  place of the test's settings, all settings or not.
 - [ ] On a games or pairs job's **Manage** page, **expect** the same Settings,
   Match score and (with a test) SPRT cards after Progress, and no one-line
   "SPRT … LLR" summary in Progress.
@@ -266,10 +272,11 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
 - [ ] **Do** open **Players**. **Expect** the four seeded configs, newest first:
   name, how it searches ("1-ply sim, 100 iterations", "static, by score"),
   lexicon CSW24, leaves, created.
-- [ ] **Do** open `sim-1ply`. **Expect** Search, Lexicon, Leaves, Win %,
-  Plays considered, Recorder ("best, 10 plays kept"), Wordmap "yes" and Rack
-  info table "yes", then every setting behind **All settings**, with a JSON
-  download.
+- [ ] **Do** open `sim-1ply`. **Expect** a table of Search, Lexicon, Leaves,
+  Win %, Plays considered, Recorder ("best, 10 plays kept"), Wordmap "yes" and
+  Rack info table "yes" (no Win % row on `static-equity`), and a JSON
+  download. **Do** press **All settings**. **Expect** every setting in the same
+  table, Search still first.
 - [ ] **Do** open `/player-configs/00000000-0000-4000-8000-000000000000`.
   **Expect** "no such player config".
 - [ ] Signed out, **expect** no **New player config** button on **Players**; as

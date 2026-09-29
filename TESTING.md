@@ -69,7 +69,7 @@ at tier 5 names a symptom.
 | Tier | Tests | Where |
 |---|---|---|
 | 1 Unit | 225 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 147 | Vitest, `frontend/src/lib/`: `format.test.ts` (30), `jobSettings.test.ts` (6), `matchScore.test.ts` (3), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1F Frontend unit | 148 | Vitest, `frontend/src/lib/`: `format.test.ts` (30), `jobSettings.test.ts` (7), `matchScore.test.ts` (3), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 165 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 232 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
@@ -703,6 +703,15 @@ Each entry's tests are the `describe` block named for its id.
   average scores to a decimal place and the spread signed ("+13.4", "-2.5",
   never "-0.0"); before any game, none of them rather than 0 or NaN.
   *(Covered: `matchScore.test.ts`.)*
+- `F-SET-1` The settings tables (`lib/jobSettings.ts`): a player's search in a
+  few words; the job's groups with each row marked key or not, the key rows
+  alone (type, variant, letter distribution, board; a games job's target, or
+  its cap and Elo bounds with a test) and a group with none left out; a job
+  without a test shows its target and "SPRT none" and none of the test's
+  settings; players side by side, one row per setting and a row they differ
+  in marked, every setting after the search; the key rows for one player or
+  two, a Win % row only when a player has a model, and every key row also a
+  row of the full table. *(Covered: `jobSettings.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
@@ -2519,12 +2528,12 @@ below.
   setting of each player config, in role order, with the
   config's id to link to; it names no creator and carries no user id; an
   unknown job is a `404`. *(Covered:
-  `public_api::a_jobs_full_configuration_is_public`; the page's summary and
-  side-by-side table by `jobSettings.test.ts`, `F-SET-1`.)*
+  `public_api::a_jobs_full_configuration_is_public`; the page's key and full
+  tables, grouped and side by side, by `jobSettings.test.ts`, `F-SET-1`.)*
 - `A-PUBLIC-1d` Player configs are public (`GET /api/player-configs`, newest
   first, and `/:id`): every setting with files by name, and the config it was
   cloned from, but not who made it; an unknown config is a `404`. *(Covered:
-  `public_api::player_configs_are_public`; the page's key settings by
+  `public_api::player_configs_are_public`; the page's key and full table by
   `jobSettings.test.ts`, `F-SET-1`.)*
 - `A-PUBLIC-1b` `?status=` filters the job list and its total. *(Covered:
   `public_api::the_job_list_filters_by_status`.)* (Eighteenth audit.) Deleting
@@ -2864,7 +2873,8 @@ admin in once and the admin journeys reuse its storage state.
   `e9-password-reset.spec.ts`, reading its link from the outbox.)*
 - `E-10` A page renders correctly at phone width — one journey, not all of them.
   *(Covered: `e10-phone-width.spec.ts`: a Pixel 5 viewport, the job list, a
-  job page and both rankings, nothing wider than the screen and each ranking's
+  job page (its Settings card opened to every setting, the players side by
+  side) and both rankings, nothing wider than the screen and each ranking's
   own column inside its box — a pseudonym's sixteen characters pushed it out,
   thirty-second audit. The contributors' list is measured with a row in it;
   the job page again with a 32-character creator and contributor, and both
@@ -2900,7 +2910,8 @@ admin in once and the admin journeys reuse its storage state.
   search, and clicking one looks it up. *(Covered:
   `e13-opening-rack-samples.spec.ts`.)*
 - `E-14` A signed-out visitor reaches the player configs from the nav, opens
-  one, reads its key settings, and opens every setting. *(Covered:
+  one, reads its key settings in a table (the Search row), grows the table to
+  every setting with **All settings**, and shrinks it back. *(Covered:
   `e14-player-configs.spec.ts`.)*
 - `E-15` The player-config form will not submit a stopping percentage of 0 or
   100, which the server refuses; 99.5 is accepted. *(Covered:
