@@ -106,7 +106,9 @@
   {#if search && position}
     <div class="flex flex-wrap items-center gap-2 text-sm" data-testid="rack-search">
       <span class="text-muted-foreground">
-        Position {search.at + 1} with the rack <span class="font-mono">{search.rack.toUpperCase()}</span>, newest first
+        <!-- The rack as the server spells it (the job's letter order, the blank
+             last), which the position shown holds, rather than as it was typed. -->
+        Position {search.at + 1} with the rack <span class="font-mono">{position.rack}</span>, newest first
       </span>
       {#if search.at > 0}
         <button
