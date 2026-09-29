@@ -4,9 +4,10 @@
   import { api, type JobStats } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
-  import { duration, datetime, jobTypeLabel, sprtLabel, sprtState, jobTitle } from '$lib/format';
+  import { datetime, jobTypeLabel, sprtLabel, sprtState, jobTitle } from '$lib/format';
   import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
   import CompletionNote from '$lib/components/CompletionNote.svelte';
+  import JobStatsRow from '$lib/components/JobStatsRow.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import OutcomeChart from '$lib/components/OutcomeChart.svelte';
@@ -89,7 +90,6 @@
       {#if stats.job.name}
         <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
       {/if}
-      <JobStatusBadge status={stats.job.status} />
       <span class="text-sm text-muted-foreground">
         {stats.job.lexicon ?? '—'} · {stats.job.variant ?? '—'}{#if config?.players.length}
           · {playersLine(config)}{/if}
@@ -102,26 +102,7 @@
     </header>
     <CompletionNote {stats} />
 
-    <div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-      <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Allocation</p>
-        <p class="mt-1 text-xl tabular-nums">
-          {stats.job.allocation === null ? '—' : `${stats.job.allocation}%`}
-        </p>
-      </div>
-      <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Redundancy</p>
-        <p class="mt-1 text-xl tabular-nums">{stats.job.redundancy}×</p>
-      </div>
-      <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Results accepted</p>
-        <p class="mt-1 text-xl tabular-nums">{stats.results_accepted.toLocaleString()}</p>
-      </div>
-      <div class="card">
-        <p class="text-xs uppercase text-muted-foreground">Estimated time left</p>
-        <p class="mt-1 text-xl tabular-nums">{duration(stats.eta_seconds)}</p>
-      </div>
-    </div>
+    <JobStatsRow {stats} />
 
     <div class="card space-y-4">
       <h2 class="text-lg font-medium">Progress</h2>

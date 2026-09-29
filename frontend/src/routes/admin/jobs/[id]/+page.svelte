@@ -11,9 +11,9 @@
     type JobStats
   } from '$lib/api';
   import { subscribeToJob } from '$lib/sse';
-  import { jobTitle, jobTypeLabel, sprtLabel, sprtState, duration } from '$lib/format';
-  import JobStatusBadge from '$lib/components/JobStatusBadge.svelte';
+  import { jobTitle, jobTypeLabel, sprtLabel, sprtState } from '$lib/format';
   import CompletionNote from '$lib/components/CompletionNote.svelte';
+  import JobStatsRow from '$lib/components/JobStatsRow.svelte';
   import DerivedDataStatus from '$lib/components/DerivedDataStatus.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
@@ -384,10 +384,10 @@
       {#if stats.job.name}
         <span class="text-sm text-muted-foreground">{jobTypeLabel(stats.job.job_type)}</span>
       {/if}
-      <JobStatusBadge status={stats.job.status} />
       <a href="/jobs/{jobId}" class="text-sm">public view</a>
     </header>
     <CompletionNote {stats} />
+    <JobStatsRow {stats} />
     <DerivedDataStatus {jobId} />
 
     <div class="card space-y-4">
@@ -615,8 +615,7 @@
       {/if}
       <p class="text-sm text-muted-foreground">
         {stats.tasks_available.toLocaleString()} available ·
-        {stats.tasks_claimed.toLocaleString()} claimed ·
-        ETA {duration(stats.eta_seconds)}
+        {stats.tasks_claimed.toLocaleString()} claimed
       </p>
     </div>
 

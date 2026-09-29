@@ -2799,7 +2799,8 @@ try is a failure this tier exists to report. `admin.setup.ts` signs the seeded
 admin in once and the admin journeys reuse its storage state.
 
 - `E-1` An anonymous visitor browses the landing page, job list, a job detail
-  page and the contributor leaderboard. *(Covered:
+  page — its four headline cards, status first — and the contributor
+  leaderboard. *(Covered:
   `e1-anonymous-browsing.spec.ts`.)*
 - `E-2` Register → confirm the email → log in → generate an API key → see it
   exactly once → deactivate it; first, a bad username, `a@b` and no password

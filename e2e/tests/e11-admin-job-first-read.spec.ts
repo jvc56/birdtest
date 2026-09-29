@@ -153,10 +153,10 @@ test('E-11b: a slow read does not undo what the stream has since said', async ({
   // The held read did carry the old status, or this proves nothing.
   expect(heldStatus).toBe('active');
   await expect(page.getByText(/Could not load all of this job/)).toBeHidden({ timeout: 10_000 });
-  const jobHeader = page.locator('header', { has: page.getByRole('heading', { level: 1 }) });
-  await expect(jobHeader.getByText('completed', { exact: true })).toBeVisible();
+  const status = page.getByTestId('job-status');
+  await expect(status.getByText('completed', { exact: true })).toBeVisible();
   await page.waitForTimeout(1000);
-  await expect(jobHeader.getByText('completed', { exact: true })).toBeVisible();
+  await expect(status.getByText('completed', { exact: true })).toBeVisible();
   await api.dispose();
 });
 

@@ -130,11 +130,10 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 Open "dev game pairs: static equity vs static score".
 
-- [ ] **Expect** the job's name as the title with "Game pairs" beside it, a
-  status badge, then "CSW24 · classic · static, by equity vs static, by
-  score".
-- [ ] **Expect** cards for Allocation, Redundancy, Results accepted and
-  Estimated time left.
+- [ ] **Expect** the job's name as the title with "Game pairs" beside it, then
+  "CSW24 · classic · static, by equity vs static, by score".
+- [ ] **Expect** cards for Status (a badge), Allocation, Tasks completed and
+  Estimated time left; the redundancy is under **All settings**.
 - [ ] **Expect** a Progress card: a bar of "pairs completed (hard cap)", the
   Available / Claimed / Completed task counts, when it was created, "Created
   by dev" and "requires MAGPIE ≥ …".
@@ -511,8 +510,9 @@ The six seeded jobs hold 96% between them.
 - [ ] **Do** activate "tester cap" at 10%. **Expect** "the other active jobs
   already allocate 96% — 4% is the most this job can take".
 - [ ] **Do** deactivate "dev leave generation" (its **Manage** page →
-  **Deactivate**). **Expect** "Job deactivated." and status **inactive**; its
-  public page no longer says "live".
+  **Deactivate**). **Expect** "Job deactivated." and **inactive** in the Status
+  card, the same four cards as the public page's; its public page no longer
+  says "live".
 - [ ] **Do** activate "tester cap" at 16%. **Expect** "Job activated.", "Now:
   16%", and the workers taking its tasks.
 - [ ] **Do** type 150, then 2.5, and **Activate**. **Expect** "Enter a

@@ -64,10 +64,12 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await expect(page).toHaveURL(/\/admin\/jobs\/[0-9a-f-]{36}$/);
   const jobId = page.url().split('/').pop()!;
   const header = page.locator('main header');
-  // Titled by the name it was given, its type beside it.
+  // Titled by the name it was given, its type beside it; its status in the
+  // figures below.
   await expect(header.getByRole('heading', { name: jobName })).toBeVisible();
   await expect(header.getByText('Game pairs', { exact: true })).toBeVisible();
-  await expect(header.getByText('inactive', { exact: true })).toBeVisible();
+  const status = page.getByTestId('job-status');
+  await expect(status.getByText('inactive', { exact: true })).toBeVisible();
 
   // Activating refetches the job once, after the action; wait that out.
   const isJobFetch = (url: string, method: string) =>
@@ -77,7 +79,7 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   await page.getByRole('button', { name: 'Activate', exact: true }).click();
   await refetched;
   await expect(page.getByText('Job activated.')).toBeVisible();
-  await expect(header.getByText('active', { exact: true })).toBeVisible();
+  await expect(status.getByText('active', { exact: true })).toBeVisible();
 
   // From here on the page must update itself. It fetches the job over REST
   // only on load and after an admin action, so count those fetches: the
@@ -103,5 +105,5 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
   // And the admin takes the job out of rotation again, handing its share back.
   await page.getByRole('button', { name: 'Deactivate' }).click();
   await expect(page.getByText('Job deactivated.')).toBeVisible();
-  await expect(header.getByText('inactive', { exact: true })).toBeVisible();
+  await expect(status.getByText('inactive', { exact: true })).toBeVisible();
 });

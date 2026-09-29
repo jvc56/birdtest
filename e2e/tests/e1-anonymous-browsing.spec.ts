@@ -34,6 +34,11 @@ test('E-1: an anonymous visitor browses the landing page, jobs, a job and the le
   await expect(page).toHaveURL(new RegExp(`/jobs/${job.id}$`));
   await expect(page.getByRole('heading', { name: 'Game pairs' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'SPRT' })).toBeVisible();
+  // The headline figures: status first, where the title's badge was.
+  await expect(page.locator('.grid > .card > p:first-child')).toHaveText([
+    'Status', 'Allocation', 'Tasks completed', 'Estimated time left'
+  ]);
+  await expect(page.getByTestId('job-status')).toContainText(/\b(active|inactive|completed)\b/);
   // Anonymous workers are shown by pseudonym, never by the UUID that is
   // their credential.
   const contributors = page.locator('.card', { has: page.getByRole('heading', { name: 'Contributors' }) });
