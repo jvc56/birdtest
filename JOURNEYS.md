@@ -240,15 +240,25 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
   position analysed on every turn of its games. Sign in to search them."
   **Do** follow **Sign in**, as `dev-contributor-1`. **Expect** to land back on
   this job.
-- [ ] Signed in, **expect** the ten newest positions, each "Game G, turn T ·
-  rack … · after MOVE (score) · N moves ranked", its board as a CGP string,
-  and its ranked moves, with a **Win %** column on the simmer's turns.
-- [ ] **Do** **Load more**. **Expect** ten more.
-- [ ] **Do** search a rack shown on the page, typed in lower case and another
-  order. **Expect** only positions with that rack, and **Show all** to clear
-  the search.
+- [ ] Signed in, **expect** one position: "Game G, turn T · rack … · after
+  MOVE (score) · N moves ranked", the board with its premium squares (TW, DW,
+  TL, DL and a star on the centre), its tiles each with a letter and a score
+  (a blank a red lower-case letter with none), the tiles MOVE placed
+  outlined, both racks and scores with **to move** on the player whose rack
+  it is, the CGP under the board, and the ranked moves beside it (below it on
+  a narrow window), with a **Win %** column on the simmer's turns.
+- [ ] **Do** **Random position** a few times. **Expect** another position
+  each time (now and then the same one again), the board, racks and scores agreeing with the CGP; on a turn 1
+  position an empty board and nothing outlined, and after an exchange
+  (`(exch …)`) or a pass nothing outlined either.
+- [ ] **Do** search the rack on the board, typed in lower case and another
+  order. **Expect** "Position 1 with the rack …, newest first" and a position
+  with that rack; where there are more, **Next** and **Previous** step through
+  them.
 - [ ] **Do** search `QQQQQQQ`. **Expect** "No saved position has the rack
   QQQQQQQ."
+- [ ] Narrow the window to phone width. **Expect** the board to shrink with
+  it, nothing scrolling sideways.
 - [ ] On the other pairs jobs, **expect** no such section.
 
 ### V-11 Ratings
@@ -723,7 +733,7 @@ curl -s "$SITE/api/worker/client-version"
 ```bash
 curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/me"                     # 401: not signed in
 curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/admin/player-configs"   # 401
-curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/jobs/$JOB/positions"    # 401: signed-in users only
+curl -s -o /dev/null -w '%{http_code}\n' "$SITE/api/jobs/$JOB/positions/random"  # 401: signed-in users only
 ```
 
 ### A signed-in user
@@ -758,13 +768,17 @@ curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
 curl -s -b "$JAR" "$SITE/api/me/api-keys"
 ```
 
-**Search a job's saved positions** (the seeded "(positions saved)" job). Up to
-20 a page, newest first; `next_cursor`, when present, fetches the next page
-(`&cursor=…`), and `&rack=` keeps one rack.
+**A job's saved positions** (the seeded "(positions saved)" job): one at
+random, or those with one rack, up to 20 a page, newest first;
+`next_cursor`, when present, fetches the next page (`&cursor=…`). The board
+they are drawn on is public.
 
 ```bash
-curl -s -b "$JAR" "$SITE/api/jobs/$JOB/positions?per_page=5" \
+curl -s -b "$JAR" "$SITE/api/jobs/$JOB/positions/random" \
+  | jq '{game_index, turn_number, rack, position, previous_move, best: .moves[0].move}'
+curl -s -b "$JAR" "$SITE/api/jobs/$JOB/positions?rack=aeinrst&per_page=5" \
   | jq '.items[] | {game_index, turn_number, rack, best: .moves[0].move}'
+curl -s "$SITE/api/jobs/$JOB/board" | jq '{start, first_row: .squares[0], letters: .letters[:3]}'
 ```
 
 **An admin route, as a user**, is `403`:

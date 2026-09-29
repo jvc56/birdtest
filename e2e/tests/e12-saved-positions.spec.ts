@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, devices } from '@playwright/test';
 import { AdminApi, waitUntilSettled } from '../lib/api';
 import { ADMIN_STATE, SEEDED_DATA, env } from '../lib/env';
 
@@ -6,9 +6,10 @@ test.use({ storageState: ADMIN_STATE });
 
 /**
  * E-12: a games job made through the form with "Save the positions played"
- * ticked lets a signed-in user page through them and search them by rack, and
- * tells a signed-out visitor to sign in. The fake workers synthesise the
- * captured positions, 18 to 26 a game, so four games are plenty for two pages.
+ * ticked shows a signed-in user one saved position at a time on its board --
+ * a random one, or one of a rack's -- and tells a signed-out visitor to sign
+ * in. The fake workers play synthetic games, 18 to 26 turns each, whose
+ * positions are real boards: tiles, both racks, and the play before.
  */
 let api: AdminApi;
 let jobId: string;
@@ -54,7 +55,7 @@ test.afterAll(async () => {
   await api.dispose();
 });
 
-test('E-12: a signed-in user pages through and searches a job\'s saved positions', async ({ page, browser }) => {
+test('E-12: a signed-in user draws saved positions at random and searches them by rack', async ({ page, browser }) => {
   const signedOut = await browser.newContext({ storageState: { cookies: [], origins: [] } });
   const visitor = await signedOut.newPage();
   await visitor.goto(`/jobs/${jobId}`);
@@ -63,20 +64,61 @@ test('E-12: a signed-in user pages through and searches a job\'s saved positions
 
   await page.goto(`/jobs/${jobId}`);
   await expect(page.getByRole('heading', { name: 'Saved positions', exact: true })).toBeVisible();
-  const entries = page.locator('p', { hasText: 'moves ranked' });
-  await expect(entries).toHaveCount(10);
-  await page.getByRole('button', { name: 'Load more' }).click();
-  await expect(entries).toHaveCount(20);
+  const shown = page.getByTestId('saved-position');
+  const board = page.getByTestId('board');
+  await expect(shown).toBeVisible();
 
-  // Search for the rack the newest position was played from, typed in lower
-  // case: every result holds it.
-  const rack = (await entries.first().locator('span.font-mono').first().innerText()).trim();
-  await page.getByLabel('Rack').fill(rack.toLowerCase());
+  // A position after a play, rather than an opening turn's empty board or
+  // one after an exchange: its tiles are down and the play's are outlined.
+  await expect(async () => {
+    if (!(await board.locator('.tile.last').count())) {
+      await page.getByRole('button', { name: 'Random position' }).click();
+    }
+    await expect(board.locator('.tile.last').first()).toBeVisible({ timeout: 1_000 });
+  }).toPass({ timeout: 30_000 });
+  await expect(shown).toContainText('after');
+  expect(await board.locator('.tile').count()).toBeGreaterThan(await board.locator('.tile.last').count());
+  // Both racks and scores, the player to move marked, and the ranked moves.
+  await expect(shown.getByTestId('rack')).toHaveCount(2);
+  await expect(shown.getByTestId('score')).toHaveCount(2);
+  await expect(shown.getByText('to move', { exact: true })).toHaveCount(1);
+  expect(await shown.locator('tbody tr').count()).toBeGreaterThan(0);
+
+  // Search for the rack on the board, typed in lower case and backwards:
+  // what comes back holds it.
+  const rack = (await shown.getByTestId('position-rack').innerText()).trim();
+  await page.getByLabel('Rack').fill([...rack.toLowerCase()].reverse().join(''));
   await page.getByRole('button', { name: 'Search' }).click();
-  await expect(page.getByRole('button', { name: 'Show all' })).toBeVisible();
-  const found = await entries.count();
-  expect(found).toBeGreaterThan(0);
-  for (let i = 0; i < found; i++) {
-    await expect(entries.nth(i).locator('span.font-mono').first()).toHaveText(rack);
+  await expect(page.getByText(`Position 1 with the rack ${rack}`)).toBeVisible();
+  await expect(shown.getByTestId('position-rack')).toHaveText(rack);
+  await expect(board).toBeVisible();
+  const searching = page.getByTestId('rack-search');
+  const next = searching.getByRole('button', { name: 'Next', exact: true });
+  if (await next.isVisible()) {
+    await next.click();
+    await expect(page.getByText(`Position 2 with the rack ${rack}`)).toBeVisible();
+    await expect(shown.getByTestId('position-rack')).toHaveText(rack);
+    await searching.getByRole('button', { name: 'Previous', exact: true }).click();
+    await expect(page.getByText(`Position 1 with the rack ${rack}`)).toBeVisible();
   }
+
+  await page.getByLabel('Rack').fill('QQQQQQQ');
+  await page.getByRole('button', { name: 'Search' }).click();
+  await expect(page.getByText('No saved position has the rack QQQQQQQ.')).toBeVisible();
+  await expect(shown).toHaveCount(0);
+});
+
+test('E-12b: the board fits a phone', async ({ browser }) => {
+  const phone = await browser.newContext({ ...devices['Pixel 5'], storageState: ADMIN_STATE });
+  const page = await phone.newPage();
+  await page.goto(`/jobs/${jobId}`);
+  await expect(page.getByTestId('board')).toBeVisible();
+  const screen = page.viewportSize()!.width;
+  expect(screen).toBeLessThan(400);
+  // The board shrinks to the screen rather than pushing the page sideways.
+  const box = (await page.getByTestId('board').boundingBox())!;
+  expect(box.x + box.width).toBeLessThanOrEqual(screen);
+  const scrollWidth = await page.evaluate(() => document.documentElement.scrollWidth);
+  expect(scrollWidth, 'page is wider than the screen').toBeLessThanOrEqual(screen);
+  await phone.close();
 });

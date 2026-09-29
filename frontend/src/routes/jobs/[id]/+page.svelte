@@ -155,7 +155,7 @@
 
     {#if config?.games?.capture_positions}
       {#if $session}
-        <SavedPositions {jobId} />
+        <SavedPositions {jobId} players={config.players.map((p) => p.name)} />
       {:else if $session === null}
         <div class="card space-y-1">
           <h2 class="text-lg font-medium">Saved positions</h2>

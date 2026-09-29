@@ -136,6 +136,27 @@ export interface SavedPosition {
   }[];
 }
 
+/** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
+export type BoardSquare =
+  | 'normal'
+  | 'double_letter'
+  | 'double_word'
+  | 'triple_letter'
+  | 'triple_word'
+  | 'quadruple_letter'
+  | 'quadruple_word'
+  | 'brick';
+
+/** What a job's positions are drawn on: its board layout and what its tiles score. */
+export interface BoardData {
+  /** The square the first play covers, `[row, column]` from zero. */
+  start: [number, number];
+  /** Top row first. */
+  squares: BoardSquare[][];
+  /** In machine-letter order; the blank's own row is `?`. */
+  letters: { letter: string; blank: string; score: number }[];
+}
+
 export interface CursorPage<T> {
   items: T[];
   /** Always -1: an exact count costs more than it is worth to the caller. */
@@ -572,13 +593,17 @@ export const api = {
         Object.entries(params).map(([k, v]) => [k, String(v)])
       )}`
     ),
-  /** Signed-in users only: a games or pairs job's captured positions. */
-  jobPositions: (id: string, params: Record<string, string | number> = {}) =>
+  /** Signed-in users only: a games or pairs job's captured positions with one rack, newest first. */
+  jobPositions: (id: string, rack: string, params: { per_page?: number; cursor?: string } = {}) =>
     get<CursorPage<SavedPosition>>(
-      `/api/jobs/${id}/positions?${new URLSearchParams(
-        Object.entries(params).map(([k, v]) => [k, String(v)])
-      )}`
+      `/api/jobs/${id}/positions?${new URLSearchParams({
+        rack,
+        ...Object.fromEntries(Object.entries(params).map(([k, v]) => [k, String(v)]))
+      })}`
     ),
+  /** Signed-in users only: one captured position at random, or `null` before any. */
+  randomPosition: (id: string) => get<SavedPosition | null>(`/api/jobs/${id}/positions/random`),
+  jobBoard: (id: string) => get<BoardData>(`/api/jobs/${id}/board`),
   publicPlayerConfigs: () => get<import('$lib/jobSettings').PublicPlayerConfig[]>('/api/player-configs'),
   publicPlayerConfig: (id: string) => get<import('$lib/jobSettings').PublicPlayerConfig>(`/api/player-configs/${id}`),
   ratingPools: () => get<RatingPoolListItem[]>('/api/rating-pools'),

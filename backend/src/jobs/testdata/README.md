@@ -56,6 +56,10 @@ What each mode prints (see `emit_fixture` in the script):
 | `stale` | the whole body, `{"claim_token", "result"}`, under a token the assignment did not issue |
 | `abandon` | `null`: the mode never submits |
 
+`fake_worker_games_captured.json` is also read by the frontend's
+`cgp.test.ts` (`F-CGP-4`), which checks that every position in it is a board
+the saved-positions page can draw, each following from the one before.
+
 Regenerating changes the numbers only if `fake_worker.py`'s random draws
 change. A test that then fails on a *value* (a rack, a count) is expected to be
 updated alongside; one that fails on *validation* is a fake-worker bug.

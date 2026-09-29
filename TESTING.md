@@ -68,18 +68,18 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 225 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (15), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
-| 1F Frontend unit | 148 | Vitest, `frontend/src/lib/`: `format.test.ts` (30), `jobSettings.test.ts` (7), `matchScore.test.ts` (3), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
+| 1 Unit | 227 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (14), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1F Frontend unit | 160 | Vitest, `frontend/src/lib/`: `format.test.ts` (30), `jobSettings.test.ts` (7), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 165 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (28), `scheduler.rs` (18), `jobs.rs` (14), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (7), `exports.rs` (10), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
-| 3 API | 232 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (17), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
+| 3 API | 234 | `backend/tests/`: `worker_api.rs` (48), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (22), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 17 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 5 End-to-end | 18 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
 | 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 651 backend tests (the per-tier counts above are
+--run-ignored all` runs 655 backend tests (the per-tier counts above are
 from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
 they had drifted by up to 17).
 
@@ -219,6 +219,15 @@ against it, so a change in ordering silently re-points existing rows.
   A duplicate letter used to be accepted and enumerated twice; refusing it in
   `parse`, the first fix, made every Catalan job -- games included -- fail to
   load, which a review caught before it shipped.)*
+- `U-RACK-2b` A distribution keeps every row whole for drawing a tile -- the
+  letter as named (`L·L`), its blank's spelling (`l·l`), its score -- in
+  machine-letter order, and `canonical_rack` spells a rack typed any way as
+  MAGPIE spells a captured position's (`rack_get_string`): machine-letter
+  order (Catalan's `Ç` after `C`, not after `Z`), the blank last, a
+  multi-character letter bracketed; a rack with a tile the distribution lacks
+  is `None`. The positions search used to sort the characters, so a rack with
+  a blank -- `?` sorts first, MAGPIE writes it last -- was never found.
+  *(Covered: `racks::tests::a_rack_is_spelt_as_magpie_spells_it`.)*
 - `U-RACK-3` `enumerate_racks(k)` returns exactly `total()` racks for that size,
   each sorted, with no duplicates. *(Covered:
   `racks::tests::every_enumerated_rack_is_canonical_distinct_and_counted`.)*
@@ -531,7 +540,9 @@ to answer with a field the server had never accepted.
 
 - `U-FAKE-1` A captured `games` submission deserializes into
   `GameResultsResponse` and passes `process_response`. *(Covered:
-  `plausibility::tests::the_fake_workers_games_submission_passes_validation`.)*
+  `plausibility::tests::the_fake_workers_games_submission_passes_validation`;
+  that its positions are boards the site can draw, each following from the
+  last, is `F-CGP-4`.)*
 - `U-FAKE-2` A captured `game_pairs` submission does the same, **including** the
   pentanomial cross-checks. *(Covered:
   `plausibility::tests::the_fake_workers_game_pairs_submission_passes_the_pentanomial_cross_checks`.)*
@@ -719,6 +730,33 @@ Each entry's tests are the `describe` block named for its id.
   distribution or board left on its empty "Choose…" (the job and rating-pool
   forms, which no longer pick the first imported for the admin). *(Covered:
   `format.test.ts`.)* (Twenty-second audit.)
+
+### `F-CGP-*` — `lib/cgp.ts`
+
+The saved-positions board is drawn from two strings MAGPIE writes, so these
+read them as it writes them (`game_get_cgp_string`, `move_get_string`) and
+refuse what it could not have written, rather than draw a wrong board.
+
+- `F-CGP-1` `parseCgp` reads the board row by row (runs of empty squares as
+  numbers, a blank in lower case, a bracketed multi-character letter as one
+  tile, `Ç` as one), both racks in seat order (`?` a blank), the scores and
+  the scoreless turns, ignoring options after them; a board that is not
+  square, a rack or score missing, or an unclosed bracket is `null`.
+  *(Covered: `cgp.test.ts`.)*
+- `F-CGP-2` `parseMove` reads a play across as row then column (`8G HUH`) and
+  one down as column then row (`E9 (E)RUVIM`), letters played through in
+  parentheses or as `.`, blanks and bracketed letters, an exchange and a pass,
+  and refuses anything else. *(Covered: `cgp.test.ts`.)*
+- `F-CGP-3` The previous move's highlight is the squares it placed, never
+  those it played through, and nothing for a pass, an exchange or text it
+  cannot read; the player to move is the seat holding the position's rack, in
+  any order. *(Covered: `cgp.test.ts`.)*
+- `F-CGP-4` Every position MAGPIE wrote (`contract-fixtures/result-games.json`)
+  and the fake worker wrote (`fake_worker_games_captured.json`) parses, its
+  mover is found, and its previous move is exactly the difference from the
+  turn before: its placed squares were empty and now hold the letters it
+  names, every other square is unchanged, and the mover's score rose by its
+  score. *(Covered: `cgp.test.ts`.)*
 
 ### `F-API-*` — `lib/api.ts`
 
@@ -2455,7 +2493,9 @@ below.
   trailing whitespace, row widths, unknown squares and start squares (it is
   stricter only on parser quirks). *(Covered:
   `admin_api::a_config_or_job_no_worker_can_run_is_refused`,
-  `routes::admin::tests::a_layout_magpie_would_refuse_is_refused`.)*
+  `routes::admin::tests::a_layout_magpie_would_refuse_is_refused`; the same
+  parser reads each square and the start square for the saved-positions
+  board, `board::tests::a_layout_is_read_square_by_square`.)*
   (Thirty-second audit.)
 - `A-ADMIN-22` Deleting an account locks the account before its own rows:
   with the account held, the delete waits holding none of its reset links.
@@ -2567,10 +2607,21 @@ below.
   about a job that exists, and "nothing yet" is its answer; only an unknown job
   is a 404. *(Covered: `public_api::rack_lookup_finds_an_analysed_rack`.)*
 - `A-PUBLIC-4b` A games job's captured positions (`/api/jobs/:id/positions`)
-  page newest first with their ranked moves, and `?rack=` finds a rack however
-  it is typed; signed out is a `401`, an opening-rack job a `400`, an unknown
-  job a `404`. *(Covered:
-  `public_api::captured_positions_are_searchable_when_signed_in`.)*
+  with one rack page newest first with their ranked moves, the rack however
+  it is typed -- blank first, lower case -- spelt as MAGPIE spells one; a rack
+  the distribution cannot spell is an empty page; no rack is a `400`, signed
+  out a `401`, an opening-rack job a `400`, an unknown job a `404`.
+  *(Covered: `public_api::captured_positions_are_searchable_when_signed_in`.)*
+- `A-PUBLIC-4c` A random position (`/positions/random`) is drawn from the
+  tasks that have one, past tasks still being played -- the first captured of
+  a task comes back, which the newest-position fallback never returns -- and
+  is `null` for a job with no task, or none returned; signed out is a `401`,
+  an opening-rack job a `400`, an unknown job a `404`. *(Covered:
+  `public_api::a_random_position_is_drawn_from_the_tasks_that_have_one`.)*
+- `A-PUBLIC-4d` A job's board (`/api/jobs/:id/board`) is public: its layout
+  square by square with the start square, and every letter of its
+  distribution with its blank's spelling and score. *(Covered:
+  `public_api::a_jobs_board_is_its_layout_and_letter_scores`.)*
 - `A-PUBLIC-5` The SSE stream emits an event after a result is accepted, and the
   event body is byte-identical to what a page reload would fetch. *(Covered:
   `public_api::the_stream_sends_what_a_reload_would_fetch_after_each_result`,
@@ -2902,10 +2953,15 @@ admin in once and the admin journeys reuse its storage state.
   "No worker has declined this job", showed 100, and Activate sent it
   (thirty-second audit, pass 16).
 - `E-12` A games job made through the form with "Save the positions played"
-  ticked shows a signed-out visitor a
-  prompt to sign in, and a signed-in user its positions ten at a time with
-  "Load more", and a rack search whose every result holds that rack.
-  *(Covered: `e12-saved-positions.spec.ts`.)*
+  ticked shows a signed-out visitor a prompt to sign in, and a signed-in user
+  one position at a time on its board: **Random position** until one follows
+  a play, whose tiles are down with the play's outlined, both racks and
+  scores with the player to move marked, and its ranked moves; a rack search
+  for that rack typed backwards in lower case shows a position holding it
+  (with **Next** and **Previous** when there are more); a rack nothing has is
+  said to be. `E-12b`: at phone width the board fits the screen and nothing
+  scrolls sideways. *(Covered: `e12-saved-positions.spec.ts`, two tests; the
+  fake workers play synthetic games whose positions are real boards.)*
 - `E-13` An opening-rack job's page offers ten racks it has analysed under the
   search, and clicking one looks it up. *(Covered:
   `e13-opening-rack-samples.spec.ts`.)*
