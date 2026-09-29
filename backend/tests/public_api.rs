@@ -793,6 +793,8 @@ async fn captured_positions_are_searchable_when_signed_in() {
     )
     .await;
     assert_eq!(second["items"][0]["position"], "cgp-0-0", "{second}");
+    // The rack's last position: no "Next" to a page with nothing on it.
+    assert!(second["next_cursor"].is_null(), "{second}");
 
     let (_, later) = send(&app, get_request(&format!("{path}?rack=eedcbba"), &headers)).await;
     let items = later["items"].as_array().unwrap();

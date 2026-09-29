@@ -1178,8 +1178,10 @@ async fn job_positions(
     };
 
     // A seek into `position_analysis_records_game_rack_idx`, newest (highest
-    // id) first.
-    let rows = sqlx::query(&format!(
+    // id) first. One row past the page says whether there is a next: the page
+    // shows positions one at a time, and a cursor on every full page offered
+    // "Next" after a rack's only position, to a page saying it had none.
+    let mut rows = sqlx::query(&format!(
         "SELECT {POSITION_COLUMNS} FROM position_analysis_records r
          WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NOT NULL
            AND ($3::bigint IS NULL OR r.id < $3)
@@ -1189,11 +1191,13 @@ async fn job_positions(
     .bind(id)
     .bind(&rack)
     .bind(after)
-    .bind(limit)
+    .bind(limit + 1)
     .fetch_all(&state.read_pool)
     .await?;
 
-    let next_cursor = (rows.len() as i64 == limit)
+    let more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    let next_cursor = more
         .then(|| rows.last())
         .flatten()
         .map(|last| super::encode_cursor(&[last.get::<i64, _>("id").to_string()]));
