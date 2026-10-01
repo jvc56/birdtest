@@ -71,6 +71,8 @@ const OPENING_RACK_CORPUS: &str = "
                               'rank', m.rank, 'move', m.move, 'score', m.score,
                               'equity', m.equity, 'win_percentage', m.win_percentage,
                               'blended_utility', m.blended_utility,
+                              'mean_spread', m.mean_spread,
+                              'fidelity_plies', m.fidelity_plies,
                               'plies', COALESCE((
                                   SELECT jsonb_agg(
                                              jsonb_build_object(

@@ -749,11 +749,11 @@ async fn captured_positions_are_searchable_when_signed_in() {
     for batch in 0..2 {
         let mut result = games_result(2, 1);
         result["positions"] = json!([
-            { "game_index": 0, "turn_number": 0, "rack": "AABCDE?", "position": format!("cgp-{batch}-0"),
+            { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AABCDE?", "position": format!("cgp-{batch}-0"),
               "num_moves": 40, "moves": [
                   { "move": "8D BACCAE", "score": 74, "equity": 81.2 },
                   { "move": "8D ABACE", "score": 72, "equity": 79.0 } ] },
-            { "game_index": 1, "turn_number": 3, "rack": "ABBCDEE", "position": format!("cgp-{batch}-1"),
+            { "game_index": 1, "turn_number": 3, "analysis": "static", "rack": "ABBCDEE", "position": format!("cgp-{batch}-1"),
               "previous_move": "8D DAB", "previous_move_score": 10,
               "num_moves": 30, "moves": [{ "move": "8D BEDE", "score": 70, "equity": 77.0 }] },
         ]);
@@ -779,11 +779,14 @@ async fn captured_positions_are_searchable_when_signed_in() {
     assert_eq!(first["items"].as_array().unwrap().len(), 1, "{first}");
     assert_eq!(first["items"][0]["position"], "cgp-1-0", "{first}");
     assert_eq!(first["items"][0]["rack"], "AABCDE?");
+    assert_eq!(first["items"][0]["analysis"], "static");
     assert_eq!(
         first["items"][0]["moves"],
         json!([
-            { "rank": 1, "move": "8D BACCAE", "score": 74, "equity": 81.2, "win_percentage": null },
-            { "rank": 2, "move": "8D ABACE", "score": 72, "equity": 79.0, "win_percentage": null },
+            { "rank": 1, "move": "8D BACCAE", "score": 74, "equity": 81.2, "win_percentage": null,
+              "mean_spread": null, "fidelity_plies": null },
+            { "rank": 2, "move": "8D ABACE", "score": 72, "equity": 79.0, "win_percentage": null,
+              "mean_spread": null, "fidelity_plies": null },
         ])
     );
     let cursor = first["next_cursor"].as_str().expect("a full page has a next");
@@ -864,9 +867,9 @@ async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
     let (assignment, uuid) = &claims[2];
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "rack": "AABCDE?", "position": "first",
+        { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AABCDE?", "position": "first",
           "num_moves": 3, "moves": [{ "move": "8D BACCAE", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 4, "rack": "ABBCDEE", "position": "second",
+        { "game_index": 1, "turn_number": 4, "analysis": "static", "rack": "ABBCDEE", "position": "second",
           "previous_move": "8D DAB", "previous_move_score": 10,
           "num_moves": 3, "moves": [{ "move": "8D BEDE", "score": 70, "equity": 77.0 }] },
     ]);

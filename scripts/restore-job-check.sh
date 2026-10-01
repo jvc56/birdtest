@@ -121,8 +121,8 @@ SELECT t.id, t.job_id, gen_random_uuid(), 'completed', (SELECT id FROM users), n
 INSERT INTO game_results (task_claim_id, task_id, job_id, games, wins, losses, ties,
                           p1_score_mean, p1_score_sd, p2_score_mean, p2_score_sd)
 SELECT c.id, c.task_id, c.job_id, 10, 6, 4, 0, 412.5, 55.25, 398.0, 61.5 FROM task_claims c;
-INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves)
-SELECT c.id, c.task_id, c.job_id, 'AEINRST', 2 FROM task_claims c WHERE c.job_id = '00000000-0000-0000-0000-00000000000a' LIMIT 20;
+INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves, analysis)
+SELECT c.id, c.task_id, c.job_id, 'AEINRST', 2, 'sim' FROM task_claims c WHERE c.job_id = '00000000-0000-0000-0000-00000000000a' LIMIT 20;
 INSERT INTO position_analysis_moves (record_id, rank, move, score, equity)
 SELECT r.id, k, 'H8 RETAINS', 70 + k, 40.5 + k FROM position_analysis_records r, generate_series(1, 3) k;
 INSERT INTO position_analysis_plies (move_id, ply, bingo_percentage, average_score)

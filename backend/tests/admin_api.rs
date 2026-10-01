@@ -137,13 +137,13 @@ async fn purging_a_job_removes_its_captured_positions_through_the_record() {
     let uuid = assignment["worker_uuid"].as_str().unwrap();
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+        { "game_index": 0, "turn_number": 0, "analysis": "sim", "rack": "AEINRST", "position": "cgp-0",
           "num_moves": 40,
           "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                       "win_percentage": 55.0, "blended_utility": 0.6,
                       "plies": [{ "ply": 0, "bingo_percentage": 0.0, "average_score": 24.0 }] }] },
         // A capturing job's result has positions from every game of its batch.
-        { "game_index": 1, "turn_number": 0, "rack": "AEINRST", "position": "cgp-1",
+        { "game_index": 1, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp-1",
           "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
     ]);
     let (_, body) = send(
@@ -1154,6 +1154,98 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["job"]["bingo_bonus"], json!(50), "{created}");
     assert_eq!(created["job"]["sim_cutoff"], json!(0.005), "{created}");
+}
+
+/// A-ADMIN-25: a player config solves the endgame and the pre-endgame
+/// exactly as it states. `endgame_plies` 0 solves nothing, and the
+/// pre-endgame is refused without it, since PEG scores its emptier scenarios
+/// with endgame solves. A PEG setting without the pre-endgame on is refused,
+/// as a simulation setting without plies is; what a PEG player leaves out is
+/// MAGPIE's default, written into the row.
+#[tokio::test]
+async fn a_player_config_solves_the_end_of_the_game_only_as_it_states() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let body = |name: &str, extra: serde_json::Value| {
+        let mut body = json!({
+            "name": name, "recorder_type": "best", "kwg_id": kwg, "klv_id": klv,
+            "num_plays_recorded": 1,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    };
+
+    // Off unless asked for.
+    let (status, plain) = player_config(&app, &headers, body("plain", json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{plain}");
+    assert_eq!(plain["endgame_plies"], json!(0), "{plain}");
+    assert_eq!(plain["peg_max_bag"], json!(0), "{plain}");
+    assert_eq!(plain["peg_stage_top_k"], json!(null), "{plain}");
+
+    // The endgame alone states no PEG settings.
+    let (status, endgamer) =
+        player_config(&app, &headers, body("endgamer", json!({ "endgame_plies": 4 }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{endgamer}");
+    assert_eq!(endgamer["endgame_plies"], json!(4), "{endgamer}");
+    assert_eq!(endgamer["peg_nested"], json!(null), "{endgamer}");
+
+    // The pre-endgame with only its switch takes MAGPIE's schedule.
+    let (status, pegger) = player_config(&app, &headers, body("pegger", json!({
+        "endgame_plies": 6, "peg_max_bag": 2,
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{pegger}");
+    for (field, expected) in [
+        ("peg_max_bag", json!(2)),
+        ("peg_stage_top_k", json!([32, 16, 8, 4, 2])),
+        ("peg_scenario_stride", json!(1)),
+        ("peg_opp_model", json!("rational")),
+        ("peg_nested", json!(true)),
+        ("peg_nested_cand_caps", json!([8, 4, 2])),
+        ("peg_nested_max_depth", json!(1)),
+        ("peg_nested_strides", json!([1, 1, 5, 7])),
+    ] {
+        assert_eq!(pegger[field], expected, "pegger {field}: {pegger}");
+    }
+
+    // Without nested lookahead the nested settings are not stated.
+    let (status, flat) = player_config(&app, &headers, body("flat", json!({
+        "endgame_plies": 3, "peg_max_bag": 1, "peg_nested": false,
+        "peg_stage_top_k": [8, 4], "peg_opp_model": "pessimistic",
+    }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{flat}");
+    assert_eq!(flat["peg_nested_cand_caps"], json!(null), "{flat}");
+    assert_eq!(flat["peg_opp_model"], json!("pessimistic"), "{flat}");
+
+    let refused = [
+        ("peg-without-endgame", json!({ "peg_max_bag": 2 }), "peg_max_bag"),
+        ("peg-with-endgame-off", json!({ "endgame_plies": 0, "peg_max_bag": 2 }), "peg_max_bag"),
+        ("too-deep", json!({ "endgame_plies": 26 }), "endgame_plies"),
+        ("bag-too-big", json!({ "endgame_plies": 6, "peg_max_bag": 5 }), "peg_max_bag"),
+        ("stride-without-peg", json!({ "endgame_plies": 6, "peg_scenario_stride": 2 }), "peg_scenario_stride"),
+        (
+            "depth-without-nested",
+            json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_nested": false, "peg_nested_max_depth": 2 }),
+            "peg_nested_max_depth",
+        ),
+        ("one-play-stage", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_stage_top_k": [4, 1] }), "peg_stage_top_k"),
+        ("growing-stages", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_stage_top_k": [4, 8] }), "peg_stage_top_k"),
+        ("zero-stride", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_scenario_stride": 0 }), "peg_scenario_stride"),
+        ("unknown-opponent", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_opp_model": "nice" }), "peg_opp_model"),
+        ("three-strides", json!({ "endgame_plies": 6, "peg_max_bag": 2, "peg_nested_strides": [1, 1, 5] }), "peg_nested_strides"),
+    ];
+    for (name, extra, field) in refused {
+        let (status, response) = player_config(&app, &headers, body(name, extra)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{name}: {response}");
+        assert_eq!(response["fields"][0]["field"], field, "{name}: {response}");
+    }
 }
 
 /// A config or job no worker can run is refused at creation. Each of these

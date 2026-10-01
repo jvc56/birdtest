@@ -104,9 +104,9 @@ async fn completed_capture_job(db: &TestDb, app: &axum::Router, results: usize) 
 fn captured_result(i: usize) -> serde_json::Value {
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": format!("cgp-{i}-0"),
+        { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": format!("cgp-{i}-0"),
           "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 3, "rack": "AEINRSU", "position": format!("cgp-{i}-1"),
+        { "game_index": 1, "turn_number": 3, "analysis": "static", "rack": "AEINRSU", "position": format!("cgp-{i}-1"),
           "previous_move": "8D DOG", "previous_move_score": 10,
           "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
     ]);
@@ -590,8 +590,8 @@ async fn a_reader_that_hangs_up_ends_its_corpus_query() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves)
-         SELECT $1, $2, $3, 'R' || g, 5 FROM generate_series(1, 150000) g",
+        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves, analysis)
+         SELECT $1, $2, $3, 'R' || g, 5, 'static' FROM generate_series(1, 150000) g",
     )
     .bind(claim)
     .bind(task)
@@ -650,8 +650,8 @@ async fn a_stream_the_database_cuts_off_ends_in_an_error() {
     )
     .bind(task).bind(job).bind(admin).fetch_one(&db.pool).await.unwrap();
     sqlx::query(
-        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves)
-         SELECT $1, $2, $3, 'R' || g, 5 FROM generate_series(1, 150000) g",
+        "INSERT INTO position_analysis_records (task_claim_id, task_id, job_id, rack, num_moves, analysis)
+         SELECT $1, $2, $3, 'R' || g, 5, 'static' FROM generate_series(1, 150000) g",
     )
     .bind(claim).bind(task).bind(job).execute(&db.pool).await.unwrap();
     sqlx::query(
@@ -885,8 +885,9 @@ async fn results_and_positions_are_read_in_one_snapshot() {
     .unwrap();
     sqlx::query(
         "INSERT INTO position_analysis_records
-             (task_claim_id, task_id, job_id, rack, position, game_index, turn_number, num_moves)
-         VALUES ($1, $2, $3, 'AEINRST', 'late', 0, 0, 1)",
+             (task_claim_id, task_id, job_id, rack, position, game_index, turn_number, num_moves,
+              analysis)
+         VALUES ($1, $2, $3, 'AEINRST', 'late', 0, 0, 1, 'static')",
     )
     .bind(claim)
     .bind(task)

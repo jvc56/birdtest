@@ -8,6 +8,7 @@ import {
   jobTypeLabel,
   leavePlayerConflict,
   optionalNumber,
+  optionalIntList,
   parseTargetRackCounts,
   MAX_LEAVE_GENERATIONS,
   MAX_TARGET_RACK_COUNT,
@@ -179,6 +180,16 @@ describe('F-FMT-6 form numbers', () => {
     expect(optionalNumber('7')).toBe(7);
   });
 
+  it('reads a blank list as the default and refuses a part that is not a whole number', () => {
+    expect(optionalIntList('')).toEqual({ values: null });
+    expect(optionalIntList('  ')).toEqual({ values: null });
+    expect(optionalIntList('32, 16,8 ,4,2')).toEqual({ values: [32, 16, 8, 4, 2] });
+    expect(optionalIntList('7')).toEqual({ values: [7] });
+    expect(optionalIntList('8, x')).toEqual({ error: '"x" is not a whole number.' });
+    expect(optionalIntList('8,,4')).toEqual({ error: '"" is not a whole number.' });
+    expect(optionalIntList('-2')).toEqual({ error: '"-2" is not a whole number.' });
+  });
+
   it('names the fields a request would send blank', () => {
     expect(blankFields({ a: 1, b: null, c: Number.NaN, d: 'x', e: 0 })).toEqual(['b', 'c']);
     expect(blankFields({ a: 1 })).toEqual([]);
@@ -342,12 +353,18 @@ describe('F-FMT-17 leavePlayerConflict', () => {
 
   it('names everything job creation would refuse', () => {
     expect(leavePlayerConflict({ ...player, num_plies: 1 })).toBe(
-      'static simulates 1 ply; leave generation plays statically on equity, without a rack info table.'
+      'static simulates 1 ply; leave generation plays statically on equity, without a rack info table ' +
+        'or endgame solving.'
     );
     expect(leavePlayerConflict({ ...player, num_plies: 2, sort_strategy: 'score', use_rit: true })).toBe(
       'static simulates 2 plies, sorts on score and asks for a rack info table; leave generation ' +
-        'plays statically on equity, without a rack info table.'
+        'plays statically on equity, without a rack info table or endgame solving.'
     );
+    expect(leavePlayerConflict({ ...player, endgame_plies: 6 })).toBe(
+      'static solves endgames; leave generation plays statically on equity, without a rack info ' +
+        'table or endgame solving.'
+    );
+    expect(leavePlayerConflict({ ...player, endgame_plies: 0 })).toBeNull();
   });
 });
 

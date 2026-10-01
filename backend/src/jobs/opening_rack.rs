@@ -72,11 +72,15 @@ impl JobHandler for OpeningRackHandler {
                 analysis.num_moves,
                 "opening rack",
             )?;
-            racks.push(PositionAnalysis::opening_rack(
+            let rack = PositionAnalysis::opening_rack(
                 analysis.rack.clone(),
                 analysis.moves,
                 analysis.num_moves,
-            ));
+            );
+            // An opening rack is analysed statically or by simulation, never
+            // by a solver: a solve's statistics on one are a broken client.
+            super::plausibility::check_analysis(rack.analysis, &rack.moves, "opening rack")?;
+            racks.push(rack);
         }
         Ok(PositionAnalysisRecord { positions: racks })
     }

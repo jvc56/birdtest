@@ -281,7 +281,7 @@ fn position(game_index: i32, num_moves: i32, moves: usize) -> Value {
         .map(|i| json!({ "move": format!("move-{i}"), "score": 60 - i as i32, "equity": 70.0 - i as f64 }))
         .collect();
     json!({
-        "game_index": game_index, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "game_index": game_index, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": num_moves, "moves": moves,
     })
 }
@@ -320,6 +320,79 @@ async fn captured_positions_keep_the_configured_moves_and_the_full_count() {
         ],
         "five sent, three kept, forty ranked; a shorter list is kept whole"
     );
+}
+
+/// I-SUBMIT-9: a position a solver decided keeps how it was analysed and
+/// each move's projected spread and ranking depth -- a pre-endgame's with its
+/// win percentage -- and a position whose moves do not match its analysis is
+/// refused: an endgame position with two moves, or a pre-endgame move with no
+/// spread, would read as an analysis that never ran.
+#[tokio::test]
+async fn solved_positions_keep_their_analysis_spread_and_depth() {
+    let db = TestDb::new().await;
+    let job = capturing_job(&db, 5).await;
+    let app = birdtest::app(db.state().await);
+
+    let solved = |index: i32, analysis: &str, moves: Value| {
+        json!({
+            "game_index": index, "turn_number": 20, "rack": "AEINRST", "position": "cgp",
+            "num_moves": 12, "analysis": analysis, "moves": moves,
+        })
+    };
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([
+        solved(0, "peg", json!([
+            { "move": "8D RETAINS", "score": 74, "equity": 80.5, "win_percentage": 87.5,
+              "mean_spread": 31.25, "fidelity_plies": 4 },
+            { "move": "8D STAINER", "score": 70, "equity": 79.0, "win_percentage": 50.0,
+              "mean_spread": -2.5, "fidelity_plies": 0 },
+        ])),
+        solved(1, "endgame", json!([
+            { "move": "8D RETAINS", "score": 74, "equity": 82.0, "mean_spread": 18.0,
+              "fidelity_plies": 6 },
+        ])),
+    ]);
+    claim_and_submit(&app, result).await;
+
+    /// A stored move: its position's game and analysis, its rank, win %, spread and depth.
+    type Stored = (i16, String, i16, Option<f64>, Option<f64>, Option<i16>);
+    let rows: Vec<Stored> = sqlx::query_as(
+        "SELECT r.game_index, r.analysis, m.rank, m.win_percentage, m.mean_spread, m.fidelity_plies
+         FROM position_analysis_records r
+         JOIN position_analysis_moves m ON m.record_id = r.id
+         WHERE r.job_id = $1 ORDER BY r.game_index, m.rank",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            (0, "peg".into(), 1, Some(87.5), Some(31.25), Some(4)),
+            (0, "peg".into(), 2, Some(50.0), Some(-2.5), Some(0)),
+            (1, "endgame".into(), 1, None, Some(18.0), Some(6)),
+        ]
+    );
+
+    let refused = [
+        solved(0, "endgame", json!([
+            { "move": "8D RETAINS", "score": 74, "equity": 82.0, "mean_spread": 18.0, "fidelity_plies": 6 },
+            { "move": "8D STAINER", "score": 70, "equity": 79.0, "mean_spread": 10.0, "fidelity_plies": 6 },
+        ])),
+        solved(0, "peg", json!([{ "move": "8D RETAINS", "score": 74, "equity": 82.0, "win_percentage": 50.0 }])),
+        solved(0, "static", json!([
+            { "move": "8D RETAINS", "score": 74, "equity": 82.0, "mean_spread": 18.0, "fidelity_plies": 6 },
+        ])),
+        solved(0, "rollout", json!([{ "move": "8D RETAINS", "score": 74, "equity": 82.0 }])),
+    ];
+    for position in refused {
+        let mut result = games_result(2, 1);
+        result["positions"] = json!([position]);
+        let (assignment, uuid) = first_claim(&app).await;
+        let (status, body) = submit(&app, &assignment, &uuid, result).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{position}: {body}");
+    }
 }
 
 /// I-SUBMIT-7: rank 1 is the best move -- the first of the worker's

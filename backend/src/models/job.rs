@@ -138,6 +138,19 @@ pub struct PlayerConfig {
     /// so this table is the exhaustive source of what a job asked for; a
     /// job's two player configs must agree on it (validated at creation).
     pub movegen_margin: f64,
+    /// Endgame and pre-endgame solving (see the migration's comment).
+    /// `endgame_plies` 0 solves nothing and turns PEG off; the PEG schedule is
+    /// `None` unless `peg_max_bag` is above 0, and the nested knobs unless
+    /// `peg_nested` is set.
+    pub endgame_plies: i32,
+    pub peg_max_bag: i32,
+    pub peg_stage_top_k: Option<Vec<i32>>,
+    pub peg_scenario_stride: Option<i32>,
+    pub peg_opp_model: Option<String>,
+    pub peg_nested: Option<bool>,
+    pub peg_nested_cand_caps: Option<Vec<i32>>,
+    pub peg_nested_max_depth: Option<i32>,
+    pub peg_nested_strides: Option<Vec<i32>>,
     /// `None` once the admin who created it has been deleted.
     pub created_by: Option<Uuid>,
     pub created_at: DateTime<Utc>,

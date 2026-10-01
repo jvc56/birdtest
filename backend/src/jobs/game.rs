@@ -65,7 +65,15 @@ pub(super) fn validate_positions(
             Some(position.num_moves),
             "captured position",
         )?;
+        let analysis = Analysis::parse(&position.analysis).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "captured position has an unknown analysis {:?}",
+                position.analysis
+            ))
+        })?;
+        super::plausibility::check_analysis(analysis, &position.moves, "captured position")?;
         out.push(PositionAnalysis {
+            analysis,
             rack: position.rack,
             position: Some(position.position),
             game_index: Some(position.game_index),
@@ -226,7 +234,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "game_index": 0, "turn_number": turn, "rack": "AEINRST",
                 "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
-                "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
+                "num_moves": 1, "analysis": "static",
+                "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
             }))
             .unwrap()
         };

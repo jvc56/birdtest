@@ -296,6 +296,15 @@ struct PlayerSettings {
     utility_w_spread: Option<f64>,
     utility_spread_scale: Option<f64>,
     movegen_margin: f64,
+    endgame_plies: i32,
+    peg_max_bag: i32,
+    peg_stage_top_k: Option<Vec<i32>>,
+    peg_scenario_stride: Option<i32>,
+    peg_opp_model: Option<String>,
+    peg_nested: Option<bool>,
+    peg_nested_cand_caps: Option<Vec<i32>>,
+    peg_nested_max_depth: Option<i32>,
+    peg_nested_strides: Option<Vec<i32>>,
 }
 
 fn no_role(role: &&'static str) -> bool {
@@ -332,6 +341,15 @@ impl PlayerSettings {
             utility_w_spread: c.utility_w_spread,
             utility_spread_scale: c.utility_spread_scale,
             movegen_margin: c.movegen_margin,
+            endgame_plies: c.endgame_plies,
+            peg_max_bag: c.peg_max_bag,
+            peg_stage_top_k: c.peg_stage_top_k,
+            peg_scenario_stride: c.peg_scenario_stride,
+            peg_opp_model: c.peg_opp_model,
+            peg_nested: c.peg_nested,
+            peg_nested_cand_caps: c.peg_nested_cand_caps,
+            peg_nested_max_depth: c.peg_nested_max_depth,
+            peg_nested_strides: c.peg_nested_strides,
         }
     }
 }
@@ -1073,7 +1091,8 @@ const MAX_POSITIONS_PER_PAGE: i64 = 20;
 
 /// A saved position's own columns, as every positions route reads them.
 const POSITION_COLUMNS: &str = "r.id, r.task_id, r.rack, r.position, r.game_index, r.turn_number,
-                                r.previous_move, r.previous_move_score, r.num_moves, r.submitted_at";
+                                r.previous_move, r.previous_move_score, r.num_moves, r.analysis,
+                                r.submitted_at";
 
 /// A games or game-pairs job, or the `400` that says only those save positions.
 async fn capturing_job(state: &AppState, id: Uuid) -> AppResult<Job> {
@@ -1105,7 +1124,8 @@ async fn saved_positions(
     let ids: Vec<i64> = rows.iter().map(|r| r.get("id")).collect();
     let mut moves: HashMap<i64, Vec<serde_json::Value>> = HashMap::new();
     for m in sqlx::query(
-        "SELECT record_id, rank, move, score, equity, win_percentage
+        "SELECT record_id, rank, move, score, equity, win_percentage, mean_spread,
+                fidelity_plies
          FROM position_analysis_moves
          WHERE record_id = ANY($1)
          ORDER BY record_id, rank",
@@ -1120,6 +1140,8 @@ async fn saved_positions(
             "score": m.get::<i32, _>("score"),
             "equity": m.get::<f64, _>("equity"),
             "win_percentage": m.get::<Option<f64>, _>("win_percentage"),
+            "mean_spread": m.get::<Option<f64>, _>("mean_spread"),
+            "fidelity_plies": m.get::<Option<i16>, _>("fidelity_plies"),
         }));
     }
 
@@ -1136,6 +1158,7 @@ async fn saved_positions(
                 "previous_move": r.get::<Option<String>, _>("previous_move"),
                 "previous_move_score": r.get::<Option<i32>, _>("previous_move_score"),
                 "num_moves": r.get::<i32, _>("num_moves"),
+                "analysis": r.get::<String, _>("analysis"),
                 "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),
                 "moves": moves.remove(&record).unwrap_or_default(),
             })

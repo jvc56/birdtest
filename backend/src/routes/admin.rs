@@ -541,6 +541,184 @@ struct CreatePlayerConfigBody {
     utility_spread_scale: Option<f64>,
     #[serde(default)]
     movegen_margin: Option<f64>,
+    /// Endgame and pre-endgame solving, for games and game-pairs jobs. Off
+    /// unless `endgame_plies` is above 0, which PEG needs too; see
+    /// [`resolve_solver_settings`].
+    #[serde(default)]
+    endgame_plies: Option<i32>,
+    #[serde(default)]
+    peg_max_bag: Option<i32>,
+    #[serde(default)]
+    peg_stage_top_k: Option<Vec<i32>>,
+    #[serde(default)]
+    peg_scenario_stride: Option<i32>,
+    #[serde(default)]
+    peg_opp_model: Option<String>,
+    #[serde(default)]
+    peg_nested: Option<bool>,
+    #[serde(default)]
+    peg_nested_cand_caps: Option<Vec<i32>>,
+    #[serde(default)]
+    peg_nested_max_depth: Option<i32>,
+    #[serde(default)]
+    peg_nested_strides: Option<Vec<i32>>,
+}
+
+/// A player config's endgame and pre-endgame settings as the row stores them.
+#[derive(Debug, Default, PartialEq)]
+struct SolverSettings {
+    endgame_plies: i32,
+    peg_max_bag: i32,
+    peg_stage_top_k: Option<Vec<i32>>,
+    peg_scenario_stride: Option<i32>,
+    peg_opp_model: Option<String>,
+    peg_nested: Option<bool>,
+    peg_nested_cand_caps: Option<Vec<i32>>,
+    peg_nested_max_depth: Option<i32>,
+    peg_nested_strides: Option<Vec<i32>>,
+}
+
+/// MAGPIE's endgame depth ceiling (`MAX_VARIANT_LENGTH`) and largest
+/// pre-endgame bag (`PEG_MAX_BAG`).
+const MAGPIE_MAX_ENDGAME_PLIES: i32 = 25;
+const MAGPIE_PEG_MAX_BAG: i32 = 4;
+/// The most stages a PEG schedule, or levels a nested cap list, may have
+/// (`AUTOPLAY_SOLVER_MAX_PEG_STAGES`, `AUTOPLAY_SOLVER_MAX_NESTED_CAND_CAPS`).
+const MAGPIE_MAX_PEG_STAGES: usize = 16;
+
+/// Resolves and checks a body's endgame and pre-endgame settings.
+///
+/// They nest, as MAGPIE reads them: `endgame_plies` 0 solves nothing, and PEG
+/// is refused without it, since PEG scores its emptier scenarios with endgame
+/// solves. A PEG setting without `peg_max_bag` above 0 is refused, as is a
+/// nested setting without nested lookahead -- the same rule simulation
+/// settings follow without plies: a setting nothing reads would read as one
+/// the player uses. Settings left out take MAGPIE's defaults
+/// ([`crate::magpie_defaults`]), written into the row like every other.
+fn resolve_solver_settings(body: &CreatePlayerConfigBody) -> AppResult<SolverSettings> {
+    use crate::magpie_defaults as defaults;
+    let mut err = AppError::bad_request("player config is invalid");
+    let plies = body.endgame_plies.unwrap_or(0);
+    let max_bag = body.peg_max_bag.unwrap_or(0);
+    if !(0..=MAGPIE_MAX_ENDGAME_PLIES).contains(&plies) {
+        err = err.with_field(
+            "endgame_plies",
+            format!("must be between 0 (off) and {MAGPIE_MAX_ENDGAME_PLIES}"),
+        );
+    }
+    if !(0..=MAGPIE_PEG_MAX_BAG).contains(&max_bag) {
+        err = err
+            .with_field("peg_max_bag", format!("must be between 0 (off) and {MAGPIE_PEG_MAX_BAG}"));
+    } else if max_bag > 0 && plies == 0 {
+        err = err.with_field(
+            "peg_max_bag",
+            "the pre-endgame needs endgame solving: set an endgame depth (endgame_plies) as well",
+        );
+    }
+    let peg_stated = [
+        ("peg_stage_top_k", body.peg_stage_top_k.is_some()),
+        ("peg_scenario_stride", body.peg_scenario_stride.is_some()),
+        ("peg_opp_model", body.peg_opp_model.is_some()),
+        ("peg_nested", body.peg_nested.is_some()),
+        ("peg_nested_cand_caps", body.peg_nested_cand_caps.is_some()),
+        ("peg_nested_max_depth", body.peg_nested_max_depth.is_some()),
+        ("peg_nested_strides", body.peg_nested_strides.is_some()),
+    ];
+    if max_bag <= 0 {
+        for (field, stated) in peg_stated {
+            if stated {
+                err = err.with_field(
+                    field,
+                    "is a pre-endgame setting: set peg_max_bag above 0 to run the pre-endgame, \
+                     or leave it out",
+                );
+            }
+        }
+        return if err.fields.is_empty() {
+            Ok(SolverSettings { endgame_plies: plies, peg_max_bag: 0, ..Default::default() })
+        } else {
+            Err(err)
+        };
+    }
+
+    let top_k = body.peg_stage_top_k.clone().unwrap_or_else(|| defaults::PEG_STAGE_TOP_K.to_vec());
+    if top_k.is_empty() || top_k.len() > MAGPIE_MAX_PEG_STAGES {
+        err = err.with_field(
+            "peg_stage_top_k",
+            format!("needs 1 to {MAGPIE_MAX_PEG_STAGES} stages"),
+        );
+    } else if top_k.iter().any(|&k| k < 2) || top_k.windows(2).any(|w| w[1] > w[0]) {
+        err = err.with_field(
+            "peg_stage_top_k",
+            "each stage keeps at least 2 plays, and no more than the stage before it",
+        );
+    }
+    let stride = body.peg_scenario_stride.unwrap_or(defaults::PEG_SCENARIO_STRIDE);
+    if stride < 1 {
+        err = err.with_field("peg_scenario_stride", "must be at least 1 (1 is full enumeration)");
+    }
+    let opp_model = body.peg_opp_model.clone().unwrap_or_else(|| defaults::PEG_OPP_MODEL.into());
+    if !matches!(opp_model.as_str(), "rational" | "pessimistic") {
+        err = err.with_field("peg_opp_model", "must be 'rational' or 'pessimistic'");
+    }
+    let nested = body.peg_nested.unwrap_or(defaults::PEG_NESTED);
+    let mut settings = SolverSettings {
+        endgame_plies: plies,
+        peg_max_bag: max_bag,
+        peg_stage_top_k: Some(top_k),
+        peg_scenario_stride: Some(stride),
+        peg_opp_model: Some(opp_model),
+        peg_nested: Some(nested),
+        ..Default::default()
+    };
+    if !nested {
+        for (field, stated) in &peg_stated[4..] {
+            if *stated {
+                err = err.with_field(
+                    *field,
+                    "is a nested-lookahead setting: set peg_nested to true, or leave it out",
+                );
+            }
+        }
+    } else {
+        let caps = body
+            .peg_nested_cand_caps
+            .clone()
+            .unwrap_or_else(|| defaults::PEG_NESTED_CAND_CAPS.to_vec());
+        if caps.is_empty() || caps.len() > MAGPIE_MAX_PEG_STAGES || caps.iter().any(|&c| c < 1) {
+            err = err.with_field(
+                "peg_nested_cand_caps",
+                format!("needs 1 to {MAGPIE_MAX_PEG_STAGES} caps, each at least 1"),
+            );
+        }
+        let depth = body.peg_nested_max_depth.unwrap_or(defaults::PEG_NESTED_MAX_DEPTH);
+        if !(1..=MAGPIE_PEG_MAX_BAG).contains(&depth) {
+            err = err.with_field(
+                "peg_nested_max_depth",
+                format!("must be between 1 and {MAGPIE_PEG_MAX_BAG}"),
+            );
+        }
+        let strides = body
+            .peg_nested_strides
+            .clone()
+            .unwrap_or_else(|| defaults::PEG_NESTED_STRIDES.to_vec());
+        if strides.len() != MAGPIE_PEG_MAX_BAG as usize || strides.iter().any(|&s| s < 1) {
+            err = err.with_field(
+                "peg_nested_strides",
+                format!(
+                    "needs one stride per inner bag size 1 to {MAGPIE_PEG_MAX_BAG}, each at least 1"
+                ),
+            );
+        }
+        settings.peg_nested_cand_caps = Some(caps);
+        settings.peg_nested_max_depth = Some(depth);
+        settings.peg_nested_strides = Some(strides);
+    }
+    if err.fields.is_empty() {
+        Ok(settings)
+    } else {
+        Err(err)
+    }
 }
 
 async fn create_player_config(
@@ -554,6 +732,7 @@ async fn create_player_config(
     csrf::verify(&method, &headers, &jar)?;
 
     validate_player_config_body(&body)?;
+    let solver = resolve_solver_settings(&body)?;
 
     if !matches!(body.recorder_type.as_str(), "best" | "equity" | "all") {
         return Err(AppError::bad_request("recorder_type must be 'best', 'equity' or 'all'"));
@@ -699,9 +878,12 @@ async fn create_player_config(
               stopping_pct, use_inference, time_limit_secs,
               use_wordmap, use_rit, min_play_iterations, threshold,
               sampling_rule, inference_margin, utility_w_winpct, utility_w_spread,
-              utility_spread_scale, movegen_margin, created_by)
+              utility_spread_scale, movegen_margin, created_by,
+              endgame_plies, peg_max_bag, peg_stage_top_k, peg_scenario_stride,
+              peg_opp_model, peg_nested, peg_nested_cand_caps, peg_nested_max_depth,
+              peg_nested_strides)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                 $18,$19,$20,$21,$22,$23,$24,$25,$26)
+                 $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
          RETURNING *",
     )
     .bind(body.name.trim())
@@ -737,6 +919,15 @@ async fn create_player_config(
     .bind(utility_spread_scale)
     .bind(movegen_margin)
     .bind(admin.0.id)
+    .bind(solver.endgame_plies)
+    .bind(solver.peg_max_bag)
+    .bind(&solver.peg_stage_top_k)
+    .bind(solver.peg_scenario_stride)
+    .bind(&solver.peg_opp_model)
+    .bind(solver.peg_nested)
+    .bind(&solver.peg_nested_cand_caps)
+    .bind(solver.peg_nested_max_depth)
+    .bind(&solver.peg_nested_strides)
     .fetch_one(&state.pool)
     .await
     .map_err(|e| match body.cloned_from_id {
@@ -1701,9 +1892,10 @@ async fn validate_leave_player(
     player_config_id: Uuid,
     letterdist_name: &str,
 ) -> AppResult<()> {
-    let (plies, sort, use_rit, kwg_role, lexicon) =
-        sqlx::query_as::<_, (i32, String, bool, String, String)>(
-            "SELECT pc.num_plies, pc.sort_strategy, pc.use_rit, kwg.role, kwg.name
+    let (plies, sort, use_rit, endgame_plies, kwg_role, lexicon) =
+        sqlx::query_as::<_, (i32, String, bool, i32, String, String)>(
+            "SELECT pc.num_plies, pc.sort_strategy, pc.use_rit, pc.endgame_plies, kwg.role,
+                    kwg.name
              FROM player_configs pc JOIN input_data kwg ON kwg.id = pc.kwg_id
              WHERE pc.id = $1",
         )
@@ -1721,6 +1913,14 @@ async fn validate_leave_player(
     }
     if use_rit {
         problems.push("asks for a rack info table (it must not)".to_string());
+    }
+    // A leave game ends before the bag is small enough for either solver, so
+    // the settings would be shown and never honoured.
+    if endgame_plies > 0 {
+        problems.push(format!(
+            "solves endgames to {endgame_plies} plies (it must not: leave games end before the \
+             endgame, so set endgame_plies to 0)"
+        ));
     }
     if !problems.is_empty() {
         return Err(AppError::bad_request("this player config cannot generate leaves").with_field(

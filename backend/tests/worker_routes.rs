@@ -658,13 +658,13 @@ async fn assert_each_refused(db: &TestDb, app: &axum::Router, valid: Build, case
 fn games_with_position(_: &Value) -> Value {
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 1, "turn_number": 3, "rack": "AEINRST", "position": "cgp",
+        "game_index": 1, "turn_number": 3, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
         "num_moves": 5,
         "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                     "win_percentage": 61.5, "blended_utility": 0.6 }],
     }, {
         // A capturing job's result has positions from every game of its batch.
-        "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": 5,
         "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);

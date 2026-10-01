@@ -125,16 +125,25 @@ export interface SavedPosition {
   previous_move: string | null;
   previous_move_score: number | null;
   num_moves: number;
+  /** How the move played here was chosen. */
+  analysis: PositionAnalysis;
   submitted_at: string;
   moves: {
     rank: number;
     move: string;
     score: number;
     equity: number;
-    /** Null for a static player. */
+    /** A simulation's or a pre-endgame solve's; null for static and endgame. */
     win_percentage: number | null;
+    /** A solve's projected final spread for the mover, in points; null unless solved. */
+    mean_spread: number | null;
+    /** The endgame depth a solve ranked the move at; null unless solved. */
+    fidelity_plies: number | null;
   }[];
 }
+
+/** Static equity, a simulation, a pre-endgame solve or an endgame solve. */
+export type PositionAnalysis = 'static' | 'sim' | 'peg' | 'endgame';
 
 /** A layout square, by what it multiplies (`#` in MAGPIE's layout is a brick). */
 /** What the contributor list can be ranked by; the server's default is compute time. */
@@ -377,6 +386,21 @@ export interface PlayerConfig {
   utility_w_spread: number | null;
   utility_spread_scale: number | null;
   movegen_margin: number;
+  /**
+   * Endgame and pre-endgame solving, for games and game-pairs jobs.
+   * endgame_plies 0 solves nothing (and so no pre-endgame either); the PEG
+   * settings are null unless peg_max_bag is above 0, and the nested ones
+   * unless peg_nested is set.
+   */
+  endgame_plies: number;
+  peg_max_bag: number;
+  peg_stage_top_k: number[] | null;
+  peg_scenario_stride: number | null;
+  peg_opp_model: 'rational' | 'pessimistic' | null;
+  peg_nested: boolean | null;
+  peg_nested_cand_caps: number[] | null;
+  peg_nested_max_depth: number | null;
+  peg_nested_strides: number[] | null;
   created_at: string;
 }
 

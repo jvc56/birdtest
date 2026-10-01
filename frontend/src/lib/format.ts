@@ -119,6 +119,22 @@ export function optionalNumber(value: number | string | null | undefined): numbe
 }
 
 /**
+ * A comma-separated list of whole numbers as a form field holds one: blank is
+ * `null` ("MAGPIE's default"), and anything that is not a list of whole
+ * numbers is an error naming the part that is not.
+ */
+export function optionalIntList(text: string): { values: number[] | null } | { error: string } {
+  const trimmed = text.trim();
+  if (trimmed === '') return { values: null };
+  const values: number[] = [];
+  for (const part of trimmed.split(',').map((p) => p.trim())) {
+    if (!/^\d+$/.test(part)) return { error: `"${part}" is not a whole number.` };
+    values.push(Number(part));
+  }
+  return { values };
+}
+
+/**
  * The fields of a request body left blank: `null`, or a number box's `NaN`.
  * Sent, the server's answer to one names the whole body ("data did not match
  * any variant"), not the field.
@@ -240,15 +256,19 @@ export function leavePlayerConflict(p: {
   num_plies: number;
   sort_strategy: string;
   use_rit: boolean;
+  /** Absent on a config read before the setting existed: it solves nothing. */
+  endgame_plies?: number;
 }): string | null {
   const problems: string[] = [];
   if (p.num_plies > 0) problems.push(`simulates ${p.num_plies} ${p.num_plies === 1 ? 'ply' : 'plies'}`);
   if (p.sort_strategy !== 'equity') problems.push(`sorts on ${p.sort_strategy}`);
   if (p.use_rit) problems.push('asks for a rack info table');
+  // A leave game ends before the bag is small enough for either solver.
+  if ((p.endgame_plies ?? 0) > 0) problems.push('solves endgames');
   if (!problems.length) return null;
   const list =
     problems.length === 1 ? problems[0] : `${problems.slice(0, -1).join(', ')} and ${problems[problems.length - 1]}`;
-  return `${p.name} ${list}; leave generation plays statically on equity, without a rack info table.`;
+  return `${p.name} ${list}; leave generation plays statically on equity, without a rack info table or endgame solving.`;
 }
 
 /** A job's title: the name it was given, or its type for one given none. */

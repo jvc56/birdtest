@@ -14,7 +14,7 @@ other then fails a test rather than a contributor's run.
 | File | Direction | What it pins |
 |---|---|---|
 | `claim-request.json` | client → server | The required claim body: version and unsupported set |
-| `assignment-games.json` | server → client | A games assignment with `expected_data`, two lexicons |
+| `assignment-games.json` | server → client | A games assignment with `expected_data`, two lexicons, and a player 2 that solves its endgame and a nested pre-endgame (every solver key stated) |
 | `assignment-opening-rack.json` | server → client | A rack batch for a simming player: the one job type whose request carries `racks` and a single `player` |
 | `assignment-leave-generation.json` | server → client | Generation 1, reading the server-built zeroed KLV, and the static `player` the bot plays both seats as |
 | `decline-missing-data.json` | client → server | A decline naming a missing file and a mismatched one |
@@ -25,7 +25,7 @@ other then fails a test rather than a contributor's run.
 | `anon-uuid-assignment.json` | server → client | The first assignment of a worker with no identity: a games task carrying the minted `worker_uuid`, and a job that pins no derived file (`derived: []`) |
 | `expected-data.json` | server → client | The `expected_data` digest list of an assignment, input files and a derived wordmap |
 | `heartbeat.json` | client → server | A heartbeat |
-| `result-games.json` | client → server | A games result with `capture_positions` on: the tally and every captured position |
+| `result-games.json` | client → server | A games result with `capture_positions` on, from two players that solve their endgames and small pre-endgames: the tally and every captured position, each with its `analysis` (`static`, `peg`, `endgame`) and a solved one's spreads and depths |
 | `result-game-pairs.json` | client → server | A pairs result: the tally, the pentanomial and the divergent subset |
 | `result-opening-rack.json` | client → server | A simulating player's rack analyses, with win%, blended utility and per-ply statistics |
 | `result-leave-generation.json` | client → server | Every rack a leave-generation task saw, on MAGPIE's two-letter test distribution |

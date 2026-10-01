@@ -536,7 +536,7 @@ pub(crate) async fn insert_position_analyses(
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_records
                  (task_claim_id, task_id, job_id, rack, position, game_index,
-                  turn_number, previous_move, previous_move_score, num_moves) ",
+                  turn_number, previous_move, previous_move_score, num_moves, analysis) ",
         );
         builder.push_values(chunk.iter(), |mut b, position| {
             b.push_bind(claim_id)
@@ -548,7 +548,8 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(position.turn_number)
                 .push_bind(position.previous_move.clone())
                 .push_bind(position.previous_move_score)
-                .push_bind(position.num_moves);
+                .push_bind(position.num_moves)
+                .push_bind(position.analysis.as_str());
         });
 
         if on_conflict_ignore {
@@ -606,7 +607,7 @@ pub(crate) async fn insert_position_analyses(
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_moves
                  (record_id, rank, move, score, equity, win_percentage,
-                  blended_utility) ",
+                  blended_utility, mean_spread, fidelity_plies) ",
         );
         builder.push_values(chunk.iter(), |mut b, (record_id, rank, entry)| {
             b.push_bind(*record_id)
@@ -616,7 +617,10 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(entry.equity)
                 // NULL for a static player, which simulates nothing.
                 .push_bind(entry.win_percentage)
-                .push_bind(entry.blended_utility);
+                .push_bind(entry.blended_utility)
+                // NULL unless a solver chose the move.
+                .push_bind(entry.mean_spread)
+                .push_bind(entry.fidelity_plies);
         });
         // Returned in insertion order, so the ids line up with `pending` and
         // the per-ply rows can be attached without looking each move up.
@@ -662,7 +666,7 @@ pub(crate) async fn insert_position_analyses(
 }
 
 /// Rows per multi-row insert, keeping each statement well under Postgres's
-/// 65,535-parameter ceiling (10, 7 and 4 binds per row respectively).
+/// 65,535-parameter ceiling (11, 9 and 4 binds per row respectively).
 const RECORD_ROWS_PER_STATEMENT: usize = 2_000;
 const MOVE_ROWS_PER_STATEMENT: usize = 4_000;
 const PLY_ROWS_PER_STATEMENT: usize = 8_000;

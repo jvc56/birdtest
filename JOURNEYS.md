@@ -249,7 +249,9 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
   **Do** follow **Sign in**, as `dev-contributor-1`. **Expect** to land back on
   this job.
 - [ ] Signed in, **expect** one position: "Game G, turn T · rack … · after
-  MOVE (score) · N moves ranked", the board with its premium squares (TW, DW,
+  MOVE (score) · N moves ranked by simulation" (or "by static equity", "by
+  pre-endgame solve", "by endgame solve" -- a solved one with **Spread** and
+  **Plies** columns), the board with its premium squares (TW, DW,
   TL, DL and a star on the centre), its tiles each with a letter and a score
   (a blank a red lower-case letter with none), the tiles MOVE placed
   outlined, both racks and scores with **to move** on the player whose rack
@@ -501,6 +503,19 @@ Do this last: it empties the database.
   1.9 GB.
 - [ ] **Do** pair the CSW24 lexicon with the `FRA20` leaves. **Expect** "leaves
   … are not compatible with lexicon …".
+- [ ] **Do** look at **Endgame and pre-endgame**. **Expect** **Solve the
+  pre-endgame** greyed out until **Solve the endgame** is ticked, and unticked
+  again when the endgame is.
+- [ ] **Do** `tester-solver`: static, tick **Solve the endgame** (depth 6) and
+  **Solve the pre-endgame** (bag 2). **Expect** it saved and described
+  "static, by equity · 6-ply endgame · PEG ≤2"; on its page, with **All
+  settings**, Endgame "6-ply endgame", Pre-endgame "bag ≤ 2" and the schedule
+  MAGPIE defaults to (32, 16, 8, 4, 2; nested caps 8, 4, 2; strides 1, 1, 5,
+  7).
+- [ ] **Do** **Show pre-endgame schedule** and type `4, x` as stage survivors.
+  **Expect** "Stage survivors: "x" is not a whole number." and nothing saved.
+- [ ] **Do** make a leave job with `tester-solver` as its player. **Expect** the
+  form to say it "solves endgames" before the submit.
 - [ ] **Expect** no way to edit a config: they never change once made.
 
 ### A-5 Delete a player config

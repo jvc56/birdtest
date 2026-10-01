@@ -522,6 +522,18 @@ def static_best_player(ctx: Context) -> str:
                          {"num_plays_recorded": 1, "use_wordmap": True, "use_rit": False})
 
 
+def solving_player(ctx: Context) -> str:
+    # A static player that solves its endgames and a small pre-endgame: two
+    # plies of endgame, PEG at a bag of one or two, a two-play schedule and no
+    # nested lookahead. Small on purpose: a pre-endgame solve has no time
+    # limit, and at a bag of four even this schedule took a minute a game on
+    # two threads, where at two a game takes about a second.
+    return create_player(ctx, ctx.data, "e2e-solving", {
+        "use_wordmap": False, "use_rit": False,
+        "endgame_plies": 2, "peg_max_bag": 2, "peg_stage_top_k": [2], "peg_nested": False,
+    })
+
+
 def games_body(players: dict, batch: int, **extra) -> dict:
     return {"job_type": "games", **players, "games_per_batch": batch, "sprt_enabled": True,
             "min_games": 1_000_000, "max_games": 1_000_000, **extra}
@@ -842,6 +854,40 @@ def case_positions(ctx: Context) -> None:
         worker.remove()
 
 
+def case_solvers(ctx: Context) -> None:
+    """M-12: a player that solves plays its pre-endgame and endgame turns with
+    the solvers, and the positions it captures there say so."""
+    deactivate_everything(ctx)
+    # Both seats solve, and four games, so a pre-endgame turn (a bag of one or
+    # two on a solving player's turn) is all but certain to come up.
+    solver = solving_player(ctx)
+    players = {"player1_config_id": solver, "player2_config_id": solver}
+    job_id = create_and_activate(ctx, ctx.data, games_body(players, 4, capture_positions=True))
+    worker = Worker(ctx, "m12")
+    try:
+        worker.run(tasks=1)
+        expect(completed_claims(ctx, job_id) == 1, "the solving task did not complete")
+        rows = ctx.psql(
+            "SELECT r.analysis, count(*) FILTER (WHERE m.mean_spread IS NOT NULL "
+            "AND m.fidelity_plies IS NOT NULL), count(*) "
+            "FROM position_analysis_records r JOIN position_analysis_moves m "
+            f"ON m.record_id = r.id WHERE r.job_id = '{job_id}' GROUP BY r.analysis")
+        counts = {line.split("|")[0]: (int(line.split("|")[1]), int(line.split("|")[2]))
+                  for line in rows.split("\n") if line}
+        expect("endgame" in counts, f"no endgame position was captured: {counts}")
+        expect("peg" in counts, f"no pre-endgame position was captured: {counts}")
+        expect("static" in counts, f"no static position was captured: {counts}")
+        for analysis in ("endgame", "peg"):
+            solved, total = counts[analysis]
+            expect(solved == total,
+                   f"{total - solved} {analysis} moves lack a spread or a depth: {counts}")
+        expect(counts["static"][0] == 0, f"a static position carries a solver's spread: {counts}")
+        log(f"M-12: positions by analysis {counts}")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+
+
 def case_concurrent(ctx: Context) -> None:
     """M-9: two contributors at once, no duplicate seeds."""
     deactivate_everything(ctx)
@@ -1007,8 +1053,13 @@ def case_capture(ctx: Context) -> None:
 
     try:
         # First, from a worker with no identity yet: the assignment that mints
-        # one. A games job capturing positions, so its result carries them.
-        one(games_body(static_players(ctx), 2, capture_positions=True), ctx.data)
+        # one. A games job capturing positions, so its result carries them,
+        # whose players solve their endgames and pre-endgames: the assignment
+        # carries the solver keys, and the result positions of all three kinds
+        # -- static, pre-endgame and endgame.
+        solver = solving_player(ctx)
+        one(games_body({"player1_config_id": solver, "player2_config_id": solver}, 2,
+                       capture_positions=True), ctx.data)
         expect(worker.uuid() is not None, "the first assignment minted no worker UUID")
         # Players with a wordmap, so the assignment pins a derived file.
         one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,
@@ -1067,6 +1118,7 @@ CASES = {
     "M-9": case_concurrent,
     "M-10": case_rack_info_table,
     "M-11": case_derived_mismatch,
+    "M-12": case_solvers,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

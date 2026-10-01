@@ -601,6 +601,28 @@ CREATE TABLE player_configs (
     -- rows in a job, validated equal at job-creation time) so this table
     -- stays the single, exhaustive source of what a job asked MAGPIE for.
     movegen_margin         DOUBLE PRECISION NOT NULL, -- move-gen equity margin for 'equity' recording (-mmargin)
+    -- Endgame and pre-endgame (PEG) solving, read only by games and game-pairs
+    -- jobs: an opening rack never reaches a small bag, and a leave job's games
+    -- end before one (job creation refuses a leave player that solves).
+    --
+    -- endgame_plies is the switch for both: 0 solves nothing, because PEG
+    -- scores its emptier scenarios with endgame solves. Above 0 the player
+    -- solves the endgame to that depth once the bag is empty, and runs PEG
+    -- while the bag holds 1..peg_max_bag tiles (0 = no PEG). Neither has a time
+    -- limit: the depth and the schedule bound the work, so a player is as
+    -- strong on a slow machine as on a fast one. Like a simulation, a solve is
+    -- multithreaded and so not reproducible run to run.
+    endgame_plies          INT NOT NULL DEFAULT 0,    -- -eplies1 / -eplies2
+    peg_max_bag            INT NOT NULL DEFAULT 0,    -- -pegbag1 / -pegbag2
+    -- The PEG schedule: NULL when peg_max_bag is 0, all set when it is not.
+    peg_stage_top_k        INT[],                     -- survivors per halving stage (-pegtopk1 / -pegtopk2)
+    peg_scenario_stride    INT,                       -- 1 = full enumeration (-pegstride1 / -pegstride2)
+    peg_opp_model          TEXT,                      -- 'rational' | 'pessimistic' (-pegpess1 / -pegpess2)
+    peg_nested             BOOLEAN,                   -- nested lookahead (-pegnested1 / -pegnested2)
+    -- The nested lookahead's knobs: set exactly when peg_nested is.
+    peg_nested_cand_caps   INT[],                     -- per-level candidate caps (-pegncaps)
+    peg_nested_max_depth   INT,                       -- nested pegs before a rollout (-pegndepth)
+    peg_nested_strides     INT[],                     -- stride per inner bag size 1..4 (-pegnstrides)
     -- SET NULL, like jobs.created_by: a config outlives the admin who made it.
     created_by       UUID REFERENCES users(id) ON DELETE SET NULL,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -624,6 +646,27 @@ CREATE TABLE player_configs (
             AND threshold IS NULL AND sampling_rule IS NULL
             AND inference_margin IS NULL AND utility_w_winpct IS NULL
             AND utility_w_spread IS NULL AND utility_spread_scale IS NULL)
+    ),
+    -- The solver settings nest: PEG needs the endgame, the PEG schedule is
+    -- stated exactly when PEG runs, and the nested knobs exactly when nested
+    -- lookahead is on. MAGPIE refuses a request that breaks any of these.
+    CONSTRAINT player_configs_solver_settings CHECK (
+        endgame_plies BETWEEN 0 AND 25
+        AND peg_max_bag BETWEEN 0 AND 4
+        AND (endgame_plies > 0 OR peg_max_bag = 0)
+        AND (
+            (peg_max_bag = 0
+                AND peg_stage_top_k IS NULL AND peg_scenario_stride IS NULL
+                AND peg_opp_model IS NULL AND peg_nested IS NULL)
+            OR
+            (peg_max_bag > 0
+                AND peg_stage_top_k IS NOT NULL AND peg_scenario_stride IS NOT NULL
+                AND peg_opp_model IN ('rational', 'pessimistic')
+                AND peg_nested IS NOT NULL)
+        )
+        AND (peg_nested IS TRUE) = (peg_nested_cand_caps IS NOT NULL)
+        AND (peg_nested IS TRUE) = (peg_nested_max_depth IS NOT NULL)
+        AND (peg_nested IS TRUE) = (peg_nested_strides IS NOT NULL)
     )
 );
 
@@ -1134,6 +1177,12 @@ CREATE TABLE position_analysis_records (
     -- NULL for turn 0 of a game (nothing preceded it) and for opening racks.
     previous_move       TEXT,
     previous_move_score INT,
+    -- How the move played from this position was chosen: by static equity, a
+    -- simulation, a pre-endgame solve or an endgame solve. Decides which of
+    -- its moves' statistics are set: win_percentage and per-ply rows for a
+    -- simulation, mean_spread and fidelity_plies for a solve. An opening rack
+    -- is 'static' or 'sim'.
+    analysis            TEXT NOT NULL CHECK (analysis IN ('static', 'sim', 'peg', 'endgame')),
     -- How many moves the worker ranked, which is generally far more than the
     -- stored moves. The one thing about the analysis those cannot tell you,
     -- since they are truncated.
@@ -1219,14 +1268,20 @@ CREATE TABLE position_analysis_moves (
     move            TEXT NOT NULL,
     score           INT NOT NULL,
     equity          DOUBLE PRECISION NOT NULL,
-    -- The simulated win percentage. NULL for a static player, which ranks on
-    -- equity alone and simulates nothing.
+    -- The win percentage: a simulation's, or a pre-endgame solve's over every
+    -- way the bag can be drawn. NULL for a static or endgame analysis.
     win_percentage  DOUBLE PRECISION,
     -- Mean win%+spread blend in [0, 1] (see the player config's
     -- utility_w_winpct/utility_w_spread/utility_spread_scale), sometimes used
     -- to rank moves instead of equity or raw win percentage. NULL for a
     -- static player, same as win_percentage.
-    blended_utility DOUBLE PRECISION
+    blended_utility DOUBLE PRECISION,
+    -- A pre-endgame or endgame solve's projected final spread for the mover,
+    -- in points, and the endgame depth the move was ranked at (a PEG move's
+    -- deepest tier; 0 is PEG's greedy seed). NULL for a static or simulated
+    -- analysis.
+    mean_spread     DOUBLE PRECISION,
+    fidelity_plies  SMALLINT
 );
 -- Every read of a best move goes through its record: the results listing joins
 -- `record_id` and filters `rank = 1`, and a rack lookup reads a record's whole

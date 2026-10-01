@@ -98,6 +98,20 @@ pub struct PlayerSpec {
     /// `None` for a static player, which never loads a win% model.
     pub win_pct_model: Option<String>,
     pub movegen_margin: f64,
+    /// Endgame and pre-endgame solving. Stated by every player, if only as 0:
+    /// `endgame_plies` 0 solves nothing. The PEG keys are null unless
+    /// `peg_max_bag` is above 0, and the nested ones unless `peg_nested` is
+    /// set -- MAGPIE refuses a key a player does not use, so they are sent as
+    /// null rather than left out.
+    pub endgame_plies: i32,
+    pub peg_max_bag: i32,
+    pub peg_stage_top_k: Option<Vec<i32>>,
+    pub peg_scenario_stride: Option<i32>,
+    pub peg_opp_model: Option<String>,
+    pub peg_nested: Option<bool>,
+    pub peg_nested_cand_caps: Option<Vec<i32>>,
+    pub peg_nested_max_depth: Option<i32>,
+    pub peg_nested_strides: Option<Vec<i32>>,
 }
 
 impl From<NamedPlayerConfig> for PlayerSpec {
@@ -132,6 +146,15 @@ impl From<NamedPlayerConfig> for PlayerSpec {
             utility_spread_scale: c.utility_spread_scale,
             win_pct_model: winpct_name,
             movegen_margin: c.movegen_margin,
+            endgame_plies: c.endgame_plies,
+            peg_max_bag: c.peg_max_bag,
+            peg_stage_top_k: c.peg_stage_top_k,
+            peg_scenario_stride: c.peg_scenario_stride,
+            peg_opp_model: c.peg_opp_model,
+            peg_nested: c.peg_nested,
+            peg_nested_cand_caps: c.peg_nested_cand_caps,
+            peg_nested_max_depth: c.peg_nested_max_depth,
+            peg_nested_strides: c.peg_nested_strides,
         }
     }
 }
@@ -299,6 +322,13 @@ pub struct MoveEntry {
     /// win_percentage.
     #[serde(default)]
     pub blended_utility: Option<f64>,
+    /// A pre-endgame or endgame solve's projected final spread for the mover,
+    /// in points, and the endgame depth the move was ranked at. Absent for a
+    /// static or simulated analysis.
+    #[serde(default)]
+    pub mean_spread: Option<f64>,
+    #[serde(default)]
+    pub fidelity_plies: Option<i16>,
     #[serde(default)]
     pub plies: Vec<PlyStats>,
 }
@@ -376,7 +406,43 @@ pub struct CapturedPosition {
     pub previous_move_score: Option<i32>,
     /// How many moves were ranked, before truncation to `num_plays_recorded`.
     pub num_moves: i32,
+    /// How the move played here was chosen: `static`, `sim`, `peg` or
+    /// `endgame` ([`Analysis`]).
+    pub analysis: String,
     pub moves: Vec<MoveEntry>,
+}
+
+/// How a position's move was chosen, which decides what its moves carry:
+/// nothing past score and equity for a static analysis, a win percentage and
+/// per-ply statistics for a simulation, a projected spread and a depth for an
+/// endgame or pre-endgame solve (a pre-endgame's with a win percentage too).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Analysis {
+    Static,
+    Sim,
+    Peg,
+    Endgame,
+}
+
+impl Analysis {
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "static" => Some(Self::Static),
+            "sim" => Some(Self::Sim),
+            "peg" => Some(Self::Peg),
+            "endgame" => Some(Self::Endgame),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Static => "static",
+            Self::Sim => "sim",
+            Self::Peg => "peg",
+            Self::Endgame => "endgame",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -440,6 +506,7 @@ pub struct PositionAnalysis {
     /// number kept in `moves`. The only part of the analysis the stored moves
     /// cannot recover, since they are truncated.
     pub num_moves: i32,
+    pub analysis: Analysis,
     /// Truncated by the caller to the job's cap. The best move is simply the
     /// first of these, so it is not carried separately.
     pub moves: Vec<MoveEntry>,
@@ -451,8 +518,17 @@ impl PositionAnalysis {
     /// `num_moves` is what the worker says it ranked, which is generally more
     /// than it reported. A client that does not send it reported everything it
     /// ranked, so the list's own length is the honest answer.
+    ///
+    /// Its analysis is a simulation's when its moves carry win percentages,
+    /// and static otherwise: an opening rack never reaches a solver.
     pub fn opening_rack(rack: String, moves: Vec<MoveEntry>, num_moves: Option<i32>) -> Self {
+        let analysis = if moves.iter().any(|m| m.win_percentage.is_some()) {
+            Analysis::Sim
+        } else {
+            Analysis::Static
+        };
         Self {
+            analysis,
             rack,
             position: None,
             game_index: None,
@@ -623,7 +699,7 @@ mod tests {
         let position: CapturedPosition = serde_json::from_value(json!({
             "game_index": 0, "turn_number": 0, "rack": "AEINRST",
             "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
-            "num_moves": 40, "moves": [bare_move],
+            "num_moves": 40, "analysis": "static", "moves": [bare_move],
         }))
         .unwrap();
         assert_eq!((position.previous_move, position.previous_move_score), (None, None));
@@ -656,7 +732,7 @@ mod tests {
         let ply = extra(json!({ "ply": 0, "bingo_percentage": 1.0, "average_score": 30.0 }));
         let entry = extra(json!({ "move": "8D QI", "score": 22, "equity": 30.5, "plies": [ply] }));
         let position = extra(json!({
-            "game_index": 0, "turn_number": 3, "rack": "AEINRST", "position": "cgp",
+            "game_index": 0, "turn_number": 3, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
             "num_moves": 40, "moves": [entry.clone()],
         }));
 

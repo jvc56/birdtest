@@ -318,6 +318,8 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
                 "rack": game.rack_string(game.on_turn),
                 "position": game.cgp(),
                 "num_moves": rng.randint(len(ranked), 400),
+                # Every move below carries a simulation's statistics.
+                "analysis": "sim",
                 "moves": [
                     {
                         "move": move["move"],

@@ -73,8 +73,8 @@ at tier 5 names a symptom.
 | 2 Integration | 174 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (15), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 236 | `backend/tests/`: `worker_api.rs` (49), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 18 | Playwright journeys `E-1`..`E-15` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 10 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-11` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 5 End-to-end | 19 | Playwright journeys `E-1`..`E-16` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 6 MAGPIE smoke | 11 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-12` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
@@ -463,6 +463,12 @@ The two that were missing:
   every captured position of a Catalan games job was refused. *(Covered:
   `plausibility::tests::racks_are_bounded_by_what_a_rack_holds`.)* (Eleventh
   audit.)
+- `U-PLAUS-5` A position's moves match how it was analysed: a static or
+  simulated position's carry no solver spread or depth, a pre-endgame's each
+  carry a win percentage, a finite spread within bounds and a depth from 0 to
+  25, and an endgame position reports exactly the one move its solve chose,
+  with a spread and depth and no simulation statistics. *(Covered:
+  `plausibility::tests::a_positions_moves_match_its_analysis`.)*
 - `U-PLAUS-4` A negative `num_moves` is refused (cast to `usize` it was larger
   than any list), and per-ply statistics must be numbered from 0 in order, with
   a bingo percentage in [0, 100] and a finite, non-negative average score.
@@ -725,14 +731,22 @@ Each entry's tests are the `describe` block named for its id.
   row of the full table; a leave job's generations counted from its list of
   targets, each target shown, and no lexicon or wordmap row of its own (its
   player's table has them); the player settings a leave job never reads --
-  leaves, win %, recorder, plays and plies recorded, move-gen margin -- marked
-  unused, and none for any other job type. *(Covered: `jobSettings.test.ts`.)*
+  leaves, win %, recorder, plays and plies recorded, move-gen margin, and the
+  endgame and pre-endgame rows -- marked unused; an opening-rack job's
+  endgame and pre-endgame rows marked unused, and none for a games or pairs
+  job. A player's endgame and pre-endgame: "off" when it solves nothing, the
+  pre-endgame "off" without the endgame whatever its bag, the schedule's lists
+  written out, key rows for them only when a player solves, and a summary that
+  names them ("· 6-ply endgame · PEG ≤2") except where the job never reaches
+  the end of a game. *(Covered: `jobSettings.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
   fields are named before it is sent (the job form); so is a letter
   distribution or board left on its empty "Choose…" (the job and rating-pool
-  forms, which no longer pick the first imported for the admin). *(Covered:
+  forms, which no longer pick the first imported for the admin). A blank list
+  field (the pre-endgame's schedule) is `null` too, and a list with a part that
+  is not a whole number is named rather than sent. *(Covered:
   `format.test.ts`.)* (Twenty-second audit.)
 - `F-FMT-14` `exportSummary`: a snapshot export is labelled "Snapshot as of
   <time> — job still running" (and, once the job has completed, as not its
@@ -747,8 +761,8 @@ Each entry's tests are the `describe` block named for its id.
   rather than sending it. *(Covered: `format.test.ts`.)*
 - `F-FMT-17` `leavePlayerConflict` names what job creation refuses of a leave
   job's player -- simulating, sorting on anything but equity, a rack info
-  table -- before the submit, and accepts a static equity player. *(Covered:
-  `format.test.ts`.)*
+  table, solving endgames -- before the submit, and accepts a static equity
+  player. *(Covered: `format.test.ts`.)*
 - `F-FMT-16` `computeTime` reads a contributor's compute time in its two
   largest units ("5h 20m", "3d 4h", "2y 17d"), and a dash for anything that is
   not a time. *(Covered: `format.test.ts`.)*
@@ -1411,6 +1425,10 @@ job creation touches needs one caller here.
   below its `num_plays_recorded`: each would store fewer moves per rack than it
   asks for. A `best` simmer is accepted (twenty-ninth audit). *(Covered:
   `admin_api::an_opening_rack_job_cannot_rank_moves_with_a_best_recorder`.)*
+- `I-JOB-14e` A leave job refuses a player that solves endgames (and so,
+  perhaps, pre-endgames), naming the player field: its games end before the bag
+  is small enough for either solver. The same player is accepted by a games
+  job. *(Covered: `jobs::a_leave_job_refuses_a_player_that_solves_the_endgame`.)*
 - `I-JOB-14d` A leave job refuses a player that simulates, sorts on anything
   but equity, or asks for a rack info table, naming the player field, and
   leaves no job behind; a static equity player is accepted. A leave body is
@@ -1454,6 +1472,13 @@ job creation touches needs one caller here.
   read goes through its record — so the test pins the index that exists and
   that the planner uses it. *(Covered:
   `submissions::the_best_move_is_rank_one_and_is_read_through_the_record_index`.)*
+- `I-SUBMIT-9` A captured position a solver decided keeps its analysis
+  (`peg`, `endgame`) and each move's projected spread and ranking depth -- a
+  pre-endgame move with its win percentage -- and a position whose moves do
+  not match its analysis (an endgame position with two moves, a pre-endgame
+  move without a spread, a static one with a spread, an analysis MAGPIE does
+  not write) is refused. *(Covered:
+  `submissions::solved_positions_keep_their_analysis_spread_and_depth`.)*
 - `I-SUBMIT-8` An opening-rack result stores one record per requested rack, and
   a result naming a rack the task did not dispatch is rejected — as is one that
   leaves a requested rack out. *(Covered:
@@ -2603,6 +2628,16 @@ below.
   the files it is built from; it reset every failed row of that role and name,
   other builders' included. *(Covered:
   `admin_api::a_retry_resets_only_the_build_it_names`.)* (Thirty-second audit.)
+- `A-ADMIN-25` A player config solves the endgame and the pre-endgame exactly
+  as it states: off by default; the endgame alone states no pre-endgame
+  setting; a pre-endgame with only its switch takes MAGPIE's schedule, written
+  into the row; without nested lookahead the nested settings are null. Refused,
+  each on its field: the pre-endgame without an endgame depth, an endgame past
+  25 plies or a bag past 4, a pre-endgame setting without the pre-endgame, a
+  nested setting without nested lookahead, a stage keeping one play or more
+  than the stage before, a zero stride, an unknown opponent model, and nested
+  strides that are not one per bag size. *(Covered:
+  `admin_api::a_player_config_solves_the_end_of_the_game_only_as_it_states`.)*
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -3086,6 +3121,12 @@ admin in once and the admin journeys reuse its storage state.
 - `E-15` The player-config form will not submit a stopping percentage of 0 or
   100, which the server refuses; 99.5 is accepted. *(Covered:
   `e15-player-config-form.spec.ts`.)*
+- `E-16` The player-config form offers the pre-endgame only once the endgame
+  is on, and turning the endgame off turns it off too; a schedule list that is
+  not whole numbers is named and not sent; and a config made to solve both
+  shows it on its page: the search "static, by equity · 6-ply endgame · PEG
+  ≤2", Endgame and Pre-endgame rows, and under All settings the schedule
+  MAGPIE defaults to. *(Covered: `e16-solving-player-config.spec.ts`.)*
 
 ### Reading confirmation codes
 
@@ -3257,6 +3298,12 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   `derived_mismatch` and both digests reach `worker_data_gaps`. *(Covered:
   `case_derived_mismatch`: the server's recorded wordmap hash is made one this
   build does not produce.)*
+- `M-12` A player that solves plays its pre-endgame and endgame turns with
+  MAGPIE's solvers: a capturing games job with one such player completes, and
+  its captured positions include `endgame` and `peg` analyses whose every move
+  has a spread and a depth, beside the other player's `static` ones, which
+  have none. *(Covered: `case_solvers`, with a small schedule so a game takes
+  seconds.)*
 
 `M-10` and the `capture` case run on MAGPIE's small data, which the script
 serves as a tarball from a GitHub stand-in it runs itself

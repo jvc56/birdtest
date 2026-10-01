@@ -355,6 +355,34 @@ async fn a_leave_generation_job_stores_every_setting_it_was_created_with() {
     assert_eq!(bucket.keys().await, vec![key], "the zeroed KLV is in the object store");
 }
 
+/// I-JOB-14e: a leave job's games end before the bag is small enough for
+/// either solver, so a player that solves endgames (and with them, perhaps,
+/// pre-endgames) is refused rather than shown and never honoured.
+#[tokio::test]
+async fn a_leave_job_refuses_a_player_that_solves_the_endgame() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let solver = admin.static_player("solver", kwg, klv, json!({ "endgame_plies": 4 })).await;
+    let (status, body) = admin
+        .create_job(json!({
+            "job_type": "leave_generation", "variant": "classic",
+            "letterdist_id": ld, "layout_id": layout, "player_config_id": solver,
+            "num_iterations": 200, "target_rack_counts": [50], "racks_per_task": 20,
+        }))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "player_config_id", "{body}");
+    assert!(body["fields"][0]["message"].as_str().unwrap().contains("endgame"), "{body}");
+
+    // The same player plays a games job, where it does reach the endgame.
+    let other = admin.static_player("other", kwg, klv, json!({})).await;
+    let (status, body) = admin.create_job(games_body(ld, layout, solver, other)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
 /// I-JOB-2: `validate_shared_player_options` reads the two stored configs --
 /// the regression guard for the renamed `winpct_id` column. Two simmers on the
 /// same win% model row are accepted; on different rows they are refused; two
@@ -642,7 +670,7 @@ async fn games_history(app: &Router) -> String {
     let uuid = assignment["worker_uuid"].as_str().unwrap().to_string();
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": 40, "moves": [
             { "move": "8D RETAINS", "score": 74, "equity": 81.2,
               "plies": [{ "ply": 1, "bingo_percentage": 10.0, "average_score": 30.0 }] },
@@ -650,7 +678,7 @@ async fn games_history(app: &Router) -> String {
         ],
     }, {
         // A capturing job's result has positions from every game of its batch.
-        "game_index": 1, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+        "game_index": 1, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);
     let (status, body) = send(

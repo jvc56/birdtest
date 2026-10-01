@@ -71,6 +71,14 @@
   $: parsed = position?.position ? parseCgp(position.position) : null;
   $: toMove = parsed && position ? seatToMove(parsed, position.rack) : null;
   $: showWinPct = position?.moves.some((m) => m.win_percentage !== null) ?? false;
+  $: solved = position?.analysis === 'peg' || position?.analysis === 'endgame';
+
+  const ANALYSIS: Record<SavedPosition['analysis'], string> = {
+    static: 'static equity',
+    sim: 'simulation',
+    peg: 'pre-endgame solve',
+    endgame: 'endgame solve'
+  };
 </script>
 
 <div class="card space-y-4">
@@ -139,7 +147,10 @@
           · after <span class="font-mono">{position.previous_move}</span>
           ({position.previous_move_score})
         {/if}
-        <span class="text-muted-foreground">· {position.num_moves.toLocaleString()} moves ranked</span>
+        <span class="text-muted-foreground"
+          >· {position.num_moves.toLocaleString()} moves ranked by
+          <span data-testid="position-analysis">{ANALYSIS[position.analysis]}</span></span
+        >
       </p>
       <div class="grid gap-4 lg:grid-cols-2">
         <div class="min-w-0 space-y-2">
@@ -156,6 +167,10 @@
               <tr>
                 <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
                 {#if showWinPct}<th class="text-right">Win %</th>{/if}
+                {#if solved}
+                  <th class="text-right" title="The mover's projected final spread">Spread</th>
+                  <th class="text-right" title="The endgame depth the move was ranked at">Plies</th>
+                {/if}
               </tr>
             </thead>
             <tbody>
@@ -169,6 +184,12 @@
                     <td class="text-right tabular-nums">
                       {move.win_percentage === null ? '—' : move.win_percentage.toFixed(1)}
                     </td>
+                  {/if}
+                  {#if solved}
+                    <td class="text-right tabular-nums">
+                      {move.mean_spread === null ? '—' : move.mean_spread.toFixed(1)}
+                    </td>
+                    <td class="text-right tabular-nums">{move.fidelity_plies ?? '—'}</td>
                   {/if}
                 </tr>
               {/each}

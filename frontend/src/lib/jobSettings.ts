@@ -35,6 +35,18 @@ export interface PlayerSettings {
   utility_w_spread: number | null;
   utility_spread_scale: number | null;
   movegen_margin: number;
+  /** 0 solves nothing; the pre-endgame needs it above 0 too. */
+  endgame_plies: number;
+  peg_max_bag: number;
+  /** Null unless the pre-endgame runs. */
+  peg_stage_top_k: number[] | null;
+  peg_scenario_stride: number | null;
+  peg_opp_model: string | null;
+  peg_nested: boolean | null;
+  /** Null unless nested lookahead is on. */
+  peg_nested_cand_caps: number[] | null;
+  peg_nested_max_depth: number | null;
+  peg_nested_strides: number[] | null;
 }
 
 /** A player config as anyone may read it (`GET /api/player-configs`). */
@@ -90,14 +102,39 @@ export function show(value: Value): string {
   return value;
 }
 
-/** How a player searches, in a few words: what tells two configs apart. */
-export function playerSummary(p: PlayerSettings): string {
-  if (p.num_plies === 0) return `static, by ${p.sort_strategy}`;
-  const parts = [`${p.num_plies}-ply sim`];
-  if (p.max_iterations !== null) parts.push(`${p.max_iterations.toLocaleString()} iterations`);
-  if (p.stopping_pct !== null) parts.push(`stops at ${p.stopping_pct}%`);
-  if (p.use_inference) parts.push('inference');
-  return parts.join(', ');
+/** Whether a player solves its endgames, and so perhaps its pre-endgames. */
+const solves = (p: PlayerSettings) => p.endgame_plies > 0;
+
+/** The endgame a player solves, in a few words. */
+export function endgameText(p: PlayerSettings): string {
+  return solves(p) ? `${p.endgame_plies}-ply endgame` : 'off';
+}
+
+/** The pre-endgame a player solves: off without the endgame, which it needs. */
+export function preEndgameText(p: PlayerSettings): string {
+  return solves(p) && p.peg_max_bag > 0 ? `bag ≤ ${p.peg_max_bag}` : 'off';
+}
+
+/**
+ * How a player searches, in a few words: what tells two configs apart. Its
+ * endgame and pre-endgame solving follow the rest of the game's search.
+ * `unusedSolvers` leaves them out where the job never reaches them.
+ */
+export function playerSummary(p: PlayerSettings, unusedSolvers = false): string {
+  let search: string;
+  if (p.num_plies === 0) {
+    search = `static, by ${p.sort_strategy}`;
+  } else {
+    const parts = [`${p.num_plies}-ply sim`];
+    if (p.max_iterations !== null) parts.push(`${p.max_iterations.toLocaleString()} iterations`);
+    if (p.stopping_pct !== null) parts.push(`stops at ${p.stopping_pct}%`);
+    if (p.use_inference) parts.push('inference');
+    search = parts.join(', ');
+  }
+  if (unusedSolvers || !solves(p)) return search;
+  const solving = [endgameText(p)];
+  if (p.peg_max_bag > 0) solving.push(`PEG ≤${p.peg_max_bag}`);
+  return [search, ...solving].join(' · ');
 }
 
 /** One of a job's settings; `key` if it is shown before "All settings". */
@@ -241,6 +278,39 @@ function row(label: string, values: string[]): SettingRow {
   return { label, values, differs: new Set(values).size > 1 };
 }
 
+const list = (values: number[] | null) => (values ? values.join(', ') : '—');
+
+/**
+ * The endgame and pre-endgame rows of the full table, after every other
+ * setting: the two switches, then the pre-endgame's schedule.
+ */
+function solverRows(players: PlayerSettings[]): SettingRow[] {
+  return [
+    row('Endgame', players.map(endgameText)),
+    row('Pre-endgame', players.map(preEndgameText)),
+    row('PEG schedule', players.map((p) => list(p.peg_stage_top_k))),
+    row('PEG stride', players.map((p) => show(p.peg_scenario_stride))),
+    row('PEG opponent', players.map((p) => show(p.peg_opp_model))),
+    row('Nested lookahead', players.map((p) => show(p.peg_nested))),
+    row('Nested caps', players.map((p) => list(p.peg_nested_cand_caps))),
+    row('Nested depth', players.map((p) => show(p.peg_nested_max_depth))),
+    row('Nested strides', players.map((p) => list(p.peg_nested_strides)))
+  ];
+}
+
+/** Every endgame and pre-endgame row's label. */
+const SOLVER_ROWS = [
+  'Endgame',
+  'Pre-endgame',
+  'PEG schedule',
+  'PEG stride',
+  'PEG opponent',
+  'Nested lookahead',
+  'Nested caps',
+  'Nested depth',
+  'Nested strides'
+];
+
 const NONE: ReadonlySet<string> = new Set();
 
 /**
@@ -257,12 +327,19 @@ const LEAVE_UNUSED: ReadonlySet<string> = new Set([
   'Recorder',
   'Plays recorded',
   'Plies recorded',
-  'Move-gen margin'
+  'Move-gen margin',
+  // A leave game ends before the bag is small enough for either solver.
+  ...SOLVER_ROWS
 ]);
+
+/** An opening rack is analysed on an empty board, far from the endgame. */
+const OPENING_RACK_UNUSED: ReadonlySet<string> = new Set(SOLVER_ROWS);
 
 /** The player settings, by row label, that a job of `jobType` never reads. */
 export function unusedPlayerSettings(jobType: JobType): ReadonlySet<string> {
-  return jobType === 'leave_generation' ? LEAVE_UNUSED : NONE;
+  if (jobType === 'leave_generation') return LEAVE_UNUSED;
+  if (jobType === 'opening_rack') return OPENING_RACK_UNUSED;
+  return NONE;
 }
 
 function marked(rows: SettingRow[], unused: ReadonlySet<string>): SettingRow[] {
@@ -275,8 +352,9 @@ function marked(rows: SettingRow[], unused: ReadonlySet<string>): SettingRow[] {
  * `playerRows` has every setting. Rows named in `unused` are marked so.
  */
 export function keySettings(players: PlayerSettings[], unused = NONE): SettingRow[] {
+  const solversUnused = unused.has('Endgame');
   const rows = [
-    row('Search', players.map(playerSummary)),
+    row('Search', players.map((p) => playerSummary(p, solversUnused))),
     row('Lexicon', players.map((p) => show(p.lexicon))),
     row('Leaves', players.map((p) => show(p.leaves)))
   ];
@@ -291,6 +369,11 @@ export function keySettings(players: PlayerSettings[], unused = NONE): SettingRo
     row('Wordmap', players.map((p) => show(p.use_wordmap))),
     row('Rack info table', players.map((p) => show(p.use_rit)))
   );
+  // A player that solves nothing has no endgame to name: rows of "off" say
+  // nothing.
+  if (players.some(solves)) {
+    rows.push(row('Endgame', players.map(endgameText)), row('Pre-endgame', players.map(preEndgameText)));
+  }
   return marked(rows, unused);
 }
 
@@ -300,10 +383,12 @@ export function keySettings(players: PlayerSettings[], unused = NONE): SettingRo
  * `unused` are marked so.
  */
 export function playerRows(players: PlayerSettings[], unused = NONE): SettingRow[] {
+  const solversUnused = unused.has('Endgame');
   return marked(
     [
-      row('Search', players.map(playerSummary)),
-      ...PLAYER_ROWS.map(([k, label]) => row(label, players.map((p) => show(p[k] as Value))))
+      row('Search', players.map((p) => playerSummary(p, solversUnused))),
+      ...PLAYER_ROWS.map(([k, label]) => row(label, players.map((p) => show(p[k] as Value)))),
+      ...solverRows(players)
     ],
     unused
   );
@@ -311,5 +396,6 @@ export function playerRows(players: PlayerSettings[], unused = NONE): SettingRow
 
 /** The players' searches in one line, for beside a job's lexicon and variant. */
 export function playersLine(c: JobConfig): string {
-  return c.players.map(playerSummary).join(' vs ');
+  const solversUnused = unusedPlayerSettings(c.job.job_type).has('Endgame');
+  return c.players.map((p) => playerSummary(p, solversUnused)).join(' vs ');
 }

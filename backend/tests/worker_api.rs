@@ -970,9 +970,9 @@ async fn redundant_captured_positions_are_recorded_once() {
     let app = birdtest::app(db.state().await);
 
     let positions = json!([
-        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+        { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp-0",
           "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 0, "rack": "AEINRSU", "position": "cgp-1",
+        { "game_index": 1, "turn_number": 0, "analysis": "static", "rack": "AEINRSU", "position": "cgp-1",
           "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
     ]);
     let mut result = games_result(2, 1);
@@ -1071,8 +1071,18 @@ async fn an_assignment_names_every_file_the_task_loads_and_no_others() {
     let request = &assignment["task_request"];
     assert_eq!(request["bingo_bonus"], json!(50), "{request}");
     assert_eq!(request["sim_cutoff"], json!(0.005), "{request}");
-    for field in ["sort_strategy", "num_plies", "num_plays", "num_plies_recorded", "movegen_margin"] {
+    for field in [
+        "sort_strategy", "num_plies", "num_plays", "num_plies_recorded", "movegen_margin",
+        "endgame_plies", "peg_max_bag",
+    ] {
         assert!(!request["player1"][field].is_null(), "player1 {field}: {request}");
+    }
+    // A player that solves nothing states its PEG settings as null, which is
+    // how MAGPIE tells "not used" from "left to this build".
+    assert_eq!(request["player1"]["endgame_plies"], json!(0), "{request}");
+    for field in ["peg_stage_top_k", "peg_scenario_stride", "peg_opp_model", "peg_nested"] {
+        let value = request["player1"].get(field);
+        assert!(value.is_some_and(|v| v.is_null()), "player1 {field} sent as null: {request}");
     }
 }
 
@@ -2229,9 +2239,9 @@ async fn a_games_jobs_captured_positions_can_be_streamed_out() {
 
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "rack": "AEINRST", "position": "cgp-0",
+        { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp-0",
           "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 3, "rack": "AEINRSU", "position": "cgp-1",
+        { "game_index": 1, "turn_number": 3, "analysis": "static", "rack": "AEINRSU", "position": "cgp-1",
           "previous_move": "8D DOG", "previous_move_score": 10,
           "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
     ]);
@@ -2383,7 +2393,7 @@ async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
     let uuid = assignment["worker_uuid"].as_str().unwrap();
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 0, "turn_number": 0, "rack": "AEINRST",
+        "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST",
         "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
         "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
     }]);
@@ -2407,7 +2417,7 @@ async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
 
 
 fn captured(game: i32, turn: i32) -> serde_json::Value {
-    json!({ "game_index": game, "turn_number": turn, "rack": "AEINRST",
+    json!({ "game_index": game, "turn_number": turn, "analysis": "static", "rack": "AEINRST",
             "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
             "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }] })
 }

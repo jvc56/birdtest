@@ -545,7 +545,7 @@ async fn a_capture_result_of_several_megabytes_is_accepted() {
             .map(|i| json!({ "move": format!("8D PADDING-{i:06}"), "score": 50, "equity": 60.0 }))
             .collect();
         json!({
-            "game_index": game, "turn_number": 0, "rack": "AEINRST", "position": "cgp",
+            "game_index": game, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
             "num_moves": MOVES, "moves": moves,
         })
     };

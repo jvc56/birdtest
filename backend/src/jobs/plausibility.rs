@@ -25,7 +25,7 @@
 //! count that cannot correspond to any game, a truncated batch reported as
 //! complete.
 
-use super::handler::{GameAggregate, MoveEntry, PlyStats, RackOccurrence};
+use super::handler::{Analysis, GameAggregate, MoveEntry, PlyStats, RackOccurrence};
 use crate::error::{AppError, AppResult};
 
 /// Tiles on a rack. Matches MAGPIE's `RACK_SIZE`; a submission naming more is
@@ -282,6 +282,77 @@ pub fn check_moves(moves: &[MoveEntry], num_moves: Option<i32>, context: &str) -
     Ok(())
 }
 
+/// The deepest endgame a solver ranks a move at (`MAX_VARIANT_LENGTH`).
+const MAX_FIDELITY_PLIES: i16 = 25;
+
+/// What a position's moves carry, against how it was analysed.
+///
+/// A static or simulated analysis carries no solver statistics; a pre-endgame
+/// solve's moves each carry a win percentage, a projected spread and the depth
+/// they were ranked at; an endgame solve reports the one move it chose, with
+/// its spread and depth and no win percentage. Anything else is not what
+/// MAGPIE writes, and stored, it would read as an analysis that never ran.
+pub fn check_analysis(analysis: Analysis, moves: &[MoveEntry], context: &str) -> AppResult<()> {
+    let solved = matches!(analysis, Analysis::Peg | Analysis::Endgame);
+    if analysis == Analysis::Endgame && moves.len() != 1 {
+        return Err(AppError::bad_request(format!(
+            "{context}: an endgame analysis reports the one move its solve chose, not {}",
+            moves.len()
+        )));
+    }
+    for entry in moves {
+        let has_solver_stats = entry.mean_spread.is_some() || entry.fidelity_plies.is_some();
+        if !solved && has_solver_stats {
+            return Err(AppError::bad_request(format!(
+                "{context}: a {} analysis of {:?} carries a solver's spread or depth",
+                analysis.as_str(),
+                entry.play
+            )));
+        }
+        if solved {
+            let (Some(spread), Some(fidelity)) = (entry.mean_spread, entry.fidelity_plies) else {
+                return Err(AppError::bad_request(format!(
+                    "{context}: a {} analysis of {:?} needs its mean_spread and fidelity_plies",
+                    analysis.as_str(),
+                    entry.play
+                )));
+            };
+            finite(spread, &format!("{context}: mean_spread of {:?}", entry.play))?;
+            if spread.abs() > MAX_ABS_EQUITY {
+                return Err(AppError::bad_request(format!(
+                    "{context}: play {:?} has an implausible spread {spread}",
+                    entry.play
+                )));
+            }
+            if !(0..=MAX_FIDELITY_PLIES).contains(&fidelity) {
+                return Err(AppError::bad_request(format!(
+                    "{context}: play {:?} was ranked at an implausible depth {fidelity}",
+                    entry.play
+                )));
+            }
+        }
+        match analysis {
+            Analysis::Peg if entry.win_percentage.is_none() => {
+                return Err(AppError::bad_request(format!(
+                    "{context}: a pre-endgame analysis of {:?} needs its win_percentage",
+                    entry.play
+                )));
+            }
+            Analysis::Endgame | Analysis::Static
+                if entry.win_percentage.is_some() || entry.blended_utility.is_some() =>
+            {
+                return Err(AppError::bad_request(format!(
+                    "{context}: a {} analysis of {:?} carries a simulation's statistics",
+                    analysis.as_str(),
+                    entry.play
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// A simulated play's per-ply statistics. MAGPIE numbers the plies from 0 in
 /// order, so a ply out of order or repeated is a broken client; a percentage
 /// outside [0, 100] or a mean score no play can reach is not a statistic.
@@ -514,8 +585,44 @@ mod tests {
             equity,
             win_percentage: None,
             blended_utility: None,
+            mean_spread: None,
+            fidelity_plies: None,
             plies: Vec::new(),
         }
+    }
+
+    fn solved(spread: f64, fidelity: i16, win: Option<f64>) -> MoveEntry {
+        MoveEntry {
+            mean_spread: Some(spread),
+            fidelity_plies: Some(fidelity),
+            win_percentage: win,
+            ..move_entry(30, 31.5)
+        }
+    }
+
+    /// What a position's moves carry has to match how it was analysed: a
+    /// static or simulated position carries no solver statistics, a solved one
+    /// all of them, and an endgame position the one move it chose.
+    #[test]
+    fn a_positions_moves_match_its_analysis() {
+        use super::Analysis::*;
+        assert!(check_analysis(Static, &[move_entry(30, 31.5)], "x").is_ok());
+        assert!(check_analysis(Static, &[solved(12.0, 4, None)], "x").is_err());
+        assert!(check_analysis(Sim, &[solved(12.0, 4, Some(55.0))], "x").is_err());
+
+        assert!(check_analysis(Endgame, &[solved(12.0, 4, None)], "x").is_ok());
+        assert!(check_analysis(Endgame, &[solved(12.0, 4, None), solved(8.0, 4, None)], "x")
+            .is_err());
+        assert!(check_analysis(Endgame, &[solved(12.0, 4, Some(100.0))], "x").is_err());
+        assert!(check_analysis(Endgame, &[move_entry(30, 31.5)], "x").is_err());
+
+        let peg = [solved(12.0, 3, Some(62.5)), solved(-4.0, 0, Some(40.0))];
+        assert!(check_analysis(Peg, &peg, "x").is_ok());
+        assert!(check_analysis(Peg, &[solved(12.0, 3, None)], "x").is_err());
+        assert!(check_analysis(Peg, &[solved(f64::NAN, 3, Some(50.0))], "x").is_err());
+        assert!(check_analysis(Peg, &[solved(1e9, 3, Some(50.0))], "x").is_err());
+        assert!(check_analysis(Peg, &[solved(1.0, 26, Some(50.0))], "x").is_err());
+        assert!(check_analysis(Peg, &[solved(1.0, -1, Some(50.0))], "x").is_err());
     }
 
     #[test]
