@@ -45,10 +45,7 @@ test('E-16: a player config solves its endgame and pre-endgame', async ({ page }
   const settings = page.locator('.card', { has: page.getByRole('heading', { name: 'Settings' }) });
   const row = (label: string) =>
     settings.getByRole('row').filter({ has: page.getByRole('cell', { name: label, exact: true }) });
-  await expect(row('Search').getByRole('cell')).toHaveText([
-    'Search',
-    'static, by equity · 6-ply endgame · PEG ≤2'
-  ]);
+  await expect(page.getByText(/^static, by equity · 6-ply endgame · PEG ≤2 · created/)).toBeVisible();
   await expect(row('Endgame').getByRole('cell')).toHaveText(['Endgame', '6-ply endgame']);
   await expect(row('Pre-endgame').getByRole('cell')).toHaveText(['Pre-endgame', 'bag ≤ 2']);
   // The schedule MAGPIE defaults to, written into the config, under All settings.

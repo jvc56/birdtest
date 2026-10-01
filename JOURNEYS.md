@@ -137,18 +137,19 @@ Open "dev game pairs: static equity vs static score".
 - [ ] **Expect** a Progress card: a bar of "pairs completed", the
   Available / Claimed / Completed task counts, when it was created, "Created
   by dev" and "requires MAGPIE ≥ …".
-- [ ] **Expect** a Settings card of two tables, each showing its key rows: a
-  "Job" group (type "Game pairs", variant, letter distribution, board) and a
-  "Game pairs and the test" group (cap 100,000, Elo H0 and H1); then the
+- [ ] **Expect** a Settings card of two tables, each showing its key rows: the
+  job's type "Game pairs", variant, letter distribution, board, bingo bonus
+  50, cap 100,000, SPRT "Elo -10 → 10" and records positions; then the
   players side by side, headed "Player 1" and "Player 2" with each name
-  linking to its config's page: search ("static, by equity" / "static, by
-  score"), lexicon, leaves, plays considered, recorder, wordmap and rack info
-  table, the rows they differ in (search) bold.
-- [ ] **Do** press **All settings**. **Expect** both tables to grow: the Job
-  group adds bingo bonus, sim cutoff, redundancy and oldest MAGPIE; the pairs
-  group adds fewest pairs before the test is acted on (50,000), α, β, pairs
-  per task and records positions; the players' table every setting after the
-  search. The button now reads **Key settings only** and puts them back.
+  linking to its config's page and its search under it ("static, by equity" /
+  "static, by score"): lexicon, leaves, plies, plays considered, sort,
+  recorder and plays recorded, the rows they differ in (sort) bold, and plays
+  recorded in grey (a job that records no positions never reads it).
+- [ ] **Do** press **All settings**. **Expect** both tables to grow: the job's
+  adds sim cutoff, fewest pairs before the test is acted on (50,000), α, β,
+  pairs per task, redundancy and oldest MAGPIE; the players' table every
+  setting after the key rows (no simulation rows: neither simulates). The
+  button now reads **Key settings only** and puts them back.
 - [ ] At phone width, **expect** the tables to wrap (or scroll inside the
   card), never the page.
 - [ ] **Do** **Download every setting as JSON**. **Expect** the same settings,
@@ -292,11 +293,12 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
 - [ ] **Do** open **Players**. **Expect** the four seeded configs, newest first:
   name, how it searches ("1-ply sim, 100 iterations", "static, by score"),
   lexicon CSW24, leaves, created.
-- [ ] **Do** open `sim-1ply`. **Expect** a table of Search, Lexicon, Leaves,
-  Win %, Plays considered, Recorder ("best, 10 plays kept"), Wordmap "yes" and
-  Rack info table "yes" (no Win % row on `static-equity`), and a JSON
-  download. **Do** press **All settings**. **Expect** every setting in the same
-  table, Search still first.
+- [ ] **Do** open `sim-1ply`. **Expect** "1-ply sim, 100 iterations" beside its
+  name, and a table of Lexicon, Leaves, Plies, Plays considered, Sort, Win %
+  model, Iterations (most), Stopping %, Inference, Recorder and Plays recorded
+  (no simulation rows on `static-equity`), and a JSON download. **Do** press
+  **All settings**. **Expect** every setting in the same table, Lexicon still
+  first.
 - [ ] **Do** open `/player-configs/00000000-0000-4000-8000-000000000000`.
   **Expect** "no such player config".
 - [ ] Signed out, **expect** no **New player config** button on **Players**; as

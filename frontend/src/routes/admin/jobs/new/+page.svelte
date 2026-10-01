@@ -23,6 +23,10 @@
   let variant = 'classic';
   let letterdistId = '';
   let layoutId = '';
+  // Run-wide rules every request states. MAGPIE's defaults, which the server
+  // writes in when the form leaves them as they are.
+  let bingoBonus = 50;
+  let simCutoff = 0.005;
 
   $: letterdists = files.filter((f) => f.role === 'letterdist');
   $: layouts = files.filter((f) => f.role === 'layout');
@@ -108,6 +112,10 @@
       variant,
       letterdist_id: letterdistId,
       layout_id: layoutId,
+      bingo_bonus: bingoBonus,
+      // A leave job's bot never simulates, so it states no cutoff: the server
+      // refuses one.
+      ...(jobType === 'leave_generation' ? {} : { sim_cutoff: simCutoff }),
       ...(minMagpieVersion ? { min_magpie_version: minMagpieVersion } : {})
     };
     const sprt = sprtEnabled
@@ -267,6 +275,23 @@
     One distribution and one board per job: MAGPIE takes a single bag and board for the whole game.
     Each player's lexicon and leaves come from its own config.
   </p>
+
+  <div class="grid grid-cols-2 gap-3">
+    <div>
+      <label class="label" for="bingo">Bingo bonus (-bb)</label>
+      <input id="bingo" type="number" min="0" step="1" required class="input" bind:value={bingoBonus} />
+    </div>
+    {#if jobType !== 'leave_generation'}
+      <div>
+        <label class="label" for="cutoff">Sim cutoff (-cutoff)</label>
+        <input id="cutoff" type="number" min="0" max="100" step="any" required class="input" bind:value={simCutoff} />
+        <p class="mt-1 text-xs text-muted-foreground">
+          How close to 0% or 100% two plays' win percentages must be for a simulation to treat
+          them as equal and rank them by equity instead.
+        </p>
+      </div>
+    {/if}
+  </div>
 
   {#if jobType === 'opening_rack' || jobType === 'leave_generation'}
     <!-- One player, in both cases: an opening-rack job's analyses every rack,

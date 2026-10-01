@@ -730,19 +730,14 @@ pub(crate) async fn insert_game_results(
     if record.positions.is_empty() {
         return Ok(());
     }
-    // How many ranked moves to keep: player 1's num_plays_recorded, which is
-    // also the one MAGPIE reads to decide how many to report. From the job's
-    // template: it is a setting of an immutable player config.
-    //
-    // Plies are kept to the larger of the two players' `num_plies_recorded`: a
-    // position is either player's, and a player that reports fewer (a static
-    // one reports none) is not truncated by the other's cap.
+    // How many ranked moves and plies to keep: player 1's num_plays_recorded
+    // and num_plies_recorded, which are what MAGPIE reads for both seats, and
+    // which job creation holds player 2 to whenever capture is on. From the
+    // job's template: they are settings of an immutable player config.
     let (top_moves, top_plies) = match &template.kind {
-        dispatch::JobKind::Games { player1, player2, .. }
-        | dispatch::JobKind::GamePairs { player1, player2, .. } => (
-            player1.num_plays_recorded,
-            player1.num_plies_recorded.max(player2.num_plies_recorded),
-        ),
+        dispatch::JobKind::Games { player1, .. } | dispatch::JobKind::GamePairs { player1, .. } => {
+            (player1.num_plays_recorded, player1.num_plies_recorded)
+        }
         _ => return Err(template.mismatch("games")),
     };
 

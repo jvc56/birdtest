@@ -720,25 +720,28 @@ Each entry's tests are the `describe` block named for its id.
   average scores to a decimal place and the spread signed ("+13.4", "-2.5",
   never "-0.0"); before any game, none of them rather than 0 or NaN.
   *(Covered: `matchScore.test.ts`.)*
-- `F-SET-1` The settings tables (`lib/jobSettings.ts`): a player's search in a
-  few words; the job's groups with each row marked key or not, the key rows
-  alone (type, variant, letter distribution, board; a games job's target, or
-  its cap and Elo bounds with a test) and a group with none left out; a job
-  without a test shows its target and "SPRT none" and none of the test's
-  settings; players side by side, one row per setting and a row they differ
-  in marked, every setting after the search; the key rows for one player or
-  two, a Win % row only when a player has a model, and every key row also a
-  row of the full table; a leave job's generations counted from its list of
-  targets, each target shown, and no lexicon or wordmap row of its own (its
-  player's table has them); the player settings a leave job never reads --
-  leaves, win %, recorder, plays and plies recorded, move-gen margin, and the
-  endgame and pre-endgame rows -- marked unused; an opening-rack job's
-  endgame and pre-endgame rows marked unused, and none for a games or pairs
-  job. A player's endgame and pre-endgame: "off" when it solves nothing, the
-  pre-endgame "off" without the endgame whatever its bag, the schedule's lists
-  written out, key rows for them only when a player solves, and a summary that
-  names them ("· 6-ply endgame · PEG ≤2") except where the job never reaches
-  the end of a game. *(Covered: `jobSettings.test.ts`.)*
+- `F-SET-1` The settings tables (`lib/jobSettings.ts`), in SETTINGS_COMPARISON.md's
+  orders. A job's settings are one ordered list, the key rows first (type,
+  variant, letter distribution, board, bingo bonus; a games job's target or
+  cap, its SPRT as "none" or "Elo H0 → H1", and whether it records positions;
+  an opening-rack job's racks and their size; a leave job's generations and
+  each one's target) and the rest after (sim cutoff, the test's minimum and
+  error rates, batch sizes, redundancy, the oldest MAGPIE); a job without a
+  test shows none of the test's settings, and a leave job has no sim cutoff
+  and no lexicon or wordmap row of its own. A player's settings are one
+  ordered list too, key rows first (lexicon, leaves, plies, plays considered,
+  sort, win% model, iterations, stopping %, inference, recorder, plays
+  recorded, endgame, pre-endgame) and every key row also a row of the full
+  table; players side by side, a row they differ in marked; the simulation
+  rows only when one of them simulates, and the endgame's among the key rows
+  only when one of them solves. Marked unused: what a leave job never reads
+  (leaves, win% model, recorder, plays and plies recorded, move-gen margin,
+  the endgame and pre-endgame rows); an opening-rack job's inference and
+  inference margin and endgame and pre-endgame rows; a games or pairs job's
+  plays and plies recorded when it records no positions, and nothing when it
+  does. A player's search in a few words leaves out what the job never reads
+  (an opening-rack player's inference, the solving where the job never
+  reaches the end of a game). *(Covered: `jobSettings.test.ts`.)*
 - `F-FMT-6` A blank optional number is `null`, never 0 (Svelte binds a cleared
   number box as `null`, and `Number(null)` is 0, which the player-config form
   wrote into configs that cannot be edited), and a request's blank required
@@ -1429,6 +1432,9 @@ job creation touches needs one caller here.
   perhaps, pre-endgames), naming the player field: its games end before the bag
   is small enough for either solver. The same player is accepted by a games
   job. *(Covered: `jobs::a_leave_job_refuses_a_player_that_solves_the_endgame`.)*
+- `I-JOB-14f` A leave job states no sim cutoff, and one sent is refused on the
+  field; a bingo bonus it states is kept. *(Covered:
+  `jobs::a_leave_job_takes_a_bingo_bonus_and_no_sim_cutoff`.)*
 - `I-JOB-14d` A leave job refuses a player that simulates, sorts on anything
   but equity, or asks for a rack info table, naming the player field, and
   leaves no job behind; a static equity player is accepted. A leave body is
@@ -2638,6 +2644,15 @@ below.
   than the stage before, a zero stride, an unknown opponent model, and nested
   strides that are not one per bag size. *(Covered:
   `admin_api::a_player_config_solves_the_end_of_the_game_only_as_it_states`.)*
+- `A-ADMIN-26` A games or pairs job that captures positions refuses players
+  that disagree on `num_plays_recorded` or `num_plies_recorded`, naming
+  `capture_positions`: MAGPIE keeps one of each for the whole run, player 1's.
+  Without capture they may differ. *(Covered:
+  `admin_api::a_capture_job_refuses_players_that_record_differently`.)*
+- `A-ADMIN-27` A job's bingo bonus and sim cutoff may be stated and are kept
+  as stated; left out, they are MAGPIE's 50 and 0.005; a negative bonus or a
+  cutoff outside 0–100 is refused on its field. *(Covered:
+  `admin_api::a_player_config_and_a_job_state_every_setting_a_task_needs`.)*
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -3115,8 +3130,9 @@ admin in once and the admin journeys reuse its storage state.
   search, and clicking one looks it up. *(Covered:
   `e13-opening-rack-samples.spec.ts`.)*
 - `E-14` A signed-out visitor reaches the player configs from the nav, opens
-  one, reads its key settings in a table (the Search row), grows the table to
-  every setting with **All settings**, and shrinks it back. *(Covered:
+  one, reads how it searches beside its name and its key settings in a table
+  (Lexicon first), grows the table to every setting with **All settings**,
+  Lexicon still first, and shrinks it back. *(Covered:
   `e14-player-configs.spec.ts`.)*
 - `E-15` The player-config form will not submit a stopping percentage of 0 or
   100, which the server refuses; 99.5 is accepted. *(Covered:
@@ -3124,8 +3140,8 @@ admin in once and the admin journeys reuse its storage state.
 - `E-16` The player-config form offers the pre-endgame only once the endgame
   is on, and turning the endgame off turns it off too; a schedule list that is
   not whole numbers is named and not sent; and a config made to solve both
-  shows it on its page: the search "static, by equity · 6-ply endgame · PEG
-  ≤2", Endgame and Pre-endgame rows, and under All settings the schedule
+  shows it on its page: "static, by equity · 6-ply endgame · PEG ≤2" beside
+  its name, Endgame and Pre-endgame rows, and under All settings the schedule
   MAGPIE defaults to. *(Covered: `e16-solving-player-config.spec.ts`.)*
 
 ### Reading confirmation codes

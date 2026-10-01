@@ -1180,6 +1180,14 @@ struct CreateJobBody {
     /// effective value is shown on the creation form so the default is visible
     /// rather than hidden.
     min_magpie_version: Option<String>,
+    /// Run-wide rules every request states. MAGPIE's defaults
+    /// ([`crate::magpie_defaults`]) where the body leaves them out, written
+    /// into the row like every other setting. A leave job states no cutoff:
+    /// its bot never simulates.
+    #[serde(default)]
+    bingo_bonus: Option<i32>,
+    #[serde(default)]
+    sim_cutoff: Option<f64>,
     #[serde(flatten)]
     config: JobTypeConfig,
 }
@@ -1396,8 +1404,10 @@ async fn create_job(
     // Written from MAGPIE's defaults, like a player config's settings, so
     // every request states them rather than each worker's build supplying
     // its own.
-    .bind(crate::magpie_defaults::BINGO_BONUS)
-    .bind(crate::magpie_defaults::SIM_CUTOFF)
+    .bind(body.bingo_bonus.unwrap_or(crate::magpie_defaults::BINGO_BONUS))
+    // Stored for a leave job too, as the column requires; its requests never
+    // carry it.
+    .bind(body.sim_cutoff.unwrap_or(crate::magpie_defaults::SIM_CUTOFF))
     .bind(admin.0.id)
     .bind(job_name(&body))
     .fetch_one(&mut *tx)
@@ -1512,6 +1522,22 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
+    }
+    // MAGPIE takes any integer, but a bonus that takes points away from a
+    // bingo is a typo, not a variant anyone plays.
+    if body.bingo_bonus.is_some_and(|b| b < 0) {
+        err = err.with_field("bingo_bonus", "must not be negative");
+    }
+    if let Some(cutoff) = body.sim_cutoff {
+        // The range MAGPIE's -cutoff accepts, and the column's CHECK.
+        if !(cutoff.is_finite() && (0.0..=100.0).contains(&cutoff)) {
+            err = err.with_field("sim_cutoff", "must be between 0 and 100");
+        } else if body.job_type == JobType::LeaveGeneration {
+            err = err.with_field(
+                "sim_cutoff",
+                "a leave job never simulates, so it has no cutoff: leave it out",
+            );
+        }
     }
     // Read loosely, a typo ("v1.6.0", "1") was 0.0.0: the lowest floor there
     // is, so a raise meant to keep older builds off the job let them all on.
@@ -1798,12 +1824,36 @@ async fn validate_capture_play_cap(
     player1_config_id: Uuid,
     player2_config_id: Uuid,
 ) -> AppResult<()> {
-    let cap: i32 =
-        sqlx::query_scalar("SELECT num_plays_recorded FROM player_configs WHERE id = $1")
-            .bind(player1_config_id)
-            .fetch_optional(&mut *conn)
-            .await?
-            .ok_or_else(|| AppError::bad_request("player config not found"))?;
+    // How many plays and plies a captured position keeps is one setting for
+    // the whole run in MAGPIE, which reads both from player 1: player 2's
+    // would be shown on the job page and never applied. So they must agree,
+    // as `movegen_margin` must (see `validate_shared_player_options`).
+    let recorded = sqlx::query_as::<_, (Uuid, i32, i32)>(
+        "SELECT id, num_plays_recorded, num_plies_recorded FROM player_configs WHERE id = ANY($1)",
+    )
+    .bind(vec![player1_config_id, player2_config_id])
+    .fetch_all(&mut *conn)
+    .await?;
+    let of = |id: Uuid| {
+        recorded
+            .iter()
+            .find(|(row, _, _)| *row == id)
+            .map(|(_, plays, plies)| (*plays, *plies))
+            .ok_or_else(|| AppError::bad_request("player config not found"))
+    };
+    let (cap, plies) = of(player1_config_id)?;
+    let (cap2, plies2) = of(player2_config_id)?;
+    if (cap, plies) != (cap2, plies2) {
+        return Err(AppError::bad_request("job settings are invalid").with_field(
+            "capture_positions",
+            format!(
+                "the players record {cap} and {cap2} plays and {plies} and {plies2} plies per \
+                 position; MAGPIE keeps one number of each for the whole run, player 1's, so \
+                 with capture on both configs must agree on num_plays_recorded and \
+                 num_plies_recorded"
+            ),
+        ));
+    }
     let players = sqlx::query_as::<_, (String, i32, i32)>(
         "SELECT name, num_plies, num_plays FROM player_configs WHERE id = ANY($1)",
     )

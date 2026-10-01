@@ -600,6 +600,9 @@ CREATE TABLE player_configs (
     -- than per-player. Stored here anyway (duplicated on both players'
     -- rows in a job, validated equal at job-creation time) so this table
     -- stays the single, exhaustive source of what a job asked MAGPIE for.
+    -- The same holds of num_plays_recorded and num_plies_recorded above in a
+    -- games or game-pairs job that captures positions: MAGPIE reads player
+    -- 1's for both seats, so job creation requires the two to agree.
     movegen_margin         DOUBLE PRECISION NOT NULL, -- move-gen equity margin for 'equity' recording (-mmargin)
     -- Endgame and pre-endgame (PEG) solving, read only by games and game-pairs
     -- jobs: an opening rack never reaches a small bag, and a leave job's games

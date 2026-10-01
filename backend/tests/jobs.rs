@@ -383,6 +383,41 @@ async fn a_leave_job_refuses_a_player_that_solves_the_endgame() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// I-JOB-14f: a leave job's bot never simulates, so a leave job states no
+/// sim cutoff and one sent is refused, naming the field; its bingo bonus, part
+/// of every score its games play, is kept as stated.
+#[tokio::test]
+async fn a_leave_job_takes_a_bingo_bonus_and_no_sim_cutoff() {
+    let db = TestDb::new().await;
+    let dir = TempDir::new();
+    let (with_store, _bucket) = db.state_with_object_store().await;
+    let mut cfg = (*with_store.cfg).clone();
+    cfg.magpie_bin = stub_magpie(&dir).to_string_lossy().into_owned();
+    let admin = Admin::new(&db, db.state_with(cfg).await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let player = admin.static_player("leaver", kwg, klv, json!({})).await;
+    let body = |extra: Value| {
+        let mut body = json!({
+            "job_type": "leave_generation", "variant": "classic",
+            "letterdist_id": ld, "layout_id": layout, "player_config_id": player,
+            "num_iterations": 200, "target_rack_counts": [50], "racks_per_task": 20,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    };
+    let (status, refused) = admin.create_job(body(json!({ "sim_cutoff": 0.005 }))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["fields"][0]["field"], "sim_cutoff", "{refused}");
+
+    let (status, created) = admin.create_job(body(json!({ "bingo_bonus": 40 }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["job"]["bingo_bonus"], json!(40), "{created}");
+}
+
 /// I-JOB-2: `validate_shared_player_options` reads the two stored configs --
 /// the regression guard for the renamed `winpct_id` column. Two simmers on the
 /// same win% model row are accepted; on different rows they are refused; two

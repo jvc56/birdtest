@@ -1052,7 +1052,7 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
         let (status, created) = player_config(&app, &headers, json!({
             "name": format!("simmer-{plays}"), "recorder_type": "best", "kwg_id": kwg,
             "klv_id": klv, "winpct_id": winpct, "num_plies": 2, "num_plays": plays,
-            "max_iterations": 100, "time_limit_secs": 0, "num_plays_recorded": 1,
+            "max_iterations": 100, "time_limit_secs": 0, "num_plays_recorded": 20,
         })).await;
         assert_eq!(status, StatusCode::CREATED, "{created}");
         simmers.push(created["id"].clone());
@@ -1073,6 +1073,55 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
     assert_eq!(status, StatusCode::CREATED, "without capture nothing is raised: {body}");
     let (status, body) = send(&app, create(&simmers[1], true)).await;
     assert_eq!(status, StatusCode::CREATED, "a simmer already at the cap: {body}");
+}
+
+/// A-ADMIN-26: how many plays and plies a captured position keeps is one
+/// setting for the whole run in MAGPIE, read from player 1. So a capturing
+/// games or pairs job whose players disagree on either is refused, naming
+/// `capture_positions`; without capture neither is read, and they may differ.
+#[tokio::test]
+async fn a_capture_job_refuses_players_that_record_differently() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let app = birdtest::app(state.clone());
+    let admin = db.user("root", true).await;
+    let headers = admin_headers(&state.cfg, admin);
+    let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let letterdist = db.input_data("letterdist", "english").await;
+    let layout = db.input_data("layout", "standard15").await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let mut configs = Vec::new();
+    for (name, plays, plies) in [("ten-two", 10, 2), ("ten-two-b", 10, 2), ("five-two", 5, 2), ("ten-four", 10, 4)] {
+        let (status, created) = player_config(&app, &headers, json!({
+            "name": name, "recorder_type": "all", "kwg_id": kwg, "klv_id": klv,
+            "num_plays_recorded": plays, "num_plies_recorded": plies,
+        })).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        configs.push(created["id"].clone());
+    }
+    let create = |job_type: &str, p2: &serde_json::Value, capture: bool| {
+        let units = if job_type == "games" { "max_games" } else { "max_pairs" };
+        let mut body = json!({
+            "job_type": job_type, "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout,
+            "player1_config_id": configs[0], "player2_config_id": p2,
+            "capture_positions": capture,
+        });
+        body[units] = json!(10);
+        post_json("/api/admin/jobs", &headers, body)
+    };
+    for job_type in ["games", "game_pairs"] {
+        for differing in [&configs[2], &configs[3]] {
+            let (status, body) = send(&app, create(job_type, differing, true)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{job_type}: {body}");
+            assert_eq!(body["fields"][0]["field"], "capture_positions", "{body}");
+            let (status, body) = send(&app, create(job_type, differing, false)).await;
+            assert_eq!(status, StatusCode::CREATED, "{job_type} without capture: {body}");
+        }
+        let (status, body) = send(&app, create(job_type, &configs[1], true)).await;
+        assert_eq!(status, StatusCode::CREATED, "{job_type}, agreeing: {body}");
+    }
 }
 
 /// A config states every setting a task needs, and a job every run-wide one:
@@ -1154,6 +1203,33 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["job"]["bingo_bonus"], json!(50), "{created}");
     assert_eq!(created["job"]["sim_cutoff"], json!(0.005), "{created}");
+
+    // A-ADMIN-27: the two may be stated instead, and are kept as stated.
+    let job = |extra: serde_json::Value| {
+        let mut body = json!({
+            "job_type": "games", "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout,
+            "player1_config_id": static_player["id"], "player2_config_id": simmer["id"],
+            "max_games": 10,
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        post_json("/api/admin/jobs", &headers, body)
+    };
+    let (status, created) = send(&app, job(json!({ "bingo_bonus": 35, "sim_cutoff": 0.5 }))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["job"]["bingo_bonus"], json!(35), "{created}");
+    assert_eq!(created["job"]["sim_cutoff"], json!(0.5), "{created}");
+    for (extra, field) in [
+        (json!({ "bingo_bonus": -1 }), "bingo_bonus"),
+        (json!({ "sim_cutoff": 100.5 }), "sim_cutoff"),
+        (json!({ "sim_cutoff": -0.1 }), "sim_cutoff"),
+    ] {
+        let (status, body) = send(&app, job(extra.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{extra}: {body}");
+        assert_eq!(body["fields"][0]["field"], field, "{extra}: {body}");
+    }
 }
 
 /// A-ADMIN-25: a player config solves the endgame and the pre-endgame

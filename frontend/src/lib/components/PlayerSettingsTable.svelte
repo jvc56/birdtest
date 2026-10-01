@@ -5,9 +5,11 @@
    * job -- with the rows the players differ in bold. The key rows unless
    * `all`, when every setting. The card around it holds the toggle, so one
    * toggle can open a job's settings and its players' together. Settings the
-   * job never reads (`unused`, by row label) are shown muted, with a note.
+   * job never reads (`unused`, by row label) are shown muted, with a note. A
+   * job's players are headed by their search in a few words; a config read on
+   * its own has that beside its name on its page.
    */
-  import { keySettings, playerRows, type PlayerSettings } from '$lib/jobSettings';
+  import { keySettings, playerRows, playerSummary, type PlayerSettings } from '$lib/jobSettings';
 
   export let players: PlayerSettings[];
   /** Every setting rather than the key rows. */
@@ -44,7 +46,10 @@
             {#each players as player}
               <th>
                 <span class="capitalize">{player.role}</span><br />
-                <a class="font-normal [overflow-wrap:anywhere]" href="/player-configs/{player.id}">{player.name}</a>
+                <a class="font-normal [overflow-wrap:anywhere]" href="/player-configs/{player.id}">{player.name}</a><br />
+                <span class="text-xs font-normal text-muted-foreground" data-testid="player-search"
+                  >{playerSummary(player, unused)}</span
+                >
               </th>
             {/each}
           </tr>
