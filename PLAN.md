@@ -214,6 +214,23 @@ position on every turn regardless; this decides whether those are recorded
 rather than discarded, turning a job run to settle an Elo question into a corpus
 of analysed positions as well.
 
+A `game_pairs` job can keep less: with `capture_first_divergence` as well, only
+each pair's **first divergence**. A pair's two games share their tiles and swap
+who moves first, so until the players choose different moves they are one game
+played from both seats; the turn they first disagree is the one position both
+players faced, with each player's ranking of it. From each pair that diverges
+the worker keeps both games' positions at that turn -- one board, one rack to
+play from, each player to move in one game -- and from a pair played
+identically, nothing. MAGPIE's positions recorder holds each turn's positions
+until the pair's play says whether that turn is the divergence
+(`divergentpositions`, `autoplay_results_commit_positions`), so nothing else
+reaches the result. The server checks the shape strictly: every pair with
+positions has exactly two, at one turn, on one board with one rack, and there
+are as many such pairs as `divergent_games` says diverged. The job's page shows
+every saved position of a pairs job beside its partner -- the same turn of the
+pair's other game -- which for a first divergence is the two players' answers
+side by side.
+
 They share `position_analysis_records` with opening racks -- the request differs
 by job type, but what comes back is a position analysis either way. In-game rows
 carry the CGP, the game index and the turn number, which are NULL for an opening
@@ -871,7 +888,7 @@ Shows all jobs with: job type, status, allocation, and a completion counter (tas
 - SPRT status text: one of `running`, `passed (H1 accepted)`, `failed (H0 accepted)`, or `stopped at its cap` — for a job that runs the test; one without has no SPRT card, and `games.sprt` is `null`.
 - The pentanomial (game pairs only), in the SPRT card: the five pair outcomes the LLR is computed from. Ratings are not here — they are pool-scoped and live on the [ratings page](#the-ratings-page).
 - A **match score** card, after the settings and before the SPRT card: player 1's wins–losses–draws, its score (W + ½D) out of the games played and the win % that is, each player's average score per game and player 1's average spread, and the win/loss/draw chart and percentages. It counts games for a pairs job too. For a job without a test it is the job's result. The averages are the batches' `p1_score_mean` / `p2_score_mean` weighted by their games, over the first accepted result of each task (`jobstats::SCORE_MEANS`).
-- **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, and the tiles the move before it placed outlined — beside its ranked moves, and its CGP as text. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. Signed-in users only; a signed-out visitor is told to sign in. The public has the results feed. Clicking a ranked move to preview it on the board is a follow-up.
+- **Saved positions**, for a job with `capture_positions` set: one captured position at a time, drawn on the job's own board (`Board.svelte`) — its premium squares from the layout, the tiles with their letters and scores (a blank in lower case, scoring nothing), both racks and scores with the player to move marked, and the tiles the move before it placed outlined — beside its ranked moves, and its CGP as text. **Random position** draws another (`GET /api/jobs/:id/positions/random`); a rack search shows that rack's positions newest first, one at a time with **Next** and **Previous** (`GET /api/jobs/:id/positions?rack=`). On a game-pairs job each position comes with its `partner`, the same turn of the pair's other game, and the two are drawn side by side ("Game 1 of the pair", "Game 2 of the pair", each naming the player to move); a rack both games hold finds the pair once. A job keeping only first divergences (`capture_first_divergence`) shows exactly the turn each pair's players first chose differently. There is no list of the newest positions: a job that captures holds millions, and one at a time on a board is what the section is for. The CGP and the move notation are read by `lib/cgp.ts` as MAGPIE writes them (`game_get_cgp_string`, `move_get_string`: `8G HUH` across, `E9 (E)RUVIM` down, letters played through in parentheses, `[L·L]` for a multi-letter tile); a position it cannot read is shown as text. The board scales to its box, so a phone shows it whole. Signed-in users only; a signed-out visitor is told to sign in. The public has the results feed. Clicking a ranked move to preview it on the board is a follow-up.
 
 **Opening rack analysis**
 
@@ -3125,7 +3142,8 @@ so the client reads results out of the structs instead of parsing formatted outp
 `config_contribute_games` serializes the array into the `positions` field of its
 submission, and sets the recorder option when the task request asks for it, so
 `capture_positions` on the birdtest job becomes `autoplay games,positions` on the
-MAGPIE invocation.
+MAGPIE invocation, and with `capture_first_divergence` on a pairs job,
+`autoplay games,divergentpositions`.
 
 #### Wire format
 
@@ -4378,7 +4396,9 @@ Server-side validation, so the client must satisfy it:
   config's `num_plays_recorded`; `num_moves` says how many were ranked and must
   not be below the number reported. It is optional, for builds that predate it.
 - `positions` is present only when the job set `capture_positions`, and each entry
-  must fall inside the task's own games — see
+  must fall inside the task's own games; a pairs job keeping first divergences
+  sends exactly two per diverging pair, at one turn of one position, and as
+  many pairs as `divergent_games` says diverged — see
   [Position Capture From Games](#position-capture-from-games).
 - A leave result names full 7-tile racks only, each once, each with a `count` of
   at least 1 and a finite `mean`; and the counts together may not exceed
@@ -5287,7 +5307,7 @@ Protected by a layout guard (`/admin/+layout.svelte`) that requires `is_admin = 
 | Route | Page |
 |---|---|
 | `/admin` | Admin overview — redirects to `/jobs`, the job list; a job's page links ("Manage") to its admin page, `/admin/jobs/:id`. There is no `/admin/jobs` list; `/admin/jobs/new` creates a job. |
-| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs. The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. |
+| `/admin/jobs/new` | Create job form — job type selector, then type-specific config fields; a games or pairs job can be set to save the positions it plays (`capture_positions`), which caps its batch at 1,000 games or 500 pairs, and a pairs job saving them to keep only where each pair first diverges (`capture_first_divergence`). The letter distribution and board layout start empty ("Choose…") and must be picked, here and on the rating-pool form: the first of each imported is no default worth having. |
 | `/admin/jobs/[id]` | Admin job view — the public page's four headline cards (status, allocation, tasks completed, ETA), the job's progress, its settings, match score and SPRT cards as the public page has them, contributors and data gaps (what workers declined it for) plus controls: activate, deactivate, force-complete, purge, delete (the last three ask first: none can be taken back), an artifact check and "merge progress now" for leave generation, and for a completed job the export panel — start, poll, download. |
 | `/admin/player-configs` | Player config list — name, recorder type, sort strategy, sim parameters. |
 | `/admin/player-configs/new` | Create player config form. |

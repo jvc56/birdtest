@@ -1079,6 +1079,8 @@ async fn a_capture_job_refuses_simmers_that_capture_would_change() {
 /// setting for the whole run in MAGPIE, read from player 1. So a capturing
 /// games or pairs job whose players disagree on either is refused, naming
 /// `capture_positions`; without capture neither is read, and they may differ.
+/// Keeping only first divergences (`capture_first_divergence`) is a pairs
+/// job's, and needs capture: on a games job, or without it, it is refused.
 #[tokio::test]
 async fn a_capture_job_refuses_players_that_record_differently() {
     let db = TestDb::new().await;
@@ -1122,6 +1124,34 @@ async fn a_capture_job_refuses_players_that_record_differently() {
         let (status, body) = send(&app, create(job_type, &configs[1], true)).await;
         assert_eq!(status, StatusCode::CREATED, "{job_type}, agreeing: {body}");
     }
+
+    // First divergences: a pairs job's, and only with capture.
+    let with_divergence = |job_type: &str, capture: bool| {
+        let units = if job_type == "games" { "max_games" } else { "max_pairs" };
+        let mut body = json!({
+            "job_type": job_type, "variant": "classic",
+            "letterdist_id": letterdist, "layout_id": layout,
+            "player1_config_id": configs[0], "player2_config_id": configs[1],
+            "capture_positions": capture, "capture_first_divergence": true,
+        });
+        body[units] = json!(10);
+        post_json("/api/admin/jobs", &headers, body)
+    };
+    for (job_type, capture) in [("games", true), ("game_pairs", false)] {
+        let (status, body) = send(&app, with_divergence(job_type, capture)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{job_type}, capture {capture}: {body}");
+        assert_eq!(body["fields"][0]["field"], "capture_first_divergence", "{body}");
+    }
+    let (status, body) = send(&app, with_divergence("game_pairs", true)).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let stored: bool = sqlx::query_scalar(
+        "SELECT capture_first_divergence FROM job_game_pair_config WHERE job_id = $1",
+    )
+    .bind(body["job"]["id"].as_str().unwrap().parse::<uuid::Uuid>().unwrap())
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert!(stored);
 }
 
 /// A config states every setting a task needs, and a job every run-wide one:

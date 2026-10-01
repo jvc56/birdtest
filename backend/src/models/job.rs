@@ -207,6 +207,10 @@ pub struct GamePairConfig {
     /// Keep the position analyses produced while playing. Off by default: at
     /// ~22.5 turns a game it roughly doubles the rows a job produces.
     pub capture_positions: bool,
+    /// With `capture_positions`, keep only each pair's first divergence: both
+    /// games' positions at the first turn they play different moves, and
+    /// nothing from a pair played identically.
+    pub capture_first_divergence: bool,
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -399,6 +403,7 @@ mod tests {
             elo_low: -3.0,
             elo_high: 4.5,
             capture_positions: false,
+            capture_first_divergence: false,
         };
 
         let fields = |p: SprtParams| {

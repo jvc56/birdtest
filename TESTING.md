@@ -68,13 +68,13 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 229 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
+| 1 Unit | 230 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (2) |
 | 1F Frontend unit | 172 | Vitest, `frontend/src/lib/`: `format.test.ts` (40), `jobSettings.test.ts` (9), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
 | 2 Integration | 175 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (15), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
-| 3 API | 236 | `backend/tests/`: `worker_api.rs` (49), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
+| 3 API | 238 | `backend/tests/`: `worker_api.rs` (49), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (19), `public_api.rs` (21), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
-| 5 End-to-end | 19 | Playwright journeys `E-1`..`E-16` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 12 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-13` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 5 End-to-end | 20 | Playwright journeys `E-1`..`E-17` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
+| 6 MAGPIE smoke | 13 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-14` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
@@ -2655,8 +2655,12 @@ below.
 - `A-ADMIN-26` A games or pairs job that captures positions refuses players
   that disagree on `num_plays_recorded` or `num_plies_recorded`, naming
   `capture_positions`: MAGPIE keeps one of each for the whole run, player 1's.
-  Without capture they may differ. *(Covered:
-  `admin_api::a_capture_job_refuses_players_that_record_differently`.)*
+  Without capture they may differ. Keeping only first divergences
+  (`capture_first_divergence`) is refused on a games job and on a pairs job
+  that captures nothing, each naming that field, and is stored when a pairs
+  job captures. *(Covered:
+  `admin_api::a_capture_job_refuses_players_that_record_differently`,
+  `jobs::each_job_type_stores_every_setting_it_was_created_with`.)*
 - `A-ADMIN-27` A job's bingo bonus and sim cutoff may be stated and are kept
   as stated; left out, they are MAGPIE's 50 and 0.005; a negative bonus or a
   cutoff outside 0–100 is refused on its field. *(Covered:
@@ -2783,6 +2787,18 @@ below.
   is `null` for a job with no task, or none returned; signed out is a `401`,
   an opening-rack job a `400`, an unknown job a `404`. *(Covered:
   `public_api::a_random_position_is_drawn_from_the_tasks_that_have_one`.)*
+- `A-PUBLIC-4f` A game-pairs job keeping first divergences takes from each
+  diverging pair both games' positions at one turn and nothing else (a lone
+  position, two at different turns, or fewer pairs than `divergent_games`
+  says are each a `400`); every saved position of a pairs job comes with its
+  `partner`, the same turn of the pair's other game -- at random and by rack,
+  where a rack both games hold finds the pair once, led by its first game --
+  and `null` where the other game has no such turn; a games job's carry no
+  `partner`. *(Covered:
+  `public_api::a_pairs_job_keeps_first_divergences_and_shows_each_with_its_partner`,
+  `public_api::a_pairs_position_without_a_partner_turn_says_so`, and
+  `jobs::game_pair::tests::first_divergences_are_both_games_at_one_turn_of_one_position`
+  for each way a pair can be malformed.)*
 - `A-PUBLIC-4d` A job's board (`/api/jobs/:id/board`) is public: its layout
   square by square with the start square, and every letter of its
   distribution with its blank's spelling and score. *(Covered:
@@ -3151,6 +3167,14 @@ admin in once and the admin journeys reuse its storage state.
   shows it on its page: "static, by equity · 6-ply endgame · PEG ≤2" beside
   its name, Endgame and Pre-endgame rows, and under All settings the schedule
   MAGPIE defaults to. *(Covered: `e16-solving-player-config.spec.ts`.)*
+- `E-17` A game-pairs job made through the form with "Save the positions
+  played" and then "Only where each pair first diverges" ticked (offered only
+  once saving is) says "first divergences" in its settings and shows a
+  signed-in user a pair's two games side by side at one turn: "Game 1 of the
+  pair" and "Game 2 of the pair", the same rack, each player to move in one,
+  each with ranked moves; a search for that rack finds the pair once, both
+  games of it. *(Covered: `e17-pair-divergences.spec.ts`, against the fake
+  workers' synthetic first divergences.)*
 
 ### Reading confirmation codes
 
@@ -3328,6 +3352,14 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   has a spread and a depth, beside the other player's `static` ones, which
   have none. *(Covered: `case_solvers`, with a small schedule so a game takes
   seconds.)*
+- `M-14` A game-pairs job keeping first divergences, on a real MAGPIE, stores
+  from each pair that diverged both games' positions at one turn, on one board
+  with one rack, each with that player's own different best move, and as many
+  pairs as `game_results` counts divergent. *(Covered:
+  `case_first_divergences`, equity against score, four tasks of five pairs.)*
+  MAGPIE's own side, including that a pair played identically keeps nothing,
+  is `magpie_test contribute`'s
+  `test_a_pairs_first_divergence_is_both_games_at_one_turn`.
 - `M-13` A job with `use_wit` dispatches only once its word info table is
   built; a worker whose table does not match the recorded hash declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`; with the right

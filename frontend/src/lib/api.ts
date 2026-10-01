@@ -128,6 +128,12 @@ export interface SavedPosition {
   /** How the move played here was chosen. */
   analysis: PositionAnalysis;
   submitted_at: string;
+  /**
+   * A game-pairs job's only: the same turn of the pair's other game (the
+   * game index with its low bit flipped), or null when that game has no
+   * position at that turn. Absent for a games job.
+   */
+  partner?: SavedPosition | null;
   moves: {
     rank: number;
     move: string;

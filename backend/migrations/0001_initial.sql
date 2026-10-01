@@ -743,7 +743,15 @@ CREATE TABLE job_game_pair_config (
     -- analyses a position every turn regardless; this decides whether those are
     -- recorded. Off by default: at ~22.5 turns a game it roughly doubles the
     -- rows a job produces.
-    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE
+    capture_positions   BOOLEAN NOT NULL DEFAULT FALSE,
+    -- With capture on, keep only each pair's first divergence: both games'
+    -- positions at the first turn the two games play different moves, and
+    -- nothing from a pair played identically. Before that turn the two games
+    -- are the same game; after it they are two different ones, and the turn
+    -- itself is where the players disagree.
+    capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
+    CONSTRAINT job_game_pair_config_divergence_needs_capture
+        CHECK (capture_positions OR NOT capture_first_divergence)
 );
 
 CREATE TABLE job_leave_config (
@@ -1009,6 +1017,9 @@ CREATE TABLE game_requests (
     -- Denormalized from the job config, like everything else here, so the
     -- request a re-dispatched task replays is exactly the one it was given.
     capture_positions BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Game pairs only: of the captured positions, keep only each pair's first
+    -- divergence (job_game_pair_config.capture_first_divergence).
+    capture_first_divergence BOOLEAN NOT NULL DEFAULT FALSE,
     -- seed is also stored on the tasks row; duplicated here for convenience when reading the full request.
     seed              BIGINT NOT NULL,
     num_games         INT NOT NULL DEFAULT 1,

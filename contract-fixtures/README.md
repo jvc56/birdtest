@@ -21,12 +21,12 @@ other then fails a test rather than a contributor's run.
 | `shutdown-data-out-of-date.json` | server → client | Every job unreachable because the data is stale |
 | `shutdown-magpie-too-old.json` | server → client | Every job unreachable because the build is old |
 | `shutdown-both.json` | server → client | Both, leading with the MAGPIE version |
-| `assignment-game-pairs.json` | server → client | A `game_pairs` assignment (`game_pairs: true`) whose players ask for a wordmap |
+| `assignment-game-pairs.json` | server → client | A `game_pairs` assignment (`game_pairs: true`) whose players ask for a wordmap, capturing only first divergences (`capture_first_divergence`) |
 | `anon-uuid-assignment.json` | server → client | The first assignment of a worker with no identity: a games task carrying the minted `worker_uuid`, and a job that pins no derived file (`derived: []`) |
 | `expected-data.json` | server → client | The `expected_data` digest list of an assignment, input files and a derived wordmap |
 | `heartbeat.json` | client → server | A heartbeat |
 | `result-games.json` | client → server | A games result with `capture_positions` on, from two players that solve their endgames and small pre-endgames: the tally and every captured position, each with its `analysis` (`static`, `peg`, `endgame`) and a solved one's spreads and depths |
-| `result-game-pairs.json` | client → server | A pairs result: the tally, the pentanomial and the divergent subset |
+| `result-game-pairs.json` | client → server | A pairs result: the tally, the pentanomial, the divergent subset, and each diverging pair's two positions at its first divergence |
 | `result-opening-rack.json` | client → server | A simulating player's rack analyses, with win%, blended utility and per-ply statistics |
 | `result-leave-generation.json` | client → server | Every rack a leave-generation task saw, on MAGPIE's two-letter test distribution |
 

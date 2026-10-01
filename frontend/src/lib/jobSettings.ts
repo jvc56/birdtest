@@ -81,6 +81,8 @@ export interface JobConfig {
     elo_low: number;
     elo_high: number;
     capture_positions: boolean;
+    /** Game pairs: only each pair's first divergence is kept. */
+    capture_first_divergence: boolean;
   };
   opening_racks?: { racks_per_batch: number; rack_size: number; total_racks: number };
   /** Its lexicon and wordmap setting are its player's, in `players`. */
@@ -184,7 +186,10 @@ export function jobSettings(c: JobConfig): JobSetting[] {
         ? key(`Cap (${unit}s)`, show(g.max_units))
         : key(`${units} to play`, show(g.max_units)),
       key('SPRT', g.sprt_enabled ? `Elo ${show(g.elo_low)} → ${show(g.elo_high)}` : 'none'),
-      key('Records positions', show(g.capture_positions))
+      key(
+        'Records positions',
+        g.capture_positions && g.capture_first_divergence ? 'first divergences' : show(g.capture_positions)
+      )
     );
   }
   if (o) rows.push(key('Racks in all', show(o.total_racks)), key('Rack size', show(o.rack_size)));

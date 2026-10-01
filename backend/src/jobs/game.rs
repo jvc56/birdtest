@@ -182,6 +182,7 @@ pub async fn next_request(
             num_games: config.games_per_batch,
             game_pairs: false,
             capture_positions: config.capture_positions,
+            capture_first_divergence: false,
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,
             player1: player1.clone(),
@@ -210,7 +211,8 @@ pub(super) async fn load_game_request_row(
 ) -> AppResult<sqlx::postgres::PgRow> {
     Ok(sqlx::query(
         "SELECT variant, letter_distribution, board_layout, seed, num_games,
-                player1_config_id, player2_config_id, capture_positions
+                player1_config_id, player2_config_id, capture_positions,
+                capture_first_divergence
          FROM game_requests WHERE task_id = $1",
     )
     .bind(task_id)

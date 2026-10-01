@@ -1402,3 +1402,181 @@ async fn submissions_during_a_cool_down_are_pushed_when_it_ends() {
     .expect("the submissions made during the cool-down are pushed when it ends");
     assert_eq!(everything["games"]["units_completed"], 6);
 }
+
+/// A game-pairs job capturing positions, keeping first divergences or not.
+async fn capturing_pairs_job(db: &TestDb, first_divergence: bool) -> Uuid {
+    let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
+    let p1 = db.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
+    let p2 = db.static_player(&format!("p2{}", Uuid::new_v4().simple()), admin).await;
+    let job = db.bare_job("game_pairs", 1, admin).await;
+    sqlx::query(
+        "INSERT INTO job_game_pair_config
+             (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs,
+              max_pairs, capture_positions, capture_first_divergence)
+         VALUES ($1, $2, $3, 2, 1000000, 1000000, TRUE, $4)",
+    )
+    .bind(job)
+    .bind(p1)
+    .bind(p2)
+    .bind(first_divergence)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    job
+}
+
+/// Two pairs, the second diverging: as a pairs result reports them.
+fn pairs_result(positions: serde_json::Value) -> serde_json::Value {
+    let mut result = games_result(4, 2);
+    result["pentanomial"] = json!([0, 0, 2, 0, 0]);
+    result["divergent_games"] = games_result(2, 1)["all_games"].clone();
+    result["positions"] = positions;
+    result
+}
+
+fn divergence(game: i32, turn: i32, scores: &str, best: &str) -> serde_json::Value {
+    json!({ "game_index": game, "turn_number": turn, "analysis": "static", "rack": "ABBCDEE",
+            "position": format!("15/15/15/15/15/15/15/7DAB5/15/15/15/15/15/15/15 {scores} 0"),
+            "previous_move": "8H DAB", "previous_move_score": 10,
+            "num_moves": 30, "moves": [{ "move": best, "score": 70, "equity": 77.0 }] })
+}
+
+/// A-PUBLIC-4f: a game-pairs job that keeps first divergences takes from each
+/// diverging pair both games' positions at that one turn and nothing else --
+/// a pair's lone position, or two at different turns, is a `400` -- and every
+/// saved position of a pairs job comes with its partner, the same turn of the
+/// pair's other game, at random and by rack, where the rack finds the pair
+/// once.
+#[tokio::test]
+async fn a_pairs_job_keeps_first_divergences_and_shows_each_with_its_partner() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let cfg = state.cfg.clone();
+    let app = birdtest::app(state);
+    let job = capturing_pairs_job(&db, true).await;
+
+    let (assignment, uuid) = first_claim(&app).await;
+    let request = &assignment["task_request"];
+    assert_eq!(request["job_type"], "game_pairs");
+    assert_eq!(request["capture_positions"], json!(true));
+    assert_eq!(request["capture_first_divergence"], json!(true));
+
+    for (positions, why) in [
+        (json!([divergence(2, 5, "ABBCDEE/ 20/10", "8D BEDE")]), "keeps both games' or neither"),
+        (
+            json!([divergence(2, 5, "a 20/10", "8D BEDE"), divergence(3, 6, "b 10/20", "8D BED")]),
+            "turns 5 and 6",
+        ),
+        (json!([]), "divergent_games says 1 diverged"),
+    ] {
+        let (status, body) = send(
+            &app,
+            post_json(
+                "/api/worker/result",
+                &[("x-worker-uuid", uuid.as_str())],
+                json!({ "claim_token": assignment["claim_token"], "result": pairs_result(positions) }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{why}: {body}");
+        assert!(body.to_string().contains(why), "{why}: {body}");
+    }
+    // Pair 1 diverged at turn 5: player 1 played BEDE in game 2 and player 2
+    // BED in game 3, from the same board and tiles.
+    submit(
+        &app,
+        &assignment,
+        &uuid,
+        pairs_result(json!([
+            divergence(3, 5, "ABBCDEE/XYZ 10/20", "8D BED"),
+            divergence(2, 5, "XYZ/ABBCDEE 20/10", "8D BEDE"),
+        ])),
+    )
+    .await;
+
+    let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
+    let headers = admin_headers(&cfg, user);
+    let (status, config) = send(&app, get_request(&format!("/api/jobs/{job}/config"), &[])).await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["games"]["capture_first_divergence"], json!(true), "{config}");
+
+    let (status, random) =
+        send(&app, get_request(&format!("/api/jobs/{job}/positions/random"), &headers)).await;
+    assert_eq!(status, StatusCode::OK, "{random}");
+    let partner = &random["partner"];
+    assert_eq!(random["turn_number"], 5, "{random}");
+    assert_eq!(partner["turn_number"], 5, "{random}");
+    let mut games = [random["game_index"].as_i64().unwrap(), partner["game_index"].as_i64().unwrap()];
+    games.sort();
+    assert_eq!(games, [2, 3], "{random}");
+    assert!(partner.get("partner").is_none(), "a partner carries no partner of its own: {random}");
+    let played = |item: &serde_json::Value| item["moves"][0]["move"].as_str().unwrap().to_string();
+    let mut plays = [played(&random), played(partner)];
+    plays.sort();
+    assert_eq!(plays, ["8D BED", "8D BEDE"], "{random}");
+
+    // Both games hold the rack; the pair is one result, led by its first game.
+    let (status, page) = send(
+        &app,
+        get_request(&format!("/api/jobs/{job}/positions?rack=ABBCDEE"), &headers),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    let items = page["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{page}");
+    assert_eq!(items[0]["game_index"], 2, "{page}");
+    assert_eq!(items[0]["partner"]["game_index"], 3, "{page}");
+}
+
+/// A-PUBLIC-4f, continued: a pairs job capturing every position shows each with its
+/// partner where the other game has that turn, and `null` where it does not;
+/// a games job's positions carry no partner field at all.
+#[tokio::test]
+async fn a_pairs_position_without_a_partner_turn_says_so() {
+    let db = TestDb::new().await;
+    let state = db.state().await;
+    let cfg = state.cfg.clone();
+    let app = birdtest::app(state);
+    let job = capturing_pairs_job(&db, false).await;
+    let (assignment, uuid) = first_claim(&app).await;
+    assert_eq!(assignment["task_request"]["capture_first_divergence"], json!(false));
+    // Every game has positions; game 1 has a turn 9 game 0 never reached.
+    let mut positions: Vec<serde_json::Value> =
+        (0..4).map(|game| divergence(game, 0, "a 0/0", "8D BED")).collect();
+    positions.push(divergence(1, 9, "b 0/0", "8D BEDE"));
+    submit(&app, &assignment, &uuid, pairs_result(json!(positions))).await;
+
+    let user = db.user(&format!("reader{}", Uuid::new_v4().simple()), false).await;
+    let headers = admin_headers(&cfg, user);
+    let (_, page) = send(
+        &app,
+        get_request(&format!("/api/jobs/{job}/positions?rack=ABBCDEE&per_page=20"), &headers),
+    )
+    .await;
+    let items = page["items"].as_array().unwrap();
+    // Turn 0 of each pair once, with its partner; game 1's turn 9 alone.
+    assert_eq!(items.len(), 3, "{page}");
+    let lone = items.iter().find(|i| i["turn_number"] == 9).expect("turn 9");
+    assert!(lone["partner"].is_null(), "{lone}");
+    for item in items.iter().filter(|i| i["turn_number"] == 0) {
+        assert_eq!(item["game_index"].as_i64().unwrap() % 2, 0, "{item}");
+        assert_eq!(item["partner"]["game_index"], item["game_index"].as_i64().unwrap() + 1);
+    }
+
+    // Out of the way, so the next claim is the games job's.
+    sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
+        .bind(job)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let games = capturing_games_job(&db).await;
+    let mut result = games_result(2, 1);
+    result["positions"] = json!([divergence(0, 0, "a 0/0", "8D BED"), divergence(1, 0, "a 0/0", "8D BED")]);
+    let (games_assignment, games_uuid) = first_claim(&app).await;
+    assert_eq!(games_assignment["job_id"], games.to_string());
+    assert_eq!(games_assignment["task_request"]["capture_first_divergence"], json!(false));
+    submit(&app, &games_assignment, &games_uuid, result).await;
+    let (_, random) =
+        send(&app, get_request(&format!("/api/jobs/{games}/positions/random"), &headers)).await;
+    assert!(random.get("partner").is_none(), "{random}");
+}

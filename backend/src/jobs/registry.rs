@@ -522,7 +522,14 @@ pub async fn decode_result(
                 record.all_games.games,
                 super::plausibility::games_dispatched(config.pairs_per_batch, true),
             )?;
-            refuse_uncaptured_positions(config.capture_positions, &record.positions, record.all_games.games)?;
+            if config.capture_first_divergence {
+                game_pair::check_first_divergences(
+                    &record.positions,
+                    record.divergent_games.as_ref(),
+                )?;
+            } else {
+                refuse_uncaptured_positions(config.capture_positions, &record.positions, record.all_games.games)?;
+            }
             Ok(DecodedResult::GamePairs(record))
         }
         JobKind::LeaveGeneration { config, .. } => {

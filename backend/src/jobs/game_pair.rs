@@ -123,6 +123,83 @@ impl JobHandler for GamePairHandler {
     }
 }
 
+/// A pairs result that keeps only first divergences
+/// (`capture_first_divergence`): from each pair whose games diverged, exactly
+/// two positions, one per game, at one turn, on one board, with one rack to
+/// play from -- before that turn the two games are the same game, so the two
+/// players face the same position with the same tiles -- and from a pair
+/// played identically, none. So the pairs with positions are the divergent
+/// ones, and there are as many as `divergent_games` says.
+///
+/// Every pair is checked rather than sampled: a pair with one position, two at
+/// different turns, or two different positions is a worker keeping something
+/// other than what the job asked for, and is exactly what the job's page would
+/// show side by side as if it were a disagreement.
+pub(super) fn check_first_divergences(
+    positions: &[PositionAnalysis],
+    divergent_games: Option<&GameAggregate>,
+) -> AppResult<()> {
+    let divergent_games = divergent_games.ok_or_else(|| {
+        AppError::bad_request(
+            "a result that keeps first divergences must report divergent_games, which says how \
+             many pairs diverged",
+        )
+    })?;
+    // Each pair's first position seen, by pair. `validate_positions` has
+    // already refused two positions for one turn of one game.
+    let mut first: std::collections::HashMap<i16, &PositionAnalysis> =
+        std::collections::HashMap::new();
+    let mut complete = 0i64;
+    for position in positions {
+        let (Some(game), Some(turn)) = (position.game_index, position.turn_number) else {
+            return Err(AppError::bad_request("a captured position names no game and turn"));
+        };
+        let pair = game / 2;
+        let Some(other) = first.get(&pair) else {
+            first.insert(pair, position);
+            continue;
+        };
+        if other.game_index == Some(game) {
+            return Err(AppError::bad_request(format!(
+                "game {game} has two first-divergence positions; a pair keeps one turn"
+            )));
+        }
+        if other.turn_number != Some(turn) {
+            return Err(AppError::bad_request(format!(
+                "pair {pair}'s first-divergence positions are at turns {} and {turn}, not one turn",
+                other.turn_number.unwrap_or_default()
+            )));
+        }
+        if board_of(&other.position) != board_of(&position.position) || other.rack != position.rack
+        {
+            return Err(AppError::bad_request(format!(
+                "pair {pair}'s first-divergence positions are different positions: before they \
+                 diverge the two games are one game, with the same board and tiles"
+            )));
+        }
+        complete += 1;
+    }
+    if first.len() as i64 != complete {
+        return Err(AppError::bad_request(
+            "a pair kept one first-divergence position; it keeps both games' or neither",
+        ));
+    }
+    if complete * 2 != i64::from(divergent_games.games) {
+        return Err(AppError::bad_request(format!(
+            "{complete} pairs kept a first divergence, and divergent_games says {} diverged",
+            divergent_games.games / 2
+        )));
+    }
+    Ok(())
+}
+
+/// The board of a CGP: its first field. The rest -- the racks, the scores --
+/// sits in each game's own seat order, and the two games of a pair seat their
+/// first mover differently.
+fn board_of(position: &Option<String>) -> Option<&str> {
+    position.as_deref().map(|cgp| cgp.split(' ').next().unwrap_or(cgp))
+}
+
 /// Same seed scheme as `games`, with `pairs_per_batch` as the stride,
 /// and the players from the job's template the same way.
 pub async fn next_request(
@@ -157,6 +234,7 @@ pub async fn next_request(
             num_games: config.pairs_per_batch,
             game_pairs: true,
             capture_positions: config.capture_positions,
+            capture_first_divergence: config.capture_first_divergence,
             bingo_bonus: job_data.bingo_bonus,
             sim_cutoff: job_data.sim_cutoff,
             player1: player1.clone(),
@@ -168,6 +246,66 @@ pub async fn next_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kept(game: i16, turn: i16, board: &str, rack: &str, scores: &str) -> PositionAnalysis {
+        PositionAnalysis {
+            rack: rack.to_string(),
+            position: Some(format!("{board} {scores} 0 lex NWL23;")),
+            game_index: Some(game),
+            turn_number: Some(turn),
+            previous_move: None,
+            previous_move_score: None,
+            num_moves: 1,
+            analysis: Analysis::Static,
+            moves: Vec::new(),
+        }
+    }
+
+    fn divergent(pairs: i32) -> GameAggregate {
+        GameAggregate {
+            games: pairs * 2, wins: pairs, losses: pairs, ties: 0,
+            p1_score_mean: 400.0, p1_score_sd: 50.0, p2_score_mean: 400.0, p2_score_sd: 50.0,
+        }
+    }
+
+    /// U-PAIRS-DIV-1: from each divergent pair both games' positions at one
+    /// turn, the same board and tiles (the racks and scores after the board are
+    /// in each game's seat order, and differ), and nothing from the others.
+    #[test]
+    fn first_divergences_are_both_games_at_one_turn_of_one_position() {
+        let board = "15/15/15/15/15/15/15/7CAT5/15/15/15/15/15/15/15";
+        let positions = [
+            kept(0, 3, board, "AEINRST", "AEINRST/DOG 10 20"),
+            kept(1, 3, board, "AEINRST", "DOG/AEINRST 20 10"),
+            // Pair 1 played identically: nothing. Pair 2 diverged at turn 0.
+            kept(5, 0, "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15", "EEIOUUV", "x"),
+            kept(4, 0, "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15", "EEIOUUV", "y"),
+        ];
+        check_first_divergences(&positions, Some(&divergent(2))).unwrap();
+        // Nothing diverged, nothing kept.
+        check_first_divergences(&[], Some(&divergent(0))).unwrap();
+
+        let refused = |positions: &[PositionAnalysis], pairs: Option<i32>| {
+            check_first_divergences(positions, divergent_games(pairs).as_ref())
+                .unwrap_err()
+                .message
+        };
+        fn divergent_games(pairs: Option<i32>) -> Option<GameAggregate> {
+            pairs.map(divergent)
+        }
+        let other_board = "15/15/15/15/15/15/15/7COT5/15/15/15/15/15/15/15";
+        assert!(refused(&positions[..1], Some(1)).contains("keeps both games' or neither"));
+        assert!(refused(&positions, Some(3)).contains("divergent_games says 3 diverged"));
+        assert!(refused(&positions, None).contains("must report divergent_games"));
+        let other_turn = [positions[0].clone(), kept(1, 4, board, "AEINRST", "s")];
+        assert!(refused(&other_turn, Some(1)).contains("turns 3 and 4"));
+        let other_position = [positions[0].clone(), kept(1, 3, other_board, "AEINRST", "s")];
+        assert!(refused(&other_position, Some(1)).contains("different positions"));
+        let other_rack = [positions[0].clone(), kept(1, 3, board, "AEINRSU", "s")];
+        assert!(refused(&other_rack, Some(1)).contains("different positions"));
+        let one_game_twice = [positions[0].clone(), kept(0, 4, board, "AEINRST", "s")];
+        assert!(refused(&one_game_twice, Some(1)).contains("game 0 has two"));
+    }
 
     /// A pentanomial that agrees with its tally only by overflowing. Summed as
     /// u64, `i64::MAX + 2` pairs doubled wrap round to exactly the 2 games

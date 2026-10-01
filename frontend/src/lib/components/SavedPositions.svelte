@@ -4,15 +4,24 @@
    * a time on the job's board: a random one, or those where the player to
    * move held one rack, newest first. Signed-in users only -- the routes
    * refuse anyone else.
+   *
+   * A pairs job's position comes with its partner, the same turn of the
+   * pair's other game, and the two are shown side by side: up to the turn a
+   * pair's games diverge they are one game with the seats swapped, so the two
+   * are each player's answer to one position. A job keeping only first
+   * divergences keeps exactly those.
    */
   import { onMount } from 'svelte';
   import { api, errorText, type BoardData, type SavedPosition } from '$lib/api';
-  import { parseCgp, seatToMove } from '$lib/cgp';
-  import Board from './Board.svelte';
+  import PositionPane from './PositionPane.svelte';
 
   export let jobId: string;
   /** The players' config names, player 1 first, when the page has them. */
   export let players: string[] = [];
+  /** A game-pairs job's: each position is shown beside its partner. */
+  export let paired = false;
+  /** A pairs job that keeps only each pair's first divergence. */
+  export let firstDivergence = false;
 
   let board: BoardData | null = null;
   let position: SavedPosition | null = null;
@@ -68,25 +77,31 @@
     random();
   });
 
-  $: parsed = position?.position ? parseCgp(position.position) : null;
-  $: toMove = parsed && position ? seatToMove(parsed, position.rack) : null;
-  $: showWinPct = position?.moves.some((m) => m.win_percentage !== null) ?? false;
-  $: solved = position?.analysis === 'peg' || position?.analysis === 'endgame';
-
-  const ANALYSIS: Record<SavedPosition['analysis'], string> = {
-    static: 'static equity',
-    sim: 'simulation',
-    peg: 'pre-endgame solve',
-    endgame: 'endgame solve'
-  };
+  // A pair's positions, its first game's first: the one found and its
+  // partner, or the one alone when the other game has none at that turn.
+  $: pair =
+    paired && position
+      ? [position, position.partner ?? null]
+          .filter((p): p is SavedPosition => p !== null)
+          .sort((a, b) => a.game_index - b.game_index)
+      : [];
 </script>
 
 <div class="card space-y-4">
   <div class="space-y-1">
     <h2 class="text-lg font-medium">Saved positions</h2>
     <p class="text-sm text-muted-foreground">
-      This job keeps the position analysed on every turn of every game: the board, both racks, and
-      the moves the player to move ranked.
+      {#if paired && firstDivergence}
+        This job keeps, from each game pair, the turn where its two games first diverged: the one
+        position both players faced, once from each seat, and the moves each ranked. A pair played
+        identically keeps nothing.
+      {:else if paired}
+        This job keeps the position analysed on every turn of every game: the board, both racks, and
+        the moves the player to move ranked. A pair's two games are shown side by side at one turn.
+      {:else}
+        This job keeps the position analysed on every turn of every game: the board, both racks, and
+        the moves the player to move ranked.
+      {/if}
     </p>
   </div>
 
@@ -138,65 +153,35 @@
     </div>
   {/if}
 
-  {#if position}
-    <div class="space-y-3" data-testid="saved-position">
+  {#if position && paired}
+    <div class="space-y-3" data-testid="saved-pair">
       <p class="text-sm">
-        Game {position.game_index + 1}, turn {position.turn_number + 1} · rack
-        <span class="font-mono" data-testid="position-rack">{position.rack}</span>
-        {#if position.previous_move}
-          · after <span class="font-mono">{position.previous_move}</span>
-          ({position.previous_move_score})
-        {/if}
-        <span class="text-muted-foreground"
-          >· {position.num_moves.toLocaleString()} moves ranked by
-          <span data-testid="position-analysis">{ANALYSIS[position.analysis]}</span></span
-        >
+        Turn {position.turn_number + 1} of a game pair{#if firstDivergence}, where the players first
+          chose differently{/if}
       </p>
-      <div class="grid gap-4 lg:grid-cols-2">
-        <div class="min-w-0 space-y-2">
-          {#if board && parsed}
-            <Board {board} position={parsed} previousMove={position.previous_move} {toMove} {players} />
-          {/if}
-          {#if position.position}
-            <p class="break-all font-mono text-xs text-muted-foreground" title="CGP">{position.position}</p>
-          {/if}
-        </div>
-        <div class="min-w-0 overflow-x-auto">
-          <table class="table text-xs">
-            <thead>
-              <tr>
-                <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
-                {#if showWinPct}<th class="text-right">Win %</th>{/if}
-                {#if solved}
-                  <th class="text-right" title="The mover's projected final spread">Spread</th>
-                  <th class="text-right" title="The endgame depth the move was ranked at">Plies</th>
-                {/if}
-              </tr>
-            </thead>
-            <tbody>
-              {#each position.moves as move}
-                <tr>
-                  <td class="tabular-nums">{move.rank}</td>
-                  <td class="font-mono">{move.move}</td>
-                  <td class="text-right tabular-nums">{move.score}</td>
-                  <td class="text-right tabular-nums">{move.equity.toFixed(2)}</td>
-                  {#if showWinPct}
-                    <td class="text-right tabular-nums">
-                      {move.win_percentage === null ? '—' : move.win_percentage.toFixed(1)}
-                    </td>
-                  {/if}
-                  {#if solved}
-                    <td class="text-right tabular-nums">
-                      {move.mean_spread === null ? '—' : move.mean_spread.toFixed(1)}
-                    </td>
-                    <td class="text-right tabular-nums">{move.fidelity_plies ?? '—'}</td>
-                  {/if}
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
+      <div class="grid gap-6 lg:grid-cols-2">
+        {#each pair as game (game.game_index)}
+          <PositionPane
+            position={game}
+            {board}
+            {players}
+            stacked
+            heading={`Game ${(game.game_index % 2) + 1} of the pair`}
+          />
+        {/each}
       </div>
+      {#if pair.length === 1}
+        <p class="text-sm text-muted-foreground">
+          The pair's other game has no position at this turn: it had ended, or its result is not in.
+        </p>
+      {/if}
     </div>
+  {:else if position}
+    <PositionPane
+      {position}
+      {board}
+      {players}
+      place={`Game ${position.game_index + 1}, turn ${position.turn_number + 1}`}
+    />
   {/if}
 </div>

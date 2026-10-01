@@ -249,22 +249,28 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
   position analysed on every turn of its games. Sign in to search them."
   **Do** follow **Sign in**, as `dev-contributor-1`. **Expect** to land back on
   this job.
-- [ ] Signed in, **expect** one position: "Game G, turn T · rack … · after
-  MOVE (score) · N moves ranked by simulation" (or "by static equity", "by
-  pre-endgame solve", "by endgame solve" -- a solved one with **Spread** and
-  **Plies** columns), the board with its premium squares (TW, DW,
-  TL, DL and a star on the centre), its tiles each with a letter and a score
-  (a blank a red lower-case letter with none), the tiles MOVE placed
-  outlined, both racks and scores with **to move** on the player whose rack
-  it is, the CGP under the board, and the ranked moves beside it (below it on
-  a narrow window), with a **Win %** column on the simmer's turns.
+- [ ] Signed in, **expect** one turn of a game pair: "Turn T of a game pair",
+  then the pair's two games side by side (one above the other on a narrow
+  window), "Game 1 of the pair · PLAYER to move" and "Game 2 of the pair ·
+  PLAYER to move", each with "rack … · after MOVE (score) · N moves ranked by
+  simulation" (or "by static equity", "by pre-endgame solve", "by endgame
+  solve" -- a solved one with **Spread** and **Plies** columns), its board with
+  premium squares (TW, DW, TL, DL and a star on the centre), its tiles each
+  with a letter and a score (a blank a red lower-case letter with none), the
+  tiles MOVE placed outlined, both racks and scores with **to move** on the
+  player whose rack it is, the CGP under the board, and the ranked moves below
+  it, with a **Win %** column on the simmer's turns. Until the two games
+  diverge the boards and racks are the same, with each player to move in one;
+  after, they differ. A turn one game never reached shows alone, saying the
+  other game has no position at that turn.
 - [ ] **Do** **Random position** a few times. **Expect** another position
   each time (now and then the same one again), the board, racks and scores agreeing with the CGP; on a turn 1
   position an empty board and nothing outlined, and after an exchange
   (`(exch …)`) or a pass nothing outlined either.
 - [ ] **Do** search the rack on the board, typed in lower case and another
-  order. **Expect** "Position 1 with the rack …, newest first" and a position
-  with that rack; where there are more, **Next** and **Previous** step through
+  order. **Expect** "Position 1 with the rack …, newest first" and a pair
+  whose first game (or, if only the second holds it, whose second) has that
+  rack -- a pair whose two games both hold it once, not twice; where there are more, **Next** and **Previous** step through
   them.
 - [ ] **Do** search `QQQQQQQ`. **Expect** "No saved position has the rack
   QQQQQQQ."
@@ -562,7 +568,16 @@ start on "Choose…": pick `english` and `standard15` each time.
 - [ ] **Games** "tester positions": the same two players, 2 per batch, 20 games
   to play,
   **Save the positions played** ticked. **Expect** the batch's maximum to drop
-  to 1,000, and, once it runs, a saved-positions section on its page (V-10).
+  to 1,000, and, once it runs, a saved-positions section on its page (V-10),
+  and no **Only where each pair first diverges** option: a games job has no
+  pairs.
+- [ ] **Game pairs** "tester divergences": `static-equity` vs `static-score`, 5
+  pairs per batch, 50 pairs to play, **Save the positions played** and then
+  **Only where each pair first diverges** ticked (it appears only once saving is).
+  **Expect** its settings to say "Records positions: first divergences", and
+  on its page each saved position to be a pair's two games at one turn, the
+  same board and rack, each player to move in one, their ranked moves
+  differing at the top; **Random position** never shows a lone game.
 - [ ] **Games**: **expect** the batch field to step by 2, and the browser to
   refuse an odd number.
 - [ ] **Opening rack analysis** with `static-equity` (recorder best, 10 plays

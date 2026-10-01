@@ -32,7 +32,8 @@ const config: JobConfig = {
   },
   games: {
     unit: 'pair', per_batch: 1, sprt_enabled: true, min_units: 100, max_units: 5000,
-    sprt_alpha: 0.05, sprt_beta: 0.05, elo_low: -10, elo_high: 10, capture_positions: false
+    sprt_alpha: 0.05, sprt_beta: 0.05, elo_low: -10, elo_high: 10, capture_positions: false,
+    capture_first_divergence: false
   },
   players: [staticPlayer, simPlayer]
 };
@@ -85,6 +86,16 @@ describe('F-SET-1 job settings', () => {
     expect(rows[0].value).toBe('Game pairs');
     expect(rows).toContainEqual({ label: 'SPRT', value: 'Elo -10 → 10', key: true });
     expect(rows).toContainEqual({ label: 'Bingo bonus', value: '50', key: true });
+  });
+
+  it('says when a pairs job keeps only first divergences', () => {
+    const value = (games: Partial<NonNullable<JobConfig['games']>>) =>
+      jobSettings({ ...config, games: { ...config.games!, ...games } }).find(
+        (r) => r.label === 'Records positions'
+      )!.value;
+    expect(value({})).toBe('no');
+    expect(value({ capture_positions: true })).toBe('yes');
+    expect(value({ capture_positions: true, capture_first_divergence: true })).toBe('first divergences');
   });
 
   it('shows a job without a test its target, and none of the test it does not run', () => {

@@ -13,7 +13,7 @@ answers three questions:
 `config.c:` refer to `src/impl/config.c` at that commit:
 
 - `arg_token_t` is defined at `config.c:100–279`.
-- Each token is registered with its CLI name at `config.c:12385–12567`.
+- Each token is registered with its CLI name at `config.c:12405–12587`.
 
 **Count.** `arg_token_t` has exactly **175 tokens**, not counting
 `NUMBER_OF_ARG_TOKENS`. 45 are registered as commands (`cmd(...)`) and 130 as
@@ -29,13 +29,13 @@ birdtest never sends MAGPIE a command line. A worker runs `magpie contribute`,
 claims a task, and gets a JSON request built from the job's row and its player
 configs' rows. For each task, `contribute` does three things:
 
-1. It resets every per-player setting (`config.c:8412`) and every run-wide
-   setting (`config.c:8944`) to a fixed value. That way nothing carries over
+1. It resets every per-player setting (`config.c:8416`) and every run-wide
+   setting (`config.c:8948`) to a fixed value. That way nothing carries over
    from a contributor's `settings.txt` or from an earlier task.
 2. It applies the values the request states.
 3. It refuses any request that leaves out a required value
-   (`config.c:8466`, `config.c:8502`, `config.c:8960`), or that states a
-   pre-endgame setting a player does not use (`config.c:8488`).
+   (`config.c:8470`, `config.c:8506`, `config.c:8964`), or that states a
+   pre-endgame setting a player does not use (`config.c:8492`).
 
 So an argument counts as **covered** only when a column feeds it into every
 request. An argument that `contribute` pins to a fixed value is not covered,
@@ -68,9 +68,9 @@ The 83 "Not stored" rows break down as follows:
 |---:|---|---|---|---|---|
 | 1 | `HELP` | `help` | command | Not stored | Interactive CLI command; no task runs it. |
 | 2 | `SET` | `setoptions` | command | Not stored | Interactive CLI command. A task's settings are applied straight from its request JSON, not through `setoptions`. |
-| 3 | `CGP` | `cgp` | command | Not stored | Loads a position. Opening-rack tasks always start on an empty board: `opening_rack_requests.previous_play` ([L999](backend/migrations/0001_initial.sql#L999)) is always NULL, and MAGPIE refuses a task where it isn't. |
+| 3 | `CGP` | `cgp` | command | Not stored | Loads a position. Opening-rack tasks always start on an empty board: `opening_rack_requests.previous_play` ([L1007](backend/migrations/0001_initial.sql#L1007)) is always NULL, and MAGPIE refuses a task where it isn't. |
 | 4 | `MOVES` | `addmoves` | command | Not stored | Interactive CLI command; no task runs it. |
-| 5 | `RACK` | `rack` | command | Run by a job type | Opening-rack job: each task's racks are unranked from `opening_rack_requests.rack_start` ([L997](backend/migrations/0001_initial.sql#L997)) + `rack_count` ([L998](backend/migrations/0001_initial.sql#L998)), over the space set by `job_opening_rack_config.rack_size` ([L694](backend/migrations/0001_initial.sql#L694)). |
+| 5 | `RACK` | `rack` | command | Run by a job type | Opening-rack job: each task's racks are unranked from `opening_rack_requests.rack_start` ([L1005](backend/migrations/0001_initial.sql#L1005)) + `rack_count` ([L1006](backend/migrations/0001_initial.sql#L1006)), over the space set by `job_opening_rack_config.rack_size` ([L694](backend/migrations/0001_initial.sql#L694)). |
 | 6 | `RANDOM_RACK` | `rrack` | command | Not stored | Interactive CLI command; no task runs it. |
 | 7 | `GEN` | `generate` | command | Run by a job type | Opening-rack job (`job_type` ([L380](backend/migrations/0001_initial.sql#L380)) `opening_rack`) generates moves for every rack. |
 | 8 | `SIM` | `simulate` | command | Run by a job type | Opening-rack job with a simming player (`num_plies > 0`, [L578](backend/migrations/0001_initial.sql#L578)). |
@@ -81,17 +81,17 @@ The 83 "Not stored" rows break down as follows:
 | 13 | `INFER` | `infer` | command | Not stored | Standalone inference. Inference inside a sim is covered by `use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) and `inference_margin` ([L601](backend/migrations/0001_initial.sql#L601)). |
 | 14 | `ENDGAME` | `endgame` | command | Not stored | Interactive command. A games or game-pairs player solves its endgames in autoplay instead, as `endgame_plies` asks (see `eplies1`/`eplies2`). |
 | 15 | `PEG` | `peg` | command | Not stored | Interactive command. A games or game-pairs player solves its pre-endgames in autoplay instead, as `peg_max_bag` asks (see `pegbag1`/`pegbag2`). |
-| 16 | `AUTOPLAY` | `autoplay` | command | Run by a job type | Games and game-pairs jobs (`job_type` ([L381](backend/migrations/0001_initial.sql#L381))). Its `<num_games>` is `job_game_config.games_per_batch` ([L706](backend/migrations/0001_initial.sql#L706)) / `job_game_pair_config.pairs_per_batch` ([L733](backend/migrations/0001_initial.sql#L733)) (sent as `game_requests.num_games` ([L1014](backend/migrations/0001_initial.sql#L1014))); its recorder list is `games` plus `positions` when `capture_positions` ([L724](backend/migrations/0001_initial.sql#L724)) is on. |
+| 16 | `AUTOPLAY` | `autoplay` | command | Run by a job type | Games and game-pairs jobs (`job_type` ([L381](backend/migrations/0001_initial.sql#L381))). Its `<num_games>` is `job_game_config.games_per_batch` ([L706](backend/migrations/0001_initial.sql#L706)) / `job_game_pair_config.pairs_per_batch` ([L733](backend/migrations/0001_initial.sql#L733)) (sent as `game_requests.num_games` ([L1025](backend/migrations/0001_initial.sql#L1025))); its recorder list is `games` plus `positions` when `capture_positions` ([L724](backend/migrations/0001_initial.sql#L724)) is on, or `divergentpositions` on a pairs job with `capture_first_divergence` ([L752](backend/migrations/0001_initial.sql#L752)) too. |
 | 17 | `CONVERT` | `convert` | command | Recorded | Not a setting. The server and workers run it to build wordmaps, rack info tables and word info tables, tracked in `derived_data` ([L307](backend/migrations/0001_initial.sql#L307)). |
 | 18 | `CONTRIBUTE` | `contribute` | command | Not stored | The worker's entry point, not a setting. |
 | 19 | `P1_NAME` | `p1` | command | Not stored | Cosmetic. birdtest's own label is `player_configs.name` ([L546](backend/migrations/0001_initial.sql#L546)), which MAGPIE never reads. |
 | 20 | `P2_NAME` | `p2` | command | Not stored | Cosmetic. birdtest's own label is `player_configs.name` ([L546](backend/migrations/0001_initial.sql#L546)), which MAGPIE never reads. |
-| 21 | `LEAVE_GEN` | `leavegen` | command | Run by a job type | Leave-generation job (`job_type` ([L383](backend/migrations/0001_initial.sql#L383))). Per-generation targets are `job_leave_config.target_rack_counts` ([L769](backend/migrations/0001_initial.sql#L769)). `contribute` passes one generation at a time with a target no rack can reach, and ends the task after `num_iterations` ([L761](backend/migrations/0001_initial.sql#L761)) games. `games_before_force_draw` has no column: the server's forced racks (`leave_requests.forced_racks` ([L1031](backend/migrations/0001_initial.sql#L1031))) replace it. |
+| 21 | `LEAVE_GEN` | `leavegen` | command | Run by a job type | Leave-generation job (`job_type` ([L383](backend/migrations/0001_initial.sql#L383))). Per-generation targets are `job_leave_config.target_rack_counts` ([L777](backend/migrations/0001_initial.sql#L777)). `contribute` passes one generation at a time with a target no rack can reach, and ends the task after `num_iterations` ([L769](backend/migrations/0001_initial.sql#L769)) games. `games_before_force_draw` has no column: the server's forced racks (`leave_requests.forced_racks` ([L1042](backend/migrations/0001_initial.sql#L1042))) replace it. |
 | 22 | `CREATE_DATA` | `createdata` | command | Not stored | Interactive CLI command; no task runs it. |
 | 23 | `DATA_PATH` | `path` | option | Not stored | Worker-local; doesn't change what a task computes. Each file is pinned by content instead (`input_data`). |
 | 24 | `BINGO_BONUS` | `bb` | option | Stored | `jobs.bingo_bonus` ([L425](backend/migrations/0001_initial.sql#L425)) |
 | 25 | `CHALLENGE_BONUS` | `cb` | option | Not stored | Only the `challenge` command reads it. Autoplay never plays a phony, so no task gets challenged. |
-| 26 | `BOARD_LAYOUT` | `bdn` | option | Stored | `jobs.layout_id` ([L418](backend/migrations/0001_initial.sql#L418)), sent as `board_layout` ([L951](backend/migrations/0001_initial.sql#L951), [L965](backend/migrations/0001_initial.sql#L965), [L981](backend/migrations/0001_initial.sql#L981)) |
+| 26 | `BOARD_LAYOUT` | `bdn` | option | Stored | `jobs.layout_id` ([L418](backend/migrations/0001_initial.sql#L418)), sent as `board_layout` ([L959](backend/migrations/0001_initial.sql#L959), [L973](backend/migrations/0001_initial.sql#L973), [L989](backend/migrations/0001_initial.sql#L989)) |
 | 27 | `GAME_VARIANT` | `var` | option | Stored | `jobs.variant` ([L416](backend/migrations/0001_initial.sql#L416)) |
 | 28 | `LETTER_DISTRIBUTION` | `ld` | option | Stored | `jobs.letterdist_id` ([L417](backend/migrations/0001_initial.sql#L417)), sent as `letter_distribution` |
 | 29 | `LEXICON` | `lex` | option | Stored (per-player form) | Global form of `l1`/`l2`: `player_configs.kwg_id` ([L559](backend/migrations/0001_initial.sql#L559)) on each player config. |
@@ -138,14 +138,14 @@ The 83 "Not stored" rows break down as follows:
 | 70 | `INFERENCE_MARGIN` | `imargin` | option | Stored (per-player form) | Global form of `im1`/`im2`: `player_configs.inference_margin` ([L601](backend/migrations/0001_initial.sql#L601)) on each player config. |
 | 71 | `MOVEGEN_MARGIN` | `mmargin` | option | Stored | `player_configs.movegen_margin` ([L612](backend/migrations/0001_initial.sql#L612)) on each player config. Run-wide in MAGPIE; job creation requires both players to agree on it. |
 | 72 | `MIN_PLAY_ITERATIONS` | `minplayiterations` | option | Stored (per-player form) | Global form of `mi1`/`mi2`: `player_configs.min_play_iterations` ([L598](backend/migrations/0001_initial.sql#L598)) on each player config. |
-| 73 | `USE_GAME_PAIRS` | `gp` | option | Stored | `job_type` ([L382](backend/migrations/0001_initial.sql#L382)) `game_pairs` (MAGPIE `config.c:9196`) |
-| 74 | `USE_SMALL_PLAYS` | `sp` | option | Not stored | Endgame move-list format. `contribute` resets it to false (MAGPIE `config.c:8949`). |
+| 73 | `USE_GAME_PAIRS` | `gp` | option | Stored | `job_type` ([L382](backend/migrations/0001_initial.sql#L382)) `game_pairs` (MAGPIE `config.c:9200`) |
+| 74 | `USE_SMALL_PLAYS` | `sp` | option | Not stored | Endgame move-list format. `contribute` resets it to false (MAGPIE `config.c:8953`). |
 | 75 | `SIM_WITH_INFERENCE` | `sinfer` | option | Stored (per-player form) | Global form of `si1`/`si2`: `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config. **Opening-rack jobs force it off: see [Fix 2](#fix-2-opening-rack-jobs-ignore-inference).** |
 | 76 | `USE_HEAT_MAP` | `useheatmap` | option | Not stored | Records heat-map data only. `contribute` resets it to false. |
 | 77 | `WRITE_BUFFER_SIZE` | `wb` | option | Not stored | I/O buffer for autoplay's file recorders. `contribute` returns JSON, so this changes no result. |
 | 78 | `HUMAN_READABLE` | `hr` | option | Not stored | Terminal display only; changes no result. `contribute` sets it to false. |
 | 79 | `SHOW_MISTAKES` | `mistakes` | option | Not stored | Only `analyze` reads it; display only. |
-| 80 | `RANDOM_SEED` | `seed` | option | Recorded | Per task, not a setting: `tasks.seed` ([L854](backend/migrations/0001_initial.sql#L854)), copied to `game_requests.seed` ([L1013](backend/migrations/0001_initial.sql#L1013)) and `leave_requests.seed` ([L1030](backend/migrations/0001_initial.sql#L1030)). An opening-rack task analyses rack *i* with seed + *i*. |
+| 80 | `RANDOM_SEED` | `seed` | option | Recorded | Per task, not a setting: `tasks.seed` ([L862](backend/migrations/0001_initial.sql#L862)), copied to `game_requests.seed` ([L1024](backend/migrations/0001_initial.sql#L1024)) and `leave_requests.seed` ([L1041](backend/migrations/0001_initial.sql#L1041)). An opening-rack task analyses rack *i* with seed + *i*. |
 | 81 | `NUMBER_OF_THREADS` | `threads` | option | Not stored | Worker-local (the contributor's settings file). Results don't depend on it: `contribute` gives each game its own thread (per-game parallelism). |
 | 82 | `PRINT_INTERVAL` | `pfrequency` | option | Not stored | Terminal display only; changes no result. `contribute` resets it to 0. |
 | 83 | `EXEC_MODE` | `mode` | option | Not stored | CLI sync/async mode. |
@@ -206,8 +206,8 @@ The 83 "Not stored" rows break down as follows:
 | 138 | `P2_SIM_WITH_INFERENCE` | `si2` | option | Stored | `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config |
 | 139 | `P1_TIME_LIMIT` | `tl1` | option | Stored | `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config (must be 0 for a simmer; see [Notes](#lower-priority-notes)) |
 | 140 | `P2_TIME_LIMIT` | `tl2` | option | Stored | `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config (must be 0 for a simmer; see [Notes](#lower-priority-notes)) |
-| 141 | `P1_PLAY_CHOOSER_TIME` | `pc1` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8440`): timed games are not reproducible from the seed, so redundancy and game pairs would mean nothing. Deliberately omitted. |
-| 142 | `P2_PLAY_CHOOSER_TIME` | `pc2` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8440`): timed games are not reproducible from the seed, so redundancy and game pairs would mean nothing. Deliberately omitted. |
+| 141 | `P1_PLAY_CHOOSER_TIME` | `pc1` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so redundancy and game pairs would mean nothing. Deliberately omitted. |
+| 142 | `P2_PLAY_CHOOSER_TIME` | `pc2` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so redundancy and game pairs would mean nothing. Deliberately omitted. |
 | 143 | `OVERTIME_PENALTY_POINTS` | `otpenalty` | option | Not stored | Only read by a PlayChooser clock, which `contribute` always turns off (see `pc1`/`pc2`). |
 | 144 | `OVERTIME_PERIOD` | `otperiod` | option | Not stored | Only read by a PlayChooser clock, which `contribute` always turns off (see `pc1`/`pc2`). |
 | 145 | `P1_THRESHOLD` | `th1` | option | Stored | `player_configs.threshold` ([L599](backend/migrations/0001_initial.sql#L599)) on each player config |
@@ -237,9 +237,9 @@ The 83 "Not stored" rows break down as follows:
 | 169 | `PEG_NESTED_CAND_CAPS` | `pegncaps` | option | Stored | `player_configs.peg_nested_cand_caps` ([L632](backend/migrations/0001_initial.sql#L632)) on each player config. One option for both players on the CLI; birdtest states it per player. |
 | 170 | `PEG_NESTED_DEPTH` | `pegndepth` | option | Stored | `player_configs.peg_nested_max_depth` ([L633](backend/migrations/0001_initial.sql#L633)) on each player config. One option for both players on the CLI; birdtest states it per player. |
 | 171 | `PEG_NESTED_STRIDES` | `pegnstrides` | option | Stored | `player_configs.peg_nested_strides` ([L634](backend/migrations/0001_initial.sql#L634)) on each player config. One option for both players on the CLI; birdtest states it per player. |
-| 172 | `MULTI_THREADING_MODE` | `mtmode` | option | Not stored | Changes results: `igp` gives a simmer every thread and so changes what it samples. `contribute` resets it to `pgp` before every task (MAGPIE `config.c:8948`). Deliberately omitted. |
+| 172 | `MULTI_THREADING_MODE` | `mtmode` | option | Not stored | Changes results: `igp` gives a simmer every thread and so changes what it samples. `contribute` resets it to `pgp` before every task (MAGPIE `config.c:8952`). Deliberately omitted. |
 | 173 | `ANALYZE` | `analyze` | command | Not stored | Interactive CLI command; no task runs it. |
-| 174 | `VERSION` | `version` | command | Recorded | Not a setting. Each claim records the worker's version in `task_claims.magpie_version` ([L924](backend/migrations/0001_initial.sql#L924)); each job sets a floor in `jobs.min_magpie_*` ([L441](backend/migrations/0001_initial.sql#L441)). |
+| 174 | `VERSION` | `version` | command | Recorded | Not a setting. Each claim records the worker's version in `task_claims.magpie_version` ([L932](backend/migrations/0001_initial.sql#L932)); each job sets a floor in `jobs.min_magpie_*` ([L441](backend/migrations/0001_initial.sql#L441)). |
 | 175 | `BUILDERS` | `builders` | command | Recorded | Not a setting. The server asks its own MAGPIE and records the answer in `derived_data.builder` ([L314](backend/migrations/0001_initial.sql#L314)). |
 
 ## Settings birdtest accounts for incorrectly
@@ -265,9 +265,9 @@ Step 5's query is kept for reference; nothing is in production to run it on.
 [L585](backend/migrations/0001_initial.sql#L585)). In MAGPIE, however, each is
 a single run-wide value:
 
-- The games executor sets both from **player 1 only** (`config.c:9257–9266`).
-- Both seats then read those values: `config.c:4075` for the capture cap, and
-  `config.c:4165` and `config.c:4179` for plies.
+- The games executor sets both from **player 1 only** (`config.c:9261–9270`).
+- Both seats then read those values: `config.c:4079` for the capture cap, and
+  `config.c:4169` and `config.c:4183` for plies.
 
 The server handles them differently again
 ([jobs/mod.rs:733–741](backend/src/jobs/mod.rs#L733-L741)):
@@ -344,7 +344,7 @@ and a higher version floor.
 **Status: implemented** (`F-SET-1`).
 
 **The problem.** The opening-rack executor forces `sim_with_inference` off
-(`config.c:9028–9030`), because an opening rack has no previous play to infer
+(`config.c:9032–9034`), because an opening rack has no previous play to infer
 from. A simming config still stores `use_inference` and `inference_margin`;
 the CHECK at [L642](backend/migrations/0001_initial.sql#L642) requires them.
 The job page then shows "Inference: yes", and the search summary
@@ -365,7 +365,7 @@ states a cutoff is refused (`I-JOB-14f`). The column stays `NOT NULL`.
 
 **The problem.** [`jobs.sim_cutoff`](backend/migrations/0001_initial.sql#L426)
 is `NOT NULL` for every job. However, the leave-generation request has no
-`sim_cutoff`, and MAGPIE's leave path doesn't read one (`config.c:9645`,
+`sim_cutoff`, and MAGPIE's leave path doesn't read one (`config.c:9665`,
 `states_cutoff=false`). The job page still lists "Sim cutoff" under
 "All settings" for a leave job.
 
@@ -444,7 +444,7 @@ Rows 13–20 appear after clicking **All settings**.
 | 5 | Bingo bonus | all | `jobs.bingo_bonus` | `bb` |
 | 6 | Games to play / Pairs to play (with SPRT: Cap) | games, pairs | `max_games` / `max_pairs` | `autoplay` total |
 | 7 | SPRT ("none", or "Elo H0 → H1") | games, pairs | `sprt_enabled`, `elo_low`, `elo_high` | n/a |
-| 8 | Records positions | games, pairs | `capture_positions` | `autoplay` recorder `positions` |
+| 8 | Records positions ("yes", "no", or "first divergences") | games, pairs | `capture_positions`, `capture_first_divergence` | `autoplay` recorder `positions`, or `divergentpositions` |
 | 9 | Racks in all | opening racks | `total_racks` | `rack` (the space) |
 | 10 | Rack size | opening racks | `rack_size` | `rack` |
 | 11 | Generations | leave | `cardinality(target_rack_counts)` | `leavegen` |

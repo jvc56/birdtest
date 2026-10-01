@@ -40,6 +40,9 @@ Each case is selectable with `--cases` (default: every M case):
   `derived_mismatch`; with the right hash it builds a table with the server's
   bytes, from the lexicon alone (no wordmap), and plays with it. On the
   two-letter data, like M-10.
+- `M-14` A game-pairs job keeping first divergences stores, from each pair
+  that diverged, both games' positions at one turn of one position, each with
+  that player's own best move, and nothing from pairs played identically.
 
 And one case that is not a test: `capture` runs one job of each type through
 `scripts/capture_contract.py`'s recording proxy and writes the contract
@@ -860,6 +863,50 @@ def case_positions(ctx: Context) -> None:
         worker.remove()
 
 
+def case_first_divergences(ctx: Context) -> None:
+    """M-14: a game-pairs job keeping first divergences stores, from each pair
+    that diverged, both games' positions at one turn of one position, each
+    player's own answer first; from a pair played identically, nothing."""
+    deactivate_everything(ctx)
+    # Equity against score, which disagree within a few turns, in pairs: four
+    # tasks of five pairs.
+    job_id = create_and_activate(ctx, ctx.data, {
+        "job_type": "game_pairs", **static_players(ctx), "pairs_per_batch": 5,
+        "sprt_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
+        "capture_positions": True, "capture_first_divergence": True})
+    worker = Worker(ctx, "m14")
+    try:
+        worker.run(tasks=4)
+        divergent_pairs = int(ctx.psql(
+            "SELECT COALESCE(SUM(divergent_games), 0) / 2 FROM game_results "
+            f"WHERE job_id = '{job_id}'"))
+        rows = ctx.psql(
+            "SELECT r.task_id, r.game_index, r.turn_number, r.rack, "
+            "split_part(r.position, ' ', 1), m.move "
+            "FROM position_analysis_records r JOIN position_analysis_moves m "
+            "ON m.record_id = r.id AND m.rank = 1 "
+            f"WHERE r.job_id = '{job_id}' ORDER BY r.task_id, r.game_index")
+        pairs: Dict[tuple, list] = {}
+        for row in (rows.split("\n") if rows else []):
+            task, game, turn, rack, board, best = row.split("|")
+            pairs.setdefault((task, int(game) // 2), []).append((int(game), turn, rack, board, best))
+        expect(divergent_pairs > 0, "no pair diverged; equity and score should disagree")
+        expect(len(pairs) == divergent_pairs,
+               f"{len(pairs)} pairs kept positions, {divergent_pairs} diverged")
+        for (task, pair), kept in pairs.items():
+            expect(len(kept) == 2, f"pair {pair} of task {task} kept {len(kept)} positions: {kept}")
+            (g1, t1, r1, b1, m1), (g2, t2, r2, b2, m2) = kept
+            expect((g1, g2) == (2 * pair, 2 * pair + 1), f"pair {pair}'s games are {g1} and {g2}")
+            expect(t1 == t2 and r1 == r2 and b1 == b2,
+                   f"pair {pair} of task {task}: not one turn of one position: {kept}")
+            expect(m1 != m2, f"pair {pair} of task {task} diverged on one best move, {m1}")
+        log(f"M-14: {divergent_pairs} divergent pairs, each kept as one position "
+            "with each player's answer")
+    finally:
+        delete_job(ctx, job_id)
+        worker.remove()
+
+
 def case_solvers(ctx: Context) -> None:
     """M-12: a player that solves plays its pre-endgame and endgame turns with
     the solvers, and the positions it captures there say so."""
@@ -1137,9 +1184,12 @@ def case_capture(ctx: Context) -> None:
         one(games_body({"player1_config_id": solver, "player2_config_id": solver}, 2,
                        capture_positions=True), ctx.data)
         expect(worker.uuid() is not None, "the first assignment minted no worker UUID")
-        # Players with a wordmap, so the assignment pins a derived file.
+        # Players with a wordmap, so the assignment pins a derived file, and
+        # first divergences kept, so the result carries a pair's two positions.
+        # Equity against score: the pairs diverge.
         one({"job_type": "game_pairs", **wordmap_players(ctx), "pairs_per_batch": 2,
-             "sprt_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000}, ctx.data,
+             "sprt_enabled": True, "min_pairs": 1_000_000, "max_pairs": 1_000_000,
+             "capture_positions": True, "capture_first_divergence": True}, ctx.data,
             needs_build=True)
         one({"job_type": "opening_rack", "player_config_id": simming_player(ctx),
              "racks_per_batch": 2, "rack_size": 7}, ctx.data)
@@ -1196,6 +1246,7 @@ CASES = {
     "M-11": case_derived_mismatch,
     "M-12": case_solvers,
     "M-13": case_word_info_table,
+    "M-14": case_first_divergences,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

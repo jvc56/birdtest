@@ -1252,6 +1252,10 @@ enum JobTypeConfig {
         sprt: SprtRequest,
         #[serde(default)]
         capture_positions: bool,
+        /// Refused: a games job has no pairs to diverge. Read so that it is
+        /// refused rather than ignored by this untagged body.
+        #[serde(default)]
+        capture_first_divergence: bool,
     },
     GamePair {
         player1_config_id: Uuid,
@@ -1269,6 +1273,9 @@ enum JobTypeConfig {
         sprt: SprtRequest,
         #[serde(default)]
         capture_positions: bool,
+        /// Of the captured positions, keep only each pair's first divergence.
+        #[serde(default)]
+        capture_first_divergence: bool,
     },
 }
 
@@ -1627,10 +1634,17 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::Game {
-            games_per_batch, min_games, max_games, sprt: test, capture_positions, ..
+            games_per_batch, min_games, max_games, sprt: test, capture_positions,
+            capture_first_divergence, ..
         } => {
             let mut err = sprt(err, "game", *games_per_batch, *min_games, *max_games, test);
             err = games_batch_field(err, "game", 1, *games_per_batch, *capture_positions);
+            if *capture_first_divergence {
+                err = err.with_field(
+                    "capture_first_divergence",
+                    "a games job plays no pairs, so its games have no first divergence",
+                );
+            }
             // MAGPIE alternates the first mover within one run, from player 1,
             // and every task is a run of its own: at a batch of 1 player 1
             // moved first in every game of the job, and SPRT passed two
@@ -1646,9 +1660,17 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             err
         }
         JobTypeConfig::GamePair {
-            pairs_per_batch, min_pairs, max_pairs, sprt: test, capture_positions, ..
+            pairs_per_batch, min_pairs, max_pairs, sprt: test, capture_positions,
+            capture_first_divergence, ..
         } => {
-            let err = sprt(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
+            let mut err = sprt(err, "pair", *pairs_per_batch, *min_pairs, *max_pairs, test);
+            if *capture_first_divergence && !*capture_positions {
+                err = err.with_field(
+                    "capture_first_divergence",
+                    "keeps only some of the positions a job captures, so it needs \
+                     capture_positions",
+                );
+            }
             games_batch_field(err, "pair", 2, *pairs_per_batch, *capture_positions)
         }
         JobTypeConfig::Leave { num_iterations, target_rack_counts, racks_per_task, .. } => {
@@ -2069,7 +2091,7 @@ async fn insert_job_config(
             JobType::Games,
             JobTypeConfig::Game {
                 player1_config_id, player2_config_id, games_per_batch,
-                min_games, max_games, sprt, capture_positions,
+                min_games, max_games, sprt, capture_positions, ..
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
@@ -2104,7 +2126,7 @@ async fn insert_job_config(
             JobType::GamePairs,
             JobTypeConfig::GamePair {
                 player1_config_id, player2_config_id, pairs_per_batch,
-                min_pairs, max_pairs, sprt, capture_positions,
+                min_pairs, max_pairs, sprt, capture_positions, capture_first_divergence,
             },
         ) => {
             validate_shared_player_options(&mut *conn, *player1_config_id, *player2_config_id)
@@ -2124,14 +2146,16 @@ async fn insert_job_config(
                 "INSERT INTO job_game_pair_config
                      (job_id, player1_config_id,
                       player2_config_id, pairs_per_batch, sprt_enabled, min_pairs, max_pairs,
-                      sprt_alpha, sprt_beta, elo_low, elo_high, capture_positions)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
+                      sprt_alpha, sprt_beta, elo_low, elo_high, capture_positions,
+                      capture_first_divergence)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
             )
             .bind(job.id)
             .bind(player1_config_id).bind(player2_config_id)
             .bind(pairs_per_batch).bind(test.enabled).bind(test.min_units).bind(max_pairs)
             .bind(test.alpha).bind(test.beta).bind(test.elo_low).bind(test.elo_high)
             .bind(capture_positions)
+            .bind(capture_first_divergence)
             .execute(conn)
             .await?;
         }

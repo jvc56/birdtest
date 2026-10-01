@@ -452,8 +452,8 @@ pub(crate) async fn insert_game_request(
         "INSERT INTO game_requests
              (task_id, variant, seed, num_games, player1_config_id,
               player2_config_id, capture_positions, letter_distribution,
-              board_layout)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+              board_layout, capture_first_divergence)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
     )
     .bind(task_id)
     .bind(&req.variant)
@@ -464,6 +464,7 @@ pub(crate) async fn insert_game_request(
     .bind(req.capture_positions)
     .bind(&req.letter_distribution)
     .bind(&req.board_layout)
+    .bind(req.capture_first_divergence)
     .execute(conn)
     .await?;
     Ok(())
@@ -490,6 +491,7 @@ pub(crate) async fn load_game_request(
         num_games: row.get("num_games"),
         game_pairs,
         capture_positions: row.get("capture_positions"),
+        capture_first_divergence: row.get("capture_first_divergence"),
         bingo_bonus: template.data.bingo_bonus,
         sim_cutoff: template.data.sim_cutoff,
         letter_distribution: row.get("letter_distribution"),

@@ -287,6 +287,83 @@ class _SyntheticGame:
         self.on_turn = 1 - seat
 
 
+def _synthetic_position(game: "_SyntheticGame", rng: random.Random, game_index: int,
+                        turn: int, ranked: List[dict], previous: Optional[dict]) -> dict:
+    """One captured position of `game` as it stands, its moves `ranked`."""
+    position = {
+        "game_index": game_index,
+        "turn_number": turn,
+        "rack": game.rack_string(game.on_turn),
+        "position": game.cgp(),
+        "num_moves": rng.randint(len(ranked), 400),
+        # Every move below carries a simulation's statistics.
+        "analysis": "sim",
+        "moves": [
+            {
+                "move": move["move"],
+                "score": move["score"],
+                "equity": move["equity"],
+                # Absent for a static player, which simulates nothing.
+                "win_percentage": round(rng.uniform(20, 80), 3),
+                # Same nullability as win_percentage: the win%+spread
+                # blend, sometimes used to rank moves instead.
+                "blended_utility": round(rng.uniform(0, 1), 3),
+                "plies": [
+                    {
+                        "ply": p,
+                        "bingo_percentage": round(rng.uniform(0, 25), 3),
+                        "average_score": round(rng.uniform(25, 45), 3),
+                    }
+                    for p in range(2)
+                ],
+            }
+            for move in ranked
+        ],
+    }
+    # Absent on the first turn of a game: nothing preceded it.
+    if previous is not None:
+        position["previous_move"] = previous["move"]
+        position["previous_move_score"] = previous["score"]
+    return position
+
+
+def _add_first_divergences(result: dict, request: dict, rng: random.Random,
+                           divergent_pairs: List[int]) -> None:
+    """A pairs task keeping first divergences: from each pair that diverged,
+    both games' positions at the turn they first disagree.
+
+    Before that turn a pair's two games are one game with the seats swapped, so
+    the two positions share the board and the mover's tiles; the second game's
+    CGP has the racks and scores the other way round, its mover in the other
+    seat. Its player ranks the moves differently, so the pair diverges here.
+    """
+    top_moves = (request.get("player1") or {}).get("num_plays_recorded") or 10
+    distribution = request.get("letter_distribution", "english")
+    positions = []
+    for pair in divergent_pairs:
+        game = _SyntheticGame(rng, distribution, first_seat=pair % 2)
+        previous = None
+        turn = 0
+        # The turns both games played alike, before they diverge.
+        alike = rng.randint(0, 14)
+        while turn < alike and not game.over():
+            previous = game.ranked_moves(1)[0]
+            game.play(previous)
+            turn += 1
+        ranked = game.ranked_moves(top_moves)
+        first = _synthetic_position(game, rng, pair * 2, turn, ranked, previous)
+        # The other game: the same position from the other seat, and another
+        # player's ranking, which puts a different move first.
+        second_ranked = ranked[1:] + ranked[:1] if len(ranked) > 1 else ranked
+        second = _synthetic_position(game, rng, pair * 2 + 1, turn, second_ranked, previous)
+        board, racks, scores, *rest = second["position"].split(" ")
+        swapped_racks = "/".join(reversed(racks.split("/")))
+        swapped_scores = "/".join(reversed(scores.split("/")))
+        second["position"] = " ".join([board, swapped_racks, swapped_scores, *rest])
+        positions += [first, second]
+    result["positions"] = positions
+
+
 def _add_captured_positions(result: dict, request: dict, rng: random.Random,
                             games: int) -> None:
     """Synthesize the per-turn analyses a real worker would capture.
@@ -312,41 +389,7 @@ def _add_captured_positions(result: dict, request: dict, rng: random.Random,
             if game.over():
                 break
             ranked = game.ranked_moves(top_moves)
-            position = {
-                "game_index": game_index,
-                "turn_number": turn,
-                "rack": game.rack_string(game.on_turn),
-                "position": game.cgp(),
-                "num_moves": rng.randint(len(ranked), 400),
-                # Every move below carries a simulation's statistics.
-                "analysis": "sim",
-                "moves": [
-                    {
-                        "move": move["move"],
-                        "score": move["score"],
-                        "equity": move["equity"],
-                        # Absent for a static player, which simulates nothing.
-                        "win_percentage": round(rng.uniform(20, 80), 3),
-                        # Same nullability as win_percentage: the win%+spread
-                        # blend, sometimes used to rank moves instead.
-                        "blended_utility": round(rng.uniform(0, 1), 3),
-                        "plies": [
-                            {
-                                "ply": p,
-                                "bingo_percentage": round(rng.uniform(0, 25), 3),
-                                "average_score": round(rng.uniform(25, 45), 3),
-                            }
-                            for p in range(2)
-                        ],
-                    }
-                    for move in ranked
-                ],
-            }
-            # Absent on the first turn of a game: nothing preceded it.
-            if previous is not None:
-                position["previous_move"] = previous["move"]
-                position["previous_move_score"] = previous["score"]
-            positions.append(position)
+            positions.append(_synthetic_position(game, rng, game_index, turn, ranked, previous))
             # The player plays their top move, as a static player does.
             previous = ranked[0]
             game.play(previous)
@@ -377,8 +420,10 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
         wins = losses = ties = 0
         divergent_games = divergent_wins = divergent_losses = divergent_ties = 0
 
-        for _ in range(pairs):
+        divergent_pairs = []
+        for pair in range(pairs):
             if rng.random() < divergence_rate:
+                divergent_pairs.append(pair)
                 # Divergent: the two games are played out independently.
                 outcomes = [_game_outcome(rng, p1_win_probability) for _ in range(2)]
                 divergent_games += 2
@@ -422,7 +467,10 @@ def _result_for(request: dict, rng: random.Random, p1_win_probability: float) ->
                 "p2_score_sd": all_games["p2_score_sd"],
             },
         }
-        _add_captured_positions(result, request, rng, pairs * 2)
+        if request.get("capture_positions") and request.get("capture_first_divergence"):
+            _add_first_divergences(result, request, rng, divergent_pairs)
+        else:
+            _add_captured_positions(result, request, rng, pairs * 2)
         return result
 
     if job_type == "opening_rack":

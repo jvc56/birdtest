@@ -254,6 +254,9 @@ struct GamesSettings {
     elo_low: f64,
     elo_high: f64,
     capture_positions: bool,
+    /// Game pairs: of the captured positions, only each pair's first
+    /// divergence is kept. Always `false` for a games job.
+    capture_first_divergence: bool,
 }
 
 /// The lexicon and wordmap setting are the player's, and shown with it.
@@ -444,6 +447,7 @@ async fn job_config(
                 elo_low: c.elo_low,
                 elo_high: c.elo_high,
                 capture_positions: c.capture_positions,
+                capture_first_divergence: false,
             });
         }
         JobType::GamePairs => {
@@ -464,6 +468,7 @@ async fn job_config(
                 elo_low: c.elo_low,
                 elo_high: c.elo_high,
                 capture_positions: c.capture_positions,
+                capture_first_divergence: c.capture_first_divergence,
             });
         }
         JobType::OpeningRack => {
@@ -1168,6 +1173,70 @@ async fn saved_positions(
         .collect())
 }
 
+/// Saved positions as the API shows them, and for a game-pairs job each with
+/// its `partner`: the same turn of the pair's other game, or `null` when that
+/// game has no position at that turn (it had ended, or its result is not in).
+///
+/// A pair's two games share their tiles and differ in who moves first, so up
+/// to the turn they first diverge they are one game, played by each player
+/// from the other seat: the partner is the other player's answer to the same
+/// position. That is what a job keeping first divergences
+/// (`capture_first_divergence`) keeps, and the page shows the two side by
+/// side. One read through `position_analysis_records_in_game_idx (task_id,
+/// game_index, turn_number)`.
+async fn saved_positions_with_partners(
+    state: &AppState,
+    job: &Job,
+    rows: Vec<sqlx::postgres::PgRow>,
+) -> AppResult<Vec<serde_json::Value>> {
+    if job.job_type != JobType::GamePairs {
+        return saved_positions(state, rows).await;
+    }
+    let mut tasks = Vec::with_capacity(rows.len());
+    let mut games = Vec::with_capacity(rows.len());
+    let mut turns = Vec::with_capacity(rows.len());
+    for row in &rows {
+        if let (Some(game), Some(turn)) =
+            (row.get::<Option<i16>, _>("game_index"), row.get::<Option<i16>, _>("turn_number"))
+        {
+            tasks.push(row.get::<Uuid, _>("task_id"));
+            games.push(game ^ 1);
+            turns.push(turn);
+        }
+    }
+    let partner_rows = sqlx::query(&format!(
+        "SELECT {POSITION_COLUMNS} FROM position_analysis_records r
+         JOIN unnest($1::uuid[], $2::smallint[], $3::smallint[]) AS k(task_id, game_index, turn_number)
+           ON r.task_id = k.task_id AND r.game_index = k.game_index
+          AND r.turn_number = k.turn_number"
+    ))
+    .bind(&tasks)
+    .bind(&games)
+    .bind(&turns)
+    .fetch_all(&state.read_pool)
+    .await?;
+    let key = |item: &serde_json::Value| {
+        (
+            item["task_id"].as_str().unwrap_or_default().to_string(),
+            item["game_index"].as_i64().unwrap_or(-1),
+            item["turn_number"].as_i64().unwrap_or(-1),
+        )
+    };
+    let mut partners: HashMap<(String, i64, i64), serde_json::Value> =
+        saved_positions(state, partner_rows)
+            .await?
+            .into_iter()
+            .map(|partner| (key(&partner), partner))
+            .collect();
+    let mut items = saved_positions(state, rows).await?;
+    for item in &mut items {
+        let (task, game, turn) = key(item);
+        let partner = partners.remove(&(task, game ^ 1, turn)).unwrap_or(serde_json::Value::Null);
+        item["partner"] = partner;
+    }
+    Ok(items)
+}
+
 /// The positions a games or game-pairs job captured (`capture_positions`)
 /// where the player to move held one rack, newest first, each with its ranked
 /// moves: for signed-in users, since a job that captures holds millions of
@@ -1206,10 +1275,20 @@ async fn job_positions(
     // id) first. One row past the page says whether there is a next: the page
     // shows positions one at a time, and a cursor on every full page offered
     // "Next" after a rack's only position, to a page saying it had none.
+    //
+    // A game-pairs job shows each position beside its partner, and a pair's
+    // two games hold the same rack at the same turn until they diverge -- at a
+    // first divergence, always. So the second game's position is left out
+    // where the first game's matches the rack too: it is already on the page,
+    // as that one's partner.
     let mut rows = sqlx::query(&format!(
         "SELECT {POSITION_COLUMNS} FROM position_analysis_records r
          WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NOT NULL
            AND ($3::bigint IS NULL OR r.id < $3)
+           AND NOT ($5 AND r.game_index % 2 = 1 AND EXISTS (
+               SELECT 1 FROM position_analysis_records p
+               WHERE p.task_id = r.task_id AND p.game_index = r.game_index - 1
+                 AND p.turn_number = r.turn_number AND p.rack = r.rack))
          ORDER BY r.id DESC
          LIMIT $4"
     ))
@@ -1217,6 +1296,7 @@ async fn job_positions(
     .bind(&rack)
     .bind(after)
     .bind(limit + 1)
+    .bind(job.job_type == JobType::GamePairs)
     .fetch_all(&state.read_pool)
     .await?;
 
@@ -1226,7 +1306,7 @@ async fn job_positions(
         .then(|| rows.last())
         .flatten()
         .map(|last| super::encode_cursor(&[last.get::<i64, _>("id").to_string()]));
-    let items = saved_positions(&state, rows).await?;
+    let items = saved_positions_with_partners(&state, &job, rows).await?;
     Ok(Json(super::CursorPage { items, total: -1, per_page: limit, next_cursor }))
 }
 
@@ -1255,7 +1335,7 @@ async fn random_position(
     Path(id): Path<Uuid>,
 ) -> AppResult<Json<Option<serde_json::Value>>> {
     use rand::Rng;
-    capturing_job(&state, id).await?;
+    let job = capturing_job(&state, id).await?;
     let pool = &state.read_pool;
     let (low, high): (Option<i64>, Option<i64>) =
         sqlx::query_as("SELECT min(seed), max(seed) FROM tasks WHERE job_id = $1")
@@ -1305,7 +1385,7 @@ async fn random_position(
         .fetch_optional(pool)
         .await?;
     }
-    Ok(Json(saved_positions(&state, row.into_iter().collect()).await?.pop()))
+    Ok(Json(saved_positions_with_partners(&state, &job, row.into_iter().collect()).await?.pop()))
 }
 
 /// What a saved position is drawn on: the job's board and what its tiles

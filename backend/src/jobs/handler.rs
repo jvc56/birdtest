@@ -239,6 +239,10 @@ pub struct GameRequest {
     /// reports them. How many ranked moves come back per position is the
     /// player config's `num_plays_recorded`.
     pub capture_positions: bool,
+    /// Game pairs with capture only: keep each pair's first divergence and
+    /// nothing else. Always stated, `false` for a games task, which MAGPIE
+    /// refuses to read as anything else.
+    pub capture_first_divergence: bool,
     /// See [`OpeningRackRequest::bingo_bonus`].
     pub bingo_bonus: i32,
     pub sim_cutoff: f64,

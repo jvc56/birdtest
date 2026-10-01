@@ -51,6 +51,8 @@
   let eloHigh = 10;
   // Keep every position the games analyse, searchable on the job's page.
   let capturePositions = false;
+  // Game pairs, with positions saved: only each pair's first divergence.
+  let captureFirstDivergence = false;
   let numIterations = 10000;
   // One occurrence target per generation, as MAGPIE's `leavegen` takes them:
   // the list's length is how many generations the job runs.
@@ -144,7 +146,8 @@
           player1_config_id: player1, player2_config_id: player2,
           pairs_per_batch: batchSize, max_pairs: maxUnits, ...sprt,
           ...(sprtEnabled ? { min_pairs: minUnits } : {}),
-          capture_positions: capturePositions
+          capture_positions: capturePositions,
+          capture_first_divergence: capturePositions && captureFirstDivergence
         };
       case 'leave_generation':
         return {
@@ -416,6 +419,17 @@
         and a batch is at most {jobType === 'games' ? '1,000 games' : '500 pairs'} while saving.
         A static player records only the move it played; a simming player, its whole ranking.
       </p>
+      {#if jobType === 'game_pairs' && capturePositions}
+        <label class="mt-2 flex items-center gap-2">
+          <input type="checkbox" bind:checked={captureFirstDivergence} />
+          <span class="label mb-0">Only where each pair first diverges</span>
+        </label>
+        <p class="mt-1 text-xs text-muted-foreground">
+          A pair's two games are one game with the seats swapped until the players choose
+          different moves. Keeps just that turn: the position, once from each game, with each
+          player's ranking. A pair played identically keeps nothing.
+        </p>
+      {/if}
     </div>
   {:else}
     {#if leaveConflict}

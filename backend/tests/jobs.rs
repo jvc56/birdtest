@@ -212,6 +212,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             "sprt_enabled": true,
             "min_pairs": 10, "max_pairs": 500, "sprt_alpha": 0.02, "sprt_beta": 0.08,
             "elo_low": -3.5, "elo_high": 6.5, "capture_positions": true,
+            "capture_first_divergence": true,
         }))
         .await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
@@ -225,6 +226,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
             "pairs_per_batch": 3, "sprt_enabled": true, "min_pairs": 10, "max_pairs": 500,
             "sprt_alpha": 0.02,
             "sprt_beta": 0.08, "elo_low": -3.5, "elo_high": 6.5, "capture_positions": true,
+            "capture_first_divergence": true,
         }),
     );
     assert_eq!(job_row(&db, pairs).await["job_type"], "game_pairs");
