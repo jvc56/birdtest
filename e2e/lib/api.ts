@@ -84,7 +84,8 @@ export class AdminApi {
       klv_id: data.klv,
       num_plays_recorded: plays,
       use_wordmap: false,
-      use_rit: false
+      use_rit: false,
+      use_wit: false
     });
     return created.id;
   }

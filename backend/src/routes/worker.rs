@@ -412,8 +412,8 @@ async fn decline_task(
     // `task_failed` is a worker that ran the task and could not produce a
     // result the server accepted. Declining hands the slot straight back, where
     // stopping the heartbeat alone held it for the whole heartbeat timeout.
-    // `derived_mismatch` is a worker that built the wordmap or rack info table
-    // this job pins and got different bytes. Distinct from `missing_data`,
+    // `derived_mismatch` is a worker that built the wordmap, rack info table or
+    // word info table this job pins and got different bytes. Distinct from `missing_data`,
     // which is a file the contributor was supposed to have downloaded: nothing
     // the contributor can do fixes this one, and the two hashes it carries are
     // the evidence that the fleet's builders disagree -- which is exactly what

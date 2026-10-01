@@ -128,6 +128,7 @@ pub fn test_builders() -> birdtest::magpie::Builders {
         wmp_builder_version: 1,
         rit_builder_version: 1,
         klv_builder_version: 1,
+        wit_builder_version: 1,
     }
 }
 

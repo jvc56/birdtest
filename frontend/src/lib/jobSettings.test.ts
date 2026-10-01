@@ -6,6 +6,7 @@ const staticPlayer: PlayerSettings = {
   recorder_type: 'best', sort_strategy: 'equity', num_plies: 0, num_plies_recorded: 2,
   num_plays: 100, num_plays_recorded: 10, max_iterations: null, stopping_pct: null,
   use_inference: null, time_limit_secs: null, use_wordmap: true, use_rit: true,
+  use_wit: false,
   min_play_iterations: null, threshold: null, sampling_rule: null, inference_margin: null,
   utility_w_winpct: null, utility_w_spread: null, utility_spread_scale: null, movegen_margin: 5,
   endgame_plies: 0, peg_max_bag: 0, peg_stage_top_k: null, peg_scenario_stride: null,
@@ -146,7 +147,7 @@ describe('F-SET-1 job settings', () => {
       'Stopping %', 'Inference', 'Recorder', 'Plays recorded', 'Endgame', 'Pre-endgame', 'Plies recorded',
       'Iterations per play (fewest)', 'Threshold', 'Sampling rule', 'Inference margin',
       'Utility weight: win %', 'Utility weight: spread', 'Utility spread scale', 'Time limit (s)',
-      'Move-gen margin', ...SOLVER_ROWS.slice(2), 'Wordmap', 'Rack info table'
+      'Move-gen margin', ...SOLVER_ROWS.slice(2), 'Wordmap', 'Rack info table', 'Word info table'
     ]);
     expect(labels(keySettings([simPlayer, solvingPlayer]))).toEqual([
       'Lexicon', 'Leaves', 'Plies', 'Plays considered', 'Sort', 'Win % model', 'Iterations (most)',

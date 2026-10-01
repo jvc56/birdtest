@@ -4,8 +4,8 @@ import { ADMIN_STATE, SEEDED_DATA } from '../lib/env';
 test.use({ storageState: ADMIN_STATE });
 
 /** A static player through the form, with the wordmap and rack info table
- *  turned off: nothing below tier 6 builds either, and a job waiting on one
- *  would never dispatch. */
+ *  turned off, and the word info table left off: nothing below tier 6 builds
+ *  any of them, and a job waiting on one would never dispatch. */
 async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'score') {
   await page.goto('/admin/player-configs/new');
   await page.getByLabel('Name').fill(name);
@@ -15,6 +15,8 @@ async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'sc
   await page.getByRole('button', { name: 'Show advanced options' }).click();
   await page.getByLabel('Use wordmap (-w)').uncheck();
   await page.getByLabel('Use rack info table (-rit)').uncheck();
+  // Off already, as MAGPIE has it.
+  await expect(page.getByLabel('Use word info table (-wit)')).not.toBeChecked();
   await page.getByRole('button', { name: 'Create' }).click();
   await expect(page).toHaveURL(/\/admin\/player-configs$/);
   await expect(page.locator('tbody tr', { hasText: name })).toContainText(sort);

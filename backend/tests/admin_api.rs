@@ -1156,6 +1156,8 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
         ("movegen_margin", json!(5.0)),
         ("use_wordmap", json!(true)),
         ("use_rit", json!(true)),
+        // Off unless asked, as MAGPIE has it.
+        ("use_wit", json!(false)),
         ("max_iterations", json!(null)),
         ("threshold", json!(null)),
         ("utility_w_spread", json!(null)),
@@ -1589,6 +1591,16 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "{response}");
     assert_eq!(response["use_rit"], json!(true), "{response}");
+
+    // A word info table is stored as asked, and is off when nothing says.
+    assert_eq!(response["use_wit"], json!(false), "{response}");
+    let (status, response) = player_config(&app, &headers, json!({
+        "name": "static-wit", "recorder_type": "best",
+        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1, "use_wit": true,
+    }))
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{response}");
+    assert_eq!(response["use_wit"], json!(true), "{response}");
 
     // The table travels under the pair's name, not the lexicon's. That is what
     // keeps NWL23-with-CSW21-leaves -- a configuration birdtest accepts on

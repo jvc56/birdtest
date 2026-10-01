@@ -57,6 +57,7 @@ pub struct Builders {
     pub wmp_builder_version: i32,
     pub rit_builder_version: i32,
     pub klv_builder_version: i32,
+    pub wit_builder_version: i32,
 }
 
 impl Builders {
@@ -70,6 +71,11 @@ impl Builders {
         format!("rit-{}", self.rit_builder_version)
     }
 
+    /// The identifier recorded with a word info table's hash.
+    pub fn wit(&self) -> String {
+        format!("wit-{}", self.wit_builder_version)
+    }
+
     /// The identifier recorded on a leave-generation KLV artifact.
     pub fn klv(&self) -> String {
         format!("klv-{}", self.klv_builder_version)
@@ -81,6 +87,7 @@ impl Builders {
         match role {
             "wmp" => Ok(self.wmp()),
             "rit" => Ok(self.rit()),
+            "wit" => Ok(self.wit()),
             other => Err(AppError::internal(format!("no builder for role {other:?}"))),
         }
     }
@@ -382,24 +389,28 @@ mod tests {
             wmp_builder_version: 1,
             rit_builder_version: 2,
             klv_builder_version: 3,
+            wit_builder_version: 4,
         };
         assert_eq!(builders.wmp(), "wmp-1");
         assert_eq!(builders.rit(), "rit-2");
         assert_eq!(builders.klv(), "klv-3");
         assert_eq!(builders.for_role("wmp").unwrap(), "wmp-1");
         assert_eq!(builders.for_role("rit").unwrap(), "rit-2");
-        assert!(builders.for_role("wit").is_err());
+        assert_eq!(builders.wit(), "wit-4");
+        assert_eq!(builders.for_role("wit").unwrap(), "wit-4");
+        assert!(builders.for_role("klv").is_err());
     }
 
     /// The exact shape `magpie builders` prints. If MAGPIE's output changes,
     /// this is what says so, rather than every build request failing at once.
     #[test]
     fn the_builders_json_magpie_prints_parses() {
-        let printed = r#"{"magpie_version":"0.1.0","build_target":"nehalem","wmp_builder_version":1,"rit_builder_version":1,"klv_builder_version":1}"#;
+        let printed = r#"{"magpie_version":"0.1.0","build_target":"nehalem","wmp_builder_version":1,"rit_builder_version":1,"klv_builder_version":1,"wit_builder_version":1}"#;
         let builders: Builders = serde_json::from_str(printed).unwrap();
         assert_eq!(builders.magpie_version, "0.1.0");
         assert_eq!(builders.build_target, "nehalem");
         assert_eq!(builders.wmp(), "wmp-1");
+        assert_eq!(builders.wit(), "wit-1");
     }
 
     #[test]

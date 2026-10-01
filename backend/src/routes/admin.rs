@@ -526,6 +526,8 @@ struct CreatePlayerConfigBody {
     #[serde(default)]
     use_rit: Option<bool>,
     #[serde(default)]
+    use_wit: Option<bool>,
+    #[serde(default)]
     min_play_iterations: Option<i32>,
     #[serde(default)]
     threshold: Option<String>,
@@ -881,9 +883,9 @@ async fn create_player_config(
               utility_spread_scale, movegen_margin, created_by,
               endgame_plies, peg_max_bag, peg_stage_top_k, peg_scenario_stride,
               peg_opp_model, peg_nested, peg_nested_cand_caps, peg_nested_max_depth,
-              peg_nested_strides)
+              peg_nested_strides, use_wit)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,
-                 $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35)
+                 $18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31,$32,$33,$34,$35,$36)
          RETURNING *",
     )
     .bind(body.name.trim())
@@ -928,6 +930,10 @@ async fn create_player_config(
     .bind(&solver.peg_nested_cand_caps)
     .bind(solver.peg_nested_max_depth)
     .bind(&solver.peg_nested_strides)
+    // Off unless the config asks, as MAGPIE has it (-wit is opt-in). The
+    // server builds the table before any job using it dispatches, once per
+    // lexicon: about three seconds and 122 MB for CSW24.
+    .bind(body.use_wit.unwrap_or(false))
     .fetch_one(&state.pool)
     .await
     .map_err(|e| match body.cloned_from_id {

@@ -247,7 +247,7 @@ async fn player_configs_are_public() {
     assert!(config["lexicon"].as_str().unwrap().starts_with("NWL"), "{config}");
     assert!(config["created_at"].is_string(), "{config}");
     // Every setting a job's config shows is here, and nothing about who made it.
-    for key in ["use_wordmap", "use_rit", "movegen_margin", "num_plays", "sort_strategy", "leaves"] {
+    for key in ["use_wordmap", "use_rit", "use_wit", "movegen_margin", "num_plays", "sort_strategy", "leaves"] {
         assert!(config.get(key).is_some(), "{key} missing: {config}");
     }
     assert!(config.get("created_by").is_none() && config.get("role").is_none(), "{config}");

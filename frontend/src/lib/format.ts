@@ -73,6 +73,17 @@ export function jobTypeLabel(type: string): string {
   return lookup(JOB_TYPE_LABELS, type);
 }
 
+const DERIVED_KIND_LABELS: Record<string, string> = {
+  wmp: 'Wordmap',
+  rit: 'Rack info table',
+  wit: 'Word info table'
+};
+
+/** What a derived file is, from its role. */
+export function derivedKind(role: string): string {
+  return lookup(DERIVED_KIND_LABELS, role);
+}
+
 const SPRT_LABELS: Record<string, string> = {
   running: 'running',
   paused: 'paused while the job is inactive',

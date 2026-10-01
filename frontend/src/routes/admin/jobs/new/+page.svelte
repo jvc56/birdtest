@@ -309,7 +309,7 @@
               {config.name} — {config.num_plies > 0 ? `${config.num_plies}-ply sim` : 'static'}, by
               {config.sort_strategy}{config.use_rit ? ', rack info table' : ''}{config.use_wordmap
                 ? ', wordmap'
-                : ''}
+                : ''}{config.use_wit ? ', word info table' : ''}
             {/if}
           </option>
         {/each}

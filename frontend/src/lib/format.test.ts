@@ -4,6 +4,7 @@ import {
   computeTime,
   unchosenText,
   datetime,
+  derivedKind,
   duration,
   jobTypeLabel,
   leavePlayerConflict,
@@ -124,6 +125,16 @@ describe('F-FMT-4 jobTypeLabel', () => {
     expect(jobTypeLabel('something_new')).not.toContain('undefined');
     // Not fooled by Object.prototype members.
     expect(jobTypeLabel('toString')).toBe('toString');
+  });
+});
+
+describe('derivedKind', () => {
+  it('names each derived file the server builds', () => {
+    expect(derivedKind('wmp')).toBe('Wordmap');
+    expect(derivedKind('rit')).toBe('Rack info table');
+    // Once every role but `wmp` read as a rack info table.
+    expect(derivedKind('wit')).toBe('Word info table');
+    expect(derivedKind('other')).toBe('other');
   });
 });
 

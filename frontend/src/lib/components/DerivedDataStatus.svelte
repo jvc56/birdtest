@@ -2,9 +2,10 @@
   import { onDestroy, onMount } from 'svelte';
   import { api, ApiError, type JobDerivedFile } from '$lib/api';
   import { BUSY_POLL_MS, IDLE_POLL_MS, createPoller } from '$lib/poller';
+  import { derivedKind as kind } from '$lib/format';
 
   /**
-   * The wordmaps and rack info tables a job waits on. A job that needs one is
+   * The wordmaps, rack info tables and word info tables a job waits on. A job that needs one is
    * not handed out until the server's copy is built, and nothing else on the
    * job page moves while it waits (no claims, so no live payloads), so this
    * reads again every few seconds while a file is queued or building, and
@@ -41,7 +42,6 @@
   onMount(() => poller.start());
   onDestroy(() => poller.stop());
 
-  const kind = (role: string) => (role === 'wmp' ? 'Wordmap' : 'Rack info table');
   const label: Record<string, string> = {
     pending: 'queued',
     building: 'building…',
@@ -62,7 +62,7 @@
     role="status"
     aria-live="polite"
   >
-    <h2 class="text-lg font-medium">Wordmaps and rack info tables</h2>
+    <h2 class="text-lg font-medium">Derived files</h2>
     {#if failed.length}
       <p class="text-sm text-destructive">
         A build has given up, so this job hands out no work. Retry it on

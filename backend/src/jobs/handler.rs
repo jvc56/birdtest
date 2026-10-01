@@ -88,6 +88,10 @@ pub struct PlayerSpec {
     /// full rack on NWL23's leaves instead. This is the same name the server
     /// pinned a hash for in `expected_data.derived`.
     pub rit_name: Option<String>,
+    /// Whether the player loads the word info table for its lexicon. Named
+    /// for the lexicon, as MAGPIE's load finds it: it is built from the
+    /// `.kwg` alone, so unlike a rack info table it needs no name of its own.
+    pub use_wit: bool,
     pub min_play_iterations: Option<i32>,
     pub threshold: Option<String>,
     pub sampling_rule: Option<String>,
@@ -137,6 +141,7 @@ impl From<NamedPlayerConfig> for PlayerSpec {
             rit_name: c
                 .use_rit
                 .then(|| crate::derived::rack_info_table_name(&lexicon, &leaves)),
+            use_wit: c.use_wit,
             min_play_iterations: c.min_play_iterations,
             threshold: c.threshold,
             sampling_rule: c.sampling_rule,

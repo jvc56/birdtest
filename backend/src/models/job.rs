@@ -127,6 +127,10 @@ pub struct PlayerConfig {
     pub time_limit_secs: Option<i32>,
     pub use_wordmap: bool,
     pub use_rit: bool,
+    /// Whether the player loads the word info table for its lexicon: a
+    /// per-substring letter mask move generation prunes with. The server
+    /// builds it and pins its hash, as for the other two derived files.
+    pub use_wit: bool,
     pub min_play_iterations: Option<i32>,
     pub threshold: Option<String>,
     pub sampling_rule: Option<String>,

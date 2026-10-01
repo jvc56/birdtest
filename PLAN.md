@@ -3714,6 +3714,7 @@ MAGPIE's per-player settings, where `N` is 1 or 2:
 | `use_wordmap` | `-wN` | applied directly against `players_data`, not `-wN`'s own arg parsing, and **before** the task's lexicon loads, which is when MAGPIE decides whether to load a wordmap |
 | `use_rit` | — | applied against `players_data` the same way, and **before** the lexicon loads |
 | `rit_name` | — | The name to load the table under, `<lexicon>.<leaves>`. A table stores precomputed leave values, so it belongs to the pair rather than the lexicon; the server pins a hash for this exact name (see [Wordmap and rack info table provenance](#wordmap-and-rack-info-table-provenance)) |
+| `use_wit` | `-witN` | applied against `players_data` the same way, and **before** the lexicon loads. The table is named for the lexicon and built from the `.kwg` alone; the server pins a hash for it as a `wit` entry |
 | `min_play_iterations` | `-miN` | |
 | `threshold` | `-thN` | `'none'` \| `'gk16'` |
 | `sampling_rule` | `-saN` | `'round_robin'` \| `'top_two_ids'` |
@@ -3768,7 +3769,7 @@ a new MAGPIE setting has a table it visibly is not in.
 | Letter distribution (`-ld`), board layout (`-bdn`), variant (`-var`) | Yes | Required on every request; the two files are pinned by digest |
 | Win% model (`-winpct`) | For simmers | From whichever player states one; pinned by digest |
 | Wordmap (`-w1`/`-w2`), rack info table (`-rit*`) | They must not — but a stale or mismatched file does | Flags stated per player and set *before* the lexical load; the file's bytes must match the hash the server built, or the task is declined. A table is loaded by its pair's name, never the lexicon's |
-| Word info table (`-wit*`) | A stale one prunes legal plays | Switched off for both players before every load; birdtest offers no setting for it |
+| Word info table (`-wit*`) | It must not — but a stale one prunes legal plays | Stated per player (`use_wit`, off unless asked) and set *before* the lexical load; the file's bytes must match the hash the server built (role `wit`), or the task is declined |
 | Recorder (`-r*`), sort (`-s*`) | Yes | Required per player |
 | Plies, candidate plays, iterations, minimum play iterations, stopping condition, time limit, threshold, sampling rule, inference and its margin, utility weights (`-pl*`, `-np*`, `-i*`, `-mi*`, `-sc*`, `-tl*`, `-th*`, `-sa*`, `-si*`, `-im*`, `-uwin*`, `-uspread*`, `-uspreadscale*`) | Yes | `num_plies` and `num_plays` required of every player, the rest of every simmer; all reset to MAGPIE's defaults first. An opening-rack task copies the player's into the run-wide settings `impl_move_gen` and `impl_sim` read, and forces inference off (there is no previous play, and `game_history` is whatever the contributor last loaded). A time limit must be 0 |
 | Bingo bonus (`-bb`), simulation cutoff (`-cutoff`) | Yes | Required at the top of every request (the cutoff where the job can simulate) |
@@ -3923,6 +3924,12 @@ pentanomial and the divergent counts kept only as a diagnostic.
 
 ### Wordmap and rack info table provenance
 
+The word info table (`use_wit`, role `wit`) goes through everything below the
+way a wordmap does -- named for its lexicon, built from the `.kwg` alone, its
+hash pinned by the server -- except that it is off unless a config asks, and it
+has no sidecar fallback: a claim that pins no hash for it is declined, as for a
+rack info table.
+
 Whether either file is used is the **job's** decision, not the client's: both
 are player settings like any other, sent as `use_wordmap` and `use_rit` on each
 player object (for `leave_generation`, the one `player` the bot plays both seats
@@ -4050,13 +4057,19 @@ clear error and `contribute` stops — there is no fallback location. A job that
 asked for neither file never reaches this path.
 
 MAGPIE can open a third file by lexicon name as it loads: a **word info table**
-(`.wit`), a per-substring letter mask move generation prunes with. birdtest
-offers no setting for it and pins no hash, so contribute switches it off for
-both players before every load. It is opt-in on the CLI (`-wit`), and left
-alone a contributor's `settings.txt` — or an earlier command in the same
-process — would have carried it into every task: built from the lexicon on disk
-it prunes nothing legal, built from an older one it prunes plays that exist,
-and nothing in a task would have checked which.
+(`.wit`), a per-substring letter mask move generation prunes with. It is
+opt-in, as on the CLI (`-wit`): a player config asks for one with `use_wit`
+(off by default), and every request states the flag for each player, so a
+contributor's `settings.txt` — or an earlier command in the same process —
+cannot carry one into a task. Built from the lexicon on disk a table prunes
+nothing legal; built from an older one, or by an older builder, it prunes plays
+that exist. So it is handled like the other two: the server builds one from the
+`.kwg` alone (`convert kwg2wit`, builder `wit-1`, about three seconds and
+122 MB for CSW24), pins its hash as a `wit` entry in `expected_data.derived`,
+and the worker builds its own and uses it only if the bytes agree. Unlike a
+rack info table it holds nothing a leave generation changes, so a leave job's
+player may use one. Until 2026-10 birdtest offered no setting for it, and
+contribute switched it off for both players before every load.
 
 #### Leave generation keeps tables off
 

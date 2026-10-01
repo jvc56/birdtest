@@ -27,6 +27,7 @@ export interface PlayerSettings {
   time_limit_secs: number | null;
   use_wordmap: boolean;
   use_rit: boolean;
+  use_wit: boolean;
   min_play_iterations: number | null;
   threshold: string | null;
   sampling_rule: string | null;
@@ -265,7 +266,8 @@ const PLAYER_ROWS: PlayerRowSpec[] = [
   { label: 'Nested depth', value: field('peg_nested_max_depth') },
   { label: 'Nested strides', value: (p) => list(p.peg_nested_strides) },
   { label: 'Wordmap', value: field('use_wordmap') },
-  { label: 'Rack info table', value: field('use_rit') }
+  { label: 'Rack info table', value: field('use_rit') },
+  { label: 'Word info table', value: field('use_wit') }
 ];
 
 /** A player setting: one value per player, and whether the players differ in it. */

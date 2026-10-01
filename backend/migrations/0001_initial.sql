@@ -305,15 +305,16 @@ CREATE TABLE input_data_import_rows (
 -- change cannot pass without bumping them, and the server asks the binary it
 -- runs (`magpie builders`) rather than being told in configuration.
 CREATE TABLE derived_data (
-    role          TEXT NOT NULL CHECK (role IN ('wmp','rit')),
-    -- What the worker loads the file as. A wordmap's is its lexicon's name; a
-    -- rack info table's is '<lexicon>.<leaves>', because a table belongs to a
-    -- (.kwg, .klv2) pair and two jobs on CSW24 with different leaves must not
-    -- share one.
+    role          TEXT NOT NULL CHECK (role IN ('wmp','rit','wit')),
+    -- What the worker loads the file as. A wordmap's and a word info table's
+    -- is its lexicon's name; a rack info table's is '<lexicon>.<leaves>',
+    -- because a table belongs to a (.kwg, .klv2) pair and two jobs on CSW24
+    -- with different leaves must not share one.
     name          TEXT NOT NULL,
-    builder       TEXT NOT NULL,          -- 'wmp-1', 'rit-1'
+    builder       TEXT NOT NULL,          -- 'wmp-1', 'rit-1', 'wit-1'
     kwg_id        UUID NOT NULL REFERENCES input_data(id),
-    -- NULL for a wordmap, which is built from the lexicon alone. The partial
+    -- NULL for a wordmap and a word info table, which are built from the
+    -- lexicon alone. The partial
     -- unique indexes below are what make (role, name, builder, kwg, NULL) a key
     -- rather than a duplicate waiting to happen: in a UNIQUE constraint two
     -- NULLs are distinct, so a plain UNIQUE would let a wordmap be queued
@@ -345,16 +346,17 @@ CREATE TABLE derived_data (
     CONSTRAINT derived_data_built_has_hash CHECK (
         (state = 'built') = (sha256 IS NOT NULL AND bytes IS NOT NULL)
     ),
-    -- A wordmap is built from the lexicon and the distribution; a rack info
-    -- table additionally from the leaves. A wmp row carrying a klv_id would be
-    -- claiming a dependency it does not have.
+    -- A wordmap and a word info table are built from the lexicon and the
+    -- distribution; a rack info table additionally from the leaves. A wmp or
+    -- wit row carrying a klv_id would be claiming a dependency it does not
+    -- have.
     CONSTRAINT derived_data_inputs_match_role CHECK (
         (role = 'rit') = (klv_id IS NOT NULL)
     )
 );
 
--- The identity of a derived file, in the two shapes it comes in. Partial
--- indexes because a wordmap's klv_id is NULL and NULLs are distinct in a
+-- The identity of a derived file, one index per role. Partial indexes because
+-- a wordmap's and a word info table's klv_id is NULL and NULLs are distinct in a
 -- UNIQUE constraint, which would silently permit duplicate wordmap rows.
 CREATE UNIQUE INDEX derived_data_wmp_idx
     ON derived_data (name, builder, kwg_id, letterdist_id)
@@ -362,6 +364,9 @@ CREATE UNIQUE INDEX derived_data_wmp_idx
 CREATE UNIQUE INDEX derived_data_rit_idx
     ON derived_data (name, builder, kwg_id, klv_id, letterdist_id)
     WHERE role = 'rit';
+CREATE UNIQUE INDEX derived_data_wit_idx
+    ON derived_data (name, builder, kwg_id, letterdist_id)
+    WHERE role = 'wit';
 
 -- The builder task's queue: oldest request first, so a job that has been
 -- waiting is not starved by one created since.
@@ -588,6 +593,7 @@ CREATE TABLE player_configs (
     -- own defaults, so a setting missing here is a task no worker will run.
     use_wordmap          BOOLEAN NOT NULL,   -- -w1 / -w2
     use_rit               BOOLEAN NOT NULL,  -- rack info table            (-rit1 / -rit2)
+    use_wit               BOOLEAN NOT NULL DEFAULT false, -- word info table (-wit1 / -wit2)
     -- More simulation parameters: NULL for a static player, set for a simmer.
     min_play_iterations   INT,               -- -mi1 / -mi2
     threshold             TEXT,              -- 'none' | 'gk16'            (-th1 / -th2)

@@ -37,6 +37,8 @@
   // workers.
   let useWordmap = true;
   let useRit = true;
+  // Off by default, as MAGPIE has it (-wit is opt-in).
+  let useWit = false;
   // Blank means "MAGPIE's default" (see optionalNumber).
   const optional = optionalNumber;
   let minPlayIterations: number | '' = '';
@@ -133,6 +135,7 @@
         time_limit_secs: simming ? 0 : null,
         use_wordmap: useWordmap,
         use_rit: useRit,
+        use_wit: useWit,
         // Left blank, the server writes MAGPIE's default into the config. These
         // are simulation settings, which a static player states none of: the
         // server refuses one that does.
@@ -373,6 +376,17 @@
           <a class="underline" href="/admin/derived-data">derived data</a>. Contributors
           build their own copy, which costs about 1.9&nbsp;GB of disk and of memory (shared by
           workers on one machine).
+        </p>
+      {/if}
+      <label class="flex items-end gap-2 text-sm">
+        <input type="checkbox" bind:checked={useWit} />
+        Use word info table (-wit)
+      </label>
+      {#if useWit}
+        <p class="col-span-2 text-sm text-muted-foreground">
+          A letter mask move generation prunes with, built from the lexicon alone. The server
+          builds it before any job using it can dispatch — a few seconds, once per lexicon.
+          Contributors build their own copy, about 122&nbsp;MB for CSW24.
         </p>
       {/if}
       <div>

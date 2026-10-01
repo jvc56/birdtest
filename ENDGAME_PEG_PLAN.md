@@ -58,9 +58,9 @@ These shape everything below.
 |---|---|---|
 | Endgame solver | `src/impl/endgame.c`, `endgame_solve` | Usable as it is. A `seed` of 0 seeds from the current time (`endgame.c:3979`), so the caller should pass one. |
 | PEG solver | `src/impl/peg.c`, `peg_solve` | Usable as it is, except that several of its knobs fall back to bag-size-dependent built-ins instead of stated values. |
-| PlayChooser, which runs both solvers inside autoplay | `src/impl/play_chooser.c`, `play_chooser_choose_move` (`:775`) | Every budget is wall-clock time (`:380`, `:548`, `:694`). An untimed player still gets a default time budget, so how strong a player is depends on the hardware. `contribute` turns PlayChooser off for every task (`config.c:8082`). |
+| PlayChooser, which runs both solvers inside autoplay | `src/impl/play_chooser.c`, `play_chooser_choose_move` (`:775`) | Every budget is wall-clock time (`:380`, `:548`, `:694`). An untimed player still gets a default time budget, so how strong a player is depends on the hardware. `contribute` turns PlayChooser off for every task (`config.c:8168`). |
 | Autoplay's per-turn move choice | `src/impl/autoplay.c:750`, `game_runner_get_best_move` | Uses PlayChooser if one is configured; otherwise a static top move or a simulation. There is no depth-bounded solver branch. |
-| PlayChooser's thread count | `config.c:3928` | PlayChooser takes the thread count autoplay computes for sims (`num_worker_threads_per_sim`). The new solver path doesn't copy that; it passes the worker's thread count. |
+| PlayChooser's thread count | `config.c:3929` | PlayChooser takes the thread count autoplay computes for sims (`num_worker_threads_per_sim`). The new solver path doesn't copy that; it passes the worker's thread count. |
 | Positions recorder | `src/ent/autoplay_results.c:2128`, `autoplay_results_add_move` | Records a static move list or simulation results only. |
 
 The existing CLI options `eplies`, `etopk`, `etlim`, `pegtopk`, `pegtlim`,
@@ -76,7 +76,7 @@ The existing CLI options `eplies`, `etopk`, `etlim`, `pegtopk`, `pegtlim`,
 | A nonzero seed for each solve, derived from the game seed, turn number and player index. | Seed 0 means "the current time". A seed derived from the task keeps results as consistent as multithreading allows (decision 2). |
 | `num_threads` is the worker's thread count, for both solvers (decision 4). | PEG on few threads is far too slow. Determinism isn't a goal, so nothing has to be held back. |
 | Transposition tables as MAGPIE already sizes them, as a fraction of the machine's RAM. The endgame shares one table across the run's solves, as PlayChooser shares one across concurrent solves (`play_chooser.c:312`). PEG allocates its own per call, as it does today. | Nothing needs tables to be the same size on every machine: their size affects speed, and results already vary (decision 2). |
-| Every PEG setting stated in the request, none left to a built-in default. | This is birdtest's existing rule for every setting (`magpie_defaults.rs`): a config should mean the same thing on every MAGPIE build. Today the nested-lookahead stride defaults by bag size (`peg.c:1367`), and the nested candidate caps live in `config.c:3520`. |
+| Every PEG setting stated in the request, none left to a built-in default. | This is birdtest's existing rule for every setting (`magpie_defaults.rs`): a config should mean the same thing on every MAGPIE build. Today the nested-lookahead stride defaults by bag size (`peg.c:1367`), and the nested candidate caps live in `config.c:3521`. |
 
 ## The settings
 
@@ -157,7 +157,7 @@ them, but only to make results deterministic, which decision 2 drops.
    (`src/impl/autoplay.h`).
 2. **Threads.** `AutoplayArgs` carries the worker's thread count for the
    solvers. Nothing in autoplay's `pgp`/`igp` handling
-   (`config.c:3838–3847`) changes.
+   (`config.c:3839–3848`) changes.
 3. **Scratch.** Each `AutoplayWorker` owns an endgame context, reused across
    turns and games. The run owns one endgame table, shared by every worker.
 4. **Choosing a move.** In `game_runner_get_best_move`
@@ -214,18 +214,18 @@ the solver's ranking. It writes an `analysis` field on each position, one of
 1. **The allowed keys.** Add the request keys from the table to
    `src/def/contribute_defs.h`:
    - `endgame_plies` and `peg_max_bag` join `contribute_required_player_keys`
-     (`config.c:8105`), so every player states them, if only as 0.
+     (`config.c:8191`), so every player states them, if only as 0.
    - Add a `contribute_required_peg_keys` list, required when
      `peg_max_bag > 0`, and a nested list, required when `peg_nested` is
      true.
 2. **Reset and apply.**
-   - `config_contribute_reset_player_settings` (`config.c:8054`) resets both
+   - `config_contribute_reset_player_settings` (`config.c:8140`) resets both
      players' solver settings to off.
-   - `config_contribute_apply_player_settings` (`config.c:8150`) reads and
+   - `config_contribute_apply_player_settings` (`config.c:8236`) reads and
      range-checks each key, with the same limits birdtest enforces. Any value
      out of range is a `CONTRIBUTE_SERVER_ERROR`, and so is
      `peg_max_bag > 0` with `endgame_plies = 0`.
-3. **The games executor** (`config_contribute_games`, `config.c:8509`) passes
+3. **The games executor** (`config_contribute_games`, `config.c:8597`) passes
    the settings and the worker's thread count to `AutoplayArgs`.
 4. **The other executors.** The opening-rack executor ignores the settings: an
    opening rack never reaches a small bag. The leave executor also ignores
@@ -263,7 +263,7 @@ in place, as [PLAN.md](PLAN.md) prescribes until release.
 
 1. **`player_configs`** gets the columns in the [settings table](#the-settings)
    and a CHECK, `player_configs_solver_settings`, next to the existing
-   simulation CHECK ([L611](backend/migrations/0001_initial.sql#L611)):
+   simulation CHECK ([L617](backend/migrations/0001_initial.sql#L617)):
    - `endgame_plies BETWEEN 0 AND 25` and `peg_max_bag BETWEEN 0 AND 4`;
    - `endgame_plies > 0 OR peg_max_bag = 0`;
    - when `peg_max_bag = 0`, every other PEG column is NULL;
@@ -274,11 +274,11 @@ in place, as [PLAN.md](PLAN.md) prescribes until release.
    Update the column comment block to say the solver settings apply to games
    and game-pairs jobs only, and that `endgame_plies = 0` turns PEG off too.
 2. **`position_analysis_records`**
-   ([L1107](backend/migrations/0001_initial.sql#L1107)) gets
+   ([L1113](backend/migrations/0001_initial.sql#L1113)) gets
    `analysis TEXT NOT NULL CHECK (analysis IN ('static','sim','peg','endgame'))`.
    Opening-rack records are `static` or `sim`.
 3. **`position_analysis_moves`**
-   ([L1205](backend/migrations/0001_initial.sql#L1205)) gets two nullable
+   ([L1211](backend/migrations/0001_initial.sql#L1211)) gets two nullable
    columns, both NULL for static and sim rows:
    - `mean_spread DOUBLE PRECISION`: PEG's mean spread, or the endgame's
      solved spread.

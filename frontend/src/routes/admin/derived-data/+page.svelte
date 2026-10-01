@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
   import { api, type DerivedData } from '$lib/api';
-  import { datetime } from '$lib/format';
+  import { datetime, derivedKind as kind } from '$lib/format';
   import { BUSY_POLL_MS, IDLE_POLL_MS, createPoller } from '$lib/poller';
 
   let rows: DerivedData[] = [];
@@ -56,8 +56,6 @@
   const mib = (bytes: number | null) =>
     bytes === null ? '—' : `${(bytes / 1024 / 1024).toFixed(0)} MiB`;
 
-  const kind = (role: string) => (role === 'wmp' ? 'Wordmap' : 'Rack info table');
-
   // Rows a builder of this version takes: one queued for another is never
   // built here, so it neither waits nor can be retried, and counted in these
   // it held the banners up for good.
@@ -67,8 +65,9 @@
 
 <h1 class="mb-2 text-2xl font-semibold">Derived data</h1>
 <p class="mb-6 text-sm text-muted-foreground">
-  Wordmaps and rack info tables are built on each contributor’s own machine and are far too
-  large to ship — 179&nbsp;MB and 1.9&nbsp;GB for CSW24 — so the server builds a reference copy
+  Wordmaps, rack info tables and word info tables are built on each contributor’s own machine
+  and are far too large to ship — 179&nbsp;MB, 1.9&nbsp;GB and 122&nbsp;MB for CSW24 — so the
+  server builds a reference copy
   with its pinned MAGPIE and publishes the SHA-256 for workers to reproduce. A worker whose
   own build has different bytes declines the task with <code>derived_mismatch</code> rather
   than playing with a file nobody checked.
@@ -76,10 +75,10 @@
 <p class="mb-6 text-sm text-muted-foreground">
   <strong>A job that needs one of these is not dispatched until it says “built”.</strong>
   That is the usual reason an active job is handing out no work. Builds run in a scheduled
-  task (<code>birdtest-derived-builder</code>); a wordmap takes a couple of seconds and a rack
-  info table one to three minutes. Once the job is handed out, each contributor builds its own
-  copy the first time it gets a task that needs one, which costs it the same minutes and about
-  2.4&nbsp;GB of memory while it builds.
+  task (<code>birdtest-derived-builder</code>); a wordmap or a word info table takes a couple of
+  seconds and a rack info table one to three minutes. Once the job is handed out, each
+  contributor builds its own copy the first time it gets a task that needs one, which costs it
+  the same time, and for a rack info table about 2.4&nbsp;GB of memory while it builds.
 </p>
 
 {#if error}
@@ -110,7 +109,7 @@
 {#if rows.length === 0 && !error}
   <p class="text-muted-foreground">
     Nothing has been asked for yet. A build is queued when a job is created or activated whose
-    players ask for a wordmap or a rack info table.
+    players ask for a wordmap, a rack info table or a word info table.
   </p>
 {:else}
   <div class="card overflow-x-auto p-0">

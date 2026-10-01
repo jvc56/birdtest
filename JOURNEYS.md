@@ -74,7 +74,7 @@ session. Journeys that need a job to *finish* have you make a small one.
   (distribution `english_ab`, lexicon `CSW21_ab`, eight possible racks). See
   [A-3](#a-3-import-data) and
   [A-12](#a-12-a-leave-generation-job-start-to-finish).
-- **Wordmaps and rack info tables** are built by dev.py itself, within about
+- **Wordmaps, rack info tables and word info tables** are built by dev.py itself, within about
   fifteen seconds of a job needing one; on the real site a scheduled task does
   it every five minutes.
 
@@ -502,7 +502,8 @@ Do this last: it empties the database.
   form: "Stopping % must be above 0 and below 100."
 - [ ] **Do** **Show advanced options**. **Expect** **Use wordmap** and **Use
   rack info table** ticked, with a note that a table costs a contributor about
-  1.9 GB.
+  1.9 GB, and **Use word info table** unticked; ticking it shows a note that
+  the server builds it once per lexicon.
 - [ ] **Do** pair the CSW24 lexicon with the `FRA20` leaves. **Expect** "leaves
   … are not compatible with lexicon …".
 - [ ] **Do** look at **Endgame and pre-endgame**. **Expect** **Solve the
@@ -526,7 +527,7 @@ Do this last: it empties the database.
 - [ ] **Do** delete `static-equity`. **Expect** "a job, a rating pool, a rating
   history or a clone references this player config".
 
-### A-6 Wordmaps and rack info tables
+### A-6 Wordmaps, rack info tables and word info tables
 
 - [ ] **Do** open **Derived data**. **Expect** the CSW24 wordmap and rack info
   table the seeded jobs use, "built", with size and SHA-256.
@@ -536,6 +537,10 @@ Do this last: it empties the database.
 - [ ] **Do** keep **Derived data** open, with nothing building, while you make
   that job in another tab. **Expect** its new rows to appear within about ten
   seconds, without a reload.
+- [ ] **Do** make a player config with **Use word info table** ticked, and a
+  games job with it. **Expect** a "Word info table" row named for the lexicon
+  on **Derived data** and on the job's page, built within seconds, and the
+  config's page to say "Word info table: yes" under **All settings**.
 
 ### A-7 Create jobs
 
@@ -924,8 +929,8 @@ These differ on the real site, and are checked there (README, "Deploying"):
 - Pages are HTTPS only: a page asked for over plain HTTP redirects, and the API
   over plain HTTP answers `426` rather than redirecting.
 - `/api/dev/login` does not exist: `404`.
-- Wordmaps and rack info tables are built by a scheduled task every five
-  minutes, not within seconds.
+- Wordmaps, rack info tables and word info tables are built by a scheduled
+  task every five minutes, not within seconds.
 - Backups run nightly and **Backups** shows them; alarms mail on failure.
 - Contributors connect from other machines.
 

@@ -70,11 +70,11 @@ at tier 5 names a symptom.
 |---|---|---|
 | 1 Unit | 229 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::game_pair`, `jobs::leave_gen`, `routes` (1 each) |
 | 1F Frontend unit | 172 | Vitest, `frontend/src/lib/`: `format.test.ts` (40), `jobSettings.test.ts` (9), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 174 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (15), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (8), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
+| 2 Integration | 175 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (15), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
 | 3 API | 236 | `backend/tests/`: `worker_api.rs` (49), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (19), `public_api.rs` (19), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 19 | Playwright journeys `E-1`..`E-16` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 11 cases + 15 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-12` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 15 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (5), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 6 MAGPIE smoke | 12 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-13` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
@@ -109,7 +109,7 @@ incidentally by higher tiers.
 | `version.rs` | 1 | Covered |
 | `compat.rs` | 1 | Covered |
 | `jobs/racks.rs` | 1 | Covered (`U-RACK-*`) |
-| `derived.rs` | 1 + 2 (+ 6) | Covered — naming and the gate at tier 1, the queue at tier 2 (`I-DERIVED-*`); the build itself at tier 6 (`magpie_smoke.rs`, `M-10`) |
+| `derived.rs` | 1 + 2 (+ 6) | Covered — naming and the gate at tier 1, the queue at tier 2 (`I-DERIVED-*`); the build itself at tier 6 (`magpie_smoke.rs`, `M-10`, `M-13`) |
 | `magpie.rs` | 1 (+ 6) | Covered — the `builders` JSON contract and error bounding at tier 1; the subprocess in the opt-in `magpie_smoke.rs` |
 | `jobs/plausibility.rs` | 1 | Covered |
 | `inputdata.rs` (archive walk) | 1 | Covered (`U-ARCHIVE-*`) |
@@ -2084,7 +2084,7 @@ runs against a real MinIO.
   — two KLVs rather than two wordmap hashes, the conversion the server runs
   for every generation.)*
 
-### `I-DERIVED-*` — wordmaps and rack info tables (`derived.rs`)
+### `I-DERIVED-*` — wordmaps, rack info tables and word info tables (`derived.rs`)
 
 - `I-DERIVED-1` A job whose players ask for a wordmap queues exactly one
   `derived_data` row per (lexicon, distribution), however many players share
@@ -2149,6 +2149,14 @@ runs against a real MinIO.
   `worker_api::a_file_built_under_another_builder_is_queued_under_this_one_by_a_claim`.)*
   (Thirty-first audit: only creating or activating a job queued anything, so
   every such job answered `204` for good.)
+- `I-DERIVED-11` A player asking for a word info table queues one `wit` row,
+  named for its lexicon, with no leaves and no wordmap behind it; its job is
+  not dispatched until it is built; then a claim pins its hash under `wit-1`
+  and sets `use_wit` for that player only. A leave job's player may ask for
+  one -- the table is the lexicon's, which no generation changes. *(Covered:
+  `derived::a_word_info_table_is_the_lexicons_and_waits_like_the_others`;
+  the build at tier 6, `magpie_smoke::a_word_info_table_is_built_from_the_lexicon_alone`
+  and `M-13`.)*
 
 ---
 
@@ -3320,8 +3328,14 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   has a spread and a depth, beside the other player's `static` ones, which
   have none. *(Covered: `case_solvers`, with a small schedule so a game takes
   seconds.)*
+- `M-13` A job with `use_wit` dispatches only once its word info table is
+  built; a worker whose table does not match the recorded hash declines with
+  `derived_mismatch` and both digests reach `worker_data_gaps`; with the right
+  hash a real `magpie contribute` builds the table from the lexicon alone (no
+  wordmap) with the server's bytes and plays with it. *(Covered:
+  `case_word_info_table`, on the two-letter data like `M-10`.)*
 
-`M-10` and the `capture` case run on MAGPIE's small data, which the script
+`M-10`, `M-13` and the `capture` case run on MAGPIE's small data, which the script
 serves as a tarball from a GitHub stand-in it runs itself
 (`--github-fixture-port`; the backend's `GITHUB_API_URL` and `GITHUB_RAW_URL`
 point at it -- set through compose's `BIRDTEST_GITHUB_API_URL` and
@@ -3785,10 +3799,11 @@ GitHub Actions.
 7. **magpie-contract** — MAGPIE's half of the contract: check out MAGPIE at the
    commit `docker/Dockerfile` pins, copy this branch's `contract-fixtures/` over its
    `test/birdtest_contract/`, and run `magpie_test contribute`; then
-   `magpie_test builderhash` (the wordmap, rack info table and both KLV
-   builders -- `createdata klv` and `rackequity2klv` -- against their pinned
-   hashes), and then every command the server invokes (`convert dawg2wordmap`,
-   `convert klvwmp2rit`, `createdata klv`, `convert rackequity2klv`), run as
+   `magpie_test builderhash` (the wordmap, rack info table, word info table
+   and both KLV builders -- `createdata klv` and `rackequity2klv` -- against
+   their pinned hashes), and then every command the server invokes (`convert
+   dawg2wordmap`, `convert klvwmp2rit`, `convert kwg2wit`, `createdata klv`,
+   `convert rackequity2klv`), run as
    the server runs it on MAGPIE's two-letter test data, each required to exit 0
    with no error and to write its file. A fixture
    changed here and not in MAGPIE fails here; a MAGPIE-side change is caught

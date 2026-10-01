@@ -34,6 +34,12 @@ Each case is selectable with `--cases` (default: every M case):
 - `M-11` A worker whose wordmap does not match the hash the server recorded
   declines with `derived_mismatch`, and both digests reach
   `worker_data_gaps`.
+- `M-12` Players that solve their endgames and pre-endgames.
+- `M-13` A `use_wit` job is not dispatched until its word info table is
+  built. A worker whose table does not match the server's hash declines with
+  `derived_mismatch`; with the right hash it builds a table with the server's
+  bytes, from the lexicon alone (no wordmap), and plays with it. On the
+  two-letter data, like M-10.
 
 And one case that is not a test: `capture` runs one job of each type through
 `scripts/capture_contract.py`'s recording proxy and writes the contract
@@ -988,6 +994,76 @@ def case_rack_info_table(ctx: Context) -> None:
             worker.remove()
 
 
+def case_word_info_table(ctx: Context) -> None:
+    """M-13"""
+    deactivate_everything(ctx)
+    remove_small_data(ctx)
+    worker = None
+    where = "role = 'wit' AND name = 'CSW21_ab' AND state = 'built'"
+    try:
+        data = small_data(ctx)
+        # Player 1 alone asks for the table, and neither asks for a wordmap:
+        # the table is built from the .kwg alone.
+        players = {
+            "player1_config_id": create_player(ctx, data, "e2e-ab-wit-equity",
+                                               {"use_wit": True, "use_wordmap": False,
+                                                "use_rit": False}),
+            "player2_config_id": create_player(ctx, data, "e2e-ab-wit-score",
+                                               {"sort_strategy": "score", "use_wordmap": False,
+                                                "use_rit": False}),
+        }
+        mismatched = create_and_activate(ctx, data, games_body(players, 2))
+        roles = ctx.psql("SELECT string_agg(role || ' ' || name || ' ' || state, ', ') "
+                         "FROM derived_data WHERE kwg_id = "
+                         f"'{data['kwg']}'")
+        expect(roles == "wit CSW21_ab pending", f"derived rows before any build: {roles!r}")
+        claim = requests.post(f"{ctx.args.api}/api/worker/task",
+                              json={"magpie_version": "0.1.1", "unsupported_jobs": []},
+                              timeout=30)
+        expect(claim.status_code == 204,
+               f"a job waiting on its table dispatched: {claim.status_code} {claim.text[:300]}")
+
+        build_derived(ctx)
+        server_hash = ctx.psql(f"SELECT sha256 FROM derived_data WHERE {where}")
+        expect(len(server_hash) == 64, f"no built word info table recorded: {server_hash!r}")
+
+        # A server whose builder differs: some other hash, written before the
+        # job's first claim (the claim path remembers a job's hashes).
+        altered = server_hash[:-1] + ("0" if server_hash[-1] != "0" else "1")
+        ctx.psql(f"UPDATE derived_data SET sha256 = '{altered}' WHERE {where}")
+        worker = Worker(ctx, "m13", small=True)
+        output = worker.run(tasks=1, succeed=False)
+        expect("declining this task: a file built here does not match" in output,
+               f"MAGPIE did not decline over the word info table:\n{output[-2000:]}")
+        expect(decline_reasons(ctx, mismatched) == ["derived_mismatch"],
+               f"decline reasons: {decline_reasons(ctx, mismatched)}")
+        gaps = data_gaps(ctx, mismatched)
+        expect(gaps == [["wit", "CSW21_ab", altered, server_hash]],
+               f"worker_data_gaps: {gaps}, expected wit CSW21_ab {altered} / {server_hash}")
+        ctx.psql(f"UPDATE derived_data SET sha256 = '{server_hash}' "
+                 "WHERE role = 'wit' AND name = 'CSW21_ab'")
+        delete_job(ctx, mismatched)
+
+        # The same players in a new job, with the server's own hash.
+        job_id = create_and_activate(ctx, data, games_body(players, 2))
+        worker.run(tasks=2)
+        built = list(worker.data.rglob("CSW21_ab.wit"))
+        expect(len(built) == 1, f"the worker built no CSW21_ab.wit: {built}")
+        expect(sha256_file(built[0]) == server_hash,
+               f"the worker's table {sha256_file(built[0])} is not the server's {server_hash}")
+        expect(not list(worker.data.rglob("CSW21_ab.wmp")),
+               "the worker built a wordmap nobody asked for")
+        expect(completed_claims(ctx, job_id) == 2, "the word-info-table job completed no tasks")
+        stats = ctx.get(f"/api/jobs/{job_id}", "job stats")
+        expect(stats["games"]["units_completed"] == 4, f"games: {stats['games']}")
+        log(f"M-13: dispatched only after the build; a wrong hash is declined; the worker's "
+            f"CSW21_ab.wit matches {server_hash[:12]} and played 4 games with it")
+    finally:
+        remove_small_data(ctx)
+        if worker:
+            worker.remove()
+
+
 def case_derived_mismatch(ctx: Context) -> None:
     """M-11: the server's recorded wordmap hash is not what this build makes."""
     deactivate_everything(ctx)
@@ -1119,6 +1195,7 @@ CASES = {
     "M-10": case_rack_info_table,
     "M-11": case_derived_mismatch,
     "M-12": case_solvers,
+    "M-13": case_word_info_table,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

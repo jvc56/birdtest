@@ -378,6 +378,7 @@ export interface PlayerConfig {
   time_limit_secs: number | null;
   use_wordmap: boolean;
   use_rit: boolean;
+  use_wit: boolean;
   min_play_iterations: number | null;
   threshold: string | null;
   sampling_rule: string | null;
@@ -480,9 +481,9 @@ export interface BackupStatus {
   recent: BackupRun[];
 }
 
-/** One wordmap or rack info table a job needs, and where its build stands. */
+/** One wordmap, rack info table or word info table a job needs, and where its build stands. */
 export interface JobDerivedFile {
-  /** `wmp` or `rit`. */
+  /** `wmp`, `rit` or `wit`. */
   role: string;
   name: string;
   /** `pending` | `building` | `built` | `failed`. */
@@ -492,15 +493,16 @@ export interface JobDerivedFile {
 }
 
 /**
- * A wordmap or rack info table the server builds a reference copy of.
+ * A wordmap, rack info table or word info table the server builds a reference
+ * copy of.
  *
- * Neither file is shipped — 179 MB and 1.9 GB for CSW24 — so what travels to a
- * worker is the SHA-256 the server's own pinned MAGPIE got from the same
+ * None of them is shipped — 179 MB, 1.9 GB and 122 MB for CSW24 — so what
+ * travels to a worker is the SHA-256 the server's own pinned MAGPIE got from the same
  * inputs. A job that needs one is not dispatched until it is `built`, which is
  * why this page exists: an active job doing nothing usually has a row here.
  */
 export interface DerivedData {
-  /** `wmp` or `rit`. */
+  /** `wmp`, `rit` or `wit`. */
   role: string;
   /** What the worker loads it as: a lexicon, or `<lexicon>.<leaves>`. */
   name: string;
