@@ -39,13 +39,32 @@ One command brings up the stack, seeds it, starts real MAGPIE contributors and
 opens the site:
 
 ```bash
-./scripts/dev.py
+./scripts/dev.py --pairs-job
 ```
 
 That is the whole setup. It waits for the backend, imports the MAGPIE-DATA
-tarball your own checkout installed, creates two player configs and an active
-game-pairs job, launches four `magpie contribute` workers, and opens
-**http://localhost:5173** signed in as the seeded admin.
+tarball your own checkout installed, creates the jobs its job flags ask for
+(here one game-pairs job, and its two player configs), launches four `magpie
+contribute` workers, and opens **http://localhost:5173** signed in as the
+seeded admin.
+
+**It starts with no job.** Each job flag adds one, created and activated -- or
+reused, when an active job of its name is already running -- and they stack:
+
+| Flag | The job |
+|---|---|
+| `--leavegen-job` | "dev leave generation (english_ab)": six generations, targets 100, 200, 500, 1,000, 1,000 and 1,000 occurrences per rack, on the two-letter test data below, so it finishes in minutes |
+| `--opening-rack-job` | "dev opening racks (english_ab)": the two-letter data's eight racks, two to a task |
+| `--games-job` | "dev games": `static-equity` against `static-score` on `--lexicon` |
+| `--pairs-job` | "dev game pairs (first divergences saved)": the same two players in pairs, saving the positions where each pair first diverges |
+
+New jobs share the allocation the active ones leave free, so four on a fresh
+database get 25% each. The games and pairs jobs stop at 100,000 games or pairs
+if their test has not decided first, and neither test is acted on before
+50,000 games or pairs. Their players use a
+wordmap and a rack info table; the workers share one ~1.9 GB copy of the
+table (dev.py runs them with `-ritmmap true`, so it is mapped rather than read
+into each), and `--no-rit` seeds players without one.
 
 The workers run in the background and write to
 `.dev-workers/worker-NN/contribute.log`. With `--worker-windows` each runs in
@@ -56,7 +75,8 @@ identity, and a second Ctrl-C, or closing the window, leaves it stopped.
 Either way, Ctrl-C in dev.py stops every worker.
 
 **A small data set to import.** While it runs, `dev.py` also serves MAGPIE's
-two-letter test data — the `english_ab` distribution and the `CSW21_ab`
+two-letter test data, which `--leavegen-job` and `--opening-rack-job` are
+seeded on — the `english_ab` distribution and the `CSW21_ab`
 lexicon, eight possible racks — as MAGPIE-DATA version `20000101` on branch
 `two-letter`, which the **Input data** page imports like any other. It stands in
 for GitHub on Docker's bridge address (port 8482) and passes every other
@@ -104,7 +124,7 @@ Everything worth varying is a flag; `./scripts/dev.py --help` is the full list.
 ```bash
 ./scripts/dev.py --workers 6                  # six contributors instead of four
 ./scripts/dev.py --workers 1 --threads 12     # one contributor, more threads each
-./scripts/dev.py --job-type games             # seed a plain games job
+./scripts/dev.py --games-job --leavegen-job    # start with a games job and a small leave job
 ./scripts/dev.py --no-browser                 # SSH sessions and CI (prints the sign-in link)
 ./scripts/dev.py --login-as alice             # open the site signed in as another account
 ./scripts/dev.py --hot-reload                 # add the Vite dev server on :5174
@@ -120,21 +140,10 @@ drops the schema so the backend rebuilds it; the database's data goes, the
 MinIO bucket stays, and `scripts/dev-dump.sh` snapshots both first if you want
 them. Add `--rebuild` when the images predate the change.
 
-The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
+The fresh database is seeded with:
 
-- the `dev` admin;
-- six jobs at equal allocation: games, opening racks, a small leave
-  generation, and three game-pairs jobs among three players — `static-equity`,
-  `static-score` and `sim-1ply` (a 1-ply sim, 100 iterations) — one for each
-  pair of them. The static-equity vs sim-1ply job saves the positions its
-  games analyse (`capture_positions`). Every player uses a wordmap and a rack
-  info table. The workers share one ~1.9 GB copy of the table (dev.py runs
-  them with `-ritmmap true`, so it is mapped rather than read into each), and
-  `--no-rit` seeds players without one. Games jobs stop at 100,000 games
-  and pairs jobs at 100,000 pairs, if their test has not decided first; a
-  pairs job's test is not acted on before 50,000 pairs (a games job's before
-  100 games). A rating pool of the
-  three players rates them from whatever pairs have been played so far;
+- the `dev` admin and the input data;
+- the jobs the job flags ask for, and none without one;
 - two contributor accounts, `dev-contributor-1` and `-2`, each with a new API
   key that workers 3 and 4 run under and keep in their `contribute.txt` for
   later runs. Workers 1 and 2 contribute anonymously.
@@ -147,8 +156,8 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | `--idle-wait` | 5 | Seconds a contributor waits when there is no work |
 | `--build-threads` | `$MAGPIE_THREADS`, or every core | Threads the server's wordmap / rack info table builder gives MAGPIE |
 | `--api-key` | anonymous | Contribute under an account instead of anonymously |
-| `--job-type` | `game_pairs` | `game_pairs`, `games` or `opening_rack` |
-| `--lexicon`, `--variant` | NWL23, classic | What the seeded job plays |
+| `--leavegen-job`, `--opening-rack-job`, `--games-job`, `--pairs-job` | none | The jobs to start with, which stack: see above |
+| `--lexicon`, `--variant` | CSW24, classic | What the games and pairs jobs play |
 | `--tarball-date` | your `DATA_VERSION` | Which MAGPIE-DATA version to import |
 | `--min-magpie-version` | your build's version | The version floor, on the server and on the job |
 | `--web-port`, `--backend-port` | 5173, 8080 | Host ports |
@@ -156,10 +165,10 @@ The fresh database is seeded with a full set, all on CSW24 (`--lexicon`):
 | `--workdir` | `.dev-workers` | Where per-worker directories live |
 | `--reset-workers` | off | Delete them first, so each starts as a brand-new anonymous worker (the keyed workers lose their keys until the next `--reset-db`) |
 | `--rebuild` | off | Rebuild images before starting |
-| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with six jobs (three of them game pairs among three players) and the two contributor accounts: see below |
+| `--reset-db` | off | Drop the database's schema before starting, so the backend rebuilds it (after a schema change), and seed the fresh database with the admin, the input data, the jobs the job flags ask for and the two contributor accounts: see below |
 | `--fresh` | off | Start as a new deployment does: `--reset-db` and `--reset-workers` without the seed, so no accounts, data imports or jobs; opens signed out and prints how to become the first admin |
 | `--keep-up` | off | Leave the stack running on exit instead of stopping it |
-| `--no-seed` | off | Skip seeding (the stack already has an active job) |
+| `--no-seed` | off | Skip seeding: no admin, data import or job (refused beside a job flag) |
 | `--no-up` | off | Assume the stack is already running |
 | `--login-as` | the seeded admin (`--username`) | Open the site signed in as this account |
 | `--no-login` | off | Open the site signed out |

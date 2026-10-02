@@ -4,7 +4,15 @@
 One command: start the stack, wait for it, seed it, launch N `magpie
 contribute` processes -- in the background, or with --worker-windows each in
 its own terminal window, so one can be stopped and restarted by hand -- and
-open the site. It is tier 6's setup with the
+open the site.
+
+It starts with no job. Each job flag adds one, and they stack:
+
+    scripts/dev.py --leavegen-job --pairs-job
+
+--leavegen-job and --opening-rack-job run on MAGPIE's two-letter test data
+(`english_ab`, eight possible full racks), so they finish in minutes;
+--games-job and --pairs-job run on --lexicon. It is tier 6's setup with the
 assertions removed, and it calls the same `scripts/seed.py`,
 so the development environment cannot drift from what the tests exercise.
 
@@ -601,12 +609,25 @@ def stop_contributors(processes: list) -> None:
 # --- the run ----------------------------------------------------------------
 
 
+# The jobs dev.py can start with: its flag, seed.py's name for the job, and
+# whether it runs on the two-letter test data.
+DEV_JOB_FLAGS = (
+    ("leavegen_job", "leave_generation", True),
+    ("opening_rack_job", "opening_rack", True),
+    ("games_job", "games", False),
+    ("pairs_job", "game_pairs", False),
+)
+
+
+def requested_jobs(args) -> List[tuple]:
+    """(seed.py's job name, on the two-letter data?) for each job flag given."""
+    return [(job, small) for flag, job, small in DEV_JOB_FLAGS if getattr(args, flag)]
+
+
 def run_seed(args, api_url: str, magpie_root: Path, floor: str) -> None:
     command = [
         sys.executable, str(REPO_ROOT / "scripts" / "seed.py"),
         "--api", api_url,
-        "--job-type", args.job_type,
-        "--job-name", f"dev {args.job_type.replace('_', ' ')}",
         "--magpie-root", str(magpie_root),
         "--username", args.username,
         "--password", args.password,
@@ -620,13 +641,22 @@ def run_seed(args, api_url: str, magpie_root: Path, floor: str) -> None:
                         ("--lexicon", args.lexicon), ("--variant", args.variant)):
         if value:
             command += [flag, str(value)]
-    # A fresh database gets the whole set: a job of every type at equal
-    # shares, and contributor accounts whose keys the keyed workers run under.
+    # Only the jobs asked for; new ones share the allocation the active jobs
+    # leave free.
+    jobs = requested_jobs(args)
+    if not jobs:
+        command.append("--no-job")
+    for job, _ in jobs:
+        command += ["--dev-job", job]
+    if any(small for _, small in jobs):
+        import e2e_magpie
+        command += ["--small-tarball-date", e2e_magpie.SMALL_DATE,
+                    "--small-git-ref", e2e_magpie.SMALL_REF]
+    # A fresh database gets contributor accounts whose keys the keyed workers
+    # run under.
     keys_file = Path(args.workdir).expanduser().resolve() / ".contributor-keys.json"
     if args.reset_db:
-        # Six jobs at equal shares, on seed.py's caps and SPRT minimums.
-        command += ["--all-job-types", "--allocation", str(100 // 6),
-                    "--contributors", str(len(KEYED_WORKERS)), "--keys-out", str(keys_file)]
+        command += ["--contributors", str(len(KEYED_WORKERS)), "--keys-out", str(keys_file)]
     if args.no_rit:
         command.append("--no-rit")
     if subprocess.run(command, cwd=REPO_ROOT).returncode != 0:
@@ -706,11 +736,9 @@ def build_parser() -> argparse.ArgumentParser:
                        help="drop the database's schema first, and let the backend rebuild it: "
                             "needed after a schema change, since the one migration is edited "
                             "in place until release (its data goes; the MinIO bucket is kept). "
-                            "The fresh database is seeded, on --lexicon, with six jobs at equal "
-                            "shares -- games, opening racks, leave generation and three game-pairs "
-                            "jobs among three players, which a rating pool can rate -- and two "
-                            "contributor accounts whose keys workers 3 and 4 run "
-                            "under")
+                            "The fresh database is seeded with the admin, the input data, the "
+                            "jobs the job flags ask for (none without one), and two "
+                            "contributor accounts whose keys workers 3 and 4 run under")
     stack.add_argument("--fresh", action="store_true",
                        help="start birdtest as a new deployment does: --reset-db and "
                             "--reset-workers, then no seeding -- no accounts, no data imports, "
@@ -727,19 +755,34 @@ def build_parser() -> argparse.ArgumentParser:
                        help="fleet-wide version floor (default: the version your MAGPIE "
                             "checkout reports, so your own build can contribute)")
 
+    jobs = parser.add_argument_group(
+        "jobs",
+        "dev.py starts with no job; each of these adds one, created and activated (or, when an "
+        "active one of its name is already running, reused), and they stack. New jobs share "
+        "the allocation the active ones leave free")
+    jobs.add_argument("--leavegen-job", action="store_true",
+                      help="a leave-generation job of six generations, targets 100, 200, 500, "
+                           "1000, 1000, 1000, on the two-letter english_ab data: done in minutes")
+    jobs.add_argument("--opening-rack-job", action="store_true",
+                      help="an opening-rack job on the two-letter english_ab data: its eight "
+                           "racks, two to a task")
+    jobs.add_argument("--games-job", action="store_true",
+                      help="a games job on --lexicon: static equity against static score")
+    jobs.add_argument("--pairs-job", action="store_true",
+                      help="a game-pairs job on --lexicon, static equity against static score, "
+                           "saving the positions where each pair first diverges")
+
     seeding = parser.add_argument_group("seeding")
     seeding.add_argument("--no-seed", action="store_true",
-                         help="skip seeding; use when the stack already has an active job")
-    seeding.add_argument("--job-type", default="game_pairs",
-                         choices=["game_pairs", "games", "opening_rack"],
-                         help="job to create and activate (default: %(default)s)")
+                         help="skip seeding (the admin, the input data and any job flags)")
     seeding.add_argument("--lexicon", default="CSW24",
-                         help="lexicon for the seeded jobs and their players (default: %(default)s)")
+                         help="lexicon for --games-job and --pairs-job and their players "
+                              "(default: %(default)s)")
     seeding.add_argument("--variant", default=None, choices=["classic", "wordsmog"])
     seeding.add_argument("--no-rit", action="store_true",
-                         help="seed players without a rack info table (~1.9 GB, which the "
-                              "workers map and share, and a few minutes' build per worker "
-                              "data directory)")
+                         help="seed --games-job's and --pairs-job's players without a rack info "
+                              "table (~1.9 GB, which the workers map and share, and a few "
+                              "minutes' build per worker data directory)")
     seeding.add_argument("--tarball-date", default=None,
                          help="MAGPIE-DATA tarball YYYYMMDD (default: the DATA_VERSION your "
                               "MAGPIE checkout installed, so the server's digests match "
@@ -803,6 +846,10 @@ def main() -> int:
     load_env_file()
     parser = build_parser()
     args = parser.parse_args()
+    asked = [f"--{flag.replace('_', '-')}" for flag, _, _ in DEV_JOB_FLAGS if getattr(args, flag)]
+    if asked and (args.fresh or args.no_seed):
+        parser.error(f"{' '.join(asked)} {'is' if len(asked) == 1 else 'are'} seeded, and "
+                     f"--{'fresh' if args.fresh else 'no-seed'} seeds nothing")
     if args.fresh:
         if args.login_as:
             parser.error("--fresh makes no accounts, so there is nobody to --login-as")
@@ -846,8 +893,13 @@ def main() -> int:
     # environment compose reads.
     if not args.no_up:
         start_data_standin(magpie_root)
-    if os.environ.get("BIRDTEST_GITHUB_API_URL"):
+    small_jobs = any(small for _, small in requested_jobs(args))
+    if os.environ.get("BIRDTEST_GITHUB_API_URL") or small_jobs:
         install_small_data(magpie_root, data)
+    if small_jobs and args.no_up:
+        log("the english_ab jobs import the two-letter test data through the stand-in of the "
+            "dev.py that started the stack; if that one has stopped and the data is not "
+            "imported yet, seeding fails: restart without --no-up")
 
     if args.reset_db:
         reset_database()

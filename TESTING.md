@@ -3731,11 +3731,16 @@ scripts/seed.py [--api URL] [--job-type TYPE] [--tarball-date YYYYMMDD]
    playing out identically.
 5. Create a job of the requested type, with an explicit version floor — a job
    records the floor it was created under, so leaving it implicit lets one
-   created earlier keep declining an unreleased local build for ever.
-6. Activate it with an allocation.
+   created earlier keep declining an unreleased local build for ever. Or,
+   with `--dev-job` (repeatable), dev.py's named jobs instead -- the two on
+   the two-letter test data import it first (`--small-tarball-date`,
+   `--small-git-ref`) -- or, with `--no-job`, none.
+6. Activate it with an allocation; dev.py's new jobs share what the active
+   ones leave free.
 
 Re-running is safe: an unconfirmed account is confirmed, an imported tarball is
-skipped, and an active job of the same type is reused rather than duplicated.
+skipped, and an active job of the same type -- and name, for dev.py's -- is
+reused rather than duplicated.
 
 ### What tiers 2 and 3 must *not* share
 
@@ -3756,11 +3761,13 @@ easier in the moment.
 ## The development environment
 
 ```
-scripts/dev.py [-w N] [--threads N] [--job-type TYPE] [--no-browser] ...
+scripts/dev.py [-w N] [--threads N] [--leavegen-job] [--opening-rack-job]
+               [--games-job] [--pairs-job] [--no-browser] ...
 ```
 
-Brings up the stack, waits for health, seeds it, starts `N` workers, and opens a
-browser. It is tier 6's setup with the assertions and the teardown removed, and
+Brings up the stack, waits for health, seeds it -- the admin, the input data,
+and the jobs its job flags ask for, which stack, and none without one -- starts
+`N` workers, and opens a browser. It is tier 6's setup with the assertions and the teardown removed, and
 it calls the same `seed.py`. `--help` lists the rest; README has the table.
 
 **Both scripts exist and are exercised.** `dev.py` has been run end to end
@@ -3782,9 +3789,10 @@ message naming both when either is missing.
 **Which means `dev.py` seeds from real data, not the fixture.** A real MAGPIE
 cannot be fed the fixture's stub lexica, for exactly the reason tier 6 cannot —
 so the dev environment inherits tier 6's data requirements wholesale, including
-the leave-generation cost noted above. `scripts/dev.py --job-type` passes through
-to the seed; prefer a `games` or `game_pairs` job for day-to-day work and reach
-for `leave_generation` deliberately.
+the leave-generation cost noted above -- except that `--leavegen-job` and
+`--opening-rack-job` run on MAGPIE's two-letter test data (`english_ab`, eight
+racks), which dev.py serves through tier 6's GitHub stand-in, so they finish in
+minutes. Each job flag becomes `seed.py --dev-job`; with none, `--no-job`.
 
 `--no-browser` for SSH sessions and CI.
 

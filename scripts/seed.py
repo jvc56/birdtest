@@ -408,27 +408,41 @@ def job_config(job_type: str, players: list, args) -> dict:
     raise SeedError(f"unknown job type {job_type!r}")
 
 
-def existing_active_job(client: Client, job_type: str) -> Optional[str]:
-    """An active job of this type, if one is already running.
+def active_jobs(client: Client) -> List[dict]:
+    """Every active job, through as many pages as there are."""
+    jobs: List[dict] = []
+    page = 0
+    while True:
+        listed = client.json(client.get(f"/api/jobs?status=active&per_page=100&page={page}"),
+                             "list active jobs")
+        jobs += listed["items"]
+        if len(listed["items"]) < 100:
+            return jobs
+        page += 1
+
+
+def existing_active_job(client: Client, job_type: str, name: str = "") -> Optional[str]:
+    """An active job of this type -- and this name, when it has one -- if one
+    is already running.
 
     Re-seeding should not pile up duplicate active jobs: they would split the
     allocation between identical experiments and make it unclear which one a
     worker is feeding.
     """
-    page = client.json(client.get("/api/jobs"), "list jobs")
-    for job in page["items"]:
-        if job["job_type"] == job_type and job["status"] == "active":
+    for job in active_jobs(client):
+        if job["job_type"] == job_type and (not name or job["name"] == name):
             return job["id"]
     return None
 
 
 def create_job(client: Client, args, data: dict, players: list,
                job_type: Optional[str] = None, name: Optional[str] = None,
-               extra: Optional[dict] = None) -> str:
+               extra: Optional[dict] = None, allocation: Optional[int] = None) -> str:
     job_type = job_type or args.job_type
     name = args.job_name if name is None else name
+    allocation = args.allocation if allocation is None else allocation
     if not args.new_job:
-        already = existing_active_job(client, job_type)
+        already = existing_active_job(client, job_type, name)
         if already:
             log(f"an active {job_type} job already exists ({already}); reusing it")
             return already
@@ -456,11 +470,102 @@ def create_job(client: Client, args, data: dict, players: list,
     log(f"created {job_type} job {job_id}")
 
     client.json(
-        client.post(f"/api/admin/jobs/{job_id}/activate", {"allocation": args.allocation}),
+        client.post(f"/api/admin/jobs/{job_id}/activate", {"allocation": allocation}),
         "activate job",
     )
-    log(f"activated it at {args.allocation}% allocation")
+    log(f"activated it at {allocation}% allocation")
     return job_id
+
+
+# --- the jobs dev.py can start with ------------------------------------------
+
+# Each a job of its own, so any of them can be asked for together. The first
+# two run on MAGPIE's two-letter test data (`english_ab`, eight possible full
+# racks), so they finish in minutes.
+DEV_JOBS = ("leave_generation", "opening_rack", "games", "game_pairs")
+
+DEV_JOB_NAMES = {
+    "leave_generation": "dev leave generation (english_ab)",
+    "opening_rack": "dev opening racks (english_ab)",
+    "games": "dev games",
+    "game_pairs": "dev game pairs (first divergences saved)",
+}
+
+
+def small_input_data(client: Client, args, layout: str) -> dict:
+    """Imports MAGPIE's two-letter test data and returns its ids. It is served
+    by dev.py's GitHub stand-in, under a date and ref no MAGPIE-DATA release
+    has; it brings no board, so the main data's is used."""
+    if not args.small_tarball_date or not args.small_git_ref:
+        raise SeedError("the english_ab jobs need --small-tarball-date and --small-git-ref, "
+                        "the version dev.py serves the two-letter test data as")
+    import_input_data(client, argparse.Namespace(
+        tarball_date=args.small_tarball_date, git_ref=args.small_git_ref,
+        import_timeout=args.import_timeout))
+    rows = client.json(client.get("/api/admin/input-data"), "list input data")
+
+    def find(role: str, name: str) -> str:
+        for row in rows:
+            if row["role"] == role and row["name"] == name:
+                return row["id"]
+        raise SeedError(f"the two-letter test data has no {role} {name}")
+
+    return {"kwg": find("kwg", "CSW21_ab"), "klv": find("klv", "CSW21_ab"),
+            "letterdist": find("letterdist", "english_ab"), "layout": layout, "winpct": None}
+
+
+def create_dev_jobs(client: Client, args, data: dict) -> None:
+    """The jobs asked for with --dev-job, each reused if an active one of its
+    name already runs, the new ones sharing what allocation is free."""
+    wanted = list(dict.fromkeys(args.dev_job))
+    small = (small_input_data(client, args, data["layout"])
+             if {"leave_generation", "opening_rack"} & set(wanted) else None)
+
+    def static_pair() -> list:
+        return [
+            player_config(client, "static-equity", "equity", data, wordmap=args.wordmap, rit=args.rit),
+            player_config(client, "static-score", "score", data, wordmap=args.wordmap, rit=args.rit),
+        ]
+
+    def spec(job: str):
+        """(data, players, settings) for one of DEV_JOBS."""
+        if job == "leave_generation":
+            # Static on equity with no rack info table: it measures the leaves
+            # a table would cache. A generation closes once every one of the
+            # eight racks has been seen its target number of times.
+            player = player_config(client, "ab-static-equity", "equity", small,
+                                   wordmap=args.wordmap, rit=False)
+            return small, [player], {"num_iterations": 1000, "racks_per_task": 50,
+                                     "target_rack_counts": [100, 200, 500, 1000, 1000, 1000]}
+        if job == "opening_rack":
+            # Every play ranked, eight racks two to a task.
+            player = player_config(client, "ab-static-equity-all", "equity", small, recorder="all",
+                                   wordmap=args.wordmap, rit=args.rit)
+            return small, [player], {"racks_per_batch": 2, "rack_size": 7}
+        if job == "games":
+            # Not acted on before 50,000 games, as the pairs job's test waits
+            # 50,000 pairs: equity against score decides within a hundred
+            # games, and a job that finishes in a minute is no use to work on.
+            return data, static_pair(), {"min_games": 50000}
+        # Equity against score diverge within a few turns, so most pairs keep
+        # a position.
+        return data, static_pair(), {"capture_positions": True, "capture_first_divergence": True}
+
+    running = {job: existing_active_job(client, job, DEV_JOB_NAMES[job]) for job in wanted}
+    new = [job for job in wanted if not running[job] or args.new_job]
+    taken = sum(job.get("allocation") or 0 for job in active_jobs(client))
+    share = (100 - taken) // len(new) if new else 0
+    if new and share < 1:
+        raise SeedError(f"the active jobs already take {taken}% of the fleet, leaving nothing "
+                        "for a new one; deactivate some, or start with --reset-db")
+    for job in wanted:
+        job_data, players, settings = spec(job)
+        if job not in new:
+            log(f"{DEV_JOB_NAMES[job]} is already active ({running[job]}); reusing it")
+            continue
+        create_job(client, args, job_data, players, job, DEV_JOB_NAMES[job],
+                   extra=settings, allocation=share)
+    log(f"seeded — {len(wanted)} job(s) active" + (f", the new ones at {share}% each" if new else ""))
 
 
 # --- defaults that come from the contributor's own MAGPIE -------------------
@@ -549,11 +654,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-rit", dest="rit", action="store_false",
                         help="players play without a rack info table (about 1.9 GB of disk "
                              "and of memory per worker process)")
-    parser.add_argument("--all-job-types", action="store_true",
-                        help="create a job of every type -- games, opening racks, leave "
-                             "generation, and three game-pairs jobs among two static players "
-                             "and a 1-ply simming one, so a rating pool can rate all three -- "
-                             "each at --allocation, instead of --job-type")
+    parser.add_argument("--dev-job", action="append", default=[], choices=DEV_JOBS,
+                        help="instead of --job-type, start with this one of dev.py's jobs; "
+                             "repeat for several: leave_generation (six generations on "
+                             "english_ab), opening_rack (english_ab), games, or game_pairs "
+                             "(saving each pair's first divergence). New ones share the "
+                             "allocation the active jobs leave free")
+    parser.add_argument("--no-job", action="store_true",
+                        help="create no job: just the admin and the input data")
+    parser.add_argument("--small-tarball-date", default=None,
+                        help="the version the two-letter test data is imported as, for the "
+                             "english_ab jobs (dev.py serves it)")
+    parser.add_argument("--small-git-ref", default=None,
+                        help="the ref the two-letter test data is resolved at")
     parser.add_argument("--contributors", type=int, default=0,
                         help="contributor accounts to make (dev-contributor-1, ...), each with a "
                              "new API key written to --keys-out")
@@ -581,45 +694,15 @@ def seed(args) -> None:
         if job_type == "opening_rack":
             return [player_config(client, "static-equity-all", "equity", data, recorder="all",
                                   wordmap=args.wordmap, rit=args.rit)]
-        if job_type == "leave_generation":
-            # Leave generation plays statically on equity, with no rack info
-            # table: it measures the leaves a table would cache.
-            return [player_config(client, "static-equity-no-rit", "equity", data,
-                                  wordmap=args.wordmap, rit=False)]
         return [
             player_config(client, "static-equity", "equity", data, wordmap=args.wordmap, rit=args.rit),
             player_config(client, "static-score", "score", data, wordmap=args.wordmap, rit=args.rit),
         ]
 
-    if args.all_job_types:
-        # Every job is made, whatever is active already: three are game pairs.
-        args.new_job = True
-        equity, score = players_for("game_pairs")
-        if not data["winpct"]:
-            raise SeedError("--all-job-types needs a win% model in the data, for its simming player")
-        # A third player, stronger than either static one, on the same files:
-        # three players every pair of whom has a pairs job is a set a rating
-        # pool can rate, once the jobs are done.
-        sim = player_config(client, "sim-1ply", "equity", data, sim={
-            "winpct_id": data["winpct"], "num_plies": 1, "max_iterations": 100,
-            "time_limit_secs": 0, "num_plays": 10, "use_inference": False,
-        }, wordmap=args.wordmap, rit=args.rit)
-        create_job(client, args, data, [equity, score], "games", "dev games")
-        for (p1, n1), (p2, n2), capture in (
-                ((equity, "static equity"), (score, "static score"), False),
-                # One job keeps the positions its games analyse, so the job
-                # page's position search has something to find. The one with
-                # the simmer: its ranked list costs nothing extra to keep,
-                # where a static player records only its best move.
-                ((equity, "static equity"), (sim, "1-ply sim"), True),
-                ((score, "static score"), (sim, "1-ply sim"), False)):
-            create_job(client, args, data, [p1, p2], "game_pairs",
-                       f"dev game pairs: {n1} vs {n2}" + (" (positions saved)" if capture else ""),
-                       extra={"capture_positions": True} if capture else None)
-        create_job(client, args, data, players_for("opening_rack"), "opening_rack", "dev opening racks")
-        create_job(client, args, data, players_for("leave_generation"), "leave_generation",
-                   "dev leave generation")
-        log(f"seeded — six jobs, each at {args.allocation}%")
+    if args.no_job:
+        log("seeded — no job")
+    elif args.dev_job:
+        create_dev_jobs(client, args, data)
     else:
         create_job(client, args, data, players_for(args.job_type))
         log("seeded — the job is active and workers can claim")

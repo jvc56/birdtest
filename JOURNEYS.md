@@ -30,10 +30,12 @@ in and signed out at once.
 ### Start the site
 
 ```bash
-./scripts/dev.py --reset-db --worker-windows
+./scripts/dev.py --reset-db --worker-windows \
+    --leavegen-job --opening-rack-job --games-job --pairs-job
 ```
 
-That drops any earlier local database, starts the stack, seeds it, starts four
+That drops any earlier local database, starts the stack, seeds it with the
+four jobs the job flags ask for (dev.py starts with none otherwise), starts four
 MAGPIE workers — each in its own terminal window, where Ctrl-C stops it and
 Enter starts it again — and opens **http://localhost:5173** (or the
 `WEB_PORT` in your `.env`) signed in as the admin. Ctrl-C in dev.py stops the
@@ -50,14 +52,13 @@ needs a separate run with `--fresh`. Do it last: it empties the database.
 | **Admin** | `dev`, password `devpassword123!` |
 | **Contributor accounts** | `dev-contributor-1` and `dev-contributor-2`, same password; workers 3 and 4 run under their API keys |
 | **Anonymous workers** | Workers 1 and 2 |
-| **Data** | The MAGPIE-DATA version your MAGPIE checkout installed; every job is on CSW24 |
-| **Player configs** | `static-equity`, `static-score`, `sim-1ply` (a 1-ply simmer), `static-equity-all` and `static-equity-no-rit` (the leave job's player) |
-| **Jobs**, each active at 16% | "dev games"; three game-pairs jobs, one for each pair of the three players, of which "static equity vs 1-ply sim" saves its positions; "dev opening racks"; "dev leave generation" |
+| **Data** | The MAGPIE-DATA version your MAGPIE checkout installed, and MAGPIE's two-letter test data (version `20000101`: distribution `english_ab`, lexicon `CSW21_ab`, eight possible full racks) |
+| **Player configs** | `static-equity` and `static-score` on CSW24; `ab-static-equity` (the leave job's player) and `ab-static-equity-all` (the opening-rack job's) on CSW21_ab |
+| **Jobs**, each active at 25% | "dev games" and "dev game pairs (first divergences saved)", `static-equity` against `static-score` on CSW24; "dev opening racks (english_ab)"; "dev leave generation (english_ab)", six generations |
 
-The seeded games and pairs jobs run for hours: their cap is 100,000, and a
-pairs job's test is not acted on before 50,000 pairs. The seeded leave
-generation covers all 3,199,724 English racks and does not finish in a
-session. Journeys that need a job to *finish* have you make a small one.
+The games and pairs jobs run for hours: their cap is 100,000, and neither
+test is acted on before 50,000 games or pairs. The two english_ab jobs finish
+within minutes -- there are only eight racks -- and stay listed as completed.
 
 ### Useful locally
 
@@ -109,15 +110,15 @@ Use a signed-out window for the V journeys unless one says otherwise.
 - [ ] **Expect** "Crowdsourced word game analysis", the buttons **Browse jobs**
   and **Create an account**, and a "Contribute" card with a MAGPIE link and a
   sample `contribute.txt` whose `server` line is this site's own address.
-- [ ] **Expect** "Active jobs" listing the six seeded jobs as cards: name,
-  status badge, "16% allocation". Clicking one opens its job page.
+- [ ] **Expect** "Active jobs" listing the seeded jobs still running as cards:
+  name, status badge, "25% allocation". Clicking one opens its job page.
 - [ ] (With every job deactivated, A-8) **expect** the section gone rather than
   an error.
 
 ### V-3 Browse the jobs
 
 - [ ] **Do** open **Jobs**. **Expect** a table, newest first, with Name, Type,
-  Status, Allocation ("16%"), Redundancy ("1×") and Progress ("value / max
+  Status, Allocation ("25%"), Redundancy ("1×") and Progress ("value / max
   unit": games, pairs, racks or generations).
 - [ ] **Expect** the progress to have moved when you reload a minute later.
 - [ ] A job that workers keep declining, and none has completed in 24 hours,
@@ -128,7 +129,7 @@ Use a signed-out window for the V journeys unless one says otherwise.
 
 ### V-4 A job's page: what every job shows
 
-Open "dev game pairs: static equity vs static score".
+Open "dev game pairs (first divergences saved)".
 
 - [ ] **Expect** the job's name as the title with "Game pairs" beside it, then
   "CSW24 · classic · static, by equity vs static, by score".
@@ -139,12 +140,13 @@ Open "dev game pairs: static equity vs static score".
   by dev" and "requires MAGPIE ≥ …".
 - [ ] **Expect** a Settings card of two tables, each showing its key rows: the
   job's type "Game pairs", variant, letter distribution, board, bingo bonus
-  50, cap 100,000, SPRT "Elo -10 → 10" and records positions; then the
-  players side by side, headed "Player 1" and "Player 2" with each name
-  linking to its config's page and its search under it ("static, by equity" /
-  "static, by score"): lexicon, leaves, plies, plays considered, sort,
-  recorder and plays recorded, the rows they differ in (sort) bold, and plays
-  recorded in grey (a job that records no positions never reads it).
+  50, cap 100,000, SPRT "Elo -10 → 10" and records positions "first
+  divergences"; then the players side by side, headed "Player 1" and "Player
+  2" with each name linking to its config's page and its search under it
+  ("static, by equity" / "static, by score"): lexicon, leaves, plies, plays
+  considered, sort, recorder and plays recorded, the rows they differ in
+  (sort) bold. On "dev games", which records no positions, plays recorded is
+  in grey: it never reads it.
 - [ ] **Do** press **All settings**. **Expect** both tables to grow: the job's
   adds sim cutoff, fewest pairs before the test is acted on (50,000), α, β,
   pairs per task, redundancy and oldest MAGPIE; the players' table every
@@ -212,10 +214,11 @@ and [A-12](#a-12-a-leave-generation-job-start-to-finish), then check:
 
 ### V-8 Opening-rack jobs: look up a rack
 
-Open "dev opening racks".
+Open "dev opening racks (english_ab)".
 
-- [ ] **Expect** "Racks analyzed N / 3,199,724", a **Look up a rack** box, and
-  under it "Analysed racks to try:" with ten racks as buttons.
+- [ ] **Expect** "Racks analyzed 8 / 8" once it has finished (within minutes),
+  a **Look up a rack** box, and under it "Analysed racks to try:" with its
+  racks as buttons, each of A and B only.
 - [ ] **Do** click one. **Expect** it fills the box and shows its ranked moves
   (#, Move, Score, Equity).
 - [ ] **Do** type that rack in lower case and in another order. **Expect** the
@@ -225,44 +228,47 @@ Open "dev opening racks".
 
 ### V-9 Leave-generation jobs
 
-Open "dev leave generation".
+Open "dev leave generation (english_ab)" as soon as dev.py has started: it
+finishes within minutes.
 
-- [ ] **Expect** "Generation 1 of 1 — target 1 occurrences per rack", "N tasks
-  and M games played this generation — live.", a bar of racks at target out of
-  3,199,724, and "Fewest occurrences so far: …" with when the rack figures
-  were last merged (or "not computed yet"), and a note that totals are merged
-  in batches.
-- [ ] **Expect** a Settings card: a "Leave generation" group (generations 1,
-  target per rack 1, games per task 20; racks per task under **All
-  settings**), with no lexicon or wordmap row of its own; then one column
-  headed "Player", `static-equity-no-rit` linking to its config: search
-  "static, by equity", lexicon CSW24, wordmap "yes", rack info table "no" -- and
+- [ ] While it runs, **expect** "Generation g of 6 — target … occurrences per
+  rack", "N tasks and M games played this generation — live.", a bar of racks
+  at target out of 8, and "Fewest occurrences so far: …" with when the rack
+  figures were last merged (or "not computed yet"), and a note that totals are
+  merged in batches. Once done, "Finished …: its last generation was built".
+- [ ] **Expect** a Settings card: a "Leave generation" group (generations 6,
+  target per rack "100, 200, 500, 1,000, 1,000, 1,000", games per task 1,000;
+  racks per task under **All settings**), with no lexicon or wordmap row of
+  its own; then one column headed "Player", `ab-static-equity` linking to its
+  config: search "static, by equity", lexicon CSW21_ab, wordmap "yes", rack
+  info table "no" -- and
   its leaves and recorder in grey, under "Settings in grey are the player
   config's, and this job does not use them." **Do** **All settings**. **Expect**
   win %, plays and plies recorded and the move-gen margin grey too.
 
 ### V-10 Saved positions
 
-Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
+Open "dev game pairs (first divergences saved)".
 
 - [ ] Signed out, **expect** a "Saved positions" card: "This job keeps the
-  position analysed on every turn of its games. Sign in to search them."
+  turn where each game pair's two games first diverged. Sign in to search
+  them."
   **Do** follow **Sign in**, as `dev-contributor-1`. **Expect** to land back on
   this job.
-- [ ] Signed in, **expect** one turn of a game pair: "Turn T of a game pair",
-  then the pair's two games side by side (one above the other on a narrow
-  window), "Game 1 of the pair · PLAYER to move" and "Game 2 of the pair ·
-  PLAYER to move", each with "rack … · after MOVE (score) · N moves ranked by
-  simulation" (or "by static equity", "by pre-endgame solve", "by endgame
-  solve" -- a solved one with **Spread** and **Plies** columns), its board with
-  premium squares (TW, DW, TL, DL and a star on the centre), its tiles each
-  with a letter and a score (a blank a red lower-case letter with none), the
-  tiles MOVE placed outlined, both racks and scores with **to move** on the
-  player whose rack it is, the CGP under the board, and the ranked moves below
-  it, with a **Win %** column on the simmer's turns. Until the two games
-  diverge the boards and racks are the same, with each player to move in one;
-  after, they differ. A turn one game never reached shows alone, saying the
-  other game has no position at that turn.
+- [ ] Signed in, **expect** one turn of a game pair: "Turn T of a game pair,
+  where the players first chose differently", then the pair's two games side
+  by side (one above the other on a narrow window), "Game 1 of the pair ·
+  PLAYER to move" and "Game 2 of the pair · PLAYER to move" -- `static-equity`
+  in one, `static-score` in the other -- each with "rack … · after MOVE
+  (score) · N moves ranked by static equity", its board with premium squares
+  (TW, DW, TL, DL and a star on the centre), its tiles each with a letter and
+  a score (a blank a red lower-case letter with none), the tiles MOVE placed
+  outlined, both racks and scores with **to move** on the player whose rack it
+  is, the CGP under the board, and the ranked moves below it. The two boards
+  and racks are the same, and the moves at the top of the two lists differ.
+  (A pairs job saving every turn shows a turn one game never reached alone,
+  saying the other game has no position at that turn; a simmer's turns add a
+  **Win %** column.)
 - [ ] **Do** **Random position** a few times. **Expect** another position
   each time (now and then the same one again), the board, racks and scores agreeing with the CGP; on a turn 1
   position an empty board and nothing outlined, and after an exchange
@@ -276,7 +282,7 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
   QQQQQQQ."
 - [ ] Narrow the window to phone width. **Expect** the board to shrink with
   it, nothing scrolling sideways.
-- [ ] On the other pairs jobs, **expect** no such section.
+- [ ] On "dev games", **expect** no such section.
 
 ### V-11 Ratings
 
@@ -284,7 +290,7 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
   explanation.
 - [ ] After [A-13](#a-13-rating-pools), **do** open **Ratings** → the pool.
   **Expect** "classic · english · standard15 — anchored at 1500", "Last fit
-  <time> (membership) over N pairs from 3 jobs, K iterations", and a warning
+  <time> (membership) over N pairs from 1 job, K iterations", and a warning
   if the fit did not converge.
 - [ ] **Expect** a dot plot with ±1 standard-error bars and the anchor in
   amber, an "All configs" table (rating, ± SE, pairs; the anchor tagged), and
@@ -297,13 +303,13 @@ Open "dev game pairs: static equity vs 1-ply sim (positions saved)".
 ### V-12 Player configs
 
 - [ ] **Do** open **Players**. **Expect** the four seeded configs, newest first:
-  name, how it searches ("1-ply sim, 100 iterations", "static, by score"),
-  lexicon CSW24, leaves, created.
-- [ ] **Do** open `sim-1ply`. **Expect** "1-ply sim, 100 iterations" beside its
-  name, and a table of Lexicon, Leaves, Plies, Plays considered, Sort, Win %
-  model, Iterations (most), Stopping %, Inference, Recorder and Plays recorded
-  (no simulation rows on `static-equity`), and a JSON download. **Do** press
-  **All settings**. **Expect** every setting in the same table, Lexicon still
+  name, how it searches ("static, by equity", "static, by score"), lexicon
+  (CSW24, or CSW21_ab for the `ab-` ones), leaves, created.
+- [ ] **Do** open `static-equity`. **Expect** "static, by equity" beside its
+  name, and a table of Lexicon, Leaves, Plies, Plays considered, Sort,
+  Recorder and Plays recorded, and a JSON download; a simmer's (A-4) adds Win %
+  model, Iterations (most), Stopping % and Inference. **Do** press **All
+  settings**. **Expect** every setting in the same table, Lexicon still
   first.
 - [ ] **Do** open `/player-configs/00000000-0000-4000-8000-000000000000`.
   **Expect** "no such player config".
@@ -479,10 +485,11 @@ Do this last: it empties the database.
   no data-19990101.tgz …".
 - [ ] **Do** version `2026`. **Expect** "tarball_date must be YYYYMMDD". **Do**
   branch `../x`. **Expect** "that is not a git ref name …".
-- [ ] **Do** version `20000101`, branch `two-letter`. **Expect** "3 new, 0
-  changed, 0 already known." — `CSW21_ab.kwg`, `CSW21_ab.klv2` and
-  `english_ab.csv`. **Do** **Insert 3 rows**. **Expect** "Confirmed. 3 rows
-  inserted." and the three files in the list.
+- [ ] **Expect** the two-letter files the english_ab jobs were seeded on --
+  `CSW21_ab.kwg`, `CSW21_ab.klv2` and `english_ab.csv`, version `20000101`.
+  (Started without `--leavegen-job` or `--opening-rack-job`, importing
+  `20000101` / `two-letter` gives "3 new, 0 changed, 0 already known." and
+  **Insert 3 rows** "Confirmed. 3 rows inserted.")
 - [ ] **Do** import `20000101` / `two-letter` again. **Expect** "0 new, 0
   changed, 3 already known." and "No new data to insert.", with no **Insert**
   button, and `input_data.import_nothing_new` in the audit log.
@@ -592,21 +599,21 @@ start on "Choose…": pick `english` and `standard15` each time.
 
 ### A-8 Activate, share out and deactivate
 
-The six seeded jobs hold 96% between them.
+The seeded games and pairs jobs hold 50% between them once the two english_ab
+jobs have finished (100% while those run).
 
-- [ ] **Do** activate "tester cap" at 10%. **Expect** "the other active jobs
-  already allocate 96% — 4% is the most this job can take".
-- [ ] **Do** deactivate "dev leave generation" (its **Manage** page →
-  **Deactivate**). **Expect** "Job deactivated." and **inactive** in the Status
-  card, the same four cards as the public page's; its public page no longer
-  says "live".
-- [ ] **Do** activate "tester cap" at 16%. **Expect** "Job activated.", "Now:
-  16%", and the workers taking its tasks.
+- [ ] **Do** activate "tester cap" at 60%. **Expect** "the other active jobs
+  already allocate 50% — 50% is the most this job can take".
+- [ ] **Do** deactivate "dev games" (its **Manage** page → **Deactivate**).
+  **Expect** "Job deactivated." and **inactive** in the Status card, the same
+  four cards as the public page's; its public page no longer says "live".
+- [ ] **Do** activate "tester cap" at 25%. **Expect** "Job activated.", "Now:
+  25%", and the workers taking its tasks.
 - [ ] **Do** type 150, then 2.5, and **Activate**. **Expect** "Enter a
   whole-number allocation from 0 to 100."
 - [ ] **Do** change an active job's share and **Activate** again. **Expect** the
   new share taken.
-- [ ] **Do** deactivate every job but one, at 16%. **Expect** that job to get
+- [ ] **Do** deactivate every job but one, at 25%. **Expect** that job to get
   all the work: shares weigh only against the other active jobs.
 - [ ] **Do** create a game-pairs job with **Min MAGPIE version** `9.9.9`, and
   make it the only active one. **Expect** every worker told its MAGPIE is too
@@ -664,15 +671,15 @@ closes in seconds rather than never.
 - [ ] **Do** **Player configs** → **New**: `tester-ab`, recorder **best**, the
   `CSW21_ab` lexicon and leaves, sort **equity**, static.
 - [ ] **Do** **New job**: Leave generation, "tester leaves", letter distribution
-  `english_ab`, board `standard15`, player config `sim-1ply`. **Expect** a red
-  "sim-1ply simulates 1 ply; leave generation plays statically on equity,
-  without a rack info table." (Submitted anyway, the server refuses it the
-  same way.) **Do** pick `tester-ab`, games per task 1,000, racks per task 50,
+  `english_ab`, board `standard15`, player config `ab-static-equity-all`.
+  **Expect** a red "ab-static-equity-all asks for a rack info table; leave
+  generation plays statically on equity, without a rack info table or endgame
+  solving." (Submitted anyway, the server refuses it the same way.) **Do** pick `tester-ab`, games per task 1,000, racks per task 50,
   occurrences per rack per generation "100, 200, 300". **Expect** "3
   generations." under the targets, and Redundancy greyed out: leave generation
   runs at redundancy 1. (**Do** type "100, 0" there first. **Expect** a red
   "Every target must be between 1 and 1,000,000, not 0.")
-- [ ] **Do** make room (A-8) and activate it at 16%. **Expect** its wordmap built
+- [ ] **Do** make room (A-8) and activate it at 25%. **Expect** its wordmap built
   on **Derived data** within about fifteen seconds (A-6).
 - [ ] **Expect**, on its public page, the generations closing one after another
   — "Generation 2 of 3 — target 200 occurrences per rack", "Targets by
@@ -693,13 +700,13 @@ closes in seconds rather than never.
   layout on "Choose…", not filled in.
 - [ ] **Do** **New rating pool**: "tester pool", classic, the `english`
   distribution and `standard15` the seeded jobs use, anchor `static-equity` at
-  1500, with `static-score` and `sim-1ply` ticked. **Expect** the pool's page,
-  fitted, all three rated from the three seeded pairs jobs.
+  1500, with `static-score` ticked. **Expect** the pool's page, fitted, both
+  rated from the seeded pairs job.
 - [ ] **Do** a second pool with nothing ticked. **Expect** "Never computed."
   until a member is added.
-- [ ] **Do** **Remove** `sim-1ply`. **Expect** it gone and the others refitted.
-  **Add** it back. **Expect** every rating to move: its games are evidence for
-  everyone. **Expect** no Remove on the anchor.
+- [ ] **Do** **Remove** `static-score`. **Expect** it gone and the anchor left
+  alone, with nothing to be rated against. **Add** it back. **Expect** it rated
+  again. **Expect** no Remove on the anchor.
 - [ ] **Do** **Recompute**. **Expect** "Last fit … (manual)".
 - [ ] **Do** under **Anchor**, pick `static-score` and 1600, **Save**. **Expect**
   "anchored at 1600", "Last fit … (anchor)", `static-score` marked anchor at
@@ -887,8 +894,8 @@ curl -s -b "$JAR" -H "X-CSRF-Token: $CSRF" -H 'Content-Type: application/json' \
 
 **Create a job, activate it, deactivate it.** Created inactive (`201`);
 activation sets the share (`200`), and a share that would take the active
-jobs past 100% is `409` — with the seed's six jobs active, 4% is the most
-left. This one runs no SPRT and plays its 20 pairs; `"sprt_enabled": true`
+jobs past 100% is `409` — with the seed's games and pairs jobs active, 50% is
+the most left. This one runs no SPRT and plays its 20 pairs; `"sprt_enabled": true`
 turns the test on, with `min_pairs` then required, and `min_pairs`, α, β or
 an Elo bound sent without it is a `400` naming each.
 
