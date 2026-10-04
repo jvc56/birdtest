@@ -6,13 +6,19 @@
    * refuse anyone else.
    *
    * A pairs job's position comes with its partner, the same turn of the
-   * pair's other game, and the two are shown side by side: up to the turn a
-   * pair's games diverge they are one game with the seats swapped, so the two
-   * are each player's answer to one position. A job keeping only first
-   * divergences keeps exactly those.
+   * pair's other game: up to the turn a pair's games diverge they are one game
+   * with the seats swapped, so the two are each player's answer to one
+   * position. A job keeping only first divergences keeps exactly those. Where
+   * the two boards are the same -- always, at a first divergence -- they share
+   * one board, with each player's move drawn on it in that player's colour
+   * (one at a time where the two would cover the same square), and each
+   * player's ranked moves beside it. Boards that differ (a pair whose games
+   * diverged earlier) are shown side by side.
    */
   import { onMount } from 'svelte';
   import { api, errorText, type BoardData, type SavedPosition } from '$lib/api';
+  import { parseCgp, placedTiles, seatToMove } from '$lib/cgp';
+  import Board, { PLAYED_COLORS } from './Board.svelte';
   import PositionPane from './PositionPane.svelte';
 
   export let jobId: string;
@@ -85,6 +91,35 @@
           .filter((p): p is SavedPosition => p !== null)
           .sort((a, b) => a.game_index - b.game_index)
       : [];
+
+  // The board field of a CGP: the racks and scores after it are each game's.
+  const boardOf = (p: SavedPosition) => p.position?.split(' ')[0] ?? null;
+  $: shared = pair.length === 2 && boardOf(pair[0]) !== null && boardOf(pair[0]) === boardOf(pair[1]);
+  $: parsedPair = pair.map((p) => (p.position ? parseCgp(p.position) : null));
+  // Each game's mover: the seat holding its rack, in player order (MAGPIE
+  // writes a CGP's racks player 1's first, whoever started the game).
+  $: movers = pair.map((p, i) => {
+    const parsed = parsedPair[i];
+    return parsed ? seatToMove(parsed, p.rack) : null;
+  });
+  const nameOf = (seat: 0 | 1 | null) => (seat === null ? '' : (players[seat] ?? `Player ${seat + 1}`));
+  const colorOf = (seat: 0 | 1 | null) => PLAYED_COLORS[seat ?? 0];
+  $: sharedPlays = pair.map((p, i) => ({
+    move: p.played_move ?? '',
+    label: `${nameOf(movers[i]) || `Game ${i + 1}`} played ${p.played_move ?? ''}`,
+    color: colorOf(movers[i])
+  }));
+  // Whether the two plays would cover a square in common, which one board
+  // cannot show at once.
+  $: overlap = (() => {
+    const squares = new Set(placedTiles(sharedPlays[0]?.move).map((t) => `${t.row},${t.col}`));
+    return placedTiles(sharedPlays[1]?.move).some((t) => squares.has(`${t.row},${t.col}`));
+  })();
+  let showing: 'both' | 0 | 1 = 'both';
+  // A new position starts from both plays, or the first when they overlap.
+  $: if (position) showing = overlap ? 0 : 'both';
+  $: drawn = showing === 'both' ? sharedPlays : sharedPlays.filter((_, i) => i === showing);
+  const show = (i: number) => (showing = i === 1 ? 1 : 0);
 </script>
 
 <div class="card space-y-4">
@@ -97,7 +132,8 @@
         identically keeps nothing.
       {:else if paired}
         This job keeps the position analysed on every turn of every game: the board, both racks, and
-        the moves the player to move ranked. A pair's two games are shown side by side at one turn.
+        the moves the player to move ranked. A pair's two games are shown at one turn: on one board
+        while they are still the same game, side by side once they have diverged.
       {:else}
         This job keeps the position analysed on every turn of every game: the board, both racks, and
         the moves the player to move ranked.
@@ -153,7 +189,64 @@
     </div>
   {/if}
 
-  {#if position && paired}
+  {#if position && paired && shared && parsedPair[0]}
+    {@const first = pair[0]}
+    {@const mover = movers[0]}
+    <div class="space-y-3" data-testid="saved-pair" data-shared-board>
+      <p class="text-sm">
+        Turn {position.turn_number + 1} of a game pair{#if firstDivergence}, where the players first
+          chose differently{/if}: rack <span class="font-mono" data-testid="position-rack">{first.rack}</span>
+        {#if first.previous_move}
+          · after <span class="font-mono">{first.previous_move}</span> ({first.previous_move_score})
+        {/if}
+        {#if mover !== null}
+          <span class="text-muted-foreground"
+            >· the player to move has {parsedPair[0].scores[mover]}, the other {parsedPair[0].scores[1 - mover]}</span
+          >
+        {/if}
+      </p>
+      <div class="grid gap-6 lg:grid-cols-2">
+        <div class="min-w-0 space-y-2">
+          {#if board}
+            <Board
+              {board}
+              position={parsedPair[0]}
+              previousMove={first.previous_move}
+              played={drawn}
+              toMove={null}
+              {players}
+              showRacks={false}
+            />
+          {/if}
+          {#if overlap}
+            <div class="flex flex-wrap items-center gap-2 text-xs" role="group" aria-label="Which play the board shows">
+              <span class="text-muted-foreground">The two plays share a square. Showing:</span>
+              {#each sharedPlays as play, i}
+                <button
+                  type="button"
+                  class={showing === i ? 'btn-primary' : 'btn-secondary'}
+                  aria-pressed={showing === i}
+                  on:click={() => show(i)}>{nameOf(movers[i]) || `Game ${i + 1}`}</button
+                >
+              {/each}
+            </div>
+          {/if}
+        </div>
+        <div class="grid min-w-0 gap-6">
+          {#each pair as game, i (game.game_index)}
+            <PositionPane
+              position={game}
+              {board}
+              {players}
+              showBoard={false}
+              playedColor={colorOf(movers[i])}
+              heading={`Game ${(game.game_index % 2) + 1} of the pair`}
+            />
+          {/each}
+        </div>
+      </div>
+    </div>
+  {:else if position && paired}
     <div class="space-y-3" data-testid="saved-pair">
       <p class="text-sm">
         Turn {position.turn_number + 1} of a game pair{#if firstDivergence}, where the players first
@@ -166,6 +259,7 @@
             {board}
             {players}
             stacked
+            playedColor={colorOf(movers[pair.indexOf(game)])}
             heading={`Game ${(game.game_index % 2) + 1} of the pair`}
           />
         {/each}

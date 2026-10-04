@@ -74,8 +74,8 @@ pub async fn acquire(
         return Ok(Acquired::Busy);
     }
 
-    // A task whose claim timed out drops back to `available`, and so does a
-    // task with redundancy left to fill, so re-dispatching those comes first.
+    // A task whose claim timed out, or was declined, drops back to
+    // `available`, so re-dispatching those comes first.
     // For games this is what keeps the seed space covered: an abandoned batch
     // is replayed rather than skipped, since nothing else would ever revisit
     // those seeds.
@@ -92,7 +92,7 @@ pub async fn acquire(
     // Every job type generates its tasks at claim time; there is no
     // pre-populated strategy any more.
     match job.job_type {
-        JobType::OpeningRack => generate_opening_rack(conn, job, template).await,
+        JobType::OpeningRack => generate_opening_rack(conn, job, identity, template).await,
         JobType::Games => generate_games(conn, job, template).await,
         JobType::GamePairs => generate_game_pairs(conn, job, template).await,
         JobType::LeaveGeneration => generate_leave_gen(conn, job, identity, template).await,
@@ -102,6 +102,7 @@ pub async fn acquire(
 async fn generate_opening_rack(
     conn: &mut PgConnection,
     job: &Job,
+    identity: &WorkerIdentity,
     template: &JobTemplate,
 ) -> AppResult<Acquired> {
     // `acquire` already holds the job's dispatch lock, which is what this
@@ -111,14 +112,16 @@ async fn generate_opening_rack(
         return Err(template.mismatch("opening_rack"));
     };
     let Some((start, request)) =
-        opening_rack::next_request(conn, job.id, config, &template.data, index, player).await?
+        opening_rack::next_request(conn, job.id, config, &template.data, index, player, identity)
+            .await?
     else {
-        // The rack space is exhausted; nothing left to hand out.
+        // The rack space is covered and no rack a consensus still wants is
+        // free to reissue; nothing left to hand out now.
         return Ok(Acquired::NoWork);
     };
 
     let task_id = insert_on_demand_task(conn, job.id, start).await?;
-    opening_rack::insert_range(conn, task_id, config, &template.data, start, request.racks.len())
+    opening_rack::insert_request(conn, task_id, config, &template.data, start, &request.racks)
         .await?;
     Ok(Acquired::Task { task_id, request: TaskRequest::OpeningRack(request), created: true })
 }
@@ -126,13 +129,10 @@ async fn generate_opening_rack(
 /// An available task this worker may take, locked with `FOR UPDATE SKIP LOCKED`
 /// so concurrent claimers never serialize on one row.
 ///
-/// Excludes tasks this identity already holds a slot on, live or completed.
-/// With redundancy above 1 a task stays `available` after its first claim, and
-/// the per-identity unique index refuses a second slot for the same worker --
-/// correctly, since redundancy means *independent* workers. Without this
+/// Excludes tasks this identity already holds a slot on, live or completed:
+/// the per-identity unique index would refuse a second, and without this
 /// filter the oldest such task would be selected again on every attempt, the
-/// insert would fail every time, and the worker would get nothing at all until
-/// someone else filled the slot.
+/// insert would fail every time, and the worker would get nothing at all.
 ///
 /// And, except in leave generation, tasks this identity declined in the last
 /// hour. A declined task goes
@@ -375,25 +375,18 @@ async fn insert_on_demand_task(
 
 /// Store a worker submission [`decode_result`] has decoded and checked.
 ///
-/// `first_result` says whether this is the first accepted result for its task,
-/// which the caller reads from the task's `accepted_count` under the task's row
-/// lock. Only a first result adds to the job's running totals or folds into a
-/// leave generation: redundant claims replay the same deterministic work.
-///
 /// `template` is the job's immutable configuration, which is where the batch
 /// size a task was dispatched with and the number of moves to keep per
 /// position come from: both are job settings the request rows denormalize, so
 /// reading them from the template costs no round trip inside the task's lock.
 ///
-/// Returns what the result adds to the job's totals (first results only) and
-/// what this claim did, which its contributor is credited with whichever
-/// result it was.
+/// Returns what the result adds to the job's totals and what this claim did,
+/// which its contributor is credited with.
 pub async fn store_result(
     conn: &mut PgConnection,
     template: &JobTemplate,
     task_id: Uuid,
     claim_id: Uuid,
-    first_result: bool,
     decoded: DecodedResult,
 ) -> AppResult<(ProgressDelta, ClaimUnits)> {
     match decoded {
@@ -405,16 +398,29 @@ pub async fn store_result(
                 .await?;
             // One row per rack, and the unique index on (task_claim_id, rack)
             // means the insert above would have failed on a duplicate, so the
-            // submission's length is its distinct-rack count. Racks never
-            // repeat across tasks either: each task analyses its own slice of
-            // the enumerated space.
+            // submission's length is its distinct-rack count -- what its
+            // contributor is credited with. What the job's totals gain depends
+            // on whether its racks were analysed before, which a consensus job
+            // reissues them to be.
+            let JobKind::OpeningRack { config, .. } = &template.kind else {
+                return Err(template.mismatch("opening_rack"));
+            };
+            let tally = opening_rack::record_consensus(conn, template.job_id, config, &racks).await?;
             let racks = record.positions.len() as i64;
-            Ok((ProgressDelta::first_result(first_result, 0, racks), ClaimUnits { games: 0, racks }))
+            Ok((
+                ProgressDelta {
+                    racks_analyzed: tally.analysed,
+                    racks_settled: tally.settled,
+                    racks_without_consensus: tally.without_consensus,
+                    ..ProgressDelta::default()
+                },
+                ClaimUnits { games: 0, racks },
+            ))
         }
         DecodedResult::Games(record) => {
             game::GameHandler::insert_record(conn, template, task_id, claim_id, &record).await?;
             let games = record.all_games.games as i64;
-            Ok((ProgressDelta::first_result(first_result, games, 0), ClaimUnits { games, racks: 0 }))
+            Ok((ProgressDelta { games_completed: games, ..ProgressDelta::default() }, ClaimUnits { games, racks: 0 }))
         }
         DecodedResult::GamePairs(record) => {
             game_pair::GamePairHandler::insert_record(conn, template, task_id, claim_id, &record)
@@ -422,18 +428,14 @@ pub async fn store_result(
             // Games, not pairs, for both job types: the pairs count is half of
             // it and is derived where it is displayed.
             let games = record.all_games.games as i64;
-            Ok((ProgressDelta::first_result(first_result, games, 0), ClaimUnits { games, racks: 0 }))
+            Ok((ProgressDelta { games_completed: games, ..ProgressDelta::default() }, ClaimUnits { games, racks: 0 }))
         }
         DecodedResult::LeaveGeneration(record) => {
             let JobKind::LeaveGeneration { config, .. } = &template.kind else {
                 return Err(template.mismatch("leave_generation"));
             };
-            if first_result {
-                leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
-                    .await?;
-            } else {
-                leave_gen::credit_claim(conn, task_id, claim_id, &record).await?;
-            }
+            leave_gen::LeaveGenHandler::insert_record(conn, template, task_id, claim_id, &record)
+                .await?;
             // A leave task plays the job's `num_iterations` games and stops
             // (its request's `num_games`, written from the same setting), and
             // reports every rack its games drew: the racks it analysed, as the
@@ -618,39 +620,23 @@ static LARGE_RESULT_DECODES: tokio::sync::Semaphore = tokio::sync::Semaphore::co
 const LARGE_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What one accepted result adds to its job's running progress totals: games
-/// played, opening racks analysed. Returned rather than written, so the submit
-/// path can make every change to the job's row in one statement, last.
+/// played, opening racks analysed for the first time, and opening racks that
+/// need no more analysis (and those of them settled without a consensus).
+/// Returned rather than written, so the submit path can make every change to
+/// the job's row in one statement, last.
 ///
-/// Only the first accepted result for its task counts. The reads these totals
-/// replace both selected one result per task -- the aggregates they summed
-/// describe the same deterministic work on every redundant claim, so counting
-/// all of them would multiply the total by the job's redundancy (PLAN.md,
-/// "What these reads cost"). "First" comes from the task's `accepted_count`,
-/// read by `submit_result` under the task's row lock before anything is
-/// stored: every accepted result increments it in the transaction that stores
-/// the result, and that transaction holds the same lock, so two submissions
-/// arriving together cannot both read zero.
+/// A task has one slot, so each accepted result is its task's only one.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ProgressDelta {
     pub games_completed: i64,
     pub racks_analyzed: i64,
-}
-
-impl ProgressDelta {
-    fn first_result(first_result: bool, games: i64, racks: i64) -> Self {
-        if first_result {
-            ProgressDelta { games_completed: games, racks_analyzed: racks }
-        } else {
-            ProgressDelta::default()
-        }
-    }
+    pub racks_settled: i64,
+    pub racks_without_consensus: i64,
 }
 
 /// What one accepted claim did, which its contributor's running totals add
 /// (`users` / `anonymous_workers`, and the claim's own row, from which a purge
-/// gives them back): games played, racks analysed. Unlike [`ProgressDelta`],
-/// every accepted claim counts, not only its task's first result -- a
-/// redundant claim replays the same work, but its contributor still did it.
+/// gives them back): games played, racks analysed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ClaimUnits {
     pub games: i64,

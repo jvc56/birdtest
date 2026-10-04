@@ -5,8 +5,9 @@
   import { subscribeToJob } from '$lib/sse';
   import { session } from '$lib/auth';
   import { datetime, jobTypeLabel, jobTitle } from '$lib/format';
-  import CompletionNote from '$lib/components/CompletionNote.svelte';
+  import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
+  import TaskCounts from '$lib/components/TaskCounts.svelte';
   import WorkerTable from '$lib/components/WorkerTable.svelte';
   import ProgressBar from '$lib/components/ProgressBar.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
@@ -14,6 +15,7 @@
   import SprtCard from '$lib/components/SprtCard.svelte';
   import SavedPositions from '$lib/components/SavedPositions.svelte';
   import { playersLine, type JobConfig } from '$lib/jobSettings';
+  import { analysesPerRack, rackConsensus, type LookupMove } from '$lib/consensus';
 
   // The [id] route only matches when the param is present.
   const jobId = $page.params.id as string;
@@ -26,6 +28,8 @@
   // Opening-rack search
   let rackQuery = '';
   let rackMoves: Record<string, unknown>[] | null = null;
+  $: lookupConsensus = rackMoves ? rackConsensus(rackMoves as unknown as LookupMove[]) : null;
+  $: seeksConsensus = (config?.opening_racks?.max_results_per_rack ?? 1) > 1;
   let rackError = '';
   // A few racks the job has analysed, to try the search on: the newest, from
   // the results feed. Read once, when the page knows it is an opening-rack job.
@@ -99,7 +103,7 @@
         <a href="/admin/jobs/{stats.job.id}" class="btn-secondary ml-auto no-underline">Manage</a>
       {/if}
     </header>
-    <CompletionNote {stats} />
+    <JobStatusCard {stats} />
 
     <JobStatsRow {stats} />
 
@@ -113,11 +117,13 @@
         />
       {:else if stats.opening_racks}
         <!-- Tasks are made on demand, so a task count is only what has been
-             handed out so far: a job 1% through its racks read 99%. -->
+             handed out so far: a job 1% through its racks read 99%. A rack is
+             done once settled, which for a consensus job may take several
+             analyses. -->
         <ProgressBar
-          value={stats.opening_racks.racks_analyzed}
+          value={stats.opening_racks.racks_settled}
           max={stats.opening_racks.racks_total}
-          label="racks analysed"
+          label="racks settled"
         />
       {:else if stats.leave_generation}
         <ProgressBar
@@ -132,14 +138,11 @@
           label="tasks completed"
         />
       {/if}
-      <dl class="grid grid-cols-2 gap-x-6 gap-y-1 text-sm sm:grid-cols-4">
-        <div><dt class="text-muted-foreground">Available</dt><dd class="tabular-nums">{stats.tasks_available.toLocaleString()}</dd></div>
-        <div><dt class="text-muted-foreground">Claimed</dt><dd class="tabular-nums">{stats.tasks_claimed.toLocaleString()}</dd></div>
-        <div><dt class="text-muted-foreground">Completed</dt><dd class="tabular-nums">{stats.tasks_completed.toLocaleString()}</dd></div>
-        <div><dt class="text-muted-foreground">Created</dt><dd>{datetime(stats.job.created_at)}</dd></div>
-      </dl>
+      <TaskCounts {stats} {config} />
       <p class="text-xs text-muted-foreground">
-        Created by <span class="break-all">{stats.job.created_by ?? 'unknown'}</span>{#if stats.job.min_magpie_version}
+        Created by <span class="break-all">{stats.job.created_by ?? 'unknown'}</span>, {datetime(
+          stats.job.created_at
+        )}{#if stats.job.min_magpie_version}
           · requires MAGPIE ≥ {stats.job.min_magpie_version}{/if}
       </p>
     </div>
@@ -151,7 +154,7 @@
     {#if stats.games}
       <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
     {/if}
-    <SprtCard {stats} />
+    <SprtCard {stats} {config} players={config?.players.map((p) => p.name) ?? []} />
 
     {#if config?.games?.capture_positions}
       {#if $session}
@@ -183,7 +186,7 @@
     {#if stats.opening_racks}
       <div class="card space-y-4">
         <h2 class="text-lg font-medium">Opening racks</h2>
-        <dl class="grid grid-cols-2 gap-4 text-sm">
+        <dl class="grid grid-cols-2 gap-4 text-sm sm:grid-cols-3">
           <div>
             <dt class="text-muted-foreground">Racks analyzed</dt>
             <dd class="text-xl tabular-nums">
@@ -193,7 +196,29 @@
               </span>
             </dd>
           </div>
+          {#if seeksConsensus}
+            <div>
+              <dt class="text-muted-foreground" title="Agreed on, or analysed the most times the job allows">
+                Racks settled
+              </dt>
+              <dd class="text-xl tabular-nums">{stats.opening_racks.racks_settled.toLocaleString()}</dd>
+            </div>
+            <div>
+              <dt class="text-muted-foreground" title="Analysed the most times the job allows, their analyses still split">
+                Settled without a consensus
+              </dt>
+              <dd class="text-xl tabular-nums">
+                {stats.opening_racks.racks_without_consensus.toLocaleString()}
+              </dd>
+            </div>
+          {/if}
         </dl>
+        {#if seeksConsensus && config?.opening_racks}
+          <p class="text-xs text-muted-foreground">
+            Each rack is analysed {analysesPerRack(config.opening_racks)}; a rack is settled once
+            they agree, or once it has been analysed the most times, and is not analysed again.
+          </p>
+        {/if}
 
         <div class="space-y-2 border-t border-border pt-4">
           <label class="label" for="rack">Look up a rack</label>
@@ -222,15 +247,27 @@
             </div>
           {/if}
           {#if rackError}<p class="field-error">{rackError}</p>{/if}
+          {#if lookupConsensus && lookupConsensus.analyses > 1}
+            <p class="text-sm" data-testid="rack-consensus">
+              <span class="font-mono">{lookupConsensus.top}</span> is the best move in
+              {lookupConsensus.count} of {lookupConsensus.analyses} analyses ({lookupConsensus.share}%).
+            </p>
+          {/if}
           {#if rackMoves?.length}
             <div class="overflow-x-auto">
             <table class="table">
               <thead>
-                <tr><th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th></tr>
+                <tr>
+                  {#if lookupConsensus && lookupConsensus.analyses > 1}<th>Analysis</th>{/if}
+                  <th>#</th><th>Move</th><th class="text-right">Score</th><th class="text-right">Equity</th>
+                </tr>
               </thead>
               <tbody>
                 {#each rackMoves as move}
-                  <tr>
+                  <tr class:border-t-2={lookupConsensus && lookupConsensus.analyses > 1 && move.rank === 1}>
+                    {#if lookupConsensus && lookupConsensus.analyses > 1}
+                      <td class="tabular-nums">{move.rank === 1 ? move.analysis : ''}</td>
+                    {/if}
                     <td class="tabular-nums">{move.rank}</td>
                     <td class="font-mono text-xs">{move.move}</td>
                     <td class="text-right tabular-nums">{move.score}</td>
@@ -252,12 +289,30 @@
           Generation {lg.current_generation} of {lg.generation_count} — target
           {lg.target_rack_count.toLocaleString()} occurrences per rack
         </h2>
-        {#if new Set(lg.target_rack_counts).size > 1}
-          <p class="text-sm text-muted-foreground">
-            Targets by generation: {lg.target_rack_counts
-              .map((t) => t.toLocaleString())
-              .join(', ')}.
-          </p>
+        {#if lg.generation_count > 1}
+          <div class="overflow-x-auto">
+            <table class="table text-xs" data-testid="leave-generations">
+              <thead>
+                <tr>
+                  <th>Generation</th>
+                  <th class="text-right">Target per rack</th>
+                  <th>State</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each lg.target_rack_counts as target, i}
+                  {@const generation = i + 1}
+                  <tr class:font-medium={generation === lg.current_generation && generation > lg.generations_closed}>
+                    <td class="tabular-nums">{generation}</td>
+                    <td class="text-right tabular-nums">{target.toLocaleString()}</td>
+                    <td>
+                      {#if generation <= lg.generations_closed}closed{:else if generation === lg.current_generation}playing now{:else}to come{/if}
+                    </td>
+                  </tr>
+                {/each}
+              </tbody>
+            </table>
+          </div>
         {/if}
         <p class="text-sm">
           <span class="tabular-nums">{lg.tasks_completed.toLocaleString()}</span> tasks and

@@ -60,7 +60,7 @@
       <thead>
         <tr>
           <th>Name</th><th>Type</th><th>Status</th><th>Allocation</th>
-          <th>Redundancy</th><th class="text-right">Progress</th>
+          <th class="text-right">Progress</th>
         </tr>
       </thead>
       <tbody>
@@ -81,7 +81,6 @@
               {/if}
             </td>
             <td class="tabular-nums">{job.allocation === null ? '—' : `${job.allocation}%`}</td>
-            <td class="tabular-nums">{job.redundancy}×</td>
             <td class="text-right tabular-nums">
               {p.value.toLocaleString()} / {p.max.toLocaleString()}
               <span class="text-muted-foreground">{p.unit}</span>

@@ -255,6 +255,8 @@ mod tests {
             turn_number: Some(turn),
             previous_move: None,
             previous_move_score: None,
+            played_move: Some("8D PLAY".into()),
+            played_move_score: Some(10),
             num_moves: 1,
             analysis: Analysis::Static,
             moves: Vec::new(),

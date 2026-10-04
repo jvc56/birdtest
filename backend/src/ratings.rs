@@ -117,16 +117,12 @@ async fn build_matrix(
                AND c.player2_config_id IN
                    (SELECT player_config_id FROM rating_pool_members WHERE pool_id = $1)
          ),
-         -- One result per task: with redundancy > 1 the other accepted claims
-         -- replayed the same seeded games, and counting them would multiply a
-         -- job's weight in the fit by its redundancy.
-         first_result_per_task AS (
-             SELECT DISTINCT ON (r.task_id)
-                    r.job_id, r.pent_0, r.pent_1, r.pent_2, r.pent_3, r.pent_4
+         -- One result per task: a task has one slot.
+         job_results AS (
+             SELECT r.job_id, r.pent_0, r.pent_1, r.pent_2, r.pent_3, r.pent_4
              FROM eligible_jobs e
              JOIN game_results r ON r.job_id = e.job_id
              WHERE r.pent_0 IS NOT NULL
-             ORDER BY r.task_id, r.submitted_at, r.task_claim_id
          )
          SELECT e.p1 AS p1, e.p2 AS p2, f.job_id AS job_id,
                 COALESCE(SUM(f.pent_0), 0)::bigint AS pent_0,
@@ -134,7 +130,7 @@ async fn build_matrix(
                 COALESCE(SUM(f.pent_2), 0)::bigint AS pent_2,
                 COALESCE(SUM(f.pent_3), 0)::bigint AS pent_3,
                 COALESCE(SUM(f.pent_4), 0)::bigint AS pent_4
-         FROM first_result_per_task f
+         FROM job_results f
          JOIN eligible_jobs e ON e.job_id = f.job_id
          GROUP BY e.p1, e.p2, f.job_id",
     )

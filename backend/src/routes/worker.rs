@@ -748,28 +748,14 @@ async fn submit_result(
     let task_id: Uuid = claim.get("task_id");
     let job_id: Uuid = claim.get("job_id");
 
-    // Submissions for the same task serialize here, on the task row, before
-    // anything is stored. Redundant claims of one task hold different claim
-    // rows, so the lock above does not order them, and what a submission
-    // stores depends on what the task's earlier submissions stored: only the
-    // first accepted result adds to the job's running progress totals
-    // (`registry::store_result`). Without this, two submissions arriving
-    // together each saw only their own uncommitted rows and both counted. The
-    // task row is locked by the update below anyway; taking it first keeps the
-    // order every path uses -- claim, then task, then job.
-    //
-    // The lock is also what makes `accepted_count` trustworthy here: every
-    // accepted result increments it in the transaction that stores the result,
-    // and that transaction holds this lock, so a zero read under it means no
-    // result for the task has been accepted before this one. That is what
-    // "first accepted result" means everywhere it is used, and reading it is
-    // one row where counting the stored results was up to 10,000 of them for
-    // an opening-rack batch.
-    let prior_accepted: i32 =
-        sqlx::query_scalar("SELECT accepted_count FROM tasks WHERE id = $1 FOR UPDATE")
-            .bind(task_id)
-            .fetch_one(&mut *tx)
-            .await?;
+    // The task row is locked by the update below anyway; taking it before
+    // anything is stored keeps the order every path uses -- claim, then task,
+    // then job. A task has one slot, and its claim is locked above, so no
+    // other submission for it can be in flight.
+    sqlx::query("SELECT 1 FROM tasks WHERE id = $1 FOR UPDATE")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
 
     if job_id != job.id {
         return Err(AppError::internal("a claim's task changed job"));
@@ -780,7 +766,6 @@ async fn submit_result(
         &template,
         task_id,
         claim_id,
-        prior_accepted == 0,
         decoded,
     )
     .await?;
@@ -802,29 +787,21 @@ async fn submit_result(
     .fetch_one(&mut *tx)
     .await?;
 
-    // `RETURNING` the new state is what tells the job's `tasks_completed`
-    // counter that a task has actually *reached* completed. A task makes that
-    // transition exactly once -- once `accepted_count` meets `redundancy` the
-    // task stops being dispatched, and a claim that lapsed before then is
-    // abandoned, so its late submission is refused above -- which is what makes
-    // counting on the transition safe rather than approximate.
+    // A task has one slot, so its one accepted result completes it.
+    // `RETURNING` whether this was that result is what tells the job's
+    // `tasks_completed` counter that a task has actually *reached* completed.
+    // A task makes that transition exactly once -- a completed task is not
+    // dispatched again, and a claim that lapsed before it was submitted is
+    // abandoned, so its late submission is refused above -- which is what
+    // makes counting on the transition safe rather than approximate.
     let task_completed = sqlx::query_scalar::<_, bool>(
         "UPDATE tasks t
          SET accepted_count = t.accepted_count + 1,
              active_claim_count = GREATEST(t.active_claim_count - 1, 0),
-             state = CASE
-                 WHEN t.accepted_count + 1 >= j.redundancy THEN 'completed'::task_state
-                 WHEN t.accepted_count + 1 + GREATEST(t.active_claim_count - 1, 0) >= j.redundancy
-                     THEN 'claimed'::task_state
-                 ELSE 'available'::task_state
-             END,
-             completed_at = CASE
-                 WHEN t.accepted_count + 1 >= j.redundancy THEN now()
-                 ELSE t.completed_at
-             END
-         FROM jobs j
-         WHERE t.id = $1 AND j.id = t.job_id
-         RETURNING t.state = 'completed'",
+             state = 'completed'::task_state,
+             completed_at = COALESCE(t.completed_at, now())
+         WHERE t.id = $1
+         RETURNING t.accepted_count = 1",
     )
     .bind(task_id)
     .fetch_one(&mut *tx)
@@ -865,20 +842,18 @@ async fn submit_result(
     // They were two separate updates, the first made while storing the result
     // -- a claim for the job then waited on this whole transaction.
     //
-    // `last_completed_at` rides along, at most once a minute when nothing else
-    // changes: a statement whose WHERE matches nothing takes no row lock, so
-    // submissions that change no counter -- the extra copies a redundancy
-    // above 1 asks for -- do not all queue on the job's row for it. (At
-    // redundancy 1, leave generation's included, every submission completes a
-    // task and takes the lock regardless.)
+    // `last_completed_at` rides along. Every accepted submission completes its
+    // task, so every one takes the lock regardless.
     {
         sqlx::query(
             "UPDATE jobs SET games_completed = games_completed + $2,
                              racks_analyzed = racks_analyzed + $3,
                              tasks_completed = tasks_completed + $4,
+                             racks_settled = racks_settled + $5,
+                             racks_without_consensus = racks_without_consensus + $6,
                              last_completed_at = now()
              WHERE id = $1
-               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0
+               AND ($2 <> 0 OR $3 <> 0 OR $4 <> 0 OR $5 <> 0
                     OR last_completed_at IS NULL
                     OR last_completed_at < now() - interval '1 minute')",
         )
@@ -886,6 +861,8 @@ async fn submit_result(
         .bind(progress.games_completed)
         .bind(progress.racks_analyzed)
         .bind(i64::from(task_completed))
+        .bind(progress.racks_settled)
+        .bind(progress.racks_without_consensus)
         .execute(&mut *tx)
         .await?;
     }
@@ -1168,15 +1145,17 @@ async fn finish_condition_met(state: &AppState, job: &Job) -> AppResult<Option<c
         JobType::OpeningRack => {
             // Tasks are generated on demand, so "all tasks complete" is not
             // enough -- it is trivially true before anything is dispatched.
-            // The job is done once the rack space is exhausted as well.
+            // The job is done once every rack is settled: analysed, and, for a
+            // job seeking a consensus, agreed on or analysed its most times.
+            // A rack settles in the transaction that stores its analysis, so
+            // the running count is exact.
             sqlx::query_scalar::<_, bool>(
-                "SELECT COALESCE(MAX(t.seed) + c.racks_per_batch, 0) >= c.total_racks
-                        AND COUNT(t.id) > 0
-                        AND COUNT(t.id) FILTER (WHERE t.state <> 'completed') = 0
-                 FROM job_opening_rack_config c
-                 LEFT JOIN tasks t ON t.job_id = c.job_id
-                 WHERE c.job_id = $1
-                 GROUP BY c.racks_per_batch, c.total_racks",
+                "SELECT j.racks_settled >= c.total_racks
+                        AND EXISTS (SELECT 1 FROM tasks t WHERE t.job_id = j.id)
+                        AND NOT EXISTS (SELECT 1 FROM tasks t
+                                        WHERE t.job_id = j.id AND t.state <> 'completed')
+                 FROM jobs j JOIN job_opening_rack_config c ON c.job_id = j.id
+                 WHERE j.id = $1",
             )
             .bind(job.id)
             .fetch_optional(&state.pool)

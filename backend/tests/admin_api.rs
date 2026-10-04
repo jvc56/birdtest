@@ -43,7 +43,7 @@ async fn with_history(app: &axum::Router) {
 #[tokio::test]
 async fn a_job_with_history_can_be_deleted_and_its_census_survives() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     with_history(&app).await;
@@ -88,7 +88,7 @@ async fn a_job_with_history_can_be_deleted_and_its_census_survives() {
 #[tokio::test]
 async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     with_history(&app).await;
@@ -122,7 +122,7 @@ async fn a_job_can_be_purged_and_its_dispatch_counter_resets() {
 #[tokio::test]
 async fn purging_a_job_removes_its_captured_positions_through_the_record() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -137,13 +137,13 @@ async fn purging_a_job_removes_its_captured_positions_through_the_record() {
     let uuid = assignment["worker_uuid"].as_str().unwrap();
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "analysis": "sim", "rack": "AEINRST", "position": "cgp-0",
+        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp-0",
           "num_moves": 40,
           "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2,
                       "win_percentage": 55.0, "blended_utility": 0.6,
                       "plies": [{ "ply": 0, "bingo_percentage": 0.0, "average_score": 24.0 }] }] },
         // A capturing job's result has positions from every game of its batch.
-        { "game_index": 1, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp-1",
+        { "game_index": 1, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp-1",
           "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
     ]);
     let (_, body) = send(
@@ -334,7 +334,7 @@ async fn a_user_with_history_can_be_deleted() {
 #[tokio::test]
 async fn a_completed_job_cannot_be_deactivated() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -367,7 +367,7 @@ async fn a_completed_job_cannot_be_deactivated() {
 #[tokio::test]
 async fn the_results_stream_is_admin_only_and_the_paginated_one_is_not() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let cfg = db.config();
     let admin = db.user("streamadmin", true).await;
     let plain = db.user("plainuser", false).await;
@@ -401,7 +401,7 @@ async fn the_results_stream_is_admin_only_and_the_paginated_one_is_not() {
 #[tokio::test]
 async fn a_running_job_exports_a_snapshot() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let cfg = db.config();
     let admin = db.user("exportadmin", true).await;
     let app = birdtest::app(db.state().await);
@@ -575,7 +575,7 @@ async fn an_opening_rack_job_cannot_rank_moves_with_a_best_recorder() {
 async fn purging_and_deleting_a_job_give_back_what_it_earned() {
     for destroy in ["purge", "delete"] {
         let db = TestDb::new().await;
-        let job = db.games_job(1, 2).await;
+        let job = db.games_job(2).await;
         let state = db.state().await;
         let app = birdtest::app(state.clone());
         with_history(&app).await;
@@ -644,7 +644,7 @@ async fn purging_and_deleting_a_job_give_back_what_it_earned() {
 #[tokio::test]
 async fn a_purge_waits_for_a_submission_in_flight_before_counting_contributions() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -712,7 +712,7 @@ async fn a_purge_waits_for_a_submission_in_flight_before_counting_contributions(
 #[tokio::test]
 async fn a_completed_job_is_not_exported_until_its_claims_have_landed() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -1186,8 +1186,8 @@ async fn a_player_config_and_a_job_state_every_setting_a_task_needs() {
         ("movegen_margin", json!(5.0)),
         ("use_wordmap", json!(true)),
         ("use_rit", json!(true)),
-        // Off unless asked, as MAGPIE has it.
-        ("use_wit", json!(false)),
+        // On unless the config opts out.
+        ("use_wit", json!(true)),
         ("max_iterations", json!(null)),
         ("threshold", json!(null)),
         ("utility_w_spread", json!(null)),
@@ -1536,7 +1536,7 @@ async fn an_identity_can_be_banned_once_and_unbanning_lifts_it() {
 #[tokio::test]
 async fn a_finish_check_overtaken_by_a_purge_does_not_complete_the_job() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let status = |db: &TestDb| {
         let pool = db.pool.clone();
         async move {
@@ -1622,15 +1622,15 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
     assert_eq!(status, StatusCode::CREATED, "{response}");
     assert_eq!(response["use_rit"], json!(true), "{response}");
 
-    // A word info table is stored as asked, and is off when nothing says.
-    assert_eq!(response["use_wit"], json!(false), "{response}");
+    // A word info table is stored as asked, and is on when nothing says.
+    assert_eq!(response["use_wit"], json!(true), "{response}");
     let (status, response) = player_config(&app, &headers, json!({
-        "name": "static-wit", "recorder_type": "best",
-        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1, "use_wit": true,
+        "name": "static-no-wit", "recorder_type": "best",
+        "kwg_id": kwg, "klv_id": klv, "num_plays_recorded": 1, "use_wit": false,
     }))
     .await;
     assert_eq!(status, StatusCode::CREATED, "{response}");
-    assert_eq!(response["use_wit"], json!(true), "{response}");
+    assert_eq!(response["use_wit"], json!(false), "{response}");
 
     // The table travels under the pair's name, not the lexicon's. That is what
     // keeps NWL23-with-CSW21-leaves -- a configuration birdtest accepts on
@@ -1649,7 +1649,7 @@ async fn a_player_config_may_ask_for_a_rack_info_table() {
 #[tokio::test]
 async fn an_export_is_not_blocked_by_a_claim_whose_worker_vanished() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -1719,13 +1719,13 @@ async fn a_newly_activated_job_joins_at_parity_instead_of_taking_everything() {
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let veteran = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET claims_issued = 100000 WHERE id = $1")
         .bind(veteran)
         .execute(&db.pool)
         .await
         .unwrap();
-    let newcomer = db.games_job(1, 2).await;
+    let newcomer = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
         .bind(newcomer)
         .execute(&db.pool)
@@ -1775,8 +1775,8 @@ async fn a_purged_job_rejoins_at_parity() {
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let steady = db.games_job(1, 2).await;
-    let purged = db.games_job(1, 2).await;
+    let steady = db.games_job(2).await;
+    let purged = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET claims_issued = 100000 WHERE id = ANY($1)")
         .bind(vec![steady, purged])
         .execute(&db.pool)
@@ -1809,7 +1809,7 @@ async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let veteran = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
     sqlx::query(
         "UPDATE jobs SET claims_issued = 100000, allocation = 40, last_claimed_at = now()
          WHERE id = $1",
@@ -1820,13 +1820,13 @@ async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
     .unwrap();
     // On offer, and out of this fleet's reach: a floor above what the workers
     // run. It has issued nothing, so its ratio is zero and stays there.
-    let lagging = db.games_job(1, 2).await;
+    let lagging = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 20, min_magpie_major = 9 WHERE id = $1")
         .bind(lagging)
         .execute(&db.pool)
         .await
         .unwrap();
-    let newcomer = db.games_job(1, 2).await;
+    let newcomer = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
         .bind(newcomer)
         .execute(&db.pool)
@@ -1865,7 +1865,7 @@ async fn a_job_nobody_is_being_served_from_does_not_set_a_newcomers_parity() {
 #[tokio::test]
 async fn purging_a_completed_job_returns_it_to_inactive() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     with_history(&app).await;
@@ -1911,7 +1911,7 @@ async fn purging_a_completed_job_returns_it_to_inactive() {
 #[tokio::test]
 async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
 
@@ -1971,7 +1971,7 @@ async fn a_purge_in_progress_neither_parks_submissions_nor_costs_its_claims() {
 #[tokio::test]
 async fn a_second_purge_or_delete_is_refused_while_one_runs() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -2015,7 +2015,7 @@ async fn a_second_purge_or_delete_is_refused_while_one_runs() {
 #[tokio::test]
 async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
     let db = TestDb::new().await;
-    let purged = db.games_job(1, 2).await;
+    let purged = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -2038,7 +2038,7 @@ async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
     assert_eq!(status, StatusCode::OK, "{body}");
     // ...and holds a claim on another job.
     sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1").bind(purged).execute(&db.pool).await.unwrap();
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let (status, other) = send(
         &app,
         post_json("/api/worker/task", &[("x-worker-uuid", uuid.as_str())], claim_body("1.0.0", &[])),
@@ -2116,7 +2116,7 @@ async fn a_purge_waiting_on_a_rating_fit_holds_up_no_submissions() {
 #[tokio::test]
 async fn a_locked_identity_row_does_not_hold_up_its_requests() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let (status, claim) =
@@ -2361,6 +2361,8 @@ async fn a_wordmap_on_a_distribution_with_more_than_two_blanks_is_refused() {
         sqlx::query_scalar("SELECT COUNT(*) FROM derived_data").fetch_one(&db.pool).await.unwrap();
     assert_eq!((jobs, queued), (0, 0), "nothing is created or queued");
 
+    // A word info table -- on by default, as "without" has it -- is built from
+    // the lexicon alone, which has no blanks, so it is no reason to refuse.
     let (status, body) = send(&app, post_json("/api/admin/jobs", &headers, job(&players[1]))).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
@@ -2444,8 +2446,8 @@ async fn a_newcomer_is_not_put_level_with_a_job_that_has_run_out_of_work() {
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let veteran = db.games_job(1, 2).await;
-    let capped = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
+    let capped = db.games_job(2).await;
     // The capped job's whole space is one task (max 2 games).
     sqlx::query("UPDATE job_game_config SET max_games = 2, min_games = 2 WHERE job_id = $1")
         .bind(capped)
@@ -2475,7 +2477,7 @@ async fn a_newcomer_is_not_put_level_with_a_job_that_has_run_out_of_work() {
         }
     }
     assert_eq!(capped_claims, 1, "the capped job has one task");
-    let newcomer = db.games_job(1, 2).await;
+    let newcomer = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
         .bind(newcomer).execute(&db.pool).await.unwrap();
     let app = birdtest::app(state.clone());
@@ -2518,17 +2520,17 @@ async fn after_a_quiet_spell_a_newcomer_still_joins_level_with_the_jobs_served()
     let db = TestDb::new().await;
     let cfg = db.config();
     let admin = db.user("root", true).await;
-    let veteran = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
     sqlx::query(
         "UPDATE jobs SET claims_issued = 100000, allocation = 40,
                          last_claimed_at = now() - interval '10 minutes'
          WHERE id = $1",
     )
     .bind(veteran).execute(&db.pool).await.unwrap();
-    let lagging = db.games_job(1, 2).await;
+    let lagging = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 20, min_magpie_major = 9 WHERE id = $1")
         .bind(lagging).execute(&db.pool).await.unwrap();
-    let newcomer = db.games_job(1, 2).await;
+    let newcomer = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
         .bind(newcomer).execute(&db.pool).await.unwrap();
     let app = birdtest::app(db.state().await);
@@ -2594,14 +2596,14 @@ async fn split_activate(db: &TestDb, state: &birdtest::state::AppState, admin: U
 async fn in_a_split_fleet_a_newcomer_is_not_starved_behind_a_lagging_job() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let t = db.games_job(1, 2).await; // runnable by everyone (floor 0.1.0)
-    let a = db.games_job(1, 2).await; // needs MAGPIE 2
+    let t = db.games_job(2).await; // runnable by everyone (floor 0.1.0)
+    let a = db.games_job(2).await; // needs MAGPIE 2
     sqlx::query("UPDATE jobs SET allocation = 10 WHERE id = $1").bind(t).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 50, min_magpie_major = 2 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     // 30% of claims from workers still on MAGPIE 1.
     split_run(&state, 1000, |i| i % 10 < 3).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL, min_magpie_major = 2 WHERE id = $1")
         .bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 40).await;
@@ -2619,14 +2621,14 @@ async fn in_a_split_fleet_a_newcomer_is_not_starved_behind_a_lagging_job() {
 async fn a_minority_newcomer_is_not_starved_behind_a_lagging_minority_job() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await; // everyone
-    let b = db.games_job(1, 2).await; // MAGPIE 2 only
+    let a = db.games_job(2).await; // everyone
+    let b = db.games_job(2).await; // MAGPIE 2 only
     sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 30, min_magpie_major = 2 WHERE id = $1").bind(b).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     // 80% of claims from MAGPIE-1 workers.
     split_run(&state, 1000, |i| i % 10 < 8).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL, min_magpie_major = 2 WHERE id = $1")
         .bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 30).await;
@@ -2645,8 +2647,8 @@ async fn a_minority_newcomer_is_not_starved_behind_a_lagging_minority_job() {
 #[tokio::test]
 async fn a_job_nobody_could_run_rejoins_at_parity_when_the_fleet_can() {
     let db = TestDb::new().await;
-    let veteran = db.games_job(1, 2).await;
-    let waiting = db.games_job(1, 2).await;
+    let veteran = db.games_job(2).await;
+    let waiting = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(veteran).execute(&db.pool).await.unwrap();
     // Activated an hour ago; nobody has had MAGPIE 9 since.
     sqlx::query("UPDATE jobs SET allocation = 40, min_magpie_major = 9, activated_at = now() - interval '1 hour' WHERE id = $1")
@@ -2669,9 +2671,9 @@ async fn a_job_nobody_could_run_rejoins_at_parity_when_the_fleet_can() {
 #[tokio::test]
 async fn jobs_lagging_together_keep_their_shares() {
     let db = TestDb::new().await;
-    let t = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
-    let c = db.games_job(1, 2).await;
+    let t = db.games_job(2).await;
+    let b = db.games_job(2).await;
+    let c = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 10 WHERE id = $1").bind(t).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 45, min_magpie_major = 2, created_at = now() - interval '1 hour' WHERE id = $1")
         .bind(b).execute(&db.pool).await.unwrap();
@@ -2691,8 +2693,8 @@ async fn jobs_lagging_together_keep_their_shares() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_concurrent_burst_to_a_small_job_is_paid_back() {
     let db = TestDb::new().await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 1 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 99 WHERE id = $1").bind(b).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2740,8 +2742,8 @@ async fn majority_claims(state: &birdtest::state::AppState, n: usize) -> Vec<Uui
 /// A at 50% that everyone runs, L at 40% that only the 20% of claims from
 /// MAGPIE 2 can run -- L lags, served, for as long as the split lasts.
 async fn minority_split(db: &TestDb) -> (birdtest::state::AppState, Uuid, Uuid) {
-    let a = db.games_job(1, 2).await;
-    let l = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let l = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 40, min_magpie_major = 2 WHERE id = $1").bind(l).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2761,7 +2763,7 @@ async fn a_newcomer_everyone_can_run_is_not_put_level_with_a_minority_job() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
     let (state, a, _) = minority_split(&db).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1").bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 10).await;
     let majority = majority_claims(&state, 1000).await;
@@ -2780,9 +2782,9 @@ async fn a_newcomer_everyone_can_run_is_not_put_level_with_a_minority_job() {
 async fn an_allocation_changed_in_a_split_fleet_takes_nothing_over() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
-    let l = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
+    let l = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 20 WHERE id = $1").bind(b).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 40, min_magpie_major = 2 WHERE id = $1").bind(l).execute(&db.pool).await.unwrap();
@@ -2804,7 +2806,7 @@ async fn an_allocation_changed_in_a_split_fleet_takes_nothing_over() {
 #[tokio::test]
 async fn a_returning_job_in_a_split_fleet_takes_nothing_over() {
     let db = TestDb::new().await;
-    let x = db.games_job(1, 2).await;
+    let x = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 10, min_magpie_major = 9, activated_at = now() - interval '1 hour' WHERE id = $1")
         .bind(x).execute(&db.pool).await.unwrap();
     let (state, a, _) = minority_split(&db).await;
@@ -2823,9 +2825,9 @@ async fn a_returning_job_in_a_split_fleet_takes_nothing_over() {
 #[tokio::test]
 async fn a_job_passed_over_for_a_moment_waits_for_nothing() {
     let db = TestDb::new().await;
-    let p = db.games_job(1, 2).await;
-    let c = db.games_job(1, 2).await;
-    let d = db.games_job(1, 2).await;
+    let p = db.games_job(2).await;
+    let c = db.games_job(2).await;
+    let d = db.games_job(2).await;
     for (job, alloc, age) in [(p, 50, 3), (c, 1, 2), (d, 49, 1)] {
         sqlx::query("UPDATE jobs SET allocation = $2, created_at = now() - make_interval(hours => $3) WHERE id = $1")
             .bind(job).bind(alloc).bind(age).execute(&db.pool).await.unwrap();
@@ -2867,8 +2869,8 @@ async fn a_job_passed_over_for_a_moment_waits_for_nothing() {
 #[tokio::test]
 async fn a_job_with_nothing_to_hand_out_banks_no_debt() {
     let db = TestDb::new().await;
-    let p = db.games_job(1, 2).await;
-    let d = db.games_job(1, 2).await;
+    let p = db.games_job(2).await;
+    let d = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = ANY($1)").bind(vec![p, d]).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     split_run(&state, 100, |_| false).await;
@@ -2915,8 +2917,8 @@ async fn minority_claims(state: &birdtest::state::AppState, n: usize) -> std::co
 async fn a_burst_in_the_first_hour_is_paid_back() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = ANY($1)")
         .bind(vec![a, b]).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -2957,11 +2959,11 @@ async fn a_burst_in_the_first_hour_is_paid_back() {
 async fn a_newcomer_the_majority_declines_is_not_settled_at_its_pace() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let l = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let l = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 50 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 40, min_magpie_major = 2 WHERE id = $1").bind(l).execute(&db.pool).await.unwrap();
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1").bind(n).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     let app = birdtest::app(state.clone());
@@ -3022,13 +3024,13 @@ async fn a_newcomer_the_majority_declines_is_not_settled_at_its_pace() {
 async fn a_newcomer_is_not_settled_past_a_job_paused_for_a_moment() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let l = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let l = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 40 WHERE id = $1").bind(a).execute(&db.pool).await.unwrap();
     sqlx::query("UPDATE jobs SET allocation = 30, min_magpie_major = 2 WHERE id = $1").bind(l).execute(&db.pool).await.unwrap();
     let state = db.state().await;
     minority_claims(&state, 1000).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL, min_magpie_major = 2 WHERE id = $1")
         .bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 30).await;
@@ -3082,7 +3084,7 @@ async fn concurrent_claims(state: &birdtest::state::AppState, per_worker: usize)
 async fn equal_jobs_claimed_together_leave_no_worker_idle() {
     let db = TestDb::new().await;
     for _ in 0..3 {
-        db.games_job(1, 2).await;
+        db.games_job(2).await;
     }
     sqlx::query("UPDATE jobs SET allocation = 33").execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -3100,8 +3102,8 @@ async fn equal_jobs_claimed_together_leave_no_worker_idle() {
 #[tokio::test]
 async fn a_busy_job_costs_a_claim_one_wait() {
     let db = TestDb::new().await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
     let state = db.state().await;
     split_run(&state, 20, |_| false).await;
     // Another holder keeps A's dispatch lock.
@@ -3132,8 +3134,8 @@ async fn a_busy_job_costs_a_claim_one_wait() {
 async fn a_busy_large_job_does_not_hand_a_small_one_its_claims() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let a = db.games_job(1, 2).await;
-    let b = db.games_job(1, 2).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = ANY($1)")
         .bind(vec![a, b]).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -3170,8 +3172,8 @@ async fn a_busy_large_job_does_not_hand_a_small_one_its_claims() {
 async fn repeated_busy_spells_on_a_settling_job_are_paid_back() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let small = db.games_job(1, 2).await;
-    let large = db.games_job(1, 2).await;
+    let small = db.games_job(2).await;
+    let large = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = ANY($1)")
         .bind(vec![small, large]).execute(&db.pool).await.unwrap();
     let state = db.state().await;
@@ -3209,7 +3211,7 @@ async fn a_newcomer_busy_once_is_still_settled() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
     let (state, a, _) = minority_split(&db).await;
-    let n = db.games_job(1, 2).await;
+    let n = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1").bind(n).execute(&db.pool).await.unwrap();
     split_activate(&db, &state, admin, n, 10).await;
     // One claim while another holder keeps N's dispatch lock.
@@ -3224,4 +3226,114 @@ async fn a_newcomer_busy_once_is_still_settled() {
     let first = majority.iter().position(|j| *j == a);
     assert!(first.is_some_and(|i| i < 16), "A's first claim at {first:?}");
     assert!((630..=690).contains(&got), "A got {got} of the majority's 800, not about 667");
+}
+
+
+/// The allocations, the status and the audit trail of a set of jobs.
+async fn allocations_of(db: &TestDb, jobs: &[Uuid]) -> Vec<(String, Option<i32>)> {
+    let mut out = Vec::new();
+    for job in jobs {
+        out.push(
+            sqlx::query_as::<_, (String, Option<i32>)>("SELECT status::text, allocation FROM jobs WHERE id = $1")
+                .bind(job)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap(),
+        );
+    }
+    out
+}
+
+/// A-ADMIN-28: several jobs' allocations are set in one request, checked as
+/// a whole: 50/50 becomes 60/40, which one job at a time cannot do without
+/// first lowering one -- 50 + 60 is over 100. A job named at 0% is
+/// deactivated, an inactive one named above 0% is activated, and each change
+/// is audited (`job.allocation_changed` from what to what, and the status
+/// changes as activation and deactivation write them). A request totalling
+/// over 100%, naming a completed job, a job twice, or an allocation outside
+/// 0-100 changes nothing.
+#[tokio::test]
+async fn allocations_are_set_together_and_checked_as_a_whole() {
+    let db = TestDb::new().await;
+    let cfg = db.config();
+    let admin = db.user("root", true).await;
+    let a = db.games_job(2).await;
+    let b = db.games_job(2).await;
+    let paused = db.games_job(2).await;
+    sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL WHERE id = $1")
+        .bind(paused)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let done = db.games_job(2).await;
+    sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
+        .bind(done)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let app = birdtest::app(db.state().await);
+    let headers = admin_headers(&cfg, admin);
+    let borrowed: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let set = |rows: serde_json::Value| {
+        send(&app, put_json("/api/admin/jobs/allocations", &borrowed, json!({ "allocations": rows })))
+    };
+
+    // One at a time this is refused: the other job still holds 50%.
+    let (status, _) = send(
+        &app,
+        post_json(&format!("/api/admin/jobs/{a}/activate"), &borrowed, json!({ "allocation": 60 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let (status, body) = set(json!([{ "job_id": a, "allocation": 60 }, { "job_id": b, "allocation": 40 }])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["jobs"].as_array().unwrap().len(), 2, "{body}");
+    assert_eq!(
+        allocations_of(&db, &[a, b]).await,
+        [("active".to_string(), Some(60)), ("active".to_string(), Some(40))]
+    );
+    let changes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT target_id, reason FROM audit_log WHERE action = 'job.allocation_changed' ORDER BY reason",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(changes, [(b.to_string(), "50% -> 40%".to_string()), (a.to_string(), "50% -> 60%".to_string())]);
+
+    // B's share to the paused job: B deactivated, the paused job activated.
+    let (status, body) = set(json!([{ "job_id": b, "allocation": 0 }, { "job_id": paused, "allocation": 40 }])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        allocations_of(&db, &[b, paused]).await,
+        [("inactive".to_string(), Some(40)), ("active".to_string(), Some(40))]
+    );
+    let statuses: Vec<(String, String)> = sqlx::query_as(
+        "SELECT action, target_id FROM audit_log
+         WHERE action IN ('job.activated', 'job.deactivated') ORDER BY action",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        statuses,
+        [("job.activated".to_string(), paused.to_string()), ("job.deactivated".to_string(), b.to_string())]
+    );
+
+    // Refused whole, each for what is wrong with it.
+    let before = allocations_of(&db, &[a, b, paused, done]).await;
+    let (status, body) = set(json!([{ "job_id": a, "allocation": 70 }, { "job_id": b, "allocation": 1 }])).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["message"].as_str().unwrap().contains("111%"), "{body}");
+    let (status, body) = set(json!([{ "job_id": done, "allocation": 10 }])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "allocations[0].job_id", "{body}");
+    let (status, body) = set(json!([{ "job_id": a, "allocation": 10 }, { "job_id": a, "allocation": 20 }])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "allocations[1].job_id", "{body}");
+    let (status, body) = set(json!([{ "job_id": a, "allocation": 101 }])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["fields"][0]["field"], "allocations[0].allocation", "{body}");
+    let (status, _) = set(json!([])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(allocations_of(&db, &[a, b, paused, done]).await, before, "nothing changed");
 }

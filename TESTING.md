@@ -68,20 +68,20 @@ at tier 5 names a symptom.
 
 | Tier | Tests | Where |
 |---|---|---|
-| 1 Unit | 230 | `#[cfg(test)]` in `jobs::plausibility` (25), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (16), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (3), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (2) |
-| 1F Frontend unit | 172 | Vitest, `frontend/src/lib/`: `format.test.ts` (40), `jobSettings.test.ts` (9), `matchScore.test.ts` (3), `cgp.test.ts` (12), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (6) |
-| 2 Integration | 175 | `backend/tests/`: `leave_gen.rs` (34), `ratings.rs` (32), `scheduler.rs` (18), `jobs.rs` (15), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (5), `artifacts.rs` (5), `audit.rs` (3) |
-| 3 API | 238 | `backend/tests/`: `worker_api.rs` (49), `admin_api.rs` (56), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (19), `public_api.rs` (21), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
+| 1 Unit | 234 | `#[cfg(test)]` in `jobs::plausibility` (26), `inputdata` (30), `jobs::racks` (16), `stats::bradley_terry` (30), `stats::sprt` (12), `error` (8), `config` (7), `extract` (7), `routes::admin` (15), `jobs::handler` (6), `backups` (5), `auth::api_key` (6), `auth::session` (4), `clientip` (5), `version` (4), `auth::csrf` (3), `compat` (3), `derived` (3), `jobs::opening_rack` (7), `magpie` (3), `models::job` (3), `routes::public` (3), `sse` (5), `email` (8), `jobs::dispatch` (2), `ratelimit` (2), `routes::auth` (2), `jobs::game` (2), `board`, `exports`, `jobs`, `jobs::leave_gen`, `routes` (1 each); `jobs::game_pair` (2) |
+| 1F Frontend unit | 187 | Vitest, `frontend/src/lib/`: `format.test.ts` (44), `jobSettings.test.ts` (11), `matchScore.test.ts` (4), `compare.test.ts` (2), `consensus.test.ts` (3), `cgp.test.ts` (16), `api.test.ts` (17), `auth.test.ts` (9), `accountRules.test.ts` (9), `sse.test.ts` (12), `importWatch.test.ts` (10), `poller.test.ts` (7), `contributeDocs.test.ts` (4), `nginxConfig.test.ts` (2), and `charts/`: `ratingDotPlot.test.ts` (19), `labels.test.ts` (2), `residuals.test.ts` (11), `pentanomial.test.ts` (5) |
+| 2 Integration | 177 | `backend/tests/`: `leave_gen.rs` (33), `ratings.rs` (31), `scheduler.rs` (18), `jobs.rs` (18), `stats.rs` (19), `input_data.rs` (14), `derived.rs` (9), `leave_generation.rs` (8), `exports.rs` (13), `submissions.rs` (6), `artifacts.rs` (5), `audit.rs` (3) |
+| 3 API | 236 | `backend/tests/`: `worker_api.rs` (45), `admin_api.rs` (59), `auth_routes.rs` (28), `worker_routes.rs` (23), `boundaries.rs` (18), `public_api.rs` (21), `admin_routes.rs` (12), `authz.rs` (7), `account.rs` (10), `auth_api.rs` (5), `finish.rs` (7), `fake_worker.rs` (1) |
 | 4 Contract | 14 | `routes::worker::contract_fixtures`, over 16 fixtures; MAGPIE checks its half in `test/contribute_test.c` |
 | 5 End-to-end | 20 | Playwright journeys `E-1`..`E-17` (`E-11` in three tests, `E-12` in two) in `e2e/tests/*.spec.ts`, plus the `admin.setup.ts` sign-in they share; run by `e2e/run.sh` |
-| 6 MAGPIE smoke | 13 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-14` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
+| 6 MAGPIE smoke | 14 cases + 16 | `scripts/e2e_magpie.py`'s cases `M-1`..`M-7`, `M-9`..`M-15` against a real `magpie contribute` (natively via `scripts/e2e_magpie_native.sh`, or the nightly compose job); and 16 opt-in `#[ignore]` Rust tests that run the server's own MAGPIE (`MAGPIE_BIN`): `magpie_smoke.rs` (6), `magpie_leave.rs` (7), `magpie_routes.rs` (3) |
 
 The tier-2/3 split is by the ids a file proves; many tier-2 files also drive
 the router to reach a state, and several tier-3 files read the database
 directly to assert one. With the tier-6 tests selected, `cargo nextest run
---run-ignored all` runs 668 backend tests (the per-tier counts above are
-from `cargo nextest list --run-ignored all` and `vitest`, thirty-second audit;
-they had drifted by up to 17).
+--run-ignored all` runs 677 backend tests (the per-tier counts above are
+from `cargo nextest list --run-ignored all` and `vitest`, after October 2026's
+feature batch).
 
 Tier 2 was the largest gap and the highest value.
 `sqlx::query` is checked at runtime, so the compiler sees opaque text. Two bugs
@@ -260,6 +260,15 @@ against it, so a change in ordering silently re-points existing rows.
   longer one and wrote past every per-letter array. *(Covered:
   `racks::tests::a_distribution_past_magpies_alphabet_is_refused`; job creation
   refuses one in `A-ADMIN-3`.)* (Twenty-second audit.)
+- `U-RACK-11` A rack's consensus standing: it settles once it has its fewest
+  analyses and they agree in the share asked for (4 of 5 at 80%, not 3 of 4),
+  not before however much they agree; at its most without agreeing it settles
+  without a consensus, on its most common move; a tie names the alphabetically
+  first; one analysis per rack settles at the first. *(Covered:
+  `opening_rack::tests::a_rack_settles_at_its_minimum_once_its_analyses_agree`,
+  `…::a_split_rack_settles_at_its_maximum_without_a_consensus`,
+  `…::a_tie_names_the_first_move_alphabetically`,
+  `…::one_analysis_per_rack_settles_at_the_first`.)*
 
 ### `U-ERR-*` — error mapping (`error.rs`)
 
@@ -715,18 +724,22 @@ Each entry's tests are the `describe` block named for its id.
   *(Covered: `format.test.ts`, `F-FMT-5b sprtState`.)*
 - `F-FMT-5` `sprtLabel` covers all four statuses. *(Covered:
   `format.test.ts`.)*
-- `F-MATCH-1` The match score card's figures: player 1's record "W–L–D", its
-  score W + ½D (no ".0" when whole) and that as a share of the games, the
-  average scores to a decimal place and the spread signed ("+13.4", "-2.5",
-  never "-0.0"); before any game, none of them rather than 0 or NaN.
-  *(Covered: `matchScore.test.ts`.)*
+- `F-MATCH-1` The match score table's rows, a column per player: wins
+  (player 2's are player 1's losses), draws, score W + ½D (no ".0" when whole)
+  and that as a share of the games, the average scores to a decimal place and
+  the spread signed from each player's side ("+13.4" / "-13.4", never "-0.0");
+  before any game, none of them rather than 0 or NaN. *(Covered:
+  `matchScore.test.ts`.)*
+- `F-CMP-1` A two-player table marks the higher value of a row higher (green)
+  and the other lower (red), and neither when they are equal or one is
+  missing. *(Covered: `compare.test.ts`.)*
 - `F-SET-1` The settings tables (`lib/jobSettings.ts`), in SETTINGS_COMPARISON.md's
   orders. A job's settings are one ordered list, the key rows first (type,
   variant, letter distribution, board, bingo bonus; a games job's target or
   cap, its SPRT as "none" or "Elo H0 → H1", and whether it records positions;
   an opening-rack job's racks and their size; a leave job's generations and
   each one's target) and the rest after (sim cutoff, the test's minimum and
-  error rates, batch sizes, redundancy, the oldest MAGPIE); a job without a
+  error rates, batch sizes, the oldest MAGPIE); a job without a
   test shows none of the test's settings, and a leave job has no sim cutoff
   and no lexicon or wordmap row of its own. A player's settings are one
   ordered list too, key rows first (lexicon, leaves, plies, plays considered,
@@ -757,11 +770,12 @@ Each entry's tests are the `describe` block named for its id.
   failed build, is offered **Build the final export**; a running job's button
   exports a snapshot; a leave job's snapshot notes it is as of the last merge.
   *(Covered: `format.test.ts`.)*
-- `F-FMT-15` `parseTargetRackCounts` reads the job form's "100, 200, 500" as
-  one target per generation, spaces and a trailing comma forgiven, and names
-  what is wrong with anything else — nothing listed, an empty entry, a
-  non-integer, a target outside 1–1,000,000, more than 100 generations —
-  rather than sending it. *(Covered: `format.test.ts`.)*
+- `F-FMT-15` `parseTargetRackCounts` reads the job form's "100, 200, 500" (or
+  "100 200 500") as one target per generation, a trailing comma forgiven, and
+  names what is wrong with anything else — nothing listed, an empty entry, a
+  non-integer, a target outside 1–1,000,000, more than 100 generations, a
+  thousands separator ("1,000" reads as 1 and 000) — rather than sending it.
+  *(Covered: `format.test.ts`.)*
 - `F-FMT-17` `leavePlayerConflict` names what job creation refuses of a leave
   job's player -- simulating, sorting on anything but equity, a rack info
   table, solving endgames -- before the submit, and accepts a static equity
@@ -769,6 +783,19 @@ Each entry's tests are the `describe` block named for its id.
 - `F-FMT-16` `computeTime` reads a contributor's compute time in its two
   largest units ("5h 20m", "3d 4h", "2y 17d"), and a dash for anything that is
   not a time. *(Covered: `format.test.ts`.)*
+- `F-FMT-18` `targetsText` lists a leave job's targets in generation order
+  joined by arrows ("100 → 200 → 1,000"), since a comma list cannot be read
+  when the numbers carry thousands separators. *(Covered: `format.test.ts`.)*
+
+### `F-CONS-*` — `lib/consensus.ts`
+
+- `F-CONS-1` `analysesPerRack` states an opening-rack job's consensus as its
+  settings table shows it: "1" for one analysis per rack, otherwise the range
+  and the share ("3 to 7, until 80% agree on the best move"). *(Covered:
+  `consensus.test.ts`.)*
+- `F-CONS-2` `rackConsensus` counts each analysis's best move in a rack lookup
+  and names the most common (the alphabetically first of a tie), with its
+  count and share; nothing for no analyses. *(Covered: `consensus.test.ts`.)*
 
 ### `F-CGP-*` — `lib/cgp.ts`
 
@@ -795,7 +822,13 @@ refuse what it could not have written, rather than draw a wrong board.
   mover is found, and its previous move is exactly the difference from the
   turn before: its placed squares were empty and now hold the letters it
   names, every other square is unchanged, and the mover's score rose by its
-  score. *(Covered: `cgp.test.ts`.)*
+  score. Each states the move played from it, which the next turn names as
+  its previous move, with that score, and whose tiles go down on squares that
+  are empty. *(Covered: `cgp.test.ts`.)*
+- `F-CGP-5` `placedTiles` gives the tiles a play puts down, each on its square
+  -- a blank as its letter, flagged -- skipping the squares it plays through,
+  and nothing for a pass, an exchange or text it cannot read: what the board
+  draws for the move played from a position. *(Covered: `cgp.test.ts`.)*
 
 ### `F-API-*` — `lib/api.ts`
 
@@ -886,9 +919,11 @@ Test the pure functions; do not snapshot the SVG.
   threshold on enough pairs to be at least three standard errors out — the
   same misses on ten pairs each do not raise it. *(Covered: `charts/residuals.test.ts`; the component now sorts
   itself instead of drawing in the order it is handed.)*
-- `F-CHART-7` The job page maps pentanomial buckets to the right labels — index
-  0 is "P1 lost both", index 4 "won both". An off-by-one here inverts the
-  reading of every paired job. *(Covered: `charts/pentanomial.test.ts`.)*
+- `F-CHART-7` The pair-outcome table reads each player's row from its own side
+  — bucket 4 is player 1's "Won both" and player 2's is bucket 0 — and its
+  three rows (won both, won one and drew one, even) hold all five buckets. An
+  off-by-one here inverts the reading of every paired job. *(Covered:
+  `charts/pentanomial.test.ts`.)*
 - `F-CHART-8` Percentages are computed against pairs, not games, and a zero
   denominator renders 0.0% rather than `NaN`. *(Covered:
   `charts/pentanomial.test.ts`.)*
@@ -1013,7 +1048,7 @@ let db     = TestDb::new().await;
 let admin  = db.user("root", true).await;
 let ld     = db.input_data("letterdist", "english").await;
 let player = db.static_player("equity", admin).await;
-let job    = db.games_job(/* redundancy */ 2, /* games per batch */ 2).await;
+let job    = db.games_job(/* games per batch */ 2).await;
 db.derived_ready(job).await;          // satisfy the dispatch gate by hand
 let app    = birdtest::app(db.state().await);
 ```
@@ -1048,7 +1083,7 @@ Three ways to build the `AppState` a test runs against:
 Roughly half the entries below need a state the application would refuse to
 create, and a builder that enforces invariants makes exactly those unwritable:
 
-- `I-SCHED-14` — a task already at `redundancy` active claims
+- `I-SCHED-14` — a task already claimed, or completed, written directly
 - `I-SCHED-12` — a claim exactly one second past its timeout
 - `I-JOB-7` — an allocation outside 0–100
 - `I-SUBMIT-2` — a `game_results` row whose pentanomial contradicts its counts
@@ -1252,11 +1287,9 @@ The single most important group. Every entry is about a decision made in SQL.
   version actually derived from the active jobs, not a hardcoded string.
   *(Covered: `scheduler::a_shutdown_names_what_the_active_jobs_actually_require`.)*
 - `I-SCHED-11` **Reclamation**: a claim past the heartbeat timeout flips to
-  `abandoned`, decrements `active_claim_count`, and returns an at-capacity task
-  to `available` — including a redundancy-2 task with one slot accepted and the
-  other lapsed, which reopens rather than staying `claimed` or completing.
-  *(Covered: `scheduler::a_lapsed_claim_is_reclaimed_by_the_next_claim_for_its_job_only`,
-  `boundaries::a_task_with_one_accepted_and_one_lapsed_slot_reopens_for_someone_else`.)*
+  `abandoned`, decrements `active_claim_count`, and returns its task to
+  `available`. *(Covered:
+  `scheduler::a_lapsed_claim_is_reclaimed_by_the_next_claim_for_its_job_only`.)*
 - `I-SCHED-12` Reclamation is lazy — it happens on the next claim for that job,
   and a claim one second *inside* the timeout is not reclaimed. *(Covered:
   `scheduler::a_lapsed_claim_is_reclaimed_by_the_next_claim_for_its_job_only`.)*
@@ -1267,12 +1300,10 @@ The single most important group. Every entry is about a decision made in SQL.
   retrying the loser answered `204` past three-way contention. *(Covered:
   `scheduler::concurrent_claimers_neither_collide_nor_lose_a_count`,
   `worker_api::concurrent_claims_tile_the_seed_space_instead_of_colliding`.)*
-- `I-SCHED-14` A task at `redundancy` active claims is not handed to an
-  additional worker, and the worker whose result filled a slot is never offered
-  that task again. *(Covered:
-  `scheduler::a_task_at_redundancy_is_not_handed_to_a_third_worker`,
-  `boundaries::a_task_with_one_accepted_and_one_lapsed_slot_reopens_for_someone_else`,
-  `worker_api::redundancy_does_not_starve_a_worker_holding_a_slot`.)*
+- `I-SCHED-14` A task has one slot: a claimed or completed task is not handed
+  to another worker, who gets a fresh task instead. *(Covered:
+  `scheduler::a_taken_task_is_not_handed_to_another_worker`,
+  `scheduler::a_claim_writes_its_row_and_counts_itself_on_the_task`.)*
 - `I-SCHED-15` **The `declined` partial-index trap.** `task_claims_user_unique_idx`
   and `task_claims_anon_unique_idx` are partial on
   `WHERE state NOT IN ('abandoned','declined')`. Drop `'declined'` from either
@@ -1306,6 +1337,17 @@ The single most important group. Every entry is about a decision made in SQL.
   state `main` actually builds grants the grace
   (`boundaries::a_freshly_built_production_state_grants_the_restart_grace`,
   `A-BOUND-10`) — the tests above set it by hand.
+- `I-SCHED-21` **An opening-rack consensus job reissues its unsettled racks.**
+  It covers its space in ranges, then hands out unsettled racks as lists,
+  from seeds past the end of the space: fewest analyses first, none another
+  reissue holds, and none the claiming worker analysed while others are left
+  -- but those too rather than nothing, so a rack wanting more analyses than
+  the fleet has workers still settles. A rack settles once enough analyses
+  agree, or at its most without a consensus; the running totals (`racks_analyzed`,
+  `racks_settled`, `racks_without_consensus`) follow, and the job completes once
+  every rack is settled. The rack lookup numbers each analysis. *(Covered:
+  `worker_api::a_consensus_job_reissues_its_unsettled_racks_until_each_settles`;
+  the standing itself, `U-RACK-11`.)*
 
 ### `I-EXPECT-*` — capability negotiation (`jobs/mod.rs::expected_data`)
 
@@ -1361,6 +1403,14 @@ job creation touches needs one caller here.
   shapes (and a NULL element) below the API. *(Covered:
   `routes::admin::tests::a_leave_job_lists_between_one_and_the_most_generations_each_with_a_sane_target`;
   the form's parse, `F-FMT-15`.)*
+- `I-JOB-1e` **An opening-rack job's consensus** -- the share of a rack's
+  analyses that must agree on its best move, after at least and at most so
+  many -- is stored as stated for a simming player (one analysis per rack, 100%,
+  when the body says nothing), and refused by name where it cannot work: a
+  share at or below 50% or above 100%, no analyses, a most below the fewest or
+  above 100, and any consensus for a static player, whose analyses always
+  agree. *(Covered:
+  `jobs::an_opening_rack_jobs_consensus_is_stored_and_refused_where_it_cannot_work`.)*
 - `I-JOB-2` **`validate_shared_player_options` runs against real rows.** Two
   configs with different `winpct_id` are rejected; two with the same are
   accepted; two with different `movegen_margin` are rejected. The regression
@@ -1458,15 +1508,15 @@ job creation touches needs one caller here.
   shown to fire on its own. *(Covered:
   `submissions::a_pairs_result_stores_its_pentanomial_and_the_schema_refuses_a_contradiction`.)*
 - `I-SUBMIT-3` Accepting a result increments `accepted_count`, decrements
-  `active_claim_count`, and completes the task at `redundancy`. *(Covered:
-  `submissions::accepted_results_move_the_task_counters_and_complete_it_at_redundancy`.)*
+  `active_claim_count`, and completes the task, which has one slot, counting
+  it in `tasks_completed` once. *(Covered:
+  `submissions::an_accepted_result_completes_its_task`.)*
 - `I-SUBMIT-4` A submission against a stale claim token is ignored, not
   accepted, and does not move any counter. *(Covered:
   `worker_api::submissions_for_reclaimed_or_already_accepted_claims_change_nothing`,
   `worker_api::a_claim_token_works_only_for_the_identity_it_was_issued_to`.)*
-- `I-SUBMIT-5` **Position capture deduplication**: under `redundancy = 2`,
-  identical replayed games produce one set of `position_analysis_records`, not
-  two. *(Covered: `worker_api::redundant_captured_positions_are_recorded_once`.)*
+- `I-SUBMIT-5` *(Retired with redundancy: a task has one slot, so no claim
+  replays another's captured positions.)*
 - `I-SUBMIT-6` Captured positions are truncated to the player config's
   `num_plays_recorded`, and `num_moves` records the pre-truncation count.
   *(Covered: `submissions::captured_positions_keep_the_configured_moves_and_the_full_count`.)*
@@ -1700,10 +1750,8 @@ permanent.
   `ratings::a_plain_games_job_is_not_evidence`,
   `ratings::a_self_play_job_is_not_counted_as_evidence` (thirty-second audit).)*
 - `I-RATE-3` The pair is the unit: a head-to-head's `games` equals pairs, not
-  games, and its score is the half-point total over four. Under redundancy 2 a
-  task is evidence once, through its first accepted copy. *(Covered:
-  `ratings::a_head_to_head_counts_pairs_and_scores_half_points_over_four`,
-  `ratings::a_redundant_task_is_evidence_once_through_its_first_accepted_copy`.)*
+  games, and its score is the half-point total over four. *(Covered:
+  `ratings::a_head_to_head_counts_pairs_and_scores_half_points_over_four`.)*
 - `I-RATE-4` `recompute` writes one `rating_runs` row and one
   `player_config_ratings` row per member, with `is_anchor` set on exactly one.
   *(Covered: `ratings::a_fit_stores_one_run_and_one_rating_per_member`.)*
@@ -1753,28 +1801,17 @@ permanent.
   means weighted by their games, for games and pairs jobs alike (10 games at
   400-380 and 30 at 440-450 are 430-432.5, spread -2.5; unweighted, 420-415).
   *(Covered: `stats::average_scores_weight_each_batch_by_its_games`; how the
-  match score card prints them, `matchScore.test.ts`, `F-MATCH-1`.)*
+  match score table prints them, `matchScore.test.ts`, `F-MATCH-1`.)*
 - `I-STATS-4` A job with no results reports zeros and an LLR of 0, not an error
   or a NaN, and no average score (null, not 0). *(Covered:
   `stats::a_job_with_no_results_reports_zeros_not_nan`.)*
 - `I-STATS-5` Opening-rack stats count analysed racks against `total_racks`, from
-  the running `jobs.racks_analyzed` total, and count a task's racks **once** even
-  when two redundant claims of it are accepted. *(Covered:
-  `worker_api::analysed_racks_are_counted_once_per_task_as_they_arrive`.)*
-- `I-STATS-5b` The job list's `units_completed` reads the same kind of running
-  total and agrees with `game_stats` on a redundancy-2 job, and every aggregate
-  reads the same copy the total counted: the first *accepted*, in acceptance
-  order under the task's row lock — not the earliest `submitted_at`, which was
-  the submitting transaction's start and so could name the copy accepted
-  second. *(Covered: `worker_api::redundant_results_for_one_task_count_once`,
-  `worker_api::the_copy_every_aggregate_reads_is_the_first_accepted_not_the_first_begun`;
-  `submitted_at` is now `clock_timestamp()`.)*
-- `I-STATS-5d` **Concurrent submissions for one task count once.** Two
-  redundant claims of a task submitting at the same moment (each blocked,
-  before commit, on a lock the other holds) still add the task's games to the
-  running total once. *(Covered:
-  `worker_api::concurrent_redundant_results_count_once`.)*
-- `I-STATS-5c` A purge zeroes both running totals. *(Covered:
+  the running `jobs.racks_analyzed` total. *(Covered:
+  `worker_api::analysed_racks_are_counted_as_they_arrive`.)*
+- `I-STATS-5b`, `I-STATS-5d` *(Retired with redundancy: a task has one slot,
+  so it has one result and nothing to count twice.)*
+- `I-STATS-5c` A purge zeroes the running totals, the rack consensus ones and
+  `opening_rack_progress` included. *(Covered:
   `admin_api::a_job_can_be_purged_and_its_dispatch_counter_resets`.)*
 - `I-STATS-6` Leave-generation stats report racks at target against the
   universe, and the current generation. *(Covered:
@@ -1785,14 +1822,13 @@ permanent.
   `worker_api::contributions_are_counted_as_they_arrive`.)*
 - `I-STATS-7b` **A contributor is credited with each claim it completed**: the
   time the claim was held, claim to submission, in whole milliseconds, and the
-  games and racks it did -- every accepted claim, where the job's own totals
-  count a task's first result. Two workers on one task at redundancy 2 are each
-  credited its two games (and the job two); a claim held 90 s is credited
-  90 s; each of two redundant opening-rack claims is credited the batch's
-  racks; a leave task is credited the job's `num_iterations` games and the
-  racks it reported; each claim keeps its own games and racks. *(Covered:
+  games and racks it did. Two workers on a task each are each credited their
+  two games (and the job four); a claim held 90 s is credited 90 s; each of
+  two opening-rack claims is credited its batch's racks; a leave task is
+  credited the job's `num_iterations` games and the racks it reported; each
+  claim keeps its own games and racks. *(Covered:
   `worker_api::each_accepted_claim_credits_its_time_and_games_to_its_contributor`,
-  `worker_api::analysed_racks_are_counted_once_per_task_as_they_arrive`,
+  `worker_api::analysed_racks_are_counted_as_they_arrive`,
   `leave_generation::nothing_is_handed_out_once_every_rack_is_at_target`.)*
 - `I-STATS-7c` **A purge or a delete gives back every contributor counter** the
   job's claims added -- tasks, compute time, games and racks -- to the
@@ -1803,9 +1839,9 @@ permanent.
   `admin_api::a_purge_waits_for_a_submission_in_flight_before_counting_contributions`.)*
 - `I-STATS-8` ETA is `None` without recent throughput rather than infinity.
   *(Covered: `stats::the_eta_is_none_without_recent_throughput`.)*
-- `I-STATS-8b` A games job's ETA divides by the redundancy: units left at claims
-  an hour × batch ÷ redundancy. *(Covered:
-  `stats::the_games_eta_divides_by_redundancy`.)* (Sixteenth audit.)
+- `I-STATS-8b` A games job's ETA is the units left at claims an hour × batch.
+  *(Covered: `stats::the_games_eta_is_claims_times_the_batch`.)* (Sixteenth
+  audit.)
 - `I-STATS-8c` A job activated less than an hour ago is measured since its
   activation (at least a minute), not over the hour: ten minutes in, the hour's
   average read six times the real time left. *(Covered:
@@ -2417,9 +2453,10 @@ below.
   `fake_worker::a_stale_mode_submission_is_not_accepted_and_changes_nothing`.)*
 - `A-WORKER-12` Each validation failure from tier 1 surfaces as a 400 with a
   message, not a 500. *(Covered:
-  `worker_routes::every_implausible_games_result_is_a_400_that_says_why`, and
-  the same for `game_pairs`, `opening_rack` and leave results; an oversized body
-  by `A-BOUND-5`.)*
+  `worker_routes::every_implausible_games_result_is_a_400_that_says_why` --
+  among them a captured position stating no move played from it, an empty
+  one, or one scoring what no play can -- and the same for `game_pairs`,
+  `opening_rack` and leave results; an oversized body by `A-BOUND-5`.)*
 - `A-WORKER-13` **Artifact fetch resolves only keys the server minted**; an
   arbitrary key is 404. Otherwise this is a read primitive for the whole bucket.
   *(Covered: `worker_routes::an_artifact_is_served_only_under_a_key_the_server_minted`.)*
@@ -2665,6 +2702,16 @@ below.
   as stated; left out, they are MAGPIE's 50 and 0.005; a negative bonus or a
   cutoff outside 0–100 is refused on its field. *(Covered:
   `admin_api::a_player_config_and_a_job_state_every_setting_a_task_needs`.)*
+- `A-ADMIN-28` **Several jobs' allocations in one request**
+  (`PUT /api/admin/jobs/allocations`), checked as a whole: 50/50 becomes 60/40,
+  which one job at a time refuses (50 + 60 is over 100). A job named at 0% is
+  deactivated and an inactive one named above 0% activated; each change is
+  audited (`job.allocation_changed` from what to what, `job.activated` /
+  `job.deactivated` for a status change). A request totalling over 100%, naming
+  a completed job, a job twice, an allocation outside 0–100, or nothing,
+  changes nothing. *(Covered:
+  `admin_api::allocations_are_set_together_and_checked_as_a_whole`; the route's
+  authorization and CSRF pair, `authz`.)*
 
 ### `A-RATE-*` — `routes/ratings.rs`
 
@@ -2931,10 +2978,7 @@ silent.
 - `A-BOUND-8` An admin cannot delete their own account: a 400 saying so, the
   account and its session untouched. *(Covered:
   `boundaries::an_admin_cannot_delete_their_own_account`.)*
-- `A-BOUND-9` A redundancy-2 task with one slot accepted and one lapsed reopens
-  for a third worker with the same seed, and is never offered back to the
-  worker whose result was accepted. *(Covered:
-  `boundaries::a_task_with_one_accepted_and_one_lapsed_slot_reopens_for_someone_else`.)*
+- `A-BOUND-9` *(Retired with redundancy: a task has one slot.)*
 - `A-BOUND-10` `AppState::new`, what `main` builds, starts the restart grace at
   start plus the heartbeat timeout (`I-SCHED-20`), so the grace cannot be lost
   in the wiring while every test that sets it by hand still passes. *(Covered:
@@ -3360,6 +3404,12 @@ surfacing the mismatch as a red build rather than as a dead job in production.
   MAGPIE's own side, including that a pair played identically keeps nothing,
   is `magpie_test contribute`'s
   `test_a_pairs_first_divergence_is_both_games_at_one_turn`.
+- `M-15` An opening-rack job seeking a consensus (at least 2, at most 3
+  analyses a rack, 100%), with a real 1-ply simmer on the two-letter data,
+  covers its eight racks, reissues them as lists from seeds past the end of
+  the space, and completes with every rack settled after at least two
+  analyses. *(Covered: `case_consensus`, one task a run until the job
+  completes.)*
 - `M-13` A job with `use_wit` dispatches only once its word info table is
   built; a worker whose table does not match the recorded hash declines with
   `derived_mismatch` and both digests reach `worker_data_gaps`; with the right
@@ -3595,8 +3645,8 @@ width. Revisit once the design settles.
 
 **Every combination of job type × capability × scheduler state.** The state
 space is combinatorial. The tests above pick the boundaries where behaviour
-changes (a version exactly at the floor, an allocation of 0, a redundancy of 1
-versus 2, an empty top tier) rather than sampling the interior.
+changes (a version exactly at the floor, an allocation of 0, an empty top
+tier) rather than sampling the interior.
 
 **Load and performance.** No throughput or latency assertions. Nothing in
 birdtest has a performance requirement anyone has stated, and a threshold nobody
@@ -3789,10 +3839,13 @@ message naming both when either is missing.
 **Which means `dev.py` seeds from real data, not the fixture.** A real MAGPIE
 cannot be fed the fixture's stub lexica, for exactly the reason tier 6 cannot —
 so the dev environment inherits tier 6's data requirements wholesale, including
-the leave-generation cost noted above -- except that `--leavegen-job` and
-`--opening-rack-job` run on MAGPIE's two-letter test data (`english_ab`, eight
-racks), which dev.py serves through tier 6's GitHub stand-in, so they finish in
-minutes. Each job flag becomes `seed.py --dev-job`; with none, `--no-job`.
+the leave-generation cost noted above -- except that a job flag with `_ab`
+appended (`--leavegen-job_ab`) runs on MAGPIE's two-letter test data
+(`english_ab`, eight racks), which dev.py serves through tier 6's GitHub
+stand-in, so its leave-generation and opening-rack jobs finish in minutes.
+Without `_ab`, every job runs on `--lexicon` and the english distribution.
+Each job flag becomes `seed.py --dev-job` (`leave_generation_ab`, say); with
+none, `--no-job`.
 
 `--no-browser` for SSH sessions and CI.
 

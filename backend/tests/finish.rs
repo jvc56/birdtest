@@ -72,7 +72,7 @@ async fn claim_state(db: &TestDb, assignment: &Value) -> String {
 #[tokio::test]
 async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 100).await;
+    let job = db.games_job(100).await;
     sqlx::query("UPDATE job_game_config SET min_games = 100 WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -130,7 +130,7 @@ async fn under_steady_load_the_finish_check_runs_on_every_nth_submission() {
 async fn opening_rack_job(db: &TestDb, racks_per_batch: i32, total_racks: i64) -> Uuid {
     let admin = db.user("admin", true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -215,7 +215,7 @@ async fn a_forced_completion_is_reported_as_forced() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
     let admin = db.user("root", true).await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let row = jobstats::load_job(&db.pool, job).await.unwrap();
     assert!(jobstats::compute(&db.pool, &row).await.unwrap().completion.is_none());
 
@@ -322,7 +322,7 @@ async fn a_job_whose_last_results_landed_while_inactive_completes_once_reactivat
 /// the first claim to find it empty completes it.
 async fn a_games_job_whose_cap_landed_while_inactive(sprt_enabled: bool) -> (TestDb, Uuid) {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 100).await;
+    let job = db.games_job(100).await;
     sqlx::query(
         "UPDATE job_game_config SET sprt_enabled = $2, min_games = 100, max_games = 200
          WHERE job_id = $1",

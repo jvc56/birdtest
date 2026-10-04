@@ -101,7 +101,6 @@ export class AdminApi {
       variant: 'classic',
       letterdist_id: data.letterdist,
       layout_id: data.layout,
-      redundancy: 1,
       ...config
     });
     await this.post(`/api/admin/jobs/${created.job.id}/activate`, { allocation });

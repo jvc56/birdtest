@@ -413,6 +413,11 @@ pub struct CapturedPosition {
     pub previous_move: Option<String>,
     #[serde(default)]
     pub previous_move_score: Option<i32>,
+    /// The move played from this position, and its score: the one chosen
+    /// this turn, which need not be the top of `moves` (a simmer's pick, or
+    /// a solver's). Always stated.
+    pub played_move: String,
+    pub played_move_score: i32,
     /// How many moves were ranked, before truncation to `num_plays_recorded`.
     pub num_moves: i32,
     /// How the move played here was chosen: `static`, `sim`, `peg` or
@@ -511,6 +516,10 @@ pub struct PositionAnalysis {
     /// `None` for turn 0 of a game and for opening racks.
     pub previous_move: Option<String>,
     pub previous_move_score: Option<i32>,
+    /// The move played from this position, and its score. `None` for an
+    /// opening rack, from which nothing is played.
+    pub played_move: Option<String>,
+    pub played_move_score: Option<i32>,
     /// How many moves the worker ranked, which is generally far more than the
     /// number kept in `moves`. The only part of the analysis the stored moves
     /// cannot recover, since they are truncated.
@@ -544,6 +553,8 @@ impl PositionAnalysis {
             turn_number: None,
             previous_move: None,
             previous_move_score: None,
+            played_move: None,
+            played_move_score: None,
             num_moves: num_moves.unwrap_or(moves.len() as i32),
             moves,
         }
@@ -706,7 +717,7 @@ mod tests {
         assert_eq!(analysis.num_moves, None);
 
         let position: CapturedPosition = serde_json::from_value(json!({
-            "game_index": 0, "turn_number": 0, "rack": "AEINRST",
+            "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",
             "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
             "num_moves": 40, "analysis": "static", "moves": [bare_move],
         }))
@@ -741,7 +752,7 @@ mod tests {
         let ply = extra(json!({ "ply": 0, "bingo_percentage": 1.0, "average_score": 30.0 }));
         let entry = extra(json!({ "move": "8D QI", "score": 22, "equity": 30.5, "plies": [ply] }));
         let position = extra(json!({
-            "game_index": 0, "turn_number": 3, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
+            "game_index": 0, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "sim", "rack": "AEINRST", "position": "cgp",
             "num_moves": 40, "moves": [entry.clone()],
         }));
 

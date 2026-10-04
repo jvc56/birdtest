@@ -15,7 +15,7 @@ use uuid::Uuid;
 /// generation-0 artifact row so it can dispatch.
 async fn leave_job(db: &TestDb, racks_per_task: i32) -> (Uuid, i64) {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
     let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
@@ -917,71 +917,6 @@ async fn a_leave_task_carries_its_seed_and_a_reissue_replays_it() {
         send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
     assert_eq!(status, StatusCode::OK, "{other}");
     assert_ne!(other["task_request"]["seed"], first["task_request"]["seed"]);
-}
-
-/// With redundancy above 1 every claim of a leave task replays the same seed,
-/// so only the first accepted result folds into the generation; the others are
-/// credited and nothing more.
-#[tokio::test]
-async fn only_the_first_result_for_a_leave_task_is_folded() {
-    let db = TestDb::new().await;
-    let (job, _) = leave_job(&db, 2).await;
-    sqlx::query("UPDATE jobs SET redundancy = 2 WHERE id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    let app = birdtest::app(db.state().await);
-
-    let mut claims = Vec::new();
-    for _ in 0..2 {
-        let (status, body) =
-            send(&app, post_json("/api/worker/task", &[], claim_body("1.0.0", &[]))).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        claims.push(body);
-    }
-    assert_eq!(
-        claims[0]["task_request"]["seed"], claims[1]["task_request"]["seed"],
-        "both slots of one task: {claims:?}"
-    );
-    let rack = forced_racks(&claims[0])[0].clone();
-
-    for claim in &claims {
-        let (status, body) = send(
-            &app,
-            post_json(
-                "/api/worker/result",
-                &[("x-worker-uuid", claim["worker_uuid"].as_str().unwrap())],
-                json!({ "claim_token": claim["claim_token"], "result": { "racks": [
-                    { "rack": rack, "count": 3, "mean": 10.0 }
-                ]}}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["accepted"], json!(true));
-    }
-
-    birdtest::jobs::leave_gen::merge_staged(&db.pool, job, 1, true).await.unwrap();
-    let count: i64 = sqlx::query_scalar(
-        "SELECT occurrence_count FROM leave_rack_progress
-         WHERE job_id = $1 AND generation = 1 AND rack = $2",
-    )
-    .bind(job)
-    .bind(&rack)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(count, 3, "the same games are counted once, not once per claim");
-
-    let credited: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM leave_records r JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
-    )
-    .bind(job)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(credited, 2, "both claims are credited");
 }
 
 /// Generation 1's universe is seeded by the first claim, like every later

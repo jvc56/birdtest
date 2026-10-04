@@ -12,7 +12,7 @@ It exists so server-side behaviour can be tested at speed and on purpose.
 Real games take real time and produce results nobody chose; almost every
 interesting server property is about something else:
 
-  * scheduling — deficit-based allocation, redundancy
+  * scheduling — deficit-based allocation
   * the claim lifecycle — heartbeat timeouts, stale tokens, reclamation
   * SPRT and ratings — which need a *chosen* win rate to reach a known verdict
   * submission validation and the plausibility checks — which need a client
@@ -324,6 +324,10 @@ def _synthetic_position(game: "_SyntheticGame", rng: random.Random, game_index: 
     if previous is not None:
         position["previous_move"] = previous["move"]
         position["previous_move_score"] = previous["score"]
+    # The move played from here: the top of the ranking, which is what the
+    # synthetic game plays.
+    position["played_move"] = ranked[0]["move"]
+    position["played_move_score"] = ranked[0]["score"]
     return position
 
 

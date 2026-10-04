@@ -27,35 +27,47 @@ test('E-8: a finished game-pairs job shows its labelled pentanomial and SPRT ver
     /^Completed: (passed \(H1 accepted\)|stopped at its cap), LLR -?\d+\.\d{3} after [\d,]+ pairs\. With the pairs that were in flight then, LLR -?\d+\.\d{3}, bounds \[-?\d+\.\d{2}, -?\d+\.\d{2}\]\.$/
   );
 
-  const table = sprt.locator('table');
-  await expect(table.locator('thead th')).toHaveText(['Pair outcome', 'Pairs', 'Share']);
+  // The test explained with the job's own numbers, folded away.
+  await expect(sprt.getByTestId('sprt-explained')).toContainText('What do the LLR and bounds mean?');
+
+  // The pair outcomes, a column per player, each row read from the player's
+  // own side: player 1's "won both" is bucket 4, player 2's bucket 0.
+  const table = sprt.getByTestId('player-compare');
+  await expect(table.locator('thead th')).toHaveText(['Pair outcome', 'static-equity', 'static-score']);
   const rows = table.locator('tbody tr');
-  await expect(rows.locator('td:first-child')).toHaveText([
-    'P1 lost both',
-    'Lost one, drew one',
-    'Split 1-1',
-    'Won one, drew one',
-    'P1 won both'
-  ]);
+  await expect(rows.locator('td:first-child')).toHaveText(['Won both', 'Won one, drew one', 'Even']);
 
   // Every completed pair is in exactly one bucket, and the shares are of pairs.
   const stats = await (await request.get(`/api/jobs/${job.id}`)).json();
   const pentanomial: number[] = stats.games.pentanomial;
   const pairs: number = stats.games.units_completed;
   expect(pentanomial.reduce((a, b) => a + b, 0)).toBe(pairs);
-  await expect(rows.locator('td:nth-child(2)')).toHaveText(pentanomial.map((n) => n.toLocaleString('en-US')));
-  await expect(rows.locator('td:nth-child(3)')).toHaveText(
-    pentanomial.map((n) => `${((100 * n) / pairs).toFixed(1)}%`)
+  // Matched from the start: a marked cell also says "(higher)" or "(lower)"
+  // to a screen reader.
+  const cell = (n: number) =>
+    new RegExp(`^${n.toLocaleString('en-US')} \\(${((100 * n) / pairs).toFixed(1)}%\\)`);
+  await expect(rows.locator('td:nth-child(2)')).toHaveText([4, 3, 2].map((b) => cell(pentanomial[b])));
+  await expect(rows.locator('td:nth-child(3)')).toHaveText([0, 1, 2].map((b) => cell(pentanomial[b])));
+  // The higher of a row is marked, the even row never.
+  const standing = (n: number, m: number) => (n === m ? 'even' : n > m ? 'higher' : 'lower');
+  await expect(rows.nth(0).locator('td:nth-child(2)')).toHaveAttribute(
+    'data-standing',
+    standing(pentanomial[4], pentanomial[0])
   );
+  await expect(rows.nth(2).locator('td:nth-child(2)')).toHaveAttribute('data-standing', 'even');
   await expect(sprt.getByText(`The test runs on all ${pairs.toLocaleString('en-US')} pairs`)).toBeVisible();
 
   // Player 1's record is the match score's, in a box of its own above the
-  // test, counted in games; the SPRT card keeps only the test.
+  // test, a column per player, counted in games; the SPRT card keeps only the test.
   const score = page.locator('.card', { has: page.getByRole('heading', { name: 'Match score' }) });
   const { wins, losses, draws } = stats.games;
-  await expect(score.getByTestId('match-record')).toHaveText(
-    [wins, losses, draws].map((n: number) => n.toLocaleString('en-US')).join('–')
-  );
-  await expect(score.getByText(/^Average score:/)).toBeVisible();
+  const scoreRows = score.getByTestId('player-compare').locator('tbody tr');
+  await expect(scoreRows.nth(0).locator('td')).toHaveText([
+    'Wins',
+    new RegExp(`^${wins.toLocaleString('en-US')}\\b`),
+    new RegExp(`^${losses.toLocaleString('en-US')}\\b`)
+  ]);
+  await expect(scoreRows.nth(1).locator('td')).toHaveText(['Draws', ...[draws, draws].map((n: number) => n.toLocaleString('en-US'))]);
+  await expect(score.getByTestId('match-games')).toContainText(`Over ${(wins + losses + draws).toLocaleString('en-US')} games`);
   await expect(sprt.getByText(/^Player 1:/)).toHaveCount(0);
 });

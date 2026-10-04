@@ -144,7 +144,7 @@ async fn leave_job(
     let admin = db
         .user(&format!("admin{}", Uuid::new_v4().simple()), true)
         .await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
     if let Some(ld) = ld {
         sqlx::query("UPDATE jobs SET letterdist_id = $2 WHERE id = $1")
             .bind(job)

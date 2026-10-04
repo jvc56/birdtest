@@ -35,7 +35,7 @@ async fn leave_job(
     let admin = db
         .user(&format!("admin{}", Uuid::new_v4().simple()), true)
         .await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
     let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(

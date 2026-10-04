@@ -83,7 +83,7 @@ async fn download(url: &str) -> Vec<u8> {
 /// captured positions each, completed by SQL -- every claim has landed, so the
 /// export is not refused as unsettled.
 async fn completed_capture_job(db: &TestDb, app: &axum::Router, results: usize) -> Uuid {
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -104,9 +104,9 @@ async fn completed_capture_job(db: &TestDb, app: &axum::Router, results: usize) 
 fn captured_result(i: usize) -> serde_json::Value {
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": format!("cgp-{i}-0"),
+        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": format!("cgp-{i}-0"),
           "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 3, "analysis": "static", "rack": "AEINRSU", "position": format!("cgp-{i}-1"),
+        { "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRSU", "position": format!("cgp-{i}-1"),
           "previous_move": "8D DOG", "previous_move_score": 10,
           "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
     ]);
@@ -406,7 +406,7 @@ async fn startup_fails_exports_left_running_and_leaves_the_rest_alone() {
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
     let headers = admin_headers(&state.cfg, admin);
-    let (done, orphan) = (db.games_job(1, 2).await, db.games_job(1, 2).await);
+    let (done, orphan) = (db.games_job(2).await, db.games_job(2).await);
     let ready = export_row(&db, done, "ready").await;
     let failed = export_row(&db, done, "failed").await;
     let running = export_row(&db, orphan, "running").await;
@@ -573,7 +573,7 @@ async fn a_reader_that_hangs_up_ends_its_corpus_query() {
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
     let headers = admin_headers(&state.cfg, admin);
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     let task: Uuid = sqlx::query_scalar("INSERT INTO tasks (job_id, seed, state) VALUES ($1, 0, 'completed') RETURNING id")
         .bind(job)
         .fetch_one(&db.pool)
@@ -641,7 +641,7 @@ async fn a_stream_the_database_cuts_off_ends_in_an_error() {
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
     let headers = admin_headers(&state.cfg, admin);
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     let task: Uuid = sqlx::query_scalar("INSERT INTO tasks (job_id, seed, state) VALUES ($1, 0, 'completed') RETURNING id")
         .bind(job).fetch_one(&db.pool).await.unwrap();
     let claim: Uuid = sqlx::query_scalar(
@@ -886,8 +886,8 @@ async fn results_and_positions_are_read_in_one_snapshot() {
     sqlx::query(
         "INSERT INTO position_analysis_records
              (task_claim_id, task_id, job_id, rack, position, game_index, turn_number, num_moves,
-              analysis)
-         VALUES ($1, $2, $3, 'AEINRST', 'late', 0, 0, 1, 'static')",
+              analysis, played_move, played_move_score)
+         VALUES ($1, $2, $3, 'AEINRST', 'late', 0, 0, 1, 'static', '8D PLAYED', 10)",
     )
     .bind(claim)
     .bind(task)

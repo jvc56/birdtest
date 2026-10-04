@@ -60,6 +60,11 @@ pub(super) fn validate_positions(
             position.previous_move_score,
             "captured position",
         )?;
+        super::plausibility::check_played_move(
+            &position.played_move,
+            position.played_move_score,
+            "captured position",
+        )?;
         super::plausibility::check_moves(
             &position.moves,
             Some(position.num_moves),
@@ -80,6 +85,8 @@ pub(super) fn validate_positions(
             turn_number: Some(position.turn_number),
             previous_move: position.previous_move,
             previous_move_score: position.previous_move_score,
+            played_move: Some(position.played_move),
+            played_move_score: Some(position.played_move_score),
             num_moves: position.num_moves,
             moves: position.moves,
         });
@@ -234,7 +241,7 @@ mod tests {
     fn one_captured_position_a_turn() {
         let position = |turn: i16| -> crate::jobs::handler::CapturedPosition {
             serde_json::from_value(serde_json::json!({
-                "game_index": 0, "turn_number": turn, "rack": "AEINRST",
+                "game_index": 0, "turn_number": turn, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST",
                 "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
                 "num_moves": 1, "analysis": "static",
                 "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]

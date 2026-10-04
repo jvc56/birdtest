@@ -390,8 +390,8 @@ impl TestDb {
             "INSERT INTO player_configs
                  (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
                   num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
-                  movegen_margin, created_by)
-             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, false, false, 5, $4)
+                  use_wit, movegen_margin, created_by)
+             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, false, false, false, 5, $4)
              RETURNING id",
         )
         .bind(name)
@@ -413,8 +413,8 @@ impl TestDb {
             "INSERT INTO player_configs
                  (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
                   num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
-                  movegen_margin, created_by)
-             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, $4, false, 5, $5)
+                  use_wit, movegen_margin, created_by)
+             VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, $4, false, false, 5, $5)
              RETURNING id",
         )
         .bind(name)
@@ -430,11 +430,11 @@ impl TestDb {
     /// An active `games` job at 50% allocation, with its config row. It runs
     /// an SPRT at the schema's defaults, which the stats and finish tests read;
     /// at a floor and cap of a million games it never decides anything else.
-    pub async fn games_job(&self, redundancy: i32, games_per_batch: i32) -> Uuid {
+    pub async fn games_job(&self, games_per_batch: i32) -> Uuid {
         let admin = self.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
         let p1 = self.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
         let p2 = self.static_player(&format!("p2{}", Uuid::new_v4().simple()), admin).await;
-        let job = self.bare_job("games", redundancy, admin).await;
+        let job = self.bare_job("games", admin).await;
         sqlx::query(
             "INSERT INTO job_game_config
                  (job_id, player1_config_id, player2_config_id, games_per_batch, sprt_enabled,
@@ -452,17 +452,16 @@ impl TestDb {
     }
 
     /// A `jobs` row and nothing else: active, allocation 50, floor 0.1.0.
-    pub async fn bare_job(&self, job_type: &str, redundancy: i32, created_by: Uuid) -> Uuid {
+    pub async fn bare_job(&self, job_type: &str, created_by: Uuid) -> Uuid {
         let ld = self.input_data("letterdist", "english").await;
         let layout = self.input_data("layout", "standard15").await;
         sqlx::query_scalar(
-            "INSERT INTO jobs (job_type, allocation, redundancy, status, created_by,
+            "INSERT INTO jobs (job_type, allocation, status, created_by,
                                variant, letterdist_id, layout_id, bingo_bonus, sim_cutoff)
-             VALUES ($1::job_type, 50, $2, 'active', $3, 'classic', $4, $5, 50, 0.005)
+             VALUES ($1::job_type, 50, 'active', $2, 'classic', $3, $4, 50, 0.005)
              RETURNING id",
         )
         .bind(job_type)
-        .bind(redundancy)
         .bind(created_by)
         .bind(ld)
         .bind(layout)
@@ -513,6 +512,14 @@ pub async fn send(app: &Router, request: Request<Body>) -> (StatusCode, serde_js
 
 pub fn post_json(path: &str, headers: &[(&str, &str)], body: serde_json::Value) -> Request<Body> {
     let mut builder = Request::post(path).header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(Body::from(body.to_string())).unwrap()
+}
+
+pub fn put_json(path: &str, headers: &[(&str, &str)], body: serde_json::Value) -> Request<Body> {
+    let mut builder = Request::put(path).header("content-type", "application/json");
     for (name, value) in headers {
         builder = builder.header(*name, *value);
     }

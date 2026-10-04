@@ -201,6 +201,7 @@ const ROUTES: &[(&str, &str, Access, &str)] = &[
         Admin,
         r#"{"job_type":"opening_rack","variant":"classic","letterdist_id":"00000000-0000-4000-8000-000000000001","layout_id":"00000000-0000-4000-8000-000000000001","player_config_id":"00000000-0000-4000-8000-000000000001"}"#,
     ),
+    ("PUT", "/api/admin/jobs/allocations", Admin, r#"{"allocations":[{"job_id":"00000000-0000-4000-8000-000000000001","allocation":50}]}"#),
     ("POST", "/api/admin/jobs/:id/activate", Admin, r#"{"allocation":50}"#),
     ("POST", "/api/admin/jobs/:id/deactivate", Admin, ""),
     ("POST", "/api/admin/jobs/:id/complete", Admin, ""),
@@ -450,8 +451,8 @@ async fn every_cookie_backed_write_requires_the_csrf_pair() {
         }
         checked += 1;
     }
-    // 24 admin writes, 3 account writes, logout and sign-out-everywhere.
-    assert_eq!(checked, 29);
+    // 25 admin writes, 3 account writes, logout and sign-out-everywhere.
+    assert_eq!(checked, 30);
 
     // Nothing was done under any of them: the admin is still signed in, and
     // the audit log is empty.
@@ -473,7 +474,7 @@ async fn worker_writes_need_no_csrf_token_even_alongside_session_cookies() {
     let db = TestDb::new().await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let user = db.user("contributor", false).await;
     let raw_key = birdtest::auth::api_key::generate_raw_key();
     sqlx::query("INSERT INTO api_keys (user_id, key_hash) VALUES ($1, $2)")

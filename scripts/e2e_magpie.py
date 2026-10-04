@@ -43,6 +43,10 @@ Each case is selectable with `--cases` (default: every M case):
 - `M-14` A game-pairs job keeping first divergences stores, from each pair
   that diverged, both games' positions at one turn of one position, each with
   that player's own best move, and nothing from pairs played identically.
+- `M-15` An opening-rack job seeking a consensus, with a real simmer on the
+  two-letter data: it covers its eight racks, then reissues them -- as lists,
+  from seeds past the end of the space -- until each is settled, and
+  completes once all are; every rack has at least its fewest analyses.
 
 And one case that is not a test: `capture` runs one job of each type through
 `scripts/capture_contract.py`'s recording proxy and writes the contract
@@ -252,6 +256,9 @@ def create_player(ctx: Context, data: dict, name: str, body: dict) -> str:
     created = ctx.post("/api/admin/player-configs", f"create player config {name}", {
         "name": name, "recorder_type": "best", "sort_strategy": "equity",
         "kwg_id": data["kwg"], "klv_id": data["klv"], "num_plays_recorded": 5,
+        # No word info table unless a case asks for one: the server's default
+        # is on, and a table makes a job wait for the derived-file builder.
+        "use_wit": False,
         **body,
     })
     return created["id"]
@@ -1155,6 +1162,53 @@ def case_derived_mismatch(ctx: Context) -> None:
 # --- capturing the contract fixtures ----------------------------------------
 
 
+def case_consensus(ctx: Context) -> None:
+    """M-15"""
+    deactivate_everything(ctx)
+    remove_small_data(ctx)
+    worker = None
+    try:
+        data = small_data(ctx)
+        simmer = create_player(ctx, data, "e2e-ab-consensus", {
+            "recorder_type": "all", "winpct_id": ctx.winpct, "num_plies": 1, "num_plays": 5,
+            "num_plies_recorded": 1, "max_iterations": 40, "stopping_pct": 99,
+            "time_limit_secs": 0, "use_wordmap": False, "use_rit": False,
+        })
+        job_id = create_and_activate(ctx, data, {
+            "job_type": "opening_rack", "player_config_id": simmer, "racks_per_batch": 4,
+            "rack_size": 7, "min_results_per_rack": 2, "max_results_per_rack": 3,
+            "consensus_pct": 100,
+        })
+        # One task a run: how many the consensus takes depends on how often
+        # the simulations agree, and a worker asked for more than there are
+        # would wait for them.
+        worker = Worker(ctx, "m15", small=True)
+        for _ in range(12):
+            if ctx.get(f"/api/jobs/{job_id}", "job stats")["job"]["status"] == "completed":
+                break
+            worker.run(tasks=1)
+        stats = ctx.get(f"/api/jobs/{job_id}", "job stats")
+        racks = stats["opening_racks"]
+        expect(stats["job"]["status"] == "completed", f"the job did not complete: {stats['job']}")
+        expect(racks["racks_total"] == 8 and racks["racks_settled"] == 8
+               and racks["racks_analyzed"] == 8, f"rack counts: {racks}")
+        fewest = int(ctx.psql(
+            f"SELECT MIN(results) FROM opening_rack_progress WHERE job_id = '{job_id}'"))
+        rows = int(ctx.psql(
+            f"SELECT COUNT(*) FROM opening_rack_progress WHERE job_id = '{job_id}' AND settled"))
+        expect(rows == 8 and fewest >= 2, f"{rows} racks settled, fewest analyses {fewest}")
+        reissues = int(ctx.psql(
+            "SELECT COUNT(*) FROM tasks t JOIN opening_rack_requests r ON r.task_id = t.id "
+            f"WHERE t.job_id = '{job_id}' AND t.seed >= 8 AND r.racks IS NOT NULL"))
+        expect(reissues >= 2, f"{reissues} reissue tasks")
+        log(f"M-15: 8 racks settled after {reissues} reissues, "
+            f"{racks['racks_without_consensus']} without a consensus")
+    finally:
+        remove_small_data(ctx)
+        if worker:
+            worker.remove()
+
+
 def case_capture(ctx: Context) -> None:
     """Runs one job of each type through the recording proxy."""
     out = ctx.args.capture_out
@@ -1247,6 +1301,7 @@ CASES = {
     "M-12": case_solvers,
     "M-13": case_word_info_table,
     "M-14": case_first_divergences,
+    "M-15": case_consensus,
     "capture": case_capture,
 }
 DEFAULT_CASES = [name for name in CASES if name.startswith("M-")]

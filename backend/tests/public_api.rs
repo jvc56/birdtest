@@ -149,7 +149,7 @@ async fn anon_worker(db: &TestDb, tasks_completed: i64) -> Uuid {
 async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -176,7 +176,7 @@ async fn opening_rack_job(db: &TestDb, racks_per_batch: i32) -> Uuid {
 async fn a_jobs_full_configuration_is_public() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
 
     let (status, config) = send(&app, get_request(&format!("/api/jobs/{job}/config"), &[])).await;
     assert_eq!(status, StatusCode::OK, "{config}");
@@ -217,7 +217,7 @@ async fn a_jobs_full_configuration_is_public() {
 async fn player_configs_are_public() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let (p1, p2): (Uuid, Uuid) = sqlx::query_as(
         "SELECT player1_config_id, player2_config_id FROM job_game_config WHERE job_id = $1",
     )
@@ -265,8 +265,8 @@ async fn the_job_list_filters_by_status() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
     let admin = db.user("root", true).await;
-    let active = db.bare_job("games", 1, admin).await;
-    let inactive = db.bare_job("games", 1, admin).await;
+    let active = db.bare_job("games", admin).await;
+    let inactive = db.bare_job("games", admin).await;
     sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
         .bind(inactive)
         .execute(&db.pool)
@@ -287,7 +287,7 @@ async fn the_job_list_filters_by_status() {
 #[tokio::test]
 async fn the_job_list_flags_a_stalled_job() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let app = birdtest::app(db.state().await);
     let stalled = |body: &serde_json::Value| body["items"][0]["stalled"].clone();
 
@@ -336,7 +336,7 @@ async fn the_job_list_paginates_and_clamps_its_page_size() {
     let admin = db.user("root", true).await;
     let mut jobs = Vec::new();
     for day in 1..=5 {
-        let job = db.bare_job("games", 1, admin).await;
+        let job = db.bare_job("games", admin).await;
         sqlx::query("UPDATE jobs SET created_at = $2::timestamptz WHERE id = $1")
             .bind(job)
             .bind(format!("2026-01-0{day}T00:00:00Z"))
@@ -381,8 +381,8 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     let app = birdtest::app(db.state().await);
     let admin = db.user("root", true).await;
 
-    let games = db.games_job(1, 2).await;
-    let pairs = db.bare_job("game_pairs", 1, admin).await;
+    let games = db.games_job(2).await;
+    let pairs = db.bare_job("game_pairs", admin).await;
     let p1 = db.static_player("p1", admin).await;
     let p2 = db.static_player("p2", admin).await;
     sqlx::query(
@@ -397,7 +397,7 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     .await
     .unwrap();
     let racks = opening_rack_job(&db, 6).await;
-    let leave = db.bare_job("leave_generation", 1, admin).await;
+    let leave = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "CSW24").await;
     let leave_player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
@@ -440,7 +440,10 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
     assert_eq!(games["games"]["sprt"]["status"], "running", "{games}");
     assert_eq!(pairs["games"]["sprt"], json!(null), "{pairs}");
     let (_, racks) = send(&app, get_request(&format!("/api/jobs/{racks}"), &[])).await;
-    assert_eq!(racks["opening_racks"], json!({ "racks_analyzed": 0, "racks_total": 100 }));
+    assert_eq!(
+        racks["opening_racks"],
+        json!({ "racks_analyzed": 0, "racks_settled": 0, "racks_without_consensus": 0, "racks_total": 100 })
+    );
     let (_, settings) = send(&app, get_request(&format!("/api/jobs/{leave}/config"), &[])).await;
     assert_eq!(settings["leave_generation"]["target_rack_counts"], json!([100, 500, 1000]));
     // The lexicon and wordmap setting are the player's, shown with it.
@@ -476,7 +479,7 @@ async fn job_detail_carries_the_stats_block_of_its_type() {
 async fn the_results_feed_paginates_and_filters_without_counting() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let alice = db.user("alice", false).await;
     let worker = anon_worker(&db, 2).await;
     let mut newest_first = Vec::new();
@@ -696,8 +699,8 @@ async fn rack_lookup_finds_an_analysed_rack() {
     assert_eq!(
         body["items"],
         json!([
-            { "rank": 1, "move": "8G WUZ", "score": 30, "equity": 32.5 },
-            { "rank": 2, "move": "8H ZA", "score": 22, "equity": 21.0 },
+            { "analysis": 1, "rank": 1, "move": "8G WUZ", "score": 30, "equity": 32.5 },
+            { "analysis": 1, "rank": 2, "move": "8H ZA", "score": 22, "equity": 21.0 },
         ]),
         "{typed} -> {}",
         racks[1]
@@ -723,7 +726,7 @@ async fn rack_lookup_finds_an_analysed_rack() {
 
 /// A games job with `capture_positions` on.
 async fn capturing_games_job(db: &TestDb) -> Uuid {
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -749,11 +752,11 @@ async fn captured_positions_are_searchable_when_signed_in() {
     for batch in 0..2 {
         let mut result = games_result(2, 1);
         result["positions"] = json!([
-            { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AABCDE?", "position": format!("cgp-{batch}-0"),
+            { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AABCDE?", "position": format!("cgp-{batch}-0"),
               "num_moves": 40, "moves": [
                   { "move": "8D BACCAE", "score": 74, "equity": 81.2 },
                   { "move": "8D ABACE", "score": 72, "equity": 79.0 } ] },
-            { "game_index": 1, "turn_number": 3, "analysis": "static", "rack": "ABBCDEE", "position": format!("cgp-{batch}-1"),
+            { "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE", "position": format!("cgp-{batch}-1"),
               "previous_move": "8D DAB", "previous_move_score": 10,
               "num_moves": 30, "moves": [{ "move": "8D BEDE", "score": 70, "equity": 77.0 }] },
         ]);
@@ -807,6 +810,9 @@ async fn captured_positions_are_searchable_when_signed_in() {
     assert_eq!(items[0]["turn_number"], 3);
     assert_eq!(items[0]["previous_move"], "8D DAB");
     assert_eq!(items[0]["previous_move_score"], 10);
+    // And the move played from it, which the board draws where it goes.
+    assert_eq!(items[0]["played_move"], "8D PLAYED");
+    assert_eq!(items[0]["played_move_score"], 10);
     assert_eq!(items[0]["num_moves"], 30);
 
     // A rack no tile of the distribution spells finds nothing, rather than
@@ -867,9 +873,9 @@ async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
     let (assignment, uuid) = &claims[2];
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AABCDE?", "position": "first",
+        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AABCDE?", "position": "first",
           "num_moves": 3, "moves": [{ "move": "8D BACCAE", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 4, "analysis": "static", "rack": "ABBCDEE", "position": "second",
+        { "game_index": 1, "turn_number": 4, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE", "position": "second",
           "previous_move": "8D DAB", "previous_move_score": 10,
           "num_moves": 3, "moves": [{ "move": "8D BEDE", "score": 70, "equity": 77.0 }] },
     ]);
@@ -908,7 +914,7 @@ async fn a_random_position_is_drawn_from_the_tasks_that_have_one() {
 async fn a_jobs_board_is_its_layout_and_letter_scores() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let (status, board) = send(&app, get_request(&format!("/api/jobs/{job}/board"), &[])).await;
     assert_eq!(status, StatusCode::OK, "{board}");
     assert_eq!(board["start"], json!([7, 7]));
@@ -947,7 +953,7 @@ async fn a_jobs_board_is_its_layout_and_letter_scores() {
 #[tokio::test]
 async fn the_stream_sends_what_a_reload_would_fetch_after_each_result() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
     let detail = format!("/api/jobs/{job}");
 
@@ -988,7 +994,7 @@ async fn the_stream_sends_what_a_reload_would_fetch_after_each_result() {
 #[tokio::test]
 async fn the_stream_unsubscribes_when_the_client_disconnects() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     assert!(!state.sse.has_subscribers(job));
@@ -1250,7 +1256,7 @@ async fn tied_jobs_and_users_are_each_listed_exactly_once() {
     let admin = db.user("root", true).await;
     let mut jobs = Vec::new();
     for _ in 0..9 {
-        jobs.push(db.bare_job("games", 1, admin).await.to_string());
+        jobs.push(db.bare_job("games", admin).await.to_string());
     }
     for i in 0..9 {
         db.user(&format!("tied{i}"), false).await;
@@ -1300,7 +1306,7 @@ async fn tied_jobs_and_users_are_each_listed_exactly_once() {
 #[tokio::test]
 async fn live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let admin = db.user("root", true).await;
     let mut cfg = db.config();
     cfg.stats_cache = std::time::Duration::from_secs(10);
@@ -1361,7 +1367,7 @@ async fn live_pushes_are_spaced_by_the_stats_interval_but_admin_changes_are_not(
 #[tokio::test]
 async fn submissions_during_a_cool_down_are_pushed_when_it_ends() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let mut cfg = db.config();
     cfg.stats_cache = std::time::Duration::from_secs(2);
     let app = birdtest::app(db.state_with(cfg).await);
@@ -1408,7 +1414,7 @@ async fn capturing_pairs_job(db: &TestDb, first_divergence: bool) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let p1 = db.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
     let p2 = db.static_player(&format!("p2{}", Uuid::new_v4().simple()), admin).await;
-    let job = db.bare_job("game_pairs", 1, admin).await;
+    let job = db.bare_job("game_pairs", admin).await;
     sqlx::query(
         "INSERT INTO job_game_pair_config
              (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs,
@@ -1435,7 +1441,7 @@ fn pairs_result(positions: serde_json::Value) -> serde_json::Value {
 }
 
 fn divergence(game: i32, turn: i32, scores: &str, best: &str) -> serde_json::Value {
-    json!({ "game_index": game, "turn_number": turn, "analysis": "static", "rack": "ABBCDEE",
+    json!({ "game_index": game, "turn_number": turn, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "ABBCDEE",
             "position": format!("15/15/15/15/15/15/15/7DAB5/15/15/15/15/15/15/15 {scores} 0"),
             "previous_move": "8H DAB", "previous_move_score": 10,
             "num_moves": 30, "moves": [{ "move": best, "score": 70, "equity": 77.0 }] })

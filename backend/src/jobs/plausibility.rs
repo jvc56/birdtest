@@ -208,6 +208,23 @@ pub fn check_position_text(
     Ok(())
 }
 
+/// The move played from a captured position, bounded as any play is, and a
+/// score a play can score. Not required to be among the position's ranked
+/// moves: a simmer can pick a play ranked lower by equity, and only the top
+/// `num_plays_recorded` are kept.
+pub fn check_played_move(play: &str, score: i32, context: &str) -> AppResult<()> {
+    if play.trim().is_empty() {
+        return Err(AppError::bad_request(format!("{context}: no play made from it is stated")));
+    }
+    check_play_text(play, context)?;
+    if !(0..=MAX_MOVE_SCORE).contains(&score) {
+        return Err(AppError::bad_request(format!(
+            "{context}: the play made from it scores {score}, which no play can score"
+        )));
+    }
+    Ok(())
+}
+
 /// A result's JSON text holds no NUL character. Postgres refuses one in a
 /// string, and the insert failed as a `500` -- which MAGPIE retries until it
 /// gives up, leaving the claim open (the audit's pass 21). JSON can carry one

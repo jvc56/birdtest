@@ -376,6 +376,9 @@ def player_config(
                 "use_wordmap": wordmap,
                 # A table is built from the wordmap, so no wordmap is no table.
                 "use_rit": rit and wordmap,
+                # Off with the wordmap: --no-wordmap means no job waits on the
+                # derived-file builder, which builds this table too.
+                "use_wit": wordmap,
                 **(sim or {}),
             },
         ),
@@ -453,7 +456,6 @@ def create_job(client: Client, args, data: dict, players: list,
         "variant": args.variant,
         "letterdist_id": data["letterdist"],
         "layout_id": data["layout"],
-        "redundancy": args.redundancy,
         **job_config(job_type, players, args),
         **(extra or {}),
     }
@@ -479,17 +481,39 @@ def create_job(client: Client, args, data: dict, players: list,
 
 # --- the jobs dev.py can start with ------------------------------------------
 
-# Each a job of its own, so any of them can be asked for together. The first
-# two run on MAGPIE's two-letter test data (`english_ab`, eight possible full
-# racks), so they finish in minutes.
-DEV_JOBS = ("leave_generation", "opening_rack", "games", "game_pairs")
-
-DEV_JOB_NAMES = {
-    "leave_generation": "dev leave generation (english_ab)",
-    "opening_rack": "dev opening racks (english_ab)",
-    "games": "dev games",
-    "game_pairs": "dev game pairs (first divergences saved)",
+# Each a job of its own, so any of them can be asked for together. Each runs on
+# the main data (--lexicon, on the english distribution), or, with `_ab`
+# appended, on MAGPIE's two-letter test data (`english_ab`, eight possible full
+# racks), where it finishes in minutes.
+#
+# Each: the job type it creates, whether its players simulate, its name, and
+# what its name says it keeps.
+DEV_JOB_KINDS = {
+    "leave_generation": ("leave_generation", False, "dev leave generation", None),
+    "opening_rack": ("opening_rack", False, "dev opening racks", None),
+    "games": ("games", False, "dev games", "positions saved"),
+    "games_sim": ("games", True, "dev sim games", "positions saved"),
+    "game_pairs": ("game_pairs", False, "dev game pairs", "first divergences saved"),
+    "game_pairs_sim": ("game_pairs", True, "dev sim game pairs", "first divergences saved"),
 }
+SMALL_SUFFIX = "_ab"
+DEV_JOBS = tuple(job + suffix for job in DEV_JOB_KINDS for suffix in ("", SMALL_SUFFIX))
+
+
+def dev_job_kind(job: str) -> str:
+    """The DEV_JOB_KINDS entry one of DEV_JOBS is."""
+    return job[:-len(SMALL_SUFFIX)] if job.endswith(SMALL_SUFFIX) else job
+
+
+def dev_job_type(job: str) -> str:
+    """The job type one of DEV_JOBS creates."""
+    return DEV_JOB_KINDS[dev_job_kind(job)][0]
+
+
+def dev_job_name(job: str) -> str:
+    _, _, name, keeps = DEV_JOB_KINDS[dev_job_kind(job)]
+    notes = (["english_ab"] if job.endswith(SMALL_SUFFIX) else []) + ([keeps] if keeps else [])
+    return f"{name} ({', '.join(notes)})" if notes else name
 
 
 def small_input_data(client: Client, args, layout: str) -> dict:
@@ -519,39 +543,69 @@ def create_dev_jobs(client: Client, args, data: dict) -> None:
     name already runs, the new ones sharing what allocation is free."""
     wanted = list(dict.fromkeys(args.dev_job))
     small = (small_input_data(client, args, data["layout"])
-             if {"leave_generation", "opening_rack"} & set(wanted) else None)
-
-    def static_pair() -> list:
-        return [
-            player_config(client, "static-equity", "equity", data, wordmap=args.wordmap, rit=args.rit),
-            player_config(client, "static-score", "score", data, wordmap=args.wordmap, rit=args.rit),
-        ]
+             if any(job.endswith(SMALL_SUFFIX) for job in wanted) else None)
 
     def spec(job: str):
         """(data, players, settings) for one of DEV_JOBS."""
-        if job == "leave_generation":
+        on_small = job.endswith(SMALL_SUFFIX)
+        job_data = small if on_small else data
+        # Each data set's players named apart, since a config that already
+        # exists by name is reused as it is.
+        prefix = "ab-" if on_small else ""
+
+        def player(name: str, sort: str, recorder: str = "best", rit: bool = args.rit,
+                   sim: Optional[dict] = None) -> str:
+            return player_config(client, prefix + name, sort, job_data, recorder=recorder,
+                                 sim=sim, wordmap=args.wordmap, rit=rit)
+
+        job_type = dev_job_type(job)
+        if job_type == "leave_generation":
             # Static on equity with no rack info table: it measures the leaves
-            # a table would cache. A generation closes once every one of the
-            # eight racks has been seen its target number of times.
-            player = player_config(client, "ab-static-equity", "equity", small,
-                                   wordmap=args.wordmap, rit=False)
-            return small, [player], {"num_iterations": 1000, "racks_per_task": 50,
-                                     "target_rack_counts": [100, 200, 500, 1000, 1000, 1000]}
-        if job == "opening_rack":
-            # Every play ranked, eight racks two to a task.
-            player = player_config(client, "ab-static-equity-all", "equity", small, recorder="all",
-                                   wordmap=args.wordmap, rit=args.rit)
-            return small, [player], {"racks_per_batch": 2, "rack_size": 7}
-        if job == "games":
+            # a table would cache. A generation closes once every rack has
+            # been seen its target number of times -- minutes for the eight
+            # english_ab racks, far longer for english's millions.
+            name = "static-equity" if on_small else "static-equity-no-rit"
+            return job_data, [player(name, "equity", rit=False)], {
+                "num_iterations": 1000, "racks_per_task": 50,
+                "target_rack_counts": [100, 200, 500, 1000, 1000, 1000]}
+        if job_type == "opening_rack":
+            # Every play ranked: english_ab's eight racks two to a task,
+            # english's millions at the server's default batch.
+            return job_data, [player("static-equity-all", "equity", recorder="all")], {
+                "racks_per_batch": 2 if on_small else 500, "rack_size": 7}
+        # english_ab's players share the leave job's config, which has no
+        # rack info table: one on eight racks saves nothing.
+        rit = args.rit and not on_small
+        if DEV_JOB_KINDS[dev_job_kind(job)][1]:
+            # A simmer must sort on equity, so the two differ in depth
+            # instead. They consider at least the ten plays a captured
+            # position keeps (player_config's num_plays_recorded), as job
+            # creation requires. A task is two games or one pair, so a claim
+            # finishes in minutes. english_ab brings no win% model, so its
+            # simmers use the main data's.
+            if not data["winpct"]:
+                raise SeedError(f"{dev_job_name(job)} needs a win% model, and the imported "
+                                "data has none")
+            players = [player(f"sim-{plies}ply", "equity", recorder="all", rit=rit, sim={
+                "winpct_id": data["winpct"], "num_plies": plies, "num_plays": 10,
+                "max_iterations": 200, "time_limit_secs": 0}) for plies in (2, 1)]
+            batch = ({"games_per_batch": 2} if job_type == "games" else {"pairs_per_batch": 1})
+        else:
+            players = [player("static-equity", "equity", rit=rit),
+                       player("static-score", "score", rit=rit)]
+            batch = {}
+        if job_type == "games":
             # Not acted on before 50,000 games, as the pairs job's test waits
             # 50,000 pairs: equity against score decides within a hundred
             # games, and a job that finishes in a minute is no use to work on.
-            return data, static_pair(), {"min_games": 50000}
-        # Equity against score diverge within a few turns, so most pairs keep
-        # a position.
-        return data, static_pair(), {"capture_positions": True, "capture_first_divergence": True}
+            return job_data, players, {"min_games": 50000, "capture_positions": True, **batch}
+        # The players diverge within a few turns, so most pairs keep a
+        # position.
+        return job_data, players, {"capture_positions": True, "capture_first_divergence": True,
+                                   **batch}
 
-    running = {job: existing_active_job(client, job, DEV_JOB_NAMES[job]) for job in wanted}
+    running = {job: existing_active_job(client, dev_job_type(job), dev_job_name(job))
+               for job in wanted}
     new = [job for job in wanted if not running[job] or args.new_job]
     taken = sum(job.get("allocation") or 0 for job in active_jobs(client))
     share = (100 - taken) // len(new) if new else 0
@@ -559,11 +613,11 @@ def create_dev_jobs(client: Client, args, data: dict) -> None:
         raise SeedError(f"the active jobs already take {taken}% of the fleet, leaving nothing "
                         "for a new one; deactivate some, or start with --reset-db")
     for job in wanted:
-        job_data, players, settings = spec(job)
         if job not in new:
-            log(f"{DEV_JOB_NAMES[job]} is already active ({running[job]}); reusing it")
+            log(f"{dev_job_name(job)} is already active ({running[job]}); reusing it")
             continue
-        create_job(client, args, job_data, players, job, DEV_JOB_NAMES[job],
+        job_data, players, settings = spec(job)
+        create_job(client, args, job_data, players, dev_job_type(job), dev_job_name(job),
                    extra=settings, allocation=share)
     log(f"seeded — {len(wanted)} job(s) active" + (f", the new ones at {share}% each" if new else ""))
 
@@ -641,24 +695,26 @@ def build_parser() -> argparse.ArgumentParser:
                              "MAGPIE can claim.")
     parser.add_argument("--new-job", action="store_true",
                         help="always create a job, even if an active one of this type exists")
-    parser.add_argument("--redundancy", type=int, default=1)
     parser.add_argument("--job-name", default="",
                         help="what to call the seeded job (shown first in the jobs list); "
                              "unnamed by default, so it is titled by its type")
     parser.add_argument("--allocation", type=int, default=100)
     parser.add_argument("--no-wordmap", dest="wordmap", action="store_false",
                         help="players (and the leave-generation bot) play without a wordmap, "
-                             "or the rack info table built from one, so no job waits on the "
-                             "derived-file builder; a player config that already exists by "
-                             "name is reused as it is")
+                             "the rack info table built from one, or a word info table, so no "
+                             "job waits on the derived-file builder; a player config that "
+                             "already exists by name is reused as it is")
     parser.add_argument("--no-rit", dest="rit", action="store_false",
                         help="players play without a rack info table (about 1.9 GB of disk "
                              "and of memory per worker process)")
     parser.add_argument("--dev-job", action="append", default=[], choices=DEV_JOBS,
                         help="instead of --job-type, start with this one of dev.py's jobs; "
-                             "repeat for several: leave_generation (six generations on "
-                             "english_ab), opening_rack (english_ab), games, or game_pairs "
-                             "(saving each pair's first divergence). New ones share the "
+                             "repeat for several: leave_generation (six generations), "
+                             "opening_rack, games (saving positions), game_pairs (saving each "
+                             "pair's first divergence), or games_sim or game_pairs_sim (the "
+                             "same, between two simmers), each on --lexicon and --letterdist, "
+                             "or with _ab "
+                             "appended on the two-letter english_ab data. New ones share the "
                              "allocation the active jobs leave free")
     parser.add_argument("--no-job", action="store_true",
                         help="create no job: just the admin and the input data")

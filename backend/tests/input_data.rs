@@ -818,7 +818,7 @@ async fn an_input_file_in_use_cannot_be_deleted() {
             .await
             .unwrap()
     };
-    let (job_ld, job_layout) = board(db.bare_job("games", 1, admin.id).await).await;
+    let (job_ld, job_layout) = board(db.bare_job("games", admin.id).await).await;
     // A simming player's lexicon, leaves and win% model.
     let kwg = db.input_data("kwg", "NWL23").await;
     let klv = db.input_data("klv", "NWL23").await;
@@ -837,7 +837,7 @@ async fn an_input_file_in_use_cannot_be_deleted() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let player: Uuid = body["id"].as_str().unwrap().parse().unwrap();
     // A leave job's player, whose config pins its lexicon and leaves.
-    let leave = db.bare_job("leave_generation", 1, admin.id).await;
+    let leave = db.bare_job("leave_generation", admin.id).await;
     let (leave_ld, leave_layout) = board(leave).await;
     let leave_kwg = db.input_data("kwg", "CSW21").await;
     let leave_player = db.leave_player(leave_kwg, true, admin.id).await;

@@ -5,7 +5,8 @@
  * ordered list; its players' are another table, side by side.
  */
 import type { JobType } from '$lib/api';
-import { jobTypeLabel } from '$lib/format';
+import { jobTypeLabel, targetsText } from '$lib/format';
+import { analysesPerRack } from '$lib/consensus';
 
 export interface PlayerSettings {
   /** Its part in a job ("player 1"); absent for a config read on its own. */
@@ -66,7 +67,6 @@ export interface JobConfig {
     layout: string;
     bingo_bonus: number;
     sim_cutoff: number;
-    redundancy: number;
     min_magpie_version: string;
   };
   games?: {
@@ -84,7 +84,15 @@ export interface JobConfig {
     /** Game pairs: only each pair's first divergence is kept. */
     capture_first_divergence: boolean;
   };
-  opening_racks?: { racks_per_batch: number; rack_size: number; total_racks: number };
+  opening_racks?: {
+    racks_per_batch: number;
+    rack_size: number;
+    total_racks: number;
+    /** See `lib/consensus.ts`: one analysis per rack when the most is 1. */
+    consensus_pct: number;
+    min_results_per_rack: number;
+    max_results_per_rack: number;
+  };
   /** Its lexicon and wordmap setting are its player's, in `players`. */
   leave_generation?: {
     num_iterations: number;
@@ -161,7 +169,7 @@ const more = (label: string, value: string): JobSetting => ({ label, value, key:
  * bonus; how much it plays -- a games job's target, its test and whether it
  * records positions, an opening-rack job's racks and their size, a leave job's
  * generations and each one's target. The rest -- the simulation cutoff, the
- * test's minimum and error rates, batch sizes, redundancy, the oldest MAGPIE --
+ * test's minimum and error rates, batch sizes, the oldest MAGPIE --
  * is under "All settings". A leave job's lexicon and wordmap are its player's,
  * and shown with it; it has no sim cutoff row, since it never simulates.
  */
@@ -192,11 +200,17 @@ export function jobSettings(c: JobConfig): JobSetting[] {
       )
     );
   }
-  if (o) rows.push(key('Racks in all', show(o.total_racks)), key('Rack size', show(o.rack_size)));
+  if (o) {
+    rows.push(
+      key('Racks in all', show(o.total_racks)),
+      key('Rack size', show(o.rack_size)),
+      key('Analyses per rack', analysesPerRack(o))
+    );
+  }
   if (l) {
     rows.push(
       key('Generations', show(l.target_rack_counts.length)),
-      key('Target per rack', l.target_rack_counts.map((t) => t.toLocaleString()).join(', '))
+      key('Target per rack', targetsText(l.target_rack_counts))
     );
   }
   if (!l) rows.push(more('Sim cutoff', show(c.job.sim_cutoff)));
@@ -211,10 +225,7 @@ export function jobSettings(c: JobConfig): JobSetting[] {
   if (l) rows.push(more('Games per task', show(l.num_iterations)));
   if (o) rows.push(more('Racks per task', show(o.racks_per_batch)));
   if (l) rows.push(more('Racks per task', show(l.racks_per_task)));
-  rows.push(
-    more('Redundancy', `${c.job.redundancy}×`),
-    more('Oldest MAGPIE', show(c.job.min_magpie_version))
-  );
+  rows.push(more('Oldest MAGPIE', show(c.job.min_magpie_version)));
   return rows;
 }
 

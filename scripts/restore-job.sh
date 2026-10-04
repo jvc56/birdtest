@@ -167,6 +167,7 @@ TABLES=(
   "position_analysis_records|job_id = '$job'"
   "position_analysis_moves|record_id IN ($RECORDS)"
   "position_analysis_plies|move_id IN ($MOVES)"
+  "opening_rack_progress|job_id = '$job'"
   "leave_rack_progress|job_id = '$job'"
   "leave_rack_staging|job_id = '$job'"
   "leave_generation_progress|job_id = '$job'"

@@ -63,10 +63,10 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   await expect(page.getByRole('heading', { name: 'SPRT' })).toBeVisible();
   await expectNoSidewaysScroll(page);
 
-  // The four headline figures stack in one column rather than squeezing four
-  // across: each is as wide as the one above it and sits below it.
+  // The three headline figures stack in one column rather than squeezing
+  // three across: each is as wide as the one above it and sits below it.
   const cards = page.locator('.grid > .card');
-  await expect(cards).toHaveCount(4);
+  await expect(cards).toHaveCount(3);
   const boxes = await Promise.all((await cards.all()).map((card) => card.boundingBox()));
   for (let i = 1; i < boxes.length; i++) {
     expect(boxes[i]!.x).toBeCloseTo(boxes[0]!.x, 0);
@@ -80,7 +80,10 @@ test('E-10: a visitor on a phone reads the job list, a job page and the rankings
   }
   // Every setting, the players' side by side: the tables wrap, or scroll
   // inside their card, but never widen the page.
-  const settings = page.locator('.card', { has: page.getByRole('heading', { name: 'Settings' }) });
+  const jobSettings = page.locator('.card', { has: page.getByRole('heading', { name: 'Job settings' }) });
+  await jobSettings.getByRole('button', { name: 'All settings' }).tap();
+  await expect(jobSettings.getByText('Oldest MAGPIE')).toBeVisible();
+  const settings = page.locator('.card', { has: page.getByRole('heading', { name: 'Player settings' }) });
   await settings.getByRole('button', { name: 'All settings' }).tap();
   await expect(settings.getByText('Move-gen margin')).toBeVisible();
   await expectNoSidewaysScroll(page);

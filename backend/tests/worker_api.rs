@@ -64,7 +64,7 @@ async fn a_worker_with_no_identity_is_persisted_only_when_given_a_task() {
     }
     assert_eq!(anonymous_worker_count(&db).await, 0, "idle polls must not mint identities");
 
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let (_, uuid) = first_claim(&app).await;
     assert_eq!(anonymous_worker_count(&db).await, 1);
 
@@ -91,31 +91,6 @@ async fn requests_other_than_a_claim_require_an_identity() {
     assert_eq!(anonymous_worker_count(&db).await, 0);
 }
 
-/// Bug: with redundancy above 1, a task stays `available` after its first
-/// claim, and `next_available` offered it straight back to the worker holding
-/// it. The per-identity unique index refused the slot, the claim retried three
-/// times against the same task, and the worker got nothing at all.
-#[tokio::test]
-async fn redundancy_does_not_starve_a_worker_holding_a_slot() {
-    let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
-    let app = birdtest::app(db.state().await);
-
-    let (first, uuid) = first_claim(&app).await;
-    let (status, second) = claim_as(&app, &uuid).await;
-    assert_eq!(status, StatusCode::OK, "the second claim must still find work: {second}");
-    assert_eq!(second["job_id"], json!(job.to_string()));
-    assert_ne!(
-        first["task_request"]["seed"], second["task_request"]["seed"],
-        "a worker must never hold two slots on one task"
-    );
-
-    // A second, independent worker is the one that fills the first task's
-    // other slot.
-    let (other, _) = first_claim(&app).await;
-    assert_eq!(other["task_request"]["seed"], first["task_request"]["seed"]);
-}
-
 /// Bug: the submit path read the claim outside its transaction and marked it
 /// completed unconditionally. A timeout reclaiming it in between left the
 /// claim both abandoned and completed and the task's live count decremented
@@ -125,7 +100,7 @@ async fn redundancy_does_not_starve_a_worker_holding_a_slot() {
 #[tokio::test]
 async fn submissions_for_reclaimed_or_already_accepted_claims_change_nothing() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
 
@@ -178,7 +153,7 @@ async fn submissions_for_reclaimed_or_already_accepted_claims_change_nothing() {
 #[tokio::test]
 async fn a_restarted_server_does_not_abandon_claims_it_could_not_have_heard_from() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
 
     // The outage: a worker claimed, and the server was away for an hour.
     let before = birdtest::app(db.state().await);
@@ -223,7 +198,7 @@ async fn a_restarted_server_does_not_abandon_claims_it_could_not_have_heard_from
 #[tokio::test]
 async fn a_claim_still_silent_after_the_grace_is_reclaimed() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let mut state = db.state().await;
     state.reclaim_from = std::time::Instant::now() + std::time::Duration::from_millis(300);
     let app = birdtest::app(state);
@@ -255,7 +230,7 @@ async fn a_live_stats_stream_ends_when_the_server_is_told_to_stop() {
     use tower::ServiceExt;
 
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
 
@@ -280,163 +255,15 @@ async fn a_live_stats_stream_ends_when_the_server_is_told_to_stop() {
     assert!(text.contains("event: stats"), "the first payload was sent before the end: {text}");
 }
 
-/// Bug: SPRT, progress and ratings summed every `game_results` row. With
-/// redundancy 2 each seeded batch is played twice with identical outcomes, so
-/// every game counted twice and SPRT saw double the evidence it had.
-#[tokio::test]
-async fn redundant_results_for_one_task_count_once() {
-    let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
-    let state = db.state().await;
-    let app = birdtest::app(state.clone());
-
-    let (a, uuid_a) = first_claim(&app).await;
-    let (b, uuid_b) = first_claim(&app).await;
-    assert_eq!(a["task_request"]["seed"], b["task_request"]["seed"], "same task, two slots");
-
-    // The two copies disagree -- a replay should not, but nothing checks at
-    // submission -- so which one counts is visible: the first accepted, a 2-0,
-    // and not the 0-2 after it.
-    for (assignment, uuid, wins) in [(&a, &uuid_a, 2), (&b, &uuid_b, 0)] {
-        let token = assignment["claim_token"].as_str().unwrap();
-        let (_, body) = submit_as(&app, uuid, token, games_result(2, wins)).await;
-        assert_eq!(body, json!({ "accepted": true }));
-    }
-
-    let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
-    let games = birdtest::jobstats::game_stats(&db.pool, &job_row).await.unwrap().unwrap();
-    assert_eq!(games.units_completed, 2, "two games were played, not four");
-    assert_eq!((games.wins, games.losses), (2, 0), "the first accepted copy, not the second");
-
-    // The job list reads a running total instead of re-deriving this on
-    // every page view, and it has to answer 2 for the same reason.
-    assert_eq!(job_row.games_completed, 2, "the running total counts one result per task");
-    let (_, list) = send(&app, get_request("/api/jobs", &[])).await;
-    assert_eq!(list["items"][0]["units_completed"], json!(2));
-}
-
-/// Bug: the running total decided "first accepted result for this task" by
-/// counting the task's result rows, before the task row was locked. Two
-/// submissions for a redundancy-2 task's two slots, arriving together, each
-/// counted only their own uncommitted rows, both concluded they were first, and
-/// the job list showed every such batch twice. Submissions for one task now
-/// serialize on the task row before anything is stored.
-///
-/// Deterministic rather than timing-dependent: an outside transaction holds the
-/// job row, so both submissions get as far as they can and wait on a lock
-/// before either commits -- the exact interleaving that double-counted.
-#[tokio::test]
-async fn concurrent_redundant_results_count_once() {
-    let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
-    let app = birdtest::app(db.state().await);
-
-    let (a, uuid_a) = first_claim(&app).await;
-    let (b, uuid_b) = first_claim(&app).await;
-    assert_eq!(a["task_request"]["seed"], b["task_request"]["seed"], "same task, two slots");
-    let token_a = a["claim_token"].as_str().unwrap();
-    let token_b = b["claim_token"].as_str().unwrap();
-
-    let mut blocker = db.pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM jobs WHERE id = $1 FOR UPDATE")
-        .bind(job)
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
-
-    let release = async {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pg_stat_activity
-                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
-            )
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-            if waiting >= 2 {
-                break;
-            }
-            assert!(std::time::Instant::now() < deadline, "both submissions should block");
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        blocker.commit().await.unwrap();
-    };
-
-    let ((status_a, body_a), (status_b, body_b), ()) = tokio::join!(
-        submit_as(&app, &uuid_a, token_a, games_result(2, 2)),
-        submit_as(&app, &uuid_b, token_b, games_result(2, 2)),
-        release,
-    );
-    assert_eq!((status_a, status_b), (StatusCode::OK, StatusCode::OK), "{body_a} {body_b}");
-    assert_eq!((&body_a["accepted"], &body_b["accepted"]), (&json!(true), &json!(true)));
-
-    let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
-    assert_eq!(job_row.games_completed, 2, "two games were played, not four");
-}
-
-/// I-STATS-5b: "first accepted" is acceptance order -- the task's
-/// `accepted_count` read as zero under its row lock -- and every aggregate
-/// must read the same copy the running total counted.
-///
-/// Bug: the aggregates took the copy with the earliest `submitted_at`, which
-/// defaulted to `now()`, the time the submitting *transaction began*. A
-/// submission that began first but reached the task's lock second was
-/// accepted second and still read as first, so SPRT and the ratings used one
-/// copy while the running total had counted the other.
-///
-/// Deterministic: B's submission begins and is held on its own claim row by an
-/// outside lock; A's submission then begins, is accepted, and commits; only
-/// then is B let through. The copies differ (2-0 and 0-2) so the choice shows.
-#[tokio::test]
-async fn the_copy_every_aggregate_reads_is_the_first_accepted_not_the_first_begun() {
-    let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
-    let app = birdtest::app(db.state().await);
-
-    let (a, uuid_a) = first_claim(&app).await;
-    let (b, uuid_b) = first_claim(&app).await;
-    assert_eq!(a["task_request"]["seed"], b["task_request"]["seed"], "same task, two slots");
-    let token_a = a["claim_token"].as_str().unwrap();
-    let token_b = b["claim_token"].as_str().unwrap();
-
-    let mut blocker = db.pool.begin().await.unwrap();
-    sqlx::query("SELECT 1 FROM task_claims WHERE claim_token = $1::uuid FOR UPDATE")
-        .bind(token_b)
-        .execute(&mut *blocker)
-        .await
-        .unwrap();
-
-    let overtake = async {
-        // B has begun its transaction and is waiting on its claim row.
-        wait_for_lock_waiters(&db, 1).await;
-        let (status, body) = submit_as(&app, &uuid_a, token_a, games_result(2, 2)).await;
-        assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })));
-        blocker.commit().await.unwrap();
-    };
-    let ((status_b, body_b), ()) =
-        tokio::join!(submit_as(&app, &uuid_b, token_b, games_result(2, 0)), overtake);
-    assert_eq!((status_b, &body_b), (StatusCode::OK, &json!({ "accepted": true })));
-
-    let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
-    assert_eq!(job_row.games_completed, 2, "the running total counted one copy");
-    let games = birdtest::jobstats::game_stats(&db.pool, &job_row).await.unwrap().unwrap();
-    assert_eq!(
-        (games.wins, games.losses),
-        (2, 0),
-        "SPRT reads A's copy, accepted first, not B's, begun first"
-    );
-}
-
 /// The opening-rack detail page reads a running count of analysed racks
 /// rather than counting distinct racks over every stored analysis, which at a
 /// million racks took seconds on every view and every live push.
 #[tokio::test]
-async fn analysed_racks_are_counted_once_per_task_as_they_arrive() {
+async fn analysed_racks_are_counted_as_they_arrive() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 2, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -449,42 +276,35 @@ async fn analysed_racks_are_counted_once_per_task_as_they_arrive() {
     .unwrap();
     let app = birdtest::app(db.state().await);
 
+    // Two workers, a task each: a task has one slot.
     let (a, uuid_a) = first_claim(&app).await;
     let (b, uuid_b) = first_claim(&app).await;
-    let racks: Vec<String> = a["task_request"]["racks"]
-        .as_array()
-        .expect("an opening-rack assignment carries racks")
-        .iter()
-        .map(|r| r.as_str().unwrap().to_string())
-        .collect();
-    assert_eq!(racks.len(), 2);
-
-    let result = json!({ "racks": racks.iter().map(|rack| json!({
-        "rack": rack,
-        "num_moves": 1,
-        "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
-    })).collect::<Vec<_>>() });
-
-    // Both slots of the one task, so a second accepted result must not count
-    // the same racks again.
-    for uuid in [&uuid_a, &uuid_b] {
-        let token = if uuid == &uuid_a {
-            a["claim_token"].as_str().unwrap()
-        } else {
-            b["claim_token"].as_str().unwrap()
-        };
-        let (status, body) = submit_as(&app, uuid, token, result.clone()).await;
+    assert_ne!(a["task_request"]["seed"], b["task_request"]["seed"], "a task each");
+    for (assignment, uuid) in [(&a, &uuid_a), (&b, &uuid_b)] {
+        let racks: Vec<String> = assignment["task_request"]["racks"]
+            .as_array()
+            .expect("an opening-rack assignment carries racks")
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(racks.len(), 2);
+        let result = json!({ "racks": racks.iter().map(|rack| json!({
+            "rack": rack,
+            "num_moves": 1,
+            "moves": [{ "move": "8G WUZ", "score": 30, "equity": 32.5 }],
+        })).collect::<Vec<_>>() });
+        let token = assignment["claim_token"].as_str().unwrap();
+        let (status, body) = submit_as(&app, uuid, token, result).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
 
     let job_row = birdtest::jobstats::load_job(&db.pool, job).await.unwrap();
-    assert_eq!(job_row.racks_analyzed, 2);
+    assert_eq!(job_row.racks_analyzed, 4);
     let stats = birdtest::jobstats::compute(&db.pool, &job_row).await.unwrap();
     let racks = stats.opening_racks.expect("an opening-rack job reports rack stats");
-    assert_eq!(racks.racks_analyzed, 2, "two racks were analysed, by two workers");
+    assert_eq!(racks.racks_analyzed, 4, "four racks were analysed, two by each worker");
 
-    // Each worker, though, analysed both: a contributor is credited with its
-    // own claim, not the task's first result.
+    // Each worker is credited with its own claim's racks.
     for uuid in [&uuid_a, &uuid_b] {
         let credited: (i64, i64) = sqlx::query_as(
             "SELECT games_played, racks_analyzed FROM anonymous_workers WHERE uuid = $1::uuid",
@@ -497,6 +317,140 @@ async fn analysed_racks_are_counted_once_per_task_as_they_arrive() {
     }
 }
 
+/// I-SCHED-21: an opening-rack consensus job analyses its rack space once,
+/// then reissues the racks that are not yet settled -- fewest analyses first,
+/// none another task is analysing, none the claiming worker analysed when it
+/// can be helped -- as lists, from seeds past the end of the space. A rack
+/// settles once at least two analyses agree completely, or at its third
+/// without a consensus, and the job completes once every rack is settled.
+#[tokio::test]
+async fn a_consensus_job_reissues_its_unsettled_racks_until_each_settles() {
+    let db = TestDb::new().await;
+    let admin = db.user("admin", true).await;
+    let player = db.static_player("analyst", admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
+    // Written directly: job creation refuses a consensus for a static player,
+    // and nothing here depends on how the moves were ranked.
+    sqlx::query(
+        "INSERT INTO job_opening_rack_config
+             (job_id, player_config_id, racks_per_batch, rack_size, total_racks,
+              consensus_pct, min_results_per_rack, max_results_per_rack)
+         VALUES ($1, $2, 2, 7, 4, 100, 2, 3)",
+    )
+    .bind(job)
+    .bind(player)
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let app = birdtest::app(db.state().await);
+
+    let racks_of = |assignment: &serde_json::Value| -> Vec<String> {
+        assignment["task_request"]["racks"]
+            .as_array()
+            .expect("an opening-rack assignment carries racks")
+            .iter()
+            .map(|r| r.as_str().unwrap().to_string())
+            .collect()
+    };
+    // Each rack's best move as the worker reports it.
+    let submit = |assignment: serde_json::Value, uuid: String, best: Vec<(String, &'static str)>| {
+        let app = app.clone();
+        async move {
+            let result = json!({ "racks": best.iter().map(|(rack, play)| json!({
+                "rack": rack, "num_moves": 1,
+                "moves": [{ "move": play, "score": 30, "equity": 32.5 }],
+            })).collect::<Vec<_>>() });
+            let token = assignment["claim_token"].as_str().unwrap().to_string();
+            let (status, body) = submit_as(&app, &uuid, &token, result).await;
+            assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })));
+        }
+    };
+    let counters = || async {
+        sqlx::query_as::<_, (i64, i64, i64, String)>(
+            "SELECT racks_analyzed, racks_settled, racks_without_consensus, status::text
+             FROM jobs WHERE id = $1",
+        )
+        .bind(job)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
+    };
+
+    // The first pass: the space, two racks a task, from seeds 0 and 2.
+    let (a, uuid_a) = first_claim(&app).await;
+    let (b, uuid_b) = first_claim(&app).await;
+    assert_eq!((a["task_request"]["seed"].clone(), b["task_request"]["seed"].clone()), (json!("0"), json!("2")));
+    let (first_a, first_b) = (racks_of(&a), racks_of(&b));
+    let [r1, r2] = [first_a[0].clone(), first_a[1].clone()];
+    let [r3, r4] = [first_b[0].clone(), first_b[1].clone()];
+    submit(a, uuid_a.clone(), vec![(r1.clone(), "8G WUZ"), (r2.clone(), "8G WUZ")]).await;
+    submit(b, uuid_b.clone(), vec![(r3.clone(), "8G WUZ"), (r4.clone(), "8G WUZ")]).await;
+    assert_eq!(counters().await, (4, 0, 0, "active".into()), "analysed once, none settled");
+
+    // Reissues: past the end of the space, each worker given the racks the
+    // other analysed, and never one another task holds.
+    let (status, again_a) = claim_as(&app, &uuid_a).await;
+    assert_eq!(status, StatusCode::OK, "{again_a}");
+    assert_eq!(again_a["task_request"]["seed"], json!("4"));
+    let mut expected = vec![r3.clone(), r4.clone()];
+    expected.sort();
+    let mut got = racks_of(&again_a);
+    got.sort();
+    assert_eq!(got, expected, "A analyses what B did");
+    let (status, again_b) = claim_as(&app, &uuid_b).await;
+    assert_eq!(status, StatusCode::OK, "{again_b}");
+    assert_eq!(again_b["task_request"]["seed"], json!("6"));
+    let mut expected = vec![r1.clone(), r2.clone()];
+    expected.sort();
+    let mut got = racks_of(&again_b);
+    got.sort();
+    assert_eq!(got, expected, "B analyses what A did");
+    let listed: Vec<Option<Vec<String>>> = sqlx::query_scalar(
+        "SELECT r.racks FROM opening_rack_requests r JOIN tasks t ON t.id = r.task_id
+         WHERE t.job_id = $1 ORDER BY t.seed",
+    )
+    .bind(job)
+    .fetch_all(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(listed.iter().map(Option::is_some).collect::<Vec<_>>(), [false, false, true, true]);
+
+    // r1, r2 and r3 agree twice and settle; r4 splits.
+    submit(again_a, uuid_a.clone(), vec![(r3.clone(), "8G WUZ"), (r4.clone(), "8G ZOA")]).await;
+    submit(again_b, uuid_b.clone(), vec![(r1.clone(), "8G WUZ"), (r2.clone(), "8G WUZ")]).await;
+    assert_eq!(counters().await, (4, 3, 0, "active".into()));
+
+    // Both workers have analysed r4, the last unsettled rack: it goes to A
+    // anyway rather than to nobody.
+    let (status, last) = claim_as(&app, &uuid_a).await;
+    assert_eq!(status, StatusCode::OK, "{last}");
+    assert_eq!(racks_of(&last), vec![r4.clone()]);
+    // Nothing else is free meanwhile.
+    let (status, _) = claim_as(&app, &uuid_b).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Its third analysis disagrees again: settled at its most, without a
+    // consensus, and the job is done.
+    submit(last, uuid_a.clone(), vec![(r4.clone(), "8G QI")]).await;
+    assert_eq!(counters().await, (4, 4, 1, "completed".into()));
+    let standing: (i32, String, i32, bool, bool) = sqlx::query_as(
+        "SELECT results, top_move, top_count, settled, without_consensus
+         FROM opening_rack_progress WHERE job_id = $1 AND rack = $2",
+    )
+    .bind(job)
+    .bind(&r4)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(standing, (3, "8G QI".into(), 1, true, true));
+
+    // The page's lookup numbers each analysis of a rack.
+    let query = r4.replace('?', "%3F");
+    let (_, page) = send(&app, get_request(&format!("/api/jobs/{job}/results?rack={query}"), &[])).await;
+    let analyses: Vec<i64> = page["items"].as_array().unwrap().iter().map(|m| m["analysis"].as_i64().unwrap()).collect();
+    assert_eq!(analyses, [1, 2, 3], "{page}");
+}
+
 /// Bug: any error claiming from one job failed the whole claim, so a single
 /// job that could not dispatch -- here, one whose config row is missing --
 /// answered every worker with a 500 for as long as it led the candidate list.
@@ -505,8 +459,8 @@ async fn a_job_that_cannot_dispatch_does_not_block_the_others() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
     // Created first, so it wins the deficit tie-break and is tried first.
-    let broken = db.bare_job("games", 1, admin).await;
-    let healthy = db.games_job(1, 2).await;
+    let broken = db.bare_job("games", admin).await;
+    let healthy = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let (status, body) =
@@ -522,7 +476,7 @@ async fn a_job_that_cannot_dispatch_does_not_block_the_others() {
 #[tokio::test]
 async fn a_stale_unsupported_entry_does_not_change_the_shutdown_reason() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query(
         "UPDATE jobs SET min_magpie_major = 2, min_magpie_minor = 0, min_magpie_patch = 0
          WHERE id = $1",
@@ -532,7 +486,7 @@ async fn a_stale_unsupported_entry_does_not_change_the_shutdown_reason() {
     .await
     .unwrap();
     let admin = db.user("admin", true).await;
-    let finished = db.bare_job("games", 1, admin).await;
+    let finished = db.bare_job("games", admin).await;
     sqlx::query("UPDATE jobs SET status = 'completed' WHERE id = $1")
         .bind(finished)
         .execute(&db.pool)
@@ -552,7 +506,7 @@ async fn a_stale_unsupported_entry_does_not_change_the_shutdown_reason() {
 #[tokio::test]
 async fn every_claim_advances_the_dispatch_counter() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let (assignment, uuid) = first_claim(&app).await;
@@ -607,7 +561,7 @@ async fn every_claim_advances_the_dispatch_counter() {
 async fn a_banned_identity_is_refused_however_it_authenticates() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
 
     // An anonymous worker, banned by the UUID the server minted for it.
     let (_, anon) = first_claim(&app).await;
@@ -673,7 +627,7 @@ async fn a_banned_identity_is_refused_however_it_authenticates() {
 async fn a_claim_token_works_only_for_the_identity_it_was_issued_to() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
 
     let (owner_claim, owner) = first_claim(&app).await;
     let (_, other) = first_claim(&app).await;
@@ -726,7 +680,7 @@ async fn public_endpoints_name_anonymous_workers_by_pseudonym_only() {
     let db = TestDb::new().await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
 
     let (claim, uuid) = first_claim(&app).await;
     let token = claim["claim_token"].as_str().unwrap();
@@ -772,7 +726,7 @@ async fn an_opening_rack_result_must_answer_the_racks_it_was_given() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -852,7 +806,7 @@ async fn an_opening_rack_result_must_answer_the_racks_it_was_given() {
 #[tokio::test]
 async fn concurrent_claims_tile_the_seed_space_instead_of_colliding() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let app = birdtest::app(db.state().await);
 
     // Well past the three retries the old path allowed.
@@ -893,7 +847,7 @@ async fn a_batched_opening_rack_submission_keeps_each_racks_own_moves() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -950,71 +904,6 @@ async fn a_batched_opening_rack_submission_keeps_each_racks_own_moves() {
     }
 }
 
-/// Captured in-game positions are keyed on the task, not the claim, so a
-/// redundant claim replaying the same deterministic games records nothing new.
-///
-/// Written as one multi-row insert with `ON CONFLICT DO NOTHING`, what comes
-/// back is a *subset* of what went in, so the second claim's moves must be
-/// matched to the rows that actually landed rather than zipped against the
-/// whole batch. Zipped, the second claim would attach its moves to the wrong
-/// records, or to none.
-#[tokio::test]
-async fn redundant_captured_positions_are_recorded_once() {
-    let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
-    sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
-        .bind(job)
-        .execute(&db.pool)
-        .await
-        .unwrap();
-    let app = birdtest::app(db.state().await);
-
-    let positions = json!([
-        { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp-0",
-          "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 0, "analysis": "static", "rack": "AEINRSU", "position": "cgp-1",
-          "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
-    ]);
-    let mut result = games_result(2, 1);
-    result["positions"] = positions;
-
-    // Two independent workers on the same task, both replaying the same games.
-    let (first, first_uuid) = first_claim(&app).await;
-    let (second, second_uuid) = first_claim(&app).await;
-    assert_eq!(first["task_request"]["seed"], second["task_request"]["seed"], "the same task");
-
-    for (uuid, assignment) in [(&first_uuid, &first), (&second_uuid, &second)] {
-        let token = assignment["claim_token"].as_str().unwrap();
-        let (status, body) = submit_as(&app, uuid, token, result.clone()).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["accepted"], true, "{body}");
-    }
-
-    let (records, moves): (i64, i64) = sqlx::query_as(
-        "SELECT (SELECT COUNT(*) FROM position_analysis_records r WHERE r.job_id = $1),
-                (SELECT COUNT(*) FROM position_analysis_moves m
-                 JOIN position_analysis_records r ON r.id = m.record_id
-                 WHERE r.job_id = $1)",
-    )
-    .bind(job)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(records, 2, "redundancy must not multiply the corpus");
-    assert_eq!(moves, 2, "and the second claim's moves must not be written twice either");
-
-    // Both aggregates are still stored separately: redundancy still verifies
-    // the result, it just does not duplicate the positions.
-    let results: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM game_results r JOIN tasks t ON t.id = r.task_id WHERE t.job_id = $1",
-    )
-    .bind(job)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap();
-    assert_eq!(results, 2);
-}
-
 /// `expected_data` is the union over the job and its players, deduplicated, and
 /// it is what the client verifies before it runs anything.
 ///
@@ -1033,7 +922,7 @@ async fn an_assignment_names_every_file_the_task_loads_and_no_others() {
     // the degenerate case the dedup has to survive.
     let admin = db.user("admin", true).await;
     let player = db.static_player("shared", admin).await;
-    let job = db.bare_job("games", 1, admin).await;
+    let job = db.bare_job("games", admin).await;
     sqlx::query(
         "INSERT INTO job_game_config
              (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
@@ -1092,7 +981,7 @@ async fn an_assignment_names_every_file_the_task_loads_and_no_others() {
 #[tokio::test]
 async fn contributions_are_counted_as_they_arrive() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let counters = |uuid: String| {
@@ -1144,14 +1033,12 @@ async fn contributions_are_counted_as_they_arrive() {
 }
 
 /// A contributor is credited with what each of its claims did: the time the
-/// claim was held, claim to submission, and the games it played -- every
-/// accepted claim, not only the task's first result, which is all the job's
-/// own progress counts. Two workers on one task at redundancy 2 are each
-/// credited its games; the job counts them once.
+/// claim was held, claim to submission, and the games it played. Two workers,
+/// a task each, are each credited its games; the job counts them all.
 #[tokio::test]
 async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
     let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let counters = |uuid: String| {
@@ -1170,10 +1057,7 @@ async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
 
     let (first, a) = first_claim(&app).await;
     let (second, b) = first_claim(&app).await;
-    assert_eq!(
-        first["task_request"]["seed"], second["task_request"]["seed"],
-        "both claims are of the one task"
-    );
+    assert_ne!(first["task_request"]["seed"], second["task_request"]["seed"], "a task each");
     assert_eq!(counters(a.clone()).await, (0, 0, 0, 0), "a claim is not a contribution");
     // The first claim was held a minute and a half; the second not at all.
     sqlx::query(
@@ -1194,14 +1078,14 @@ async fn each_accepted_claim_credits_its_time_and_games_to_its_contributor() {
     assert_eq!((tasks, games, racks), (1, 2, 0));
     assert!((90_000..100_000).contains(&compute_ms), "held 90 s: {compute_ms} ms");
     let (tasks, compute_ms, games, racks) = counters(b.clone()).await;
-    assert_eq!((tasks, games, racks), (1, 2, 0), "the second result is credited its games too");
+    assert_eq!((tasks, games, racks), (1, 2, 0), "the second worker is credited its own games");
     assert!(compute_ms < 10_000, "{compute_ms} ms");
     let games_completed: i64 = sqlx::query_scalar("SELECT games_completed FROM jobs WHERE id = $1")
         .bind(job)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(games_completed, 2, "the job counts the task's first result alone");
+    assert_eq!(games_completed, 4, "the job counts both tasks' games");
 
     // The claims keep what they did, and the list shows it.
     let per_claim: Vec<(i32, i32)> = sqlx::query_as(
@@ -1229,7 +1113,7 @@ async fn the_results_feed_walks_every_row_exactly_once() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -1303,7 +1187,7 @@ async fn the_results_feed_walks_every_row_exactly_once() {
 #[tokio::test]
 async fn a_failed_task_is_handed_straight_back() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let (assignment, uuid) = first_claim(&app).await;
@@ -1355,7 +1239,7 @@ async fn wait_for_lock_waiters(db: &TestDb, count: i64) {
 #[tokio::test]
 async fn a_claim_racing_a_jobs_completion_hands_nothing_out() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let mut completer = db.pool.begin().await.unwrap();
@@ -1393,7 +1277,7 @@ async fn a_claim_racing_a_jobs_completion_hands_nothing_out() {
 #[tokio::test]
 async fn sprt_jobs_hand_out_nothing_past_their_cap() {
     let db = TestDb::new().await;
-    let games = db.games_job(1, 2).await;
+    let games = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET max_games = 3 WHERE job_id = $1")
         .bind(games)
         .execute(&db.pool)
@@ -1419,7 +1303,7 @@ async fn sprt_jobs_hand_out_nothing_past_their_cap() {
     let admin = db.user("pairs-admin", true).await;
     let p1 = db.static_player("pairs-p1", admin).await;
     let p2 = db.static_player("pairs-p2", admin).await;
-    let pairs = db.bare_job("game_pairs", 1, admin).await;
+    let pairs = db.bare_job("game_pairs", admin).await;
     sqlx::query(
         "INSERT INTO job_game_pair_config
              (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs, max_pairs)
@@ -1451,7 +1335,7 @@ async fn a_pools_residuals_are_the_ones_its_latest_fit_stored() {
     // the job's player 1.
     let anchor = db.static_player("anchor", admin).await;
     let rival = db.static_player("rival", admin).await;
-    let job = db.bare_job("game_pairs", 1, admin).await;
+    let job = db.bare_job("game_pairs", admin).await;
     sqlx::query(
         "INSERT INTO job_game_pair_config
              (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs, max_pairs)
@@ -1566,8 +1450,8 @@ async fn deriving_player(
         "INSERT INTO player_configs
              (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
               num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
-              movegen_margin, created_by)
-         VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, true, $4, 5, $5)
+              use_wit, movegen_margin, created_by)
+         VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, true, $4, false, 5, $5)
          RETURNING id",
     )
     .bind(name)
@@ -1583,7 +1467,7 @@ async fn deriving_player(
 /// A `games` job between two given player configs.
 async fn job_between(db: &TestDb, p1: Uuid, p2: Uuid) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
-    let job = db.bare_job("games", 1, admin).await;
+    let job = db.bare_job("games", admin).await;
     sqlx::query(
         "INSERT INTO job_game_config
              (job_id, player1_config_id, player2_config_id, games_per_batch, min_games, max_games)
@@ -1877,7 +1761,7 @@ async fn players_on_different_lexicons_need_a_wordmap_each() {
 #[tokio::test]
 async fn a_jobs_template_is_read_once_survives_a_purge_and_goes_with_the_job() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
     let app = birdtest::app(state.clone());
     let admin = db.user("root", true).await;
@@ -1925,8 +1809,8 @@ async fn a_jobs_template_is_read_once_survives_a_purge_and_goes_with_the_job() {
 #[tokio::test]
 async fn a_job_at_zero_allocation_is_offered_to_nobody() {
     let db = TestDb::new().await;
-    let parked = db.games_job(1, 2).await;
-    let running = db.games_job(1, 2).await;
+    let parked = db.games_job(2).await;
+    let running = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
         .bind(parked)
         .execute(&db.pool)
@@ -1959,7 +1843,7 @@ async fn every_assignment_states_the_seed_its_task_was_stored_with() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
     let player = db.static_player("analyser", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -1999,7 +1883,7 @@ async fn every_assignment_states_the_seed_its_task_was_stored_with() {
 #[tokio::test]
 async fn a_parked_job_shuts_nobody_down() {
     let db = TestDb::new().await;
-    let too_new = db.games_job(1, 2).await;
+    let too_new = db.games_job(2).await;
     sqlx::query(
         "UPDATE jobs SET allocation = 0, min_magpie_major = 2, min_magpie_minor = 0,
                          min_magpie_patch = 0
@@ -2009,7 +1893,7 @@ async fn a_parked_job_shuts_nobody_down() {
     .execute(&db.pool)
     .await
     .unwrap();
-    let unsupported = db.games_job(1, 2).await;
+    let unsupported = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET allocation = 0 WHERE id = $1")
         .bind(unsupported)
         .execute(&db.pool)
@@ -2043,7 +1927,7 @@ async fn an_opening_rack_corpus_carries_each_racks_ranked_moves() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
     let player = db.static_player("solver", admin).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -2116,7 +2000,7 @@ async fn an_opening_rack_corpus_carries_each_racks_ranked_moves() {
 async fn the_results_feed_filters_by_who_a_name_is() {
     let db = TestDb::new().await;
     let app = birdtest::app(db.state().await);
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
 
     // One result from an anonymous worker...
     let (claim, anon) = first_claim(&app).await;
@@ -2185,7 +2069,7 @@ async fn the_results_feed_filters_by_who_a_name_is() {
     // page, decided from their claims in this job before reading its records.
     // (Read the other way, the planner judged their share of this job from
     // their share of all claims, and walked all of it to return nothing.)
-    let other = db.games_job(1, 2).await;
+    let other = db.games_job(2).await;
     let (status, body) =
         send(&app, get_request(&format!("/api/jobs/{other}/results?worker=keyed"), &[])).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -2227,7 +2111,7 @@ async fn the_display_pool_bounds_its_reads() {
 #[tokio::test]
 async fn a_games_jobs_captured_positions_can_be_streamed_out() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -2239,9 +2123,9 @@ async fn a_games_jobs_captured_positions_can_be_streamed_out() {
 
     let mut result = games_result(2, 1);
     result["positions"] = json!([
-        { "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp-0",
+        { "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp-0",
           "num_moves": 40, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }] },
-        { "game_index": 1, "turn_number": 3, "analysis": "static", "rack": "AEINRSU", "position": "cgp-1",
+        { "game_index": 1, "turn_number": 3, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRSU", "position": "cgp-1",
           "previous_move": "8D DOG", "previous_move_score": 10,
           "num_moves": 30, "moves": [{ "move": "8D URINATES", "score": 70, "equity": 77.0 }] },
     ]);
@@ -2279,7 +2163,7 @@ async fn a_games_jobs_captured_positions_can_be_streamed_out() {
 
     // An opening-rack job's stream already is its positions.
     let player = db.static_player("solver", admin).await;
-    let racks = db.bare_job("opening_rack", 1, admin).await;
+    let racks = db.bare_job("opening_rack", admin).await;
     sqlx::query(
         "INSERT INTO job_opening_rack_config
              (job_id, player_config_id, racks_per_batch, rack_size, total_racks)
@@ -2354,7 +2238,7 @@ async fn decline_as(app: &axum::Router, uuid: &str, token: &serde_json::Value, r
 #[tokio::test]
 async fn a_declined_task_is_not_handed_back_to_the_worker_that_declined_it() {
     let db = TestDb::new().await;
-    db.games_job(1, 1).await;
+    db.games_job(1).await;
     let app = birdtest::app(db.state().await);
 
     let (status, first) = claim_fresh(&app).await;
@@ -2385,7 +2269,7 @@ async fn a_declined_task_is_not_handed_back_to_the_worker_that_declined_it() {
 #[tokio::test]
 async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
     let (status, assignment) = claim_fresh(&app).await;
     assert_eq!(status, StatusCode::OK, "{assignment}");
@@ -2393,7 +2277,7 @@ async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
     let uuid = assignment["worker_uuid"].as_str().unwrap();
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST",
+        "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST",
         "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
         "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }]
     }]);
@@ -2417,7 +2301,7 @@ async fn positions_from_a_job_that_does_not_capture_them_are_refused() {
 
 
 fn captured(game: i32, turn: i32) -> serde_json::Value {
-    json!({ "game_index": game, "turn_number": turn, "analysis": "static", "rack": "AEINRST",
+    json!({ "game_index": game, "turn_number": turn, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST",
             "position": "15/15/15/15/15/15/15/15/15/15/15/15/15/15/15 AEINRST/ 0/0 0",
             "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 70, "equity": 70.0 }] })
 }
@@ -2432,7 +2316,7 @@ fn captured(game: i32, turn: i32) -> serde_json::Value {
 #[tokio::test]
 async fn a_capturing_jobs_result_is_complete_and_no_result_holds_what_cannot_be_stored() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -2496,7 +2380,7 @@ async fn a_capturing_jobs_result_is_complete_and_no_result_holds_what_cannot_be_
 #[tokio::test]
 async fn a_decline_holding_a_nul_is_refused_and_the_claim_stays_declinable() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let app = birdtest::app(db.state().await);
     let (assignment, uuid) = first_claim(&app).await;
     let decline = |name: &str| {

@@ -78,7 +78,7 @@ fn row(action: &str) -> AuditRow {
 #[tokio::test]
 async fn each_audit_helper_records_who_did_what_to_which_target() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 1).await;
+    let job = db.games_job(1).await;
     let actor = db.user("auditor", true).await;
     let anon = Uuid::new_v4();
     let mut conn = db.pool.acquire().await.unwrap();
@@ -280,16 +280,16 @@ async fn every_destructive_admin_action_writes_exactly_its_record() {
     let headers = admin_headers(&state.cfg, admin);
     let app = birdtest::app(state);
 
-    let purged = db.games_job(1, 2).await;
+    let purged = db.games_job(2).await;
     with_history(&app).await;
     sqlx::query("UPDATE jobs SET status = 'inactive' WHERE id = $1")
         .bind(purged)
         .execute(&db.pool)
         .await
         .unwrap();
-    let deleted = db.games_job(1, 2).await;
+    let deleted = db.games_job(2).await;
     with_history(&app).await;
-    let lifecycle = db.games_job(1, 2).await;
+    let lifecycle = db.games_job(2).await;
     let victim = db.user("victim", false).await;
     let banned = db.user("banned", false).await;
     let unused_file = db.input_data("winpct", "unused").await;

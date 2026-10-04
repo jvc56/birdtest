@@ -10,10 +10,11 @@ It starts with no job. Each job flag adds one, and they stack:
 
     scripts/dev.py --leavegen-job --pairs-job
 
---leavegen-job and --opening-rack-job run on MAGPIE's two-letter test data
-(`english_ab`, eight possible full racks), so they finish in minutes;
---games-job and --pairs-job run on --lexicon. It is tier 6's setup with the
-assertions removed, and it calls the same `scripts/seed.py`,
+Every job runs on --lexicon and the english distribution. Append `_ab` to a
+job flag (--leavegen-job_ab, say) to run that job on MAGPIE's two-letter test
+data instead (`english_ab`, eight possible full racks), where it finishes in
+minutes. It is tier 6's setup with the assertions removed, and it calls the
+same `scripts/seed.py`,
 so the development environment cannot drift from what the tests exercise.
 
 **Contributors are always real MAGPIE.** There is no fake-worker mode here.
@@ -610,12 +611,27 @@ def stop_contributors(processes: list) -> None:
 
 
 # The jobs dev.py can start with: its flag, seed.py's name for the job, and
-# whether it runs on the two-letter test data.
-DEV_JOB_FLAGS = (
-    ("leavegen_job", "leave_generation", True),
-    ("opening_rack_job", "opening_rack", True),
-    ("games_job", "games", False),
-    ("pairs_job", "game_pairs", False),
+# what the job is. Each flag also comes with `_ab` appended, which runs the job
+# on the two-letter test data rather than the main data.
+DEV_JOBS = (
+    ("--leavegen-job", "leave_generation",
+     "a leave-generation job of six generations, targets 100, 200, 500, 1000, 1000, 1000"),
+    ("--opening-rack-job", "opening_rack", "an opening-rack job, every play of every rack ranked"),
+    ("--games-job", "games",
+     "a games job, static equity against static score, saving every position"),
+    ("--pairs-job", "game_pairs",
+     "a game-pairs job, static equity against static score, saving the positions where each "
+     "pair first diverges"),
+    ("--sim-games-job", "games_sim",
+     "a games job, a 2-ply simmer against a 1-ply one, saving every position"),
+    ("--sim-pairs-job", "game_pairs_sim",
+     "a game-pairs job, a 2-ply simmer against a 1-ply one, saving the positions where each "
+     "pair first diverges"),
+)
+# (dest, seed.py's job name, on the two-letter data?) for every job flag.
+DEV_JOB_FLAGS = tuple(
+    (flag[2:].replace("-", "_") + suffix, job + suffix, bool(suffix))
+    for flag, job, _ in DEV_JOBS for suffix in ("", "_ab")
 )
 
 
@@ -760,27 +776,23 @@ def build_parser() -> argparse.ArgumentParser:
         "dev.py starts with no job; each of these adds one, created and activated (or, when an "
         "active one of its name is already running, reused), and they stack. New jobs share "
         "the allocation the active ones leave free")
-    jobs.add_argument("--leavegen-job", action="store_true",
-                      help="a leave-generation job of six generations, targets 100, 200, 500, "
-                           "1000, 1000, 1000, on the two-letter english_ab data: done in minutes")
-    jobs.add_argument("--opening-rack-job", action="store_true",
-                      help="an opening-rack job on the two-letter english_ab data: its eight "
-                           "racks, two to a task")
-    jobs.add_argument("--games-job", action="store_true",
-                      help="a games job on --lexicon: static equity against static score")
-    jobs.add_argument("--pairs-job", action="store_true",
-                      help="a game-pairs job on --lexicon, static equity against static score, "
-                           "saving the positions where each pair first diverges")
+    for flag, _, what in DEV_JOBS:
+        jobs.add_argument(flag, action="store_true",
+                          help=f"{what}, on --lexicon and the english distribution")
+        # Spelled with a hyphen as well, as every other flag here is.
+        jobs.add_argument(f"{flag}_ab", f"{flag}-ab", action="store_true",
+                          help="the same job on the two-letter english_ab data (eight "
+                               "possible full racks)")
 
     seeding = parser.add_argument_group("seeding")
     seeding.add_argument("--no-seed", action="store_true",
                          help="skip seeding (the admin, the input data and any job flags)")
     seeding.add_argument("--lexicon", default="CSW24",
-                         help="lexicon for --games-job and --pairs-job and their players "
+                         help="lexicon for the jobs not on english_ab, and their players "
                               "(default: %(default)s)")
     seeding.add_argument("--variant", default=None, choices=["classic", "wordsmog"])
     seeding.add_argument("--no-rit", action="store_true",
-                         help="seed --games-job's and --pairs-job's players without a rack info "
+                         help="seed the jobs' players without a rack info "
                               "table (~1.9 GB, which the workers map and share, and a few "
                               "minutes' build per worker data directory)")
     seeding.add_argument("--tarball-date", default=None,

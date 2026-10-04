@@ -206,8 +206,8 @@ The 83 "Not stored" rows break down as follows:
 | 138 | `P2_SIM_WITH_INFERENCE` | `si2` | option | Stored | `player_configs.use_inference` ([L589](backend/migrations/0001_initial.sql#L589)) on each player config |
 | 139 | `P1_TIME_LIMIT` | `tl1` | option | Stored | `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config (must be 0 for a simmer; see [Notes](#lower-priority-notes)) |
 | 140 | `P2_TIME_LIMIT` | `tl2` | option | Stored | `player_configs.time_limit_secs` ([L590](backend/migrations/0001_initial.sql#L590)) on each player config (must be 0 for a simmer; see [Notes](#lower-priority-notes)) |
-| 141 | `P1_PLAY_CHOOSER_TIME` | `pc1` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so redundancy and game pairs would mean nothing. Deliberately omitted. |
-| 142 | `P2_PLAY_CHOOSER_TIME` | `pc2` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so redundancy and game pairs would mean nothing. Deliberately omitted. |
+| 141 | `P1_PLAY_CHOOSER_TIME` | `pc1` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so game pairs would mean nothing. Deliberately omitted. |
+| 142 | `P2_PLAY_CHOOSER_TIME` | `pc2` | option | Not stored | Turns on PlayChooser (timed play). `contribute` resets it to -1 (off) before every task (MAGPIE `config.c:8444`): timed games are not reproducible from the seed, so game pairs would mean nothing. Deliberately omitted. |
 | 143 | `OVERTIME_PENALTY_POINTS` | `otpenalty` | option | Not stored | Only read by a PlayChooser clock, which `contribute` always turns off (see `pc1`/`pc2`). |
 | 144 | `OVERTIME_PERIOD` | `otperiod` | option | Not stored | Only read by a PlayChooser clock, which `contribute` always turns off (see `pc1`/`pc2`). |
 | 145 | `P1_THRESHOLD` | `th1` | option | Stored | `player_configs.threshold` ([L599](backend/migrations/0001_initial.sql#L599)) on each player config |
@@ -433,7 +433,7 @@ These are limits rather than bugs. None of them needs a change today.
 This is one ordered list for every job type, and the job page shows it so
 ([`jobSettings`](frontend/src/lib/jobSettings.ts)). A job shows only the rows
 that apply to it. **Rows 1–12 are the key rows** and are shown by default.
-Rows 13–20 appear after clicking **All settings**.
+Rows 14–20 appear after clicking **All settings**.
 
 | # | Setting | Shown for | Column(s) | MAGPIE argument |
 |---:|---|---|---|---|
@@ -447,19 +447,19 @@ Rows 13–20 appear after clicking **All settings**.
 | 8 | Records positions ("yes", "no", or "first divergences") | games, pairs | `capture_positions`, `capture_first_divergence` | `autoplay` recorder `positions`, or `divergentpositions` |
 | 9 | Racks in all | opening racks | `total_racks` | `rack` (the space) |
 | 10 | Rack size | opening racks | `rack_size` | `rack` |
-| 11 | Generations | leave | `cardinality(target_rack_counts)` | `leavegen` |
-| 12 | Target per rack | leave | `target_rack_counts` | `leavegen` targets |
-| 13 | Sim cutoff | games, pairs, opening racks | `jobs.sim_cutoff` | `cutoff` |
-| 14 | Fewest games / pairs before the test acts | games, pairs with SPRT on | `min_games` / `min_pairs` | n/a |
-| 15 | SPRT α | games, pairs with SPRT on | `sprt_alpha` | n/a |
-| 16 | SPRT β | games, pairs with SPRT on | `sprt_beta` | n/a |
-| 17 | Games per task / Pairs per task | games, pairs, leave | `games_per_batch` / `pairs_per_batch` / `num_iterations` | `autoplay <num_games>`; leave: game cap per task |
-| 18 | Racks per task | opening racks, leave | `racks_per_batch` / `racks_per_task` | `rack` batch; `leave_requests.forced_racks` |
-| 19 | Redundancy | all | `jobs.redundancy` | n/a |
+| 11 | Analyses per rack ("1", or "3 to 7, until 80% agree on the best move") | opening racks | `min_results_per_rack`, `max_results_per_rack`, `consensus_pct` | n/a (birdtest reissues the racks) |
+| 12 | Generations | leave | `cardinality(target_rack_counts)` | `leavegen` |
+| 13 | Target per rack | leave | `target_rack_counts` | `leavegen` targets |
+| 14 | Sim cutoff | games, pairs, opening racks | `jobs.sim_cutoff` | `cutoff` |
+| 15 | Fewest games / pairs before the test acts | games, pairs with SPRT on | `min_games` / `min_pairs` | n/a |
+| 16 | SPRT α | games, pairs with SPRT on | `sprt_alpha` | n/a |
+| 17 | SPRT β | games, pairs with SPRT on | `sprt_beta` | n/a |
+| 18 | Games per task / Pairs per task | games, pairs, leave | `games_per_batch` / `pairs_per_batch` / `num_iterations` | `autoplay <num_games>`; leave: game cap per task |
+| 19 | Racks per task | opening racks, leave | `racks_per_batch` / `racks_per_task` | `rack` batch; `leave_requests.forced_racks` |
 | 20 | Oldest MAGPIE | all | `jobs.min_magpie_*` | `version` (compared at claim) |
 
-With these key rows, a games job shows 8 rows by default, and an opening-rack
-or leave job shows 7.
+With these key rows, a games job and an opening-rack job show 8 rows by
+default, and a leave job shows 7.
 
 Compared with the groups the page showed before, this order made five
 changes:

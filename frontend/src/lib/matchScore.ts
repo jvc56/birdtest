@@ -1,52 +1,75 @@
 /**
- * A games or pairs job's match score, as its box on the job pages shows it:
- * player 1's record, its score -- a win is a point, a draw half of one -- over
- * every game played, and the players' average scores and spread.
+ * A games or pairs job's match score, as its table on the job pages shows it:
+ * a column per player, and in each row the figure that is better higher --
+ * wins, draws, score (a win is a point, a draw half of one) and its share of
+ * the games, average score per game, and average spread.
  *
  * Every figure counts games, for a pairs job too: pairs are the SPRT's unit,
- * and their outcomes are the pentanomial in the SPRT card. For a job that runs
- * no test, this is the job's result.
+ * and their outcomes are the pair-outcome table in the SPRT card. For a job
+ * that runs no test, this is the job's result.
  */
+import type { CompareRow } from './compare';
 
 export interface MatchScoreInput {
+  /** Player 1's results; player 2's wins are player 1's losses. */
   wins: number;
   losses: number;
   draws: number;
   p1_score_mean: number | null;
   p2_score_mean: number | null;
+  /** Player 1's average spread; player 2's is its negation. */
   spread_mean: number | null;
 }
 
-export interface MatchScore {
-  /** Player 1's wins–losses–draws, "12–8–1". */
-  record: string;
-  /** Every game played: the record's total. */
-  games: number;
-  /** W + ½D, "12.5"; a whole number has no ".0". */
-  score: string;
-  /** The score's share of the games, "59.5%"; null before any game. */
-  scorePct: string | null;
-  /** Average points per game, one decimal place; null before any game. */
-  p1Mean: string | null;
-  p2Mean: string | null;
-  /** Player 1's average spread, signed ("+13.4", "-2.5", "0.0"). */
-  spread: string | null;
+/** A score, W + ½D: "12.5", and a whole number without ".0". */
+const points = (n: number) => n.toLocaleString(undefined, { maximumFractionDigits: 1 });
+/** Rounded to one place first, so -0.04 reads 0.0 rather than -0.0. */
+const tenths = (n: number) => Math.round(n * 10) / 10 || 0;
+const signed = (n: number) => `${n > 0 ? '+' : ''}${n.toFixed(1)}`;
+
+/** The games the counts cover: the record's total. */
+export function gamesPlayed(g: MatchScoreInput): number {
+  return g.wins + g.losses + g.draws;
 }
 
-const oneDecimal = (value: number | null) => (value === null ? null : value.toFixed(1));
-
-export function matchScore(g: MatchScoreInput): MatchScore {
-  const games = g.wins + g.losses + g.draws;
-  const score = g.wins + g.draws / 2;
-  // Rounded to one place first, so a spread of -0.04 reads 0.0, not -0.0.
-  const spread = g.spread_mean === null ? null : Math.round(g.spread_mean * 10) / 10;
-  return {
-    record: [g.wins, g.losses, g.draws].map((n) => n.toLocaleString()).join('–'),
-    games,
-    score: score.toLocaleString(undefined, { maximumFractionDigits: 1 }),
-    scorePct: games ? `${((100 * score) / games).toFixed(1)}%` : null,
-    p1Mean: oneDecimal(g.p1_score_mean),
-    p2Mean: oneDecimal(g.p2_score_mean),
-    spread: spread === null ? null : `${spread > 0 ? '+' : ''}${(spread || 0).toFixed(1)}`
-  };
+export function matchRows(g: MatchScoreInput): CompareRow[] {
+  const games = gamesPlayed(g);
+  const scores: [number, number] = [g.wins + g.draws / 2, g.losses + g.draws / 2];
+  const pct = (score: number) => (games ? (100 * score) / games : null);
+  const pcts: [number | null, number | null] = [pct(scores[0]), pct(scores[1])];
+  const means: [number | null, number | null] = [
+    g.p1_score_mean === null ? null : tenths(g.p1_score_mean),
+    g.p2_score_mean === null ? null : tenths(g.p2_score_mean)
+  ];
+  const spreads: [number | null, number | null] =
+    g.spread_mean === null ? [null, null] : [tenths(g.spread_mean), tenths(-g.spread_mean)];
+  const dash = (n: number | null, f: (n: number) => string) => (n === null ? '—' : f(n));
+  return [
+    { label: 'Wins', values: [g.wins.toLocaleString(), g.losses.toLocaleString()], numbers: [g.wins, g.losses] },
+    { label: 'Draws', values: [g.draws.toLocaleString(), g.draws.toLocaleString()], numbers: [g.draws, g.draws] },
+    {
+      label: 'Score',
+      title: 'A win is a point, a draw half of one',
+      values: [points(scores[0]), points(scores[1])],
+      numbers: scores
+    },
+    {
+      label: 'Score %',
+      title: 'The score over the games played',
+      values: [dash(pcts[0], (n) => `${n.toFixed(1)}%`), dash(pcts[1], (n) => `${n.toFixed(1)}%`)],
+      numbers: pcts
+    },
+    {
+      label: 'Average score',
+      title: 'Points per game',
+      values: [dash(means[0], (n) => n.toFixed(1)), dash(means[1], (n) => n.toFixed(1))],
+      numbers: means
+    },
+    {
+      label: 'Average spread',
+      title: 'Points ahead of the opponent at the end of a game, on average',
+      values: [dash(spreads[0], signed), dash(spreads[1], signed)],
+      numbers: spreads
+    }
+  ];
 }

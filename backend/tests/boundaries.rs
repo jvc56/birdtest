@@ -2,7 +2,6 @@
 //! halves, the role each input-data reference on a player config must have,
 //! the result route's own body limit on the real router, the decline list's
 //! bounds, the 100% allocation cap under concurrent activations, self-deletion,
-//! a redundancy-2 task reopened by one lapsed slot beside one accepted result,
 //! and the restart grace as the production state is built.
 
 mod common;
@@ -65,11 +64,6 @@ async fn first_claim(app: &Router) -> (Value, String) {
     assert_eq!(status, StatusCode::OK, "{body}");
     let uuid = body["worker_uuid"].as_str().expect("a minted worker_uuid").to_string();
     (body, uuid)
-}
-
-async fn claim_as(app: &Router, uuid: &str) -> (StatusCode, Value) {
-    send(app, post_json("/api/worker/task", &[("x-worker-uuid", uuid)], claim_body("1.0.0", &[])))
-        .await
 }
 
 async fn submit_as(app: &Router, uuid: &str, token: &Value, result: Value) -> (StatusCode, Value) {
@@ -269,7 +263,7 @@ const LIVE_STREAMS_PER_ADDRESS: usize = 32;
 #[tokio::test]
 async fn one_address_holds_at_most_its_share_of_live_streams() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = proxied_app(&db).await;
     let stream = |ip: &'static str| {
         let app = app.clone();
@@ -306,7 +300,7 @@ async fn one_address_holds_at_most_its_share_of_live_streams() {
 #[tokio::test]
 async fn made_up_worker_credentials_are_limited_per_address_and_real_ones_are_not() {
     let db = TestDb::new().await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
     let app = proxied_app(&db).await;
     let shared = "203.0.113.99";
 
@@ -506,7 +500,7 @@ async fn a_player_config_refuses_input_data_of_the_wrong_role() {
 
 /// A games job capturing positions, whose player 1 keeps `keep` moves.
 async fn capturing_job(db: &TestDb, keep: i32) -> Uuid {
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -545,7 +539,7 @@ async fn a_capture_result_of_several_megabytes_is_accepted() {
             .map(|i| json!({ "move": format!("8D PADDING-{i:06}"), "score": 50, "equity": 60.0 }))
             .collect();
         json!({
-            "game_index": game, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
+            "game_index": game, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
             "num_moves": MOVES, "moves": moves,
         })
     };
@@ -585,7 +579,7 @@ async fn a_capture_result_of_several_megabytes_is_accepted() {
 #[tokio::test]
 async fn a_result_over_the_limit_is_a_413_in_the_api_shape_and_changes_nothing() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     db.derived_ready(job).await;
     let app = birdtest::app(db.state().await);
     let (assignment, uuid) = first_claim(&app).await;
@@ -628,7 +622,7 @@ async fn a_decline_list_is_cut_to_its_cap_and_each_field_to_its_bound() {
     const MAX_GAP_FIELD_CHARS: usize = 128;
 
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     db.derived_ready(job).await;
     let app = birdtest::app(db.state().await);
     let (assignment, uuid) = first_claim(&app).await;
@@ -681,8 +675,8 @@ async fn a_decline_list_is_cut_to_its_cap_and_each_field_to_its_bound() {
 
 /// Two jobs, neither active.
 async fn two_inactive_jobs(db: &TestDb) -> (Uuid, Uuid) {
-    let first = db.games_job(1, 2).await;
-    let second = db.games_job(1, 2).await;
+    let first = db.games_job(2).await;
+    let second = db.games_job(2).await;
     sqlx::query("UPDATE jobs SET status = 'inactive', allocation = NULL")
         .execute(&db.pool)
         .await
@@ -827,68 +821,6 @@ async fn an_admin_cannot_delete_their_own_account() {
 }
 
 // ---------------------------------------------------------------------------
-// Redundancy 2: one slot accepted, one lapsed
-// ---------------------------------------------------------------------------
-
-/// The state and counters of the task `claim` is a slot on.
-async fn task_row(db: &TestDb, claim: Uuid) -> (String, i32, i32) {
-    sqlx::query_as(
-        "SELECT t.state::text, t.accepted_count, t.active_claim_count
-         FROM tasks t JOIN task_claims c ON c.task_id = t.id WHERE c.claim_token = $1",
-    )
-    .bind(claim)
-    .fetch_one(&db.pool)
-    .await
-    .unwrap()
-}
-
-/// I-SCHED-11, I-SCHED-14 (mixed reclaim): on a redundancy-2 task with one
-/// slot accepted and the other lapsed, reclamation reopens the task --
-/// `available`, one accepted, none live -- rather than leaving it `claimed` or
-/// marking it `completed`. The worker whose result was accepted is never
-/// offered the reopened slot (its next claim is a different task, not a 204),
-/// and a third worker gets the same seed.
-#[tokio::test]
-async fn a_task_with_one_accepted_and_one_lapsed_slot_reopens_for_someone_else() {
-    let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
-    db.derived_ready(job).await;
-    let app = birdtest::app(db.state().await);
-
-    let (a, a_uuid) = first_claim(&app).await;
-    let (b, _) = first_claim(&app).await;
-    let seed = a["task_request"]["seed"].clone();
-    assert_eq!(b["task_request"]["seed"], seed, "B fills the task's other slot");
-    let (status, body) = submit_as(&app, &a_uuid, &a["claim_token"], games_result(2, 1)).await;
-    assert_eq!((status, &body), (StatusCode::OK, &json!({ "accepted": true })));
-    assert_eq!(task_row(&db, token(&a)).await, ("claimed".into(), 1, 1));
-
-    // B's claim lapses: its last sign of life is an hour old.
-    sqlx::query(
-        "UPDATE task_claims SET claimed_at = now() - interval '1 hour', last_heartbeat_at = NULL
-         WHERE claim_token = $1",
-    )
-    .bind(token(&b))
-    .execute(&db.pool)
-    .await
-    .unwrap();
-
-    let (status, next) = claim_as(&app, &a_uuid).await;
-    assert_eq!(status, StatusCode::OK, "A is given other work, not told to wait: {next}");
-    assert_ne!(next["task_request"]["seed"], seed, "A is never offered the task it already did");
-    assert_eq!(claim_state(&db, token(&b)).await, "abandoned");
-    assert_eq!(
-        task_row(&db, token(&a)).await,
-        ("available".into(), 1, 0),
-        "one accepted and one lapsed reopens the task"
-    );
-
-    let (c, _) = first_claim(&app).await;
-    assert_eq!(c["task_request"]["seed"], seed, "C gets the reopened slot");
-    assert_eq!(task_row(&db, token(&a)).await, ("claimed".into(), 1, 1));
-}
-
-// ---------------------------------------------------------------------------
 // The restart grace, as production builds the state
 // ---------------------------------------------------------------------------
 
@@ -916,7 +848,7 @@ fn aws_env() {
 #[tokio::test]
 async fn a_freshly_built_production_state_grants_the_restart_grace() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     db.derived_ready(job).await;
     aws_env();
     let cfg = Arc::new(db.config());

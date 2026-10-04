@@ -37,8 +37,9 @@
   // workers.
   let useWordmap = true;
   let useRit = true;
-  // Off by default, as MAGPIE has it (-wit is opt-in).
-  let useWit = false;
+  // On by default, although MAGPIE has it opt-in (-wit): it speeds move
+  // generation and costs little.
+  let useWit = true;
   // Blank means "MAGPIE's default" (see optionalNumber).
   const optional = optionalNumber;
   let minPlayIterations: number | '' = '';

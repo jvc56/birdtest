@@ -11,6 +11,7 @@ import {
   optionalNumber,
   optionalIntList,
   parseTargetRackCounts,
+  targetsText,
   MAX_LEAVE_GENERATIONS,
   MAX_TARGET_RACK_COUNT,
   sprtLabel,
@@ -259,7 +260,7 @@ describe('F-FMT-12 completionText', () => {
   it('names the other job types\' own ends', () => {
     expect(
       completionText({ job: { job_type: 'opening_rack' }, completion: { forced: false, reason: null } })
-    ).toBe('every rack was analysed');
+    ).toBe('every rack was settled');
     expect(
       completionText({
         job: { job_type: 'leave_generation' },
@@ -334,6 +335,13 @@ describe('F-FMT-15 parseTargetRackCounts', () => {
     expect(parseTargetRackCounts('100,200,500,1000')).toEqual({ targets: [100, 200, 500, 1000] });
     expect(parseTargetRackCounts(' 100 , 200, 500, ')).toEqual({ targets: [100, 200, 500] });
     expect(parseTargetRackCounts('500')).toEqual({ targets: [500] });
+    expect(parseTargetRackCounts('100 200  500')).toEqual({ targets: [100, 200, 500] });
+  });
+
+  it('refuses a thousands separator, which reads as two targets', () => {
+    expect(parseTargetRackCounts('100, 1,000')).toEqual({
+      error: '"1,000" reads as two targets: write 1000 without a thousands separator.'
+    });
   });
 
   it('names what is wrong rather than sending it', () => {
@@ -397,5 +405,12 @@ describe('F-FMT-16 computeTime', () => {
     expect(computeTime(null)).toBe('—');
     expect(computeTime(Number.NaN)).toBe('—');
     expect(computeTime(-1)).toBe('—');
+  });
+});
+
+describe('F-FMT-18 targetsText', () => {
+  it('joins the targets in generation order with arrows, not commas', () => {
+    expect(targetsText([100, 1000, 1000])).toBe(`100 → ${(1000).toLocaleString()} → ${(1000).toLocaleString()}`);
+    expect(targetsText([500])).toBe('500');
   });
 });

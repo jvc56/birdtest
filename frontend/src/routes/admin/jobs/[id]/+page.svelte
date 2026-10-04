@@ -13,8 +13,9 @@
   import { subscribeToJob } from '$lib/sse';
   import { exportSummary, jobTitle, jobTypeLabel } from '$lib/format';
   import type { JobConfig } from '$lib/jobSettings';
-  import CompletionNote from '$lib/components/CompletionNote.svelte';
+  import JobStatusCard from '$lib/components/JobStatusCard.svelte';
   import JobStatsRow from '$lib/components/JobStatsRow.svelte';
+  import TaskCounts from '$lib/components/TaskCounts.svelte';
   import DerivedDataStatus from '$lib/components/DerivedDataStatus.svelte';
   import JobSettings from '$lib/components/JobSettings.svelte';
   import MatchScore from '$lib/components/MatchScore.svelte';
@@ -403,7 +404,7 @@
       {/if}
       <a href="/jobs/{jobId}" class="text-sm">public view</a>
     </header>
-    <CompletionNote {stats} />
+    <JobStatusCard {stats} />
     <JobStatsRow {stats} />
     <DerivedDataStatus {jobId} />
 
@@ -483,7 +484,8 @@
       <p class="text-xs text-muted-foreground">
         The active jobs may allocate at most 100% between them; activation is rejected if this
         job's share would push the total over. A share of 0% is the same as inactive: the job
-        is offered to nobody until it is raised.
+        is offered to nobody until it is raised. To move shares between jobs in one step, use
+        <a href="/admin/allocation">Allocation</a>.
       </p>
 
       {#if rebuild}
@@ -614,9 +616,9 @@
         />
       {:else if stats.opening_racks}
         <ProgressBar
-          value={stats.opening_racks.racks_analyzed}
+          value={stats.opening_racks.racks_settled}
           max={stats.opening_racks.racks_total}
-          label="racks analysed"
+          label="racks settled"
         />
       {:else if stats.leave_generation}
         <ProgressBar
@@ -627,10 +629,7 @@
       {:else}
         <ProgressBar value={stats.tasks_completed} max={stats.tasks_total} label="tasks completed" />
       {/if}
-      <p class="text-sm text-muted-foreground">
-        {stats.tasks_available.toLocaleString()} available ·
-        {stats.tasks_claimed.toLocaleString()} claimed
-      </p>
+      <TaskCounts {stats} {config} />
     </div>
 
     {#if config}
@@ -639,7 +638,7 @@
     {#if stats.games}
       <MatchScore games={stats.games} players={config?.players.map((p) => p.name) ?? []} />
     {/if}
-    <SprtCard {stats} />
+    <SprtCard {stats} {config} players={config?.players.map((p) => p.name) ?? []} />
 
     <div class="card">
       <h2 class="mb-1 text-lg font-medium">Data gaps</h2>

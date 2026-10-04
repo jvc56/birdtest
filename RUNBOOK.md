@@ -690,6 +690,7 @@ UPDATE jobs SET status = 'inactive', sprt_decided_status = NULL,
 DELETE FROM job_exports WHERE job_id = :'job';
 DELETE FROM task_claims c USING tasks t WHERE c.task_id = t.id AND t.job_id = :'job';
 DELETE FROM tasks WHERE job_id = :'job';
+DELETE FROM opening_rack_progress       WHERE job_id = :'job';
 DELETE FROM leave_rack_progress         WHERE job_id = :'job';
 DELETE FROM leave_rack_staging          WHERE job_id = :'job';
 DELETE FROM leave_generation_progress   WHERE job_id = :'job';
@@ -859,7 +860,7 @@ Postgres through each of these cases, nightly.
 | 3 | `task_claims`, then `worker_data_gaps` | `task_id IN (...)` / `job_id = :job` |
 | 4 | `game_results`, `leave_records` | `job_id = :job` / `task_id IN (...)` |
 | 5 | `position_analysis_records` → `_moves` → `_plies` | `job_id = :job`, then by parent id |
-| 6 | `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_selection_cursors`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
+| 6 | `opening_rack_progress`, `leave_rack_progress`, `leave_rack_staging`, `leave_generation_progress`, `leave_selection_cursors`, `leave_generation_artifacts`, `leave_generation_transitions` | `job_id = :job` |
 
 `worker_data_gaps` is what the admin page's data gaps and the job list's
 `stalled` flag read: left out, a job's declines are forgotten.
@@ -938,21 +939,21 @@ UPDATE tasks t
    -- seconds of writes and as many dead tuples, for rows already right.
    AND (t.accepted_count, t.active_claim_count) IS DISTINCT FROM (actual.accepted, actual.active);
 
--- State and completed_at follow from the counters and the job's redundancy,
--- exactly as the submit path computes them.
+-- State and completed_at follow from the counters, exactly as the submit
+-- path computes them: a task has one slot, so an accepted result completes
+-- it and a live claim holds it.
 UPDATE tasks t
    SET state = CASE
-         WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
-         WHEN t.accepted_count + t.active_claim_count >= j.redundancy THEN 'claimed'::task_state
+         WHEN t.accepted_count > 0 THEN 'completed'::task_state
+         WHEN t.active_claim_count > 0 THEN 'claimed'::task_state
          ELSE 'available'::task_state
        END,
-       completed_at = CASE WHEN t.accepted_count >= j.redundancy
+       completed_at = CASE WHEN t.accepted_count > 0
                            THEN COALESCE(t.completed_at, now()) ELSE NULL END
-  FROM jobs j
- WHERE j.id = t.job_id AND t.job_id = :'job'
+ WHERE t.job_id = :'job'
    AND t.state IS DISTINCT FROM CASE
-         WHEN t.accepted_count >= j.redundancy THEN 'completed'::task_state
-         WHEN t.accepted_count + t.active_claim_count >= j.redundancy THEN 'claimed'::task_state
+         WHEN t.accepted_count > 0 THEN 'completed'::task_state
+         WHEN t.active_claim_count > 0 THEN 'claimed'::task_state
          ELSE 'available'::task_state
        END;
 
@@ -963,8 +964,7 @@ UPDATE tasks t
 -- rest are the dashboard's progress totals; they
 -- are maintained one task at a time in the claim and submit paths, so a row
 -- copy leaves them describing the results the job had before. Each is
--- recomputed here exactly as the read it replaced computed it: one result per
--- task, because redundant claims replay the same work.
+-- recomputed here exactly as the read it replaced computed it.
 -- The claims are read once, for both of their columns: a second subquery for
 -- last_completed_at was a second pass over them.
 UPDATE jobs j
@@ -973,19 +973,27 @@ UPDATE jobs j
        tasks_total = (SELECT count(*) FROM tasks t WHERE t.job_id = j.id),
        tasks_completed = (SELECT count(*) FROM tasks t
                            WHERE t.job_id = j.id AND t.state = 'completed'),
-       games_completed = (SELECT COALESCE(sum(g.games), 0) FROM (
-                            SELECT DISTINCT ON (r.task_id) r.games
-                              FROM game_results r
-                             WHERE r.job_id = j.id
-                             ORDER BY r.task_id, r.submitted_at, r.task_claim_id
-                          ) g),
+       games_completed = (SELECT COALESCE(sum(r.games), 0)
+                            FROM game_results r WHERE r.job_id = j.id),
        racks_analyzed = (SELECT count(DISTINCT p.rack)
                            FROM position_analysis_records p
-                          WHERE p.job_id = j.id AND p.game_index IS NULL)
+                          WHERE p.job_id = j.id AND p.game_index IS NULL),
+       -- A consensus job's settled racks are its settled progress rows; a
+       -- job wanting one analysis per rack settles each at its first, and
+       -- keeps no rows.
+       racks_settled = CASE WHEN rc.max_results_per_rack > 1
+                            THEN (SELECT count(*) FROM opening_rack_progress p
+                                   WHERE p.job_id = j.id AND p.settled)
+                            ELSE (SELECT count(DISTINCT p.rack)
+                                    FROM position_analysis_records p
+                                   WHERE p.job_id = j.id AND p.game_index IS NULL) END,
+       racks_without_consensus = (SELECT count(*) FROM opening_rack_progress p
+                                   WHERE p.job_id = j.id AND p.without_consensus)
   FROM (SELECT count(*) AS issued,
                max(c.completed_at) FILTER (WHERE c.state = 'completed') AS last
           FROM task_claims c JOIN tasks t ON t.id = c.task_id
          WHERE t.job_id = :'job') cl
+  LEFT JOIN job_opening_rack_config rc ON rc.job_id = :'job'
  WHERE j.id = :'job';
 
 -- Level with the lowest of the jobs being *served* -- those that issued a
@@ -1010,7 +1018,8 @@ UPDATE jobs j
 COMMIT;
 ```
 
-`racks_analyzed` is meaningful only for an opening-rack job and
+`racks_analyzed`, `racks_settled` and `racks_without_consensus` are meaningful
+only for an opening-rack job and
 `games_completed` only for a games or game-pairs job; the statement above leaves
 each at 0 for the job types that do not use it, which is what they hold anyway.
 

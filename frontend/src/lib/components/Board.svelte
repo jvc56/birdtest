@@ -1,24 +1,42 @@
+<script context="module" lang="ts">
+  /**
+   * The colours a played move is drawn in: player 1's, then player 2's -- a
+   * game pair's shared board shows both players' moves at once.
+   */
+  export const PLAYED_COLORS = ['hsl(142 70% 32%)', 'hsl(280 60% 50%)'] as const;
+</script>
+
 <script lang="ts">
   /**
    * A saved position on the job's own board: the premium squares from its
    * layout, the tiles with their letters and scores (a blank in lower case,
    * in red, scoring nothing), the tiles the previous move placed outlined,
-   * and below it both racks and scores, the player to move marked.
+   * the move played from here drawn on the squares it is about to fill --
+   * green, dashed, apart from the tiles already down -- and below it both
+   * racks and scores, the player to move marked. A game pair's position may
+   * show both players' moves, each in its player's colour.
    *
    * One SVG in board units, so it scales to its box: at phone width the
    * board shrinks rather than pushing the page sideways.
    */
   import type { BoardData, BoardSquare } from '$lib/api';
-  import { placedSquares, type Position, type Tile } from '$lib/cgp';
+  import { placedSquares, placedTiles, type PlacedTile, type Position, type Tile } from '$lib/cgp';
 
   export let board: BoardData;
   export let position: Position;
   /** The move that led here, as MAGPIE names it. */
   export let previousMove: string | null = null;
+  /**
+   * The moves played from here, as MAGPIE names them, each drawn on the
+   * empty squares it fills in its own colour, and named in the legend.
+   */
+  export let played: { move: string; label: string; color: string }[] = [];
   /** The seat to move, when known. */
   export let toMove: 0 | 1 | null = null;
   /** The players' config names, player 1 first, when the page has them. */
   export let players: string[] = [];
+  /** Both racks and scores under the board; off where the page states them itself. */
+  export let showRacks = true;
 
   const PREMIUM: Record<BoardSquare, { fill: string; label: string; name: string }> = {
     normal: { fill: 'hsl(217 19% 17%)', label: '', name: '' },
@@ -39,6 +57,15 @@
   $: dim = board.squares.length;
   $: scores = new Map(board.letters.map((l) => [l.letter, l.score]));
   $: placed = placedSquares(previousMove);
+  // Each square a played move fills, with what it puts there; the first move
+  // listed wins a square two of them fill (the page shows one at a time then).
+  $: ghosts = played.reduce((squares, { move, color }) => {
+    for (const tile of placedTiles(move)) {
+      const key = `${tile.row},${tile.col}`;
+      if (!squares.has(key) && !position.board[tile.row]?.[tile.col]) squares.set(key, { tile, color });
+    }
+    return squares;
+  }, new Map<string, { tile: PlacedTile; color: string }>());
   $: used = new Set(board.squares.flat());
   $: legend = (Object.keys(PREMIUM) as BoardSquare[]).filter((s) => s !== 'normal' && used.has(s));
   $: names = [players[0] ?? 'Player 1', players[1] ?? 'Player 2'];
@@ -61,7 +88,9 @@
     viewBox="{-M} {-M} {dim * U + M} {dim * U + M}"
     class="block h-auto w-full max-w-xl select-none"
     role="img"
-    aria-label="The board: {tileCount} tiles{placed.size ? ', the previous move outlined' : ''}"
+    aria-label="The board: {tileCount} tiles{placed.size ? ', the previous move outlined' : ''}{ghosts.size
+      ? `, ${played.map((p) => `${p.label} ${p.move}`).join(' and ')} drawn where it goes`
+      : ''}"
     data-testid="board"
   >
     {#each Array(dim) as _, i}
@@ -100,6 +129,38 @@
               >
             {/if}
           </g>
+        {:else if ghosts.has(`${r},${c}`)}
+          {@const ghost = ghosts.get(`${r},${c}`)}
+          {#if ghost}
+            {@const points = score(ghost.tile)}
+            <g class="played" data-letter={ghost.tile.letter} data-blank={ghost.tile.blank || undefined}>
+              <rect
+                x={(c + 0.04) * U}
+                y={(r + 0.04) * U}
+                width={0.92 * U}
+                height={0.92 * U}
+                rx={0.1 * U}
+                fill="hsl(140 45% 82%)"
+                stroke={ghost.color}
+                stroke-width={0.09 * U}
+                stroke-dasharray="{0.16 * U} {0.1 * U}"
+              />
+              <text
+                x={(c + (points === undefined ? 0.5 : 0.45)) * U}
+                y={(r + 0.53) * U}
+                font-size={fontSize(ghost.tile.letter)}
+                text-anchor="middle"
+                dominant-baseline="central"
+                class="letter"
+                fill={ghost.tile.blank ? 'hsl(0 70% 42%)' : 'hsl(222 47% 10%)'}
+              >{ghost.tile.blank ? ghost.tile.letter.toLowerCase() : ghost.tile.letter}</text>
+              {#if points !== undefined}
+                <text x={(c + 0.88) * U} y={(r + 0.86) * U} font-size={0.26 * U} text-anchor="end" fill="hsl(222 47% 10%)"
+                  >{points}</text
+                >
+              {/if}
+            </g>
+          {/if}
         {:else}
           <rect
             x={(c + 0.04) * U}
@@ -123,6 +184,7 @@
     {/each}
   </svg>
 
+  {#if showRacks}
   <div class="grid gap-2 sm:grid-cols-2">
     {#each position.racks as rack, seat}
       <div class="space-y-1" data-testid="rack">
@@ -153,9 +215,10 @@
       </div>
     {/each}
   </div>
+  {/if}
 
-  {#if legend.length}
-    <p class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+  {#if legend.length || placed.size || ghosts.size}
+    <p class="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground" data-testid="board-legend">
       {#each legend as square}
         <span class="inline-flex items-center gap-1">
           <span class="inline-block h-3 w-3 rounded-sm" style="background: {PREMIUM[square].fill}"></span>
@@ -169,6 +232,17 @@
           previous move
         </span>
       {/if}
+      {#each played as { label, color, move }}
+        {#if placedTiles(move).length}
+          <span class="inline-flex items-center gap-1">
+            <span
+              class="inline-block h-3 w-3 rounded-sm border-2 border-dashed"
+              style="background: hsl(140 45% 82%); border-color: {color}"
+            ></span>
+            {label}
+          </span>
+        {/if}
+      {/each}
     </p>
   {/if}
 </div>

@@ -1,12 +1,14 @@
 <script lang="ts">
   /**
-   * One saved position: what it is, the board, its CGP and the moves the
-   * player to move ranked. Beside the moves on a wide screen, or above them
-   * when `stacked` -- as each of a game pair's two positions is, side by side.
+   * One saved position: what it is, the board -- the previous move outlined,
+   * the move played from here drawn where it goes -- and the moves the player
+   * to move ranked, the one played marked. Beside the moves on a wide screen,
+   * or above them when `stacked`; without the board when `showBoard` is off,
+   * as each of a game pair's two positions is when they share one board.
    */
   import type { BoardData, SavedPosition } from '$lib/api';
   import { parseCgp, seatToMove } from '$lib/cgp';
-  import Board from './Board.svelte';
+  import Board, { PLAYED_COLORS } from './Board.svelte';
 
   export let position: SavedPosition;
   export let board: BoardData | null;
@@ -17,6 +19,10 @@
   /** A heading naming the position among others, e.g. "Game 1 of the pair". */
   export let heading = '';
   export let stacked = false;
+  /** Off where the page draws the board itself, shared with another position. */
+  export let showBoard = true;
+  /** The colour the move played from here is drawn in, on this board or a shared one. */
+  export let playedColor: string = PLAYED_COLORS[0];
 
   const ANALYSIS: Record<SavedPosition['analysis'], string> = {
     static: 'static equity',
@@ -45,20 +51,35 @@
       · after <span class="font-mono">{position.previous_move}</span>
       ({position.previous_move_score})
     {/if}
+    {#if position.played_move}
+      · played
+      <span class="font-mono" data-testid="played-move" style="text-decoration: underline dashed {playedColor}"
+        >{position.played_move}</span
+      >
+      ({position.played_move_score})
+    {/if}
     <span class="text-muted-foreground"
       >· {position.num_moves.toLocaleString()} moves ranked by
       <span data-testid="position-analysis">{ANALYSIS[position.analysis]}</span></span
     >
   </p>
-  <div class={stacked ? 'grid gap-4' : 'grid gap-4 lg:grid-cols-2'}>
-    <div class="min-w-0 space-y-2">
-      {#if board && parsed}
-        <Board {board} position={parsed} previousMove={position.previous_move} {toMove} {players} />
-      {/if}
-      {#if position.position}
-        <p class="break-all font-mono text-xs text-muted-foreground" title="CGP">{position.position}</p>
-      {/if}
-    </div>
+  <div class={stacked || !showBoard ? 'grid gap-4' : 'grid gap-4 lg:grid-cols-2'}>
+    {#if showBoard}
+      <div class="min-w-0 space-y-2">
+        {#if board && parsed}
+          <Board
+            {board}
+            position={parsed}
+            previousMove={position.previous_move}
+            played={position.played_move
+              ? [{ move: position.played_move, label: 'played here', color: playedColor }]
+              : []}
+            {toMove}
+            {players}
+          />
+        {/if}
+      </div>
+    {/if}
     <div class="min-w-0 overflow-x-auto">
       <table class="table text-xs">
         <thead>
@@ -73,9 +94,15 @@
         </thead>
         <tbody>
           {#each position.moves as move}
-            <tr>
+            {@const playedHere = move.move === position.played_move}
+            <tr class:played-row={playedHere} data-played={playedHere || undefined}>
               <td class="tabular-nums">{move.rank}</td>
-              <td class="font-mono">{move.move}</td>
+              <td class="font-mono">
+                {move.move}{#if playedHere}<span
+                    class="ml-1 rounded px-1 font-sans text-[10px] uppercase"
+                    style="background: {playedColor}; color: white">played</span
+                  >{/if}
+              </td>
               <td class="text-right tabular-nums">{move.score}</td>
               <td class="text-right tabular-nums">{move.equity.toFixed(2)}</td>
               {#if showWinPct}
@@ -96,3 +123,9 @@
     </div>
   </div>
 </div>
+
+<style>
+  .played-row {
+    background: hsl(140 45% 50% / 0.12);
+  }
+</style>

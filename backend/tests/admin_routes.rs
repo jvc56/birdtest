@@ -79,8 +79,8 @@ fn static_config(name: &str, files: &Files) -> Value {
         "name": name, "recorder_type": "all", "sort_strategy": "equity",
         "kwg_id": files.kwg, "klv_id": files.klv, "num_plays_recorded": 3,
         // The test lexicons are not real KWGs, so no reference wordmap or rack
-        // info table exists for a worker to be asked to reproduce.
-        "use_wordmap": false, "use_rit": false,
+        // info table or word info table exists for a worker to be asked to reproduce.
+        "use_wordmap": false, "use_rit": false, "use_wit": false,
     })
 }
 
@@ -441,8 +441,8 @@ async fn each_lifecycle_action_answers_its_shape_and_a_read_agrees() {
 async fn data_gaps_report_what_workers_declined_for() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db).await;
-    let job = db.games_job(1, 2).await;
-    let other = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
+    let other = db.games_job(2).await;
     let (kwg, klv) = ("a".repeat(64), "b".repeat(64));
 
     // Two workers, steered to `job` by listing the other one as unsupported.
@@ -504,7 +504,7 @@ async fn data_gaps_report_what_workers_declined_for() {
 async fn a_jobs_derived_data_says_what_it_waits_for() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db).await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query(
         "UPDATE player_configs SET use_rit = true
          WHERE id IN (SELECT player1_config_id FROM job_game_config WHERE job_id = $1)",
@@ -532,7 +532,7 @@ async fn a_jobs_derived_data_says_what_it_waits_for() {
     assert_eq!(states(&files), vec![("wmp".into(), "built".into()), ("rit".into(), "built".into())]);
 
     // A job that needs none lists none; a job that does not exist is a 404.
-    let plain = db.games_job(1, 2).await;
+    let plain = db.games_job(2).await;
     let (status, files) = admin.get(&format!("/api/admin/jobs/{plain}/derived-data")).await;
     assert_eq!((status, files), (StatusCode::OK, json!([])));
     let (status, _) = admin.get(&format!("/api/admin/jobs/{}/derived-data", Uuid::new_v4())).await;
@@ -547,7 +547,7 @@ async fn a_jobs_derived_data_says_what_it_waits_for() {
 async fn the_fleet_view_counts_workers_by_the_version_they_run() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db).await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
 
     let (_, first) = claim(&admin.app, &[], "1.0.0", &[]).await;
     let w1 = first["worker_uuid"].as_str().unwrap().to_string();
@@ -628,7 +628,7 @@ async fn the_backups_view_reports_staleness_from_the_backups_table() {
 async fn only_a_leave_jobs_artifacts_can_be_rebuilt() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db).await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
 
     let (status, body) = admin.post(&format!("/api/admin/jobs/{job}/rebuild-artifacts"), json!({})).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -647,7 +647,7 @@ async fn only_a_leave_jobs_artifacts_can_be_rebuilt() {
 async fn a_ban_by_either_identity_refuses_the_next_claim_and_unban_restores_it() {
     let db = TestDb::new().await;
     let admin = Admin::new(&db).await;
-    db.games_job(1, 2).await;
+    db.games_job(2).await;
 
     let (_, first) = claim(&admin.app, &[], "1.0.0", &[]).await;
     let anon = first["worker_uuid"].as_str().unwrap().to_string();

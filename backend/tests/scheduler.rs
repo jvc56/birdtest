@@ -2,7 +2,7 @@
 //! `birdtest::scheduler` and `birdtest::jobs::expected_data` directly: which
 //! job a claim goes to, what a claim writes, what a worker that can run
 //! nothing is told, and which files an assignment names. States the claim path
-//! would not produce on its own -- a task already at redundancy, a claim a
+//! would not produce on its own -- a task already claimed, a claim a
 //! second inside its timeout -- are written with plain SQL.
 
 mod common;
@@ -145,12 +145,12 @@ async fn load_job(db: &TestDb, job: Uuid) -> birdtest::models::job::Job {
 
 /// I-SCHED-1: a claim against one active job returns a task, writes a
 /// `task_claims` row naming the worker and the MAGPIE it reported, and counts
-/// it on the task -- the second worker filling a redundancy-2 task's other slot
-/// takes it to capacity.
+/// it on the task, which its one slot makes `claimed`; the second worker gets
+/// a task of its own.
 #[tokio::test]
 async fn a_claim_writes_its_row_and_counts_itself_on_the_task() {
     let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
 
     let worker = anon(&db).await;
@@ -178,18 +178,11 @@ async fn a_claim_writes_its_row_and_counts_itself_on_the_task() {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-    assert_eq!((active, state_text.as_str()), (1, "available"), "one of two slots taken");
+    assert_eq!((active, state_text.as_str()), (1, "claimed"), "its one slot taken");
     assert_eq!(claims_issued(&db, job).await, 1);
 
     let second = claim_task(&state, &anon(&db).await, &caps("1.2.3", &[])).await;
-    assert_eq!(task_of(&db, second.claim_token).await, task_id, "the other slot of the same task");
-    let (active, state_text): (i32, String) =
-        sqlx::query_as("SELECT active_claim_count, state::text FROM tasks WHERE id = $1")
-            .bind(task_id)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
-    assert_eq!((active, state_text.as_str()), (2, "claimed"), "at redundancy the task is claimed");
+    assert_ne!(task_of(&db, second.claim_token).await, task_id, "a claimed task is not handed out again");
     assert_eq!(claims_issued(&db, job).await, 2);
 }
 
@@ -202,8 +195,8 @@ async fn a_claim_writes_its_row_and_counts_itself_on_the_task() {
 #[tokio::test]
 async fn abandoned_claims_still_count_against_a_jobs_share() {
     let db = TestDb::new().await;
-    let flaky = db.games_job(1, 1).await;
-    let steady = db.games_job(1, 1).await;
+    let flaky = db.games_job(1).await;
+    let steady = db.games_job(1).await;
     // The flaky job wins every tie, so it is the one that would run away.
     set_created(&db, flaky, 60).await;
     let state = db.state().await;
@@ -246,8 +239,8 @@ async fn abandoned_claims_still_count_against_a_jobs_share() {
 #[tokio::test]
 async fn equal_deficits_go_to_the_older_job() {
     let db = TestDb::new().await;
-    let newer = db.games_job(1, 1).await;
-    let older = db.games_job(1, 1).await;
+    let newer = db.games_job(1).await;
+    let older = db.games_job(1).await;
     set_created(&db, older, 60).await;
     let state = db.state().await;
 
@@ -276,9 +269,9 @@ async fn equal_deficits_go_to_the_older_job() {
 #[tokio::test]
 async fn a_worker_that_cannot_run_the_job_furthest_behind_gets_the_next_one() {
     let db = TestDb::new().await;
-    let behind = db.games_job(1, 1).await;
-    let next = db.games_job(1, 1).await;
-    let ahead = db.games_job(1, 1).await;
+    let behind = db.games_job(1).await;
+    let next = db.games_job(1).await;
+    let ahead = db.games_job(1).await;
     for (job, issued) in [(behind, 0i64), (next, 5), (ahead, 10)] {
         sqlx::query("UPDATE jobs SET claims_issued = $2 WHERE id = $1")
             .bind(job)
@@ -313,8 +306,8 @@ async fn a_worker_that_cannot_run_the_job_furthest_behind_gets_the_next_one() {
 #[tokio::test]
 async fn a_1_9_worker_gets_a_1_9_job_and_never_a_1_10_one() {
     let db = TestDb::new().await;
-    let needs_1_10 = db.games_job(1, 1).await;
-    let needs_1_9 = db.games_job(1, 1).await;
+    let needs_1_10 = db.games_job(1).await;
+    let needs_1_9 = db.games_job(1).await;
     set_floor(&db, needs_1_10, 1, 10, 0).await;
     set_floor(&db, needs_1_9, 1, 9, 0).await;
     set_created(&db, needs_1_10, 60).await;
@@ -347,7 +340,7 @@ async fn idle_means_work_exists_and_no_work_exists_means_none_is_offered() {
     let worker = anon(&db).await;
     assert_eq!(outcome_kind(&claim(&state, &worker, &caps("1.0.0", &[])).await), "no_work_exists");
 
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", job).await;
     assert_eq!(
         outcome_kind(&claim(&state, &worker, &caps("1.0.0", &[])).await),
@@ -372,8 +365,8 @@ async fn idle_means_work_exists_and_no_work_exists_means_none_is_offered() {
 #[tokio::test]
 async fn each_shutdown_reason_names_what_the_worker_must_change() {
     let db = TestDb::new().await;
-    let too_new = db.games_job(1, 1).await;
-    let data = db.games_job(1, 1).await;
+    let too_new = db.games_job(1).await;
+    let data = db.games_job(1).await;
     set_floor(&db, too_new, 2, 0, 0).await;
     let state = db.state().await;
     let worker = anon(&db).await;
@@ -414,14 +407,14 @@ async fn each_shutdown_reason_names_what_the_worker_must_change() {
 #[tokio::test]
 async fn a_shutdown_names_what_the_active_jobs_actually_require() {
     let db = TestDb::new().await;
-    let v_small = db.games_job(1, 1).await;
-    let v_big = db.games_job(1, 1).await;
+    let v_small = db.games_job(1).await;
+    let v_big = db.games_job(1).await;
     set_floor(&db, v_small, 2, 9, 5).await;
     set_floor(&db, v_big, 2, 10, 0).await;
-    let d1 = db.games_job(1, 1).await;
-    let d2 = db.games_job(1, 1).await;
-    let inactive = db.games_job(1, 1).await;
-    let parked = db.games_job(1, 1).await;
+    let d1 = db.games_job(1).await;
+    let d2 = db.games_job(1).await;
+    let inactive = db.games_job(1).await;
+    let parked = db.games_job(1).await;
     exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", inactive).await;
     exec(&db, "UPDATE jobs SET allocation = 0 WHERE id = $1", parked).await;
 
@@ -473,8 +466,8 @@ async fn a_shutdown_names_what_the_active_jobs_actually_require() {
 #[tokio::test]
 async fn a_lapsed_claim_is_reclaimed_by_the_next_claim_for_its_job_only() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 1).await;
-    let other = db.games_job(1, 1).await;
+    let job = db.games_job(1).await;
+    let other = db.games_job(1).await;
     let state = db.state().await;
     let timeout = state.cfg.heartbeat_timeout.as_secs() as i32;
 
@@ -533,8 +526,8 @@ async fn a_lapsed_claim_is_reclaimed_by_the_next_claim_for_its_job_only() {
     assert_eq!(counts, vec![1, 1]);
 }
 
-/// I-SCHED-13: many workers claiming at once from one redundancy-2 job all get
-/// work, and nothing is lost in the counters: every task's live count is the
+/// I-SCHED-13: many workers claiming at once from one job all get work, each
+/// a task of its own, and nothing is lost in the counters: every task's live count is the
 /// number of claims on it, the job's dispatch counter is the number of claims,
 /// its task total is the number of tasks, and the tasks' seeds tile the space
 /// with neither a duplicate nor a gap.
@@ -543,7 +536,7 @@ async fn concurrent_claimers_neither_collide_nor_lose_a_count() {
     const WORKERS: usize = 8;
     const BATCH: i64 = 3;
     let db = TestDb::new().await;
-    let job = db.games_job(2, BATCH as i32).await;
+    let job = db.games_job(BATCH as i32).await;
     let state = db.state().await;
 
     let mut identities = Vec::new();
@@ -576,11 +569,12 @@ async fn concurrent_claimers_neither_collide_nor_lose_a_count() {
     .unwrap();
     for (seed, active, claims, task_state) in &tasks {
         assert_eq!(i64::from(*active), *claims, "task {seed}: live count matches its claims");
-        assert!(*claims <= 2, "task {seed} is over redundancy");
-        assert_eq!(task_state == "claimed", *claims == 2, "task {seed}: {task_state} with {claims}");
+        assert_eq!(*claims, 1, "task {seed} has one slot");
+        assert_eq!(task_state, "claimed", "task {seed}: {task_state} with {claims}");
     }
     let total: i64 = tasks.iter().map(|t| t.2).sum();
     assert_eq!(total, WORKERS as i64);
+    assert_eq!(tasks.len(), WORKERS, "a task per worker");
     let seeds: Vec<i64> = tasks.iter().map(|t| t.0).collect();
     let tiled: Vec<i64> = (0..seeds.len() as i64).map(|i| 1 + i * BATCH).collect();
     assert_eq!(seeds, tiled, "seeds tile the space");
@@ -605,26 +599,27 @@ async fn concurrent_claimers_neither_collide_nor_lose_a_count() {
     assert_eq!(doubled, 0, "no worker holds two slots on one task");
 }
 
-/// I-SCHED-14: a task already at `redundancy` -- two live claims, or one
-/// accepted result and one live claim -- is not handed to another worker; the
-/// third worker gets a fresh task and the full ones are untouched.
+/// I-SCHED-14: a task already taken -- a live claim, or an accepted result --
+/// is not handed to another worker; the next worker gets a fresh task and the
+/// taken ones are untouched.
 #[tokio::test]
-async fn a_task_at_redundancy_is_not_handed_to_a_third_worker() {
+async fn a_taken_task_is_not_handed_to_another_worker() {
     let db = TestDb::new().await;
-    let job = db.games_job(2, 2).await;
+    let job = db.games_job(2).await;
     let state = db.state().await;
 
-    // Two full tasks, written directly.
+    // Two taken tasks, written directly.
     let mut full = Vec::new();
-    for (seed, accepted, active, claim_states) in
-        [(1i64, 0, 2, ["claimed", "claimed"]), (3, 1, 1, ["completed", "claimed"])]
+    for (seed, task_state, accepted, active, claim_states) in
+        [(1i64, "claimed", 0, 1, ["claimed"]), (3, "completed", 1, 0, ["completed"])]
     {
         let task: Uuid = sqlx::query_scalar(
             "INSERT INTO tasks (job_id, seed, state, accepted_count, active_claim_count)
-             VALUES ($1, $2, 'claimed', $3, $4) RETURNING id",
+             VALUES ($1, $2, $3::task_state, $4, $5) RETURNING id",
         )
         .bind(job)
         .bind(seed)
+        .bind(task_state)
         .bind(accepted)
         .bind(active)
         .fetch_one(&db.pool)
@@ -647,15 +642,15 @@ async fn a_task_at_redundancy_is_not_handed_to_a_third_worker() {
         full.push(task);
     }
 
-    let third = claim_task(&state, &anon(&db).await, &caps("1.0.0", &[])).await;
-    let got = task_of(&db, third.claim_token).await;
-    assert!(!full.contains(&got), "a full task was handed out again");
+    let next = claim_task(&state, &anon(&db).await, &caps("1.0.0", &[])).await;
+    let got = task_of(&db, next.claim_token).await;
+    assert!(!full.contains(&got), "a taken task was handed out again");
     let seed: i64 = sqlx::query_scalar("SELECT seed FROM tasks WHERE id = $1")
         .bind(got)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(seed, 5, "a new batch after the full ones");
+    assert_eq!(seed, 5, "a new batch after the taken ones");
 
     for task in full {
         let (active, claims): (i32, i64) = sqlx::query_as(
@@ -666,8 +661,8 @@ async fn a_task_at_redundancy_is_not_handed_to_a_third_worker() {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert_eq!(claims, 2, "no third claim on a full task");
-        assert!(active <= 2);
+        assert_eq!(claims, 1, "no second claim on a taken task");
+        assert!(active <= 1);
     }
 }
 
@@ -697,7 +692,7 @@ async fn a_worker_that_declined_a_task_can_claim_the_same_task_again() {
 
     let state = db.state().await;
     for worker in [anon(&db).await, registered(&db).await] {
-        let job = db.games_job(1, 2).await;
+        let job = db.games_job(2).await;
         let only_this = caps("1.0.0", &every_job_but(&db, job).await);
 
         let first = claim_task(&state, &worker, &only_this).await;
@@ -747,9 +742,8 @@ async fn a_worker_that_declined_a_task_can_claim_the_same_task_again() {
 }
 
 /// I-SCHED-16: one worker never holds two live claims on one task, by account
-/// or by anonymous UUID. Claiming again from a redundancy-2 job hands the
-/// worker the next task rather than the other slot of its own, and the unique
-/// index refuses a second live row even written directly.
+/// or by anonymous UUID. Claiming again hands the worker the next task, and
+/// the unique index refuses a second live row even written directly.
 #[tokio::test]
 async fn one_worker_never_holds_two_live_claims_on_one_task() {
     let db = TestDb::new().await;
@@ -759,12 +753,12 @@ async fn one_worker_never_holds_two_live_claims_on_one_task() {
         (registered(&db).await, "task_claims_user_unique_idx"),
         (anon(&db).await, "task_claims_anon_unique_idx"),
     ] {
-        let job = db.games_job(2, 2).await;
+        let job = db.games_job(2).await;
         let others = every_job_but(&db, job).await;
         let first = claim_task(&state, &worker, &caps("1.0.0", &others)).await;
         let second = claim_task(&state, &worker, &caps("1.0.0", &others)).await;
         let task = task_of(&db, first.claim_token).await;
-        assert_ne!(task_of(&db, second.claim_token).await, task, "{worker:?} got its own task's other slot");
+        assert_ne!(task_of(&db, second.claim_token).await, task, "{worker:?} got its own task again");
 
         let err = sqlx::query(
             "INSERT INTO task_claims (task_id, job_id, claim_token, claimed_by_user_id, claimed_by_anon_uuid)
@@ -788,8 +782,8 @@ async fn one_worker_never_holds_two_live_claims_on_one_task() {
 #[tokio::test]
 async fn an_inactive_job_is_never_selected() {
     let db = TestDb::new().await;
-    let inactive = db.games_job(1, 1).await;
-    let active = db.games_job(1, 1).await;
+    let inactive = db.games_job(1).await;
+    let active = db.games_job(1).await;
     exec(&db, "UPDATE jobs SET status = 'inactive' WHERE id = $1", inactive).await;
     set_created(&db, inactive, 60).await;
     sqlx::query("UPDATE jobs SET claims_issued = 1000 WHERE id = $1")
@@ -843,7 +837,7 @@ async fn player_files(db: &TestDb, player: Uuid) -> (String, String) {
 #[tokio::test]
 async fn players_on_different_lexicons_each_contribute_a_kwg_and_a_klv() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 1).await;
+    let job = db.games_job(1).await;
     let (p1, p2): (Uuid, Uuid) = sqlx::query_as(
         "SELECT player1_config_id, player2_config_id FROM job_game_config WHERE job_id = $1",
     )
@@ -879,7 +873,7 @@ async fn players_on_different_lexicons_each_contribute_a_kwg_and_a_klv() {
 async fn a_leave_job_needs_its_lexicon_bag_and_board_and_never_leaves() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "CSW24").await;
     db.input_data("klv", "CSW24").await;
     let player = db.leave_player(kwg, true, admin).await;
@@ -905,7 +899,7 @@ async fn a_leave_job_needs_its_lexicon_bag_and_board_and_never_leaves() {
 #[tokio::test]
 async fn every_expected_file_carries_the_pinned_rows_digest() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 1).await;
+    let job = db.games_job(1).await;
 
     let pinned: Vec<(Uuid, String, String, String)> = sqlx::query_as(
         "SELECT d.id, d.role, d.name, d.sha256 FROM input_data d
@@ -948,7 +942,7 @@ async fn every_expected_file_carries_the_pinned_rows_digest() {
 async fn an_opening_rack_job_needs_its_players_files_and_the_jobs_bag_and_board() {
     let db = TestDb::new().await;
     let admin = db.user("admin", true).await;
-    let job = db.bare_job("opening_rack", 1, admin).await;
+    let job = db.bare_job("opening_rack", admin).await;
     let player = db.static_player("solo", admin).await;
     db.static_player("bystander", admin).await;
     let winpct = db.input_data("winpct", "winpct").await;

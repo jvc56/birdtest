@@ -3,8 +3,7 @@
    * Player configs' settings as a table: a column per player -- one on a
    * config's own page or a leave job's, two side by side for a games or pairs
    * job -- with the rows the players differ in bold. The key rows unless
-   * `all`, when every setting. The card around it holds the toggle, so one
-   * toggle can open a job's settings and its players' together. Settings the
+   * `all`, when every setting; the card around it holds the toggle. Settings the
    * job never reads (`unused`, by row label) are shown muted, with a note. A
    * job's players are headed by their search in a few words; a config read on
    * its own has that beside its name on its page.
@@ -49,7 +48,8 @@
                 <a class="font-normal [overflow-wrap:anywhere]" href="/player-configs/{player.id}">{player.name}</a><br />
                 <span class="text-xs font-normal text-muted-foreground" data-testid="player-search"
                   >{playerSummary(player, unused)}</span
-                >
+                ><br />
+                <a class="text-xs font-normal" href="/player-configs/{player.id}">Open config →</a>
               </th>
             {/each}
           </tr>

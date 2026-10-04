@@ -3,9 +3,9 @@ import { ADMIN_STATE, SEEDED_DATA } from '../lib/env';
 
 test.use({ storageState: ADMIN_STATE });
 
-/** A static player through the form, with the wordmap and rack info table
- *  turned off, and the word info table left off: nothing below tier 6 builds
- *  any of them, and a job waiting on one would never dispatch. */
+/** A static player through the form, with the wordmap, rack info table and
+ *  word info table turned off: nothing below tier 6 builds any of them, and a
+ *  job waiting on one would never dispatch. */
 async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'score') {
   await page.goto('/admin/player-configs/new');
   await page.getByLabel('Name').fill(name);
@@ -15,8 +15,9 @@ async function createStaticConfig(page: Page, name: string, sort: 'equity' | 'sc
   await page.getByRole('button', { name: 'Show advanced options' }).click();
   await page.getByLabel('Use wordmap (-w)').uncheck();
   await page.getByLabel('Use rack info table (-rit)').uncheck();
-  // Off already, as MAGPIE has it.
-  await expect(page.getByLabel('Use word info table (-wit)')).not.toBeChecked();
+  // On by default, unlike MAGPIE's -wit.
+  await expect(page.getByLabel('Use word info table (-wit)')).toBeChecked();
+  await page.getByLabel('Use word info table (-wit)').uncheck();
   await page.getByRole('button', { name: 'Create' }).click();
   await expect(page).toHaveURL(/\/admin\/player-configs$/);
   await expect(page.locator('tbody tr', { hasText: name })).toContainText(sort);
@@ -108,8 +109,9 @@ test('E-4: an admin creates configs and a job, activates it, and watches it fill
     sprt.getByText(/^(running — LLR|Completed: passed \(H1 accepted\), LLR) -?\d+\.\d{3}/)
   ).toBeVisible();
   const score = page.locator('.card', { has: page.getByRole('heading', { name: 'Match score' }) });
-  await expect(score.getByTestId('match-record')).toHaveText(/^\d[\d,]*–\d[\d,]*–\d[\d,]*$/);
-  await expect(score.getByText(/^Average score:/)).toBeVisible();
+  await expect(score.getByTestId('player-compare').locator('tbody td:first-child')).toHaveText([
+    'Wins', 'Draws', 'Score', 'Score %', 'Average score', 'Average spread'
+  ]);
   await expect(page.getByText('No contributions yet.')).toHaveCount(0);
   await expect(
     page.locator('.card', { has: page.getByRole('heading', { name: 'Contributors' }) }).getByText(/^Anonymous · /).first()

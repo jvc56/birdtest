@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { api, errorText, type InputData, type JobType, type PlayerConfig } from '$lib/api';
-  import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, unchosenText } from '$lib/format';
+  import { blankFields, jobTypeLabel, leavePlayerConflict, parseTargetRackCounts, targetsText, unchosenText } from '$lib/format';
 
   let configs: PlayerConfig[] = [];
   let files: InputData[] = [];
@@ -15,7 +15,6 @@
   let jobType: JobType = 'game_pairs';
   // Shown first wherever jobs are listed, and as the job page's title.
   let name = '';
-  let redundancy = 1;
   // Pre-filled from the server-wide floor rather than left blank: a default
   // nobody sees is how every new job quietly inherits a floor that is too low.
   let minMagpieVersion = '';
@@ -59,6 +58,10 @@
   let targetRackCounts = '500';
   $: targets = parseTargetRackCounts(targetRackCounts);
   let racksPerTask = 50;
+  // An opening-rack job's consensus: one analysis per rack unless asked.
+  let minResults = 1;
+  let maxResults = 1;
+  let consensusPct = 80;
 
   const types: JobType[] = ['opening_rack', 'games', 'game_pairs', 'leave_generation'];
 
@@ -69,6 +72,15 @@
   // whatever its recorder). And no player reports more plays than num_plays,
   // which sizes the move list.
   $: selectedConfig = configs.find((config) => config.id === playerConfigId);
+  $: selectedStatic = selectedConfig ? selectedConfig.num_plies === 0 : false;
+  $: consensusProblem =
+    jobType !== 'opening_rack' || selectedStatic || maxResults <= 1
+      ? null
+      : !(minResults >= 1 && maxResults >= minResults && maxResults <= 100)
+        ? 'The most analyses must be at least the fewest, and at most 100.'
+        : !(consensusPct > 50 && consensusPct <= 100)
+          ? 'The share that must agree must be above 50% and at most 100%.'
+          : null;
   $: openingRackConflict =
     jobType !== 'opening_rack' || !selectedConfig
       ? null
@@ -109,8 +121,6 @@
     const common = {
       name: name.trim(),
       job_type: jobType,
-      // Leave generation runs at redundancy 1 only: the server refuses more.
-      redundancy: jobType === 'leave_generation' ? 1 : redundancy,
       variant,
       letterdist_id: letterdistId,
       layout_id: layoutId,
@@ -131,7 +141,18 @@
       : { sprt_enabled: false };
     switch (jobType) {
       case 'opening_rack':
-        return { ...common, player_config_id: playerConfigId };
+        return {
+          ...common,
+          player_config_id: playerConfigId,
+          // A static player's analyses always agree, so it gets one per rack.
+          ...(selectedStatic || maxResults <= 1
+            ? { min_results_per_rack: 1, max_results_per_rack: 1 }
+            : {
+                min_results_per_rack: minResults,
+                max_results_per_rack: maxResults,
+                consensus_pct: consensusPct
+              })
+        };
       case 'games':
         return {
           ...common,
@@ -178,6 +199,11 @@
     }
     if (jobType === 'leave_generation' && 'error' in targets) {
       error = `Targets per generation: ${targets.error}`;
+      fromSubmit = true;
+      return;
+    }
+    if (consensusProblem) {
+      error = `Analyses per rack: ${consensusProblem}`;
       fromSubmit = true;
       return;
     }
@@ -237,10 +263,6 @@
   </div>
 
   <div class="grid grid-cols-2 gap-3">
-    <div>
-      <label class="label" for="redundancy">Redundancy</label>
-      <input id="redundancy" type="number" min="1" class="input" bind:value={redundancy} disabled={jobType === 'leave_generation'} />
-    </div>
     <div>
       <label class="label" for="magpie">Min MAGPIE version</label>
       <input id="magpie" class="input" bind:value={minMagpieVersion} placeholder="1.4.0" />
@@ -328,6 +350,52 @@
         does, or one that records a single play.
       </p>
     {/if}
+    <fieldset class="space-y-2" data-testid="consensus">
+      <legend class="label">Analyses per rack</legend>
+      {#if selectedStatic}
+        <p class="text-xs text-muted-foreground">
+          One: {selectedConfig?.name} is static, so every analysis of a rack ranks it the same
+          way and there is no consensus to seek. Pick a simulating player to analyse each rack
+          until its analyses agree.
+        </p>
+      {:else}
+        <div class="grid grid-cols-3 gap-3">
+          <div>
+            <label class="label" for="minres">At least</label>
+            <input id="minres" type="number" min="1" max="100" class="input" bind:value={minResults} />
+          </div>
+          <div>
+            <label class="label" for="maxres">At most</label>
+            <input id="maxres" type="number" min="1" max="100" class="input" bind:value={maxResults} />
+          </div>
+          <div>
+            <label class="label" for="consensus">Consensus %</label>
+            <input
+              id="consensus"
+              type="number"
+              min="51"
+              max="100"
+              step="any"
+              class="input"
+              bind:value={consensusPct}
+              disabled={maxResults <= 1}
+            />
+          </div>
+        </div>
+        {#if consensusProblem}<p class="field-error">{consensusProblem}</p>{/if}
+        <p class="text-xs text-muted-foreground">
+          {#if maxResults <= 1}
+            One analysis per rack. Raise <strong>At most</strong> to analyse a rack until its
+            analyses agree.
+          {:else}
+            Each rack is analysed at least {minResults} time{minResults === 1 ? '' : 's'}, and again
+            — by other workers where there are any — until {consensusPct}% of its analyses
+            agree on its best move, or until it has been analysed {maxResults} times, when it is
+            settled without a consensus. The job is done once every rack is settled.
+          {/if}
+        </p>
+      {/if}
+    </fieldset>
     <p class="text-xs text-muted-foreground">
       The recorder is shown because it decides whether a static player can rank anything at
       all: <strong>best</strong> keeps only the top move, so every rack would come back with one
@@ -464,9 +532,11 @@
           <span class="field-error">{targets.error}</span>
         {:else}
           {targets.targets.length}
-          {targets.targets.length === 1 ? 'generation' : 'generations'}. Each closes once every
-          rack has occurred its own target number of times, as in MAGPIE's
-          <code>leavegen 100,200,500,…</code>.
+          {targets.targets.length === 1 ? 'generation' : 'generations'}:
+          <span class="tabular-nums text-foreground">{targetsText(targets.targets)}</span>. Each
+          closes once every rack has occurred its own target number of times, as in MAGPIE's
+          <code>leavegen 100,200,500,…</code>. Separate targets with commas or spaces, and write
+          no thousands separators.
         {/if}
       </p>
     </div>

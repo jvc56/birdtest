@@ -60,9 +60,10 @@ impl Admin {
         let mut body = json!({
             "name": name, "recorder_type": "all", "kwg_id": kwg, "klv_id": klv,
             "num_plays_recorded": 3,
-            // The test lexicons are not real KWGs, so no reference wordmap
-            // or rack info table exists for a worker to be asked to reproduce.
-            "use_wordmap": false, "use_rit": false,
+            // The test lexicons are not real KWGs, so no reference wordmap,
+            // rack info table or word info table exists for a worker to be
+            // asked to reproduce.
+            "use_wordmap": false, "use_rit": false, "use_wit": false,
         });
         for (key, value) in extra.as_object().unwrap() {
             body[key] = value.clone();
@@ -165,7 +166,7 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
     // games, with every optional setting stated and none at its default.
     let (status, created) = admin
         .create_job(json!({
-            "job_type": "games", "redundancy": 2, "variant": "wordsmog",
+            "job_type": "games", "variant": "wordsmog",
             "letterdist_id": ld, "layout_id": layout, "min_magpie_version": "1.2.3",
             "player1_config_id": p1, "player2_config_id": p2, "games_per_batch": 4,
             "sprt_enabled": true,
@@ -189,7 +190,6 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
     let job = job_row(&db, games).await;
     for (column, expected) in [
         ("job_type", json!("games")),
-        ("redundancy", json!(2)),
         ("variant", json!("wordsmog")),
         ("letterdist_id", json!(ld)),
         ("layout_id", json!(layout)),
@@ -269,9 +269,70 @@ async fn each_job_type_stores_every_setting_it_was_created_with() {
         &json!({
             "job_id": racks, "player_config_id": p1, "racks_per_batch": 50, "rack_size": 5,
             "total_racks": total,
+            // One analysis per rack unless the body asks for a consensus.
+            "consensus_pct": 100.0, "min_results_per_rack": 1, "max_results_per_rack": 1,
         }),
     );
     assert_eq!(job_row(&db, racks).await["job_type"], "opening_rack");
+}
+
+/// I-JOB-1e: an opening-rack job's consensus -- the share of a rack's
+/// analyses that must agree on its best move, after at least so many and at
+/// most so many of them -- is stored as stated for a simming player, and
+/// refused where it cannot work: a share at or below half (two moves could
+/// both hold it), too few or too many analyses, a maximum below the minimum,
+/// and any consensus at all for a static player, whose analyses always agree.
+#[tokio::test]
+async fn an_opening_rack_jobs_consensus_is_stored_and_refused_where_it_cannot_work() {
+    let db = TestDb::new().await;
+    let admin = Admin::new(&db, db.state().await).await;
+    let (ld, layout) = board(&db).await;
+    let kwg = db.input_data("kwg", "NWL23").await;
+    let klv = db.input_data("klv", "NWL23").await;
+    let winpct = db.input_data("winpct", "winpct").await;
+    let simmer = admin.simmer("simmer", kwg, klv, winpct).await;
+    let fixed = admin.static_player("fixed", kwg, klv, json!({})).await;
+    let body = |player: Uuid, consensus: Value| {
+        let mut body = json!({
+            "job_type": "opening_rack", "variant": "classic", "letterdist_id": ld,
+            "layout_id": layout, "player_config_id": player, "racks_per_batch": 10,
+        });
+        for (key, value) in consensus.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    };
+
+    let (status, created) = admin
+        .create_job(body(simmer, json!({
+            "consensus_pct": 80.0, "min_results_per_rack": 3, "max_results_per_rack": 7,
+        })))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let job: Uuid = created["job"]["id"].as_str().unwrap().parse().unwrap();
+    let row = config_row(&db, "job_opening_rack_config", job).await;
+    assert_eq!(row["consensus_pct"].as_f64(), Some(80.0));
+    assert_eq!((&row["min_results_per_rack"], &row["max_results_per_rack"]), (&json!(3), &json!(7)));
+
+    for (consensus, field) in [
+        (json!({ "consensus_pct": 50.0 }), "consensus_pct"),
+        (json!({ "consensus_pct": 100.5 }), "consensus_pct"),
+        (json!({ "min_results_per_rack": 0 }), "min_results_per_rack"),
+        (json!({ "min_results_per_rack": 3, "max_results_per_rack": 2 }), "max_results_per_rack"),
+        (json!({ "min_results_per_rack": 3, "max_results_per_rack": 101 }), "max_results_per_rack"),
+    ] {
+        let (status, refused) = admin.create_job(body(simmer, consensus.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{consensus}: {refused}");
+        assert_eq!(refused["fields"][0]["field"], field, "{consensus}: {refused}");
+    }
+    let (status, refused) = admin
+        .create_job(body(fixed, json!({ "min_results_per_rack": 2, "max_results_per_rack": 3 })))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{refused}");
+    assert_eq!(refused["fields"][0]["field"], "max_results_per_rack", "{refused}");
+    // One analysis per rack is fine for it.
+    let (status, created) = admin.create_job(body(fixed, json!({}))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
 }
 
 /// A directory removed when dropped, so a test leaves nothing behind however
@@ -707,7 +768,7 @@ async fn games_history(app: &Router) -> String {
     let uuid = assignment["worker_uuid"].as_str().unwrap().to_string();
     let mut result = games_result(2, 1);
     result["positions"] = json!([{
-        "game_index": 0, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
+        "game_index": 0, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": 40, "moves": [
             { "move": "8D RETAINS", "score": 74, "equity": 81.2,
               "plies": [{ "ply": 1, "bingo_percentage": 10.0, "average_score": 30.0 }] },
@@ -715,7 +776,7 @@ async fn games_history(app: &Router) -> String {
         ],
     }, {
         // A capturing job's result has positions from every game of its batch.
-        "game_index": 1, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
+        "game_index": 1, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": 1, "moves": [{ "move": "8D RETAINS", "score": 74, "equity": 81.2 }],
     }]);
     let (status, body) = send(
@@ -736,7 +797,7 @@ async fn games_history(app: &Router) -> String {
 /// it.
 async fn leave_job(db: &TestDb) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
     let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
@@ -883,7 +944,7 @@ async fn deleting_a_job_leaves_nothing_anywhere_that_points_at_it() {
     let columns = referencing_columns(&db).await;
     assert!(columns.len() > 20, "the catalog query found the schema: {columns:?}");
 
-    let games = db.games_job(1, 2).await;
+    let games = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(games)
         .execute(&db.pool)
@@ -940,7 +1001,7 @@ async fn deleting_a_job_leaves_nothing_anywhere_that_points_at_it() {
 #[tokio::test]
 async fn a_purge_writes_its_census_before_it_destroys_anything() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -997,7 +1058,7 @@ async fn a_malformed_magpie_floor_is_refused() {
     let p2 = admin.static_player("p2", kwg, klv, json!({})).await;
     let job = |floor: &str| {
         json!({
-            "job_type": "games", "redundancy": 1, "variant": "classic",
+            "job_type": "games", "variant": "classic",
             "letterdist_id": ld, "layout_id": layout, "min_magpie_version": floor,
             "player1_config_id": p1, "player2_config_id": p2, "max_games": 100,
         })
@@ -1069,7 +1130,7 @@ async fn a_player_config_in_use_by_any_job_cannot_be_deleted() {
     // A leave job by hand: created through the API it would build its
     // generation-0 KLV, which needs a MAGPIE and an object store.
     let owner = db.user("leave-owner", true).await;
-    let leave = db.bare_job("leave_generation", 1, owner).await;
+    let leave = db.bare_job("leave_generation", owner).await;
     sqlx::query(
         "INSERT INTO job_leave_config
              (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
@@ -1175,7 +1236,7 @@ async fn claimed_seed(app: &Router) -> Option<String> {
 #[tokio::test]
 async fn a_purged_job_hands_out_its_seed_space_again_from_the_start() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let admin = Admin::new(&db, db.state().await).await;
 
     let mut before = Vec::new();

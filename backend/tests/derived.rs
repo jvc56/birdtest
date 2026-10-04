@@ -29,8 +29,8 @@ async fn player(db: &TestDb, kwg: Uuid, klv: Uuid, use_wordmap: bool, use_rit: b
         "INSERT INTO player_configs
              (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
               num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
-              movegen_margin, created_by)
-         VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, $4, $5, 5, $6)
+              use_wit, movegen_margin, created_by)
+         VALUES ($1, 'best', 'equity', $2, $3, 0, 100, 2, 10, $4, $5, false, 5, $6)
          RETURNING id",
     )
     .bind(format!("p{}", Uuid::new_v4().simple()))
@@ -50,9 +50,9 @@ async fn player(db: &TestDb, kwg: Uuid, klv: Uuid, use_wordmap: bool, use_rit: b
 async fn games_job_on(db: &TestDb, ld: Uuid, layout: Uuid, p1: Uuid, p2: Uuid) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let job: Uuid = sqlx::query_scalar(
-        "INSERT INTO jobs (job_type, allocation, redundancy, status, created_by,
+        "INSERT INTO jobs (job_type, allocation, status, created_by,
                            variant, letterdist_id, layout_id, bingo_bonus, sim_cutoff)
-         VALUES ('games', 50, 1, 'active', $1, 'classic', $2, $3, 50, 0.005)
+         VALUES ('games', 50, 'active', $1, 'classic', $2, $3, 50, 0.005)
          RETURNING id",
     )
     .bind(admin)
@@ -516,8 +516,8 @@ async fn two_distributions_with_one_name_size_two_different_rack_spaces() {
         "INSERT INTO player_configs
              (name, recorder_type, sort_strategy, kwg_id, klv_id, num_plies, num_plays,
               num_plies_recorded, num_plays_recorded, use_wordmap, use_rit,
-              movegen_margin, created_by)
-         VALUES ('analyst', 'all', 'equity', $1, $2, 0, 100, 1, 10, false, false, 5, $3)
+              use_wit, movegen_margin, created_by)
+         VALUES ('analyst', 'all', 'equity', $1, $2, 0, 100, 1, 10, false, false, false, 5, $3)
          RETURNING id",
     )
     .bind(kwg)
@@ -568,7 +568,7 @@ async fn a_leave_job_queues_its_wordmap_and_never_a_table() {
     let admin = db.user("root", true).await;
     let kwg = db.input_data("kwg", "NWL23").await;
     let klv = db.input_data("klv", "NWL23").await;
-    let leave = db.bare_job("leave_generation", 1, admin).await;
+    let leave = db.bare_job("leave_generation", admin).await;
     let leave_player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
         "INSERT INTO job_leave_config (job_id, player_config_id, num_iterations, target_rack_counts, racks_per_task)
@@ -669,7 +669,7 @@ async fn a_word_info_table_is_the_lexicons_and_waits_like_the_others() {
     assert_eq!(request["player2"]["use_wit"], json!(false), "{request}");
 
     // A leave job's player: its wordmap and its table, never a rack info table.
-    let leave = db.bare_job("leave_generation", 1, admin).await;
+    let leave = db.bare_job("leave_generation", admin).await;
     let leave_player = db.leave_player(kwg, true, admin).await;
     sqlx::query("UPDATE player_configs SET use_wit = true WHERE id = $1")
         .bind(leave_player)

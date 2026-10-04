@@ -28,7 +28,7 @@ const simPlayer: PlayerSettings = {
 const config: JobConfig = {
   job: {
     id: 'j', name: 'n', job_type: 'game_pairs', variant: 'classic', letter_distribution: 'english',
-    layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, redundancy: 1, min_magpie_version: '0.1.1'
+    layout: 'standard15', bingo_bonus: 50, sim_cutoff: 0, min_magpie_version: '0.1.1'
   },
   games: {
     unit: 'pair', per_batch: 1, sprt_enabled: true, min_units: 100, max_units: 5000,
@@ -47,7 +47,10 @@ const SOLVER_ROWS = [
 ];
 const opening: JobConfig = {
   job: { ...config.job, job_type: 'opening_rack' },
-  opening_racks: { racks_per_batch: 500, rack_size: 7, total_racks: 3199724 },
+  opening_racks: {
+    racks_per_batch: 500, rack_size: 7, total_racks: 3199724,
+    consensus_pct: 80, min_results_per_rack: 3, max_results_per_rack: 7
+  },
   players: [{ ...simPlayer, role: 'player' }]
 };
 const leave: JobConfig = {
@@ -77,7 +80,7 @@ describe('F-SET-1 job settings', () => {
     expect(labels(rows)).toEqual([
       'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Cap (pairs)', 'SPRT',
       'Records positions', 'Sim cutoff', 'Fewest pairs before the test is acted on', 'SPRT α', 'SPRT β',
-      'Pairs per task', 'Redundancy', 'Oldest MAGPIE'
+      'Pairs per task', 'Oldest MAGPIE'
     ]);
     expect(keyLabels(rows)).toEqual([
       'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Cap (pairs)', 'SPRT',
@@ -109,17 +112,20 @@ describe('F-SET-1 job settings', () => {
   it("lists an opening-rack job's racks, and a leave job's generations and no sim cutoff", () => {
     expect(labels(jobSettings(opening))).toEqual([
       'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Racks in all', 'Rack size',
-      'Sim cutoff', 'Racks per task', 'Redundancy', 'Oldest MAGPIE'
+      'Analyses per rack', 'Sim cutoff', 'Racks per task', 'Oldest MAGPIE'
     ]);
+    expect(jobSettings(opening)).toContainEqual({
+      label: 'Analyses per rack', value: '3 to 7, until 80% agree on the best move', key: true
+    });
     const rows = jobSettings(leave);
     expect(labels(rows)).toEqual([
       'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Generations', 'Target per rack',
-      'Games per task', 'Racks per task', 'Redundancy', 'Oldest MAGPIE'
+      'Games per task', 'Racks per task', 'Oldest MAGPIE'
     ]);
     expect(keyLabels(rows)).toEqual([
       'Type', 'Variant', 'Letter distribution', 'Board', 'Bingo bonus', 'Generations', 'Target per rack'
     ]);
-    expect(rows).toContainEqual({ label: 'Target per rack', value: `100, 200, ${(5000).toLocaleString()}`, key: true });
+    expect(rows).toContainEqual({ label: 'Target per rack', value: `100 → 200 → ${(5000).toLocaleString()}`, key: true });
     // The lexicon and wordmap are the player's rows, not the job's.
     expect(labels(rows)).not.toContain('Lexicon');
     expect(labels(playerRows(leave.players))).toEqual(expect.arrayContaining(['Lexicon', 'Wordmap']));

@@ -344,7 +344,7 @@ async fn scrub(db: &TestDb) {
 async fn a_scrubbed_dump_keeps_no_worker_credential() {
     let db = TestDb::new().await;
     let admin = db.user("root", true).await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let worker = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO anonymous_workers (uuid, tasks_completed, compute_ms, games_played, racks_analyzed)

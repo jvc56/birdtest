@@ -200,6 +200,28 @@ export function placedSquares(move: string | null | undefined): Set<string> {
   return new Set(parsed.squares.filter((s) => !s.through).map((s) => `${s.row},${s.col}`));
 }
 
+/** A tile a play puts down, on an empty square: what the board draws for a move not yet played. */
+export interface PlacedTile extends Tile {
+  row: number;
+  col: number;
+}
+
+/**
+ * The tiles a play puts down, each on its square -- a blank, written in lower
+ * case, as the letter it is played as with `blank` set. Nothing for a pass, an
+ * exchange, or a play that cannot be read; a square it plays through is
+ * already on the board and is left out, as is one MAGPIE named only as `.`.
+ */
+export function placedTiles(move: string | null | undefined): PlacedTile[] {
+  const parsed = move ? parseMove(move) : null;
+  if (parsed?.kind !== 'play') return [];
+  return parsed.squares.flatMap((s) => {
+    if (s.through || s.letter === null) return [];
+    const upper = s.letter.toUpperCase();
+    return [{ row: s.row, col: s.col, letter: upper, blank: upper !== s.letter }];
+  });
+}
+
 /**
  * Which seat holds `rack` -- the rack of the player to move, as a saved
  * position states it -- or `null` when neither does. Compared as tiles, in any

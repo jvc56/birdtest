@@ -61,7 +61,6 @@ struct JobListItem {
     job_type: JobType,
     status: String,
     allocation: Option<i32>,
-    redundancy: i32,
     created_at: chrono::DateTime<chrono::Utc>,
     tasks_total: i64,
     tasks_completed: i64,
@@ -87,7 +86,7 @@ async fn list_jobs(
 
     let rows = sqlx::query(
         "SELECT j.id, j.name, j.job_type, j.status::text AS status, j.allocation,
-                j.redundancy, j.created_at,
+                j.created_at,
                 -- Running totals, like games_completed below. Counted, these
                 -- were two scans of a job's whole task history for every job on
                 -- the page -- see PLAN.md on what these reads cost.
@@ -169,7 +168,6 @@ async fn list_jobs(
                 job_type,
                 status: row.get("status"),
                 allocation: row.get("allocation"),
-                redundancy: row.get("redundancy"),
                 created_at: row.get("created_at"),
                 tasks_total: row.get("tasks_total"),
                 tasks_completed: row.get("tasks_completed"),
@@ -235,7 +233,6 @@ struct JobSettings {
     layout: String,
     bingo_bonus: i32,
     sim_cutoff: f64,
-    redundancy: i32,
     min_magpie_version: String,
 }
 
@@ -503,7 +500,6 @@ async fn job_config(
             layout: file(job.layout_id).await?,
             bingo_bonus: job.bingo_bonus,
             sim_cutoff: job.sim_cutoff,
-            redundancy: job.redundancy,
             min_magpie_version: job.min_magpie_version().to_string(),
         },
         games,
@@ -1050,12 +1046,16 @@ async fn rack_lookup(
     // captured in-game position with the same rack out of an opening-rack
     // lookup.
     //
-    // Ordered by record first: under redundancy above 1 a rack has one record
-    // per accepted claim, and ordering by rank alone interleaved the lists --
+    // Ordered by record first: a rack an opening-rack job analysed more than
+    // once, to reach a consensus, has one record per analysis, and ordering by
+    // rank alone interleaved the lists --
     // two rank-1 rows, then two rank-2 rows -- as if one analysis had ranked
     // every move twice.
+    // `analysis` numbers the rack's analyses from 1, so a page can tell them
+    // apart and read their consensus.
     let rows = sqlx::query(
-        "SELECT m.rank, m.move, m.score, m.equity
+        "SELECT dense_rank() OVER (ORDER BY r.id)::int AS analysis,
+                m.rank, m.move, m.score, m.equity
          FROM position_analysis_records r
          JOIN position_analysis_moves m ON m.record_id = r.id
          WHERE r.job_id = $1 AND r.rack = $2 AND r.game_index IS NULL
@@ -1070,6 +1070,7 @@ async fn rack_lookup(
         .into_iter()
         .map(|r| {
             serde_json::json!({
+                "analysis": r.get::<i32, _>("analysis"),
                 "rank": r.get::<i16, _>("rank"),
                 "move": r.get::<String, _>("move"),
                 "score": r.get::<i32, _>("score"),
@@ -1098,7 +1099,8 @@ const MAX_POSITIONS_PER_PAGE: i64 = 20;
 
 /// A saved position's own columns, as every positions route reads them.
 const POSITION_COLUMNS: &str = "r.id, r.task_id, r.rack, r.position, r.game_index, r.turn_number,
-                                r.previous_move, r.previous_move_score, r.num_moves, r.analysis,
+                                r.previous_move, r.previous_move_score, r.played_move,
+                                r.played_move_score, r.num_moves, r.analysis,
                                 r.submitted_at";
 
 /// A games or game-pairs job, or the `400` that says only those save positions.
@@ -1164,6 +1166,8 @@ async fn saved_positions(
                 "position": r.get::<Option<String>, _>("position"),
                 "previous_move": r.get::<Option<String>, _>("previous_move"),
                 "previous_move_score": r.get::<Option<i32>, _>("previous_move_score"),
+                "played_move": r.get::<Option<String>, _>("played_move"),
+                "played_move_score": r.get::<Option<i32>, _>("played_move_score"),
                 "num_moves": r.get::<i32, _>("num_moves"),
                 "analysis": r.get::<String, _>("analysis"),
                 "submitted_at": r.get::<chrono::DateTime<chrono::Utc>, _>("submitted_at"),

@@ -30,7 +30,6 @@ pub struct Job {
     /// The job's share of the fleet while active; `None` until first
     /// activated. There is no priority: 0% is what `inactive` means.
     pub allocation: Option<i32>,
-    pub redundancy: i32,
     pub status: JobStatus,
     pub created_by: Option<Uuid>,
     /// Rules setting, not a file: 'classic' | 'wordsmog'.
@@ -76,6 +75,10 @@ pub struct Job {
     pub games_completed: i64,
     /// Distinct opening racks with an accepted analysis, on the same terms.
     pub racks_analyzed: i64,
+    /// Opening racks that need no more analysis, and those of them settled at
+    /// their most analyses without a consensus.
+    pub racks_settled: i64,
+    pub racks_without_consensus: i64,
     pub created_at: DateTime<Utc>,
     /// When the job last joined the jobs on offer: its activation, a purge, or
     /// its first claim after a spell unserved. The scheduler settles a job for
@@ -167,6 +170,20 @@ pub struct OpeningRackConfig {
     pub racks_per_batch: i32,
     pub rack_size: i32,
     pub total_racks: i64,
+    /// A rack is analysed until at least `min_results_per_rack` analyses
+    /// agree on its best move in this share (percent), or until it has
+    /// `max_results_per_rack` of them. One and one is one analysis per rack.
+    pub consensus_pct: f64,
+    pub min_results_per_rack: i32,
+    pub max_results_per_rack: i32,
+}
+
+impl OpeningRackConfig {
+    /// Whether a rack may be analysed more than once, which is what keeps a
+    /// row per rack in `opening_rack_progress`.
+    pub fn seeks_consensus(&self) -> bool {
+        self.max_results_per_rack > 1
+    }
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]

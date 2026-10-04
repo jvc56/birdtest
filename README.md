@@ -53,10 +53,19 @@ reused, when an active job of its name is already running -- and they stack:
 
 | Flag | The job |
 |---|---|
-| `--leavegen-job` | "dev leave generation (english_ab)": six generations, targets 100, 200, 500, 1,000, 1,000 and 1,000 occurrences per rack, on the two-letter test data below, so it finishes in minutes |
-| `--opening-rack-job` | "dev opening racks (english_ab)": the two-letter data's eight racks, two to a task |
-| `--games-job` | "dev games": `static-equity` against `static-score` on `--lexicon` |
+| `--leavegen-job` | "dev leave generation": six generations, targets 100, 200, 500, 1,000, 1,000 and 1,000 occurrences per rack, played by `static-equity-no-rit` |
+| `--opening-rack-job` | "dev opening racks": every rack, 500 to a task, every play ranked by `static-equity-all` |
+| `--games-job` | "dev games (positions saved)": `static-equity` against `static-score`, saving every position played |
 | `--pairs-job` | "dev game pairs (first divergences saved)": the same two players in pairs, saving the positions where each pair first diverges |
+| `--sim-games-job` | "dev sim games (positions saved)": `sim-2ply` against `sim-1ply` (10 plays considered, an iteration budget of 200), two games to a task, saving every position played |
+| `--sim-pairs-job` | "dev sim game pairs (first divergences saved)": the same two simmers in pairs, one to a task, saving the positions where each pair first diverges |
+
+Each runs on `--lexicon` (CSW24 by default) and the english distribution.
+Append `_ab` to a flag (`--leavegen-job_ab`, or `--leavegen-job-ab`) to run
+that job on the two-letter test data below instead: "dev leave generation
+(english_ab)" and the others, played by `ab-` player configs. There are only
+eight racks, so the leave-generation and opening-rack jobs finish in minutes
+(the opening-rack one two racks to a task).
 
 New jobs share the allocation the active ones leave free, so four on a fresh
 database get 25% each. The games and pairs jobs stop at 100,000 games or pairs
@@ -75,8 +84,7 @@ identity, and a second Ctrl-C, or closing the window, leaves it stopped.
 Either way, Ctrl-C in dev.py stops every worker.
 
 **A small data set to import.** While it runs, `dev.py` also serves MAGPIE's
-two-letter test data, which `--leavegen-job` and `--opening-rack-job` are
-seeded on — the `english_ab` distribution and the `CSW21_ab`
+two-letter test data, which the `_ab` job flags are seeded on — the `english_ab` distribution and the `CSW21_ab`
 lexicon, eight possible racks — as MAGPIE-DATA version `20000101` on branch
 `two-letter`, which the **Input data** page imports like any other. It stands in
 for GitHub on Docker's bridge address (port 8482) and passes every other

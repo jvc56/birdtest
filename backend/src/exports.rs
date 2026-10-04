@@ -59,7 +59,12 @@ pub const DOWNLOAD_URL_TTL: std::time::Duration = std::time::Duration::from_secs
 /// the public feed returns the best move only, and `?rack=` one rack at a time.
 ///
 /// Nested rather than joined, so the unit stays one line per record and
-/// `row_count` still counts records. Each record's moves come through
+/// `row_count` still counts records. A consensus job analyses a rack more than
+/// once, so each of its lines also carries its rack's standing (`consensus`:
+/// its analyses, its most common best move and how many ranked it first, and
+/// whether it is settled, and without a consensus) from
+/// `opening_rack_progress`, a primary-key probe per line; null for a job
+/// wanting one analysis per rack, and for an in-game position. Each record's moves come through
 /// `position_analysis_moves_record_idx (record_id, rank)` and each move's plies
 /// through the `(move_id, ply)` unique index, so the cost is an index probe per
 /// record and per simmed move, on a background task (or under the two-stream
@@ -84,7 +89,15 @@ const OPENING_RACK_CORPUS: &str = "
                               ), '[]'::jsonb))
                           ORDER BY m.rank)
                FROM position_analysis_moves m WHERE m.record_id = r.id
-           ), '[]'::jsonb)))::text AS row
+           ), '[]'::jsonb),
+           'consensus', (
+               SELECT jsonb_build_object(
+                          'results', c.results, 'top_move', c.top_move,
+                          'top_count', c.top_count, 'settled', c.settled,
+                          'without_consensus', c.without_consensus)
+               FROM opening_rack_progress c
+               WHERE c.job_id = r.job_id AND c.rack = r.rack AND r.game_index IS NULL
+           )))::text AS row
     FROM position_analysis_records r
     WHERE r.job_id = $1";
 

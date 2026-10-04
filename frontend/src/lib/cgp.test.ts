@@ -1,9 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { parseCgp, parseMove, placedSquares, seatToMove, splitLetters } from './cgp';
+import { parseCgp, parseMove, placedSquares, placedTiles, seatToMove, splitLetters } from './cgp';
 
-// Turn 3 of the first game in contract-fixtures/result-games.json, which is
+// Turn 3 of the first game of an earlier contract-fixtures/result-games.json,
 // MAGPIE's own output: after 8G HUH, 9C FLEAMS and E9 (E)RUVIM.
 const FIXTURE =
   '15/15/15/15/15/15/15/6HUH6/2FLEAMS7/4R10/4U10/4V10/4I10/4M10/15 ANORRRY/BGLOTTX 40/30 0';
@@ -192,6 +192,21 @@ describe('F-CGP-4 captured positions from MAGPIE and the fake worker', () => {
         expect(position!.scores[mover] - earlier.scores[mover]).toBe(p.previous_move_score);
       }
     });
+
+    it(`reads the move ${writer} says was played from each position: the next turn's previous move, put down on empty squares`, () => {
+      const byTurn = new Map(positions.map((p) => [`${p.game_index}:${p.turn_number}`, p]));
+      for (const p of positions) {
+        expect(p.played_move, `${p.game_index}:${p.turn_number}`).toBeTruthy();
+        const position = parseCgp(p.position)!;
+        for (const tile of placedTiles(p.played_move)) {
+          expect(position.board[tile.row][tile.col], `${p.played_move} at ${tile.row},${tile.col}`).toBeNull();
+        }
+        const after = byTurn.get(`${p.game_index}:${p.turn_number + 1}`);
+        if (!after) continue;
+        expect(after.previous_move).toBe(p.played_move);
+        expect(after.previous_move_score).toBe(p.played_move_score);
+      }
+    });
   }
 });
 
@@ -202,5 +217,29 @@ interface CapturedPosition {
   position: string;
   previous_move?: string;
   previous_move_score?: number;
+  played_move?: string;
+  played_move_score?: number;
   moves: { move: string }[];
 }
+
+describe('F-CGP-5 placedTiles', () => {
+  it('puts down the tiles a play places, a blank as its letter, and skips what it plays through', () => {
+    expect(placedTiles('8G HuH')).toEqual([
+      { row: 7, col: 6, letter: 'H', blank: false },
+      { row: 7, col: 7, letter: 'U', blank: true },
+      { row: 7, col: 8, letter: 'H', blank: false }
+    ]);
+    expect(placedTiles('E9 (E)RUV')).toEqual([
+      { row: 9, col: 4, letter: 'R', blank: false },
+      { row: 10, col: 4, letter: 'U', blank: false },
+      { row: 11, col: 4, letter: 'V', blank: false }
+    ]);
+  });
+
+  it('puts nothing down for a pass, an exchange or a play it cannot read', () => {
+    expect(placedTiles('pass')).toEqual([]);
+    expect(placedTiles('(exch AB)')).toEqual([]);
+    expect(placedTiles('nonsense')).toEqual([]);
+    expect(placedTiles(null)).toEqual([]);
+  });
+});

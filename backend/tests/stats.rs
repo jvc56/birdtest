@@ -144,7 +144,7 @@ async fn pairs_job(db: &TestDb) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let p1 = db.static_player("p1", admin).await;
     let p2 = db.static_player("p2", admin).await;
-    let job = db.bare_job("game_pairs", 1, admin).await;
+    let job = db.bare_job("game_pairs", admin).await;
     sqlx::query(
         "INSERT INTO job_game_pair_config
              (job_id, player1_config_id, player2_config_id, pairs_per_batch, sprt_enabled,
@@ -184,7 +184,7 @@ async fn stats(db: &TestDb, job: Uuid) -> jobstats::JobStats {
 #[tokio::test]
 async fn a_games_jobs_stats_sum_every_result_and_test_the_games() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     result(&db, job, (7, 2, 1), None, None).await;
     result(&db, job, (4, 5, 1), None, None).await;
     result(&db, job, (10, 0, 0), None, None).await;
@@ -219,7 +219,7 @@ async fn a_games_jobs_stats_sum_every_result_and_test_the_games() {
 #[tokio::test]
 async fn average_scores_weight_each_batch_by_its_games() {
     let db = TestDb::new().await;
-    let games = db.games_job(1, 10).await;
+    let games = db.games_job(10).await;
     scored_result(&db, games, (6, 4, 0), None, None, (400.0, 380.0)).await;
     scored_result(&db, games, (12, 18, 0), None, None, (440.0, 450.0)).await;
     let pairs = pairs_job(&db).await;
@@ -291,7 +291,7 @@ async fn divergent_pairs_are_reported_but_not_tested() {
 #[tokio::test]
 async fn a_job_with_no_results_reports_zeros_not_nan() {
     let db = TestDb::new().await;
-    for job in [db.games_job(1, 10).await, pairs_job(&db).await] {
+    for job in [db.games_job(10).await, pairs_job(&db).await] {
         let games = game_stats(&db, job).await;
         let test = games.sprt.expect("an SPRT job");
         assert_eq!((games.wins, games.losses, games.draws, games.units_completed), (0, 0, 0, 0));
@@ -326,7 +326,7 @@ async fn a_job_with_no_results_reports_zeros_not_nan() {
 /// 500g, with the generation-0 artifact every job starts from.
 async fn leave_job(db: &TestDb, generations: i32) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
-    let job = db.bare_job("leave_generation", 1, admin).await;
+    let job = db.bare_job("leave_generation", admin).await;
     let kwg = db.input_data("kwg", "NWL23").await;
     let player = db.leave_player(kwg, true, admin).await;
     sqlx::query(
@@ -427,8 +427,8 @@ async fn leave_stats_report_the_current_generations_racks_against_its_universe()
 #[tokio::test]
 async fn contributions_are_attributed_to_each_identity_across_both_kinds() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
-    let other_job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
+    let other_job = db.games_job(10).await;
     let alice = db.user("alice", false).await;
     let bob = db.user("bob", false).await;
     let worker = anon(&db).await;
@@ -499,7 +499,7 @@ async fn contributions_are_attributed_to_each_identity_across_both_kinds() {
 #[tokio::test]
 async fn the_eta_is_none_without_recent_throughput() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let worker = Owner::Anon(anon(&db).await);
 
     assert_eq!(stats(&db, job).await.eta_seconds, None, "nothing done at all");
@@ -519,21 +519,19 @@ async fn the_eta_is_none_without_recent_throughput() {
 }
 
 /// I-STATS-8b: a games job's ETA is the units left at the rate units have
-/// been finishing -- claims an hour times the batch, over the redundancy,
-/// since a task's redundant copies add no units. Counted per completed task,
-/// as it was, it read half the time left at redundancy 2.
+/// been finishing -- claims an hour times the batch.
 #[tokio::test]
-async fn the_games_eta_divides_by_redundancy() {
+async fn the_games_eta_is_claims_times_the_batch() {
     let db = TestDb::new().await;
-    let job = db.games_job(2, 10).await;
+    let job = db.games_job(10).await;
     let worker = Owner::Anon(anon(&db).await);
     claim(&db, job, worker, "completed", 10).await;
     claim(&db, job, worker, "completed", 10).await;
     let stats = stats(&db, job).await;
     let games = stats.games.as_ref().expect("a games job");
     let left = games.max_units as f64 - games.units_completed as f64;
-    // Two claims in the last hour, ten games a batch, each task played twice.
-    let expected = left / (2.0 / 3600.0 * 10.0 / 2.0);
+    // Two claims in the last hour, ten games a batch.
+    let expected = left / (2.0 / 3600.0 * 10.0);
     let eta = stats.eta_seconds.expect("recent throughput");
     assert!((eta - expected).abs() < 1e-6 * expected, "{eta} vs {expected}");
 }
@@ -544,7 +542,7 @@ async fn the_games_eta_divides_by_redundancy() {
 #[tokio::test]
 async fn a_new_jobs_eta_is_measured_since_it_was_activated() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     sqlx::query("UPDATE jobs SET activated_at = now() - interval '10 minutes' WHERE id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -569,7 +567,7 @@ async fn a_new_jobs_eta_is_measured_since_it_was_activated() {
 #[tokio::test]
 async fn the_stats_cache_follows_admin_changes() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 10).await;
+    let job = db.games_job(10).await;
     let before = jobstats::load_job(&db.pool, job).await.unwrap();
     let ttl = std::time::Duration::from_secs(600);
     let allocation = |json: &str| -> serde_json::Value {
@@ -598,7 +596,7 @@ async fn the_stats_cache_follows_admin_changes() {
 
 /// A games job of one 100-game batch per task, with the given gates.
 async fn gated_games_job(db: &TestDb, min_games: i32, max_games: i32) -> Uuid {
-    let job = db.games_job(1, 100).await;
+    let job = db.games_job(100).await;
     sqlx::query("UPDATE job_game_config SET min_games = $2, max_games = $3 WHERE job_id = $1")
         .bind(job)
         .bind(min_games)
@@ -779,7 +777,7 @@ async fn a_job_without_an_sprt_completes_at_its_target_and_not_before() {
 #[tokio::test]
 async fn a_stats_build_takes_one_connection() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let acquired = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let counter = acquired.clone();
     let connects = acquired.clone();
@@ -820,7 +818,7 @@ async fn a_stats_build_takes_one_connection() {
 #[tokio::test]
 async fn viewers_waiting_on_a_failed_build_are_answered_together() {
     let db = TestDb::new().await;
-    let job_id = db.games_job(1, 2).await;
+    let job_id = db.games_job(2).await;
     let job = birdtest::jobstats::load_job(&db.pool, job_id).await.unwrap();
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)

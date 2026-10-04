@@ -88,6 +88,16 @@ test('E-12: a signed-in user draws saved positions at random and searches them b
   await expect(shown.getByTestId('score')).toHaveCount(2);
   await expect(shown.getByText('to move', { exact: true })).toHaveCount(1);
   expect(await shown.locator('tbody tr').count()).toBeGreaterThan(0);
+  // The move played from here: named, marked in the list, and -- unless it
+  // was a pass or an exchange -- drawn where it goes, apart from the tiles
+  // already down. No CGP text under the board.
+  const played = (await shown.getByTestId('played-move').innerText()).trim();
+  expect(played.length).toBeGreaterThan(0);
+  await expect(shown.locator('tr[data-played]')).toHaveCount(1);
+  if (!/^(pass|\(exch )/.test(played)) {
+    expect(await board.locator('.played').count()).toBeGreaterThan(0);
+  }
+  await expect(shown.locator('[title="CGP"]')).toHaveCount(0);
 
   // Search for the rack on the board, typed in lower case and backwards:
   // what comes back holds it.

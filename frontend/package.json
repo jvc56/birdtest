@@ -25,9 +25,5 @@
     "typescript": "^5.6.3",
     "vite": "^5.4.11",
     "vitest": "^2.1.9"
-  },
-  "dependencies": {
-    "d3-scale": "^4.0.2",
-    "layercake": "^8.4.1"
   }
 }

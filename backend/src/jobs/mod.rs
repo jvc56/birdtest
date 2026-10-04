@@ -504,9 +504,9 @@ pub(crate) async fn load_game_request(
 /// Writes analysed positions and their top-ranked moves.
 ///
 /// Shared by opening rack jobs (one position per rack) and by games jobs with
-/// capture on (one per turn). `on_conflict_ignore` is set for in-game positions:
-/// games are deterministic, so redundant claims replay identical games, and the
-/// first accepted claim is the one that lands.
+/// capture on (one per turn). `on_conflict_ignore` is set for in-game positions,
+/// which are unique per (task, game, turn): a task has one slot, so a conflict
+/// is a duplicate that can only be a no-op.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_position_analyses(
     conn: &mut PgConnection,
@@ -538,7 +538,8 @@ pub(crate) async fn insert_position_analyses(
         let mut builder = sqlx::QueryBuilder::new(
             "INSERT INTO position_analysis_records
                  (task_claim_id, task_id, job_id, rack, position, game_index,
-                  turn_number, previous_move, previous_move_score, num_moves, analysis) ",
+                  turn_number, previous_move, previous_move_score, played_move,
+                  played_move_score, num_moves, analysis) ",
         );
         builder.push_values(chunk.iter(), |mut b, position| {
             b.push_bind(claim_id)
@@ -550,6 +551,8 @@ pub(crate) async fn insert_position_analyses(
                 .push_bind(position.turn_number)
                 .push_bind(position.previous_move.clone())
                 .push_bind(position.previous_move_score)
+                .push_bind(position.played_move.clone())
+                .push_bind(position.played_move_score)
                 .push_bind(position.num_moves)
                 .push_bind(position.analysis.as_str());
         });
@@ -724,9 +727,6 @@ pub(crate) async fn insert_game_results(
     .execute(&mut *conn)
     .await?;
 
-    // Deterministic games mean redundant claims replay identical positions, so
-    // the first accepted claim records them and the rest are no-ops.
-    //
     // A job without capture submits no positions, and that is every games job
     // by default.
     if record.positions.is_empty() {

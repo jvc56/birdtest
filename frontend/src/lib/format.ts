@@ -216,7 +216,7 @@ export function completionText(stats: {
     return `it played the ${units(games.max_units, games.unit)} it was set to`;
   }
   if (completion?.reason === 'last generation built') return 'its last generation was built';
-  if (stats.job.job_type === 'opening_rack' && completion) return 'every rack was analysed';
+  if (stats.job.job_type === 'opening_rack' && completion) return 'every rack was settled';
   return 'it was completed';
 }
 
@@ -231,15 +231,24 @@ export const MAX_TARGET_RACK_COUNT = 1_000_000;
  * trailing comma forgiven. Either the list or why it cannot be sent.
  */
 export function parseTargetRackCounts(text: string): { targets: number[] } | { error: string } {
-  const parts = text.split(',').map((part) => part.trim());
+  // Commas or spaces between targets: MAGPIE's own `leavegen 100,200,500`
+  // form, or a list typed with spaces. A thousands separator cannot be told
+  // from a list separator, so "1,000" splits into 1 and 000 -- refused below,
+  // and the preview (targetsText) shows any other misreading.
+  const parts = text.trim().split(/\s*,\s*|\s+/);
   if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
   if (parts.length === 1 && parts[0] === '') {
     return { error: 'List at least one generation\'s target, e.g. 100, 200, 500.' };
   }
   const targets: number[] = [];
-  for (const part of parts) {
+  for (const [i, part] of parts.entries()) {
     if (!/^\d+$/.test(part)) {
       return { error: `"${part}" is not a whole number of occurrences.` };
+    }
+    if (i > 0 && /^0\d\d$/.test(part)) {
+      return {
+        error: `"${parts[i - 1]},${part}" reads as two targets: write ${parts[i - 1]}${part} without a thousands separator.`
+      };
     }
     const target = Number(part);
     if (target < 1 || target > MAX_TARGET_RACK_COUNT) {
@@ -253,6 +262,15 @@ export function parseTargetRackCounts(text: string): { targets: number[] } | { e
     return { error: `At most ${MAX_LEAVE_GENERATIONS} generations, not ${targets.length}.` };
   }
   return { targets };
+}
+
+/**
+ * A leave job's per-generation targets in generation order, e.g.
+ * "100 → 200 → 1,000". Arrows rather than commas: the numbers carry
+ * thousands separators, so a comma-separated list cannot be read.
+ */
+export function targetsText(targets: number[]): string {
+  return targets.map((t) => t.toLocaleString()).join(' → ');
 }
 
 /**

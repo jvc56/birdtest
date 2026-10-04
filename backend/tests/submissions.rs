@@ -60,7 +60,7 @@ const DIVERGENT: [&str; 4] = ["divergent_games", "divergent_wins", "divergent_lo
 #[tokio::test]
 async fn a_games_result_stores_one_row_with_no_pair_columns() {
     let db = TestDb::new().await;
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let mut result = games_result(2, 1);
@@ -94,7 +94,7 @@ async fn pairs_job(db: &TestDb) -> Uuid {
     let admin = db.user(&format!("admin{}", Uuid::new_v4().simple()), true).await;
     let p1 = db.static_player(&format!("p1{}", Uuid::new_v4().simple()), admin).await;
     let p2 = db.static_player(&format!("p2{}", Uuid::new_v4().simple()), admin).await;
-    let job = db.bare_job("game_pairs", 1, admin).await;
+    let job = db.bare_job("game_pairs", admin).await;
     sqlx::query(
         "INSERT INTO job_game_pair_config
              (job_id, player1_config_id, player2_config_id, pairs_per_batch, min_pairs, max_pairs)
@@ -215,49 +215,38 @@ async fn tasks_completed(db: &TestDb, job: Uuid) -> i64 {
         .unwrap()
 }
 
-/// I-SUBMIT-3: each accepted result increments the task's `accepted_count`
-/// and gives back its live claim; the task stays on offer while redundancy is
-/// unfilled, and completes -- with `completed_at`, and the job's
-/// `tasks_completed` bumped once -- at the result that reaches `redundancy`.
+/// I-SUBMIT-3: a claim takes its task's one slot, and its accepted result
+/// completes the task -- with `completed_at`, and the job's `tasks_completed`
+/// bumped once, on the transition.
 #[tokio::test]
-async fn accepted_results_move_the_task_counters_and_complete_it_at_redundancy() {
+async fn an_accepted_result_completes_its_task() {
     let db = TestDb::new().await;
-    let job = db.games_job(3, 2).await;
+    let job = db.games_job(2).await;
     let app = birdtest::app(db.state().await);
 
     let (first, first_uuid) = first_claim(&app).await;
-    let (second, second_uuid) = first_claim(&app).await;
-    assert_eq!(first["task_request"]["seed"], second["task_request"]["seed"], "one task");
     let task: Uuid = sqlx::query_scalar("SELECT id FROM tasks WHERE job_id = $1")
         .bind(job)
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert_eq!(task_counters(&db, task).await, (0, 2, "available".into(), false));
+    assert_eq!(task_counters(&db, task).await, (0, 1, "claimed".into(), false));
+    assert_eq!(tasks_completed(&db, job).await, 0);
 
     let (_, body) = submit(&app, &first, &first_uuid, games_result(2, 1)).await;
     assert_eq!(body, json!({ "accepted": true }));
-    assert_eq!(task_counters(&db, task).await, (1, 1, "available".into(), false));
-
-    let (_, body) = submit(&app, &second, &second_uuid, games_result(2, 1)).await;
-    assert_eq!(body, json!({ "accepted": true }));
-    assert_eq!(task_counters(&db, task).await, (2, 0, "available".into(), false));
-    assert_eq!(tasks_completed(&db, job).await, 0);
-
-    // The third slot: claimed, the task is at capacity; accepted, it is done.
-    let (third, third_uuid) = first_claim(&app).await;
-    assert_eq!(third["task_request"]["seed"], first["task_request"]["seed"], "the same task");
-    assert_eq!(task_counters(&db, task).await, (2, 1, "claimed".into(), false));
-    let (_, body) = submit(&app, &third, &third_uuid, games_result(2, 1)).await;
-    assert_eq!(body, json!({ "accepted": true }));
-    assert_eq!(task_counters(&db, task).await, (3, 0, "completed".into(), true));
+    assert_eq!(task_counters(&db, task).await, (1, 0, "completed".into(), true));
     assert_eq!(tasks_completed(&db, job).await, 1, "counted once, on the transition");
+
+    // The next worker gets the next task, not this one.
+    let (second, _) = first_claim(&app).await;
+    assert_ne!(second["task_request"]["seed"], first["task_request"]["seed"]);
 }
 
 /// A games job capturing positions, whose player 1 keeps `keep` moves per
 /// position.
 async fn capturing_job(db: &TestDb, keep: i32) -> Uuid {
-    let job = db.games_job(1, 2).await;
+    let job = db.games_job(2).await;
     sqlx::query("UPDATE job_game_config SET capture_positions = true WHERE job_id = $1")
         .bind(job)
         .execute(&db.pool)
@@ -281,7 +270,7 @@ fn position(game_index: i32, num_moves: i32, moves: usize) -> Value {
         .map(|i| json!({ "move": format!("move-{i}"), "score": 60 - i as i32, "equity": 70.0 - i as f64 }))
         .collect();
     json!({
-        "game_index": game_index, "turn_number": 0, "analysis": "static", "rack": "AEINRST", "position": "cgp",
+        "game_index": game_index, "turn_number": 0, "played_move": "8D PLAYED", "played_move_score": 10, "analysis": "static", "rack": "AEINRST", "position": "cgp",
         "num_moves": num_moves, "moves": moves,
     })
 }
@@ -335,7 +324,7 @@ async fn solved_positions_keep_their_analysis_spread_and_depth() {
 
     let solved = |index: i32, analysis: &str, moves: Value| {
         json!({
-            "game_index": index, "turn_number": 20, "rack": "AEINRST", "position": "cgp",
+            "game_index": index, "turn_number": 20, "played_move": "8D PLAYED", "played_move_score": 10, "rack": "AEINRST", "position": "cgp",
             "num_moves": 12, "analysis": analysis, "moves": moves,
         })
     };

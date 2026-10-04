@@ -103,8 +103,7 @@ impl JobHandler for LeaveGenHandler {
     }
 
     /// Credits the claim and stages its occurrences for the generation's next
-    /// merge ([`stage_fold`]). Only the first accepted result for a task is
-    /// staged -- see [`credit_claim`] for the others.
+    /// merge ([`stage_fold`]).
     async fn insert_record(
         conn: &mut PgConnection,
         template: &JobTemplate,
@@ -146,17 +145,9 @@ pub fn spell_as_the_universe(rack: &mut String) {
 /// The longest a full rack's string can be: seven letters of up to four bytes.
 const MAX_RACK_BYTES: usize = 7 * 4;
 
-/// Records that a claim did a task's work, without adding its occurrences to
-/// the generation.
-///
-/// This is all a redundant result gets. With redundancy above 1 every claim of
-/// a task plays the same seed, so folding each of them in counted the same
-/// games `redundancy` times -- a generation reached its occurrence target on
-/// a fraction of the coverage it names, and closed early. Every other job
-/// type's aggregates already read one result per task, the first accepted
-/// (PLAN.md, "Redundant task execution"); this is the leave-generation half of
-/// that rule.
-pub async fn credit_claim(
+/// Records that a claim did a task's work: the racks its games drew, which
+/// its contributor is credited with.
+async fn credit_claim(
     conn: &mut PgConnection,
     task_id: Uuid,
     claim_id: Uuid,

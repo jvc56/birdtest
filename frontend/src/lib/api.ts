@@ -94,6 +94,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 const get = <T>(path: string) => request<T>('GET', path);
 const post = <T>(path: string, body?: unknown) => request<T>('POST', path, body ?? {});
 const patch = <T>(path: string, body: unknown) => request<T>('PATCH', path, body);
+const put = <T>(path: string, body: unknown) => request<T>('PUT', path, body);
 const del = <T>(path: string) => request<T>('DELETE', path);
 
 // --- Shared shapes ---------------------------------------------------------
@@ -124,6 +125,12 @@ export interface SavedPosition {
   position: string | null;
   previous_move: string | null;
   previous_move_score: number | null;
+  /**
+   * The move played from this position, and its score: the one chosen, which
+   * need not be the top of `moves` (a simmer's pick, or a solver's).
+   */
+  played_move: string | null;
+  played_move_score: number | null;
   num_moves: number;
   /** How the move played here was chosen. */
   analysis: PositionAnalysis;
@@ -208,7 +215,6 @@ export interface JobListItem {
   status: JobStatus;
   /** The job's share of claims while active (not of worker time: PLAN's KL-88); null until first activated. 0% means what inactive means. */
   allocation: number | null;
-  redundancy: number;
   created_at: string;
   tasks_total: number;
   tasks_completed: number;
@@ -228,7 +234,6 @@ export interface JobRow {
   job_type: JobType;
   status: JobStatus;
   allocation: number | null;
-  redundancy: number;
   variant: string;
   created_at: string;
 }
@@ -304,8 +309,7 @@ export interface JobStats {
     job_type: JobType;
     status: JobStatus;
     allocation: number | null;
-    redundancy: number;
-    min_magpie_version: string;
+      min_magpie_version: string;
     created_at: string;
     created_by: string | null;
     /** The lexicons in play. A games job comparing two reads "CSW21 vs NWL23". */
@@ -320,6 +324,13 @@ export interface JobStats {
   games?: GameStats;
   opening_racks?: {
     racks_analyzed: number;
+    /**
+     * Racks needing no more analysis -- the job is done once all are -- and
+     * those of them settled at their most analyses without a consensus. For a
+     * job wanting one analysis per rack, `racks_settled` is `racks_analyzed`.
+     */
+    racks_settled: number;
+    racks_without_consensus: number;
     /** Size of the rack space — the denominator for progress. */
     racks_total: number;
   };
@@ -747,6 +758,13 @@ export const api = {
   activateJob: (id: string, allocation: number) =>
     post<JobRow>(`/api/admin/jobs/${id}/activate`, { allocation }),
   deactivateJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/deactivate`),
+  /**
+   * Several jobs' allocations at once, the active jobs checked against 100%
+   * as they will stand: above 0% activates a job, 0% deactivates one, and a
+   * job not named keeps what it has. Nothing changes unless all of it does.
+   */
+  setAllocations: (rows: { job_id: string; allocation: number }[]) =>
+    put<{ jobs: JobRow[] }>('/api/admin/jobs/allocations', { allocations: rows }),
   completeJob: (id: string) => post<JobRow>(`/api/admin/jobs/${id}/complete`),
   purgeJob: (id: string) => post<{ tasks_reset: number }>(`/api/admin/jobs/${id}/purge`),
   deleteJob: (id: string) => del<void>(`/api/admin/jobs/${id}`),

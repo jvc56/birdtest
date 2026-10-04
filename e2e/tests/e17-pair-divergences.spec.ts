@@ -7,8 +7,8 @@ test.use({ storageState: ADMIN_STATE });
 /**
  * E-17: a game-pairs job made through the form keeping only where each pair
  * first diverges shows a signed-in user the two games' positions of one pair
- * side by side: the same turn, the same rack, each player to move in one of
- * them. The fake workers synthesize first divergences the way MAGPIE keeps
+ * on one board: the same turn, the same rack, each player to move in one of
+ * them, each player's move drawn where it goes and marked in its list. The fake workers synthesize first divergences the way MAGPIE keeps
  * them: one position per game, the second from the other seat.
  */
 let api: AdminApi;
@@ -57,7 +57,7 @@ test.afterAll(async () => {
   await api.dispose();
 });
 
-test("E-17: a pairs job shows each pair's first divergence as two positions side by side", async ({ page }) => {
+test("E-17: a pairs job shows each pair's first divergence as two players' answers on one board", async ({ page }) => {
   await page.goto(`/jobs/${jobId}`);
   await expect(page.getByText('first divergences').first()).toBeVisible();
   await expect(page.getByText('the turn where its two games first diverged')).toBeVisible();
@@ -80,6 +80,17 @@ test("E-17: a pairs job shows each pair's first divergence as two positions side
   expect(movers.some((m) => m.includes(`${names[1]} to move`)), movers.join(' | ')).toBe(true);
   expect(await games.nth(0).locator('tbody tr').count()).toBeGreaterThan(0);
   expect(await games.nth(1).locator('tbody tr').count()).toBeGreaterThan(0);
+
+  // One board for the two: the same position, with each player's move drawn
+  // on it (or one at a time where they share a square), and no CGP text.
+  await expect(pair).toHaveAttribute('data-shared-board', '');
+  await expect(pair.getByTestId('board')).toHaveCount(1);
+  for (const i of [0, 1]) {
+    const played = (await games.nth(i).getByTestId('played-move').innerText()).trim();
+    expect(played.length).toBeGreaterThan(0);
+  }
+  await expect(pair.locator('[title="CGP"]')).toHaveCount(0);
+  await expect(pair.getByTestId('board-legend')).toContainText('played');
 
   // The rack finds the pair once, both games of it.
   await page.getByLabel('Rack').fill(rack);

@@ -404,8 +404,6 @@ CREATE TABLE jobs (
     -- is exactly what `inactive` means, and a job that should get everything
     -- is the only one above 0%.
     allocation INT CHECK (allocation BETWEEN 0 AND 100),
-    -- Number of independent workers that must complete each task. Default 1 = single-claim behavior.
-    redundancy INT NOT NULL DEFAULT 1 CHECK (redundancy >= 1),
     -- Jobs start inactive; admin activates with an allocation percentage.
     status     job_status NOT NULL DEFAULT 'inactive',
     -- SET NULL if the creating admin's account is deleted.
@@ -487,12 +485,8 @@ CREATE TABLE jobs (
         AND (sprt_decided_status IS NULL) = (sprt_decided_units IS NULL)
     ),
     -- Progress totals the dashboard reads, maintained in the submit transaction
-    -- rather than counted on read (PLAN.md, "What these reads cost"). Both are
-    -- incremented
-    -- once per task, on its FIRST accepted result, because that is the row the
-    -- reads they replace selected: with redundancy > 1 the later claims of a
-    -- task replay the same deterministic work, and summing all of them would
-    -- multiply every total by the redundancy.
+    -- rather than counted on read (PLAN.md, "What these reads cost"), once per
+    -- accepted result: a task has one slot, so one result.
     --
     -- games_completed counts GAMES for both games and game_pairs; a pairs job's
     -- unit count is half of it, exactly as the read derived it. racks_analyzed
@@ -505,6 +499,13 @@ CREATE TABLE jobs (
     -- recomputes them (RUNBOOK 2.3).
     games_completed BIGINT NOT NULL DEFAULT 0 CHECK (games_completed >= 0),
     racks_analyzed  BIGINT NOT NULL DEFAULT 0 CHECK (racks_analyzed >= 0),
+    -- An opening-rack job's racks that need no more analysis (see
+    -- job_opening_rack_config's consensus), and those of them settled by
+    -- reaching their most analyses without a consensus. Racks settle at their
+    -- first analysis when the job wants one, so for such a job the first is
+    -- racks_analyzed. The job is done once every rack is settled.
+    racks_settled            BIGINT NOT NULL DEFAULT 0 CHECK (racks_settled >= 0),
+    racks_without_consensus  BIGINT NOT NULL DEFAULT 0 CHECK (racks_without_consensus >= 0),
     -- Tasks created, and tasks that reached `completed`. The job list shows
     -- both for every job on the page, and counting them meant two COUNT(*)s
     -- over `tasks` per job per page view -- linear in each job's whole history,
@@ -593,7 +594,7 @@ CREATE TABLE player_configs (
     -- own defaults, so a setting missing here is a task no worker will run.
     use_wordmap          BOOLEAN NOT NULL,   -- -w1 / -w2
     use_rit               BOOLEAN NOT NULL,  -- rack info table            (-rit1 / -rit2)
-    use_wit               BOOLEAN NOT NULL DEFAULT false, -- word info table (-wit1 / -wit2)
+    use_wit               BOOLEAN NOT NULL,  -- word info table (-wit1 / -wit2)
     -- More simulation parameters: NULL for a static player, set for a simmer.
     min_play_iterations   INT,               -- -mi1 / -mi2
     threshold             TEXT,              -- 'none' | 'gk16'            (-th1 / -th2)
@@ -694,7 +695,21 @@ CREATE TABLE job_opening_rack_config (
     rack_size         INT NOT NULL DEFAULT 7 CHECK (rack_size BETWEEN 1 AND 7),
     -- Size of the rack space, computed at job creation. Tasks address ranges of
     -- it, so this is what tells the scheduler when the job is exhausted.
-    total_racks       BIGINT NOT NULL CHECK (total_racks >= 0)
+    total_racks       BIGINT NOT NULL CHECK (total_racks >= 0),
+    -- Consensus: a rack is analysed until enough of its analyses agree on its
+    -- best move, each analysis a task of its own. Its consensus is the share
+    -- of its analyses whose rank-1 move is the most common rank-1 move. It is
+    -- settled once it has at least `min_results_per_rack` analyses and its
+    -- consensus is at least `consensus_pct`, or once it has
+    -- `max_results_per_rack` analyses (settled without consensus), and never
+    -- analysed again. One and one is one analysis per rack, which is what a
+    -- static player gets: its analyses are deterministic and always agree.
+    consensus_pct          DOUBLE PRECISION NOT NULL DEFAULT 100
+                           CHECK (consensus_pct > 50 AND consensus_pct <= 100),
+    min_results_per_rack   INT NOT NULL DEFAULT 1 CHECK (min_results_per_rack >= 1),
+    max_results_per_rack   INT NOT NULL DEFAULT 1
+                           CHECK (max_results_per_rack >= min_results_per_rack
+                                  AND max_results_per_rack <= 100)
 );
 
 CREATE TABLE job_game_config (
@@ -861,7 +876,9 @@ CREATE TABLE tasks (
     -- below serves.
     seed                 BIGINT NOT NULL,
     state                task_state NOT NULL DEFAULT 'available',
-    -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate join/aggregate.
+    -- Denormalized counters used by SKIP LOCKED selection; avoids per-candidate
+    -- join/aggregate. A task has one slot: it is claimed by one worker at a
+    -- time and completed by its one accepted result, so each is 0 or 1.
     accepted_count       INT NOT NULL DEFAULT 0,
     active_claim_count   INT NOT NULL DEFAULT 0,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -880,12 +897,11 @@ CREATE UNIQUE INDEX tasks_seed_unique_idx ON tasks (job_id, seed);
 -- The queue index carries `created_at` rather than `state`, which the partial
 -- predicate already fixes: claim-time selection takes the *oldest* available
 -- task of a job (`registry::next_available`), so with `state` in the key the
--- planner had to read every available task of the job and sort it. A job with
--- redundancy above 1 leaves tasks available until their slots fill, so that is
--- not a short list.
+-- planner had to read every available task of the job and sort it.
 CREATE INDEX tasks_queue_idx   ON tasks (job_id, created_at) WHERE state = 'available';
 
--- Individual claims (one row per worker claim; up to redundancy concurrent/cumulative rows per task)
+-- Individual claims (one row per worker claim: a task's lapsed and declined
+-- claims, then the one that completed it)
 --
 -- claimed_by_user_id carries no ON DELETE clause because a user row is never
 -- deleted: account deletion anonymizes it in place (users.deleted_at, and a
@@ -1001,9 +1017,17 @@ CREATE TABLE opening_rack_requests (
     -- pins, not on whatever board its own settings last loaded.
     board_layout      TEXT NOT NULL,
     -- Index of the first rack in this batch, and how many it covers. The final
-    -- batch of a job may be short.
+    -- batch of a job may be short. A task reissuing racks a consensus still
+    -- wants (`racks` below) has its seed here instead: the cursor past the end
+    -- of the rack space, so rack i of it is analysed from a seed no earlier
+    -- analysis used.
     rack_start        BIGINT NOT NULL CHECK (rack_start >= 0),
     rack_count        INT NOT NULL CHECK (rack_count >= 1),
+    -- The racks themselves, for a task reissuing racks a consensus still
+    -- wants: they are scattered over the space rather than a range of it.
+    -- NULL for a task covering a range, which is every task of a job wanting
+    -- one analysis per rack.
+    racks             TEXT[] CHECK (racks IS NULL OR cardinality(racks) = rack_count),
     previous_play     TEXT,                  -- GCG-encoded previous move; required when inference is enabled; NULL for opening racks
     player_config_id  UUID NOT NULL REFERENCES player_configs(id)
 );
@@ -1047,6 +1071,29 @@ CREATE TABLE leave_requests (
     previous_artifact_key TEXT NOT NULL,
     player_config_id    UUID NOT NULL REFERENCES player_configs(id)
 );
+
+-- An opening-rack consensus job's racks: how many analyses each has, its most
+-- common rank-1 move and how many analyses ranked it first, and whether it is
+-- settled (see job_opening_rack_config). Only for a job wanting more than one
+-- analysis per rack: one that wants one settles each rack at its first, and
+-- needs no row per rack to know it. A rack has a row from its first analysis;
+-- the racks still to be reissued are its unsettled rows, fewest analyses
+-- first.
+CREATE TABLE opening_rack_progress (
+    job_id     UUID NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    rack       TEXT NOT NULL,
+    results    INT NOT NULL CHECK (results >= 1),
+    top_move   TEXT NOT NULL,
+    top_count  INT NOT NULL CHECK (top_count BETWEEN 1 AND results),
+    settled    BOOLEAN NOT NULL,
+    -- Settled by reaching the job's most analyses, its analyses still split.
+    without_consensus BOOLEAN NOT NULL CHECK (settled OR NOT without_consensus),
+    PRIMARY KEY (job_id, rack)
+);
+
+-- What a reissue picks from: a job's unsettled racks, fewest analyses first.
+CREATE INDEX opening_rack_progress_unsettled_idx
+    ON opening_rack_progress (job_id, results, rack) WHERE NOT settled;
 
 -- Per-rack occurrence progress for each generation of a leave-gen job, one row per
 -- full 7-tile rack the distribution can draw (3,199,724 for English), seeded at zero when
@@ -1154,7 +1201,7 @@ CREATE TABLE leave_selection_cursors (
     PRIMARY KEY (job_id, generation)
 );
 
--- Task records (one per accepted claim; keyed by task_claim_id since redundancy > 1 yields multiple results per task)
+-- Task records (one per accepted claim, keyed by task_claim_id)
 -- task_id is denormalized here for efficient job-results queries without joining through task_claims.
 
 -- One analysed position per row, whatever produced it.
@@ -1197,6 +1244,13 @@ CREATE TABLE position_analysis_records (
     -- NULL for turn 0 of a game (nothing preceded it) and for opening racks.
     previous_move       TEXT,
     previous_move_score INT,
+    -- The move played from this position, and its score: the one chosen this
+    -- turn, which need not be the top-ranked move below (a simmer's pick, or
+    -- a solver's), and which no later row holds when only a pair's first
+    -- divergence is kept. Every in-game position has it; an opening rack,
+    -- from which nothing is played, never does.
+    played_move         TEXT,
+    played_move_score   INT,
     -- How the move played from this position was chosen: by static equity, a
     -- simulation, a pre-endgame solve or an endgame solve. Decides which of
     -- its moves' statistics are set: win_percentage and per-ply rows for a
@@ -1215,22 +1269,24 @@ CREATE TABLE position_analysis_records (
     CONSTRAINT position_analysis_in_game_together CHECK (
         (game_index IS NULL AND turn_number IS NULL)
         OR (game_index IS NOT NULL AND turn_number IS NOT NULL)
+    ),
+    CONSTRAINT position_analysis_played_in_game CHECK (
+        (played_move IS NULL) = (game_index IS NULL)
+        AND (played_move_score IS NULL) = (played_move IS NULL)
     )
 );
 
--- Games are seeded and deterministic, so redundant claims replay identical
--- games and would capture identical positions. Keying on the task rather than
--- the claim makes the first accepted claim the one that lands and the rest
--- no-ops, so redundancy still verifies the *result* without multiplying the
--- corpus. It is also how a random saved position is drawn
+-- One position per turn of a task's game. It is also how a random saved
+-- position is drawn
 -- (`/api/jobs/:id/positions/random`): a random turn of one task's games, a
 -- few hundred entries at most, where `ORDER BY random()` read the whole job.
 CREATE UNIQUE INDEX position_analysis_records_in_game_idx
     ON position_analysis_records (task_id, game_index, turn_number)
     WHERE game_index IS NOT NULL;
 
--- Opening racks keep their natural key: one analysis per rack per claim, so
--- redundant claims each record their own and can be compared.
+-- Opening racks keep their natural key: one analysis per rack per claim. A
+-- rack an opening-rack job analyses more than once, to reach a consensus,
+-- is in several tasks, each with its own claim.
 CREATE UNIQUE INDEX position_analysis_records_rack_idx
     ON position_analysis_records (task_claim_id, rack)
     WHERE game_index IS NULL;
@@ -1335,12 +1391,6 @@ CREATE TABLE position_analysis_plies (
 -- the pentanomial: how many completed pairs ended in each of the five possible
 -- pair outcomes. The pentanomial is what SPRT and the rating fits read; the
 -- divergent summary alongside it is a diagnostic only.
---
--- With redundancy > 1 a task has several rows here, one per accepted claim,
--- and because games are seeded and deterministic they describe the *same*
--- games. Every aggregate that treats rows as observations (SPRT, progress,
--- ratings) therefore reads one row per task -- the first accepted -- or it
--- would count each game `redundancy` times.
 CREATE TABLE game_results (
     task_claim_id     UUID PRIMARY KEY REFERENCES task_claims(id) ON DELETE CASCADE,
     task_id           UUID NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,

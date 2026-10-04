@@ -9,7 +9,7 @@ use crate::state::AppState;
 use crate::extract::{ApiPath as Path, ApiQuery as Query};
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use serde::{Deserialize, Serialize};
@@ -20,6 +20,7 @@ pub fn router() -> Router<AppState> {
         .route("/player-configs", get(list_player_configs).post(create_player_config))
         .route("/player-configs/:id", get(get_player_config).delete(delete_player_config))
         .route("/jobs", post(create_job))
+        .route("/jobs/allocations", put(set_allocations))
         .route("/jobs/:id/activate", post(activate_job))
         .route("/jobs/:id/deactivate", post(deactivate_job))
         .route("/jobs/:id/complete", post(complete_job))
@@ -930,10 +931,11 @@ async fn create_player_config(
     .bind(&solver.peg_nested_cand_caps)
     .bind(solver.peg_nested_max_depth)
     .bind(&solver.peg_nested_strides)
-    // Off unless the config asks, as MAGPIE has it (-wit is opt-in). The
-    // server builds the table before any job using it dispatches, once per
-    // lexicon: about three seconds and 122 MB for CSW24.
-    .bind(body.use_wit.unwrap_or(false))
+    // On unless the config opts out, although MAGPIE has it opt-in (-wit):
+    // it speeds move generation, and costs little. The server builds the
+    // table before any job using it dispatches, once per lexicon: about three
+    // seconds and 122 MB for CSW24.
+    .bind(body.use_wit.unwrap_or(true))
     .fetch_one(&state.pool)
     .await
     .map_err(|e| match body.cloned_from_id {
@@ -1173,8 +1175,6 @@ struct CreateJobBody {
     #[serde(default)]
     name: Option<String>,
     job_type: JobType,
-    #[serde(default = "one")]
-    redundancy: i32,
     /// Rules setting shared by every job type.
     variant: String,
     /// One letter distribution and one board per job: MAGPIE takes a single
@@ -1235,6 +1235,15 @@ enum JobTypeConfig {
         racks_per_batch: i32,
         #[serde(default = "default_rack_size")]
         rack_size: i32,
+        /// Consensus: a rack is analysed until at least `min_results_per_rack`
+        /// analyses agree on its best move in this share (percent), or until
+        /// it has `max_results_per_rack`. One analysis per rack by default.
+        #[serde(default = "default_consensus_pct")]
+        consensus_pct: f64,
+        #[serde(default = "one")]
+        min_results_per_rack: i32,
+        #[serde(default = "one")]
+        max_results_per_rack: i32,
     },
     Game {
         player1_config_id: Uuid,
@@ -1334,6 +1343,9 @@ impl SprtRequest {
     }
 }
 
+fn default_consensus_pct() -> f64 {
+    100.0
+}
 fn default_racks_per_batch() -> i32 {
     500
 }
@@ -1401,13 +1413,12 @@ async fn create_job(
     let mut tx = state.pool.begin().await?;
     let job = sqlx::query_as::<_, Job>(
         "INSERT INTO jobs
-             (job_type, redundancy, variant, letterdist_id, layout_id,
+             (job_type, variant, letterdist_id, layout_id,
               min_magpie_major, min_magpie_minor, min_magpie_patch, bingo_bonus,
               sim_cutoff, created_by, name)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
     )
     .bind(body.job_type)
-    .bind(body.redundancy)
     .bind(&body.variant)
     .bind(body.letterdist_id)
     .bind(body.layout_id)
@@ -1432,9 +1443,10 @@ async fn create_job(
     // blanks (`cannot create WMP with more than 2 blanks`, an abort): a job
     // that needs either on `english_super` was created, its build failed
     // three times, and it never dispatched, with nothing on its page to say
-    // why (the audit's pass 7).
+    // why (the audit's pass 7). A word info table is built from the `.kwg`
+    // alone, which has no blanks, so it is no reason to refuse.
     if blanks > MAGPIE_MAX_WORDMAP_BLANKS
-        && !crate::derived::needs_for_job(&mut tx, job.id).await?.is_empty()
+        && crate::derived::needs_for_job(&mut tx, job.id).await?.iter().any(|need| need.role != "wit")
     {
         return Err(AppError::bad_request(
             "no wordmap or rack info table can be built for this letter distribution",
@@ -1478,6 +1490,8 @@ async fn create_job(
 /// its request and every rack comes back analysed in one submission, so this
 /// bounds both; 500 is the default.
 const MAX_RACKS_PER_BATCH: i32 = 10_000;
+/// The most analyses an opening-rack consensus may ask of one rack.
+const MAX_RESULTS_PER_RACK: i32 = 100;
 
 /// The most games one task may play (a pair counts two), and the most when
 /// the job captures positions. A captured position's game is an `i16`, so a
@@ -1523,15 +1537,6 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
         err = err.with_field("name", format!("at most {MAX_JOB_NAME_CHARS} characters"));
     } else if name.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
         err = err.with_field("name", "one line, with no control characters");
-    }
-    if body.redundancy < 1 {
-        err = err.with_field("redundancy", "must be at least 1");
-    }
-    // A leave task's redundant copies replay the same seed only when MAGPIE runs
-    // single-threaded; multi-threaded they are different samples, and there is
-    // no integrity use for them today. Refused rather than given a meaning.
-    if body.job_type == JobType::LeaveGeneration && body.redundancy > 1 {
-        err = err.with_field("redundancy", "leave generation runs at redundancy 1");
     }
     if !matches!(body.variant.as_str(), "classic" | "wordsmog") {
         err = err.with_field("variant", "must be 'classic' or 'wordsmog'");
@@ -1621,7 +1626,10 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
     };
 
     err = match &body.config {
-        JobTypeConfig::OpeningRack { racks_per_batch, rack_size, .. } => {
+        JobTypeConfig::OpeningRack {
+            racks_per_batch, rack_size, consensus_pct, min_results_per_rack,
+            max_results_per_rack, ..
+        } => {
             if !(1..=MAX_RACKS_PER_BATCH).contains(racks_per_batch) {
                 err = err.with_field(
                     "racks_per_batch",
@@ -1630,6 +1638,26 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
             }
             if !(1..=7).contains(rack_size) {
                 err = err.with_field("rack_size", "must be between 1 and 7");
+            }
+            // Above half: at or below it two moves could each hold the
+            // consensus, and a tie would settle a rack on whichever sorted
+            // first.
+            if !(consensus_pct.is_finite() && *consensus_pct > 50.0 && *consensus_pct <= 100.0) {
+                err = err.with_field("consensus_pct", "must be above 50 and at most 100");
+            }
+            if !(1..=MAX_RESULTS_PER_RACK).contains(min_results_per_rack) {
+                err = err.with_field(
+                    "min_results_per_rack",
+                    format!("must be between 1 and {MAX_RESULTS_PER_RACK}"),
+                );
+            } else if !(*min_results_per_rack..=MAX_RESULTS_PER_RACK).contains(max_results_per_rack) {
+                err = err.with_field(
+                    "max_results_per_rack",
+                    format!(
+                        "must be between min_results_per_rack ({min_results_per_rack}) and \
+                         {MAX_RESULTS_PER_RACK}"
+                    ),
+                );
             }
             err
         }
@@ -1746,6 +1774,7 @@ fn validate_job_body(body: &CreateJobBody) -> AppResult<()> {
 async fn validate_opening_rack_player(
     conn: &mut sqlx::PgConnection,
     player_config_id: Uuid,
+    max_results_per_rack: i32,
 ) -> AppResult<()> {
     let (recorder, recorded, plies, plays) = sqlx::query_as::<_, (String, i32, i32, i32)>(
         "SELECT recorder_type, num_plays_recorded, num_plies, num_plays
@@ -1781,6 +1810,19 @@ async fn validate_opening_rack_player(
                  with at most {plays} moves rather than the {recorded} it asks for. Use a \
                  config with num_plays of at least {recorded}, or a lower num_plays_recorded."
             ),
+        ));
+    }
+    // A static analysis is deterministic: a second one of a rack ranks it
+    // exactly as the first did, so asking for more costs the fleet and can
+    // only ever agree.
+    if plies == 0 && max_results_per_rack > 1 {
+        return Err(AppError::bad_request(
+            "a static player's analyses of a rack always agree, so there is no consensus to seek",
+        )
+        .with_field(
+            "max_results_per_rack",
+            "a static player analyses each rack once: set min_results_per_rack and \
+             max_results_per_rack to 1, or use a simulating player",
         ));
     }
     Ok(())
@@ -2055,7 +2097,10 @@ async fn insert_job_config(
     match (job.job_type, config) {
         (
             JobType::OpeningRack,
-            JobTypeConfig::OpeningRack { player_config_id, racks_per_batch, rack_size },
+            JobTypeConfig::OpeningRack {
+                player_config_id, racks_per_batch, rack_size, consensus_pct,
+                min_results_per_rack, max_results_per_rack,
+            },
         ) => {
             validate_player_compatibility(
                 &mut *conn,
@@ -2063,7 +2108,8 @@ async fn insert_job_config(
                 letterdist_name,
             )
             .await?;
-            validate_opening_rack_player(&mut *conn, *player_config_id).await?;
+            validate_opening_rack_player(&mut *conn, *player_config_id, *max_results_per_rack)
+                .await?;
             // Counting the space is cheap -- a small dynamic-programming table
             // over the letter distribution -- and recording it here means the
             // scheduler can tell when the job is exhausted without re-deriving
@@ -2075,15 +2121,18 @@ async fn insert_job_config(
                 crate::jobs::opening_rack::total_racks(&job_data.letterdist, *rack_size)?;
             sqlx::query(
                 "INSERT INTO job_opening_rack_config
-                     (job_id, player_config_id,
-                      racks_per_batch, rack_size, total_racks)
-                 VALUES ($1, $2, $3, $4, $5)",
+                     (job_id, player_config_id, racks_per_batch, rack_size, total_racks,
+                      consensus_pct, min_results_per_rack, max_results_per_rack)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
             .bind(job.id)
             .bind(player_config_id)
             .bind(racks_per_batch)
             .bind(rack_size)
             .bind(total_racks)
+            .bind(consensus_pct)
+            .bind(min_results_per_rack)
+            .bind(max_results_per_rack)
             .execute(conn)
             .await?;
         }
@@ -2287,6 +2336,236 @@ async fn activate_job(
     state.finish_checks.rearm_idle(id);
     super::worker::push_after_change(&state, id);
     Ok(Json(updated))
+}
+
+/// The most jobs one allocation change names: more than any fleet runs at once.
+const MAX_ALLOCATION_ROWS: usize = 200;
+
+#[derive(Deserialize)]
+struct AllocationsBody {
+    allocations: Vec<AllocationRow>,
+}
+
+#[derive(Deserialize)]
+struct AllocationRow {
+    job_id: Uuid,
+    allocation: i32,
+}
+
+#[derive(Serialize)]
+struct AllocationsResult {
+    /// Every job the request named, as it now stands, in the request's order.
+    jobs: Vec<Job>,
+}
+
+/// Several jobs' allocations at once, checked as a whole: the active jobs
+/// must sum to at most 100% *after* the change, not after each step of it.
+/// One at a time, moving 20% from a job at 60% to one at 40% meant lowering
+/// the first before the second could be raised, and an admin rebalancing
+/// three jobs had to work out an order that never passed through 101%.
+///
+/// A row above 0% leaves its job active at that allocation, activating it if
+/// it was not; a row at 0% leaves it inactive, deactivating it if it was
+/// active (its last allocation is kept, as deactivation keeps it). A job the
+/// request does not name keeps what it has. A completed job, or one being
+/// purged, is refused, and so is everything else in the request with it:
+/// nothing changes unless all of it does.
+///
+/// Each job that changes is audited as activation and deactivation are --
+/// `job.activated` / `job.deactivated` when its status changes -- and a new
+/// allocation as `job.allocation_changed`, from what to what.
+async fn set_allocations(
+    State(state): State<AppState>,
+    admin: AdminUser,
+    method: Method,
+    headers: HeaderMap,
+    jar: CookieJar,
+    ApiJson(body): ApiJson<AllocationsBody>,
+) -> AppResult<Json<AllocationsResult>> {
+    csrf::verify(&method, &headers, &jar)?;
+
+    let mut err = AppError::bad_request("allocations are invalid");
+    if body.allocations.is_empty() {
+        err = err.with_field("allocations", "name at least one job");
+    } else if body.allocations.len() > MAX_ALLOCATION_ROWS {
+        err = err.with_field("allocations", format!("at most {MAX_ALLOCATION_ROWS} jobs at once"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (i, row) in body.allocations.iter().enumerate() {
+        if !(0..=100).contains(&row.allocation) {
+            err = err.with_field(format!("allocations[{i}].allocation"), "must be between 0 and 100");
+        }
+        if !seen.insert(row.job_id) {
+            err = err.with_field(format!("allocations[{i}].job_id"), "names a job named before it");
+        }
+    }
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+
+    let mut purges = std::collections::HashMap::new();
+    for row in &body.allocations {
+        purges.insert(row.job_id, refuse_while_purging(&state, row.job_id)?);
+    }
+
+    // What activation does first, for each job this activates: a leave job's
+    // generation-0 KLV, and its derived files under this deployment's
+    // builder. Outside the transaction, as there.
+    for row in body.allocations.iter().filter(|r| r.allocation > 0) {
+        let unlocked = match crate::jobstats::load_job(&state.pool, row.job_id).await {
+            Ok(job) => job,
+            // Named below, with the rest of what is wrong.
+            Err(_) => continue,
+        };
+        if unlocked.status == JobStatus::Active || unlocked.status == JobStatus::Completed {
+            continue;
+        }
+        if !registry::job_artifacts_ready(&state.pool, &unlocked).await? {
+            registry::initialize_job_artifacts(&state, &unlocked).await?;
+        }
+        request_derived_data(&state, row.job_id).await?;
+    }
+
+    let mut tx = state.pool.begin().await?;
+    // Every row first, in id order, then the activation lock: the order
+    // `activate_job` takes them in (a row, then the lock), so the two never
+    // wait on each other the wrong way round.
+    let mut ids: Vec<Uuid> = body.allocations.iter().map(|r| r.job_id).collect();
+    ids.sort();
+    let locked: Vec<Job> = sqlx::query_as::<_, Job>(
+        "SELECT * FROM jobs WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+    )
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    let before: std::collections::HashMap<Uuid, Job> =
+        locked.into_iter().map(|job| (job.id, job)).collect();
+    let mut err = AppError::bad_request("allocations are invalid");
+    for (i, row) in body.allocations.iter().enumerate() {
+        match before.get(&row.job_id) {
+            None => err = err.with_field(format!("allocations[{i}].job_id"), "no such job"),
+            Some(job) if job.status == JobStatus::Completed => {
+                err = err.with_field(
+                    format!("allocations[{i}].job_id"),
+                    "the job is completed, and a completed job cannot be reactivated",
+                )
+            }
+            Some(_) => refuse_if_purged_since(&state, row.job_id, purges[&row.job_id])?,
+        }
+    }
+    if !err.fields.is_empty() {
+        return Err(err);
+    }
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('birdtest.activate'))")
+        .execute(&mut *tx)
+        .await?;
+
+    let others = sqlx::query_scalar::<_, Option<i64>>(
+        "SELECT SUM(allocation) FROM jobs WHERE status = 'active' AND id <> ALL($1)",
+    )
+    .bind(&ids)
+    .fetch_one(&mut *tx)
+    .await?
+    .unwrap_or(0);
+    let named: i64 = body.allocations.iter().map(|r| i64::from(r.allocation)).sum();
+    if others + named > 100 {
+        return Err(AppError::conflict(format!(
+            "the active jobs would allocate {}% between them; the most is 100%{}",
+            others + named,
+            if others > 0 {
+                format!(" (the jobs not named here already allocate {others}%)")
+            } else {
+                String::new()
+            }
+        )));
+    }
+
+    let mut activated = Vec::new();
+    let mut changed = Vec::new();
+    for row in &body.allocations {
+        let job = &before[&row.job_id];
+        let active = job.status == JobStatus::Active;
+        if row.allocation > 0 {
+            if active && job.allocation == Some(row.allocation) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE jobs SET status = 'active', allocation = $1, activated_at = now() WHERE id = $2",
+            )
+            .bind(row.allocation)
+            .bind(row.job_id)
+            .execute(&mut *tx)
+            .await?;
+            // As activation does, and for the same reason: a new allocation
+            // rescales the job's ratio, so it joins level with the jobs being
+            // served rather than with a deficit to work off.
+            crate::scheduler::join_at_parity(&mut tx, row.job_id, state.cfg.heartbeat_timeout).await?;
+            if !active {
+                audit::log_status_change(
+                    &mut tx,
+                    "job.activated",
+                    admin.0.id,
+                    row.job_id,
+                    status_name(job.status),
+                    "active",
+                )
+                .await?;
+                activated.push(row.job_id);
+            }
+            if job.allocation != Some(row.allocation) {
+                let from = job.allocation.map_or("none".to_string(), |a| format!("{a}%"));
+                audit::log_detail(
+                    &mut tx,
+                    "job.allocation_changed",
+                    admin.0.id,
+                    "job",
+                    row.job_id.to_string(),
+                    Some(row.job_id),
+                    format!("{from} -> {}%", row.allocation),
+                )
+                .await?;
+            }
+            changed.push(row.job_id);
+        } else if active {
+            sqlx::query("UPDATE jobs SET status = 'inactive', deactivated_at = now() WHERE id = $1")
+                .bind(row.job_id)
+                .execute(&mut *tx)
+                .await?;
+            audit::log_status_change(
+                &mut tx,
+                "job.deactivated",
+                admin.0.id,
+                row.job_id,
+                status_name(job.status),
+                "inactive",
+            )
+            .await?;
+            changed.push(row.job_id);
+        }
+    }
+
+    let after: std::collections::HashMap<Uuid, Job> =
+        sqlx::query_as::<_, Job>("SELECT * FROM jobs WHERE id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .map(|job| (job.id, job))
+            .collect();
+    tx.commit().await?;
+    for id in &activated {
+        state.finish_checks.rearm_idle(*id);
+    }
+    for id in &changed {
+        super::worker::push_after_change(&state, *id);
+    }
+    let mut jobs = Vec::with_capacity(body.allocations.len());
+    for row in &body.allocations {
+        if let Some(job) = after.get(&row.job_id) {
+            jobs.push(job.clone());
+        }
+    }
+    Ok(Json(AllocationsResult { jobs }))
 }
 
 async fn deactivate_job(
@@ -2741,6 +3020,7 @@ async fn purge_body(
     // meant to start it over. Active and inactive jobs keep their state.
     sqlx::query(
         "UPDATE jobs SET claims_issued = 0, games_completed = 0, racks_analyzed = 0,
+                         racks_settled = 0, racks_without_consensus = 0,
                          tasks_total = 0, tasks_completed = 0, last_completed_at = NULL,
                          sprt_decided_status = NULL, sprt_decided_llr = NULL,
                          sprt_decided_units = NULL,
@@ -2752,6 +3032,12 @@ async fn purge_body(
     .execute(&mut *tx)
     .await?;
     sqlx::query("DELETE FROM leave_rack_progress WHERE job_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    // An opening-rack consensus job's per-rack standings describe analyses
+    // the claims above took with them.
+    sqlx::query("DELETE FROM opening_rack_progress WHERE job_id = $1")
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -3368,8 +3654,7 @@ async fn rebuild_artifacts(
 /// tombstones, the password becomes unusable, API keys, confirmation codes and
 /// reset tokens are deleted, and every session is revoked. Contributions stay:
 /// the account's claims and results are kept under the tombstone, and no
-/// counter is rolled back, so no donated compute is lost -- including captured
-/// positions other redundant claims deduplicated against. Open claims are left
+/// counter is rolled back, so no donated compute is lost. Open claims are left
 /// to time out; nothing can submit for them once the keys are gone.
 async fn delete_user(
     State(state): State<AppState>,
@@ -3927,9 +4212,9 @@ mod tests {
     #[test]
     fn degenerate_error_rates_are_rejected_and_every_problem_is_reported() {
         let got = fields(validate_job_body(&game_pairs(serde_json::json!({
-            "sprt_alpha": 0.0, "sprt_beta": 1.0, "max_pairs": 0, "redundancy": 0
+            "sprt_alpha": 0.0, "sprt_beta": 1.0, "max_pairs": 0
         }))));
-        for expected in ["sprt_alpha", "sprt_beta", "max_pairs", "redundancy"] {
+        for expected in ["sprt_alpha", "sprt_beta", "max_pairs"] {
             assert!(got.iter().any(|f| f == expected), "missing {expected} in {got:?}");
         }
     }
@@ -4004,20 +4289,6 @@ mod tests {
                 "{bad}"
             );
         }
-    }
-
-    #[test]
-    fn leave_generation_runs_at_redundancy_one() {
-        let mut leave = body(serde_json::json!({
-            "job_type": "leave_generation",
-            "player_config_id": Uuid::nil(),
-            "num_iterations": 1,
-            "target_rack_counts": [10],
-            "racks_per_task": 1,
-        }));
-        assert!(validate_job_body(&leave).is_ok());
-        leave.redundancy = 2;
-        assert_eq!(fields(validate_job_body(&leave)), ["redundancy"]);
     }
 
     #[test]
